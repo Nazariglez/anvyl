@@ -9,7 +9,7 @@ use anvyx_frontend::{
     ast::{FormatKind, FormatSign, FormatSpec},
 };
 
-use super::{lambda_capture_has_runtime, rep_policy::AirRustRepPolicy, rir};
+use super::{rep_policy::AirRustRepPolicy, rir};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustBackendProfile;
@@ -295,11 +295,6 @@ impl ProfileCx<'_> {
     }
 
     fn check_lambda_decl(&mut self, site: ProfileSite, decl: &air::LambdaDecl) {
-        if decl.escape == air::LambdaEscape::Escaping
-            && decl.captures.iter().any(lambda_capture_has_runtime)
-        {
-            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
-        }
         for capture in &decl.captures {
             match capture {
                 air::LambdaCaptureDecl::NoRuntime { .. } => {}
@@ -316,7 +311,13 @@ impl ProfileCx<'_> {
                     ty,
                     mutability,
                     ..
-                } => self.check_scoped_borrow_decl(site, *borrow, *ty, *mutability),
+                } => {
+                    if decl.escape == air::LambdaEscape::Escaping {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    } else {
+                        self.check_scoped_borrow_decl(site, *borrow, *ty, *mutability);
+                    }
+                }
                 air::LambdaCaptureDecl::CaptureCell { .. } => {
                     if decl.escape != air::LambdaEscape::NonEscaping {
                         self.push(site, ProfileErrorKind::UnsupportedLambdaCell);

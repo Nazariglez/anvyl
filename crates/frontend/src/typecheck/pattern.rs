@@ -1476,7 +1476,7 @@ fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
 pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let binding = &binding_node.node;
     let mode = mode_for_binding(binding);
-    let value_ty = match &binding.ty {
+    let (value_ty, binding_ty) = match &binding.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
@@ -1495,13 +1495,13 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             let binding_handle = tc.type_handle(&binding_ty);
             check_place_at(
                 &binding.pattern,
-                value.pattern_place(binding_handle, binding_ty),
+                value.pattern_place(binding_handle, binding_ty.clone()),
                 mode,
                 binding.value.node.id,
                 PatternContext::Binding,
                 tc,
             );
-            value_ty
+            (value_ty, binding_ty)
         }
         None => {
             let value = check_pattern_scrutinee(&binding.value, mode, tc);
@@ -1516,12 +1516,15 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
                 PatternContext::Binding,
                 tc,
             );
-            value_ty
+            (value_ty.clone(), value_ty)
         }
     };
 
-    let function_value = matches!(value_ty, Type::Func { .. });
-    let binding_id = simple_owned_binding_name(binding).and_then(|name| tc.local_binding_id(name));
+    let binding_name = simple_owned_binding_name(binding);
+    let function_value = matches!(value_ty, Type::Func { .. })
+        || matches!(binding_ty, Type::Func { .. })
+        || binding_name.is_some_and(|name| tc.local_binding_is_function_value(name));
+    let binding_id = binding_name.and_then(|name| tc.local_binding_id(name));
     tc.closure.bind_local(
         binding_id,
         binding.value.node.id,

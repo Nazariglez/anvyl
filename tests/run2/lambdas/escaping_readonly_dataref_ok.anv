@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @contains: 99
+
+dataref Box {
+    value: int,
+}
+
+fn make(box: Box) -> fn() -> int {
+    || box.value
+}
+
+fn main() {
+    let box = Box { value: 99 };
+    let f = make(box);
+    println(f());
+}

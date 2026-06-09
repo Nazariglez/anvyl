@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Holder {
+    f: fn(),
+}
+
+fn make(holder: Holder) -> fn() -> int {
+    let f = holder.f;
+    {
+        let f = 1;
+        || f
+    }
+}

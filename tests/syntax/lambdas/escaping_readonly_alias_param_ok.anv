@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn keep(f: escaping fn()) {}
+
+fn main(seed: int) {
+    let f: fn() = || { seed; };
+    keep(f);
+}

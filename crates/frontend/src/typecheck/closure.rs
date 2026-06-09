@@ -53,6 +53,9 @@ impl TypeChecker {
                 EscapeEvent::Borrowed { capture, span } => {
                     self.push_borrowed_escaping_capture(&capture, span);
                 }
+                EscapeEvent::UnknownFunction { span } => {
+                    self.push_unknown_function_escape(span);
+                }
             }
         }
     }
@@ -125,6 +128,12 @@ impl TypeChecker {
         self.push_error(TypeError::BorrowedCaptureEscapes {
             name: capture.name,
             origin: capture.origin,
+            span: self.error_span(span),
+        });
+    }
+
+    fn push_unknown_function_escape(&mut self, span: Span) {
+        self.push_error(TypeError::UnknownFunctionValueEscapes {
             span: self.error_span(span),
         });
     }
@@ -279,8 +288,11 @@ impl ClosureClassifier {
         function_value: bool,
         span: Span,
     ) -> bool {
-        let flow = self.storable_expr_flow(value, function_value);
+        let mut flow = self.storable_expr_flow(value, function_value);
         if function_value {
+            if flow.is_empty() {
+                flow.insert_unknown_function();
+            }
             self.record_assigned_capture_flow(binding_id, &flow, span);
             self.record_loop_assignment(binding_id, value, flow.clone(), span);
         }
@@ -301,15 +313,11 @@ impl ClosureClassifier {
         let Some(expr_flow) = self.expr_flows.get(&expr) else {
             return flow;
         };
-        for origin in expr_flow.callbacks() {
-            flow.insert_callback(origin.clone());
-        }
         if function_value {
-            for capture in expr_flow.borrowed() {
-                flow.insert_borrowed(capture.clone());
-            }
-            for lambda in expr_flow.lambdas() {
-                flow.insert_lambda(lambda);
+            flow.union(expr_flow);
+        } else {
+            for origin in expr_flow.callbacks() {
+                flow.insert_callback(origin.clone());
             }
         }
         flow
@@ -549,6 +557,12 @@ impl ClosureClassifier {
         for capture in flow.borrowed() {
             self.record_borrowed_function_expr(expr, capture.clone());
         }
+        if flow.has_unknown_function() {
+            self.expr_flows
+                .entry(expr)
+                .or_default()
+                .insert_unknown_function();
+        }
         for lambda in flow.lambdas() {
             self.record_lambda_origin(expr, lambda);
         }
@@ -556,6 +570,54 @@ impl ClosureClassifier {
 
     pub(super) fn lambda_value(&mut self, expr: ExprId) {
         self.expr_flows.entry(expr).or_default().insert_lambda(expr);
+    }
+
+    pub(super) fn record_function_value_origin(
+        &mut self,
+        expr: ExprId,
+        kind: &FunctionValueKind,
+        mut is_function_source: impl FnMut(SemanticLocalId) -> bool,
+    ) {
+        match kind {
+            FunctionValueKind::Named(_) => {
+                self.expr_flows
+                    .entry(expr)
+                    .or_default()
+                    .insert_known_function();
+            }
+            FunctionValueKind::Lambda { .. } => {}
+            FunctionValueKind::LocalOrPlace => {
+                self.record_local_or_place_function_origin(expr, &mut is_function_source);
+            }
+        }
+    }
+
+    fn record_local_or_place_function_origin(
+        &mut self,
+        expr: ExprId,
+        is_function_source: &mut impl FnMut(SemanticLocalId) -> bool,
+    ) {
+        if self
+            .expr_flows
+            .get(&expr)
+            .is_some_and(|flow| !flow.is_empty())
+        {
+            return;
+        }
+        let known = self.expr_sources.get(&expr).is_some_and(|sources| {
+            !sources.is_empty()
+                && sources.iter().all(|binding| {
+                    self.bindings
+                        .get(binding)
+                        .is_some_and(|info| is_function_source(info.type_id))
+                })
+        });
+        let flow = self.expr_flows.entry(expr).or_default();
+        if known {
+            flow.insert_known_function();
+        } else {
+            flow.insert_unknown_function();
+        }
     }
 
     fn record_lambda_origin(&mut self, expr: ExprId, origin: ExprId) {
@@ -630,6 +692,10 @@ impl ClosureClassifier {
         }
         for lambda in flow.lambdas() {
             self.record_lambda_escape(lambda);
+        }
+        if flow.has_unknown_function() {
+            self.escape_events
+                .push(EscapeEvent::UnknownFunction { span });
         }
     }
 
@@ -943,6 +1009,14 @@ impl EscapeFlow {
         self.origins.insert(FlowOrigin::Lambda(expr));
     }
 
+    fn insert_known_function(&mut self) {
+        self.origins.insert(FlowOrigin::KnownFunction);
+    }
+
+    fn insert_unknown_function(&mut self) {
+        self.origins.insert(FlowOrigin::UnknownFunction);
+    }
+
     fn union(&mut self, other: &Self) {
         self.origins.extend(other.origins.iter().cloned());
     }
@@ -950,22 +1024,37 @@ impl EscapeFlow {
     fn callbacks(&self) -> impl Iterator<Item = &NonEscapingCallback> {
         self.origins.iter().filter_map(|origin| match origin {
             FlowOrigin::Callback(callback) => Some(callback),
-            FlowOrigin::Borrowed(_) | FlowOrigin::Lambda(_) => None,
+            FlowOrigin::Borrowed(_)
+            | FlowOrigin::Lambda(_)
+            | FlowOrigin::KnownFunction
+            | FlowOrigin::UnknownFunction => None,
         })
     }
 
     fn borrowed(&self) -> impl Iterator<Item = &BorrowedCapture> {
         self.origins.iter().filter_map(|origin| match origin {
             FlowOrigin::Borrowed(capture) => Some(capture),
-            FlowOrigin::Callback(_) | FlowOrigin::Lambda(_) => None,
+            FlowOrigin::Callback(_)
+            | FlowOrigin::Lambda(_)
+            | FlowOrigin::KnownFunction
+            | FlowOrigin::UnknownFunction => None,
         })
     }
 
     fn lambdas(&self) -> impl Iterator<Item = ExprId> + '_ {
         self.origins.iter().filter_map(|origin| match origin {
             FlowOrigin::Lambda(expr) => Some(*expr),
-            FlowOrigin::Callback(_) | FlowOrigin::Borrowed(_) => None,
+            FlowOrigin::Callback(_)
+            | FlowOrigin::Borrowed(_)
+            | FlowOrigin::KnownFunction
+            | FlowOrigin::UnknownFunction => None,
         })
+    }
+
+    fn has_unknown_function(&self) -> bool {
+        self.origins
+            .iter()
+            .any(|origin| matches!(origin, FlowOrigin::UnknownFunction))
     }
 }
 
@@ -974,6 +1063,8 @@ enum FlowOrigin {
     Callback(NonEscapingCallback),
     Borrowed(BorrowedCapture),
     Lambda(ExprId),
+    KnownFunction,
+    UnknownFunction,
 }
 
 impl PartialEq for FlowOrigin {
@@ -982,6 +1073,8 @@ impl PartialEq for FlowOrigin {
             (Self::Callback(left), Self::Callback(right)) => left.id == right.id,
             (Self::Borrowed(left), Self::Borrowed(right)) => left.id == right.id,
             (Self::Lambda(left), Self::Lambda(right)) => left == right,
+            (Self::KnownFunction, Self::KnownFunction)
+            | (Self::UnknownFunction, Self::UnknownFunction) => true,
             _ => false,
         }
     }
@@ -994,6 +1087,7 @@ impl Hash for FlowOrigin {
             Self::Callback(origin) => origin.id.hash(state),
             Self::Borrowed(capture) => capture.id.hash(state),
             Self::Lambda(expr) => expr.hash(state),
+            Self::KnownFunction | Self::UnknownFunction => {}
         }
     }
 }
@@ -1029,6 +1123,9 @@ pub(super) enum EscapeEvent {
     },
     Borrowed {
         capture: BorrowedCapture,
+        span: Span,
+    },
+    UnknownFunction {
         span: Span,
     },
 }

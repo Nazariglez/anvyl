@@ -22,11 +22,12 @@ use super::{
         RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind,
         RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction,
         RirFunctionId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg,
-        RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
-        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
-        RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
+        RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvId, RirLambdaEnvLayout,
+        RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
+        RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
+        RirMutPlaceArg, RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirReturn,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
         RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
         RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
         RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
@@ -2583,6 +2584,310 @@ fn rir_rejects_stack_cell_init_in_loop() {
 }
 
 #[test]
+fn rir_accepts_heap_env_lambda_capture_descriptor_and_value() {
+    let program = valid_heap_env_lambda_rir();
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_zero_env_escaping_lambda_without_env() {
+    let program = zero_env_escaping_lambda_rir();
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_heap_env_on_non_escaping_lambda() {
+    let mut program = valid_heap_env_lambda_rir();
+    program.lambdas[0].escape = RirLambdaEscape::NonEscaping;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_heap_env_with_mut_borrow_capture() {
+    let mut program = valid_heap_env_lambda_rir();
+    program.lambdas[0].captures[0].semantic = RirParamSemantic::MutBorrow;
+    program.lambdas[0].captures[0].abi = RirParamAbi::MutBorrow;
+    program.functions[0].params[0].semantic = RirParamSemantic::MutBorrow;
+    program.functions[0].params[0].abi = RirParamAbi::MutBorrow;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_heap_env_with_scoped_cell_capture() {
+    let mut program = valid_heap_env_lambda_rir();
+    program.lambdas[0].captures[0].semantic = RirParamSemantic::ScopedPlaceCell;
+    program.lambdas[0].captures[0].abi = RirParamAbi::ScopedPlaceCell;
+    program.lambdas[0].captures[0].kind = RirLambdaCaptureKind::ScopedPlaceCell {
+        cell: RirScopedPlaceCellId::from_index(0),
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_shared_heap_env_layout_between_lambdas() {
+    let mut program = valid_heap_env_lambda_rir();
+    let mut lambda = program.lambdas[0].clone();
+    lambda.id = RirLambdaId::from_index(1);
+    program.lambdas.push(lambda);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_unknown_function_value_captured_by_heap_env() {
+    let mut program = valid_heap_env_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    program.lambdas[0].captures[0].ty = lambda_ty;
+    program.lambda_envs[0].fields[0].ty = lambda_ty;
+    program.functions[0].params[0].ty = lambda_ty;
+    program.functions[0].locals[0].ty = lambda_ty;
+    program.functions[1].locals[0].ty = lambda_ty;
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &mut program.functions[1].body.stmts[0]
+    else {
+        panic!("missing lambda init");
+    };
+    captures[0] = RirLambdaCaptureArg::Readonly {
+        value: RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: lambda_ty,
+        }),
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
+}
+
+#[test]
+fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
+    let mut program = valid_heap_env_lambda_rir();
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda = RirLambdaId::from_index(1);
+    let target = RirFunctionId::from_index(2);
+    let source = RirLocalId::from_index(0);
+
+    program.lambdas.push(RirLambda {
+        id: lambda,
+        source: RirLambdaSource::Lambda(air::LambdaId::from_index(1)),
+        function: target,
+        sig,
+        escape: RirLambdaEscape::NonEscaping,
+        storage: RirLambdaStorage::ScopedCaptures,
+        captures: vec![RirLambdaCapture {
+            ty: int,
+            semantic: RirParamSemantic::SharedBorrow,
+            abi: RirParamAbi::SharedBorrow,
+            kind: RirLambdaCaptureKind::Param,
+        }],
+    });
+    program.functions.push(RirFunction {
+        id: target,
+        air_id: None,
+        symbol: RirSymbol::new("borrowed_target"),
+        params: vec![RirParam {
+            local: source,
+            ty: int,
+            semantic: RirParamSemantic::SharedBorrow,
+            abi: RirParamAbi::SharedBorrow,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![RirLocal {
+            id: source,
+            ty: int,
+            mutable: false,
+            symbol: RirSymbol::new("capture"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_accepts_returning_heap_env_lambda_local() {
+    let mut program = valid_heap_env_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let f = RirLocalId::from_index(1);
+    program.functions[1].ret.ty = lambda_ty;
+    program.functions[1].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace {
+        local: f,
+        projections: vec![],
+        ty: lambda_ty,
+    })));
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_heap_env_lambda_local_alias_and_repeated_calls() {
+    let mut program = valid_heap_env_lambda_rir();
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    let f = RirLocalId::from_index(1);
+    let g = RirLocalId::from_index(2);
+    program.functions[1].locals.push(RirLocal {
+        id: g,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("g"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[1].body.stmts.extend([
+        RirStmt::Init {
+            local: g,
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                local: f,
+                projections: vec![],
+                ty: lambda_ty,
+            })),
+        },
+        RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::LambdaValue {
+                callee: RirOperand::Place(RirPlace {
+                    local: g,
+                    projections: vec![],
+                    ty: lambda_ty,
+                }),
+                sig: RirLambdaSigId::from_index(0),
+            },
+            args: vec![],
+            ty: void,
+        }),
+        RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::LambdaValue {
+                callee: RirOperand::Place(RirPlace {
+                    local: g,
+                    projections: vec![],
+                    ty: lambda_ty,
+                }),
+                sig: RirLambdaSigId::from_index(0),
+            },
+            args: vec![],
+            ty: void,
+        }),
+    ]);
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_heap_env_lambda_passed_to_escaping_param() {
+    let mut program = valid_heap_env_lambda_rir();
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    let f = RirLocalId::from_index(1);
+    let consumer = RirFunctionId::from_index(2);
+    program.functions.push(RirFunction {
+        id: consumer,
+        air_id: None,
+        symbol: RirSymbol::new("consumer"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::Escaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            mutable: false,
+            symbol: RirSymbol::new("f"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    });
+    program.functions[1]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(consumer),
+            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
+                local: f,
+                projections: vec![],
+                ty: lambda_ty,
+            }))],
+            ty: void,
+        }));
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_heap_env_lambda_call_signature_mismatch() {
+    let mut program = valid_heap_env_lambda_rir();
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let lambda_ty = RirTypeId::from_index(2);
+    let f = RirLocalId::from_index(1);
+    program.lambda_sigs.push(RirLambdaSig {
+        id: RirLambdaSigId::from_index(1),
+        params: vec![RirLambdaParam {
+            ty: int,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: void,
+    });
+    program.functions[1]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::LambdaValue {
+                callee: RirOperand::Place(RirPlace {
+                    local: f,
+                    projections: vec![],
+                    ty: lambda_ty,
+                }),
+                sig: RirLambdaSigId::from_index(1),
+            },
+            args: vec![],
+            ty: void,
+        }));
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::CallArgCount {
+            expected: 1,
+            found: 0,
+        },
+    );
+}
+
+#[test]
+fn heap_env_lambda_signatures_need_context_and_are_not_copy() {
+    let program = valid_heap_env_lambda_rir();
+    let policy = RustRepPolicy::new(&program);
+    let sig = RirLambdaSigId::from_index(0);
+
+    assert!(policy.lambda_sig_has_heap_env(sig));
+    assert!(policy.lambda_sig_needs_ctx_lifetime(sig));
+    assert!(!policy.lambda_sig_copyable(sig));
+}
+
+#[test]
+fn rir_rejects_heap_env_field_capture_count_mismatch() {
+    let mut program = valid_heap_env_lambda_rir();
+    program.lambda_envs[0].fields.clear();
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
 fn rir_accepts_stack_cell_lambda_capture_descriptor_and_value() {
     rir::verify(&valid_stack_cell_lambda_rir()).expect("RIR verify failed");
 }
@@ -4432,7 +4737,74 @@ fn plan_rejects_hidden_scoped_local_lambda_capture() {
 }
 
 #[test]
-fn plan_rejects_escaping_runtime_capture_by_target_gap() {
+fn emit_traces_tracked_lambda_env_and_lambda_value_fields() {
+    let mut program = valid_heap_env_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let zero = RirLambdaId::from_index(1);
+    let zero_fn = RirFunctionId::from_index(2);
+    program.lambdas[0].captures[0].ty = lambda_ty;
+    program.lambda_envs[0].fields[0].ty = lambda_ty;
+    program.functions[0].params[0].ty = lambda_ty;
+    program.functions[0].locals[0].ty = lambda_ty;
+    program.functions[1].locals[0].ty = lambda_ty;
+    program.functions[1].locals[0].initialized = false;
+    program.lambdas.push(RirLambda {
+        id: zero,
+        source: RirLambdaSource::Lambda(air::LambdaId::from_index(1)),
+        function: zero_fn,
+        sig: RirLambdaSigId::from_index(0),
+        escape: RirLambdaEscape::Escaping,
+        storage: RirLambdaStorage::ZeroEnv,
+        captures: vec![],
+    });
+    program.functions.push(RirFunction {
+        id: zero_fn,
+        air_id: None,
+        symbol: RirSymbol::new("zero"),
+        params: vec![],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(0),
+        },
+        locals: vec![],
+        body: RirStructuredBlock::default(),
+    });
+    program.functions[1].body.stmts.insert(
+        0,
+        RirStmt::Init {
+            local: RirLocalId::from_index(0),
+            value: RirRValue::Lambda {
+                lambda: zero,
+                captures: vec![],
+                ty: lambda_ty,
+            },
+        },
+    );
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &mut program.functions[1].body.stmts[1]
+    else {
+        panic!("missing lambda init");
+    };
+    captures[0] = RirLambdaCaptureArg::Readonly {
+        value: RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: lambda_ty,
+        }),
+    };
+
+    let verified = rir::verify(&program).expect("RIR verify failed");
+    let source = emit::emit(&verified).into_string();
+
+    assert!(source.contains("lambda_env0: heap.register_tracked::<LambdaEnv0"));
+    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct LambdaEnv0<'cx>"));
+    assert!(source.contains("c0: LambdaSig0<'cx>,"));
+    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nenum LambdaSig0<'cx>"));
+}
+
+#[test]
+fn plan_lowers_escaping_readonly_capture_to_heap_env() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let int = program.alloc_type(TypeData::Int);
@@ -4442,7 +4814,10 @@ fn plan_rejects_escaping_runtime_capture_by_target_gap() {
     )));
     let module = program.alloc_module(root_module());
     let owner = FunctionId::from_index(1);
+    let consumer = FunctionId::from_index(2);
     let captured = air::LocalId::from_index(0);
+    let f = air::LocalId::from_index(1);
+    let g = air::LocalId::from_index(2);
     let body = program.alloc_function(Function {
         name: Ident::new("lambda"),
         module,
@@ -4481,42 +4856,131 @@ fn plan_rejects_escaping_runtime_capture_by_target_gap() {
         owner: None,
         specialization: None,
         signature: Signature::new(vec![], void),
-        locals: vec![Local {
-            name: None,
-            binding: Some(BindingId::from_index(0)),
-            ty: int,
-            mutability: Mutability::Immutable,
-            kind: LocalKind::User,
-        }],
+        locals: vec![
+            Local {
+                name: None,
+                binding: Some(BindingId::from_index(0)),
+                ty: int,
+                mutability: Mutability::Immutable,
+                kind: LocalKind::User,
+            },
+            local(lambda_ty, LocalKind::User),
+            local(lambda_ty, LocalKind::User),
+        ],
         body: structured_body(
             vec![
                 Statement::Init {
                     local: captured,
                     value: RValue::Use(Operand::Const(one)),
                 },
-                Statement::Eval(RValue::MakeLambda {
-                    lambda,
-                    captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
-                        value: Operand::Place(Place {
-                            root: PlaceRoot::Local(captured),
-                            projection: vec![],
-                            ty: int,
-                        }),
-                    }],
-                    ty: lambda_ty,
+                Statement::Init {
+                    local: f,
+                    value: RValue::MakeLambda {
+                        lambda,
+                        captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
+                            value: Operand::Place(Place {
+                                root: PlaceRoot::Local(captured),
+                                projection: vec![],
+                                ty: int,
+                            }),
+                        }],
+                        ty: lambda_ty,
+                    },
+                },
+                Statement::Init {
+                    local: g,
+                    value: RValue::Use(Operand::Place(Place {
+                        root: PlaceRoot::Local(f),
+                        projection: vec![],
+                        ty: lambda_ty,
+                    })),
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(consumer),
+                    args: vec![CallArg::Value(Operand::Place(Place {
+                        root: PlaceRoot::Local(g),
+                        projection: vec![],
+                        ty: lambda_ty,
+                    }))],
                 }),
             ],
             air::AirTail::Return(None),
         ),
     });
     debug_assert_eq!(func, owner);
-    program.module_mut(module).functions.extend([body, func]);
+    let consumer_func = program.alloc_function(Function {
+        name: Ident::new("consumer"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("f")),
+                ty: lambda_ty,
+                mode: ParamMode::Value,
+                escape: ParamEscape::Escaping,
+                role: ParamRole::Normal,
+                local_id: air::LocalId::from_index(0),
+            }],
+            void,
+        ),
+        locals: vec![local(lambda_ty, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    debug_assert_eq!(consumer_func, consumer);
+    program
+        .module_mut(module)
+        .functions
+        .extend([body, func, consumer_func]);
 
-    assert_plan_gap(
-        program,
-        rust_plan_config(),
-        RustTargetGapKind::UnsupportedLambdaCapture,
-    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let rir = plan.program();
+
+    assert_eq!(rir.lambda_envs.len(), 1);
+    assert_eq!(rir.lambda_envs[0].lambda, RirLambdaId::from_index(0));
+    assert_eq!(rir.lambda_envs[0].fields.len(), 1);
+    let int = rir
+        .types
+        .iter()
+        .position(|ty| *ty == RirType::Int)
+        .map(RirTypeId::from_index)
+        .unwrap();
+    assert_eq!(rir.lambda_envs[0].fields[0].ty, int);
+    assert!(matches!(
+        rir.lambdas[0].storage,
+        RirLambdaStorage::HeapEnv {
+            env: RirLambdaEnvId(_)
+        }
+    ));
+
+    let source = emit::emit(&plan.verified()).into_string();
+    assert!(source.contains("lambda_env0: anvyx_runtime::HeapType<'cx, LambdaEnv0>"));
+    assert!(source.contains("lambda_env0: heap.register_untracked::<LambdaEnv0>()"));
+    assert!(source.contains("struct LambdaEnv0"));
+    assert!(source.contains("c0: i64,"));
+    assert!(source.contains("ctx.heap().alloc(heap_type, LambdaEnv0 { c0:"));
+    assert!(source.contains("L0 { env: anvyx_runtime::Handle<'cx, LambdaEnv0> }"));
+    let materialize = source
+        .find("let c0 = ctx.heap().with(env, |env|")
+        .expect("missing env field materialization");
+    let call = source[materialize..]
+        .find("(ctx, c0)")
+        .expect("missing materialized body call");
+    assert!(call > 0);
+    for forbidden in [
+        "Box<dyn Fn",
+        "Vec<Value",
+        "static ",
+        "thread_local!",
+        "OnceLock",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "generated source contains {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -6991,6 +7455,154 @@ fn owner_cell_ref() -> RirCellRef {
 fn valid_stack_cell_arg() -> RirLambdaCaptureArg {
     RirLambdaCaptureArg::StackCell {
         cell: owner_cell_ref(),
+    }
+}
+
+fn valid_heap_env_lambda_rir() -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    let lambda = RirLambdaId::from_index(0);
+    let env = RirLambdaEnvId::from_index(0);
+    let target = RirFunctionId::from_index(0);
+    let maker = RirFunctionId::from_index(1);
+    let capture = RirLocalId::from_index(0);
+    let source = RirLocalId::from_index(0);
+    let f = RirLocalId::from_index(1);
+
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: lambda,
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape: RirLambdaEscape::Escaping,
+            storage: RirLambdaStorage::HeapEnv { env },
+            captures: vec![RirLambdaCapture {
+                ty: int,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        }],
+        lambda_envs: vec![RirLambdaEnvLayout {
+            id: env,
+            lambda,
+            symbol: RirSymbol::new("LambdaEnv0"),
+            fields: vec![RirLambdaEnvField {
+                ty: int,
+                symbol: RirSymbol::new("c0"),
+            }],
+        }],
+        functions: vec![
+            RirFunction {
+                id: target,
+                air_id: None,
+                symbol: RirSymbol::new("target"),
+                params: vec![RirParam {
+                    local: capture,
+                    ty: int,
+                    semantic: RirParamSemantic::Value,
+                    abi: RirParamAbi::Value,
+                    escape: RirParamEscape::NonEscaping,
+                }],
+                ret: RirReturn { ty: void },
+                locals: vec![RirLocal {
+                    id: capture,
+                    ty: int,
+                    mutable: false,
+                    symbol: RirSymbol::new("capture"),
+                    initialized: true,
+                    payload_ref: false,
+                }],
+                body: RirStructuredBlock::default(),
+            },
+            RirFunction {
+                id: maker,
+                air_id: None,
+                symbol: RirSymbol::new("maker"),
+                params: vec![],
+                ret: RirReturn { ty: void },
+                locals: vec![
+                    RirLocal {
+                        id: source,
+                        ty: int,
+                        mutable: false,
+                        symbol: RirSymbol::new("source"),
+                        initialized: true,
+                        payload_ref: false,
+                    },
+                    RirLocal {
+                        id: f,
+                        ty: lambda_ty,
+                        mutable: false,
+                        symbol: RirSymbol::new("f"),
+                        initialized: false,
+                        payload_ref: false,
+                    },
+                ],
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::Init {
+                        local: f,
+                        value: RirRValue::Lambda {
+                            lambda,
+                            captures: vec![RirLambdaCaptureArg::Readonly {
+                                value: RirOperand::Place(RirPlace {
+                                    local: source,
+                                    projections: vec![],
+                                    ty: int,
+                                }),
+                            }],
+                            ty: lambda_ty,
+                        },
+                    }],
+                    term: RirTerm::Return(None),
+                },
+            },
+        ],
+        ..RirProgram::default()
+    }
+}
+
+fn zero_env_escaping_lambda_rir() -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda = RirLambdaId::from_index(0);
+    let target = RirFunctionId::from_index(0);
+
+    RirProgram {
+        types: vec![RirType::Void, RirType::Lambda(sig)],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: lambda,
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape: RirLambdaEscape::Escaping,
+            storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
+        }],
+        functions: vec![RirFunction {
+            id: target,
+            air_id: None,
+            symbol: RirSymbol::new("target"),
+            params: vec![],
+            ret: RirReturn { ty: void },
+            locals: vec![],
+            body: RirStructuredBlock::default(),
+        }],
+        ..RirProgram::default()
     }
 }
 

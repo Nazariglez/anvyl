@@ -211,6 +211,9 @@ impl<'a> RustValues<'a> {
             RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
             RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
             RirType::DataRef(_) => format!("{expr}.clone()"),
+            RirType::Lambda(sig) if self.policy.lambda_sig_has_heap_env(sig) => {
+                format!("{expr}.clone()")
+            }
             RirType::Struct(_) | RirType::Tuple(_) | RirType::Array { .. } | RirType::Enum(_) => {
                 self.copy_from_ref(ty, &format!("&{expr}"))
             }
@@ -416,9 +419,11 @@ impl<'a> RustValues<'a> {
 
     fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
         match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::Lambda(_) => {
-                format!("*({expr})")
+            RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
+            RirType::Lambda(sig) if self.policy.lambda_sig_has_heap_env(sig) => {
+                format!("({expr}).clone()")
             }
+            RirType::Lambda(_) => format!("*({expr})"),
             RirType::Struct(id) => {
                 let strukt = &self.program.structs[id.index()];
                 self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)

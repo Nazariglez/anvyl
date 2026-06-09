@@ -409,7 +409,7 @@ fn compiler_rejects_lambda_types() {
 }
 
 #[test]
-fn compiler_rejects_lambda_values_and_captures() {
+fn compiler_rejects_readonly_lambda_values_and_captures() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let int = program.alloc_type(TypeData::Int);
@@ -436,15 +436,14 @@ fn compiler_rejects_lambda_values_and_captures() {
         body,
         owner,
         signature: air::SignatureType::new(vec![], air::ReturnMode::Value(void)),
-        escape: LambdaEscape::NonEscaping,
-        captures: vec![air::LambdaCaptureDecl::ScopedLocal {
+        escape: LambdaEscape::Escaping,
+        captures: vec![air::LambdaCaptureDecl::ReadonlyLocal {
             binding: BindingId::from_index(0),
             source: CaptureLocalSource {
                 owner,
                 local: captured,
             },
             ty: int,
-            mutability: Mutability::Immutable,
         }],
     });
     program.function_mut(body).kind = FunctionKind::Lambda(lambda);
@@ -474,12 +473,8 @@ fn compiler_rejects_lambda_values_and_captures() {
                 },
                 Statement::Eval(RValue::MakeLambda {
                     lambda,
-                    captures: vec![air::LambdaCaptureArg::ScopedLocal {
-                        place: Place {
-                            root: PlaceRoot::Local(captured),
-                            projection: vec![],
-                            ty: int,
-                        },
+                    captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
+                        value: Operand::Place(place(captured, int)),
                     }],
                     ty: lambda_ty,
                 }),

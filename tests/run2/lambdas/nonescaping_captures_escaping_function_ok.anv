@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @skip: function-valued captures of env-backed lambdas are still unsupported
+// @frontend: new
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn call(f: fn() -> int) -> int {
+    let g = |x: int| f() + x;
+    g(4)
+}
+
+fn main() {
+    let f = make(3);
+    println(call(f));
+}

@@ -12,7 +12,11 @@ mod target;
 mod value;
 mod write;
 
-use std::{collections::HashMap, error::Error, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+};
 
 use anvyx_frontend::{
     air::{
@@ -33,15 +37,16 @@ use self::{
         RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId,
         RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
         RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand,
-        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -269,6 +274,7 @@ struct PlanCx<'a> {
     function_lambda_map: HashMap<FunctionId, RirLambdaId>,
     lambda_map: HashMap<air::LambdaId, RirLambdaId>,
     function_type_copyable: HashMap<TypeId, bool>,
+    function_type_shareable: HashMap<TypeId, bool>,
     lambda_runtime_capture_slots: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), usize>,
     capture_cell_map: HashMap<air::CaptureCellId, RirCellId>,
     scoped_place_cell_map: HashMap<air::ScopedBorrowId, RirScopedPlaceCellId>,
@@ -292,6 +298,11 @@ impl KnownLambdaValue {
             ty: self.ty,
         }
     }
+}
+
+struct PlannedLambdaCaptures {
+    captures: Vec<RirLambdaCapture>,
+    env_fields: Vec<RirLambdaEnvField>,
 }
 
 struct PlannedRValue {
@@ -368,6 +379,7 @@ impl<'a> PlanCx<'a> {
             function_lambda_map: HashMap::new(),
             lambda_map: HashMap::new(),
             function_type_copyable: HashMap::new(),
+            function_type_shareable: HashMap::new(),
             lambda_runtime_capture_slots: HashMap::new(),
             capture_cell_map: HashMap::new(),
             scoped_place_cell_map: HashMap::new(),
@@ -397,9 +409,12 @@ impl<'a> PlanCx<'a> {
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
+        self.plan_function_type_capture_policy(&mut program);
         self.plan_cells(&mut program);
         self.plan_scoped_place_cells(&mut program);
         self.plan_lambdas(&mut program)?;
+        self.check_lambda_sig_storage_support(&program)?;
+        self.check_lambda_env_storage_support(&program)?;
         self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
         self.plan_stringify_helpers(&mut program)?;
@@ -1249,15 +1264,7 @@ impl<'a> PlanCx<'a> {
         }
         for (index, decl) in self.air.lambdas.iter().enumerate() {
             let lambda = air::LambdaId::from_index(index);
-            if decl.escape == air::LambdaEscape::Escaping
-                && decl.captures.iter().any(lambda_capture_has_runtime)
-            {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(decl.owner),
-                    RustTargetGapKind::UnsupportedLambdaCapture,
-                ));
-            }
-            let captures = self.plan_lambda_captures(program, lambda, decl)?;
+            let planned = self.plan_lambda_captures(program, lambda, decl)?;
             let sig = self.intern_lambda_sig(program, &decl.signature);
             let id = Self::push_lambda(
                 program,
@@ -1268,11 +1275,59 @@ impl<'a> PlanCx<'a> {
                     air::LambdaEscape::NonEscaping => RirLambdaEscape::NonEscaping,
                     air::LambdaEscape::Escaping => RirLambdaEscape::Escaping,
                 },
-                captures,
+                planned.captures,
+                planned.env_fields,
             );
             self.lambda_map.insert(lambda, id);
         }
         Ok(())
+    }
+
+    fn check_lambda_sig_storage_support(&self, program: &RirProgram) -> Result<(), RustPlanError> {
+        let policy = RustRepPolicy::new(program);
+        for sig in &program.lambda_sigs {
+            if !policy.lambda_sig_has_heap_env(sig.id) || !policy.lambda_sig_needs_lifetime(sig.id)
+            {
+                continue;
+            }
+            let lambda = program
+                .lambdas_for_sig(sig.id)
+                .find(|lambda| matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }))
+                .expect("heap-env signature must have a heap-env lambda");
+            return Err(Self::gap(
+                self.lambda_gap_site(lambda),
+                RustTargetGapKind::UnsupportedLambdaCapture,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_lambda_env_storage_support(&self, program: &RirProgram) -> Result<(), RustPlanError> {
+        let policy = RustRepPolicy::new(program);
+        for env in &program.lambda_envs {
+            for field in &env.fields {
+                let RirType::Lambda(sig) = program.types[field.ty.index()] else {
+                    continue;
+                };
+                if policy.lambda_sig_needs_lifetime(sig) {
+                    let lambda = &program.lambdas[env.lambda.index()];
+                    return Err(Self::gap(
+                        self.lambda_gap_site(lambda),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lambda_gap_site(&self, lambda: &RirLambda) -> RustTargetGapSite {
+        match lambda.source {
+            RirLambdaSource::Lambda(id) => {
+                RustTargetGapSite::Function(self.air.lambdas[id.index()].owner)
+            }
+            RirLambdaSource::Function(id) => RustTargetGapSite::Function(id),
+        }
     }
 
     fn check_lambda_value_capture_cycles(&self, program: &RirProgram) -> Result<(), RustPlanError> {
@@ -1328,21 +1383,37 @@ impl<'a> PlanCx<'a> {
         })
     }
 
-    fn lambda_gap_site(&self, lambda: &RirLambda) -> RustTargetGapSite {
-        match lambda.source {
-            RirLambdaSource::Function(function) => RustTargetGapSite::Function(function),
-            RirLambdaSource::Lambda(lambda) => {
-                RustTargetGapSite::Function(self.air.lambdas[lambda.index()].owner)
+    fn plan_function_type_capture_policy(&mut self, program: &mut RirProgram) {
+        let mut heap_env_sigs = HashSet::new();
+        for decl in &self.air.lambdas {
+            if decl.escape != air::LambdaEscape::Escaping
+                || decl
+                    .captures
+                    .iter()
+                    .all(|capture| matches!(capture, air::LambdaCaptureDecl::NoRuntime { .. }))
+            {
+                continue;
             }
+            heap_env_sigs.insert(self.intern_lambda_sig(program, &decl.signature));
+        }
+        self.function_type_copyable.clear();
+        self.function_type_shareable.clear();
+        for (ty, sig) in &self.lambda_sig_map {
+            let has_heap_env = heap_env_sigs.contains(sig);
+            self.function_type_copyable.insert(*ty, !has_heap_env);
+            self.function_type_shareable.insert(*ty, true);
         }
     }
 
     fn plan_function_type_copyability(&mut self, program: &RirProgram) {
         let policy = RustRepPolicy::new(program);
         self.function_type_copyable.clear();
+        self.function_type_shareable.clear();
         for (ty, sig) in &self.lambda_sig_map {
-            self.function_type_copyable
-                .insert(*ty, policy.lambda_sig_copyable(*sig));
+            let copyable = policy.lambda_sig_copyable(*sig);
+            self.function_type_copyable.insert(*ty, copyable);
+            self.function_type_shareable
+                .insert(*ty, copyable || policy.lambda_sig_has_heap_env(*sig));
         }
     }
 
@@ -1351,17 +1422,26 @@ impl<'a> PlanCx<'a> {
         program: &RirProgram,
         lambda: air::LambdaId,
         decl: &air::LambdaDecl,
-    ) -> Result<Vec<RirLambdaCapture>, RustPlanError> {
+    ) -> Result<PlannedLambdaCaptures, RustPlanError> {
         let policy = RustRepPolicy::new(program);
         let mut captures = vec![];
+        let mut env_fields = vec![];
         for (slot, capture) in decl.captures.iter().enumerate() {
-            let Some(capture) = self.plan_lambda_capture(program, decl.owner, capture)? else {
+            let source_slot = air::LambdaCaptureSlotId::from_index(slot);
+            let Some(capture) =
+                self.plan_lambda_capture(program, decl.owner, decl.escape, capture)?
+            else {
                 continue;
             };
-            self.lambda_runtime_capture_slots.insert(
-                (lambda, air::LambdaCaptureSlotId::from_index(slot)),
-                captures.len(),
-            );
+            let capture_index = captures.len();
+            self.lambda_runtime_capture_slots
+                .insert((lambda, source_slot), capture_index);
+            if decl.escape == air::LambdaEscape::Escaping {
+                env_fields.push(RirLambdaEnvField {
+                    ty: capture.ty,
+                    symbol: RirSymbol::new(format!("c{capture_index}")),
+                });
+            }
             captures.push(capture);
         }
         for capture in &captures {
@@ -1372,13 +1452,17 @@ impl<'a> PlanCx<'a> {
                 ));
             }
         }
-        Ok(captures)
+        Ok(PlannedLambdaCaptures {
+            captures,
+            env_fields,
+        })
     }
 
     fn plan_lambda_capture(
         &self,
         program: &RirProgram,
         owner: FunctionId,
+        escape: air::LambdaEscape,
         capture: &air::LambdaCaptureDecl,
     ) -> Result<Option<RirLambdaCapture>, RustPlanError> {
         let policy = RustRepPolicy::new(program);
@@ -1391,11 +1475,12 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
                 }
-                let semantic = if self.rust_copyable_air_type(*ty) {
-                    RirParamSemantic::Value
-                } else {
-                    RirParamSemantic::SharedBorrow
-                };
+                let semantic =
+                    if escape == air::LambdaEscape::Escaping || self.rust_copyable_air_type(*ty) {
+                        RirParamSemantic::Value
+                    } else {
+                        RirParamSemantic::SharedBorrow
+                    };
                 let ty = self.type_map[ty];
                 Ok(Some(RirLambdaCapture {
                     ty,
@@ -1408,6 +1493,14 @@ impl<'a> PlanCx<'a> {
                 RustTargetGapSite::Function(owner),
                 RustTargetGapKind::UnsupportedLambdaCapture,
             )),
+            air::LambdaCaptureDecl::ScopedBorrow { .. }
+                if escape == air::LambdaEscape::Escaping =>
+            {
+                Err(Self::gap(
+                    RustTargetGapSite::Function(owner),
+                    RustTargetGapKind::UnsupportedLambdaCapture,
+                ))
+            }
             air::LambdaCaptureDecl::ScopedBorrow { borrow, ty, .. } => {
                 let ty = self.type_map[ty];
                 Ok(Some(RirLambdaCapture {
@@ -1418,6 +1511,12 @@ impl<'a> PlanCx<'a> {
                         cell: self.scoped_place_cell_map[borrow],
                     },
                 }))
+            }
+            air::LambdaCaptureDecl::CaptureCell { .. } if escape == air::LambdaEscape::Escaping => {
+                Err(Self::gap(
+                    RustTargetGapSite::Function(owner),
+                    RustTargetGapKind::UnsupportedLambdaCapture,
+                ))
             }
             air::LambdaCaptureDecl::CaptureCell { cell, ty, .. } => {
                 let ty = self.type_map[ty];
@@ -1440,7 +1539,7 @@ impl<'a> PlanCx<'a> {
         sig: RirLambdaSigId,
         escape: RirLambdaEscape,
     ) -> RirLambdaId {
-        Self::push_lambda(program, source, function, sig, escape, vec![])
+        Self::push_lambda(program, source, function, sig, escape, vec![], vec![])
     }
 
     fn push_lambda(
@@ -1450,10 +1549,20 @@ impl<'a> PlanCx<'a> {
         sig: RirLambdaSigId,
         escape: RirLambdaEscape,
         captures: Vec<RirLambdaCapture>,
+        env_fields: Vec<RirLambdaEnvField>,
     ) -> RirLambdaId {
         let id = RirLambdaId::from_index(program.lambdas.len());
         let storage = if captures.is_empty() {
             RirLambdaStorage::ZeroEnv
+        } else if escape == RirLambdaEscape::Escaping {
+            let env = RirLambdaEnvId::from_index(program.lambda_envs.len());
+            program.lambda_envs.push(RirLambdaEnvLayout {
+                id: env,
+                lambda: id,
+                symbol: RirSymbol::new(format!("LambdaEnv{}", env.index())),
+                fields: env_fields,
+            });
+            RirLambdaStorage::HeapEnv { env }
         } else {
             RirLambdaStorage::ScopedCaptures
         };
@@ -3232,7 +3341,11 @@ impl<'a> PlanCx<'a> {
 
     fn rust_shareable_air_type(&self, ty: TypeId) -> bool {
         if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
-            return self.rust_copyable_air_type(ty);
+            return self
+                .function_type_shareable
+                .get(&ty)
+                .copied()
+                .unwrap_or_else(|| self.rust_copyable_air_type(ty));
         }
         self.air_policy().value_place_shareable(ty)
     }
@@ -3249,10 +3362,6 @@ impl<'a> PlanCx<'a> {
             ty: self.type_map[&place.ty],
         }
     }
-}
-
-fn lambda_capture_has_runtime(capture: &air::LambdaCaptureDecl) -> bool {
-    !matches!(capture, air::LambdaCaptureDecl::NoRuntime { .. })
 }
 
 fn set_if_changed(slot: &mut bool, value: bool) -> bool {

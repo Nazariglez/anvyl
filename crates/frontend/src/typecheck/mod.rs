@@ -350,6 +350,9 @@ pub(crate) enum TypeError {
         help: Option<String>,
         span: Option<SourceSpan>,
     },
+    UnknownFunctionValueEscapes {
+        span: Option<SourceSpan>,
+    },
     BorrowedCaptureEscapes {
         name: Ident,
         origin: CaptureStorageOrigin,
@@ -857,6 +860,7 @@ impl TypeError {
             | TypeError::MutableAlias { span, .. }
             | TypeError::InvalidFormatSpec { span, .. }
             | TypeError::NonEscapingCallbackEscapes { span, .. }
+            | TypeError::UnknownFunctionValueEscapes { span }
             | TypeError::BorrowedCaptureEscapes { span, .. }
             | TypeError::RequiresMutablePlace { span, .. }
             | TypeError::VarPatternRequiresMutablePlace { span, .. }
@@ -1871,6 +1875,21 @@ impl TypeChecker {
             })
     }
 
+    fn local_binding_is_function_value(&self, name: Ident) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| match scope.get(&name) {
+                Some(LocalSymbol::Value(info)) => Some(matches!(
+                    self.solver.local_type_to_type(info.type_id),
+                    Type::Func { .. }
+                )),
+                Some(LocalSymbol::Callable(_)) => Some(true),
+                None => None,
+            })
+            .unwrap_or(false)
+    }
+
     fn define_local_callable(&mut self, name: Ident, callee: CallableRef, surface_ty: Type) {
         let binding_id = self.fresh_binding_id();
         let type_id = self.solver.alloc_local_type(&surface_ty);
@@ -2162,6 +2181,13 @@ impl TypeChecker {
         kind: FunctionValueKind,
     ) {
         if matches!(ty, Type::Func { .. }) {
+            self.closure
+                .record_function_value_origin(expr_id, &kind, |id| {
+                    matches!(
+                        self.solver.local_type_to_type(id),
+                        Type::Func { .. } | Type::Infer
+                    )
+                });
             self.record_function_value(
                 expr_id,
                 FunctionValueFact {
@@ -4084,6 +4110,11 @@ fn check_expr_checked_with_hint(
                         let value = place::global_value(sig, checked);
                         tc.record_expr_place(expr.node.id, &value);
                         place::record_value_read(expr.node.id, &value, tc);
+                        tc.record_function_value_expr(
+                            expr.node.id,
+                            &value.checked.ty,
+                            FunctionValueKind::LocalOrPlace,
+                        );
                         return value.checked;
                     }
                     if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {

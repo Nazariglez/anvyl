@@ -42,6 +42,7 @@ rir_id!(RirStringifyHelperId);
 rir_id!(RirStringifyReqId);
 rir_id!(RirLambdaSigId);
 rir_id!(RirLambdaId);
+rir_id!(RirLambdaEnvId);
 rir_id!(RirCellId);
 rir_id!(RirScopedPlaceCellId);
 
@@ -70,6 +71,7 @@ pub struct RirProgram {
     pub tuples: Vec<RirTuple>,
     pub lambda_sigs: Vec<RirLambdaSig>,
     pub lambdas: Vec<RirLambda>,
+    pub lambda_envs: Vec<RirLambdaEnvLayout>,
     pub cells: Vec<RirCellDecl>,
     pub scoped_place_cells: Vec<RirScopedPlaceCellDecl>,
     pub stringify_reqs: Vec<RirStringifyReq>,
@@ -252,6 +254,21 @@ impl RirLambdaEscape {
 pub enum RirLambdaStorage {
     ZeroEnv,
     ScopedCaptures,
+    HeapEnv { env: RirLambdaEnvId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirLambdaEnvLayout {
+    pub id: RirLambdaEnvId,
+    pub lambda: RirLambdaId,
+    pub symbol: RirSymbol,
+    pub fields: Vec<RirLambdaEnvField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirLambdaEnvField {
+    pub ty: RirTypeId,
+    pub symbol: RirSymbol,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,6 +1056,7 @@ impl VerifyCx<'_> {
         }
         self.check_lambda_sigs();
         self.check_lambdas();
+        self.check_lambda_envs();
         self.check_cells();
         self.check_scoped_place_cells();
         self.check_cell_symbol_uniqueness();
@@ -1178,12 +1196,16 @@ impl VerifyCx<'_> {
                 .iter()
                 .any(|capture| capture.semantic == RirParamSemantic::MutBorrow);
         }
-        if has_cell && has_mut_borrow {
+        let policy = RustRepPolicy::new(self.program);
+        let mixed_heap_env_and_borrows =
+            policy.lambda_sig_has_heap_env(sig) && policy.lambda_sig_needs_lifetime(sig);
+        if (has_cell && has_mut_borrow) || mixed_heap_env_and_borrows {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
     }
 
     fn check_lambdas(&mut self) {
+        let mut env_owners = vec![None; self.program.lambda_envs.len()];
         for (index, lambda) in self.program.lambdas.iter().enumerate() {
             let site = RirVerifySite::Program;
             let id = RirLambdaId::from_index(index);
@@ -1193,7 +1215,53 @@ impl VerifyCx<'_> {
             self.check_function_id(site, lambda.function);
             self.check_lambda_sig_id(site, lambda.sig);
             self.check_lambda_storage(site, lambda);
+            if let RirLambdaStorage::HeapEnv { env } = lambda.storage
+                && let Some(owner) = env_owners.get_mut(env.index())
+                && owner.replace(lambda.id).is_some()
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
             self.check_lambda_function_signature(site, lambda);
+        }
+    }
+
+    fn check_lambda_envs(&mut self) {
+        for (index, env) in self.program.lambda_envs.iter().enumerate() {
+            let site = RirVerifySite::Program;
+            let id = RirLambdaEnvId::from_index(index);
+            if env.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            self.check_lambda_id(site, env.lambda);
+            if env.symbol.as_str().is_empty() {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            let Some(lambda) = self.program.lambdas.get(env.lambda.index()) else {
+                continue;
+            };
+            if !matches!(lambda.storage, RirLambdaStorage::HeapEnv { env: storage } if storage == id)
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            if env.fields.len() != lambda.captures.len() {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            for (index, field) in env.fields.iter().enumerate() {
+                self.check_type_id(site, field.ty);
+                if field.symbol.as_str().is_empty() {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                }
+                match lambda.captures.get(index) {
+                    Some(capture) if capture.ty != field.ty => self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: capture.ty,
+                            found: field.ty,
+                        },
+                    ),
+                    Some(_) | None => {}
+                }
+            }
         }
     }
 
@@ -1208,33 +1276,61 @@ impl VerifyCx<'_> {
             RirLambdaStorage::ScopedCaptures if lambda.escape == RirLambdaEscape::Escaping => {
                 self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             }
+            RirLambdaStorage::HeapEnv { env } if lambda.captures.is_empty() => {
+                self.check_lambda_env_id(site, env);
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            RirLambdaStorage::HeapEnv { env } if lambda.escape != RirLambdaEscape::Escaping => {
+                self.check_lambda_env_id(site, env);
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            RirLambdaStorage::HeapEnv { env } => {
+                self.check_lambda_env_id(site, env);
+                if self
+                    .program
+                    .lambda_envs
+                    .get(env.index())
+                    .is_some_and(|layout| layout.lambda != lambda.id)
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                }
+            }
             RirLambdaStorage::ZeroEnv | RirLambdaStorage::ScopedCaptures => {}
         }
+        let heap_env = matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. });
         for capture in &lambda.captures {
             self.check_type_id(site, capture.ty);
             self.check_abi(site, capture.ty, capture.semantic, capture.abi);
             match capture.kind {
                 RirLambdaCaptureKind::Param => {
-                    if matches!(
-                        (capture.semantic, capture.abi),
-                        (
-                            RirParamSemantic::MutBorrow
-                                | RirParamSemantic::StackCell
-                                | RirParamSemantic::ScopedPlaceCell,
-                            _
-                        ) | (
-                            _,
-                            RirParamAbi::MutBorrow
-                                | RirParamAbi::StackCell
-                                | RirParamAbi::ScopedPlaceCell
-                        )
-                    ) {
-                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
-                    }
-                    if capture.semantic == RirParamSemantic::Value
-                        && !self.copyable_type(capture.ty)
-                    {
-                        self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                    if heap_env {
+                        if capture.semantic != RirParamSemantic::Value
+                            || capture.abi != RirParamAbi::Value
+                        {
+                            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                        }
+                    } else {
+                        if matches!(
+                            (capture.semantic, capture.abi),
+                            (
+                                RirParamSemantic::MutBorrow
+                                    | RirParamSemantic::StackCell
+                                    | RirParamSemantic::ScopedPlaceCell,
+                                _
+                            ) | (
+                                _,
+                                RirParamAbi::MutBorrow
+                                    | RirParamAbi::StackCell
+                                    | RirParamAbi::ScopedPlaceCell
+                            )
+                        ) {
+                            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                        }
+                        if capture.semantic == RirParamSemantic::Value
+                            && !self.copyable_type(capture.ty)
+                        {
+                            self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                        }
                     }
                 }
                 RirLambdaCaptureKind::StackCell { cell } => {
@@ -2629,7 +2725,16 @@ impl VerifyCx<'_> {
                         continue;
                     };
                     self.check_lambda_capture_place(site, function, place, decl.ty);
-                    if !self.copyable_type(decl.ty) {
+                    if matches!(self.ty(decl.ty), Some(RirType::Lambda(_)))
+                        && matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })
+                        && self.operand_lambda_escape(function, value)
+                            != Some(RirLambdaEscape::Escaping)
+                    {
+                        self.push(site, RirVerifyErrorKind::CallArgEscape);
+                    }
+                    if !matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })
+                        && !self.copyable_type(decl.ty)
+                    {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -4337,6 +4442,18 @@ impl VerifyCx<'_> {
 
     fn check_lambda_sig_id(&mut self, site: RirVerifySite, id: RirLambdaSigId) {
         if id.index() >= self.program.lambda_sigs.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn check_lambda_id(&mut self, site: RirVerifySite, id: RirLambdaId) {
+        if id.index() >= self.program.lambdas.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn check_lambda_env_id(&mut self, site: RirVerifySite, id: RirLambdaEnvId) {
+        if id.index() >= self.program.lambda_envs.len() {
             self.push(site, RirVerifyErrorKind::BadId);
         }
     }

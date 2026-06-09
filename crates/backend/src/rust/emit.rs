@@ -5,10 +5,11 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaId, RirLambdaSig,
-        RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace,
-        RirProgram, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock,
-        RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvId,
+        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLoop, RirLoopId,
+        RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue,
+        RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -69,6 +70,9 @@ impl EmitCx<'_> {
         for dataref in &self.program.datarefs {
             self.emit_dataref(dataref);
         }
+        for env in &self.program.lambda_envs {
+            self.emit_lambda_env(env);
+        }
         for strukt in &self.program.structs {
             self.emit_struct(strukt);
         }
@@ -95,7 +99,7 @@ impl EmitCx<'_> {
     fn emit_ctx(&mut self) {
         let ctx = self.program.ctx.symbol.as_str();
         let policy = RustRepPolicy::new(self.program);
-        let datarefs = self
+        let mut heap_types = self
             .program
             .datarefs
             .iter()
@@ -108,9 +112,17 @@ impl EmitCx<'_> {
                 )
             })
             .collect::<Vec<_>>();
+        heap_types.extend(self.program.lambda_envs.iter().map(|env| {
+            let register = target::heap_register(policy.lambda_env_storage_tracked(env));
+            (
+                lambda_env_heap_type_symbol(env.id),
+                policy.lambda_env_storage_ty(env),
+                register,
+            )
+        }));
 
         self.w.block("struct AnvTypes<'cx>", |w| {
-            for (heap_type, storage, _) in &datarefs {
+            for (heap_type, storage, _) in &heap_types {
                 w.line(format_args!(
                     "{heap_type}: {},",
                     target::heap_type_ty(storage)
@@ -124,7 +136,7 @@ impl EmitCx<'_> {
                 format_args!("fn register(heap: &mut {}) -> Self", target::heap_ty()),
                 |w| {
                     w.block("Self", |w| {
-                        for (heap_type, storage, register) in &datarefs {
+                        for (heap_type, storage, register) in &heap_types {
                             w.line(format_args!("{heap_type}: heap.{register}::<{storage}>(),"));
                         }
                         w.line("_brand: std::marker::PhantomData,");
@@ -239,6 +251,36 @@ impl EmitCx<'_> {
             dataref.symbol.as_str(),
             target::handle_ty(&policy.dataref_storage_ty(dataref))
         ));
+        self.w.blank();
+    }
+
+    fn emit_lambda_env(&mut self, env: &RirLambdaEnvLayout) {
+        let policy = RustRepPolicy::new(self.program);
+        let lifetime = if policy.lambda_env_cx_dependent(env) {
+            "<'cx>"
+        } else {
+            ""
+        };
+        if policy.lambda_env_storage_tracked(env) {
+            self.w.line(target::trace_derive(&["Clone"]));
+            self.w.line(target::trace_crate_attr(
+                policy.lambda_env_cx_dependent(env),
+            ));
+        } else {
+            self.w.line("#[derive(Clone)]");
+        }
+        self.w.block(
+            format_args!("struct {}{lifetime}", env.symbol.as_str()),
+            |w| {
+                for field in &env.fields {
+                    w.line(format_args!(
+                        "{}: {},",
+                        field.symbol.as_str(),
+                        policy.rust_ty(field.ty)
+                    ));
+                }
+            },
+        );
         self.w.blank();
     }
 
@@ -425,7 +467,14 @@ impl EmitCx<'_> {
         let variants = self
             .program
             .lambdas_for_sig(sig.id)
-            .map(|lambda| (lambda.id, lambda.function, lambda.captures.as_slice()))
+            .map(|lambda| {
+                (
+                    lambda.id,
+                    lambda.function,
+                    lambda.storage,
+                    lambda.captures.as_slice(),
+                )
+            })
             .collect::<Vec<_>>();
         let params = std::iter::once(format!("ctx: &mut {}", self.ctx_ty()))
             .chain(sig.params.iter().enumerate().map(|(index, param)| {
@@ -434,10 +483,15 @@ impl EmitCx<'_> {
             .collect::<Vec<_>>();
         let fallible = variants
             .iter()
-            .any(|(_, function, _)| self.fallible_functions[function.index()]);
+            .any(|(_, function, _, _)| self.fallible_functions[function.index()]);
         let ret = self.lambda_sig_ret_ty(sig, fallible);
-        let captures_self = variants.iter().any(|(_, _, captures)| !captures.is_empty());
-        let mut_self = variants.iter().any(|(_, _, captures)| {
+        let captures_self = variants
+            .iter()
+            .any(|(_, _, _, captures)| !captures.is_empty());
+        let mut_self = variants.iter().any(|(_, _, storage, captures)| {
+            if matches!(storage, RirLambdaStorage::HeapEnv { .. }) {
+                return false;
+            }
             captures
                 .iter()
                 .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
@@ -473,12 +527,32 @@ impl EmitCx<'_> {
             (false, false) => "",
         };
 
-        if policy.lambda_sig_copyable(sig.id) {
+        let trace = self.trace_plan.needs_lambda_sig_trace(sig.id);
+        if trace {
+            let derives = if policy.lambda_sig_copyable(sig.id) {
+                ["Clone", "Copy"].as_slice()
+            } else {
+                ["Clone"].as_slice()
+            };
+            self.w.line(target::trace_derive(derives));
+            self.w.line(target::trace_crate_attr(
+                policy.lambda_sig_needs_ctx_lifetime(sig.id),
+            ));
+        } else if policy.lambda_sig_copyable(sig.id) {
             self.w.line("#[derive(Clone, Copy)]");
+        } else if policy.lambda_sig_has_heap_env(sig.id) {
+            self.w.line("#[derive(Clone)]");
         }
         self.w.block(format_args!("enum {symbol}{lifetime}"), |w| {
-            for (lambda, _, captures) in &variants {
-                if captures.is_empty() {
+            for (lambda, _, storage, captures) in &variants {
+                if let RirLambdaStorage::HeapEnv { env } = storage {
+                    let env = &self.program.lambda_envs[env.index()];
+                    w.line(format_args!(
+                        "{} {{ env: {} }},",
+                        lambda_variant(*lambda),
+                        target::handle_ty(&policy.lambda_env_storage_ty(env))
+                    ));
+                } else if captures.is_empty() {
                     w.line(format_args!("{},", lambda_variant(*lambda)));
                 } else {
                     let fields = captures
@@ -500,41 +574,70 @@ impl EmitCx<'_> {
             }
         });
         self.w.blank();
+        let body_call = |function: &RirFunction, capture_args: Vec<String>| {
+            let args = std::iter::once("ctx".to_string())
+                .chain(capture_args)
+                .chain((0..arity).map(|index| format!("arg_{index}")));
+            let call = format!("{}({})", function.symbol.as_str(), comma(args));
+            if fallible && !fallible_functions[function.id.index()] {
+                format!("Ok({call})")
+            } else {
+                call
+            }
+        };
         self.w
             .block(format_args!("impl{lifetime} {symbol}{lifetime}"), |w| {
                 w.line(format_args!("{header} {{"));
                 w.indented(|w| {
                     w.line("match self {");
                     w.indented(|w| {
-                        for (lambda, function_id, captures) in &variants {
+                        for (lambda, function_id, storage, captures) in &variants {
                             let function = &program.functions[function_id.index()];
-                            let capture_args = captures
-                                .iter()
-                                .enumerate()
-                                .map(|(index, capture)| lambda_capture_call_arg(index, capture));
-                            let args = std::iter::once("ctx".to_string())
-                                .chain(capture_args)
-                                .chain((0..arity).map(|index| format!("arg_{index}")));
-                            let call = format!("{}({})", function.symbol.as_str(), comma(args));
-                            let call = if fallible && !fallible_functions[function.id.index()] {
-                                format!("Ok({call})")
-                            } else {
-                                call
-                            };
-                            if captures.is_empty() {
-                                w.line(format_args!(
-                                    "Self::{} => {call},",
-                                    lambda_variant(*lambda)
-                                ));
-                            } else {
-                                let fields = (0..captures.len())
-                                    .map(|index| format!("c{index}"))
-                                    .collect::<Vec<_>>();
-                                w.line(format_args!(
-                                    "Self::{} {{ {} }} => {call},",
-                                    lambda_variant(*lambda),
-                                    comma(fields)
-                                ));
+                            let variant = lambda_variant(*lambda);
+                            match storage {
+                                RirLambdaStorage::HeapEnv { env } => {
+                                    let env = &program.lambda_envs[env.index()];
+                                    w.line(format_args!("Self::{variant} {{ env }} => {{"));
+                                    w.indented(|w| {
+                                        let values = RustValues::new(program, function);
+                                        for (index, field) in env.fields.iter().enumerate() {
+                                            let capture = &captures[index];
+                                            let source = format!("&env.{}", field.symbol.as_str());
+                                            w.line(format_args!(
+                                                "let c{index} = ctx.heap().with(env, |env| {});",
+                                                values.value_from_ref(capture.ty, &source)
+                                            ));
+                                        }
+                                        let capture_args = (0..captures.len())
+                                            .map(|index| format!("c{index}"))
+                                            .collect();
+                                        w.line(body_call(function, capture_args));
+                                    });
+                                    w.line("},");
+                                }
+                                _ if captures.is_empty() => {
+                                    w.line(format_args!(
+                                        "Self::{variant} => {},",
+                                        body_call(function, vec![])
+                                    ));
+                                }
+                                _ => {
+                                    let fields = (0..captures.len())
+                                        .map(|index| format!("c{index}"))
+                                        .collect::<Vec<_>>();
+                                    let capture_args = captures
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, capture)| {
+                                            lambda_capture_call_arg(index, capture)
+                                        })
+                                        .collect();
+                                    w.line(format_args!(
+                                        "Self::{variant} {{ {} }} => {},",
+                                        comma(fields),
+                                        body_call(function, capture_args)
+                                    ));
+                                }
                             }
                         }
                     });
@@ -1194,25 +1297,49 @@ impl EmitCx<'_> {
             RirRValue::Lambda {
                 lambda, captures, ..
             } => {
-                let decl = &self.program.lambdas[lambda.index()];
-                let sig = RustRepPolicy::new(self.program).lambda_sig_symbol(decl.sig);
+                let lambda_decl = &self.program.lambdas[lambda.index()];
+                let sig = RustRepPolicy::new(self.program).lambda_sig_symbol(lambda_decl.sig);
                 let variant = lambda_variant(*lambda);
-                if captures.is_empty() {
-                    format!("{sig}::{variant}")
-                } else {
-                    let fields = decl
-                        .captures
-                        .iter()
-                        .zip(captures)
-                        .enumerate()
-                        .map(|(index, (decl, capture))| {
-                            field_init(
-                                &format!("c{index}"),
-                                self.lambda_capture_arg(function, decl, capture),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    format!("{sig}::{variant} {{ {} }}", comma(fields))
+                match lambda_decl.storage {
+                    RirLambdaStorage::ZeroEnv => format!("{sig}::{variant}"),
+                    RirLambdaStorage::HeapEnv { env } => {
+                        let env = &self.program.lambda_envs[env.index()];
+                        let fields = env
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(index, field)| {
+                                let capture_decl = &lambda_decl.captures[index];
+                                let capture = &captures[index];
+                                field_init(
+                                    field.symbol.as_str(),
+                                    self.lambda_capture_arg(function, capture_decl, capture),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let heap_type =
+                            format!("ctx._types.{}", lambda_env_heap_type_symbol(env.id));
+                        let storage = format!("{} {{ {} }}", env.symbol.as_str(), comma(fields));
+                        let alloc = target::ctx_heap_alloc("ctx", "heap_type", &storage);
+                        format!(
+                            "{{ let heap_type = {heap_type}; {sig}::{variant} {{ env: {alloc} }} }}"
+                        )
+                    }
+                    RirLambdaStorage::ScopedCaptures => {
+                        let fields = lambda_decl
+                            .captures
+                            .iter()
+                            .zip(captures)
+                            .enumerate()
+                            .map(|(index, (decl, capture))| {
+                                field_init(
+                                    &format!("c{index}"),
+                                    self.lambda_capture_arg(function, decl, capture),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        format!("{sig}::{variant} {{ {} }}", comma(fields))
+                    }
                 }
             }
         }
@@ -1671,6 +1798,10 @@ fn loop_label(id: RirLoopId) -> String {
 
 fn lambda_variant(id: RirLambdaId) -> String {
     format!("L{}", id.index())
+}
+
+fn lambda_env_heap_type_symbol(id: RirLambdaEnvId) -> String {
+    format!("lambda_env{}", id.index())
 }
 
 fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {

@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @contains: 12
+
+fn make(seed: int) -> fn() -> int {
+    || {
+        let inner = || seed;
+        inner()
+    }
+}
+
+fn main() {
+    let f = make(12);
+    println(f());
+}

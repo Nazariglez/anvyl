@@ -10083,6 +10083,92 @@ fn main() {}
     }
 
     #[test]
+    fn escaping_readonly_lambda_capture_lowers_to_slot() {
+        for (source, root) in [
+            (
+                "fn make(seed: int) -> fn() { let x = seed + 1; || { x; } }",
+                "make",
+            ),
+            ("fn make(seed: int) -> fn() { || { seed; } }", "make"),
+            (
+                "fn later(f: escaping fn()) {} fn main(seed: int) { let x = seed + 1; later(|| { x; }); }",
+                "main",
+            ),
+        ] {
+            let air = lower_root(source, root).expect("lower failed");
+            let lambda = air.lambdas.first().expect("missing lambda");
+
+            assert_eq!(lambda.escape, LambdaEscape::Escaping);
+            assert!(matches!(
+                &lambda.captures[..],
+                [LambdaCaptureDecl::ReadonlyLocal { .. }]
+            ));
+            assert!(program_statements(&air).any(|statement| {
+                matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                    if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+            }));
+        }
+    }
+
+    #[test]
+    fn escaping_no_runtime_capture_kind_stays_no_runtime() {
+        let kind = lowered_capture_kind(
+            ExprId(0),
+            LambdaEscapeKind::Escaping,
+            CaptureStorage::NoRuntime,
+            CaptureStorageOrigin::Const,
+            false,
+        )
+        .expect("capture kind failed");
+
+        assert!(matches!(kind, LoweredCaptureKind::NoRuntime));
+    }
+
+    #[test]
+    fn nested_escaping_readonly_capture_forwards_parent_slot() {
+        let source = "fn later(f: escaping fn()) {} fn main(seed: int) { let x = seed + 1; let outer: fn() = || { later(|| { x; }); }; outer(); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let outer = air
+            .lambdas
+            .iter()
+            .find(|decl| air.function(decl.owner).name == Ident::new("main"))
+            .expect("missing outer lambda");
+        let inner = air
+            .lambdas
+            .iter()
+            .find(|decl| decl.owner == outer.body)
+            .expect("missing inner lambda");
+
+        assert_eq!(inner.escape, LambdaEscape::Escaping);
+        assert!(matches!(
+            &inner.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(
+            function_statements(air.function(outer.body)).any(|statement| {
+                matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal {
+                    value: Operand::Place(place)
+                }] if matches!(place.root, PlaceRoot::LambdaCapture(_))))
+            })
+        );
+    }
+
+    #[test]
+    fn returned_zero_env_lambda_lowers_without_captures() {
+        let source = "fn make() -> fn() { || {} }";
+        let air = lower_root(source, "make").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(lambda.escape, LambdaEscape::Escaping);
+        assert!(lambda.captures.is_empty());
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if captures.is_empty())
+        }));
+    }
+
+    #[test]
     fn mutable_lambda_capture_lowers_to_capture_cell() {
         let source = "fn f(seed: int) { var x = seed; let g: fn() = || { x = x + 1; }; g; }";
         let air = lower_root(source, "f").expect("lower failed");

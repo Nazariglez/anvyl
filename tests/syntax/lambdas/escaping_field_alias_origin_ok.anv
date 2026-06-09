@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @skip: blocked on Lambda aggregate function-value storage/provenance
+// @frontend: new
+
+struct Holder {
+    f: fn(),
+}
+
+fn keep(f: escaping fn()) {}
+
+fn bad(holder: Holder) {
+    let f = holder.f;
+    keep(f);
+}

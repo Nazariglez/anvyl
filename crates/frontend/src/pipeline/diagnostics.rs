@@ -668,6 +668,9 @@ pub(super) fn diagnose_type_error(
         TypeError::NonEscapingCallbackEscapes { name, .. } => {
             format!("callback parameter '{name}' is non-escaping by default, but it escapes here")
         }
+        TypeError::UnknownFunctionValueEscapes { .. } => {
+            "function value with unknown storage origin cannot escape".to_string()
+        }
         TypeError::BorrowedCaptureEscapes { name, origin, .. } => {
             borrowed_capture_escape_message(*name, *origin)
         }

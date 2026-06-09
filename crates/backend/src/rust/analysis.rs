@@ -1,7 +1,7 @@
 use super::rir::{
-    RirCallArg, RirCallTarget, RirExternKind, RirFunction, RirOperand, RirParamAbi, RirPlace,
-    RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType,
-    RirTypeId,
+    RirCallArg, RirCallTarget, RirExternKind, RirFunction, RirLambdaStorage, RirOperand,
+    RirParamAbi, RirPlace, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct,
+    RirStructuredBlock, RirType, RirTypeId,
 };
 
 pub(super) fn fallible_functions(program: &RirProgram) -> Vec<bool> {
@@ -209,6 +209,10 @@ fn rvalue_uses_ctx(program: &RirProgram, value: &RirRValue) -> bool {
         RirRValue::Stringify { source_ty, .. } => {
             matches!(program.types[source_ty.index()], RirType::Struct(_))
         }
+        RirRValue::Lambda { lambda, .. } => program
+            .lambdas
+            .get(lambda.index())
+            .is_some_and(|lambda| matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })),
         _ => false,
     }
 }

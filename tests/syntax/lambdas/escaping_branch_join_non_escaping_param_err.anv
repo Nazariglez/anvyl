@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'f' is non-escaping by default, but it escapes here
+// @frontend: new
+
+fn keep(g: escaping fn()) {}
+
+fn bad(f: fn(), cond: bool, seed: int) {
+    var g: fn() = || { seed; };
+    if cond {
+        g = f;
+    }
+    keep(g);
+}
