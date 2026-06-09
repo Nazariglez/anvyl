@@ -1,0 +1,26 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: projected borrowed mutable places await mutable_place_projected_values
+// @match: 1
+
+struct Box {
+    value: int,
+}
+
+fn inc(var x: int) {
+    x += 1;
+}
+
+fn touch(var b: Box) {
+    let f = || {
+        inc(b.value);
+    };
+    f();
+}
+
+fn main() {
+    var b = Box { value: 0 };
+    touch(b);
+    println(b.value);
+}

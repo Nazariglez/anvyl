@@ -1,0 +1,24 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+fn inc(var x: int) {
+    x += 1;
+}
+
+fn touch(var x: int) {
+    let outer = || {
+        let inner = || {
+            inc(x);
+        };
+        inner();
+    };
+    outer();
+}
+
+fn main() {
+    var n = 0;
+    touch(n);
+    println(n);
+}

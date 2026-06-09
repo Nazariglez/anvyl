@@ -7,8 +7,8 @@ use super::{
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaId, RirLambdaSig,
         RirLoop, RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace,
-        RirProgram, RirRValue, RirRawEnumValue, RirStmt, RirStructuredBlock, RirTerm, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirProgram, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock,
+        RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -447,18 +447,30 @@ impl EmitCx<'_> {
             (true, false) => "&self",
             (false, false) => "self",
         };
-        let header = if ret == "()" {
-            format!("fn call<'cx, 'rt>({self_arg}, {})", comma(params))
+        let call_lifetimes = if policy.lambda_sig_needs_ctx_lifetime(sig.id) {
+            "<'rt>"
         } else {
-            format!("fn call<'cx, 'rt>({self_arg}, {}) -> {ret}", comma(params))
+            "<'cx, 'rt>"
+        };
+        let header = if ret == "()" {
+            format!("fn call{call_lifetimes}({self_arg}, {})", comma(params))
+        } else {
+            format!(
+                "fn call{call_lifetimes}({self_arg}, {}) -> {ret}",
+                comma(params)
+            )
         };
         let arity = sig.params.len();
         let program = self.program;
         let fallible_functions = &self.fallible_functions;
-        let lifetime = if policy.lambda_sig_needs_lifetime(sig.id) {
-            "<'env>"
-        } else {
-            ""
+        let lifetime = match (
+            policy.lambda_sig_needs_lifetime(sig.id),
+            policy.lambda_sig_needs_ctx_lifetime(sig.id),
+        ) {
+            (true, true) => "<'env, 'cx>",
+            (true, false) => "<'env>",
+            (false, true) => "<'cx>",
+            (false, false) => "",
         };
 
         if policy.lambda_sig_copyable(sig.id) {
@@ -597,6 +609,7 @@ impl EmitCx<'_> {
             if predeclare {
                 this.emit_local_declarations(function);
             }
+            this.emit_scoped_place_cells(function);
             for stmt in &block.stmts {
                 this.emit_stmt_mode(function, stmt, predeclare);
             }
@@ -676,6 +689,21 @@ impl EmitCx<'_> {
         }
     }
 
+    fn emit_scoped_place_cells(&mut self, function: &RirFunction) {
+        for cell in self
+            .program
+            .scoped_place_cells
+            .iter()
+            .filter(|cell| cell.owner == function.id)
+        {
+            let source = function.locals[cell.source_local.index()].symbol.as_str();
+            self.w.line(format_args!(
+                "let {} = anvyx_runtime::ScopedMutPlaceCell::new({source});",
+                cell.symbol.as_str()
+            ));
+        }
+    }
+
     fn stringify_helper_ctx_name(&self, strukt: &super::rir::RirStruct) -> &'static str {
         if analysis::stringify_helper_uses_ctx(self.program, strukt) {
             "ctx"
@@ -713,9 +741,8 @@ impl EmitCx<'_> {
                 let places = RustPlaces::new(self.program, function);
                 if places.mut_place_root_param(dst) {
                     self.w.line(format_args!(
-                        "{}.set({}, {})?;",
+                        "{}.set({})?;",
                         places.local_place(dst),
-                        target::ctx_runtime("ctx"),
                         self.rvalue(function, value)
                     ));
                 } else {
@@ -748,6 +775,11 @@ impl EmitCx<'_> {
             RirStmt::CellSet { cell, value } => self.w.line(format_args!(
                 "{}.set({})?;",
                 self.cell_ref(function, *cell),
+                self.rvalue(function, value)
+            )),
+            RirStmt::ScopedPlaceCellSet { cell, value } => self.w.line(format_args!(
+                "{}.set({})?;",
+                self.scoped_place_cell_ref(function, *cell),
                 self.rvalue(function, value)
             )),
             RirStmt::DataRefSet {
@@ -966,6 +998,9 @@ impl EmitCx<'_> {
             } => self.dataref_get(function, object, *dataref, projections, *ty),
             RirRValue::CellGetCopy { cell, .. } => {
                 format!("{}.get_copy()?", self.cell_ref(function, *cell))
+            }
+            RirRValue::ScopedPlaceCellGet { cell, ty } => {
+                values.scoped_place_cell_value(*cell, *ty)
             }
             RirRValue::Array { elems, .. } => {
                 format!(
@@ -1191,10 +1226,9 @@ impl EmitCx<'_> {
         body: String,
     ) -> String {
         format!(
-            "{}.{}({}, |value| {})?",
+            "{}.{}(|value| {})?",
             RustPlaces::new(self.program, function).local_place(place),
             op,
-            target::ctx_runtime("ctx"),
             body
         )
     }
@@ -1207,6 +1241,31 @@ impl EmitCx<'_> {
             super::rir::RirCellRef::Capture { local, .. } => {
                 function.locals[local.index()].symbol.as_str().to_string()
             }
+        }
+    }
+
+    fn scoped_place_cell_ref(&self, function: &RirFunction, cell: RirScopedPlaceCellRef) -> String {
+        match cell {
+            RirScopedPlaceCellRef::Owner(cell) => self.program.scoped_place_cells[cell.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+            RirScopedPlaceCellRef::Capture { local, .. } => {
+                function.locals[local.index()].symbol.as_str().to_string()
+            }
+        }
+    }
+
+    fn scoped_place_cell_capture_arg(
+        &self,
+        function: &RirFunction,
+        cell: RirScopedPlaceCellRef,
+    ) -> String {
+        match cell {
+            RirScopedPlaceCellRef::Owner(_) => {
+                format!("&{}", self.scoped_place_cell_ref(function, cell))
+            }
+            RirScopedPlaceCellRef::Capture { .. } => self.scoped_place_cell_ref(function, cell),
         }
     }
 
@@ -1254,6 +1313,11 @@ impl EmitCx<'_> {
                 super::rir::RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
                 super::rir::RirCellRef::Capture { .. } => self.cell_ref(function, *cell),
             },
+            (
+                RirLambdaCaptureKind::ScopedPlaceCell { .. },
+                RirParamSemantic::ScopedPlaceCell,
+                RirLambdaCaptureArg::ScopedPlaceCell { cell },
+            ) => self.scoped_place_cell_capture_arg(function, *cell),
             _ => unreachable!("verified lambda capture arg mode"),
         }
     }
@@ -1614,10 +1678,11 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
         RirLambdaCaptureKind::Param => match capture.semantic {
             RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
-            RirParamSemantic::MutPlace | RirParamSemantic::StackCell => {
-                unreachable!("verified non-param capture kind")
-            }
+            RirParamSemantic::MutPlace
+            | RirParamSemantic::StackCell
+            | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),
         },
         RirLambdaCaptureKind::StackCell { .. } => format!("*c{index}"),
+        RirLambdaCaptureKind::ScopedPlaceCell { .. } => format!("*c{index}"),
     }
 }

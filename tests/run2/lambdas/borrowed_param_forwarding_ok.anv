@@ -3,9 +3,13 @@
 // @expect: success
 // @match: 1
 
+fn inc(var x: int) {
+    x += 1;
+}
+
 fn touch(var count: int) {
     let f = || {
-        count += 1;
+        inc(count);
     };
     f();
 }

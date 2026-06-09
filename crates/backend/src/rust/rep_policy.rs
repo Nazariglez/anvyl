@@ -320,6 +320,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
             RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
+            RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
         }
     }
 
@@ -422,21 +423,31 @@ impl<'a> RustRepPolicy<'a> {
         abi: RirParamAbi,
         lifetime: Option<&str>,
     ) -> String {
-        let lifetime = lifetime.map_or(String::new(), |lifetime| format!("{lifetime} "));
+        let reference_lifetime = lifetime.map_or(String::new(), |lifetime| format!("{lifetime} "));
         match abi {
             RirParamAbi::Value => self.rust_ty(ty),
             RirParamAbi::SharedBorrow => match self.borrow_view(ty) {
-                RustBorrowView::Str => format!("&{lifetime}str"),
-                _ => format!("&{lifetime}{}", self.rust_ty(ty)),
+                RustBorrowView::Str => format!("&{reference_lifetime}str"),
+                _ => format!("&{reference_lifetime}{}", self.rust_ty(ty)),
             },
-            RirParamAbi::MutBorrow => format!("&{lifetime}mut {}", self.rust_ty(ty)),
+            RirParamAbi::MutBorrow => format!("&{reference_lifetime}mut {}", self.rust_ty(ty)),
             RirParamAbi::MutPlace => {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
             }
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
-                format!("&{lifetime}{}", target::stack_lambda_cell_ty(&payload))
+                format!(
+                    "&{reference_lifetime}{}",
+                    target::stack_lambda_cell_ty(&payload)
+                )
+            }
+            RirParamAbi::ScopedPlaceCell => {
+                let payload = self.rust_ty(ty);
+                let source_lifetime = lifetime.unwrap_or("'_");
+                format!(
+                    "&{reference_lifetime}anvyx_runtime::ScopedMutPlaceCell<{source_lifetime}, 'cx, {payload}>"
+                )
             }
         }
     }
@@ -452,10 +463,14 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn lambda_sig_ty(self, id: RirLambdaSigId) -> String {
         let symbol = self.lambda_sig_symbol(id);
-        if self.lambda_sig_needs_lifetime(id) {
-            format!("{symbol}<'_>")
-        } else {
-            symbol
+        match (
+            self.lambda_sig_needs_lifetime(id),
+            self.lambda_sig_needs_ctx_lifetime(id),
+        ) {
+            (true, true) => format!("{symbol}<'_, 'cx>"),
+            (true, false) => format!("{symbol}<'_>"),
+            (false, true) => format!("{symbol}<'cx>"),
+            (false, false) => symbol,
         }
     }
 
@@ -469,6 +484,15 @@ impl<'a> RustRepPolicy<'a> {
                 .captures
                 .iter()
                 .any(|capture| capture.abi != RirParamAbi::Value)
+        })
+    }
+
+    pub fn lambda_sig_needs_ctx_lifetime(self, id: RirLambdaSigId) -> bool {
+        self.program.lambdas_for_sig(id).any(|lambda| {
+            lambda
+                .captures
+                .iter()
+                .any(|capture| capture.abi == RirParamAbi::ScopedPlaceCell)
         })
     }
 
@@ -487,7 +511,9 @@ impl<'a> RustRepPolicy<'a> {
         let copyable = self.program.lambdas_for_sig(id).all(|lambda| {
             lambda.captures.iter().all(|capture| match capture.abi {
                 RirParamAbi::Value => self.copyable_inner(capture.ty, active),
-                RirParamAbi::SharedBorrow | RirParamAbi::StackCell => true,
+                RirParamAbi::SharedBorrow
+                | RirParamAbi::StackCell
+                | RirParamAbi::ScopedPlaceCell => true,
                 RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
             })
         });
@@ -670,9 +696,9 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
-            RirParamSemantic::MutPlace | RirParamSemantic::StackCell => {
-                !matches!(ty, RirType::Void)
-            }
+            RirParamSemantic::MutPlace
+            | RirParamSemantic::StackCell
+            | RirParamSemantic::ScopedPlaceCell => !matches!(ty, RirType::Void),
         }
     }
 

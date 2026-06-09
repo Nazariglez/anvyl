@@ -26,10 +26,11 @@ use super::{
         RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
         RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
         RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue,
-        RirReturn, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
 };
@@ -1061,7 +1062,7 @@ fn emit_dataref_mut_borrow_root_rebinds_handle() {
     assert!(source.contains(
         "mut v0: anvyx_runtime::MutPlace<'_, 'cx, anvT2_Node<'cx>>, v1: anvT2_Node<'cx>"
     ));
-    assert!(source.contains("v0.set(ctx.runtime(), v1.clone())?;"));
+    assert!(source.contains("v0.set(v1.clone())?;"));
 }
 
 #[test]
@@ -2587,6 +2588,346 @@ fn rir_accepts_stack_cell_lambda_capture_descriptor_and_value() {
 }
 
 #[test]
+fn rir_accepts_scoped_place_cell_declaration() {
+    rir::verify(&scoped_place_cell_rir(valid_scoped_place_cell_decl())).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_scoped_place_cell_lambda_capture_descriptor_and_value() {
+    rir::verify(&valid_scoped_place_cell_lambda_rir()).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_scoped_place_cell_get() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            ty: RirTypeId::from_index(1),
+        }));
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_scoped_place_cell_get_shareable_noncopy_payload() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    let string = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::String);
+    program.scoped_place_cells[0].payload_ty = string;
+    program.functions[0].params[0].ty = string;
+    program.functions[0].locals[0].ty = string;
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            ty: string,
+        }));
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_scoped_place_cell_set() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    let value = push_int_const(&mut program, 1);
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::ScopedPlaceCellSet {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            value: RirRValue::Use(RirOperand::Const(value)),
+        });
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_accepts_scoped_place_cell_mut_place_arg() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                ty: RirTypeId::from_index(1),
+            })],
+            ty: RirTypeId::from_index(0),
+        }));
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_promoted_scoped_place_source_local_use() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: RirTypeId::from_index(1),
+        }))));
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_promoted_scoped_place_source_param_forwarding() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::Param {
+                local: RirLocalId::from_index(0),
+                ty: RirTypeId::from_index(1),
+            })],
+            ty: RirTypeId::from_index(0),
+        }));
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.externs.push(RirExtern {
+        id: RirExternId::from_index(0),
+        symbol: RirSymbol::new("native_touch"),
+        kind: RirExternKind::Native(rir::RirNativeExtern {
+            path: vec!["host".to_string(), "touch".to_string()],
+            abi: anvyx_runtime::RustExternAbi {
+                params: vec![anvyx_runtime::RustParamAbi::MutBorrow(
+                    anvyx_runtime::ExternTypeExpr::Int,
+                )],
+                ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Void),
+                fallible: false,
+                support: anvyx_runtime::RustAbiSupport::Direct,
+            },
+        }),
+        params: vec![RirExternParam {
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+        }],
+        ret: RirTypeId::from_index(0),
+    });
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Extern(RirExternId::from_index(0)),
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                ty: RirTypeId::from_index(1),
+            })],
+            ty: RirTypeId::from_index(0),
+        }));
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_get_payload_type_mismatch() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            ty: RirTypeId::from_index(0),
+        }));
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_mut_place_arg_payload_type_mismatch() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                ty: RirTypeId::from_index(0),
+            })],
+            ty: RirTypeId::from_index(0),
+        }));
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_accepts_nested_scoped_place_cell_capture_ref() {
+    rir::verify(&valid_nested_scoped_place_cell_lambda_rir()).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_bad_id() {
+    assert_rir_error(
+        scoped_place_cell_rir_with(|cell| cell.id = RirScopedPlaceCellId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_bad_owner() {
+    assert_rir_error(
+        scoped_place_cell_rir_with(|cell| cell.owner = RirFunctionId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_bad_source_local() {
+    assert_rir_error(
+        scoped_place_cell_rir_with(|cell| cell.source_local = RirLocalId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_payload_type_mismatch() {
+    assert_rir_type_error(scoped_place_cell_rir_with(|cell| {
+        cell.payload_ty = RirTypeId::from_index(0);
+    }));
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_non_mut_place_source_local() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.functions[0].params[0].semantic = RirParamSemantic::Value;
+    program.functions[0].params[0].abi = RirParamAbi::Value;
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_duplicate_scoped_place_cells_for_source_local() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    let mut duplicate = valid_scoped_place_cell_decl();
+    duplicate.id = RirScopedPlaceCellId::from_index(1);
+    program.scoped_place_cells.push(duplicate);
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::DuplicateScopedPlaceCell {
+            owner: RirFunctionId::from_index(0),
+            source_local: RirLocalId::from_index(0),
+            first: RirScopedPlaceCellId::from_index(0),
+            second: RirScopedPlaceCellId::from_index(1),
+        },
+    );
+}
+
+#[test]
+fn rir_rejects_stack_and_scoped_place_cell_symbol_collision() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.cells.push(RirCellDecl {
+        id: RirCellId::from_index(0),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(0),
+        payload_ty: RirTypeId::from_index(1),
+        storage: RirCellStorage::StackScoped,
+        symbol: RirSymbol::new("__scoped0"),
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::DuplicateSymbol);
+}
+
+#[test]
+fn rir_rejects_escaping_scoped_place_cell_lambda_capture() {
+    let mut program = valid_scoped_place_cell_lambda_rir();
+    program.lambdas[0].escape = RirLambdaEscape::Escaping;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_hidden_abi_in_source_signature() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    program.functions[0].params[0].semantic = RirParamSemantic::ScopedPlaceCell;
+    program.functions[0].params[0].abi = RirParamAbi::ScopedPlaceCell;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_wrong_capture_kind() {
+    let mut program = valid_scoped_place_cell_lambda_rir();
+    program.lambdas[0].captures[0].kind = RirLambdaCaptureKind::Param;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_scoped_place_cell_invalid_capture_ref() {
+    let mut program = valid_scoped_place_cell_lambda_rir();
+    let owner = &mut program.functions[0];
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &mut owner.body.stmts[0]
+    else {
+        panic!("missing lambda init");
+    };
+    captures[0] = RirLambdaCaptureArg::ScopedPlaceCell {
+        cell: RirScopedPlaceCellRef::Capture {
+            cell: RirScopedPlaceCellId::from_index(0),
+            local: RirLocalId::from_index(99),
+        },
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_nested_scoped_place_cell_mismatched_capture_ref() {
+    let mut program = valid_nested_scoped_place_cell_lambda_rir();
+    program.scoped_place_cells.push(RirScopedPlaceCellDecl {
+        id: RirScopedPlaceCellId::from_index(1),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(0),
+        payload_ty: RirTypeId::from_index(1),
+        symbol: RirSymbol::new("__scoped1"),
+    });
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &mut program.functions[1].body.stmts[0]
+    else {
+        panic!("missing nested lambda init");
+    };
+    captures[0] = RirLambdaCaptureArg::ScopedPlaceCell {
+        cell: RirScopedPlaceCellRef::Capture {
+            cell: RirScopedPlaceCellId::from_index(1),
+            local: RirLocalId::from_index(0),
+        },
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
 fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
     let mut program = valid_stack_cell_lambda_rir();
     program.entry = Some(RirFunctionId::from_index(0));
@@ -2663,6 +3004,38 @@ fn rir_rejects_ordinary_place_use_of_stack_cell_capture_param() {
             projections: vec![],
             ty: RirTypeId::from_index(1),
         })))];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_ordinary_place_use_of_scoped_place_cell_capture_param() {
+    let mut program = valid_scoped_place_cell_lambda_rir();
+    program.functions[1].body.stmts =
+        vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: RirTypeId::from_index(1),
+        })))];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+}
+
+#[test]
+fn rir_rejects_mut_borrow_call_arg_use_of_scoped_place_cell_capture_param() {
+    let mut program = valid_scoped_place_cell_lambda_rir();
+    program
+        .functions
+        .push(mut_borrow_sink_function(RirFunctionId::from_index(2)));
+    program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Call {
+        callee: RirCallTarget::Function(RirFunctionId::from_index(2)),
+        args: vec![RirCallArg::MutBorrow(RirPlace {
+            local: RirLocalId::from_index(0),
+            projections: vec![],
+            ty: RirTypeId::from_index(1),
+        })],
+        ty: RirTypeId::from_index(0),
+    })];
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
@@ -3643,7 +4016,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
 }
 
 #[test]
-fn emit_internal_direct_mut_borrow_lambda_capture_without_heap_envs() {
+fn rir_rejects_internal_direct_mut_borrow_lambda_capture() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
     let lambda_ty = RirTypeId::from_index(2);
@@ -3781,20 +4154,7 @@ fn emit_internal_direct_mut_borrow_lambda_capture_without_heap_envs() {
         },
     });
 
-    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
-    let text = source.as_str();
-    assert!(text.contains("enum LambdaSig0<'env>"));
-    assert!(text.contains("L0 { c0: &'env mut i64 }"));
-    assert!(!text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
-    assert!(text.contains("c0: &mut count"));
-    assert!(!text.contains("Box<dyn"));
-    assert!(!text.contains("LambdaEnv"));
-    assert!(!text.contains("LambdaCell"));
-    assert!(!text.contains("Rc<"));
-    assert!(!text.contains("RefCell"));
-
-    let output = run_source(source);
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
 
 #[test]
@@ -3884,7 +4244,7 @@ fn profile_rejects_deferred_function_kinds_and_param_roles() {
 }
 
 #[test]
-fn profile_accepts_mutable_scoped_lambda_captures_and_still_rejects_unrelated_local_kinds() {
+fn profile_rejects_hidden_scoped_local_lambda_capture() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let int = program.alloc_type(TypeData::Int);
@@ -3970,19 +4330,15 @@ fn profile_accepts_mutable_scoped_lambda_captures_and_still_rejects_unrelated_lo
     program.module_mut(module).functions.extend([body, func]);
 
     let errors = profile_errors(program);
-    assert!(!has_error(
+    assert!(has_error(
         &errors,
         ProfileErrorKind::UnsupportedLambdaCapture
     ));
     assert!(has_error(&errors, ProfileErrorKind::UnsupportedLocalKind));
-    assert!(!has_error(
-        &errors,
-        ProfileErrorKind::UnsupportedLambdaValue
-    ));
 }
 
 #[test]
-fn plan_scoped_lambda_capture_to_rir_descriptor() {
+fn plan_rejects_hidden_scoped_local_lambda_capture() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
     let int = program.alloc_type(TypeData::Int);
@@ -4064,10 +4420,15 @@ fn plan_scoped_lambda_capture_to_rir_descriptor() {
     program.module_mut(module).functions.extend([body, func]);
     let verified = air::verify(&program).expect("AIR verify failed");
 
-    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
-    let lambda = &plan.program().lambdas[0];
-    assert_eq!(lambda.storage, RirLambdaStorage::ScopedCaptures);
-    assert_eq!(lambda.captures.len(), 1);
+    let err = match plan(&verified, rust_plan_config()) {
+        Ok(_) => panic!("plan accepted scoped-local capture"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        RustPlanError::TargetGaps(gaps)
+            if gaps.iter().any(|gap| gap.kind == RustTargetGapKind::UnsupportedLambdaCapture)
+    ));
 }
 
 #[test]
@@ -4784,6 +5145,56 @@ fn profile_accepts_lambda_callee_capture_cell_source_var_arg() {
 }
 
 #[test]
+fn profile_accepts_scoped_borrowed_param_capture() {
+    let mut program = scoped_borrow_lambda_program();
+    program
+        .function_mut(FunctionId::from_index(1))
+        .body
+        .block
+        .stmts
+        .clear();
+    check(program);
+}
+
+#[test]
+fn profile_accepts_nested_scoped_borrowed_param_capture() {
+    check(nested_scoped_borrow_lambda_program());
+}
+
+#[test]
+fn profile_accepts_scoped_borrowed_param_forwarding() {
+    check(scoped_borrow_lambda_program());
+}
+
+#[test]
+fn profile_rejects_scoped_borrowed_param_to_native_mut_borrow() {
+    let mut program = scoped_borrow_lambda_program();
+    let body = FunctionId::from_index(1);
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let void = program.function(body).signature.return_mode.ty();
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "touch",
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let Statement::Eval(RValue::Call { callee, .. }) =
+        &mut program.function_mut(body).body.block.stmts[0]
+    else {
+        unreachable!("test helper should start with source var call")
+    };
+    *callee = Callee::Extern(ext);
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
+}
+
+#[test]
 fn profile_rejects_dataref_source_var_arg() {
     expect_reject(
         projected_mut_call_arg_program(),
@@ -4862,12 +5273,329 @@ fn plan_lowers_lambda_capture_cell_source_var_arg_to_stack_cell() {
 }
 
 #[test]
+fn air_rejects_scoped_borrowed_param_projection_before_profile() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    program.scoped_borrows[0].ty = tuple;
+    let owner = program.function_mut(FunctionId::from_index(2));
+    owner.signature.params[0].ty = tuple;
+    owner.locals[0].ty = tuple;
+    let lambda_body = program.function_mut(FunctionId::from_index(1));
+    let Statement::Eval(RValue::Call { args, .. }) = &mut lambda_body.body.block.stmts[0] else {
+        unreachable!("test helper should start with source var call")
+    };
+    args[0] = CallArg::MutBorrow(Place {
+        root: PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+        projection: vec![Projection::TupleField(0)],
+        ty: int,
+    });
+
+    air::verify(&program).expect_err("AIR accepted scoped borrow projection");
+}
+
+#[test]
+fn air_rejects_escaping_scoped_borrowed_param_capture_before_profile() {
+    let mut program = scoped_borrow_lambda_program();
+    program.lambdas[0].escape = LambdaEscape::Escaping;
+
+    air::verify(&program).expect_err("AIR accepted escaping scoped borrow capture");
+}
+
+#[test]
+fn plan_lowers_scoped_borrow_to_scoped_place_cell() {
+    let program = scoped_borrow_lambda_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let rir = plan.program();
+
+    assert!(rir.cells.is_empty());
+    assert_eq!(rir.scoped_place_cells.len(), 1);
+    assert_eq!(
+        rir.scoped_place_cells[0].owner,
+        RirFunctionId::from_index(2)
+    );
+    assert_eq!(
+        rir.scoped_place_cells[0].source_local,
+        RirLocalId::from_index(0)
+    );
+    assert!(matches!(
+        rir.lambdas[0].captures[0].kind,
+        RirLambdaCaptureKind::ScopedPlaceCell {
+            cell: RirScopedPlaceCellId(0)
+        }
+    ));
+}
+
+#[test]
+fn plan_lowers_scoped_borrow_capture_arg_to_owner_ref() {
+    let program = scoped_borrow_lambda_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
+
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &owner.body.stmts[0]
+    else {
+        panic!("expected lambda init")
+    };
+    assert!(matches!(
+        captures.as_slice(),
+        [RirLambdaCaptureArg::ScopedPlaceCell {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0))
+        }]
+    ));
+}
+
+#[test]
+fn plan_lowers_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
+    let program = scoped_borrow_lambda_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+    let arg = only_call_arg(lambda_body);
+
+    assert!(matches!(
+        arg,
+        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+            cell: RirScopedPlaceCellRef::Capture {
+                cell: RirScopedPlaceCellId(0),
+                ..
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn plan_lowers_nested_scoped_borrow_recapture_to_same_cell() {
+    let program = nested_scoped_borrow_lambda_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let outer_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+    let inner_body = rir_function_for_air(plan.program(), FunctionId::from_index(2));
+
+    let RirStmt::Init {
+        value: RirRValue::Lambda { captures, .. },
+        ..
+    } = &outer_body.body.stmts[0]
+    else {
+        panic!("expected nested lambda init")
+    };
+    assert!(matches!(
+        captures.as_slice(),
+        [RirLambdaCaptureArg::ScopedPlaceCell {
+            cell: RirScopedPlaceCellRef::Capture {
+                cell: RirScopedPlaceCellId(0),
+                local: RirLocalId(1),
+            }
+        }]
+    ));
+    assert!(matches!(
+        only_call_arg(inner_body),
+        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+            cell: RirScopedPlaceCellRef::Capture {
+                cell: RirScopedPlaceCellId(0),
+                local: RirLocalId(0),
+            },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn plan_lowers_owner_scoped_borrow_write_to_scoped_place_cell_set() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let one = int_const(&mut program, int, 1);
+    program
+        .function_mut(FunctionId::from_index(2))
+        .body
+        .block
+        .stmts
+        .push(Statement::Assign {
+            dst: root_place(
+                PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
+                int,
+            ),
+            value: RValue::Use(Operand::Const(one)),
+        });
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
+
+    assert!(
+        owner
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt, RirStmt::ScopedPlaceCellSet { .. }))
+    );
+}
+
+#[test]
+fn plan_lowers_lambda_scoped_borrow_read_to_scoped_place_cell_get() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let body = program.function_mut(FunctionId::from_index(1));
+    body.locals.push(local(int, LocalKind::Temp));
+    body.body.block.stmts.insert(
+        0,
+        Statement::Init {
+            local: air::LocalId::from_index(0),
+            value: RValue::Use(Operand::Place(root_place(
+                PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                int,
+            ))),
+        },
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+
+    assert!(lambda_body.body.stmts.iter().any(|stmt| matches!(
+        stmt,
+        RirStmt::Init {
+            value: RirRValue::ScopedPlaceCellGet { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn plan_lowers_owner_scoped_borrow_read_to_scoped_place_cell_get() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let owner = program.function_mut(FunctionId::from_index(2));
+    let temp = air::LocalId::from_index(owner.locals.len());
+    owner.locals.push(local(int, LocalKind::Temp));
+    owner.body.block.stmts.push(Statement::Init {
+        local: temp,
+        value: RValue::Use(Operand::Place(root_place(
+            PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
+            int,
+        ))),
+    });
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
+
+    assert!(owner.body.stmts.iter().any(|stmt| matches!(
+        stmt,
+        RirStmt::Init {
+            value: RirRValue::ScopedPlaceCellGet {
+                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+                ..
+            },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn plan_lowers_owner_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let callee = FunctionId::from_index(0);
+    program
+        .function_mut(FunctionId::from_index(2))
+        .body
+        .block
+        .stmts
+        .push(source_var_call(
+            callee,
+            PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
+            int,
+        ));
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
+
+    assert!(matches!(
+        only_call_arg(owner),
+        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
+            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn plan_lowers_lambda_scoped_borrow_write_to_scoped_place_cell_set() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    let one = int_const(&mut program, int, 1);
+    program
+        .function_mut(FunctionId::from_index(1))
+        .body
+        .block
+        .stmts
+        .push(Statement::Assign {
+            dst: root_place(
+                PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                int,
+            ),
+            value: RValue::Use(Operand::Const(one)),
+        });
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
+
+    assert!(body.body.stmts.iter().any(|stmt| matches!(
+        stmt,
+        RirStmt::ScopedPlaceCellSet {
+            cell: RirScopedPlaceCellRef::Capture {
+                cell: RirScopedPlaceCellId(0),
+                local: RirLocalId(0),
+            },
+            ..
+        }
+    )));
+}
+
+#[test]
 fn emit_passes_capture_cell_var_arg_as_stack_cell_mut_place() {
     let source = plan_source(lambda_capture_cell_source_var_arg_program()).into_string();
 
     assert!(source.contains("MutPlace::stack_cell(&"));
     assert!(!source.contains("MutPlace::local(&mut"));
     assert!(!source.contains(".get_copy()?"));
+}
+
+#[test]
+fn emit_scoped_borrowed_param_uses_scoped_mut_place_cell() {
+    let source = plan_source(scoped_borrow_lambda_program()).into_string();
+
+    assert!(source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new(v0);"));
+    assert!(source.contains("c0: &'env anvyx_runtime::ScopedMutPlaceCell<'env, 'cx, i64>"));
+    assert!(source.contains("c0: &__scoped0"));
+    assert!(source.contains("anvyx_runtime::MutPlace::scoped_cell(v0)"));
+    assert!(!source.contains("&mut **c0"));
+    assert!(!source.contains("MutPlace::local(&mut v0)"));
+    assert!(!source.contains("MutPlace::stack_cell"));
+}
+
+#[test]
+fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
+    let mut program = scoped_borrow_lambda_program();
+    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
+    program
+        .function_mut(FunctionId::from_index(2))
+        .body
+        .block
+        .stmts
+        .push(source_var_call(
+            FunctionId::from_index(0),
+            PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
+            int,
+        ));
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("anvyx_runtime::MutPlace::scoped_cell(&__scoped0)"));
+    assert!(!source.contains("MutPlace::local(&mut v0)"));
+    assert!(!source.contains("v0.reborrow()"));
 }
 
 #[test]
@@ -6434,6 +7162,287 @@ fn stack_cell_lambda_rir(
         }],
         ..RirProgram::default()
     }
+}
+
+fn valid_scoped_place_cell_decl() -> RirScopedPlaceCellDecl {
+    RirScopedPlaceCellDecl {
+        id: RirScopedPlaceCellId::from_index(0),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(0),
+        payload_ty: RirTypeId::from_index(1),
+        symbol: RirSymbol::new("__scoped0"),
+    }
+}
+
+fn scoped_place_cell_rir_with(edit: impl FnOnce(&mut RirScopedPlaceCellDecl)) -> RirProgram {
+    let mut cell = valid_scoped_place_cell_decl();
+    edit(&mut cell);
+    scoped_place_cell_rir(cell)
+}
+
+fn scoped_place_cell_rir(cell: RirScopedPlaceCellDecl) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let owner = RirFunctionId::from_index(0);
+    let source = RirLocalId::from_index(0);
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int],
+        scoped_place_cells: vec![cell],
+        functions: vec![RirFunction {
+            id: owner,
+            air_id: None,
+            symbol: RirSymbol::new("owner"),
+            params: vec![RirParam {
+                local: source,
+                ty: int,
+                semantic: RirParamSemantic::MutPlace,
+                abi: RirParamAbi::MutPlace,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: RirReturn { ty: void },
+            locals: vec![RirLocal {
+                id: source,
+                ty: int,
+                mutable: true,
+                symbol: RirSymbol::new("source"),
+                initialized: true,
+                payload_ref: false,
+            }],
+            body: RirStructuredBlock::default(),
+        }],
+        ..RirProgram::default()
+    }
+}
+
+fn valid_scoped_place_cell_lambda_rir() -> RirProgram {
+    scoped_place_cell_lambda_rir(false)
+}
+
+fn valid_nested_scoped_place_cell_lambda_rir() -> RirProgram {
+    scoped_place_cell_lambda_rir(true)
+}
+
+fn scoped_place_cell_capture() -> RirLambdaCapture {
+    RirLambdaCapture {
+        ty: RirTypeId::from_index(1),
+        semantic: RirParamSemantic::ScopedPlaceCell,
+        abi: RirParamAbi::ScopedPlaceCell,
+        kind: RirLambdaCaptureKind::ScopedPlaceCell {
+            cell: RirScopedPlaceCellId::from_index(0),
+        },
+    }
+}
+
+fn mut_place_sink_function(id: RirFunctionId) -> RirFunction {
+    let source = RirLocalId::from_index(0);
+    RirFunction {
+        id,
+        air_id: None,
+        symbol: RirSymbol::new("mut_place_sink"),
+        params: vec![RirParam {
+            local: source,
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::MutPlace,
+            abi: RirParamAbi::MutPlace,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(0),
+        },
+        locals: vec![RirLocal {
+            id: source,
+            ty: RirTypeId::from_index(1),
+            mutable: true,
+            symbol: RirSymbol::new("p"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    }
+}
+
+fn mut_borrow_sink_function(id: RirFunctionId) -> RirFunction {
+    let source = RirLocalId::from_index(0);
+    RirFunction {
+        id,
+        air_id: None,
+        symbol: RirSymbol::new("mut_borrow_sink"),
+        params: vec![RirParam {
+            local: source,
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::MutBorrow,
+            abi: RirParamAbi::MutBorrow,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(0),
+        },
+        locals: vec![RirLocal {
+            id: source,
+            ty: RirTypeId::from_index(1),
+            mutable: true,
+            symbol: RirSymbol::new("p"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    }
+}
+
+fn scoped_place_cell_lambda_rir(nested: bool) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let sig = RirLambdaSigId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    let owner = RirFunctionId::from_index(0);
+    let target = RirFunctionId::from_index(1);
+    let nested_target = RirFunctionId::from_index(2);
+    let source = RirLocalId::from_index(0);
+    let f = RirLocalId::from_index(1);
+    let mut program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
+        scoped_place_cells: vec![valid_scoped_place_cell_decl()],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        lambdas: vec![RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+            function: target,
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![scoped_place_cell_capture()],
+        }],
+        functions: vec![
+            RirFunction {
+                id: owner,
+                air_id: None,
+                symbol: RirSymbol::new("owner"),
+                params: vec![RirParam {
+                    local: source,
+                    ty: int,
+                    semantic: RirParamSemantic::MutPlace,
+                    abi: RirParamAbi::MutPlace,
+                    escape: RirParamEscape::NonEscaping,
+                }],
+                ret: RirReturn { ty: void },
+                locals: vec![
+                    RirLocal {
+                        id: source,
+                        ty: int,
+                        mutable: true,
+                        symbol: RirSymbol::new("source"),
+                        initialized: true,
+                        payload_ref: false,
+                    },
+                    RirLocal {
+                        id: f,
+                        ty: lambda_ty,
+                        mutable: false,
+                        symbol: RirSymbol::new("f"),
+                        initialized: false,
+                        payload_ref: false,
+                    },
+                ],
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::Init {
+                        local: f,
+                        value: RirRValue::Lambda {
+                            lambda: RirLambdaId::from_index(0),
+                            captures: vec![RirLambdaCaptureArg::ScopedPlaceCell {
+                                cell: RirScopedPlaceCellRef::Owner(
+                                    RirScopedPlaceCellId::from_index(0),
+                                ),
+                            }],
+                            ty: lambda_ty,
+                        },
+                    }],
+                    term: RirTerm::Return(None),
+                },
+            },
+            RirFunction {
+                id: target,
+                air_id: None,
+                symbol: RirSymbol::new("target"),
+                params: vec![RirParam {
+                    local: source,
+                    ty: int,
+                    semantic: RirParamSemantic::ScopedPlaceCell,
+                    abi: RirParamAbi::ScopedPlaceCell,
+                    escape: RirParamEscape::NonEscaping,
+                }],
+                ret: RirReturn { ty: void },
+                locals: vec![RirLocal {
+                    id: source,
+                    ty: int,
+                    mutable: false,
+                    symbol: RirSymbol::new("cell"),
+                    initialized: true,
+                    payload_ref: false,
+                }],
+                body: RirStructuredBlock::default(),
+            },
+        ],
+        ..RirProgram::default()
+    };
+    if nested {
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(1),
+            source: RirLambdaSource::Lambda(air::LambdaId::from_index(1)),
+            function: nested_target,
+            sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![scoped_place_cell_capture()],
+        });
+        program.functions[1].locals.push(RirLocal {
+            id: f,
+            ty: lambda_ty,
+            mutable: false,
+            symbol: RirSymbol::new("inner"),
+            initialized: false,
+            payload_ref: false,
+        });
+        program.functions[1].body.stmts.push(RirStmt::Init {
+            local: f,
+            value: RirRValue::Lambda {
+                lambda: RirLambdaId::from_index(1),
+                captures: vec![RirLambdaCaptureArg::ScopedPlaceCell {
+                    cell: RirScopedPlaceCellRef::Capture {
+                        cell: RirScopedPlaceCellId::from_index(0),
+                        local: source,
+                    },
+                }],
+                ty: lambda_ty,
+            },
+        });
+        program.functions.push(RirFunction {
+            id: nested_target,
+            air_id: None,
+            symbol: RirSymbol::new("nested_target"),
+            params: vec![RirParam {
+                local: source,
+                ty: int,
+                semantic: RirParamSemantic::ScopedPlaceCell,
+                abi: RirParamAbi::ScopedPlaceCell,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: RirReturn { ty: void },
+            locals: vec![RirLocal {
+                id: source,
+                ty: int,
+                mutable: false,
+                symbol: RirSymbol::new("cell"),
+                initialized: true,
+                payload_ref: false,
+            }],
+            body: RirStructuredBlock::default(),
+        });
+    }
+    program
 }
 
 fn scoped_capture_rir(
@@ -10894,6 +11903,204 @@ fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId
     })
 }
 
+fn scoped_borrow_lambda_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let callee = source_var_callee(&mut program, module, int, void);
+    let body = FunctionId::from_index(1);
+    let owner = FunctionId::from_index(2);
+    let source = air::LocalId::from_index(0);
+    let binding = BindingId::from_index(0);
+    let borrow = scoped_borrow(&mut program, owner, source, binding, int);
+    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body,
+        signature: sig,
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedBorrow {
+            binding,
+            borrow,
+            ty: int,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    assert_eq!(lambda, air::LambdaId::from_index(0));
+    let lambda_body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Lambda(lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![source_var_call(
+                callee,
+                PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                int,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(lambda_body, body);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("capture"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, source)], void),
+        locals: vec![
+            bound_arg_source_local(binding, int),
+            local(lambda_ty, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![Statement::Init {
+                local: air::LocalId::from_index(1),
+                value: RValue::MakeLambda {
+                    lambda,
+                    captures: vec![air::LambdaCaptureArg::ScopedBorrow {
+                        place: root_place(PlaceRoot::ScopedBorrow(borrow), int),
+                    }],
+                    ty: lambda_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(caller, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([callee, lambda_body, caller]);
+    program
+}
+
+fn nested_scoped_borrow_lambda_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let callee = source_var_callee(&mut program, module, int, void);
+    let outer_body = FunctionId::from_index(1);
+    let inner_body = FunctionId::from_index(2);
+    let owner = FunctionId::from_index(3);
+    let source = air::LocalId::from_index(0);
+    let binding = BindingId::from_index(0);
+    let borrow = scoped_borrow(&mut program, owner, source, binding, int);
+    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
+    let outer = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body: outer_body,
+        signature: sig.clone(),
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedBorrow {
+            binding,
+            borrow,
+            ty: int,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    let inner = program.alloc_lambda(LambdaDecl {
+        source: ExprId(1),
+        module,
+        owner: outer_body,
+        body: inner_body,
+        signature: sig,
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedBorrow {
+            binding,
+            borrow,
+            ty: int,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    let outer_fn = program.alloc_function(Function {
+        name: Ident::new("outer"),
+        module,
+        kind: FunctionKind::Lambda(outer),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(lambda_ty, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: air::LocalId::from_index(0),
+                value: RValue::MakeLambda {
+                    lambda: inner,
+                    captures: vec![air::LambdaCaptureArg::ScopedBorrow {
+                        place: root_place(
+                            PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                            int,
+                        ),
+                    }],
+                    ty: lambda_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(outer_fn, outer_body);
+    let inner_fn = program.alloc_function(Function {
+        name: Ident::new("inner"),
+        module,
+        kind: FunctionKind::Lambda(inner),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![source_var_call(
+                callee,
+                PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                int,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(inner_fn, inner_body);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("capture"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, source)], void),
+        locals: vec![
+            bound_arg_source_local(binding, int),
+            local(lambda_ty, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![Statement::Init {
+                local: air::LocalId::from_index(1),
+                value: RValue::MakeLambda {
+                    lambda: outer,
+                    captures: vec![air::LambdaCaptureArg::ScopedBorrow {
+                        place: root_place(PlaceRoot::ScopedBorrow(borrow), int),
+                    }],
+                    ty: lambda_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(caller, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([callee, outer_fn, inner_fn, caller]);
+    program
+}
+
 fn owner_capture_cell_source_var_arg_program() -> Program {
     capture_cell_source_var_arg_program(false)
 }
@@ -11050,12 +12257,34 @@ fn capture_cell(
     })
 }
 
+fn scoped_borrow(
+    program: &mut Program,
+    owner: FunctionId,
+    source_local: air::LocalId,
+    binding: BindingId,
+    ty: air::TypeId,
+) -> air::ScopedBorrowId {
+    program.alloc_scoped_borrow(air::ScopedBorrowDecl {
+        owner,
+        binding,
+        source: air::ScopedBorrowSource::SourceMutParam {
+            local: source_local,
+        },
+        ty,
+        mutability: Mutability::Mutable,
+    })
+}
 fn bound_source_local(binding: BindingId, ty: air::TypeId) -> Local {
     let mut local = mut_local(ty, LocalKind::User);
     local.binding = Some(binding);
     local
 }
 
+fn bound_arg_source_local(binding: BindingId, ty: air::TypeId) -> Local {
+    let mut local = mut_local(ty, LocalKind::Arg);
+    local.binding = Some(binding);
+    local
+}
 fn init_cell(program: &mut Program, cell: air::CaptureCellId, ty: air::TypeId) -> Statement {
     Statement::Assign {
         dst: root_place(PlaceRoot::CaptureCell(cell), ty),

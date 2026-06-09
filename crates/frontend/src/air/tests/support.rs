@@ -2,8 +2,8 @@ use super::super::{
     AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData, EnumDecl,
     EnumRepr, ExternDecl, ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local,
     LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
-    PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, Signature, TypeData, VariantDecl,
-    VariantShape,
+    PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, ScopedBorrowSource, Signature,
+    TypeData, VariantDecl, VariantShape,
     ids::{
         AggregateId, BindingId, BlockId, CaptureCellId, ConstId, EnumId, ExternId, ExternTypeId,
         FunctionId, GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
@@ -355,6 +355,22 @@ pub fn term_return_void() -> AirTail {
 
 pub fn term_unreachable() -> AirTail {
     AirTail::Unreachable
+}
+
+pub fn scoped_mut_param_borrow(
+    owner: FunctionId,
+    binding: BindingId,
+    local: LocalId,
+    ty: TypeId,
+    mutability: Mutability,
+) -> ScopedBorrowDecl {
+    ScopedBorrowDecl {
+        owner,
+        binding,
+        source: ScopedBorrowSource::SourceMutParam { local },
+        ty,
+        mutability,
+    }
 }
 
 pub fn place(local: LocalId, ty: TypeId) -> Place {

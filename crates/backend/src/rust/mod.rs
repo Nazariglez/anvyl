@@ -37,11 +37,11 @@ use self::{
         RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
         RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand,
         RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -271,6 +271,7 @@ struct PlanCx<'a> {
     function_type_copyable: HashMap<TypeId, bool>,
     lambda_runtime_capture_slots: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), usize>,
     capture_cell_map: HashMap<air::CaptureCellId, RirCellId>,
+    scoped_place_cell_map: HashMap<air::ScopedBorrowId, RirScopedPlaceCellId>,
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
@@ -369,6 +370,7 @@ impl<'a> PlanCx<'a> {
             function_type_copyable: HashMap::new(),
             lambda_runtime_capture_slots: HashMap::new(),
             capture_cell_map: HashMap::new(),
+            scoped_place_cell_map: HashMap::new(),
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
@@ -396,6 +398,7 @@ impl<'a> PlanCx<'a> {
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
         self.plan_cells(&mut program);
+        self.plan_scoped_place_cells(&mut program);
         self.plan_lambdas(&mut program)?;
         self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
@@ -1202,6 +1205,22 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn plan_scoped_place_cells(&mut self, program: &mut RirProgram) {
+        for (index, borrow) in self.air.scoped_borrows.iter().enumerate() {
+            let air_id = air::ScopedBorrowId::from_index(index);
+            let id = RirScopedPlaceCellId::from_index(program.scoped_place_cells.len());
+            self.scoped_place_cell_map.insert(air_id, id);
+            let air::ScopedBorrowSource::SourceMutParam { local } = borrow.source;
+            program.scoped_place_cells.push(RirScopedPlaceCellDecl {
+                id,
+                owner: self.function_map[&borrow.owner],
+                source_local: RirLocalId::from_index(local.index()),
+                payload_ty: self.type_map[&borrow.ty],
+                symbol: RirSymbol::new(format!("__scoped{}", id.index())),
+            });
+        }
+    }
+
     fn plan_lambdas(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
         let mut function_refs = Vec::new();
         for function in &self.air.functions {
@@ -1385,26 +1404,21 @@ impl<'a> PlanCx<'a> {
                     kind: RirLambdaCaptureKind::Param,
                 }))
             }
-            air::LambdaCaptureDecl::ScopedLocal { ty, mutability, .. } => {
-                if *mutability != Mutability::Mutable {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(owner),
-                        RustTargetGapKind::UnsupportedLambdaCapture,
-                    ));
-                }
-                let ty = self.type_map[ty];
-                let semantic = RirParamSemantic::MutBorrow;
-                Ok(Some(RirLambdaCapture {
-                    ty,
-                    semantic,
-                    abi: policy.param_abi(semantic),
-                    kind: RirLambdaCaptureKind::Param,
-                }))
-            }
-            air::LambdaCaptureDecl::ScopedBorrow { .. } => Err(Self::gap(
+            air::LambdaCaptureDecl::ScopedLocal { .. } => Err(Self::gap(
                 RustTargetGapSite::Function(owner),
                 RustTargetGapKind::UnsupportedLambdaCapture,
             )),
+            air::LambdaCaptureDecl::ScopedBorrow { borrow, ty, .. } => {
+                let ty = self.type_map[ty];
+                Ok(Some(RirLambdaCapture {
+                    ty,
+                    semantic: RirParamSemantic::ScopedPlaceCell,
+                    abi: policy.param_abi(RirParamSemantic::ScopedPlaceCell),
+                    kind: RirLambdaCaptureKind::ScopedPlaceCell {
+                        cell: self.scoped_place_cell_map[borrow],
+                    },
+                }))
+            }
             air::LambdaCaptureDecl::CaptureCell { cell, ty, .. } => {
                 let ty = self.type_map[ty];
                 Ok(Some(RirLambdaCapture {
@@ -2273,16 +2287,22 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                     });
                 }
-                air::LambdaCaptureArg::ScopedLocal { place } => {
-                    planned.push(RirLambdaCaptureArg::Scoped {
-                        place: self.plan_place_in_function(function, place),
-                    });
-                }
-                air::LambdaCaptureArg::ScopedBorrow { .. } => {
+                air::LambdaCaptureArg::ScopedLocal { .. } => {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
+                }
+                air::LambdaCaptureArg::ScopedBorrow { place } => {
+                    let Some(borrow) = self.place_scoped_borrow(function, place) else {
+                        return Err(Self::gap(
+                            RustTargetGapSite::Function(function),
+                            RustTargetGapKind::UnsupportedLambdaCapture,
+                        ));
+                    };
+                    planned.push(RirLambdaCaptureArg::ScopedPlaceCell {
+                        cell: self.scoped_place_cell_ref(function, borrow),
+                    });
                 }
                 air::LambdaCaptureArg::CaptureCell { cell } => {
                     planned.push(RirLambdaCaptureArg::StackCell {
@@ -2362,6 +2382,18 @@ impl<'a> PlanCx<'a> {
             }
             return Ok(PlannedRValue::from_value(RirRValue::CellGetCopy {
                 cell: self.capture_cell_ref(function, cell),
+                ty: self.type_map[&place.ty],
+            }));
+        }
+        if let Some(borrow) = self.place_scoped_borrow(function, place) {
+            if !place.projection.is_empty() {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedMutablePlaceProjection,
+                ));
+            }
+            return Ok(PlannedRValue::from_value(RirRValue::ScopedPlaceCellGet {
+                cell: self.scoped_place_cell_ref(function, borrow),
                 ty: self.type_map[&place.ty],
             }));
         }
@@ -2652,6 +2684,13 @@ impl<'a> PlanCx<'a> {
                     };
                     return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
                 }
+                if let Some(borrow) = self.place_scoped_borrow(function, place) {
+                    let arg = RirMutPlaceArg::ScopedPlaceCell {
+                        cell: self.scoped_place_cell_ref(function, borrow),
+                        ty,
+                    };
+                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
+                }
                 let Some(root) = place.root.local() else {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
@@ -2669,6 +2708,7 @@ impl<'a> PlanCx<'a> {
             CallArg::MutBorrow(place) => {
                 if self.place_is_source_mut_place_param(function, place)
                     || self.place_capture_cell(function, place).is_some()
+                    || self.place_scoped_borrow(function, place).is_some()
                 {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
@@ -2752,6 +2792,22 @@ impl<'a> PlanCx<'a> {
                 operand: RirOperand::Place(self.rir_root_place(local, place.ty)),
             };
         }
+        if let Some(borrow) = self.place_scoped_borrow(function, place) {
+            if !place.projection.is_empty() {
+                unreachable!("Rust backend profile rejects projected scoped-borrow places")
+            }
+            let local = self.alloc_temp(locals, place.ty);
+            return PlannedOperand {
+                stmts: vec![RirStmt::Init {
+                    local,
+                    value: RirRValue::ScopedPlaceCellGet {
+                        cell: self.scoped_place_cell_ref(function, borrow),
+                        ty: self.type_map[&place.ty],
+                    },
+                }],
+                operand: RirOperand::Place(self.rir_root_place(local, place.ty)),
+            };
+        }
         if !self.place_crosses_dataref(function, place) {
             if self.place_is_source_mut_place_param(function, place) && place.projection.is_empty()
             {
@@ -2829,6 +2885,17 @@ impl<'a> PlanCx<'a> {
                     *slot = true;
                 }
             }
+            return Ok(());
+        }
+        if let Some(borrow) = self.place_scoped_borrow(function, place) {
+            if !place.projection.is_empty() {
+                unreachable!("Rust backend profile rejects projected scoped-borrow places")
+            }
+            let value = self.rvalue_temp(value, place.ty, locals, stmts);
+            stmts.push(RirStmt::ScopedPlaceCellSet {
+                cell: self.scoped_place_cell_ref(function, borrow),
+                value: RirRValue::Use(value),
+            });
             return Ok(());
         }
         if !self.place_crosses_dataref(function, place) {
@@ -2951,12 +3018,20 @@ impl<'a> PlanCx<'a> {
     ) -> RirOperand {
         match value {
             RirRValue::Use(operand) => operand,
-            value => {
-                let local = self.alloc_temp(locals, ty);
-                stmts.push(RirStmt::Init { local, value });
-                RirOperand::Place(self.rir_root_place(local, ty))
-            }
+            value => self.rvalue_temp(value, ty, locals, stmts),
         }
+    }
+
+    fn rvalue_temp(
+        &self,
+        value: RirRValue,
+        ty: TypeId,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> RirOperand {
+        let local = self.alloc_temp(locals, ty);
+        stmts.push(RirStmt::Init { local, value });
+        RirOperand::Place(self.rir_root_place(local, ty))
     }
 
     fn dataref_projection_segment(
@@ -3033,6 +3108,44 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn scoped_place_cell_ref(
+        &self,
+        function: FunctionId,
+        borrow: air::ScopedBorrowId,
+    ) -> RirScopedPlaceCellRef {
+        let cell = self.scoped_place_cell_map[&borrow];
+        if self.air.scoped_borrows[borrow.index()].owner == function {
+            return RirScopedPlaceCellRef::Owner(cell);
+        }
+        let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+            unreachable!("AIR verifier rejects inaccessible scoped borrows")
+        };
+        let slot = self.air.lambdas[lambda.index()]
+            .captures
+            .iter()
+            .enumerate()
+            .find_map(|(slot, capture)| match capture {
+                air::LambdaCaptureDecl::ScopedBorrow { borrow: found, .. } if *found == borrow => {
+                    Some(air::LambdaCaptureSlotId::from_index(slot))
+                }
+                _ => None,
+            })
+            .expect("AIR verifier rejects uncaptured scoped-borrow use");
+        let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
+        RirScopedPlaceCellRef::Capture {
+            cell,
+            local: RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
+        }
+    }
+
+    fn place_scoped_borrow(
+        &self,
+        function: FunctionId,
+        place: &Place,
+    ) -> Option<air::ScopedBorrowId> {
+        self.air.scoped_borrow_root(function, place.root)
+    }
+
     fn current_place_root(&self, function: FunctionId, place: &Place) -> (TypeId, RirLocalId) {
         match place.root {
             air::PlaceRoot::Local(local) => (
@@ -3046,7 +3159,7 @@ impl<'a> PlanCx<'a> {
                 let decl = &self.air.lambdas[lambda.index()].captures[slot.index()];
                 let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
                 (
-                    lambda_capture_ty(decl),
+                    decl.ty(),
                     RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
                 )
             }
@@ -3140,16 +3253,6 @@ impl<'a> PlanCx<'a> {
 
 fn lambda_capture_has_runtime(capture: &air::LambdaCaptureDecl) -> bool {
     !matches!(capture, air::LambdaCaptureDecl::NoRuntime { .. })
-}
-
-fn lambda_capture_ty(capture: &air::LambdaCaptureDecl) -> TypeId {
-    match capture {
-        air::LambdaCaptureDecl::NoRuntime { ty, .. }
-        | air::LambdaCaptureDecl::ReadonlyLocal { ty, .. }
-        | air::LambdaCaptureDecl::ScopedLocal { ty, .. }
-        | air::LambdaCaptureDecl::ScopedBorrow { ty, .. }
-        | air::LambdaCaptureDecl::CaptureCell { ty, .. } => *ty,
-    }
 }
 
 fn set_if_changed(slot: &mut bool, value: bool) -> bool {

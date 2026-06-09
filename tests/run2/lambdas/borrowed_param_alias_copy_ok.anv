@@ -1,13 +1,15 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match: 1
+// @match: 2
 
 fn touch(var count: int) {
     let f = || {
         count += 1;
     };
+    let g = f;
     f();
+    g();
 }
 
 fn main() {

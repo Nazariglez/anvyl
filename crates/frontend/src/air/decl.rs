@@ -99,6 +99,38 @@ pub enum LambdaCaptureDecl {
     },
 }
 
+impl LambdaCaptureDecl {
+    pub fn binding(&self) -> BindingId {
+        match self {
+            Self::NoRuntime { binding, .. }
+            | Self::ReadonlyLocal { binding, .. }
+            | Self::ScopedLocal { binding, .. }
+            | Self::ScopedBorrow { binding, .. }
+            | Self::CaptureCell { binding, .. } => *binding,
+        }
+    }
+
+    pub fn ty(&self) -> TypeId {
+        match self {
+            Self::NoRuntime { ty, .. }
+            | Self::ReadonlyLocal { ty, .. }
+            | Self::ScopedLocal { ty, .. }
+            | Self::ScopedBorrow { ty, .. }
+            | Self::CaptureCell { ty, .. } => *ty,
+        }
+    }
+
+    pub fn mutability(&self) -> Mutability {
+        match self {
+            Self::ScopedLocal { mutability, .. } | Self::ScopedBorrow { mutability, .. } => {
+                *mutability
+            }
+            Self::CaptureCell { .. } => Mutability::Mutable,
+            Self::NoRuntime { .. } | Self::ReadonlyLocal { .. } => Mutability::Immutable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LambdaEscape {
     NonEscaping,
@@ -180,8 +212,16 @@ pub enum LocalKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedBorrowDecl {
+    pub owner: FunctionId,
+    pub binding: BindingId,
+    pub source: ScopedBorrowSource,
     pub ty: TypeId,
     pub mutability: Mutability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopedBorrowSource {
+    SourceMutParam { local: LocalId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -28,7 +28,7 @@ pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,
     managed_alloc_details, typed_dropper,
 };
-pub use mutable_place::MutPlace;
+pub use mutable_place::{MutPlace, ScopedMutPlaceCell};
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,
     CallbackThread, ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternCallbackParam,

@@ -48,7 +48,7 @@ fn stmt_calls_fallible(
             place_is_mut_place_param(function, dst)
                 || rvalue_calls_fallible(program, fallible, function, value)
         }
-        RirStmt::CellSet { .. } => true,
+        RirStmt::CellSet { .. } | RirStmt::ScopedPlaceCellSet { .. } => true,
         RirStmt::DataRefSet { object, value, .. } => {
             operand_uses_mut_place_param(function, object)
                 || operand_uses_mut_place_param(function, value)
@@ -76,7 +76,7 @@ fn rvalue_calls_fallible(
                     .lambdas_for_sig(*sig)
                     .any(|lambda| fallible[lambda.function.index()]),
             },
-            RirRValue::CellGetCopy { .. } => true,
+            RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => true,
             RirRValue::Stringify { source_ty, .. } => {
                 stringify_calls_fallible(program, fallible, *source_ty)
             }
@@ -120,12 +120,12 @@ fn block_uses_ctx(
 fn stmt_uses_ctx(program: &RirProgram, function: &RirFunction, stmt: &RirStmt) -> bool {
     match stmt {
         RirStmt::Init { value, .. } | RirStmt::CellInit { value, .. } | RirStmt::Eval(value) => {
-            rvalue_uses_ctx(program, function, value)
+            rvalue_uses_ctx(program, value)
         }
-        RirStmt::Assign { dst, value } => {
-            place_is_mut_place_param(function, dst) || rvalue_uses_ctx(program, function, value)
+        RirStmt::Assign { value, .. } => rvalue_uses_ctx(program, value),
+        RirStmt::CellSet { value, .. } | RirStmt::ScopedPlaceCellSet { value, .. } => {
+            rvalue_uses_ctx(program, value)
         }
-        RirStmt::CellSet { value, .. } => rvalue_uses_ctx(program, function, value),
         RirStmt::DataRefSet { .. } => true,
         _ => stmt_child_blocks_any(stmt, |block| block_uses_ctx(program, function, block)),
     }
@@ -158,6 +158,7 @@ fn stmt_child_blocks_any(
         | RirStmt::Assign { .. }
         | RirStmt::CellInit { .. }
         | RirStmt::CellSet { .. }
+        | RirStmt::ScopedPlaceCellSet { .. }
         | RirStmt::Eval(_)
         | RirStmt::DataRefSet { .. } => false,
     }
@@ -200,17 +201,16 @@ fn local_is_mut_place_param(function: &RirFunction, local: super::rir::RirLocalI
         .any(|param| param.local == local && param.abi == RirParamAbi::MutPlace)
 }
 
-fn rvalue_uses_ctx(program: &RirProgram, function: &RirFunction, value: &RirRValue) -> bool {
-    rvalue_uses_mut_place_param(function, value)
-        || match value {
-            RirRValue::Call { .. }
-            | RirRValue::DataRefAlloc { .. }
-            | RirRValue::DataRefGet { .. } => true,
-            RirRValue::Stringify { source_ty, .. } => {
-                matches!(program.types[source_ty.index()], RirType::Struct(_))
-            }
-            _ => false,
+fn rvalue_uses_ctx(program: &RirProgram, value: &RirRValue) -> bool {
+    match value {
+        RirRValue::Call { .. } | RirRValue::DataRefAlloc { .. } | RirRValue::DataRefGet { .. } => {
+            true
         }
+        RirRValue::Stringify { source_ty, .. } => {
+            matches!(program.types[source_ty.index()], RirType::Struct(_))
+        }
+        _ => false,
+    }
 }
 
 fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> bool {
@@ -259,6 +259,8 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
             place_is_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
         }
-        RirRValue::Lambda { .. } | RirRValue::CellGetCopy { .. } => false,
+        RirRValue::Lambda { .. }
+        | RirRValue::CellGetCopy { .. }
+        | RirRValue::ScopedPlaceCellGet { .. } => false,
     }
 }

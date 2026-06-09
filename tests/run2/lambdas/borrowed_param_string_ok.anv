@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: go!
+
+fn touch(var text: string) {
+    let f = || {
+        text = "go!";
+    };
+    f();
+}
+
+fn main() {
+    var text = "go";
+    touch(text);
+    println(text);
+}

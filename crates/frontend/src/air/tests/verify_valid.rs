@@ -35,14 +35,17 @@ fn non_local_roots_verify_with_declarations() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
-    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
-        ty: int_ty,
-        mutability: Mutability::Immutable,
-    });
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(0),
+        BindingId::from_index(1),
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
     let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
         owner: FunctionId::from_index(0),
-        source_local: LocalId::from_index(0),
+        source_local: LocalId::from_index(1),
         ty: int_ty,
     });
     let global = builder.alloc_global(GlobalDecl {
@@ -53,6 +56,8 @@ fn non_local_roots_verify_with_declarations() {
     });
 
     let mut fb = FunctionBuilder::new("roots", module, FunctionKind::Normal, int_ty);
+    let param = fb.push_param_with_mode("p", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    fb.bind_local(param, BindingId::from_index(1));
     let x = fb.push_local(Some("x"), int_ty, Mutability::Mutable, LocalKind::User);
     fb.bind_local(x, BindingId::from_index(0));
     let tmp = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
@@ -85,6 +90,247 @@ fn non_local_roots_verify_with_declarations() {
     );
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn source_mut_param_scoped_borrow_verifies() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(0),
+        binding,
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
+
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    fb.bind_local(local, binding);
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::ScopedBorrow(scoped),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn source_var_call_accepts_scoped_borrow_root() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+
+    let mut callee = FunctionBuilder::new("inc", module, FunctionKind::Normal, void_ty);
+    let arg = callee.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    assert_eq!(arg, LocalId::from_index(0));
+    let inc = builder.alloc_function(callee.finish());
+
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(1),
+        binding,
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
+    let mut owner = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    let local = owner.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(local, binding);
+    let bb0 = owner.push_block(term_return_void());
+    owner.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(inc),
+            args: vec![CallArg::MutBorrow(Place {
+                root: PlaceRoot::ScopedBorrow(scoped),
+                projection: vec![],
+                ty: int_ty,
+            })],
+        }),
+    );
+    let owner = builder.alloc_function(owner.finish());
+    builder.set_entry(owner);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn source_var_call_accepts_lambda_slot_scoped_borrow() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let binding = BindingId::from_index(0);
+
+    let mut callee = FunctionBuilder::new("inc", module, FunctionKind::Normal, void_ty);
+    callee.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let inc = builder.alloc_function(callee.finish());
+
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(2),
+        binding,
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
+    let lambda = LambdaId::from_index(0);
+    let body = FunctionId::from_index(1);
+    builder.alloc_lambda(LambdaDecl {
+        source: crate::ast::ExprId(0),
+        module,
+        owner: FunctionId::from_index(2),
+        body,
+        signature: SignatureType::new(vec![], ReturnMode::Value(void_ty)),
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![LambdaCaptureDecl::ScopedBorrow {
+            binding,
+            borrow: scoped,
+            ty: int_ty,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    let mut lambda_body =
+        FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), void_ty);
+    let bb0 = lambda_body.push_block(term_return_void());
+    lambda_body.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(inc),
+            args: vec![CallArg::MutBorrow(Place {
+                root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)),
+                projection: vec![],
+                ty: int_ty,
+            })],
+        }),
+    );
+    assert_eq!(builder.alloc_function(lambda_body.finish()), body);
+
+    let mut owner = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    let local = owner.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(local, binding);
+    owner.push_block(term_return_void());
+    let owner = builder.alloc_function(owner.finish());
+    builder.set_entry(owner);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn distinct_scoped_borrows_do_not_alias() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("both", module, FunctionKind::Normal, void_ty);
+    callee.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let both = builder.alloc_function(callee.finish());
+
+    let first_binding = BindingId::from_index(0);
+    let second_binding = BindingId::from_index(1);
+    let first = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(1),
+        first_binding,
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
+    let second = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(1),
+        second_binding,
+        LocalId::from_index(1),
+        int_ty,
+        Mutability::Mutable,
+    ));
+
+    let mut owner = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    let a = owner.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(a, first_binding);
+    let b = owner.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(b, second_binding);
+    let bb0 = owner.push_block(term_return_void());
+    owner.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(both),
+            args: vec![
+                CallArg::MutBorrow(Place {
+                    root: PlaceRoot::ScopedBorrow(first),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+                CallArg::MutBorrow(Place {
+                    root: PlaceRoot::ScopedBorrow(second),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+            ],
+        }),
+    );
+    let owner = builder.alloc_function(owner.finish());
+    builder.set_entry(owner);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn scoped_borrow_and_distinct_local_do_not_alias() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+
+    let mut callee = FunctionBuilder::new("both", module, FunctionKind::Normal, void_ty);
+    callee.push_param_with_mode("a", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_param_with_mode("b", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let both = builder.alloc_function(callee.finish());
+
+    let first_binding = BindingId::from_index(0);
+    let second_binding = BindingId::from_index(1);
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(1),
+        first_binding,
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
+
+    let mut owner = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    let x = owner.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(x, first_binding);
+    let y = owner.push_param_with_mode("y", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    owner.bind_local(y, second_binding);
+    let bb0 = owner.push_block(term_return_void());
+    owner.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(both),
+            args: vec![
+                CallArg::MutBorrow(Place {
+                    root: PlaceRoot::ScopedBorrow(scoped),
+                    projection: vec![],
+                    ty: int_ty,
+                }),
+                CallArg::MutBorrow(place(y, int_ty)),
+            ],
+        }),
+    );
+    let owner = builder.alloc_function(owner.finish());
+    builder.set_entry(owner);
 
     expect_verified(&builder.finish());
 }
@@ -445,24 +691,27 @@ fn nonescaping_lambda_body_may_use_declared_scoped_borrow() {
     let lambda = LambdaId::from_index(0);
     let body = FunctionId::from_index(0);
     let binding = BindingId::from_index(0);
-    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
-        ty: int_ty,
-        mutability: Mutability::Immutable,
-    });
+    let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
+        FunctionId::from_index(1),
+        BindingId::from_index(0),
+        LocalId::from_index(0),
+        int_ty,
+        Mutability::Mutable,
+    ));
     let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
     assert_eq!(
         builder.alloc_lambda(LambdaDecl {
             source: crate::ast::ExprId(0),
             module,
             body,
-            owner: FunctionId::from_index(0),
+            owner: FunctionId::from_index(1),
             signature: sig,
             escape: LambdaEscape::NonEscaping,
             captures: vec![LambdaCaptureDecl::ScopedBorrow {
                 binding,
                 borrow: scoped,
                 ty: int_ty,
-                mutability: Mutability::Immutable,
+                mutability: Mutability::Mutable,
             }],
         }),
         lambda
@@ -476,6 +725,8 @@ fn nonescaping_lambda_body_may_use_declared_scoped_borrow() {
     })));
     assert_eq!(builder.alloc_function(lambda_body.finish()), body);
     let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let param = main.push_param_with_mode("p", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    main.bind_local(param, binding);
     main.push_block(term_return(op_const(builder.alloc_const(ConstData {
         ty: int_ty,
         value: ConstValue::Int(1),

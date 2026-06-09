@@ -43,6 +43,7 @@ rir_id!(RirStringifyReqId);
 rir_id!(RirLambdaSigId);
 rir_id!(RirLambdaId);
 rir_id!(RirCellId);
+rir_id!(RirScopedPlaceCellId);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirSymbol(pub String);
@@ -70,6 +71,7 @@ pub struct RirProgram {
     pub lambda_sigs: Vec<RirLambdaSig>,
     pub lambdas: Vec<RirLambda>,
     pub cells: Vec<RirCellDecl>,
+    pub scoped_place_cells: Vec<RirScopedPlaceCellDecl>,
     pub stringify_reqs: Vec<RirStringifyReq>,
     pub stringify_helpers: Vec<RirStringifyHelper>,
     pub consts: Vec<RirConst>,
@@ -222,6 +224,7 @@ pub struct RirLambdaCapture {
 pub enum RirLambdaCaptureKind {
     Param,
     StackCell { cell: RirCellId },
+    ScopedPlaceCell { cell: RirScopedPlaceCellId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +273,24 @@ pub struct RirCellDecl {
 pub enum RirCellRef {
     Owner(RirCellId),
     Capture { cell: RirCellId, local: RirLocalId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirScopedPlaceCellDecl {
+    pub id: RirScopedPlaceCellId,
+    pub owner: RirFunctionId,
+    pub source_local: RirLocalId,
+    pub payload_ty: RirTypeId,
+    pub symbol: RirSymbol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirScopedPlaceCellRef {
+    Owner(RirScopedPlaceCellId),
+    Capture {
+        cell: RirScopedPlaceCellId,
+        local: RirLocalId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +356,7 @@ pub enum RirParamSemantic {
     MutBorrow,
     MutPlace,
     StackCell,
+    ScopedPlaceCell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +366,7 @@ pub enum RirParamAbi {
     MutBorrow,
     MutPlace,
     StackCell,
+    ScopedPlaceCell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +400,10 @@ pub enum RirStmt {
     },
     CellSet {
         cell: RirCellRef,
+        value: RirRValue,
+    },
+    ScopedPlaceCellSet {
+        cell: RirScopedPlaceCellRef,
         value: RirRValue,
     },
     DataRefSet {
@@ -457,6 +484,10 @@ pub enum RirRValue {
     },
     CellGetCopy {
         cell: RirCellRef,
+        ty: RirTypeId,
+    },
+    ScopedPlaceCellGet {
+        cell: RirScopedPlaceCellRef,
         ty: RirTypeId,
     },
     Array {
@@ -601,6 +632,7 @@ pub enum RirLambdaCaptureArg {
     Readonly { value: RirOperand },
     Scoped { place: RirPlace },
     StackCell { cell: RirCellRef },
+    ScopedPlaceCell { cell: RirScopedPlaceCellRef },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,8 +668,18 @@ impl RirCallArg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirMutPlaceArg {
     Local(RirPlace),
-    Param { local: RirLocalId, ty: RirTypeId },
-    StackCell { cell: RirCellRef, ty: RirTypeId },
+    Param {
+        local: RirLocalId,
+        ty: RirTypeId,
+    },
+    StackCell {
+        cell: RirCellRef,
+        ty: RirTypeId,
+    },
+    ScopedPlaceCell {
+        cell: RirScopedPlaceCellRef,
+        ty: RirTypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -778,6 +820,7 @@ pub enum RirVerifySite {
     Extern(RirExternId),
     Function(RirFunctionId),
     Cell(RirCellId),
+    ScopedPlaceCell(RirScopedPlaceCellId),
     Param(RirFunctionId, usize),
     Local(RirFunctionId, RirLocalId),
     Statement(RirFunctionId, usize),
@@ -816,6 +859,12 @@ pub enum RirVerifyErrorKind {
         source_local: RirLocalId,
         first: RirCellId,
         second: RirCellId,
+    },
+    DuplicateScopedPlaceCell {
+        owner: RirFunctionId,
+        source_local: RirLocalId,
+        first: RirScopedPlaceCellId,
+        second: RirScopedPlaceCellId,
     },
     RawEnumMissingRawType,
     RawEnumWrongRawType,
@@ -991,6 +1040,8 @@ impl VerifyCx<'_> {
         self.check_lambda_sigs();
         self.check_lambdas();
         self.check_cells();
+        self.check_scoped_place_cells();
+        self.check_cell_symbol_uniqueness();
         self.check_structs();
         self.check_datarefs();
         self.check_enums();
@@ -1096,9 +1147,13 @@ impl VerifyCx<'_> {
             for param in &sig.params {
                 self.check_type_id(site, param.ty);
                 self.check_abi(site, param.ty, param.semantic, param.abi);
-                if param.semantic == RirParamSemantic::StackCell
-                    || param.abi == RirParamAbi::StackCell
-                {
+                if matches!(
+                    (param.semantic, param.abi),
+                    (
+                        RirParamSemantic::StackCell | RirParamSemantic::ScopedPlaceCell,
+                        _
+                    ) | (_, RirParamAbi::StackCell | RirParamAbi::ScopedPlaceCell)
+                ) {
                     self.push(site, RirVerifyErrorKind::UnsupportedAbi);
                 }
             }
@@ -1108,19 +1163,22 @@ impl VerifyCx<'_> {
     }
 
     fn check_lambda_sig_capture_kinds(&mut self, site: RirVerifySite, sig: RirLambdaSigId) {
-        let mut has_stack_cell = false;
+        let mut has_cell = false;
         let mut has_mut_borrow = false;
         for lambda in self.program.lambdas_for_sig(sig) {
-            has_stack_cell |= lambda
-                .captures
-                .iter()
-                .any(|capture| matches!(capture.kind, RirLambdaCaptureKind::StackCell { .. }));
+            has_cell |= lambda.captures.iter().any(|capture| {
+                matches!(
+                    capture.kind,
+                    RirLambdaCaptureKind::StackCell { .. }
+                        | RirLambdaCaptureKind::ScopedPlaceCell { .. }
+                )
+            });
             has_mut_borrow |= lambda
                 .captures
                 .iter()
                 .any(|capture| capture.semantic == RirParamSemantic::MutBorrow);
         }
-        if has_stack_cell && has_mut_borrow {
+        if has_cell && has_mut_borrow {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
     }
@@ -1157,9 +1215,20 @@ impl VerifyCx<'_> {
             self.check_abi(site, capture.ty, capture.semantic, capture.abi);
             match capture.kind {
                 RirLambdaCaptureKind::Param => {
-                    if capture.semantic == RirParamSemantic::StackCell
-                        || capture.abi == RirParamAbi::StackCell
-                    {
+                    if matches!(
+                        (capture.semantic, capture.abi),
+                        (
+                            RirParamSemantic::MutBorrow
+                                | RirParamSemantic::StackCell
+                                | RirParamSemantic::ScopedPlaceCell,
+                            _
+                        ) | (
+                            _,
+                            RirParamAbi::MutBorrow
+                                | RirParamAbi::StackCell
+                                | RirParamAbi::ScopedPlaceCell
+                        )
+                    ) {
                         self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                     }
                     if capture.semantic == RirParamSemantic::Value
@@ -1182,6 +1251,27 @@ impl VerifyCx<'_> {
                         RirCellRef::Owner(cell),
                         RirCellStorage::StackScoped,
                     ) {
+                        Some(decl) if decl.payload_ty != capture.ty => self.push(
+                            site,
+                            RirVerifyErrorKind::TypeMismatch {
+                                expected: decl.payload_ty,
+                                found: capture.ty,
+                            },
+                        ),
+                        Some(_) | None => {}
+                    }
+                }
+                RirLambdaCaptureKind::ScopedPlaceCell { cell } => {
+                    if capture.semantic != RirParamSemantic::ScopedPlaceCell
+                        || capture.abi != RirParamAbi::ScopedPlaceCell
+                    {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    }
+                    if lambda.escape != RirLambdaEscape::NonEscaping {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    }
+                    match self.check_scoped_place_cell_ref(site, RirScopedPlaceCellRef::Owner(cell))
+                    {
                         Some(decl) if decl.payload_ty != capture.ty => self.push(
                             site,
                             RirVerifyErrorKind::TypeMismatch {
@@ -1274,6 +1364,91 @@ impl VerifyCx<'_> {
                 }
                 if cell.owner == other.owner && cell.symbol == other.symbol {
                     self.push(RirVerifySite::Cell(id), RirVerifyErrorKind::DuplicateSymbol);
+                }
+            }
+        }
+    }
+
+    fn check_scoped_place_cells(&mut self) {
+        for (index, cell) in self.program.scoped_place_cells.iter().enumerate() {
+            let id = RirScopedPlaceCellId::from_index(index);
+            let site = RirVerifySite::ScopedPlaceCell(id);
+            if cell.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            self.check_scoped_place_cell(site, cell);
+        }
+        self.check_scoped_place_cell_uniqueness();
+    }
+
+    fn check_scoped_place_cell(&mut self, site: RirVerifySite, cell: &RirScopedPlaceCellDecl) {
+        self.check_scoped_place_cell_ref(site, RirScopedPlaceCellRef::Owner(cell.id));
+        self.check_function_id(site, cell.owner);
+        self.check_type_id(site, cell.payload_ty);
+        if cell.symbol.as_str().is_empty() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+        let Some(owner) = self.program.functions.get(cell.owner.index()) else {
+            return;
+        };
+        if owner.locals.iter().any(|local| local.symbol == cell.symbol) {
+            self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+        }
+        match owner.locals.get(cell.source_local.index()) {
+            Some(local) if local.id != cell.source_local => {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            Some(local) if local.ty != cell.payload_ty => {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::TypeMismatch {
+                        expected: cell.payload_ty,
+                        found: local.ty,
+                    },
+                );
+            }
+            Some(_) if !self.function_local_is_mut_place_param(owner, cell.source_local) => {
+                self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
+            Some(_) => {}
+            None => self.push(site, RirVerifyErrorKind::BadId),
+        }
+    }
+
+    fn check_scoped_place_cell_uniqueness(&mut self) {
+        for (index, cell) in self.program.scoped_place_cells.iter().enumerate() {
+            let id = RirScopedPlaceCellId::from_index(index);
+            for (other_index, other) in self.program.scoped_place_cells[..index].iter().enumerate()
+            {
+                if cell.owner == other.owner && cell.source_local == other.source_local {
+                    self.push(
+                        RirVerifySite::ScopedPlaceCell(id),
+                        RirVerifyErrorKind::DuplicateScopedPlaceCell {
+                            owner: cell.owner,
+                            source_local: cell.source_local,
+                            first: RirScopedPlaceCellId::from_index(other_index),
+                            second: id,
+                        },
+                    );
+                }
+                if cell.owner == other.owner && cell.symbol == other.symbol {
+                    self.push(
+                        RirVerifySite::ScopedPlaceCell(id),
+                        RirVerifyErrorKind::DuplicateSymbol,
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_cell_symbol_uniqueness(&mut self) {
+        for scoped in &self.program.scoped_place_cells {
+            for cell in &self.program.cells {
+                if scoped.owner == cell.owner && scoped.symbol == cell.symbol {
+                    self.push(
+                        RirVerifySite::ScopedPlaceCell(scoped.id),
+                        RirVerifyErrorKind::DuplicateSymbol,
+                    );
                 }
             }
         }
@@ -1759,9 +1934,15 @@ impl VerifyCx<'_> {
             self.check_local_id(site, function, param.local);
             self.check_type_id(site, param.ty);
             self.check_abi(site, param.ty, param.semantic, param.abi);
-            if (param.semantic == RirParamSemantic::StackCell
-                || param.abi == RirParamAbi::StackCell)
+            if (matches!(param.semantic, RirParamSemantic::StackCell)
+                || matches!(param.abi, RirParamAbi::StackCell))
                 && !self.function_param_is_stack_cell_capture(id, index, *param)
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
+            }
+            if (matches!(param.semantic, RirParamSemantic::ScopedPlaceCell)
+                || matches!(param.abi, RirParamAbi::ScopedPlaceCell))
+                && !self.function_param_is_scoped_place_cell_capture(id, index, *param)
             {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
@@ -1940,6 +2121,13 @@ impl VerifyCx<'_> {
                     if !self.cell_initialized(decl.id) {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
                     }
+                    self.check_rvalue(function_id, function, index, value, Some(decl.payload_ty));
+                }
+            }
+            RirStmt::ScopedPlaceCellSet { cell, value } => {
+                if let Some(decl) =
+                    self.check_function_scoped_place_cell_ref(site, function_id, *cell)
+                {
                     self.check_rvalue(function_id, function, index, value, Some(decl.payload_ty));
                 }
             }
@@ -2339,6 +2527,7 @@ impl VerifyCx<'_> {
             | RirStmt::Assign { .. }
             | RirStmt::CellInit { .. }
             | RirStmt::CellSet { .. }
+            | RirStmt::ScopedPlaceCellSet { .. }
             | RirStmt::DataRefSet { .. }
             | RirStmt::Eval(_) => true,
         }
@@ -2486,6 +2675,32 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(cell_decl.id));
                     }
                 }
+                (
+                    RirLambdaCaptureArg::ScopedPlaceCell { cell },
+                    RirParamSemantic::ScopedPlaceCell,
+                ) => {
+                    let RirLambdaCaptureKind::ScopedPlaceCell { cell: expected } = decl.kind else {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                        continue;
+                    };
+                    let Some(cell_decl) =
+                        self.check_function_scoped_place_cell_ref(site, function_id, *cell)
+                    else {
+                        continue;
+                    };
+                    if cell_decl.id != expected {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    }
+                    if cell_decl.payload_ty != decl.ty {
+                        self.push(
+                            site,
+                            RirVerifyErrorKind::TypeMismatch {
+                                expected: cell_decl.payload_ty,
+                                found: decl.ty,
+                            },
+                        );
+                    }
+                }
                 _ => self.push(site, RirVerifyErrorKind::CallArgMode),
             }
         }
@@ -2598,6 +2813,26 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
                     }
                     if !self.copyable_type(decl.payload_ty) {
+                        self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                    }
+                }
+                Some(*ty)
+            }
+            RirRValue::ScopedPlaceCellGet { cell, ty } => {
+                self.check_type_id(site, *ty);
+                if let Some(decl) =
+                    self.check_function_scoped_place_cell_ref(site, function_id, *cell)
+                {
+                    if decl.payload_ty != *ty {
+                        self.push(
+                            site,
+                            RirVerifyErrorKind::TypeMismatch {
+                                expected: decl.payload_ty,
+                                found: *ty,
+                            },
+                        );
+                    }
+                    if !RustRepPolicy::new(self.program).shareable_value(decl.payload_ty) {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -3097,6 +3332,9 @@ impl VerifyCx<'_> {
             RirMutPlaceArg::Param { local, ty } => {
                 self.check_local_id(site, function, *local);
                 self.check_type_id(site, *ty);
+                if self.function_local_is_scoped_place_source(function_id, *local) {
+                    self.push(site, RirVerifyErrorKind::CallArgMode);
+                }
                 match function.params.iter().find(|param| param.local == *local) {
                     Some(param)
                         if param.semantic == RirParamSemantic::MutPlace
@@ -3132,6 +3370,22 @@ impl VerifyCx<'_> {
                     if !self.cell_initialized(decl.id) {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
                     }
+                }
+                *ty
+            }
+            RirMutPlaceArg::ScopedPlaceCell { cell, ty } => {
+                self.check_type_id(site, *ty);
+                if let Some(decl) =
+                    self.check_function_scoped_place_cell_ref(site, function_id, *cell)
+                    && decl.payload_ty != *ty
+                {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: decl.payload_ty,
+                            found: *ty,
+                        },
+                    );
                 }
                 *ty
             }
@@ -3371,10 +3625,15 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         operand: &RirOperand,
     ) {
-        if let RirOperand::Place(place) = operand
-            && self.function_local_is_mut_place_param(function, place.local)
-        {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        if let RirOperand::Place(place) = operand {
+            if self.function_local_is_hidden_cell_param(function, place.local)
+                || self.function_local_is_scoped_place_source(function.id, place.local)
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
+            if self.function_local_is_mut_place_param(function, place.local) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
         }
     }
 
@@ -3507,6 +3766,11 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::BadId);
                         return None;
                     };
+                    if self.function_local_is_hidden_cell_param(function, *local)
+                        || self.function_local_is_scoped_place_source(function.id, *local)
+                    {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    }
                     if self.function_local_is_mut_place_param(function, *local) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     }
@@ -3539,7 +3803,11 @@ impl VerifyCx<'_> {
             Some(local) => local.ty,
             None => return,
         };
-        if self.function_local_is_stack_cell_param(function, place.local) {
+        if self.function_local_is_hidden_cell_param(function, place.local) {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            return;
+        }
+        if self.function_local_is_scoped_place_source(function.id, place.local) {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             return;
         }
@@ -3591,7 +3859,9 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::BadId);
                         return;
                     };
-                    if self.function_local_is_stack_cell_param(function, *local) {
+                    if self.function_local_is_hidden_cell_param(function, *local)
+                        || self.function_local_is_scoped_place_source(function.id, *local)
+                    {
                         self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                     }
                     if self.function_local_is_mut_place_param(function, *local) {
@@ -3730,6 +4000,47 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_scoped_place_cell_ref(
+        &mut self,
+        site: RirVerifySite,
+        cell_ref: RirScopedPlaceCellRef,
+    ) -> Option<RirScopedPlaceCellDecl> {
+        let cell = match cell_ref {
+            RirScopedPlaceCellRef::Owner(cell) | RirScopedPlaceCellRef::Capture { cell, .. } => {
+                cell
+            }
+        };
+        let decl = self.program.scoped_place_cells.get(cell.index()).cloned();
+        if decl.is_none() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+        decl
+    }
+
+    fn check_function_scoped_place_cell_ref(
+        &mut self,
+        site: RirVerifySite,
+        function: RirFunctionId,
+        cell_ref: RirScopedPlaceCellRef,
+    ) -> Option<RirScopedPlaceCellDecl> {
+        let decl = self.check_scoped_place_cell_ref(site, cell_ref)?;
+        match cell_ref {
+            RirScopedPlaceCellRef::Owner(_) if decl.owner == function => Some(decl),
+            RirScopedPlaceCellRef::Owner(_) => {
+                self.push(site, RirVerifyErrorKind::BadId);
+                None
+            }
+            RirScopedPlaceCellRef::Capture { local, .. } => {
+                if self.function_has_scoped_place_cell_capture(function, decl.id, local) {
+                    Some(decl)
+                } else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    None
+                }
+            }
+        }
+    }
+
     fn mark_cell_initialized(&mut self, cell: RirCellId) {
         if let Some(slot) = self.initialized_cells.get_mut(cell.index()) {
             *slot = true;
@@ -3753,12 +4064,26 @@ impl VerifyCx<'_> {
             .unwrap_or(false)
     }
 
-    fn function_local_is_stack_cell_param(
+    fn function_local_is_hidden_cell_param(
         &self,
         function: &RirFunction,
         local: RirLocalId,
     ) -> bool {
-        self.function_local_param_abi(function, local) == Some(RirParamAbi::StackCell)
+        matches!(
+            self.function_local_param_abi(function, local),
+            Some(RirParamAbi::StackCell | RirParamAbi::ScopedPlaceCell)
+        )
+    }
+
+    fn function_local_is_scoped_place_source(
+        &self,
+        function: RirFunctionId,
+        local: RirLocalId,
+    ) -> bool {
+        self.program
+            .scoped_place_cells
+            .iter()
+            .any(|cell| cell.owner == function && cell.source_local == local)
     }
 
     fn function_local_is_mut_place_param(&self, function: &RirFunction, local: RirLocalId) -> bool {
@@ -3849,6 +4174,84 @@ impl VerifyCx<'_> {
                     lambda.captures.get(param_index),
                     Some(RirLambdaCapture {
                         kind: RirLambdaCaptureKind::StackCell { cell: found },
+                        ..
+                    }) if *found == cell
+                )
+            })
+            && self
+                .program
+                .lambdas
+                .iter()
+                .any(|lambda| lambda.function == function)
+    }
+
+    fn function_has_scoped_place_cell_capture(
+        &self,
+        function: RirFunctionId,
+        cell: RirScopedPlaceCellId,
+        local: RirLocalId,
+    ) -> bool {
+        let Some(function) = self.program.functions.get(function.index()) else {
+            return false;
+        };
+        let Some((param_index, _)) = function
+            .params
+            .iter()
+            .enumerate()
+            .find(|(_, param)| param.local == local)
+        else {
+            return false;
+        };
+        self.function_param_maps_scoped_place_cell(function.id, param_index, cell)
+    }
+
+    fn function_param_is_scoped_place_cell_capture(
+        &self,
+        function: RirFunctionId,
+        param_index: usize,
+        param: RirParam,
+    ) -> bool {
+        param.semantic == RirParamSemantic::ScopedPlaceCell
+            && param.abi == RirParamAbi::ScopedPlaceCell
+            && param.escape == RirParamEscape::NonEscaping
+            && self
+                .program
+                .lambdas
+                .iter()
+                .filter(|lambda| lambda.function == function)
+                .all(|lambda| {
+                    matches!(
+                        lambda.captures.get(param_index),
+                        Some(RirLambdaCapture {
+                            ty,
+                            semantic: RirParamSemantic::ScopedPlaceCell,
+                            abi: RirParamAbi::ScopedPlaceCell,
+                            kind: RirLambdaCaptureKind::ScopedPlaceCell { .. },
+                        }) if *ty == param.ty
+                    )
+                })
+            && self
+                .program
+                .lambdas
+                .iter()
+                .any(|lambda| lambda.function == function)
+    }
+
+    fn function_param_maps_scoped_place_cell(
+        &self,
+        function: RirFunctionId,
+        param_index: usize,
+        cell: RirScopedPlaceCellId,
+    ) -> bool {
+        self.program
+            .lambdas
+            .iter()
+            .filter(|lambda| lambda.function == function)
+            .all(|lambda| {
+                matches!(
+                    lambda.captures.get(param_index),
+                    Some(RirLambdaCapture {
+                        kind: RirLambdaCaptureKind::ScopedPlaceCell { cell: found },
                         ..
                     }) if *found == cell
                 )

@@ -13,9 +13,42 @@ enum CellBorrowState {
     Mutable,
 }
 
+pub(crate) struct CellBorrowFlag {
+    state: Cell<CellBorrowState>,
+}
+
+impl Default for CellBorrowFlag {
+    fn default() -> Self {
+        Self {
+            state: Cell::new(CellBorrowState::Unborrowed),
+        }
+    }
+}
+
+impl CellBorrowFlag {
+    pub(crate) fn shared_guard(&self) -> Result<SharedCellGuard<'_>, RuntimeError> {
+        match self.state.get() {
+            CellBorrowState::Unborrowed => self.state.set(CellBorrowState::Shared(1)),
+            CellBorrowState::Shared(count) => self.state.set(CellBorrowState::Shared(count + 1)),
+            CellBorrowState::Mutable => return Err(cell_borrow_error()),
+        }
+        Ok(SharedCellGuard { flag: self })
+    }
+
+    pub(crate) fn mutable_guard(&self) -> Result<MutableCellGuard<'_>, RuntimeError> {
+        match self.state.get() {
+            CellBorrowState::Unborrowed => self.state.set(CellBorrowState::Mutable),
+            CellBorrowState::Shared(_) | CellBorrowState::Mutable => {
+                return Err(cell_borrow_error());
+            }
+        }
+        Ok(MutableCellGuard { flag: self })
+    }
+}
+
 pub struct StackLambdaCell<T> {
     value: UnsafeCell<T>,
-    borrow: Cell<CellBorrowState>,
+    borrow: CellBorrowFlag,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -23,7 +56,7 @@ impl<T> StackLambdaCell<T> {
     pub fn new(value: T) -> Self {
         Self {
             value: UnsafeCell::new(value),
-            borrow: Cell::new(CellBorrowState::Unborrowed),
+            borrow: CellBorrowFlag::default(),
             _not_send_sync: PhantomData,
         }
     }
@@ -32,7 +65,7 @@ impl<T> StackLambdaCell<T> {
         &self,
         f: impl FnOnce(&T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
-        let _guard = self.shared_guard()?;
+        let _guard = self.borrow.shared_guard()?;
         f(unsafe { &*self.value.get() })
     }
 
@@ -40,7 +73,7 @@ impl<T> StackLambdaCell<T> {
         &self,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
-        let _guard = self.mutable_guard()?;
+        let _guard = self.borrow.mutable_guard()?;
         f(unsafe { &mut *self.value.get() })
     }
 
@@ -54,25 +87,6 @@ impl<T> StackLambdaCell<T> {
             Ok(())
         })
     }
-
-    fn shared_guard(&self) -> Result<SharedCellGuard<'_, T>, RuntimeError> {
-        match self.borrow.get() {
-            CellBorrowState::Unborrowed => self.borrow.set(CellBorrowState::Shared(1)),
-            CellBorrowState::Shared(count) => self.borrow.set(CellBorrowState::Shared(count + 1)),
-            CellBorrowState::Mutable => return Err(cell_borrow_error()),
-        }
-        Ok(SharedCellGuard { cell: self })
-    }
-
-    fn mutable_guard(&self) -> Result<MutableCellGuard<'_, T>, RuntimeError> {
-        match self.borrow.get() {
-            CellBorrowState::Unborrowed => self.borrow.set(CellBorrowState::Mutable),
-            CellBorrowState::Shared(_) | CellBorrowState::Mutable => {
-                return Err(cell_borrow_error());
-            }
-        }
-        Ok(MutableCellGuard { cell: self })
-    }
 }
 
 impl<T: Copy> StackLambdaCell<T> {
@@ -85,16 +99,16 @@ fn cell_borrow_error() -> RuntimeError {
     RuntimeError::new("conflicting mutable cell access")
 }
 
-struct SharedCellGuard<'a, T> {
-    cell: &'a StackLambdaCell<T>,
+pub(crate) struct SharedCellGuard<'a> {
+    flag: &'a CellBorrowFlag,
 }
 
-impl<T> Drop for SharedCellGuard<'_, T> {
+impl Drop for SharedCellGuard<'_> {
     fn drop(&mut self) {
-        match self.cell.borrow.get() {
-            CellBorrowState::Shared(1) => self.cell.borrow.set(CellBorrowState::Unborrowed),
+        match self.flag.state.get() {
+            CellBorrowState::Shared(1) => self.flag.state.set(CellBorrowState::Unborrowed),
             CellBorrowState::Shared(count) => {
-                self.cell.borrow.set(CellBorrowState::Shared(count - 1));
+                self.flag.state.set(CellBorrowState::Shared(count - 1));
             }
             CellBorrowState::Unborrowed | CellBorrowState::Mutable => {
                 debug_assert!(false, "invalid shared cell borrow state");
@@ -103,14 +117,14 @@ impl<T> Drop for SharedCellGuard<'_, T> {
     }
 }
 
-struct MutableCellGuard<'a, T> {
-    cell: &'a StackLambdaCell<T>,
+pub(crate) struct MutableCellGuard<'a> {
+    flag: &'a CellBorrowFlag,
 }
 
-impl<T> Drop for MutableCellGuard<'_, T> {
+impl Drop for MutableCellGuard<'_> {
     fn drop(&mut self) {
-        debug_assert_eq!(self.cell.borrow.get(), CellBorrowState::Mutable);
-        self.cell.borrow.set(CellBorrowState::Unborrowed);
+        debug_assert_eq!(self.flag.state.get(), CellBorrowState::Mutable);
+        self.flag.state.set(CellBorrowState::Unborrowed);
     }
 }
 

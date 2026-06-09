@@ -1,0 +1,25 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+fn leaf(var x: int) {
+    let f = || {
+        x += 1;
+    };
+    f();
+}
+
+fn mid(var x: int) {
+    leaf(x);
+}
+
+fn top(var x: int) {
+    mid(x);
+}
+
+fn main() {
+    var n = 0;
+    top(n);
+    println(n);
+}

@@ -135,22 +135,61 @@ impl Program {
     ) -> Option<CaptureCellId> {
         match root {
             PlaceRoot::CaptureCell(cell) => Some(cell),
-            PlaceRoot::LambdaCapture(slot) => {
-                let FunctionKind::Lambda(lambda) = self.function(function_id).kind else {
-                    return None;
-                };
-                match self
-                    .lambdas
-                    .get(lambda.index())?
-                    .captures
-                    .get(slot.index())?
-                {
-                    LambdaCaptureDecl::CaptureCell { cell, .. } => Some(*cell),
-                    _ => None,
-                }
-            }
+            PlaceRoot::LambdaCapture(slot) => match self.lambda_capture(function_id, slot)? {
+                LambdaCaptureDecl::CaptureCell { cell, .. } => Some(*cell),
+                _ => None,
+            },
             PlaceRoot::Local(_) | PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => None,
         }
+    }
+
+    pub fn scoped_borrow_root(
+        &self,
+        function_id: FunctionId,
+        root: PlaceRoot,
+    ) -> Option<ScopedBorrowId> {
+        match root {
+            PlaceRoot::ScopedBorrow(borrow) => Some(borrow),
+            PlaceRoot::LambdaCapture(slot) => match self.lambda_capture(function_id, slot)? {
+                LambdaCaptureDecl::ScopedBorrow { borrow, .. } => Some(*borrow),
+                _ => None,
+            },
+            PlaceRoot::Local(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => None,
+        }
+    }
+
+    pub fn scoped_borrow_place(&self, borrow: ScopedBorrowId) -> Option<Place> {
+        let decl = self.scoped_borrows.get(borrow.index())?;
+        Some(Place {
+            root: PlaceRoot::ScopedBorrow(borrow),
+            projection: vec![],
+            ty: decl.ty,
+        })
+    }
+
+    fn scoped_borrow_source_local(
+        &self,
+        function_id: FunctionId,
+        borrow: ScopedBorrowId,
+    ) -> Option<LocalId> {
+        let decl = self.scoped_borrows.get(borrow.index())?;
+        if decl.owner != function_id {
+            return None;
+        }
+        match decl.source {
+            ScopedBorrowSource::SourceMutParam { local } => Some(local),
+        }
+    }
+
+    fn lambda_capture(
+        &self,
+        function_id: FunctionId,
+        slot: LambdaCaptureSlotId,
+    ) -> Option<&LambdaCaptureDecl> {
+        let FunctionKind::Lambda(lambda) = self.function(function_id).kind else {
+            return None;
+        };
+        self.lambdas.get(lambda.index())?.captures.get(slot.index())
     }
 
     pub(crate) fn places_may_overlap(
@@ -159,13 +198,29 @@ impl Program {
         left: &Place,
         right: &Place,
     ) -> bool {
-        match (
+        if let (Some(left), Some(right)) = (
             self.capture_cell_root(function_id, left.root),
             self.capture_cell_root(function_id, right.root),
         ) {
-            (Some(left), Some(right)) => left == right,
-            _ => left.may_overlap(right),
+            return left == right;
         }
+        let left_borrow = self.scoped_borrow_root(function_id, left.root);
+        let right_borrow = self.scoped_borrow_root(function_id, right.root);
+        match (left_borrow, right_borrow) {
+            (Some(left), Some(right)) => return left == right,
+            (Some(borrow), None) => {
+                return right.root.local().is_some_and(|local| {
+                    self.scoped_borrow_source_local(function_id, borrow) == Some(local)
+                });
+            }
+            (None, Some(borrow)) => {
+                return left.root.local().is_some_and(|local| {
+                    self.scoped_borrow_source_local(function_id, borrow) == Some(local)
+                });
+            }
+            (None, None) => {}
+        }
+        left.may_overlap(right)
     }
 
     pub fn alloc_extern(&mut self, decl: ExternDecl) -> ExternId {

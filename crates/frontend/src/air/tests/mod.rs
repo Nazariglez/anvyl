@@ -2,8 +2,8 @@ mod support;
 
 pub(super) use support::{
     FunctionBuilder, ProgramBuilder, body_from_block, empty_module, expect_verified, op_const,
-    op_place, place, stmt_assign, stmt_eval, stmt_init, term_return, term_return_void,
-    term_unreachable, test_module,
+    op_place, place, scoped_mut_param_borrow, stmt_assign, stmt_eval, stmt_init, term_return,
+    term_return_void, term_unreachable, test_module,
 };
 
 pub(super) use super::{
@@ -15,8 +15,8 @@ pub(super) use super::{
     FunctionKind, GlobalDecl, GlobalId, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId,
     LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability,
     Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program,
-    Projection, RValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId, Signature, SignatureType,
-    TypeArena, TypeData, TypeId, VariantDecl, VariantId, VariantShape, verify,
+    Projection, RValue, ReturnMode, ScopedBorrowId, Signature, SignatureType, TypeArena, TypeData,
+    TypeId, VariantDecl, VariantId, VariantShape, verify,
 };
 
 mod structure;

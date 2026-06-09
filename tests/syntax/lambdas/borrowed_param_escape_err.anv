@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture borrowed parameter 'x' in an escaping lambda
+// @frontend: new
+
+fn make(var x: int) -> fn() {
+    || {
+        x += 1;
+    }
+}

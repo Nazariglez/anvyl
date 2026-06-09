@@ -7,8 +7,8 @@ pub use super::typing::PrimitiveKind;
 use super::{
     AggregateKind, CaptureLocalSource, ConstValue, EnumRepr, ExternMember, ExternRep, Function,
     FunctionKind, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Param,
-    ParamEscape, ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, SignatureType, TypeData,
-    VariantShape,
+    ParamEscape, ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, ScopedBorrowDecl,
+    ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
         AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirOptionalMatch, AirStmt, AirTail, CallArg,
         Callee, LambdaCaptureArg, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
@@ -441,11 +441,50 @@ pub enum BadFunction {
         owner: FunctionId,
         cell: CaptureCellId,
     },
+    LambdaScopedBorrowNotAccessible {
+        lambda: LambdaId,
+        owner: FunctionId,
+        borrow: ScopedBorrowId,
+    },
     DuplicateCaptureCell {
         owner: FunctionId,
         binding: BindingId,
         first: CaptureCellId,
         second: CaptureCellId,
+    },
+    ScopedBorrowSourceLocalMismatch {
+        borrow: ScopedBorrowId,
+        owner: FunctionId,
+        local: LocalId,
+    },
+    ScopedBorrowSourceLocalTypeMismatch {
+        borrow: ScopedBorrowId,
+        expected: TypeId,
+        found: TypeId,
+    },
+    ScopedBorrowSourceLocalBindingMismatch {
+        borrow: ScopedBorrowId,
+        expected: BindingId,
+        found: Option<BindingId>,
+    },
+    ScopedBorrowSourceLocalMustBeMutParam {
+        borrow: ScopedBorrowId,
+        local: LocalId,
+    },
+    ScopedBorrowSourceMustBeMutable {
+        borrow: ScopedBorrowId,
+    },
+    DuplicateScopedBorrow {
+        owner: FunctionId,
+        binding: BindingId,
+        first: ScopedBorrowId,
+        second: ScopedBorrowId,
+    },
+    DuplicateScopedBorrowSource {
+        owner: FunctionId,
+        source: ScopedBorrowSource,
+        first: ScopedBorrowId,
+        second: ScopedBorrowId,
     },
     CaptureCellSourceLocalMismatch {
         cell: CaptureCellId,
@@ -512,13 +551,23 @@ pub enum BadPlace {
     },
     ImmutableRoot(PlaceRoot),
     UnsupportedCaptureCellProjection(CaptureCellId),
+    UnsupportedScopedBorrowProjection(ScopedBorrowId),
     PromotedBindingBypassesCell {
         binding: BindingId,
         cell: CaptureCellId,
         local: LocalId,
     },
+    PromotedBindingBypassesScopedBorrow {
+        binding: BindingId,
+        borrow: ScopedBorrowId,
+        local: LocalId,
+    },
     CaptureCellNotAccessible {
         cell: CaptureCellId,
+        function: FunctionId,
+    },
+    ScopedBorrowNotAccessible {
+        borrow: ScopedBorrowId,
         function: FunctionId,
     },
     EscapingLambdaScopedBorrowRoot {
@@ -964,6 +1013,7 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     for (id, _) in cx.program.scoped_borrows.iter().enumerate() {
         verify_scoped_borrow(cx, ScopedBorrowId::from_index(id));
     }
+    verify_scoped_borrow_uniqueness(cx);
     for (id, _) in cx.program.capture_cells.iter().enumerate() {
         verify_capture_cell(cx, CaptureCellId::from_index(id));
     }
@@ -1111,7 +1161,7 @@ fn verify_lambda(cx: &mut VerifyCx<'_>, id: LambdaId) {
     let mut bindings = std::collections::HashMap::new();
     let mut sources = std::collections::HashMap::new();
     for (index, capture) in decl.captures.iter().enumerate() {
-        let binding = lambda_capture_decl_binding(capture);
+        let binding = capture.binding();
         if let Some(first) = bindings.insert(binding, index) {
             cx.push(
                 site.clone(),
@@ -1152,26 +1202,6 @@ fn verify_lambda(cx: &mut VerifyCx<'_>, id: LambdaId) {
     }
 }
 
-fn lambda_capture_decl_binding(capture: &LambdaCaptureDecl) -> BindingId {
-    match capture {
-        LambdaCaptureDecl::NoRuntime { binding, .. }
-        | LambdaCaptureDecl::ReadonlyLocal { binding, .. }
-        | LambdaCaptureDecl::ScopedLocal { binding, .. }
-        | LambdaCaptureDecl::ScopedBorrow { binding, .. }
-        | LambdaCaptureDecl::CaptureCell { binding, .. } => *binding,
-    }
-}
-
-fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
-    match capture {
-        LambdaCaptureDecl::NoRuntime { ty, .. }
-        | LambdaCaptureDecl::ReadonlyLocal { ty, .. }
-        | LambdaCaptureDecl::ScopedLocal { ty, .. }
-        | LambdaCaptureDecl::ScopedBorrow { ty, .. }
-        | LambdaCaptureDecl::CaptureCell { ty, .. } => *ty,
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum LambdaCaptureSourceKey {
     Local(CaptureLocalSource),
@@ -1189,17 +1219,6 @@ fn lambda_capture_decl_source(capture: &LambdaCaptureDecl) -> Option<LambdaCaptu
         LambdaCaptureDecl::CaptureCell { cell, .. } => LambdaCaptureSourceKey::CaptureCell(*cell),
         LambdaCaptureDecl::NoRuntime { .. } => return None,
     })
-}
-
-fn lambda_capture_decl_mutability(capture: &LambdaCaptureDecl) -> Mutability {
-    match capture {
-        LambdaCaptureDecl::ScopedLocal { mutability, .. }
-        | LambdaCaptureDecl::ScopedBorrow { mutability, .. } => *mutability,
-        LambdaCaptureDecl::CaptureCell { .. } => Mutability::Mutable,
-        LambdaCaptureDecl::NoRuntime { .. } | LambdaCaptureDecl::ReadonlyLocal { .. } => {
-            Mutability::Immutable
-        }
-    }
 }
 
 fn verify_lambda_capture_decl(
@@ -1253,15 +1272,31 @@ fn verify_lambda_capture_decl(
             );
         }
         LambdaCaptureDecl::ScopedBorrow {
+            binding,
             borrow,
             ty,
             mutability,
-            ..
         } => {
             cx.verify_type_ref(site.clone(), *ty);
             match cx.program.scoped_borrows.get(borrow.index()) {
                 Some(borrow_decl)
-                    if borrow_decl.ty == *ty && borrow_decl.mutability == *mutability => {}
+                    if borrow_decl.binding == *binding
+                        && borrow_decl.ty == *ty
+                        && borrow_decl.mutability == *mutability =>
+                {
+                    if !function_can_access_scoped_borrow(cx.program, decl.owner, *borrow) {
+                        cx.push(
+                            site,
+                            VerifyErrorKind::BadFunction(
+                                BadFunction::LambdaScopedBorrowNotAccessible {
+                                    lambda,
+                                    owner: decl.owner,
+                                    borrow: *borrow,
+                                },
+                            ),
+                        );
+                    }
+                }
                 Some(_) => cx.push(
                     site,
                     VerifyErrorKind::BadFunction(BadFunction::LambdaCaptureSourceMismatch {
@@ -1339,8 +1374,8 @@ fn lambda_capture_matches_local_source(
     source: CaptureLocalSource,
     ty: TypeId,
 ) -> bool {
-    lambda_capture_decl_binding(capture) == binding
-        && lambda_capture_decl_ty(capture) == ty
+    capture.binding() == binding
+        && capture.ty() == ty
         && matches!(
             lambda_capture_decl_source(capture),
             Some(LambdaCaptureSourceKey::Local(found)) if found == source
@@ -1498,8 +1533,122 @@ fn verify_signature_type(cx: &mut VerifyCx<'_>, site: VerifySite, sig: &Signatur
 }
 
 fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
-    let decl = &cx.program.scoped_borrows[id.index()];
-    cx.verify_type_ref(VerifySite::ScopedBorrow(id), decl.ty);
+    let decl = cx.program.scoped_borrows[id.index()].clone();
+    let site = VerifySite::ScopedBorrow(id);
+    if !cx.has_function(decl.owner) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.owner)),
+        );
+    }
+    match decl.source {
+        ScopedBorrowSource::SourceMutParam { local } => {
+            verify_source_mut_param_scoped_borrow(cx, site.clone(), id, &decl, local);
+        }
+    }
+    if decl.mutability != Mutability::Mutable {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceMustBeMutable {
+                borrow: id,
+            }),
+        );
+    }
+    cx.verify_type_ref(site, decl.ty);
+}
+
+fn verify_source_mut_param_scoped_borrow(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    id: ScopedBorrowId,
+    decl: &ScopedBorrowDecl,
+    local: LocalId,
+) {
+    let Some(function) = cx.program.functions.get(decl.owner.index()) else {
+        return;
+    };
+    match function.locals.get(local.index()) {
+        Some(source) => {
+            if source.ty != decl.ty {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(
+                        BadFunction::ScopedBorrowSourceLocalTypeMismatch {
+                            borrow: id,
+                            expected: decl.ty,
+                            found: source.ty,
+                        },
+                    ),
+                );
+            }
+            if source.binding != Some(decl.binding) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(
+                        BadFunction::ScopedBorrowSourceLocalBindingMismatch {
+                            borrow: id,
+                            expected: decl.binding,
+                            found: source.binding,
+                        },
+                    ),
+                );
+            }
+            if !function_param_is_mut_borrow(function, local) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(
+                        BadFunction::ScopedBorrowSourceLocalMustBeMutParam { borrow: id, local },
+                    ),
+                );
+            }
+        }
+        None => cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceLocalMismatch {
+                borrow: id,
+                owner: decl.owner,
+                local,
+            }),
+        ),
+    }
+}
+
+fn function_param_is_mut_borrow(function: &Function, local: LocalId) -> bool {
+    function.signature.params.iter().any(|param| {
+        param.local_id == local
+            && param.mode == ParamMode::MutBorrow
+            && param.role == ParamRole::Normal
+    })
+}
+
+fn verify_scoped_borrow_uniqueness(cx: &mut VerifyCx<'_>) {
+    let mut bindings = std::collections::HashMap::new();
+    let mut sources = std::collections::HashMap::new();
+    for (index, decl) in cx.program.scoped_borrows.iter().enumerate() {
+        let id = ScopedBorrowId::from_index(index);
+        if let Some(first) = bindings.insert((decl.owner, decl.binding), id) {
+            cx.push(
+                VerifySite::ScopedBorrow(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateScopedBorrow {
+                    owner: decl.owner,
+                    binding: decl.binding,
+                    first,
+                    second: id,
+                }),
+            );
+        }
+        if let Some(first) = sources.insert((decl.owner, decl.source), id) {
+            cx.push(
+                VerifySite::ScopedBorrow(id),
+                VerifyErrorKind::BadFunction(BadFunction::DuplicateScopedBorrowSource {
+                    owner: decl.owner,
+                    source: decl.source,
+                    first,
+                    second: id,
+                }),
+            );
+        }
+    }
 }
 
 fn verify_capture_cell(cx: &mut VerifyCx<'_>, id: CaptureCellId) {
@@ -2993,6 +3142,19 @@ fn verify_promoted_local_not_used(
             );
         }
     }
+    for (borrow_index, decl) in cx.program.scoped_borrows.iter().enumerate() {
+        let ScopedBorrowSource::SourceMutParam { local: source } = decl.source;
+        if decl.owner == function_id && source == local {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadPlace(BadPlace::PromotedBindingBypassesScopedBorrow {
+                    binding: decl.binding,
+                    borrow: ScopedBorrowId::from_index(borrow_index),
+                    local,
+                }),
+            );
+        }
+    }
 }
 
 fn verify_init_stmt(
@@ -3546,7 +3708,7 @@ fn verify_lambda_captures(
                 }),
             );
         }
-        if lambda_capture_decl_mutability(decl_capture) == Mutability::Mutable
+        if decl_capture.mutability() == Mutability::Mutable
             && let Some(place) = lambda_capture_arg_place(capture)
         {
             verify_mutable_place(cx, function_id, site, place);
@@ -3605,8 +3767,16 @@ fn place_is_exact_local(place: &Place, source: CaptureLocalSource, ty: TypeId) -
     place.root == PlaceRoot::Local(source.local) && place.projection.is_empty() && place.ty == ty
 }
 
-fn place_is_exact_scoped_borrow(place: &Place, borrow: ScopedBorrowId, ty: TypeId) -> bool {
-    place.root == PlaceRoot::ScopedBorrow(borrow) && place.projection.is_empty() && place.ty == ty
+fn place_is_exact_scoped_borrow(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+    borrow: ScopedBorrowId,
+    ty: TypeId,
+) -> bool {
+    place.projection.is_empty()
+        && place.ty == ty
+        && program.scoped_borrow_root(function_id, place.root) == Some(borrow)
 }
 
 fn lambda_capture_arg_place(capture: &LambdaCaptureArg) -> Option<&Place> {
@@ -3675,7 +3845,7 @@ fn lambda_capture_matches(
         (
             LambdaCaptureDecl::ScopedBorrow { borrow, ty, .. },
             LambdaCaptureArg::ScopedBorrow { place },
-        ) => place_is_exact_scoped_borrow(place, *borrow, *ty),
+        ) => place_is_exact_scoped_borrow(program, function_id, place, *borrow, *ty),
         (
             LambdaCaptureDecl::CaptureCell { cell: expected, .. },
             LambdaCaptureArg::CaptureCell { cell },
@@ -3983,7 +4153,7 @@ fn verify_place_root(
                             ),
                         );
                     }
-                    Some(lambda_capture_decl_ty(capture))
+                    Some(capture.ty())
                 }
                 None => {
                     cx.push(
@@ -4002,7 +4172,9 @@ fn verify_place_root(
                 );
                 return None;
             }
-            if let Some(lambda) = lambda_function(cx.program, function_id) {
+            if let Some(lambda) = lambda_function(cx.program, function_id)
+                && lambda_captures_scoped_borrow(cx.program, lambda, id)
+            {
                 cx.push(
                     site.clone(),
                     VerifyErrorKind::BadPlace(BadPlace::RawScopedBorrowCaptureBypass {
@@ -4024,6 +4196,15 @@ fn verify_place_root(
                         }),
                     );
                 }
+            }
+            if !function_can_access_scoped_borrow(cx.program, function_id, id) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::ScopedBorrowNotAccessible {
+                        borrow: id,
+                        function: function_id,
+                    }),
+                );
             }
             Some(cx.program.scoped_borrows[id.index()].ty)
         }
@@ -4118,6 +4299,39 @@ fn lambda_captures_capture_cell(program: &Program, lambda: LambdaId, cell: Captu
         }))
 }
 
+fn function_can_access_scoped_borrow(
+    program: &Program,
+    function_id: FunctionId,
+    borrow: ScopedBorrowId,
+) -> bool {
+    if program
+        .scoped_borrows
+        .get(borrow.index())
+        .is_some_and(|decl| decl.owner == function_id)
+    {
+        return true;
+    }
+    let Some(FunctionKind::Lambda(lambda)) =
+        program.functions.get(function_id.index()).map(|f| f.kind)
+    else {
+        return false;
+    };
+    lambda_captures_scoped_borrow(program, lambda, borrow)
+}
+
+fn lambda_captures_scoped_borrow(
+    program: &Program,
+    lambda: LambdaId,
+    borrow: ScopedBorrowId,
+) -> bool {
+    program
+        .lambdas
+        .get(lambda.index())
+        .is_some_and(|decl| decl.captures.iter().any(|capture| {
+            matches!(capture, LambdaCaptureDecl::ScopedBorrow { borrow: captured, .. } if *captured == borrow)
+        }))
+}
+
 fn place_mutability(
     program: &Program,
     function_id: FunctionId,
@@ -4135,7 +4349,7 @@ fn place_mutability(
         PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
             .and_then(|lambda| program.lambdas.get(lambda.index()))
             .and_then(|decl| decl.captures.get(slot.index()))
-            .map(lambda_capture_decl_mutability),
+            .map(LambdaCaptureDecl::mutability),
         PlaceRoot::ScopedBorrow(id) => program
             .scoped_borrows
             .get(id.index())
@@ -4174,7 +4388,7 @@ fn place_root_ty(program: &Program, function_id: FunctionId, root: PlaceRoot) ->
         PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
             .and_then(|lambda| program.lambdas.get(lambda.index()))
             .and_then(|decl| decl.captures.get(slot.index()))
-            .map(lambda_capture_decl_ty),
+            .map(LambdaCaptureDecl::ty),
         PlaceRoot::ScopedBorrow(id) => program.scoped_borrows.get(id.index()).map(|decl| decl.ty),
         PlaceRoot::CaptureCell(id) => program.capture_cells.get(id.index()).map(|decl| decl.ty),
         PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.ty),
@@ -4217,6 +4431,15 @@ fn verify_place(
         cx.push(
             site.clone(),
             VerifyErrorKind::BadReference(BadReference::InvalidType(place.ty)),
+        );
+        return None;
+    }
+    if !place.projection.is_empty()
+        && let Some(borrow) = cx.program.scoped_borrow_root(function_id, place.root)
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedScopedBorrowProjection(borrow)),
         );
         return None;
     }
@@ -4943,7 +5166,7 @@ fn lambda_capture_function_escape(
         return FunctionValueCapability::Unknown;
     };
     if !matches!(
-        program.type_arena.get(lambda_capture_decl_ty(capture)),
+        program.type_arena.get(capture.ty()),
         Some(TypeData::Function(_))
     ) {
         return FunctionValueCapability::NonFunction;

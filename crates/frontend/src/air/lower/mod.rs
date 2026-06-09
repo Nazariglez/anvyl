@@ -13,8 +13,9 @@ use super::{
     FunctionSpecialization, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
     LambdaEscape, LambdaId, Local, LocalId, LocalKind, Module, ModuleId,
     Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
-    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, Signature, SignatureType,
-    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
+    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
+    VerifyError, ownership,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -30,11 +31,11 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
-        CallableParent, CaptureStorage, ConstTerm, DeclarationIndex, DefaultArgFact,
-        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueKind, GenericArgs,
-        LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact,
-        LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface,
-        ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
+        CallableParent, CaptureStorage, CaptureStorageOrigin, ConstTerm, DeclarationIndex,
+        DefaultArgFact, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueKind,
+        GenericArgs, LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind,
+        LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode,
+        MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
         SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
         VariantPayload, nominal_generic_args, substitute_aggregate_member,
         type_has_unfinished_facts,
@@ -889,6 +890,7 @@ impl LowerCx<'_> {
             expr_id,
             escape,
             capture.storage,
+            capture.origin,
             self.binding_requires_capture_cell(capture.binding_id),
         )? {
             LoweredCaptureKind::NoRuntime => Ok(LambdaCaptureDecl::NoRuntime { binding, ty }),
@@ -910,6 +912,15 @@ impl LowerCx<'_> {
             LoweredCaptureKind::CaptureCell => {
                 let cell = exact_capture_cell(expr_id, sources, capture, ty)?;
                 Ok(LambdaCaptureDecl::CaptureCell { binding, cell, ty })
+            }
+            LoweredCaptureKind::ScopedBorrow => {
+                let borrow = exact_scoped_borrow(expr_id, sources, capture, ty)?;
+                Ok(LambdaCaptureDecl::ScopedBorrow {
+                    binding,
+                    borrow,
+                    ty,
+                    mutability: AirMutability::Mutable,
+                })
             }
         }
     }
@@ -1625,6 +1636,7 @@ enum LoweredCaptureKind {
     NoRuntime,
     ReadonlyLocal,
     CaptureCell,
+    ScopedBorrow,
 }
 
 struct FunctionLowerer<'cx, 'facts, 'tc> {
@@ -1658,11 +1670,30 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let function = cx.program.function(function_id).clone();
         let mut capture_sources = initial_capture_sources(body, facts, &locals, &function)?;
         capture_sources.extend(lambda_capture_sources(&cx.program, &function));
-        let binding_cells = binding_capture_cells(&cx.program, function_id);
         let owned_lambdas = owned_reachable_lambdas(cx, functions, body);
+        let binding_cells = binding_capture_cells(&cx.program, function_id);
+        let mut binding_scoped_borrows = binding_scoped_borrows(&cx.program, function_id);
+        alloc_borrowed_param_scoped_borrows(
+            cx,
+            function_id,
+            &function,
+            &owned_lambdas,
+            &mut capture_sources,
+            &mut binding_scoped_borrows,
+        )?;
         let locals = locals
             .into_iter()
-            .map(|(semantic, local)| (semantic, function_local_place(&function, local)))
+            .map(|(semantic, local)| {
+                let place = facts
+                    .locals
+                    .defs
+                    .get(&semantic)
+                    .and_then(|def| def.binding_id)
+                    .and_then(|binding| binding_scoped_borrows.get(&binding).copied())
+                    .and_then(|borrow| cx.program.scoped_borrow_place(borrow))
+                    .unwrap_or_else(|| function_local_place(&function, local));
+                (semantic, place)
+            })
             .collect();
         Ok(Self {
             cx,
@@ -2366,7 +2397,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         &mut self,
         expr: &ExprNode,
         requires_mut: bool,
-        allow_capture_cell: bool,
+        allow_promoted_root: bool,
     ) -> Result<Place, LowerError> {
         let fact = if requires_mut {
             match self
@@ -2375,7 +2406,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             {
                 Ok(fact) => fact,
                 Err(LowerError::MissingLocalUse { .. }) => {
-                    return self.lower_mut_place_from_read_fact(expr, allow_capture_cell);
+                    return self.lower_mut_place_from_read_fact(expr, allow_promoted_root);
                 }
                 Err(err) => return Err(err),
             }
@@ -2391,7 +2422,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let root = self.binding_place(&fact)?;
         if requires_mut {
             if self.place_is_capture_cell(&root) {
-                return lower_capture_cell_mut_arg(expr, root, allow_capture_cell);
+                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+            }
+            if self.place_is_scoped_borrow(&root) {
+                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2406,13 +2440,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_mut_place_from_read_fact(
         &mut self,
         expr: &ExprNode,
-        allow_capture_cell: bool,
+        allow_promoted_root: bool,
     ) -> Result<Place, LowerError> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(&fact)?;
             if self.place_is_capture_cell(&root) {
-                return lower_capture_cell_mut_arg(expr, root, allow_capture_cell);
+                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+            }
+            if self.place_is_scoped_borrow(&root) {
+                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2566,6 +2603,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
         match &expr.node.kind {
             ExprKind::Ident(_) => Ok(root),
+            _ if self.place_is_scoped_borrow(&root) => {
+                Err(mutable_place_projection_gap(expr.node.id))
+            }
             _ if self.place_is_capture_cell(&root) => Err(lambda_capture_gap(expr.node.id)),
             ExprKind::Field(field) => {
                 if field.node.safe {
@@ -2601,6 +2641,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.cx
             .program
             .capture_cell_root(self.function_id, place.root)
+            .is_some()
+    }
+
+    fn place_is_scoped_borrow(&self, place: &Place) -> bool {
+        self.cx
+            .program
+            .scoped_borrow_root(self.function_id, place.root)
             .is_some()
     }
 
@@ -2898,6 +2945,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             expr_id,
             escape,
             capture.storage,
+            capture.origin,
             self.cx.binding_requires_capture_cell(capture.binding_id),
         )? {
             LoweredCaptureKind::NoRuntime => Ok(LambdaCaptureArg::NoRuntime),
@@ -2910,6 +2958,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             LoweredCaptureKind::CaptureCell => {
                 let cell = exact_capture_cell(expr_id, &self.capture_sources, capture, ty)?;
                 Ok(LambdaCaptureArg::CaptureCell { cell })
+            }
+            LoweredCaptureKind::ScopedBorrow => {
+                let place = exact_scoped_borrow_place(expr_id, &self.capture_sources, capture, ty)?;
+                Ok(LambdaCaptureArg::ScopedBorrow { place })
             }
         }
     }
@@ -4961,10 +5013,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .filter(|(_, decl)| {
                 facts
                     .lambda_captures()
-                    .get(&(
-                        source,
-                        typecheck_binding_id(lambda_capture_decl_binding(decl)),
-                    ))
+                    .get(&(source, typecheck_binding_id(decl.binding())))
                     .is_some_and(|capture| capture.name == *name)
             })
             .collect::<Vec<_>>();
@@ -4974,13 +5023,20 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(Place {
             root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(*index)),
             projection: vec![],
-            ty: lambda_capture_decl_ty(decl),
+            ty: decl.ty(),
         })
     }
 
     fn require_mutable_place(&self, expr: &ExprNode, place: &Place) -> Result<(), LowerError> {
         if self.place_is_capture_cell(place) {
             return Err(lambda_capture_gap(expr.node.id));
+        }
+        if self.place_is_scoped_borrow(place) {
+            return if place.projection.is_empty() {
+                Ok(())
+            } else {
+                Err(mutable_place_projection_gap(expr.node.id))
+            };
         }
         if let Some(root) = place.root.local()
             && self.function.locals[root.index()].mutability == AirMutability::Mutable
@@ -5392,7 +5448,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(Place {
             root: PlaceRoot::LambdaCapture(*slot),
             projection: vec![],
-            ty: lambda_capture_decl_ty(decl),
+            ty: decl.ty(),
         })
     }
 
@@ -5403,7 +5459,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.cx.program.lambdas[lambda.index()]
             .captures
             .get(slot.index())
-            .map(lambda_capture_decl_mutability)
+            .map(LambdaCaptureDecl::mutability)
     }
 
     fn push_local(
@@ -6543,6 +6599,7 @@ fn lowered_capture_kind(
     expr_id: ExprId,
     escape: LambdaEscapeKind,
     storage: CaptureStorage,
+    origin: CaptureStorageOrigin,
     requires_cell: bool,
 ) -> Result<LoweredCaptureKind, LowerError> {
     match storage {
@@ -6552,6 +6609,12 @@ fn lowered_capture_kind(
             if escape == LambdaEscapeKind::NonEscaping && requires_cell =>
         {
             Ok(LoweredCaptureKind::CaptureCell)
+        }
+        CaptureStorage::BorrowedScoped
+            if escape == LambdaEscapeKind::NonEscaping
+                && origin == CaptureStorageOrigin::BorrowedParam =>
+        {
+            Ok(LoweredCaptureKind::ScopedBorrow)
         }
         CaptureStorage::OwnedMutableScoped
         | CaptureStorage::OwnedMutableUpvalue
@@ -6567,12 +6630,12 @@ fn lambda_capture_gap(expr_id: ExprId) -> LowerError {
     }
 }
 
-fn lower_capture_cell_mut_arg(
+fn lower_promoted_mut_arg(
     expr: &ExprNode,
     root: Place,
-    allow_capture_cell: bool,
+    allowed: bool,
 ) -> Result<Place, LowerError> {
-    if !allow_capture_cell {
+    if !allowed {
         return Err(lambda_capture_gap(expr.node.id));
     }
     if matches!(expr.node.kind, ExprKind::Ident(_)) {
@@ -6661,6 +6724,46 @@ fn exact_capture_cell(
     }
 }
 
+fn exact_scoped_borrow(
+    expr_id: ExprId,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<ScopedBorrowId, LowerError> {
+    match exact_capture_source(expr_id, sources, capture, ty)? {
+        LambdaCaptureSource::Local(place) => match place.root {
+            PlaceRoot::ScopedBorrow(borrow) if place.projection.is_empty() => Ok(borrow),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+        LambdaCaptureSource::Capture { decl, .. } => match decl {
+            LambdaCaptureDecl::ScopedBorrow { borrow, .. } => Ok(borrow),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+    }
+}
+
+fn exact_scoped_borrow_place(
+    expr_id: ExprId,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<Place, LowerError> {
+    match exact_capture_source(expr_id, sources, capture, ty)? {
+        LambdaCaptureSource::Local(place) => match place.root {
+            PlaceRoot::ScopedBorrow(_) if place.projection.is_empty() => Ok(place),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+        LambdaCaptureSource::Capture { slot, decl } => match decl {
+            LambdaCaptureDecl::ScopedBorrow { .. } => Ok(Place {
+                root: PlaceRoot::LambdaCapture(slot),
+                projection: vec![],
+                ty,
+            }),
+            _ => Err(lambda_capture_gap(expr_id)),
+        },
+    }
+}
+
 fn exact_capture_source(
     expr_id: ExprId,
     sources: &HashMap<BindingId, LambdaCaptureSource>,
@@ -6674,9 +6777,7 @@ fn exact_capture_source(
         LambdaCaptureSource::Local(place) if place.projection.is_empty() && place.ty == ty => {
             Ok(source.clone())
         }
-        LambdaCaptureSource::Capture { decl, .. } if lambda_capture_decl_ty(decl) == ty => {
-            Ok(source.clone())
-        }
+        LambdaCaptureSource::Capture { decl, .. } if decl.ty() == ty => Ok(source.clone()),
         _ => Err(lambda_capture_gap(expr_id)),
     }
 }
@@ -6702,6 +6803,93 @@ fn owned_reachable_lambdas(
             _ => None,
         })
         .collect()
+}
+
+fn alloc_borrowed_param_scoped_borrows(
+    cx: &mut LowerCx<'_>,
+    owner: FunctionId,
+    owner_function: &Function,
+    owned_lambdas: &[(ExprId, LambdaId)],
+    capture_sources: &mut HashMap<BindingId, LambdaCaptureSource>,
+    binding_scoped_borrows: &mut HashMap<BindingId, ScopedBorrowId>,
+) -> Result<(), LowerError> {
+    for (expr_id, _) in owned_lambdas {
+        for capture in cx.ordered_lambda_capture_facts(*expr_id)? {
+            if capture.storage != CaptureStorage::BorrowedScoped
+                || capture.origin != CaptureStorageOrigin::BorrowedParam
+            {
+                continue;
+            }
+            let binding = capture.binding_id;
+            let ty = cx.lower_ty(&capture.ty)?;
+            if exact_capture_source(*expr_id, capture_sources, &capture, ty).is_ok_and(|source| {
+                matches!(
+                    source,
+                    LambdaCaptureSource::Local(Place {
+                        root: PlaceRoot::ScopedBorrow(_),
+                        ..
+                    }) | LambdaCaptureSource::Capture {
+                        decl: LambdaCaptureDecl::ScopedBorrow { .. },
+                        ..
+                    }
+                )
+            }) {
+                continue;
+            }
+            let borrow = match binding_scoped_borrows.get(&binding).copied() {
+                Some(borrow) => borrow,
+                None => {
+                    let source_local = exact_source_mut_param_local(
+                        *expr_id,
+                        owner,
+                        owner_function,
+                        capture_sources,
+                        &capture,
+                        ty,
+                    )?;
+                    let borrow = cx.program.alloc_scoped_borrow(ScopedBorrowDecl {
+                        owner,
+                        binding: air_binding_id(binding),
+                        source: ScopedBorrowSource::SourceMutParam {
+                            local: source_local,
+                        },
+                        ty,
+                        mutability: AirMutability::Mutable,
+                    });
+                    binding_scoped_borrows.insert(binding, borrow);
+                    borrow
+                }
+            };
+            let place = cx
+                .program
+                .scoped_borrow_place(borrow)
+                .ok_or_else(|| lambda_capture_gap(*expr_id))?;
+            capture_sources.insert(binding, LambdaCaptureSource::Local(place));
+        }
+    }
+    Ok(())
+}
+
+fn exact_source_mut_param_local(
+    expr_id: ExprId,
+    owner: FunctionId,
+    owner_function: &Function,
+    sources: &HashMap<BindingId, LambdaCaptureSource>,
+    capture: &LambdaCaptureFact,
+    ty: TypeId,
+) -> Result<LocalId, LowerError> {
+    let source = exact_local_capture_source(expr_id, owner, owner_function, sources, capture, ty)?;
+    owner_function
+        .signature
+        .params
+        .iter()
+        .any(|param| {
+            param.local_id == source.local
+                && param.mode == ParamMode::MutBorrow
+                && param.role == ParamRole::Normal
+        })
+        .then_some(source.local)
+        .ok_or_else(|| lambda_capture_gap(expr_id))
 }
 
 fn capture_cell_place(cell: CaptureCellId, ty: TypeId) -> Place {
@@ -6730,6 +6918,24 @@ fn binding_capture_cells(
         .collect()
 }
 
+fn binding_scoped_borrows(
+    program: &Program,
+    owner: FunctionId,
+) -> HashMap<BindingId, ScopedBorrowId> {
+    program
+        .scoped_borrows
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| decl.owner == owner)
+        .map(|(index, decl)| {
+            (
+                typecheck_binding_id(decl.binding),
+                ScopedBorrowId::from_index(index),
+            )
+        })
+        .collect()
+}
+
 fn lambda_capture_sources(
     program: &Program,
     function: &Function,
@@ -6743,7 +6949,7 @@ fn lambda_capture_sources(
         .enumerate()
         .map(|(index, decl)| {
             (
-                typecheck_binding_id(lambda_capture_decl_binding(decl)),
+                typecheck_binding_id(decl.binding()),
                 LambdaCaptureSource::Capture {
                     slot: LambdaCaptureSlotId::from_index(index),
                     decl: decl.clone(),
@@ -6751,37 +6957,6 @@ fn lambda_capture_sources(
             )
         })
         .collect()
-}
-
-fn lambda_capture_decl_binding(capture: &LambdaCaptureDecl) -> AirBindingId {
-    match capture {
-        LambdaCaptureDecl::NoRuntime { binding, .. }
-        | LambdaCaptureDecl::ReadonlyLocal { binding, .. }
-        | LambdaCaptureDecl::ScopedLocal { binding, .. }
-        | LambdaCaptureDecl::ScopedBorrow { binding, .. }
-        | LambdaCaptureDecl::CaptureCell { binding, .. } => *binding,
-    }
-}
-
-fn lambda_capture_decl_ty(capture: &LambdaCaptureDecl) -> TypeId {
-    match capture {
-        LambdaCaptureDecl::NoRuntime { ty, .. }
-        | LambdaCaptureDecl::ReadonlyLocal { ty, .. }
-        | LambdaCaptureDecl::ScopedLocal { ty, .. }
-        | LambdaCaptureDecl::ScopedBorrow { ty, .. }
-        | LambdaCaptureDecl::CaptureCell { ty, .. } => *ty,
-    }
-}
-
-fn lambda_capture_decl_mutability(capture: &LambdaCaptureDecl) -> AirMutability {
-    match capture {
-        LambdaCaptureDecl::ScopedLocal { mutability, .. }
-        | LambdaCaptureDecl::ScopedBorrow { mutability, .. } => *mutability,
-        LambdaCaptureDecl::CaptureCell { .. } => AirMutability::Mutable,
-        LambdaCaptureDecl::NoRuntime { .. } | LambdaCaptureDecl::ReadonlyLocal { .. } => {
-            AirMutability::Immutable
-        }
-    }
 }
 
 fn typecheck_binding_id(binding: AirBindingId) -> BindingId {
@@ -10170,21 +10345,105 @@ fn main() {}
     }
 
     #[test]
-    fn borrowed_lambda_capture_reports_capture_gap() {
+    fn borrowed_param_capture_lowers_to_scoped_borrow() {
         let source = "fn f(var x: int) { || { x = 1; }; }";
-        let (root, resolved, semantic) = checked(source);
-        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
-            .expect_err("expected unsupported borrowed capture");
+        let air = lower_root(source, "f").expect("lower failed");
+        let scoped = ScopedBorrowId::from_index(0);
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(air.scoped_borrows.len(), 1);
+        assert_eq!(air.capture_cells.len(), 0);
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ScopedBorrow { borrow, .. }] if *borrow == scoped
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ScopedBorrow { place }]
+                    if place.root == PlaceRoot::ScopedBorrow(scoped)))
+        }));
         assert!(
-            matches!(
-                err,
-                LowerError::UnsupportedExpr {
-                    kind: "UnsupportedLambdaCapture",
-                    ..
-                }
-            ),
-            "unexpected error: {err:?}"
+            function_statements(air.function(lambda.body)).any(|statement| {
+                matches!(statement, AirStmt::Assign { dst, .. }
+                if dst.root == PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)))
+            })
         );
+    }
+
+    #[test]
+    fn owner_access_after_borrowed_param_capture_uses_scoped_borrow() {
+        let source = "fn f(var x: int) { let g: fn() = || { x = 1; }; x = 2; g; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let scoped = ScopedBorrowId::from_index(0);
+        let owner = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing owner");
+        let statements = function_statements(owner).collect::<Vec<_>>();
+        let lambda_index = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::Init {
+                        value: RValue::MakeLambda { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("missing lambda init");
+
+        assert!(statements[lambda_index + 1..].iter().any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. }
+                if dst.root == PlaceRoot::ScopedBorrow(scoped))
+        }));
+    }
+
+    #[test]
+    fn nested_borrowed_param_recapture_uses_parent_slot() {
+        let source = "fn f(var x: int) { let outer: fn() = || { let inner: fn() = || { x = 1; }; inner; }; outer; }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let scoped = ScopedBorrowId::from_index(0);
+        let outer = air
+            .lambdas
+            .iter()
+            .find(|decl| air.function(decl.owner).name == Ident::new("f"))
+            .expect("missing outer lambda");
+        let inner = air
+            .lambdas
+            .iter()
+            .find(|decl| decl.owner == outer.body)
+            .expect("missing inner lambda");
+
+        assert_eq!(air.scoped_borrows.len(), 1);
+        assert!(matches!(
+            &outer.captures[..],
+            [LambdaCaptureDecl::ScopedBorrow { borrow, .. }] if *borrow == scoped
+        ));
+        assert!(matches!(
+            &inner.captures[..],
+            [LambdaCaptureDecl::ScopedBorrow { borrow, .. }] if *borrow == scoped
+        ));
+        assert!(
+            function_statements(air.function(outer.body)).any(|statement| {
+                matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ScopedBorrow { place }]
+                    if place.root == PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0))))
+            })
+        );
+    }
+
+    #[test]
+    fn uncaptured_var_param_remains_local() {
+        let source = "fn f(var x: int) { x = 1; }";
+        let air = lower_root(source, "f").expect("lower failed");
+
+        assert!(air.scoped_borrows.is_empty());
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. }
+                if dst.root == PlaceRoot::Local(LocalId::from_index(0)))
+        }));
     }
 
     #[test]

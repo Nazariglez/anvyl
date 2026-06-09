@@ -3,8 +3,8 @@ use super::{
     rep_policy::{RustBorrowView, RustRepPolicy},
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
-        RirMutPlaceArg, RirOperand, RirParamSemantic, RirPlace, RirProgram, RirType, RirTypeId,
-        RirVariant, RirVariantKind,
+        RirMutPlaceArg, RirOperand, RirParamSemantic, RirPlace, RirProgram, RirScopedPlaceCellRef,
+        RirType, RirTypeId, RirVariant, RirVariantKind,
     },
     syntax::{
         comma, field_init, match_expr, rust_string, struct_lit, struct_variant, tuple_variant,
@@ -82,6 +82,15 @@ impl<'a> RustValues<'a> {
                     self.cell_ref(*cell)
                 )
             }
+            RirMutPlaceArg::ScopedPlaceCell { cell, .. } => {
+                let cell = match cell {
+                    RirScopedPlaceCellRef::Owner(_) => {
+                        format!("&{}", self.scoped_place_cell_ref(*cell))
+                    }
+                    RirScopedPlaceCellRef::Capture { .. } => self.scoped_place_cell_ref(*cell),
+                };
+                format!("{}::scoped_cell({cell})", target::mut_place_ty())
+            }
         }
     }
 
@@ -89,6 +98,19 @@ impl<'a> RustValues<'a> {
         match cell {
             RirCellRef::Owner(cell) => self.program.cells[cell.index()].symbol.as_str().to_string(),
             RirCellRef::Capture { local, .. } => self.function.locals[local.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+        }
+    }
+
+    fn scoped_place_cell_ref(&self, cell: RirScopedPlaceCellRef) -> String {
+        match cell {
+            RirScopedPlaceCellRef::Owner(cell) => self.program.scoped_place_cells[cell.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+            RirScopedPlaceCellRef::Capture { local, .. } => self.function.locals[local.index()]
                 .symbol
                 .as_str()
                 .to_string(),
@@ -158,21 +180,26 @@ impl<'a> RustValues<'a> {
     }
 
     fn mut_place_value_operand(&self, place: &RirPlace) -> String {
-        let place_expr = self.place(place);
-        if self.policy.cow_value(place.ty) {
-            return format!(
-                "{place_expr}.access({}, |value| Ok(value.share()))?",
-                target::ctx_runtime("ctx")
-            );
+        self.place_value_from_access(place.ty, &self.place(place))
+    }
+
+    pub(super) fn scoped_place_cell_value(
+        &self,
+        cell: RirScopedPlaceCellRef,
+        ty: RirTypeId,
+    ) -> String {
+        self.place_value_from_access(ty, &self.scoped_place_cell_ref(cell))
+    }
+
+    fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
+        if self.policy.cow_value(ty) {
+            return format!("{expr}.access(|value| Ok(value.share()))?");
         }
-        if !self.policy.copyable(place.ty) && self.policy.shareable_value(place.ty) {
-            let value = self.value_from_ref(place.ty, "value");
-            return format!(
-                "{place_expr}.access({}, |value| Ok({value}))?",
-                target::ctx_runtime("ctx")
-            );
+        if !self.policy.copyable(ty) && self.policy.shareable_value(ty) {
+            let value = self.value_from_ref(ty, "value");
+            return format!("{expr}.access(|value| Ok({value}))?");
         }
-        format!("{place_expr}.get_copy({})?", target::ctx_runtime("ctx"))
+        format!("{expr}.get_copy()?")
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
@@ -220,7 +247,8 @@ impl<'a> RustValues<'a> {
             }
             RirParamSemantic::MutBorrow
             | RirParamSemantic::MutPlace
-            | RirParamSemantic::StackCell => unreachable!("verified stringify override mode"),
+            | RirParamSemantic::StackCell
+            | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),
         }
     }
 

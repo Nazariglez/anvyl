@@ -1,0 +1,28 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: mutable pattern alias lowering reaches UnsupportedStmt before borrowed-origin backend gap
+// @match: 1
+
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn inc(var value: int) {
+    value += 1;
+}
+
+fn touch(var point: Point) {
+    var Point { x } = point;
+    let f = || {
+        inc(x);
+    };
+    f();
+}
+
+fn main() {
+    var p = Point { x: 0, y: 0 };
+    touch(p);
+    println(p.x);
+}

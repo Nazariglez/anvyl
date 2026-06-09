@@ -1,0 +1,16 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+fn main() {
+    var n = 0;
+    let outer = |var x: int| {
+        let inner = || {
+            x += 1;
+        };
+        inner();
+    };
+    outer(n);
+    println(n);
+}
