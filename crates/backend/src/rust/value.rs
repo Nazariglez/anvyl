@@ -98,6 +98,9 @@ impl<'a> RustValues<'a> {
                 };
                 format!("{}::scoped_cell({cell})", target::mut_place_ty())
             }
+            RirMutPlaceArg::DataRefProjection { .. } => {
+                unreachable!("dataref mut-place args must be prepared before rendering")
+            }
         }
     }
 
@@ -199,14 +202,15 @@ impl<'a> RustValues<'a> {
     }
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
+        let runtime = target::ctx_runtime("ctx");
         if self.policy.cow_value(ty) {
-            return format!("{expr}.access(ctx.runtime(), |value| Ok(value.share()))?");
+            return target::mut_place_access(expr, &runtime, "Ok(value.share())");
         }
         if !self.policy.copyable(ty) && self.policy.shareable_value(ty) {
             let value = self.value_from_ref(ty, "value");
-            return format!("{expr}.access(ctx.runtime(), |value| Ok({value}))?");
+            return target::mut_place_access(expr, &runtime, &format!("Ok({value})"));
         }
-        format!("{expr}.get_copy(ctx.runtime())?")
+        target::mut_place_get_copy(expr, &runtime)
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {

@@ -2422,10 +2422,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let root = self.binding_place(&fact)?;
         if requires_mut {
             if self.place_is_capture_cell(&root) {
-                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             if self.place_is_scoped_borrow(&root) {
-                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2446,10 +2446,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(&fact)?;
             if self.place_is_capture_cell(&root) {
-                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             if self.place_is_scoped_borrow(&root) {
-                return lower_promoted_mut_arg(expr, root, allow_promoted_root);
+                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
             }
             let Some(root_local) = root.root.local() else {
                 return Err(unsupported_expr(expr));
@@ -2461,6 +2461,24 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
         self.lower_self_mut_place_arg(expr)
             .or_else(|_| self.lower_unique_named_mut_place_arg(expr))
+    }
+
+    fn lower_promoted_mut_arg(
+        &mut self,
+        expr: &ExprNode,
+        root: Place,
+        allowed: bool,
+    ) -> Result<Place, LowerError> {
+        if !allowed {
+            return Err(lambda_capture_gap(expr.node.id));
+        }
+        if matches!(expr.node.kind, ExprKind::Ident(_)) {
+            return Ok(root);
+        }
+        if self.promoted_dataref_projection_root(&root) {
+            return self.lower_projected_place(expr, root);
+        }
+        Err(mutable_place_projection_gap(expr.node.id))
     }
 
     fn lower_unique_named_mut_place_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
@@ -2603,10 +2621,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
         match &expr.node.kind {
             ExprKind::Ident(_) => Ok(root),
-            _ if self.place_is_scoped_borrow(&root) => {
+            _ if self.place_is_scoped_borrow(&root)
+                && !self.promoted_dataref_projection_root(&root) =>
+            {
                 Err(mutable_place_projection_gap(expr.node.id))
             }
-            _ if self.place_is_capture_cell(&root) => Err(lambda_capture_gap(expr.node.id)),
+            _ if self.place_is_capture_cell(&root)
+                && !self.promoted_dataref_projection_root(&root) =>
+            {
+                Err(lambda_capture_gap(expr.node.id))
+            }
             ExprKind::Field(field) => {
                 if field.node.safe {
                     return Err(unsupported_expr(expr));
@@ -2649,6 +2673,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .program
             .scoped_borrow_root(self.function_id, place.root)
             .is_some()
+    }
+
+    fn promoted_dataref_projection_root(&self, place: &Place) -> bool {
+        matches!(self.cx.program.type_data(place.ty), TypeData::DataRef(_))
     }
 
     fn project_tuple_index(
@@ -4595,7 +4623,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 kind: "Call",
             });
         }
-        self.lower_call_args(expr_id, exprs, params, 0)
+        self.lower_call_args(
+            expr_id,
+            exprs,
+            params,
+            0,
+            !matches!(callee, Callee::Extern(_)),
+        )
     }
 
     fn lower_call_args<'a>(
@@ -4604,6 +4638,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         exprs: impl Iterator<Item = &'a ExprNode>,
         params: typing::CalleeParams,
         offset: usize,
+        capture_dataref_roots: bool,
     ) -> Result<Vec<CallArg>, LowerError> {
         exprs
             .enumerate()
@@ -4611,19 +4646,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 let Some(param) = params.get(&self.cx.program, offset + index) else {
                     return Err(unsupported_expr(expr));
                 };
-                match param.mode {
-                    ParamMode::Value => self
-                        .lower_value_to(expr, param.ty, expr)
-                        .map(CallArg::Value),
-                    ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty),
-                    ParamMode::MutBorrow => self.lower_mut_call_arg(expr).and_then(|place| {
-                        if place.ty == param.ty {
-                            Ok(CallArg::MutBorrow(place))
-                        } else {
-                            Err(unsupported_expr(expr))
+                Ok(match param.mode {
+                    ParamMode::Value => CallArg::Value(self.lower_value_to(expr, param.ty, expr)?),
+                    ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty)?,
+                    ParamMode::MutBorrow => {
+                        let place = self.lower_mut_call_arg(expr)?;
+                        if place.ty != param.ty {
+                            return Err(unsupported_expr(expr));
                         }
-                    }),
-                }
+                        let place = if capture_dataref_roots {
+                            self.capture_dataref_mut_place_root(place)?
+                        } else {
+                            place
+                        };
+                        CallArg::MutBorrow(place)
+                    }
+                })
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| match err {
@@ -4633,6 +4671,67 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 },
                 err => err,
             })
+    }
+
+    fn capture_dataref_mut_place_root(&mut self, place: Place) -> Result<Place, LowerError> {
+        if place.projection.is_empty() {
+            return Ok(place);
+        }
+        let Some(root_ty) = self.place_root_ty(place.root) else {
+            return Ok(place);
+        };
+        if !matches!(self.cx.program.type_data(root_ty), TypeData::DataRef(_)) {
+            return Ok(place);
+        }
+        let root = Place {
+            root: place.root,
+            projection: vec![],
+            ty: root_ty,
+        };
+        let Operand::Place(captured) =
+            self.emit_typed_temp(root_ty, RValue::Use(Operand::Place(root)))?
+        else {
+            unreachable!("typed temp lowers to a place")
+        };
+        Ok(Place {
+            root: captured.root,
+            projection: place.projection,
+            ty: place.ty,
+        })
+    }
+
+    fn place_root_ty(&self, root: PlaceRoot) -> Option<TypeId> {
+        match root {
+            PlaceRoot::Local(local) => self
+                .function
+                .locals
+                .get(local.index())
+                .map(|local| local.ty),
+            PlaceRoot::LambdaCapture(slot) => match self.function.kind {
+                FunctionKind::Lambda(lambda) => self
+                    .cx
+                    .program
+                    .lambdas
+                    .get(lambda.index())?
+                    .captures
+                    .get(slot.index())
+                    .map(LambdaCaptureDecl::ty),
+                _ => None,
+            },
+            PlaceRoot::ScopedBorrow(id) => self
+                .cx
+                .program
+                .scoped_borrows
+                .get(id.index())
+                .map(|decl| decl.ty),
+            PlaceRoot::CaptureCell(id) => self
+                .cx
+                .program
+                .capture_cells
+                .get(id.index())
+                .map(|decl| decl.ty),
+            PlaceRoot::Global(id) => self.cx.program.globals.get(id.index()).map(|decl| decl.ty),
+        }
     }
 
     fn lower_call_value(
@@ -4704,8 +4803,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let Some(receiver_param) = params.get(&self.cx.program, 0) else {
             return Err(unsupported_expr(expr));
         };
-        let mut args = vec![self.lower_operand_call_arg(receiver, receiver_param, expr)?];
-        args.extend(self.lower_call_args(expr.node.id, call.node.args.iter(), params, 1)?);
+        let receiver = self.lower_operand_call_arg(receiver, receiver_param, expr)?;
+        let receiver = match receiver {
+            CallArg::MutBorrow(place) => {
+                CallArg::MutBorrow(self.capture_dataref_mut_place_root(place)?)
+            }
+            arg => arg,
+        };
+        let mut args = vec![receiver];
+        args.extend(self.lower_call_args(expr.node.id, call.node.args.iter(), params, 1, true)?);
         let defaults = self.lower_default_args(expr.node.id, args.len(), expected, params)?;
         args.extend(defaults);
         if args.len() != expected {
@@ -4885,7 +4991,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if provided > expected {
             return Err(unsupported_expr(expr));
         }
-        let mut args = self.lower_call_args(expr.node.id, arg_exprs.into_iter(), params, 0)?;
+        let mut args =
+            self.lower_call_args(expr.node.id, arg_exprs.into_iter(), params, 0, true)?;
         let defaults = self.lower_default_args(expr.node.id, provided, expected, params)?;
         args.extend(defaults);
         if args.len() != expected {
@@ -6628,21 +6735,6 @@ fn lambda_capture_gap(expr_id: ExprId) -> LowerError {
     LowerError::UnsupportedExpr {
         expr_id,
         kind: "UnsupportedLambdaCapture",
-    }
-}
-
-fn lower_promoted_mut_arg(
-    expr: &ExprNode,
-    root: Place,
-    allowed: bool,
-) -> Result<Place, LowerError> {
-    if !allowed {
-        return Err(lambda_capture_gap(expr.node.id));
-    }
-    if matches!(expr.node.kind, ExprKind::Ident(_)) {
-        Ok(root)
-    } else {
-        Err(mutable_place_projection_gap(expr.node.id))
     }
 }
 

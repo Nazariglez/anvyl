@@ -30,12 +30,31 @@ pub(super) fn mut_place_ty() -> String {
     rt_path("MutPlace")
 }
 
+pub(super) fn dataref_place_ops_ty(payload: &str) -> String {
+    format!("{}<'cx, {payload}>", rt_path("DataRefPlaceOps"))
+}
+
+pub(super) fn erased_handle_ty() -> String {
+    format!("{}<'cx>", rt_path("ErasedHandle"))
+}
+
+pub(super) fn scoped_mut_place_cell_ty(source_lifetime: &str, payload: &str) -> String {
+    format!(
+        "{}<{source_lifetime}, 'cx, {payload}>",
+        rt_path("ScopedMutPlaceCell")
+    )
+}
+
 pub(super) fn stack_lambda_cell_ctor(payload: &str) -> String {
     format!("{}::<{payload}>", rt_path("StackLambdaCell"))
 }
 
 pub(super) fn lambda_cell_ctor(payload: &str) -> String {
     format!("{}::<{payload}>", rt_path("LambdaCell"))
+}
+
+pub(super) fn scoped_mut_place_cell_new(source: &str) -> String {
+    format!("{}::new({source})", rt_path("ScopedMutPlaceCell"))
 }
 
 pub(super) fn runtime_error_ty() -> String {
@@ -47,7 +66,11 @@ pub(super) fn result_ty(ret: &str) -> String {
 }
 
 pub(super) fn runtime_ctx_ty() -> String {
-    format!("{}<'cx, 'rt>", rt_path("Ctx"))
+    runtime_ctx_ty_with("'rt")
+}
+
+pub(super) fn runtime_ctx_ty_with(rt_lifetime: &str) -> String {
+    format!("{}<'cx, {rt_lifetime}>", rt_path("Ctx"))
 }
 
 pub(super) fn heap_ty() -> String {
@@ -131,8 +154,82 @@ pub(super) fn ctx_heap_with_mut(ctx: &str, object: &str, storage: &str, body: &s
     format!("{ctx}.heap().with_mut({object}, |{storage}| {{ {body} }})")
 }
 
+pub(super) fn heap_access_error() -> String {
+    rt_path("heap_access_error")
+}
+
+pub(super) fn map_heap_access_error(expr: &str) -> String {
+    format!("{expr}.map_err({})?", heap_access_error())
+}
+
+pub(super) fn ctx_heap_erase(ctx: &str, object: &str) -> String {
+    map_heap_access_error(&format!("{ctx}.heap().erase({object})"))
+}
+
+pub(super) fn ctx_heap_try_with_erased(
+    ctx: &str,
+    object: &str,
+    heap_type: &str,
+    storage: &str,
+    storage_ty: &str,
+    body: &str,
+) -> String {
+    ctx_heap_try_with_erased_op(ctx, object, heap_type, storage, storage_ty, body, false)
+}
+
+pub(super) fn ctx_heap_try_with_erased_mut(
+    ctx: &str,
+    object: &str,
+    heap_type: &str,
+    storage: &str,
+    storage_ty: &str,
+    body: &str,
+) -> String {
+    ctx_heap_try_with_erased_op(ctx, object, heap_type, storage, storage_ty, body, true)
+}
+
+fn ctx_heap_try_with_erased_op(
+    ctx: &str,
+    object: &str,
+    heap_type: &str,
+    storage: &str,
+    storage_ty: &str,
+    body: &str,
+    mutable: bool,
+) -> String {
+    let method = if mutable {
+        "try_with_erased_mut"
+    } else {
+        "try_with_erased"
+    };
+    let storage_ref = if mutable { "&mut " } else { "&" };
+    map_heap_access_error(&format!(
+        "{ctx}.heap().{method}({object}, {heap_type}, |{storage}: {storage_ref}{storage_ty}| {body})"
+    ))
+}
+
 pub(super) fn ctx_runtime(ctx: &str) -> String {
     format!("{ctx}.runtime()")
+}
+
+pub(super) fn mut_place_dataref(object: &str, ops: &str) -> String {
+    format!("{}::dataref({object}, {ops})", mut_place_ty())
+}
+
+pub(super) fn mut_place_set(place: &str, runtime: &str, value: &str) -> String {
+    format!("{place}.set({runtime}, {value})?")
+}
+
+pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String {
+    mut_place_region(place, "access", runtime, body)
+}
+
+pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {
+    format!("{place}.get_copy({runtime})?")
+}
+
+pub(super) fn mut_place_region(place: &str, op: &str, runtime: &str, body: &str) -> String {
+    format!("{place}.{op}({runtime}, |value| {body})?")
 }
 
 pub(super) fn heap_scope() -> String {
@@ -158,8 +255,12 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
-        checked_range, ctx_heap_alloc, ctx_heap_with, ctx_heap_with_mut, ctx_runtime,
-        heap_register, heap_scope, lambda_cell_ctor, mut_place_ty, result_ty, runtime_ctx_new,
+        checked_range, ctx_heap_alloc, ctx_heap_erase, ctx_heap_try_with_erased,
+        ctx_heap_try_with_erased_mut, ctx_heap_with, ctx_heap_with_mut, ctx_runtime,
+        dataref_place_ops_ty, erased_handle_ty, heap_access_error, heap_register, heap_scope,
+        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
+        mut_place_get_copy, mut_place_set, mut_place_ty, result_ty, runtime_ctx_new,
+        runtime_ctx_ty_with, scoped_mut_place_cell_new, scoped_mut_place_cell_ty,
         stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
 
@@ -179,10 +280,24 @@ mod tests {
         );
         assert_eq!(mut_place_ty(), "anvyx_runtime::MutPlace");
         assert_eq!(
+            dataref_place_ops_ty("i64"),
+            "anvyx_runtime::DataRefPlaceOps<'cx, i64>"
+        );
+        assert_eq!(erased_handle_ty(), "anvyx_runtime::ErasedHandle<'cx>");
+        assert_eq!(
+            scoped_mut_place_cell_ty("'env", "i64"),
+            "anvyx_runtime::ScopedMutPlaceCell<'env, 'cx, i64>"
+        );
+        assert_eq!(runtime_ctx_ty_with("'_"), "anvyx_runtime::Ctx<'cx, '_>");
+        assert_eq!(
             stack_lambda_cell_ctor("i64"),
             "anvyx_runtime::StackLambdaCell::<i64>"
         );
         assert_eq!(lambda_cell_ctor("i64"), "anvyx_runtime::LambdaCell::<i64>");
+        assert_eq!(
+            scoped_mut_place_cell_new("v0"),
+            "anvyx_runtime::ScopedMutPlaceCell::new(v0)"
+        );
         assert_eq!(result_ty("i64"), "Result<i64, anvyx_runtime::RuntimeError>");
         assert_eq!(result_ty("()"), "Result<(), anvyx_runtime::RuntimeError>");
     }
@@ -237,7 +352,54 @@ mod tests {
             ctx_heap_with_mut("cx", "&v0", "item", "item.value = 1;"),
             "cx.heap().with_mut(&v0, |item| { item.value = 1; })"
         );
+        assert_eq!(heap_access_error(), "anvyx_runtime::heap_access_error");
+        assert_eq!(
+            map_heap_access_error("ctx.heap().erase(&v0)"),
+            "ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
+        );
+        assert_eq!(
+            ctx_heap_erase("ctx", "&v0"),
+            "ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
+        );
+        assert_eq!(
+            ctx_heap_try_with_erased(
+                "ctx",
+                "object",
+                "self.heap_type",
+                "storage",
+                "Node",
+                "f(&storage.value)"
+            ),
+            "ctx.heap().try_with_erased(object, self.heap_type, |storage: &Node| f(&storage.value)).map_err(anvyx_runtime::heap_access_error)?"
+        );
+        assert_eq!(
+            ctx_heap_try_with_erased_mut(
+                "ctx",
+                "object",
+                "self.heap_type",
+                "storage",
+                "Node",
+                "f(&mut storage.value)"
+            ),
+            "ctx.heap().try_with_erased_mut(object, self.heap_type, |storage: &mut Node| f(&mut storage.value)).map_err(anvyx_runtime::heap_access_error)?"
+        );
         assert_eq!(ctx_runtime("ctx"), "ctx.runtime()");
+        assert_eq!(
+            mut_place_dataref("object", "&ops"),
+            "anvyx_runtime::MutPlace::dataref(object, &ops)"
+        );
+        assert_eq!(
+            mut_place_set("place", "ctx.runtime()", "value"),
+            "place.set(ctx.runtime(), value)?"
+        );
+        assert_eq!(
+            mut_place_access("place", "ctx.runtime()", "Ok(value.share())"),
+            "place.access(ctx.runtime(), |value| Ok(value.share()))?"
+        );
+        assert_eq!(
+            mut_place_get_copy("place", "ctx.runtime()"),
+            "place.get_copy(ctx.runtime())?"
+        );
         assert_eq!(heap_scope(), "anvyx_runtime::Heap::scope");
         assert_eq!(runtime_ctx_new("heap"), "anvyx_runtime::Ctx::new(heap)");
     }

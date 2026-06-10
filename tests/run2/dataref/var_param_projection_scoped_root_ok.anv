@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match: 6
+// @match: 1
 
 dataref Counter {
     value: int,
@@ -11,8 +11,13 @@ fn bump(var value: int) {
     value += 1;
 }
 
+fn touch(var c: Counter) {
+    let cb = || { bump(c.value); };
+    cb();
+}
+
 fn main() {
-    var c = Counter { value: 5 };
-    bump(c.value);
+    var c = Counter { value: 0 };
+    touch(c);
     println(c.value);
 }

@@ -1103,6 +1103,80 @@ mod tests {
     }
 
     #[test]
+    fn erased_clone_retains_and_reuses_type_checks() {
+        fn run(heap: &mut Heap<'_>) {
+            let int_ty = heap.register_untracked::<i32>();
+            let string_ty = heap.register_untracked::<String>();
+            let value = heap.alloc(int_ty, 9);
+            let erased = heap.erase(&value).expect("erase live handle");
+            assert_eq!(value.strong_count(), 2);
+            let cloned = erased.clone();
+            assert_eq!(heap.stats().clones, 1);
+            assert_eq!(value.strong_count(), 3);
+            drop(value);
+            drop(erased);
+            heap.collect(0);
+            assert_eq!(heap.try_with_erased(&cloned, int_ty, |value| *value), Ok(9));
+            assert_eq!(
+                heap.try_with_erased(&cloned, string_ty, String::len),
+                Err(AccessError::DeadHandle)
+            );
+            drop(cloned);
+            heap.collect(0);
+            assert_eq!(heap.stats().live, 0);
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
+    fn dead_erased_clone_panics() {
+        fn run(heap: &mut Heap<'_>) {
+            let ty = heap.register_untracked::<i32>();
+            let value = heap.alloc(ty, 1);
+            let erased = heap.erase(&value).expect("erase live handle");
+            let dead = manual_copy(&erased);
+            drop(value);
+            drop(erased);
+            heap.collect(0);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = dead.clone();
+                }))
+                .is_err()
+            );
+            drop(ManuallyDrop::into_inner(dead));
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
+    fn stale_erased_clone_after_slot_reuse_panics_before_mutation() {
+        fn run(heap: &mut Heap<'_>) {
+            let ty = heap.register_untracked::<i32>();
+            let first = heap.alloc(ty, 1);
+            let erased = heap.erase(&first).expect("erase live handle");
+            let stale = manual_copy(&erased);
+            drop(first);
+            drop(erased);
+            heap.collect(0);
+            let second = heap.alloc(ty, 2);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = stale.clone();
+                }))
+                .is_err()
+            );
+            assert_eq!(second.strong_count(), 1);
+            assert_eq!(heap.with(&second, |value| *value), 2);
+            drop(ManuallyDrop::into_inner(stale));
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
     fn heap_teardown_drops_payload_owned_handles_before_deallocating_storage() {
         struct HoldsHandle<'cx> {
             child: Option<Handle<'cx, i32>>,

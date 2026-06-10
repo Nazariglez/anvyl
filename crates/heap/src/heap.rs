@@ -86,12 +86,31 @@ pub struct ErasedHandle<'cx> {
     generation: u64,
     heap_type_id: HeapTypeId,
     brand: PhantomData<Cell<&'cx ()>>,
+    not_send_sync: PhantomData<Rc<()>>,
 }
 
 impl ErasedHandle<'_> {
     #[inline]
     pub fn heap_type_id(&self) -> HeapTypeId {
         self.heap_type_id
+    }
+}
+
+impl Clone for ErasedHandle<'_> {
+    fn clone(&self) -> Self {
+        let state = self.state.get();
+        state
+            .retain_strong(self.ptr, self.generation)
+            .expect("cloned dead or stale heap handle");
+        state.metrics.clones.set(state.metrics.clones.get() + 1);
+        Self {
+            ptr: self.ptr,
+            state: self.state,
+            generation: self.generation,
+            heap_type_id: self.heap_type_id,
+            brand: PhantomData,
+            not_send_sync: PhantomData,
+        }
     }
 }
 
@@ -709,12 +728,12 @@ impl<'cx> Heap<'cx> {
         (TARGET_SLOT_PAGE_BYTES / slot_size).clamp(1, MAX_SLOT_PAGE_SLOTS)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn with<T: 'cx, R>(&self, handle: &Handle<'cx, T>, f: impl FnOnce(&T) -> R) -> R {
         self.try_with(handle, f).expect("invalid heap handle")
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn with_mut<T: 'cx, R>(
         &mut self,
         handle: &Handle<'cx, T>,
@@ -723,7 +742,7 @@ impl<'cx> Heap<'cx> {
         self.try_with_mut(handle, f).expect("invalid heap handle")
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn try_with<T: 'cx, R>(
         &self,
         handle: &Handle<'cx, T>,
@@ -735,7 +754,7 @@ impl<'cx> Heap<'cx> {
         Ok(f(value))
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn try_with_mut<T: 'cx, R>(
         &mut self,
         handle: &Handle<'cx, T>,
@@ -759,6 +778,7 @@ impl<'cx> Heap<'cx> {
             generation: handle.generation,
             heap_type_id: header.heap_type_id.get(),
             brand: PhantomData,
+            not_send_sync: PhantomData,
         })
     }
 

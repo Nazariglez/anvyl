@@ -67,15 +67,18 @@ fn rvalue_calls_fallible(
 ) -> bool {
     rvalue_uses_mut_place_param(function, value)
         || match value {
-            RirRValue::Call { callee, .. } => match callee {
-                RirCallTarget::Function(id) => fallible[id.index()],
-                RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
-                    RirExternKind::Native(native) => native.abi.fallible,
-                },
-                RirCallTarget::LambdaValue { sig, .. } => program
-                    .lambdas_for_sig(*sig)
-                    .any(|lambda| fallible[lambda.function.index()]),
-            },
+            RirRValue::Call { callee, args, .. } => {
+                args.iter().any(call_arg_erases_dataref)
+                    || match callee {
+                        RirCallTarget::Function(id) => fallible[id.index()],
+                        RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
+                            RirExternKind::Native(native) => native.abi.fallible,
+                        },
+                        RirCallTarget::LambdaValue { sig, .. } => program
+                            .lambdas_for_sig(*sig)
+                            .any(|lambda| fallible[lambda.function.index()]),
+                    }
+            }
             RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => true,
             RirRValue::Stringify { source_ty, .. } => {
                 stringify_calls_fallible(program, fallible, *source_ty)
@@ -168,6 +171,13 @@ fn stmt_child_blocks_any(
         | RirStmt::Eval(_)
         | RirStmt::DataRefSet { .. } => false,
     }
+}
+
+fn call_arg_erases_dataref(arg: &RirCallArg) -> bool {
+    matches!(
+        arg,
+        RirCallArg::MutPlace(super::rir::RirMutPlaceArg::DataRefProjection { .. })
+    )
 }
 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {

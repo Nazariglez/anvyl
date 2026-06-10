@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: dataref mutable-place projections await mutable_place_dataref_projections
 // @match: 2
 
 dataref Node {

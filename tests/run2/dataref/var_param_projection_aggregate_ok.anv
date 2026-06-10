@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: aggregate dataref mutable-place projections are future work
+// @match: 2
+
+struct Stats {
+    hp: int,
+}
+
+dataref Node {
+    stats: Stats,
+}
+
+fn replace(var stats: Stats, other: Stats) {
+    stats = other;
+}
+
+fn main() {
+    var node = Node { stats: Stats { hp: 1 } };
+    replace(node.stats, Stats { hp: 2 });
+    println(node.stats.hp);
+}

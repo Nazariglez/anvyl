@@ -1,5 +1,6 @@
 use super::{
     analysis,
+    dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
     place::RustPlaces,
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
@@ -7,9 +8,10 @@ use super::{
         RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
         RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLoop,
-        RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
-        RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic,
+        RirPlace, RirProgram, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
+        RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -45,6 +47,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
     let program = program.program();
     let mut cx = EmitCx {
         program,
+        dataref_places: DataRefPlaceDescriptors::build(program),
         trace_plan: RustTracePlan::build(program),
         fallible_functions: analysis::fallible_functions(program),
         w: RustWriter::default(),
@@ -55,6 +58,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
 
 struct EmitCx<'a> {
     program: &'a RirProgram,
+    dataref_places: DataRefPlaceDescriptors,
     trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
     w: RustWriter,
@@ -70,6 +74,7 @@ impl EmitCx<'_> {
         for dataref in &self.program.datarefs {
             self.emit_dataref(dataref);
         }
+        self.emit_dataref_place_descriptors();
         for env in &self.program.lambda_envs {
             self.emit_lambda_env(env);
         }
@@ -266,6 +271,90 @@ impl EmitCx<'_> {
             target::handle_ty(&policy.dataref_storage_ty(dataref))
         ));
         self.w.blank();
+    }
+
+    fn emit_dataref_place_descriptors(&mut self) {
+        for descriptor in self.dataref_places.all() {
+            Self::emit_dataref_place_descriptor(self.program, &mut self.w, descriptor);
+        }
+    }
+
+    fn emit_dataref_place_descriptor(
+        program: &RirProgram,
+        w: &mut RustWriter,
+        descriptor: &DataRefPlaceDescriptor,
+    ) {
+        let policy = RustRepPolicy::new(program);
+        let dataref = &program.datarefs[descriptor.dataref.index()];
+        let storage = policy.dataref_storage_ty(dataref);
+        let payload = policy.rust_ty(descriptor.ty);
+        let path = descriptor.storage_path(program);
+        w.block(format_args!("struct {}<'cx>", descriptor.symbol), |w| {
+            w.line(format_args!(
+                "heap_type: {},",
+                target::heap_type_ty(&storage)
+            ));
+        });
+        w.blank();
+        w.block(
+            format_args!(
+                "impl<'cx> {} for {}<'cx>",
+                target::dataref_place_ops_ty(&payload),
+                descriptor.symbol
+            ),
+            |w| {
+                Self::emit_dataref_place_op(w, "access", &payload, &storage, &path, false);
+                w.blank();
+                Self::emit_dataref_place_op(w, "mutate", &payload, &storage, &path, true);
+            },
+        );
+        w.blank();
+    }
+
+    fn emit_dataref_place_op(
+        w: &mut RustWriter,
+        name: &str,
+        payload: &str,
+        storage: &str,
+        path: &str,
+        mutable: bool,
+    ) {
+        let payload_ref = if mutable {
+            format!("&mut {payload}")
+        } else {
+            format!("&{payload}")
+        };
+        let path_ref = if mutable { "&mut " } else { "&" };
+        let heap_call = if mutable {
+            target::ctx_heap_try_with_erased_mut
+        } else {
+            target::ctx_heap_try_with_erased
+        };
+        w.line(format_args!("fn {name}("));
+        w.indented(|w| {
+            w.line("&self,");
+            w.line(format_args!(
+                "ctx: &mut {},",
+                target::runtime_ctx_ty_with("'_")
+            ));
+            w.line(format_args!("object: &{},", target::erased_handle_ty()));
+            w.line(format_args!(
+                "f: &mut dyn FnMut({payload_ref}) -> {},",
+                target::result_ty("()")
+            ));
+        });
+        w.line(format_args!(") -> {} {{", target::result_ty("()")));
+        w.indented(|w| {
+            w.line(heap_call(
+                "ctx",
+                "object",
+                "self.heap_type",
+                "storage",
+                storage,
+                &format!("f({path_ref}{path})"),
+            ));
+        });
+        w.line("}");
     }
 
     fn emit_lambda_env(&mut self, env: &RirLambdaEnvLayout) {
@@ -628,7 +717,8 @@ impl EmitCx<'_> {
                                                 }
                                             };
                                             w.line(format_args!(
-                                                "let c{index} = ctx.heap().with(env, |env| {value});"
+                                                "let c{index} = {};",
+                                                target::ctx_heap_with("ctx", "env", "env", &value)
                                             ));
                                         }
                                         let capture_args = (0..captures.len())
@@ -828,8 +918,9 @@ impl EmitCx<'_> {
         {
             let source = function.locals[cell.source_local.index()].symbol.as_str();
             self.w.line(format_args!(
-                "let {} = anvyx_runtime::ScopedMutPlaceCell::new({source});",
-                cell.symbol.as_str()
+                "let {} = {};",
+                cell.symbol.as_str(),
+                target::scoped_mut_place_cell_new(source)
             ));
         }
     }
@@ -1170,9 +1261,7 @@ impl EmitCx<'_> {
             RirRValue::Call { callee, args, .. } => match callee {
                 RirCallTarget::Function(id) => {
                     let symbol = self.program.functions[id.index()].symbol.as_str();
-                    let mut rendered = vec!["ctx".to_string()];
-                    rendered.extend(args.iter().map(|arg| values.call_arg(arg)));
-                    let call = format!("{symbol}({})", comma(rendered));
+                    let call = self.call_expr(function, args, |args| format!("{symbol}({args})"));
                     if self.fallible_functions[id.index()] {
                         format!("{call}?")
                     } else {
@@ -1181,10 +1270,9 @@ impl EmitCx<'_> {
                 }
                 RirCallTarget::Extern(id) => self.extern_call(function, *id, args),
                 RirCallTarget::LambdaValue { callee, sig } => {
-                    let rendered = std::iter::once("ctx".to_string())
-                        .chain(args.iter().map(|arg| values.call_arg(arg)));
+                    let receiver = values.value_operand(callee);
                     let call =
-                        format!("{}.call({})", values.value_operand(callee), comma(rendered));
+                        self.call_expr(function, args, |args| format!("{receiver}.call({args})"));
                     if self.lambda_sig_fallible(&self.program.lambda_sigs[sig.index()]) {
                         format!("{call}?")
                     } else {
@@ -1364,7 +1452,7 @@ impl EmitCx<'_> {
     }
 
     fn mut_place_set(&self, place: String, value: String) -> String {
-        format!("{place}.set(ctx.runtime(), {value})?")
+        target::mut_place_set(&place, &target::ctx_runtime("ctx"), &value)
     }
 
     fn mut_place_region(
@@ -1374,11 +1462,11 @@ impl EmitCx<'_> {
         op: &str,
         body: String,
     ) -> String {
-        format!(
-            "{}.{}(ctx.runtime(), |value| {})?",
-            RustPlaces::new(self.program, function).local_place(place),
+        target::mut_place_region(
+            &RustPlaces::new(self.program, function).local_place(place),
             op,
-            body
+            &target::ctx_runtime("ctx"),
+            &body,
         )
     }
 
@@ -1487,17 +1575,87 @@ impl EmitCx<'_> {
     }
 
     fn cell_get_copy(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
-        match self.cell_decl(cell).storage {
-            RirCellStorage::StackScoped => format!("{}.get_copy()?", self.cell_ref(function, cell)),
+        let decl = self.cell_decl(cell);
+        let policy = RustRepPolicy::new(self.program);
+        let access = if !policy.copyable(decl.payload_ty) && policy.shareable_value(decl.payload_ty)
+        {
+            let values = RustValues::new(self.program, function);
+            let value = values.value_from_ref(decl.payload_ty, "value");
+            format!("access(|value| Ok({value}))")
+        } else {
+            "get_copy()".to_string()
+        };
+        match decl.storage {
+            RirCellStorage::StackScoped => format!("{}.{}?", self.cell_ref(function, cell), access),
             RirCellStorage::Heap => {
                 target::ctx_heap_with(
                     "ctx",
                     &format!("&{}", self.cell_ref(function, cell)),
                     "cell",
-                    "cell.get_copy()",
+                    &format!("cell.{access}"),
                 ) + "?"
             }
         }
+    }
+
+    fn call_expr(
+        &self,
+        function: &RirFunction,
+        args: &[RirCallArg],
+        render: impl FnOnce(String) -> String,
+    ) -> String {
+        let mut prelude = vec![];
+        let mut rendered = vec!["ctx".to_string()];
+        for (index, arg) in args.iter().enumerate() {
+            let (mut stmts, expr) = self.prepared_call_arg(function, index, arg);
+            prelude.append(&mut stmts);
+            rendered.push(expr);
+        }
+        let call = render(comma(rendered));
+        if prelude.is_empty() {
+            call
+        } else {
+            format!("{{ {} {call} }}", prelude.join(" "))
+        }
+    }
+
+    fn prepared_call_arg(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        arg: &RirCallArg,
+    ) -> (Vec<String>, String) {
+        let values = RustValues::new(self.program, function);
+        let RirCallArg::MutPlace(RirMutPlaceArg::DataRefProjection {
+            object,
+            dataref,
+            projections,
+            ty,
+        }) = arg
+        else {
+            return (vec![], values.call_arg(arg));
+        };
+        let descriptor = self
+            .dataref_places
+            .find(*dataref, projections, *ty)
+            .expect("verified dataref place descriptor");
+        let object_tmp = format!("__anv_dataref_place_object_{index}");
+        let ops_tmp = format!("__anv_dataref_place_ops_{index}");
+        let object = values.operand_ref(object);
+        let heap_type = descriptor.heap_type_field(self.program);
+        (
+            vec![
+                format!(
+                    "let {object_tmp} = {};",
+                    target::ctx_heap_erase("ctx", &object)
+                ),
+                format!(
+                    "let {ops_tmp} = {} {{ heap_type: ctx._types.{heap_type} }};",
+                    descriptor.symbol
+                ),
+            ],
+            target::mut_place_dataref(&object_tmp, &format!("&{ops_tmp}")),
+        )
     }
 
     fn lambda_capture_arg(

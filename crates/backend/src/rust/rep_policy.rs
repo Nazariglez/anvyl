@@ -455,7 +455,8 @@ impl<'a> RustRepPolicy<'a> {
                 let payload = self.rust_ty(ty);
                 let source_lifetime = lifetime.unwrap_or("'_");
                 format!(
-                    "&{reference_lifetime}anvyx_runtime::ScopedMutPlaceCell<{source_lifetime}, 'cx, {payload}>"
+                    "&{reference_lifetime}{}",
+                    target::scoped_mut_place_cell_ty(source_lifetime, &payload)
                 )
             }
         }
@@ -505,10 +506,11 @@ impl<'a> RustRepPolicy<'a> {
         self.lambda_sig_has_heap_env(id)
             || self.program.lambdas_for_sig(id).any(|lambda| {
                 lambda.captures.iter().any(|capture| {
-                    matches!(
-                        capture.abi,
-                        RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell
-                    )
+                    self.type_cx_dependent(capture.ty)
+                        || matches!(
+                            capture.abi,
+                            RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell
+                        )
                 })
             })
     }

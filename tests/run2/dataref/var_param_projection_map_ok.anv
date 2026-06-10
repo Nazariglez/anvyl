@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: map-index dataref mutable-place projections are future work
+// @match: 2
+
+dataref Bag {
+    values: [string: int],
+}
+
+fn bump(var value: int) {
+    value += 1;
+}
+
+fn main() {
+    var bag = Bag { values: ["a": 1] };
+    bump(bag.values["a"]);
+    println(bag.values["a"]);
+}

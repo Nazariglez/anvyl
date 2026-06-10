@@ -1,7 +1,8 @@
 // @mode: run
 // @frontend: new
-// @expect: error
-// @skip: array dataref payload needs user-facing target gap
+// @expect: success
+// @skip: dataref array payload projection is future work
+// @match: 1
 
 dataref Item {
     value: int,

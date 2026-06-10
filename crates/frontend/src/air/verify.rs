@@ -4435,6 +4435,7 @@ fn verify_place(
         return None;
     }
     if !place.projection.is_empty()
+        && !matches!(cx.program.type_data(current_ty), TypeData::DataRef(_))
         && let Some(borrow) = cx.program.scoped_borrow_root(function_id, place.root)
     {
         cx.push(

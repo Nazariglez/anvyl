@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
-    AccessError, Ctx, Handle, LambdaCell, RuntimeError, StackLambdaCell,
+    AccessError, Ctx, ErasedHandle, Handle, LambdaCell, RuntimeError, StackLambdaCell,
     lambda_cell::CellBorrowFlag,
 };
 
@@ -9,7 +9,30 @@ pub enum MutPlace<'place, 'cx, T> {
     Local(&'place mut T, PhantomData<&'cx ()>),
     StackCell(&'place StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
+    DataRef(DataRefPlace<'place, 'cx, T>),
     ScopedCell(&'place ScopedMutPlaceCell<'place, 'cx, T>),
+}
+
+pub struct DataRefPlace<'ops, 'cx, T> {
+    object: ErasedHandle<'cx>,
+    ops: &'ops dyn DataRefPlaceOps<'cx, T>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+pub trait DataRefPlaceOps<'cx, T> {
+    fn access(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        object: &ErasedHandle<'cx>,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
+
+    fn mutate(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        object: &ErasedHandle<'cx>,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub struct ScopedMutPlaceCell<'source, 'cx, T> {
@@ -22,6 +45,7 @@ enum ScopedMutPlaceRoot<'source, 'cx, T> {
     Local(*mut T, PhantomData<&'source mut T>, PhantomData<&'cx ()>),
     StackCell(&'source StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
+    DataRef(DataRefPlace<'source, 'cx, T>),
     ScopedCell(&'source ScopedMutPlaceCell<'source, 'cx, T>),
 }
 
@@ -33,12 +57,57 @@ fn heap_access<'cx, 'rt, T: 'cx, R>(
     ctx.heap().try_with(cell, f).map_err(heap_access_error)?
 }
 
-fn heap_access_error(error: AccessError) -> RuntimeError {
+pub fn heap_access_error(error: AccessError) -> RuntimeError {
     let message = match error {
-        AccessError::WrongHeap => "heap cell belongs to a different heap",
-        AccessError::DeadHandle => "heap cell handle is no longer live",
+        AccessError::WrongHeap => "heap object belongs to a different heap",
+        AccessError::DeadHandle => "heap object handle is no longer live",
     };
     RuntimeError::new(message)
+}
+
+impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
+    pub fn new(object: ErasedHandle<'cx>, ops: &'ops dyn DataRefPlaceOps<'cx, T>) -> Self {
+        Self {
+            object,
+            ops,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn reborrow(&self) -> DataRefPlace<'ops, 'cx, T> {
+        Self::new(self.object.clone(), self.ops)
+    }
+
+    fn access<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let mut f = Some(f);
+        let mut out = None;
+        self.ops.access(ctx, &self.object, &mut |slot| {
+            let f = f.take().expect("dataref place access invoked twice");
+            out = Some(f(slot)?);
+            Ok(())
+        })?;
+        Ok(out.expect("dataref place access did not invoke callback"))
+    }
+
+    fn mutate<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let mut f = Some(f);
+        let mut out = None;
+        self.ops.mutate(ctx, &self.object, &mut |slot| {
+            let f = f.take().expect("dataref place mutation invoked twice");
+            out = Some(f(slot)?);
+            Ok(())
+        })?;
+        Ok(out.expect("dataref place mutation did not invoke callback"))
+    }
 }
 
 impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
@@ -54,6 +123,10 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
         Self::HeapCell(cell)
     }
 
+    pub fn dataref(object: ErasedHandle<'cx>, ops: &'place dyn DataRefPlaceOps<'cx, T>) -> Self {
+        Self::DataRef(DataRefPlace::new(object, ops))
+    }
+
     pub fn scoped_cell(cell: &'place ScopedMutPlaceCell<'place, 'cx, T>) -> Self {
         Self::ScopedCell(cell)
     }
@@ -63,6 +136,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => MutPlace::local(&mut **value),
             Self::StackCell(cell, _) => MutPlace::stack_cell(cell),
             Self::HeapCell(cell) => MutPlace::heap_cell(cell.clone()),
+            Self::DataRef(place) => MutPlace::DataRef(place.reborrow()),
             Self::ScopedCell(cell) => MutPlace::scoped_cell(cell),
         }
     }
@@ -76,6 +150,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(value),
             Self::StackCell(cell, _) => cell.access(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.access(f)),
+            Self::DataRef(place) => place.access(ctx, f),
             Self::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
@@ -89,6 +164,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(*value),
             Self::StackCell(cell, _) => cell.mutate(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
+            Self::DataRef(place) => place.mutate(ctx, f),
             Self::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
@@ -141,6 +217,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &*value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.access(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.access(f)),
+            ScopedMutPlaceRoot::DataRef(ref place) => place.access(ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
@@ -155,6 +232,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &mut *value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.mutate(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
+            ScopedMutPlaceRoot::DataRef(ref place) => place.mutate(ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
@@ -177,6 +255,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceRoot<'source, 'cx, T> {
             MutPlace::Local(value, _) => Self::Local(value, PhantomData, PhantomData),
             MutPlace::StackCell(cell, _) => Self::StackCell(cell, PhantomData),
             MutPlace::HeapCell(cell) => Self::HeapCell(cell),
+            MutPlace::DataRef(place) => Self::DataRef(place),
             MutPlace::ScopedCell(cell) => Self::ScopedCell(cell),
         }
     }
@@ -190,7 +269,12 @@ impl<'cx, T: Copy + 'cx> ScopedMutPlaceCell<'_, 'cx, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AnvList, LambdaCell, MutPlace, RuntimeError, ScopedMutPlaceCell, StackLambdaCell};
+    use std::mem::ManuallyDrop;
+
+    use crate::{
+        AnvList, Ctx, DataRefPlaceOps, ErasedHandle, HeapType, LambdaCell, MutPlace, RuntimeError,
+        ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
+    };
 
     macro_rules! with_ctx {
         ($ctx:ident; $($body:tt)*) => {
@@ -391,6 +475,195 @@ mod tests {
         drop(guard);
         cell.set(&mut ctx, 3).unwrap();
         assert_eq!(cell.get_copy(&mut ctx).unwrap(), 3);
+            );
+    }
+
+    struct Storage<T> {
+        field: T,
+    }
+
+    struct FieldOps<'cx, T> {
+        ty: HeapType<'cx, Storage<T>>,
+    }
+
+    impl<'cx, T: 'cx> DataRefPlaceOps<'cx, T> for FieldOps<'cx, T> {
+        fn access(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            ctx.heap()
+                .try_with_erased(object, self.ty, |storage| f(&storage.field))
+                .map_err(heap_access_error)?
+        }
+
+        fn mutate(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            ctx.heap()
+                .try_with_erased_mut(object, self.ty, |storage| f(&mut storage.field))
+                .map_err(heap_access_error)?
+        }
+    }
+
+    fn manual_copy<T>(value: &T) -> ManuallyDrop<T> {
+        // SAFETY: these tests need a bitwise duplicate whose destructor is manually controlled.
+        unsafe { ManuallyDrop::new(std::ptr::read(value)) }
+    }
+
+    unsafe fn copy_erased_to_current_heap<'cx>(erased: &ErasedHandle<'_>) -> ErasedHandle<'cx> {
+        // SAFETY: this is only for wrong-heap diagnostics. The copied handle is dropped exactly once.
+        unsafe { std::mem::transmute_copy(erased) }
+    }
+
+    #[test]
+    fn dataref_place_routes_through_descriptor() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
+        place.update_copy(&mut ctx, |value| value + 1).unwrap();
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
+        place.set(&mut ctx, 5).unwrap();
+        assert_eq!(place.replace(&mut ctx, 8).unwrap(), 5);
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 8);
+            );
+    }
+
+    #[test]
+    fn dataref_place_set_and_replace_do_not_require_clone() {
+        with_ctx!(ctx;
+        struct NonClone(i64);
+
+        let ty = ctx.heap().register_untracked::<Storage<NonClone>>();
+        let object = ctx.heap().alloc(ty, Storage { field: NonClone(1) });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+
+        let old = place.replace(&mut ctx, NonClone(2)).unwrap();
+        assert_eq!(old.0, 1);
+        place.set(&mut ctx, NonClone(3)).unwrap();
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field.0), 3);
+            );
+    }
+
+    #[test]
+    fn dataref_place_reborrow_preserves_identity() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+        {
+            let mut forwarded = place.reborrow();
+            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
+        }
+        place.update_copy(&mut ctx, |value| value + 1).unwrap();
+
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 3);
+            );
+    }
+
+    #[test]
+    fn dataref_place_keeps_object_live() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+        drop(object);
+        ctx.heap().collect(0);
+
+        place.update_copy(&mut ctx, |value| value + 1).unwrap();
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
+            );
+    }
+
+    #[test]
+    fn dataref_place_errors_for_wrong_heap_type_and_dead_handle() {
+        with_ctx!(ctx;
+        let int_ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let bool_ty = ctx.heap().register_untracked::<Storage<bool>>();
+        let object = ctx.heap().alloc(int_ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let wrong_ops = FieldOps { ty: bool_ty };
+        let wrong = MutPlace::dataref(erased, &wrong_ops);
+        assert_eq!(
+            wrong.get_copy(&mut ctx).unwrap_err().message(),
+            "heap object handle is no longer live"
+        );
+        drop(wrong);
+
+        let foreign = ManuallyDrop::new(ctx.heap().erase(&object).unwrap());
+        crate::Heap::scope(|heap| {
+            let mut ctx = Ctx::new(heap);
+            let ty = ctx.heap().register_untracked::<Storage<i64>>();
+            let ops = FieldOps { ty };
+            let foreign = unsafe { copy_erased_to_current_heap(&foreign) };
+            let wrong = MutPlace::dataref(foreign, &ops);
+            assert_eq!(
+                wrong.get_copy(&mut ctx).unwrap_err().message(),
+                "heap object belongs to a different heap"
+            );
+        });
+
+        let erased = ctx.heap().erase(&object).unwrap();
+        let dead = manual_copy(&erased);
+        drop(object);
+        drop(erased);
+        ctx.heap().collect(0);
+        let ops = FieldOps { ty: int_ty };
+        let dead = MutPlace::dataref(ManuallyDrop::into_inner(dead), &ops);
+        assert_eq!(
+            dead.get_copy(&mut ctx).unwrap_err().message(),
+            "heap object handle is no longer live"
+        );
+            );
+    }
+
+    #[test]
+    fn dataref_place_region_restores_after_error() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+        let err = place
+            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
+            .unwrap_err();
+
+        assert_eq!(err.message(), "early");
+        place.set(&mut ctx, 2).unwrap();
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 2);
+            );
+    }
+
+    #[test]
+    fn scoped_cell_mutates_dataref_place() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let cell = ScopedMutPlaceCell::new(MutPlace::dataref(erased, &ops));
+
+        cell.set(&mut ctx, 2).unwrap();
+        let mut forwarded = MutPlace::scoped_cell(&cell);
+        forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
+
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 3);
             );
     }
 

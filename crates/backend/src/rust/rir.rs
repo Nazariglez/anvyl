@@ -713,6 +713,12 @@ pub enum RirMutPlaceArg {
         cell: RirScopedPlaceCellRef,
         ty: RirTypeId,
     },
+    DataRefProjection {
+        object: RirOperand,
+        dataref: RirDataRefId,
+        projections: Vec<RirProjection>,
+        ty: RirTypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,6 +866,12 @@ pub enum RirVerifySite {
     RValue(RirFunctionId, usize),
     CallArg(RirFunctionId, usize, usize),
     Terminator(RirFunctionId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageProjectionMode {
+    Ordinary,
+    MutPlace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2299,9 +2311,14 @@ impl VerifyCx<'_> {
                 projections,
                 value,
             } => {
-                if let Some(ty) =
-                    self.check_dataref_access(site, function, object, *dataref, projections)
-                {
+                if let Some(ty) = self.check_dataref_access(
+                    site,
+                    function,
+                    object,
+                    *dataref,
+                    projections,
+                    StorageProjectionMode::Ordinary,
+                ) {
                     self.check_value_operand_ty(site, function, value, ty);
                 }
             }
@@ -3000,8 +3017,14 @@ impl VerifyCx<'_> {
                 ty,
             } => {
                 self.check_type_id(site, *ty);
-                let found =
-                    self.check_dataref_access(site, function, object, *dataref, projections);
+                let found = self.check_dataref_access(
+                    site,
+                    function,
+                    object,
+                    *dataref,
+                    projections,
+                    StorageProjectionMode::Ordinary,
+                );
                 if let Some(found) = found
                     && found != *ty
                 {
@@ -3030,7 +3053,9 @@ impl VerifyCx<'_> {
                     if !self.cell_initialized(decl.id) {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
                     }
-                    if !self.copyable_type(decl.payload_ty) {
+                    if !self.copyable_type(decl.payload_ty)
+                        && !RustRepPolicy::new(self.program).shareable_value(decl.payload_ty)
+                    {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
                 }
@@ -3603,6 +3628,37 @@ impl VerifyCx<'_> {
                 }
                 *ty
             }
+            RirMutPlaceArg::DataRefProjection {
+                object,
+                dataref,
+                projections,
+                ty,
+            } => {
+                self.check_type_id(site, *ty);
+                let found = self.check_dataref_access(
+                    site,
+                    function,
+                    object,
+                    *dataref,
+                    projections,
+                    StorageProjectionMode::MutPlace,
+                );
+                if let Some(found) = found {
+                    if found != *ty {
+                        self.push(
+                            site,
+                            RirVerifyErrorKind::TypeMismatch {
+                                expected: found,
+                                found: *ty,
+                            },
+                        );
+                    }
+                    if !self.dataref_mut_place_payload_supported(found, projections.len() == 1) {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    }
+                }
+                *ty
+            }
         }
     }
 
@@ -3933,22 +3989,26 @@ impl VerifyCx<'_> {
         object: &RirOperand,
         dataref_id: RirDataRefId,
         projections: &[RirProjection],
+        mode: StorageProjectionMode,
     ) -> Option<RirTypeId> {
         let object_ty = self.value_operand_ty(site, function, object);
+        if mode == StorageProjectionMode::MutPlace {
+            self.check_short_region_operand(site, function, object);
+        }
         if object_ty.and_then(|ty| self.ty(ty)) != Some(RirType::DataRef(dataref_id)) {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         self.check_dataref_id(site, dataref_id);
-        let dataref = self.program.datarefs.get(dataref_id.index())?.clone();
-        self.check_storage_projection(site, function, &dataref.fields, projections)
+        self.check_storage_projection(site, function, dataref_id, projections, mode)
     }
 
     fn check_storage_projection(
         &mut self,
         site: RirVerifySite,
         function: &RirFunction,
-        fields: &[RirField],
+        dataref_id: RirDataRefId,
         projections: &[RirProjection],
+        mode: StorageProjectionMode,
     ) -> Option<RirTypeId> {
         let Some((first, rest)) = projections.split_first() else {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -3958,7 +4018,12 @@ impl VerifyCx<'_> {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             return None;
         };
-        let Some(field) = fields.get(field_id.index()) else {
+        let Some(field) = self
+            .program
+            .datarefs
+            .get(dataref_id.index())
+            .and_then(|dataref| dataref.fields.get(field_id.index()))
+        else {
             self.push(site, RirVerifyErrorKind::BadId);
             return None;
         };
@@ -4000,6 +4065,10 @@ impl VerifyCx<'_> {
                     current = field.ty;
                 }
                 RirProjection::Index(local) => {
+                    if mode == StorageProjectionMode::MutPlace {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return None;
+                    }
                     let Some(RirType::Array { elem, .. }) = self.ty(current) else {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                         return None;
@@ -4509,6 +4578,14 @@ impl VerifyCx<'_> {
 
     fn stringify_req(&self, ty: RirTypeId) -> Option<&RirStringifyReq> {
         self.program.stringify_reqs.iter().find(|req| req.ty == ty)
+    }
+
+    fn dataref_mut_place_payload_supported(&self, ty: RirTypeId, direct: bool) -> bool {
+        match self.ty(ty) {
+            Some(RirType::Int | RirType::Float | RirType::Bool) => true,
+            Some(RirType::DataRef(_)) => direct,
+            _ => false,
+        }
     }
 
     fn copyable_type(&self, ty: RirTypeId) -> bool {

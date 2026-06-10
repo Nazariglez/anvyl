@@ -13,7 +13,10 @@ use anvyx_frontend::{
 };
 
 use super::{
-    RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job, emit, plan,
+    RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
+    dataref_mut_place::{DataRefMutPlaceSupport, classify as classify_dataref_mut_place},
+    dataref_place::DataRefPlaceDescriptors,
+    emit, plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
@@ -1039,21 +1042,29 @@ fn emit_dataref_set_uses_short_mut_heap_borrow() {
 }
 
 #[test]
-fn plan_gaps_projected_source_mut_call_arg_instead_of_copyback() {
-    assert_plan_gap(
-        projected_mut_call_arg_program(),
-        rust_plan_config(),
-        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
-    );
+fn plan_lowers_projected_source_mut_call_arg_to_dataref_place() {
+    let source = plan_source(projected_mut_call_arg_program()).into_string();
+
+    assert!(source.contains("let __anv_dataref_place_object_0 = ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?;"));
+    assert!(source.contains(
+        "anvyx_runtime::MutPlace::dataref(__anv_dataref_place_object_0, &__anv_dataref_place_ops_0)"
+    ));
+    assert!(source.contains("try_with_erased(object, self.heap_type"));
+    assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
 }
 
 #[test]
-fn plan_gaps_multiple_projected_source_mut_call_args_without_copyback() {
-    assert_plan_gap(
-        multi_projected_mut_call_arg_program(),
-        rust_plan_config(),
-        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+fn plan_lowers_multiple_projected_source_mut_call_args_without_copyback() {
+    let source = plan_source(multi_projected_mut_call_arg_program()).into_string();
+
+    assert_eq!(
+        source.matches("anvyx_runtime::MutPlace::dataref").count(),
+        2
     );
+    assert!(source.contains("__anv_dataref_place_object_0"));
+    assert!(source.contains("__anv_dataref_place_object_1"));
+    assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
+    assert!(!source.contains("ctx.heap().with_mut(&v1, |storage| { storage.value ="));
 }
 
 #[test]
@@ -2439,26 +2450,14 @@ fn rir_rejects_stack_cell_get_type_mismatch() {
 }
 
 #[test]
-fn rir_rejects_noncopy_stack_cell_get_copy() {
+fn rir_rejects_nonshareable_stack_cell_get_copy() {
     let mut program = stack_cell_rir_with(|cell| cell.payload_ty = RirTypeId::from_index(2));
-    program.types.push(RirType::String);
+    program.types.push(RirType::Slice(RirTypeId::from_index(1)));
     program.functions[0].locals[0].ty = RirTypeId::from_index(2);
-    let value = RirConstId::from_index(0);
-    program.consts.push(RirConst {
-        id: value,
+    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::CellGetCopy {
+        cell: owner_cell_ref(),
         ty: RirTypeId::from_index(2),
-        value: RirConstValue::String("x".to_string()),
-    });
-    program.functions[0].body.stmts = vec![
-        RirStmt::CellInit {
-            cell: owner_cell_ref(),
-            value: RirRValue::Use(RirOperand::Const(value)),
-        },
-        RirStmt::Eval(RirRValue::CellGetCopy {
-            cell: owner_cell_ref(),
-            ty: RirTypeId::from_index(2),
-        }),
-    ];
+    })];
 
     assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
 }
@@ -6102,19 +6101,34 @@ fn profile_rejects_scoped_borrowed_param_to_native_mut_borrow() {
 }
 
 #[test]
-fn profile_rejects_dataref_source_var_arg() {
-    expect_reject(
-        projected_mut_call_arg_program(),
-        ProfileErrorKind::UnsupportedMutablePlaceDataRef,
-    );
+fn classifier_accepts_direct_scalar_dataref_source_var_arg() {
+    let program = projected_mut_call_arg_program();
+    let function = FunctionId::from_index(1);
+    let Statement::Eval(RValue::Call { args, .. }) =
+        &program.function(function).body.block.stmts[0]
+    else {
+        unreachable!();
+    };
+    let CallArg::MutBorrow(place) = &args[0] else {
+        unreachable!();
+    };
+    let root = place.root.local().unwrap();
+    let root_ty = program.function(function).locals[root.index()].ty;
+
+    assert!(matches!(
+        classify_dataref_mut_place(&program, root_ty, place),
+        DataRefMutPlaceSupport::Supported(_)
+    ));
 }
 
 #[test]
-fn profile_rejects_capture_cell_dataref_source_var_arg() {
-    expect_reject(
-        capture_cell_dataref_source_var_arg_program(),
-        ProfileErrorKind::UnsupportedMutablePlaceDataRef,
-    );
+fn profile_accepts_dataref_source_var_arg() {
+    check(projected_mut_call_arg_program());
+}
+
+#[test]
+fn profile_accepts_capture_cell_dataref_source_var_arg() {
+    check(capture_cell_dataref_source_var_arg_program());
 }
 
 #[test]
@@ -7631,6 +7645,278 @@ fn rir_verify_rejects_bad_dataref_field_type() {
     program.datarefs[0].fields[0].ty = RirTypeId::from_index(9);
 
     assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn dataref_place_descriptor_inventory_dedups_same_projection() {
+    let mut program =
+        dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    let stmt = program.functions[0].body.stmts[0].clone();
+    program.functions[0].body.stmts.push(stmt);
+
+    let descriptors = DataRefPlaceDescriptors::build(&program);
+
+    assert_eq!(descriptors.all().len(), 1);
+    assert_eq!(descriptors.all()[0].symbol, "anvP0_Node_value_place");
+}
+
+#[test]
+fn dataref_place_descriptor_inventory_separates_different_projections() {
+    let mut program =
+        dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    program.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Call {
+            callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+            args: vec![RirCallArg::MutPlace(
+                nested_dataref_projection_mut_place_arg(),
+            )],
+            ty: RirTypeId::from_index(4),
+        }));
+
+    let descriptors = DataRefPlaceDescriptors::build(&program);
+    let symbols = descriptors
+        .all()
+        .iter()
+        .map(|descriptor| descriptor.symbol.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        symbols,
+        ["anvP0_Node_value_place", "anvP1_Node_point_x_place"]
+    );
+}
+
+#[test]
+fn dataref_place_descriptor_inventory_finds_call_arg_descriptor() {
+    let program = dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    let descriptors = DataRefPlaceDescriptors::build(&program);
+    let RirStmt::Eval(RirRValue::Call { args, .. }) = &program.functions[0].body.stmts[0] else {
+        unreachable!();
+    };
+    let RirCallArg::MutPlace(RirMutPlaceArg::DataRefProjection {
+        dataref,
+        projections,
+        ty,
+        ..
+    }) = &args[0]
+    else {
+        unreachable!();
+    };
+
+    let descriptor = descriptors
+        .find(*dataref, projections, *ty)
+        .expect("descriptor missing for dataref arg");
+
+    assert_eq!(descriptor.symbol, "anvP0_Node_value_place");
+}
+
+#[test]
+fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
+    let source = emit::emit(
+        &rir::verify(&dataref_projection_mut_place_call_rir(
+            valid_dataref_projection_mut_place_arg(),
+        ))
+        .expect("RIR verify failed"),
+    )
+    .into_string();
+
+    for needle in [
+        "struct anvP0_Node_value_place<'cx>",
+        "heap_type: anvyx_runtime::HeapType<'cx, NodeStorage<'cx>>",
+        "impl<'cx> anvyx_runtime::DataRefPlaceOps<'cx, i64> for anvP0_Node_value_place<'cx>",
+        "try_with_erased(object, self.heap_type, |storage: &NodeStorage<'cx>| f(&storage.value))",
+        "try_with_erased_mut(object, self.heap_type, |storage: &mut NodeStorage<'cx>| f(&mut storage.value))",
+        "let __anv_dataref_place_object_0 = ctx.heap().erase(&node).map_err(anvyx_runtime::heap_access_error)?;",
+        "let __anv_dataref_place_ops_0 = anvP0_Node_value_place { heap_type: ctx._types.NodeHeapType };",
+        "sink(ctx, anvyx_runtime::MutPlace::dataref(__anv_dataref_place_object_0, &__anv_dataref_place_ops_0))",
+    ] {
+        assert!(source.contains(needle), "missing {needle}");
+    }
+    assert!(!source.contains("\"value\""));
+}
+
+#[test]
+fn emit_nested_dataref_projection_mut_place_descriptor_path() {
+    let source = emit::emit(
+        &rir::verify(&dataref_projection_mut_place_call_rir(
+            nested_dataref_projection_mut_place_arg(),
+        ))
+        .expect("RIR verify failed"),
+    )
+    .into_string();
+
+    assert!(source.contains("struct anvP0_Node_point_x_place<'cx>"));
+    assert!(source.contains("f(&storage.point.x)"));
+    assert!(source.contains("f(&mut storage.point.x)"));
+}
+
+#[test]
+fn rir_verify_accepts_direct_scalar_dataref_projection_mut_place_arg() {
+    rir::verify(&dataref_projection_mut_place_call_rir(
+        valid_dataref_projection_mut_place_arg(),
+    ))
+    .expect("RIR rejected dataref projection mut-place arg");
+}
+
+#[test]
+fn rir_verify_accepts_nested_inline_scalar_dataref_projection_mut_place_arg() {
+    rir::verify(&dataref_projection_mut_place_call_rir(
+        nested_dataref_projection_mut_place_arg(),
+    ))
+    .expect("RIR rejected nested dataref projection mut-place arg");
+}
+
+#[test]
+fn rir_verify_rejects_dataref_projection_mut_place_arg_wrong_object_type() {
+    let arg = edit_dataref_projection_mut_place_arg(|object, _, _, _| {
+        *object = RirOperand::Const(RirConstId::from_index(0));
+    });
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_dataref_projection_mut_place_arg_wrong_dataref_id() {
+    let arg = edit_dataref_projection_mut_place_arg(|_, dataref, _, _| {
+        *dataref = RirDataRefId::from_index(1);
+    });
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_dataref_projection_mut_place_arg_wrong_payload_type() {
+    let arg = edit_dataref_projection_mut_place_arg(|_, _, _, ty| {
+        *ty = RirTypeId::from_index(5);
+    });
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::TypeMismatch {
+            expected: RirTypeId::from_index(0),
+            found: RirTypeId::from_index(5),
+        },
+    );
+}
+
+#[test]
+fn rir_verify_rejects_empty_dataref_projection_mut_place_arg() {
+    let arg = edit_dataref_projection_mut_place_arg(|_, _, projections, _| projections.clear());
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_index_dataref_projection_mut_place_arg() {
+    let arg = dataref_projection_mut_place_arg(
+        vec![
+            RirProjection::Field(RirFieldId::from_index(4)),
+            RirProjection::Index(RirLocalId::from_index(1)),
+        ],
+        RirTypeId::from_index(0),
+    );
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_nested_dataref_handle_projection_mut_place_arg() {
+    let arg = dataref_projection_mut_place_arg(
+        vec![
+            RirProjection::Field(RirFieldId::from_index(0)),
+            RirProjection::Field(RirFieldId::from_index(1)),
+        ],
+        RirTypeId::from_index(1),
+    );
+
+    assert_rir_error(
+        dataref_projection_mut_place_call_rir(arg),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_verify_accepts_dataref_handle_projection_mut_place_arg() {
+    let arg = dataref_projection_mut_place_arg(
+        vec![RirProjection::Field(RirFieldId::from_index(3))],
+        RirTypeId::from_index(1),
+    );
+    let mut program = dataref_projection_mut_place_call_rir(arg);
+    program.functions[1].params[0].ty = RirTypeId::from_index(1);
+    program.functions[1].locals[0].ty = RirTypeId::from_index(1);
+
+    rir::verify(&program).expect("RIR rejected dataref handle mut-place arg");
+}
+
+#[test]
+fn rir_verify_rejects_aggregate_dataref_projection_mut_place_arg_payloads() {
+    for (field, ty) in [
+        (RirFieldId::from_index(0), RirTypeId::from_index(2)),
+        (RirFieldId::from_index(4), RirTypeId::from_index(3)),
+        (RirFieldId::from_index(5), RirTypeId::from_index(6)),
+        (RirFieldId::from_index(6), RirTypeId::from_index(7)),
+        (RirFieldId::from_index(7), RirTypeId::from_index(8)),
+        (RirFieldId::from_index(8), RirTypeId::from_index(9)),
+    ] {
+        assert_rir_error(
+            dataref_projection_mut_place_call_rir(dataref_projection_mut_place_arg(
+                vec![RirProjection::Field(field)],
+                ty,
+            )),
+            RirVerifyErrorKind::UnsupportedRValueType,
+        );
+    }
+}
+
+#[test]
+fn rir_verify_rejects_uninitialized_dataref_projection_mut_place_object() {
+    let mut program =
+        dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    program.functions[0].locals[0].initialized = false;
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::UninitializedLocal(RirLocalId::from_index(0)),
+    );
+}
+
+#[test]
+fn rir_verify_rejects_dataref_projection_mut_place_arg_native_boundary() {
+    let mut program =
+        dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    program.functions[1].params[0].semantic = RirParamSemantic::MutBorrow;
+    program.functions[1].params[0].abi = RirParamAbi::MutBorrow;
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_verify_rejects_mut_place_param_dataref_projection_mut_place_object() {
+    let mut program =
+        dataref_projection_mut_place_call_rir(valid_dataref_projection_mut_place_arg());
+    program.functions[0].params.push(RirParam {
+        local: RirLocalId::from_index(0),
+        ty: RirTypeId::from_index(1),
+        semantic: RirParamSemantic::MutPlace,
+        abi: RirParamAbi::MutPlace,
+        escape: RirParamEscape::NonEscaping,
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -9188,6 +9474,86 @@ fn dataref_metadata_rir() -> RirProgram {
     program
 }
 
+fn dataref_projection_mut_place_arg(
+    projections: Vec<RirProjection>,
+    ty: RirTypeId,
+) -> RirMutPlaceArg {
+    RirMutPlaceArg::DataRefProjection {
+        object: RirOperand::Place(dataref_access_place(0, 1)),
+        dataref: RirDataRefId::from_index(0),
+        projections,
+        ty,
+    }
+}
+
+fn valid_dataref_projection_mut_place_arg() -> RirMutPlaceArg {
+    dataref_projection_mut_place_arg(
+        vec![RirProjection::Field(RirFieldId::from_index(2))],
+        RirTypeId::from_index(0),
+    )
+}
+
+fn nested_dataref_projection_mut_place_arg() -> RirMutPlaceArg {
+    dataref_projection_mut_place_arg(
+        vec![
+            RirProjection::Field(RirFieldId::from_index(0)),
+            RirProjection::Field(RirFieldId::from_index(0)),
+        ],
+        RirTypeId::from_index(0),
+    )
+}
+
+fn edit_dataref_projection_mut_place_arg(
+    edit: impl FnOnce(&mut RirOperand, &mut RirDataRefId, &mut Vec<RirProjection>, &mut RirTypeId),
+) -> RirMutPlaceArg {
+    let mut arg = valid_dataref_projection_mut_place_arg();
+    let RirMutPlaceArg::DataRefProjection {
+        object,
+        dataref,
+        projections,
+        ty,
+    } = &mut arg
+    else {
+        unreachable!();
+    };
+    edit(object, dataref, projections, ty);
+    arg
+}
+
+fn dataref_projection_mut_place_call_rir(arg: RirMutPlaceArg) -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let void = RirTypeId::from_index(4);
+    let mut program = dataref_access_rir(vec![]);
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(1),
+        air_id: None,
+        symbol: RirSymbol::new("sink"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: int,
+            semantic: RirParamSemantic::MutPlace,
+            abi: RirParamAbi::MutPlace,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: int,
+            mutable: true,
+            symbol: RirSymbol::new("x"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock::default(),
+    });
+    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::Call {
+        callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+        args: vec![RirCallArg::MutPlace(arg)],
+        ty: void,
+    })];
+    program
+}
+
 fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
     let int = RirTypeId::from_index(0);
     let node = RirTypeId::from_index(1);
@@ -9195,6 +9561,10 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
     let array = RirTypeId::from_index(3);
     let void = RirTypeId::from_index(4);
     let bool_ty = RirTypeId::from_index(5);
+    let list = RirTypeId::from_index(6);
+    let map = RirTypeId::from_index(7);
+    let option = RirTypeId::from_index(8);
+    let enm = RirTypeId::from_index(9);
     let mut program = RirProgram {
         types: vec![
             RirType::Int,
@@ -9203,6 +9573,13 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
             RirType::Array { elem: int, len: 2 },
             RirType::Void,
             RirType::Bool,
+            RirType::List(int),
+            RirType::Map {
+                key: int,
+                value: int,
+            },
+            RirType::Option(int),
+            RirType::Enum(RirEnumId::from_index(0)),
         ],
         structs: vec![RirStruct {
             id: RirStructId::from_index(0),
@@ -9211,11 +9588,40 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
             display: RirSymbol::new("Point"),
             native_path: None,
             native_key: None,
+            copyable: false,
+            fields: vec![
+                RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("x"),
+                    ty: int,
+                },
+                RirField {
+                    id: RirFieldId::from_index(1),
+                    symbol: RirSymbol::new("node"),
+                    ty: node,
+                },
+            ],
+        }],
+        enums: vec![RirEnum {
+            id: RirEnumId::from_index(0),
+            air_id: None,
+            core: None,
+            repr: rir::RirEnumRepr::Adt,
+            raw_type: None,
+            symbol: RirSymbol::new("Choice"),
+            display: RirSymbol::new("Choice"),
             copyable: true,
-            fields: vec![RirField {
-                id: RirFieldId::from_index(0),
-                symbol: RirSymbol::new("x"),
-                ty: int,
+            variants: vec![RirVariant {
+                id: RirVariantId::from_index(0),
+                symbol: RirSymbol::new("Some"),
+                display: RirSymbol::new("Some"),
+                kind: RirVariantKind::Tuple,
+                raw_value: None,
+                fields: vec![RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("0"),
+                    ty: int,
+                }],
             }],
         }],
         datarefs: vec![RirDataRef {
@@ -9249,6 +9655,26 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
                     id: RirFieldId::from_index(4),
                     symbol: RirSymbol::new("more"),
                     ty: array,
+                },
+                RirField {
+                    id: RirFieldId::from_index(5),
+                    symbol: RirSymbol::new("list"),
+                    ty: list,
+                },
+                RirField {
+                    id: RirFieldId::from_index(6),
+                    symbol: RirSymbol::new("map"),
+                    ty: map,
+                },
+                RirField {
+                    id: RirFieldId::from_index(7),
+                    symbol: RirSymbol::new("option"),
+                    ty: option,
+                },
+                RirField {
+                    id: RirFieldId::from_index(8),
+                    symbol: RirSymbol::new("enm"),
+                    ty: enm,
                 },
             ],
         }],

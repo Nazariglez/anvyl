@@ -1,4 +1,5 @@
 use super::{
+    dataref_place::storage_path as dataref_storage_path,
     rir::{
         RirDataRefId, RirField, RirFunction, RirParamAbi, RirPlace, RirProgram, RirProjection,
         RirType, RirTypeId,
@@ -45,20 +46,7 @@ impl<'a> RustPlaces<'a> {
         dataref: RirDataRefId,
         projections: &[RirProjection],
     ) -> String {
-        let dataref = &self.program.datarefs[dataref.index()];
-        let Some((first, rest)) = projections.split_first() else {
-            unreachable!("verified dataref projection")
-        };
-        let RirProjection::Field(field_id) = first else {
-            unreachable!("verified dataref field projection")
-        };
-        let field = &dataref.fields[field_id.index()];
-        let mut rendered = RenderedPlace {
-            expr: format!("storage.{}", field.symbol.as_str()),
-            ty: field.ty,
-        };
-        self.apply_projections(&mut rendered, rest, false);
-        rendered.expr
+        dataref_storage_path(self.program, dataref, projections)
     }
 
     pub(super) fn record_field_place(&self, place: &RirPlace, field: &RirField) -> RirPlace {

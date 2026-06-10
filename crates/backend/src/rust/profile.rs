@@ -3,13 +3,20 @@ use anvyx_frontend::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, Local, LocalId,
         LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, PlaceRoot,
-        Program, Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
-        VariantShape, VerifiedProgram,
+        Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl, VariantShape,
+        VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
 
-use super::{rep_policy::AirRustRepPolicy, rir};
+use super::{
+    dataref_mut_place::{
+        DataRefMutPlace, DataRefMutPlaceSupport, classify as classify_dataref_mut_place,
+        projected_ty as air_projected_ty,
+    },
+    rep_policy::AirRustRepPolicy,
+    rir,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustBackendProfile;
@@ -936,18 +943,15 @@ impl ProfileCx<'_> {
             CallArg::MutBorrow(place) => {
                 match expected.unwrap_or(rir::RirParamSemantic::MutBorrow) {
                     rir::RirParamSemantic::MutPlace => {
-                        if self.place_scoped_borrow(site, place).is_some()
-                            && !place.projection.is_empty()
+                        if !place.projection.is_empty()
+                            && self
+                                .check_dataref_mut_place(
+                                    site,
+                                    place,
+                                    ProfileErrorKind::UnsupportedMutablePlaceProjection,
+                                )
+                                .is_none()
                         {
-                            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
-                            return;
-                        }
-                        if self.place_crosses_dataref(site, place) {
-                            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceDataRef);
-                            return;
-                        }
-                        if !place.projection.is_empty() {
-                            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
                             return;
                         }
                         self.check_place(site, place);
@@ -960,7 +964,10 @@ impl ProfileCx<'_> {
                         if source_place
                             || self.place_capture_cell(site, place).is_some()
                             || self.place_scoped_borrow(site, place).is_some()
-                            || self.place_crosses_dataref(site, place)
+                            || !matches!(
+                                self.dataref_mut_place_support(site, place),
+                                DataRefMutPlaceSupport::Ordinary
+                            )
                         {
                             self.push(
                                 site,
@@ -1011,7 +1018,7 @@ impl ProfileCx<'_> {
             Operand::Place(place) => {
                 self.check_place(site, place);
                 if self.place_capture_cell(site, place).is_some()
-                    && !self.policy().copyable(place.ty)
+                    && !self.policy().value_place_shareable(place.ty)
                 {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
                 }
@@ -1051,21 +1058,36 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                     return;
                 };
-                if self.place_capture_cell(site, place).is_some() && !place.projection.is_empty() {
-                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                if self.place_capture_cell(site, place).is_some()
+                    && !place.projection.is_empty()
+                    && self
+                        .check_dataref_mut_place(
+                            site,
+                            place,
+                            ProfileErrorKind::UnsupportedPlaceProjection,
+                        )
+                        .is_none()
+                {
                     return;
                 }
                 ty
             }
             PlaceRoot::CaptureCell(cell) => {
-                if !place.projection.is_empty() {
-                    self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
-                    return;
-                }
                 let Some(decl) = self.program.capture_cells.get(cell.index()) else {
                     self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
                     return;
                 };
+                if !place.projection.is_empty()
+                    && self
+                        .check_dataref_mut_place(
+                            site,
+                            place,
+                            ProfileErrorKind::UnsupportedPlaceProjection,
+                        )
+                        .is_none()
+                {
+                    return;
+                }
                 decl.ty
             }
             PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
@@ -1074,7 +1096,7 @@ impl ProfileCx<'_> {
             }
         };
         for projection in &place.projection {
-            let Some(next) = self.projected_ty(ty, projection) else {
+            let Some(next) = air_projected_ty(self.program, ty, projection) else {
                 self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
                 return;
             };
@@ -1143,12 +1165,20 @@ impl ProfileCx<'_> {
             self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
             return None;
         }
-        if !place.projection.is_empty() {
-            self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
-            return None;
-        }
+        let projected_ty = if place.projection.is_empty() {
+            None
+        } else {
+            Some(
+                self.check_dataref_mut_place(
+                    site,
+                    place,
+                    ProfileErrorKind::UnsupportedMutablePlaceProjection,
+                )?
+                .ty,
+            )
+        };
         self.check_scoped_borrow_decl(site, borrow, decl.ty, decl.mutability);
-        Some(decl.ty)
+        Some(projected_ty.unwrap_or(decl.ty))
     }
 
     fn current_function_id(&self, site: ProfileSite) -> Option<FunctionId> {
@@ -1171,60 +1201,68 @@ impl ProfileCx<'_> {
         self.program.capture_cell_root(function, place.root)
     }
 
+    fn check_dataref_mut_place(
+        &mut self,
+        site: ProfileSite,
+        place: &Place,
+        ordinary: ProfileErrorKind,
+    ) -> Option<DataRefMutPlace> {
+        match self.dataref_mut_place_support(site, place) {
+            DataRefMutPlaceSupport::Supported(supported) => Some(supported),
+            DataRefMutPlaceSupport::UnsupportedDataRef => {
+                self.push(site, ProfileErrorKind::UnsupportedMutablePlaceDataRef);
+                None
+            }
+            DataRefMutPlaceSupport::Ordinary => {
+                self.push(site, ordinary);
+                None
+            }
+        }
+    }
+
+    fn dataref_mut_place_support(
+        &self,
+        site: ProfileSite,
+        place: &Place,
+    ) -> DataRefMutPlaceSupport {
+        let Some(root_ty) = self.place_root_ty(site, place) else {
+            return DataRefMutPlaceSupport::Ordinary;
+        };
+        classify_dataref_mut_place(self.program, root_ty, place)
+    }
+
+    fn place_root_ty(&self, site: ProfileSite, place: &Place) -> Option<TypeId> {
+        match place.root {
+            PlaceRoot::Local(root) => self.current_local(site, root).map(|local| local.ty),
+            PlaceRoot::LambdaCapture(slot) => self.current_lambda_capture_ty(site, slot),
+            PlaceRoot::CaptureCell(cell) => self
+                .program
+                .capture_cells
+                .get(cell.index())
+                .map(|decl| decl.ty),
+            PlaceRoot::ScopedBorrow(borrow) => self
+                .program
+                .scoped_borrows
+                .get(borrow.index())
+                .map(|decl| decl.ty),
+            PlaceRoot::Global(_) => None,
+        }
+    }
+
     fn place_crosses_dataref(&self, site: ProfileSite, place: &Place) -> bool {
-        let mut ty = match place.root {
-            PlaceRoot::Local(root) => {
-                let Some(local) = self.current_local(site, root) else {
-                    return false;
-                };
-                local.ty
-            }
-            PlaceRoot::LambdaCapture(slot) => {
-                let Some(ty) = self.current_lambda_capture_ty(site, slot) else {
-                    return false;
-                };
-                ty
-            }
-            PlaceRoot::CaptureCell(cell) => {
-                let Some(decl) = self.program.capture_cells.get(cell.index()) else {
-                    return false;
-                };
-                decl.ty
-            }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => return false,
+        let Some(mut ty) = self.place_root_ty(site, place) else {
+            return false;
         };
         for projection in &place.projection {
             if matches!(self.program.type_arena.data(ty), TypeData::DataRef(_)) {
                 return true;
             }
-            let Some(next) = self.projected_ty(ty, projection) else {
+            let Some(next) = air_projected_ty(self.program, ty, projection) else {
                 return false;
             };
             ty = next;
         }
         false
-    }
-
-    fn projected_ty(&self, ty: TypeId, projection: &Projection) -> Option<TypeId> {
-        match (self.program.type_arena.data(ty), projection) {
-            (
-                TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate),
-                Projection::Field(field),
-            ) => self
-                .program
-                .aggregate(*aggregate)
-                .fields
-                .get(field.index())
-                .map(|field| field.ty),
-            (
-                TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem),
-                Projection::Index(_),
-            ) => Some(*elem),
-            (TypeData::Tuple(fields), Projection::TupleField(field)) => {
-                fields.get(*field as usize).copied()
-            }
-            _ => None,
-        }
     }
 
     fn check_extern(&mut self, id: ExternId, decl: &ExternDecl) {
