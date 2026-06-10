@@ -16,6 +16,7 @@ fn make() -> fn() -> int {
 
 fn main() {
     let f = make();
+    let g = f;
     println(f());
-    println(f());
+    println(g());
 }

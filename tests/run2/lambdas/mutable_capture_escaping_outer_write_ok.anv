@@ -1,21 +1,16 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match-begin
-// 1
-// 2
-// @match-end
+// @match: 10
 
 fn make() -> fn() -> int {
     var count = 0;
-    || {
-        count = count + 1;
-        count
-    }
+    let f = || count;
+    count = 10;
+    f
 }
 
 fn main() {
     let f = make();
-    println(f());
     println(f());
 }

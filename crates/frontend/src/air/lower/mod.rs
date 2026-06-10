@@ -6610,6 +6610,7 @@ fn lowered_capture_kind(
         {
             Ok(LoweredCaptureKind::CaptureCell)
         }
+        CaptureStorage::OwnedMutableUpvalue if requires_cell => Ok(LoweredCaptureKind::CaptureCell),
         CaptureStorage::BorrowedScoped
             if escape == LambdaEscapeKind::NonEscaping
                 && origin == CaptureStorageOrigin::BorrowedParam =>
@@ -10333,6 +10334,190 @@ fn main() {}
             matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
                 if captures.iter().any(|capture| matches!(capture, LambdaCaptureArg::ScopedLocal { .. })))
         }));
+    }
+
+    #[test]
+    fn escaping_mutable_counter_lowers_to_capture_cell() {
+        let source =
+            "fn make_counter() -> fn() -> int { var count = 0; || { count = count + 1; count } }";
+        let air = lower_root(source, "make_counter").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(air.capture_cells.len(), 1);
+        assert_eq!(lambda.escape, LambdaEscape::Escaping);
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::CaptureCell { cell: captured, .. }] if *captured == cell
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::CaptureCell { cell: captured }] if *captured == cell))
+        }));
+        assert!(
+            function_statements(air.function(lambda.body)).any(|statement| {
+                matches!(statement, AirStmt::Assign { dst, .. }
+                    if dst.root == PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)))
+            })
+        );
+    }
+
+    #[test]
+    fn escaping_mutable_branch_lambdas_share_one_capture_cell() {
+        let source = "fn make(cond: bool) -> fn() -> int { var count = 0; let inc = || { count = count + 1; count }; let get = || count; if cond { inc } else { get } }";
+        let air = lower_root(source, "make").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+
+        assert_eq!(air.capture_cells.len(), 1);
+        assert_eq!(
+            air.lambdas
+                .iter()
+                .filter(|lambda| lambda.escape == LambdaEscape::Escaping)
+                .filter(|lambda| matches!(
+                    &lambda.captures[..],
+                    [LambdaCaptureDecl::CaptureCell { cell: captured, .. }] if *captured == cell
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn escaping_owner_write_after_lambda_creation_uses_capture_cell() {
+        let source = "fn make(seed: int) -> fn() -> int { var x = seed; let g = || x; x = 2; g }";
+        let air = lower_root(source, "make").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+        let owner = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("make"))
+            .expect("missing owner");
+        let statements = function_statements(owner).collect::<Vec<_>>();
+        let lambda_index = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::Init {
+                        value: RValue::MakeLambda { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("missing lambda init");
+
+        assert!(statements[lambda_index + 1..].iter().any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. } if dst.root == PlaceRoot::CaptureCell(cell))
+        }));
+    }
+
+    #[test]
+    fn escaping_lambda_write_then_owner_read_uses_capture_cell() {
+        let source = "fn keep(f: escaping fn()) {} fn f(seed: int) -> int { var x = seed; let g = || { x = 2; }; g(); keep(g); x }";
+        let air = lower_root(source, "f").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+        let owner = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing owner");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(lambda.escape, LambdaEscape::Escaping);
+        assert!(matches!(
+            &owner.body.block.tail,
+            AirTail::Return(Some(Operand::Place(place))) if place.root == PlaceRoot::CaptureCell(cell)
+        ));
+    }
+
+    #[test]
+    fn nested_escaping_mutable_capture_forwards_capture_cell() {
+        let source = "fn make() -> fn() -> fn() -> int { var count = 0; || { || { count = count + 1; count } } }";
+        let air = lower_root(source, "make").expect("lower failed");
+        let cell = CaptureCellId::from_index(0);
+        let outer = air
+            .lambdas
+            .iter()
+            .find(|decl| air.function(decl.owner).name == Ident::new("make"))
+            .expect("missing outer lambda");
+        let inner = air
+            .lambdas
+            .iter()
+            .find(|decl| decl.owner == outer.body)
+            .expect("missing inner lambda");
+
+        assert_eq!(air.capture_cells.len(), 1);
+        assert!(matches!(
+            &outer.captures[..],
+            [LambdaCaptureDecl::CaptureCell { cell: captured, .. }] if *captured == cell
+        ));
+        assert!(matches!(
+            &inner.captures[..],
+            [LambdaCaptureDecl::CaptureCell { cell: captured, .. }] if *captured == cell
+        ));
+        assert!(
+            function_statements(air.function(outer.body)).any(|statement| {
+                matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                    if matches!(&captures[..], [LambdaCaptureArg::CaptureCell { cell: captured }] if *captured == cell))
+            })
+        );
+    }
+
+    #[test]
+    fn escaping_shadowed_mutable_captures_use_distinct_cells() {
+        let source = "fn make(cond: bool) -> fn() -> int { if cond { var x = 1; || { x = 2; x } } else { var x = 3; || { x = 4; x } } }";
+        let air = lower_root(source, "make").expect("lower failed");
+
+        assert_eq!(air.capture_cells.len(), 2);
+        assert_ne!(
+            air.capture_cells[0].source_local,
+            air.capture_cells[1].source_local
+        );
+        assert!(air.lambdas.iter().any(|lambda| matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::CaptureCell { cell, .. }] if *cell == CaptureCellId::from_index(0)
+        )));
+        assert!(air.lambdas.iter().any(|lambda| matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::CaptureCell { cell, .. }] if *cell == CaptureCellId::from_index(1)
+        )));
+    }
+
+    #[test]
+    fn escaping_readonly_capture_does_not_create_cell() {
+        let source = "fn make(seed: int) -> fn() -> int { var count = 0; let bonus = seed; || { count = count + 1; count + bonus } }";
+        let air = lower_root(source, "make").expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(air.capture_cells.len(), 1);
+        assert_eq!(lambda.captures.len(), 2);
+        assert!(
+            lambda
+                .captures
+                .iter()
+                .any(|capture| matches!(capture, LambdaCaptureDecl::CaptureCell { .. }))
+        );
+        assert!(
+            lambda
+                .captures
+                .iter()
+                .any(|capture| matches!(capture, LambdaCaptureDecl::ReadonlyLocal { .. }))
+        );
+    }
+
+    #[test]
+    fn escaping_projected_mutable_capture_is_named_gap() {
+        let source =
+            "struct Point { x: int } fn make() -> fn() { var p = Point { x: 0 }; || { p.x = 1; } }";
+        let err = lower_root(source, "make").expect_err("projected capture should gap");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedExpr {
+                kind: "UnsupportedLambdaCapture",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::rir::{
-    RirCallArg, RirCallTarget, RirExternKind, RirFunction, RirLambdaStorage, RirOperand,
-    RirParamAbi, RirPlace, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct,
-    RirStructuredBlock, RirType, RirTypeId,
+    RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirExternKind, RirFunction,
+    RirLambdaStorage, RirOperand, RirParamAbi, RirPlace, RirProgram, RirRValue, RirStmt,
+    RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
 };
 
 pub(super) fn fallible_functions(program: &RirProgram) -> Vec<bool> {
@@ -119,13 +119,19 @@ fn block_uses_ctx(
 
 fn stmt_uses_ctx(program: &RirProgram, function: &RirFunction, stmt: &RirStmt) -> bool {
     match stmt {
-        RirStmt::Init { value, .. } | RirStmt::CellInit { value, .. } | RirStmt::Eval(value) => {
-            rvalue_uses_ctx(program, value)
+        RirStmt::Init { value, .. } | RirStmt::Eval(value) => {
+            rvalue_uses_ctx(program, function, value)
         }
-        RirStmt::Assign { value, .. } => rvalue_uses_ctx(program, value),
-        RirStmt::CellSet { value, .. } | RirStmt::ScopedPlaceCellSet { value, .. } => {
-            rvalue_uses_ctx(program, value)
+        RirStmt::CellInit { cell, value } => {
+            cell_uses_ctx(program, *cell) || rvalue_uses_ctx(program, function, value)
         }
+        RirStmt::Assign { dst, value } => {
+            place_is_mut_place_param(function, dst) || rvalue_uses_ctx(program, function, value)
+        }
+        RirStmt::CellSet { cell, value } => {
+            cell_uses_ctx(program, *cell) || rvalue_uses_ctx(program, function, value)
+        }
+        RirStmt::ScopedPlaceCellSet { .. } => true,
         RirStmt::DataRefSet { .. } => true,
         _ => stmt_child_blocks_any(stmt, |block| block_uses_ctx(program, function, block)),
     }
@@ -201,20 +207,33 @@ fn local_is_mut_place_param(function: &RirFunction, local: super::rir::RirLocalI
         .any(|param| param.local == local && param.abi == RirParamAbi::MutPlace)
 }
 
-fn rvalue_uses_ctx(program: &RirProgram, value: &RirRValue) -> bool {
-    match value {
-        RirRValue::Call { .. } | RirRValue::DataRefAlloc { .. } | RirRValue::DataRefGet { .. } => {
-            true
+fn rvalue_uses_ctx(program: &RirProgram, function: &RirFunction, value: &RirRValue) -> bool {
+    rvalue_uses_mut_place_param(function, value)
+        || match value {
+            RirRValue::Call { .. }
+            | RirRValue::DataRefAlloc { .. }
+            | RirRValue::DataRefGet { .. } => true,
+            RirRValue::CellGetCopy { cell, .. } => cell_uses_ctx(program, *cell),
+            RirRValue::ScopedPlaceCellGet { .. } => true,
+            RirRValue::Stringify { source_ty, .. } => {
+                matches!(program.types[source_ty.index()], RirType::Struct(_))
+            }
+            RirRValue::Lambda { lambda, .. } => program
+                .lambdas
+                .get(lambda.index())
+                .is_some_and(|lambda| matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })),
+            _ => false,
         }
-        RirRValue::Stringify { source_ty, .. } => {
-            matches!(program.types[source_ty.index()], RirType::Struct(_))
-        }
-        RirRValue::Lambda { lambda, .. } => program
-            .lambdas
-            .get(lambda.index())
-            .is_some_and(|lambda| matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })),
-        _ => false,
-    }
+}
+
+fn cell_uses_ctx(program: &RirProgram, cell: RirCellRef) -> bool {
+    let id = match cell {
+        RirCellRef::Owner(id) | RirCellRef::Capture { cell: id, .. } => id,
+    };
+    program
+        .cells
+        .get(id.index())
+        .is_some_and(|cell| cell.storage == RirCellStorage::Heap)
 }
 
 fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> bool {

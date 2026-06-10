@@ -23,7 +23,7 @@ pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;
 pub use inventory;
-pub use lambda_cell::StackLambdaCell;
+pub use lambda_cell::{LambdaCell, StackLambdaCell};
 pub use managed_rc::{
     CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader, managed_alloc_count,
     managed_alloc_details, typed_dropper,

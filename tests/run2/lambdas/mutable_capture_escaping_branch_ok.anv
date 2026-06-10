@@ -6,16 +6,18 @@
 // 2
 // @match-end
 
-fn make() -> fn() -> int {
+fn make(cond: bool) -> fn() -> int {
     var count = 0;
-    || {
+    let inc = || {
         count = count + 1;
         count
-    }
+    };
+    let get = || count;
+    if cond { inc } else { get }
 }
 
 fn main() {
-    let f = make();
+    let f = make(true);
     println(f());
     println(f());
 }

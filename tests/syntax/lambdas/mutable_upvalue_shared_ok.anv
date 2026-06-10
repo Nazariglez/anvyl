@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn make_counter(cond: bool) -> fn() -> int {
+    var count = 0;
+    let inc = || {
+        count = count + 1;
+        count
+    };
+    let get = || count;
+    if cond { inc } else { get }
+}

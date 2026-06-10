@@ -51,6 +51,21 @@ mod tests {
         env: Handle<'cx, CountedNode<'cx>>,
     }
 
+    struct TestLambda<'cx> {
+        stats: Rc<Cell<usize>>,
+        env: Handle<'cx, TestLambdaEnv<'cx>>,
+    }
+
+    struct TestLambdaEnv<'cx> {
+        stats: Rc<Cell<usize>>,
+        cell: Handle<'cx, TestLambdaCell<'cx>>,
+    }
+
+    struct TestLambdaCell<'cx> {
+        stats: Rc<Cell<usize>>,
+        payload: Option<Handle<'cx, TestLambda<'cx>>>,
+    }
+
     // SAFETY: `callback` is the only heap edge; `stats` owns none.
     unsafe impl<'cx> Trace<'cx> for CountedNode<'cx> {
         fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
@@ -64,6 +79,30 @@ mod tests {
         fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
             self.stats.set(self.stats.get() + 1);
             visitor.edge(&self.env);
+        }
+    }
+
+    // SAFETY: `env` is the only heap edge; `stats` owns none.
+    unsafe impl<'cx> Trace<'cx> for TestLambda<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.stats.set(self.stats.get() + 1);
+            visitor.edge(&self.env);
+        }
+    }
+
+    // SAFETY: `cell` is the only heap edge; `stats` owns none.
+    unsafe impl<'cx> Trace<'cx> for TestLambdaEnv<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.stats.set(self.stats.get() + 1);
+            visitor.edge(&self.cell);
+        }
+    }
+
+    // SAFETY: `payload` is the only heap edge; `stats` owns none.
+    unsafe impl<'cx> Trace<'cx> for TestLambdaCell<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.stats.set(self.stats.get() + 1);
+            visitor.edge_opt(&self.payload);
         }
     }
 
@@ -690,6 +729,153 @@ mod tests {
             assert_eq!(heap_stats.edge_visits, 2);
             assert_eq!(heap_stats.blackened, 0);
             assert_eq!(stats.get(), 2);
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
+    fn lambda_env_cell_cycle_is_collectible() {
+        fn run(heap: &mut Heap<'_>) {
+            let lambda_stats = Rc::new(Cell::new(0));
+            let env_stats = Rc::new(Cell::new(0));
+            let cell_stats = Rc::new(Cell::new(0));
+            let lambda_ty = heap.register_tracked::<TestLambda<'_>>();
+            let env_ty = heap.register_tracked::<TestLambdaEnv<'_>>();
+            let cell_ty = heap.register_tracked::<TestLambdaCell<'_>>();
+            let cell = heap.alloc(
+                cell_ty,
+                TestLambdaCell {
+                    stats: Rc::clone(&cell_stats),
+                    payload: None,
+                },
+            );
+            let env = heap.alloc(
+                env_ty,
+                TestLambdaEnv {
+                    stats: Rc::clone(&env_stats),
+                    cell: cell.clone(),
+                },
+            );
+            let lambda = heap.alloc(
+                lambda_ty,
+                TestLambda {
+                    stats: Rc::clone(&lambda_stats),
+                    env: env.clone(),
+                },
+            );
+            heap.with_mut(&cell, |cell| cell.payload = Some(lambda.clone()));
+
+            drop(lambda);
+            drop(env);
+            drop(cell);
+            heap.reset_stats();
+            let outcome = heap.collect_all();
+
+            assert_eq!(outcome.collected, 3);
+            assert_eq!(heap.stats().live, 0);
+            assert_eq!(heap.stats().internal_edges, 3);
+            assert_eq!(lambda_stats.get(), 1);
+            assert_eq!(env_stats.get(), 1);
+            assert_eq!(cell_stats.get(), 1);
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
+    fn lambda_root_keeps_env_cell_graph_alive_until_removed() {
+        fn run(heap: &mut Heap<'_>) {
+            let stats = Rc::new(Cell::new(0));
+            let lambda_ty = heap.register_tracked::<TestLambda<'_>>();
+            let env_ty = heap.register_tracked::<TestLambdaEnv<'_>>();
+            let cell_ty = heap.register_tracked::<TestLambdaCell<'_>>();
+            let cell = heap.alloc(
+                cell_ty,
+                TestLambdaCell {
+                    stats: Rc::clone(&stats),
+                    payload: None,
+                },
+            );
+            let env = heap.alloc(
+                env_ty,
+                TestLambdaEnv {
+                    stats: Rc::clone(&stats),
+                    cell: cell.clone(),
+                },
+            );
+            let lambda = heap.alloc(
+                lambda_ty,
+                TestLambda {
+                    stats: Rc::clone(&stats),
+                    env: env.clone(),
+                },
+            );
+            heap.with_mut(&cell, |cell| cell.payload = Some(lambda.clone()));
+            let root = heap.root(&lambda);
+
+            drop(lambda);
+            drop(env);
+            drop(cell);
+            heap.collect_all();
+            assert_eq!(heap.stats().live, 3);
+            assert!(heap.resolve_root(&root).is_some());
+
+            assert!(heap.remove_root(&root));
+            let outcome = heap.collect_all();
+            assert_eq!(outcome.collected, 3);
+            assert_eq!(heap.stats().live, 0);
+        }
+
+        Heap::scope(run);
+    }
+
+    #[test]
+    fn lambda_cell_payload_edge_is_traced_once() {
+        fn run(heap: &mut Heap<'_>) {
+            let lambda_stats = Rc::new(Cell::new(0));
+            let env_stats = Rc::new(Cell::new(0));
+            let cell_stats = Rc::new(Cell::new(0));
+            let lambda_ty = heap.register_tracked::<TestLambda<'_>>();
+            let env_ty = heap.register_tracked::<TestLambdaEnv<'_>>();
+            let cell_ty = heap.register_tracked::<TestLambdaCell<'_>>();
+            let cell = heap.alloc(
+                cell_ty,
+                TestLambdaCell {
+                    stats: Rc::clone(&cell_stats),
+                    payload: None,
+                },
+            );
+            let env = heap.alloc(
+                env_ty,
+                TestLambdaEnv {
+                    stats: Rc::clone(&env_stats),
+                    cell: cell.clone(),
+                },
+            );
+            let lambda = heap.alloc(
+                lambda_ty,
+                TestLambda {
+                    stats: Rc::clone(&lambda_stats),
+                    env: env.clone(),
+                },
+            );
+            let extra_cell_handle = cell.clone();
+            heap.with_mut(&cell, |cell| cell.payload = Some(lambda.clone()));
+
+            drop(lambda);
+            drop(env);
+            drop(cell);
+            drop(extra_cell_handle);
+            heap.reset_stats();
+            let outcome = heap.collect_all();
+
+            assert_eq!(outcome.collected, 3);
+            assert_eq!(heap.stats().live, 0);
+            assert_eq!(heap.stats().internal_edges, 3);
+            assert_eq!(lambda_stats.get(), 1);
+            assert_eq!(env_stats.get(), 1);
+            assert_eq!(cell_stats.get(), 1);
         }
 
         Heap::scope(run);

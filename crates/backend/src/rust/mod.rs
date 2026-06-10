@@ -38,15 +38,15 @@ use self::{
         RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
         RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand,
+        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -1214,9 +1214,22 @@ impl<'a> PlanCx<'a> {
                 owner: self.function_map[&cell.owner],
                 source_local: RirLocalId::from_index(cell.source_local.index()),
                 payload_ty: self.type_map[&cell.ty],
-                storage: RirCellStorage::StackScoped,
+                storage: self.classify_capture_cell_storage(air_id),
                 symbol: RirSymbol::new(format!("__cell{}", id.index())),
             });
+        }
+    }
+
+    fn classify_capture_cell_storage(&self, cell: air::CaptureCellId) -> RirCellStorage {
+        if self.air.lambdas.iter().any(|lambda| {
+            lambda.escape == air::LambdaEscape::Escaping
+                && lambda.captures.iter().any(|capture| {
+                    matches!(capture, air::LambdaCaptureDecl::CaptureCell { cell: found, .. } if *found == cell)
+                })
+        }) {
+            RirCellStorage::Heap
+        } else {
+            RirCellStorage::StackScoped
         }
     }
 
@@ -1413,7 +1426,7 @@ impl<'a> PlanCx<'a> {
             let copyable = policy.lambda_sig_copyable(*sig);
             self.function_type_copyable.insert(*ty, copyable);
             self.function_type_shareable
-                .insert(*ty, copyable || policy.lambda_sig_has_heap_env(*sig));
+                .insert(*ty, copyable || policy.lambda_sig_cloneable(*sig));
         }
     }
 
@@ -1440,6 +1453,12 @@ impl<'a> PlanCx<'a> {
                 env_fields.push(RirLambdaEnvField {
                     ty: capture.ty,
                     symbol: RirSymbol::new(format!("c{capture_index}")),
+                    kind: match capture.kind {
+                        RirLambdaCaptureKind::HeapCell { cell } => {
+                            RirLambdaEnvFieldKind::HeapCell { cell }
+                        }
+                        _ => RirLambdaEnvFieldKind::Value,
+                    },
                 });
             }
             captures.push(capture);
@@ -1512,21 +1531,31 @@ impl<'a> PlanCx<'a> {
                     },
                 }))
             }
-            air::LambdaCaptureDecl::CaptureCell { .. } if escape == air::LambdaEscape::Escaping => {
-                Err(Self::gap(
-                    RustTargetGapSite::Function(owner),
-                    RustTargetGapKind::UnsupportedLambdaCapture,
-                ))
-            }
             air::LambdaCaptureDecl::CaptureCell { cell, ty, .. } => {
                 let ty = self.type_map[ty];
+                let cell = self.capture_cell_map[cell];
+                let storage = program.cells[cell.index()].storage;
+                let (semantic, kind) = match storage {
+                    RirCellStorage::StackScoped if escape == air::LambdaEscape::NonEscaping => (
+                        RirParamSemantic::StackCell,
+                        RirLambdaCaptureKind::StackCell { cell },
+                    ),
+                    RirCellStorage::Heap => (
+                        RirParamSemantic::HeapCell,
+                        RirLambdaCaptureKind::HeapCell { cell },
+                    ),
+                    RirCellStorage::StackScoped => {
+                        return Err(Self::gap(
+                            RustTargetGapSite::Function(owner),
+                            RustTargetGapKind::UnsupportedLambdaCapture,
+                        ));
+                    }
+                };
                 Ok(Some(RirLambdaCapture {
                     ty,
-                    semantic: RirParamSemantic::StackCell,
-                    abi: policy.param_abi(RirParamSemantic::StackCell),
-                    kind: RirLambdaCaptureKind::StackCell {
-                        cell: self.capture_cell_map[cell],
-                    },
+                    semantic,
+                    abi: policy.param_abi(semantic),
+                    kind,
                 }))
             }
         }
@@ -2414,9 +2443,15 @@ impl<'a> PlanCx<'a> {
                     });
                 }
                 air::LambdaCaptureArg::CaptureCell { cell } => {
-                    planned.push(RirLambdaCaptureArg::StackCell {
-                        cell: self.capture_cell_ref(function, *cell),
-                    });
+                    let cell_ref = self.capture_cell_ref(function, *cell);
+                    match self.classify_capture_cell_storage(*cell) {
+                        RirCellStorage::StackScoped => {
+                            planned.push(RirLambdaCaptureArg::StackCell { cell: cell_ref });
+                        }
+                        RirCellStorage::Heap => {
+                            planned.push(RirLambdaCaptureArg::HeapCell { cell: cell_ref });
+                        }
+                    }
                 }
             }
         }
@@ -2787,9 +2822,12 @@ impl<'a> PlanCx<'a> {
                 }
                 let ty = self.type_map[&place.ty];
                 if let Some(cell) = self.place_capture_cell(function, place) {
-                    let arg = RirMutPlaceArg::StackCell {
-                        cell: self.capture_cell_ref(function, cell),
-                        ty,
+                    let cell_ref = self.capture_cell_ref(function, cell);
+                    let arg = match self.classify_capture_cell_storage(cell) {
+                        RirCellStorage::StackScoped => {
+                            RirMutPlaceArg::StackCell { cell: cell_ref, ty }
+                        }
+                        RirCellStorage::Heap => RirMutPlaceArg::HeapCell { cell: cell_ref, ty },
                     };
                     return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
                 }
@@ -2973,9 +3011,10 @@ impl<'a> PlanCx<'a> {
                 .copied()
                 .unwrap_or(false)
             {
+                let value = self.rvalue_cell_set_operand(function, value, place.ty, locals, stmts);
                 stmts.push(RirStmt::CellSet {
                     cell: cell_ref,
-                    value,
+                    value: RirRValue::Use(value),
                 });
             } else if in_loop || possible_cells.get(cell.index()).copied().unwrap_or(false) {
                 return Err(Self::gap(
@@ -3129,6 +3168,41 @@ impl<'a> PlanCx<'a> {
             RirRValue::Use(operand) => operand,
             value => self.rvalue_temp(value, ty, locals, stmts),
         }
+    }
+
+    fn rvalue_cell_set_operand(
+        &self,
+        function: FunctionId,
+        value: RirRValue,
+        ty: TypeId,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> RirOperand {
+        match value {
+            RirRValue::Use(operand) if self.operand_uses_ctx(function, &operand) => {
+                self.rvalue_temp(RirRValue::Use(operand), ty, locals, stmts)
+            }
+            RirRValue::Use(operand) => operand,
+            value => self.rvalue_temp(value, ty, locals, stmts),
+        }
+    }
+
+    fn operand_uses_ctx(&self, function: FunctionId, operand: &RirOperand) -> bool {
+        matches!(operand, RirOperand::Place(place) if self.rir_place_is_source_mut_place_param(function, place))
+    }
+
+    fn rir_place_is_source_mut_place_param(&self, function: FunctionId, place: &RirPlace) -> bool {
+        place.projections.is_empty()
+            && self
+                .air
+                .function(function)
+                .signature
+                .params
+                .iter()
+                .any(|param| {
+                    param.mode == ParamMode::MutBorrow
+                        && param.local_id.index() == place.local.index()
+                })
     }
 
     fn rvalue_temp(

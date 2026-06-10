@@ -22,12 +22,20 @@ pub(super) fn stack_lambda_cell_ty(payload: &str) -> String {
     format!("{}<{payload}>", rt_path("StackLambdaCell"))
 }
 
+pub(super) fn lambda_cell_ty(payload: &str) -> String {
+    format!("{}<{payload}>", rt_path("LambdaCell"))
+}
+
 pub(super) fn mut_place_ty() -> String {
     rt_path("MutPlace")
 }
 
 pub(super) fn stack_lambda_cell_ctor(payload: &str) -> String {
     format!("{}::<{payload}>", rt_path("StackLambdaCell"))
+}
+
+pub(super) fn lambda_cell_ctor(payload: &str) -> String {
+    format!("{}::<{payload}>", rt_path("LambdaCell"))
 }
 
 pub(super) fn runtime_error_ty() -> String {
@@ -151,7 +159,7 @@ mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
         checked_range, ctx_heap_alloc, ctx_heap_with, ctx_heap_with_mut, ctx_runtime,
-        heap_register, heap_scope, mut_place_ty, result_ty, runtime_ctx_new,
+        heap_register, heap_scope, lambda_cell_ctor, mut_place_ty, result_ty, runtime_ctx_new,
         stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
 
@@ -174,6 +182,7 @@ mod tests {
             stack_lambda_cell_ctor("i64"),
             "anvyx_runtime::StackLambdaCell::<i64>"
         );
+        assert_eq!(lambda_cell_ctor("i64"), "anvyx_runtime::LambdaCell::<i64>");
         assert_eq!(result_ty("i64"), "Result<i64, anvyx_runtime::RuntimeError>");
         assert_eq!(result_ty("()"), "Result<(), anvyx_runtime::RuntimeError>");
     }

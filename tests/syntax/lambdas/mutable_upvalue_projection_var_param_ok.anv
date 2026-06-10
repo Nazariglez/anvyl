@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @skip: projected heap-cell source var calls await mutable_place_projected_values
+
+struct Point { x: int }
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn make() -> fn() {
+    var point = Point { x: 0 };
+    || { bump(point.x); }
+}

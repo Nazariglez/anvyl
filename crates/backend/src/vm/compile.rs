@@ -182,6 +182,14 @@ impl CompileCx<'_> {
             PlaceRoot::CaptureCell(_) => {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
             }
+            PlaceRoot::LambdaCapture(_)
+                if self
+                    .program
+                    .capture_cell_root(function, place.root)
+                    .is_some() =>
+            {
+                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
+            }
             PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
             }

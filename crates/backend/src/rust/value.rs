@@ -82,6 +82,13 @@ impl<'a> RustValues<'a> {
                     self.cell_ref(*cell)
                 )
             }
+            RirMutPlaceArg::HeapCell { cell, .. } => {
+                format!(
+                    "{}::heap_cell({}.clone())",
+                    target::mut_place_ty(),
+                    self.cell_ref(*cell)
+                )
+            }
             RirMutPlaceArg::ScopedPlaceCell { cell, .. } => {
                 let cell = match cell {
                     RirScopedPlaceCellRef::Owner(_) => {
@@ -193,13 +200,13 @@ impl<'a> RustValues<'a> {
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
         if self.policy.cow_value(ty) {
-            return format!("{expr}.access(|value| Ok(value.share()))?");
+            return format!("{expr}.access(ctx.runtime(), |value| Ok(value.share()))?");
         }
         if !self.policy.copyable(ty) && self.policy.shareable_value(ty) {
             let value = self.value_from_ref(ty, "value");
-            return format!("{expr}.access(|value| Ok({value}))?");
+            return format!("{expr}.access(ctx.runtime(), |value| Ok({value}))?");
         }
-        format!("{expr}.get_copy()?")
+        format!("{expr}.get_copy(ctx.runtime())?")
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
@@ -211,7 +218,7 @@ impl<'a> RustValues<'a> {
             RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
             RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
             RirType::DataRef(_) => format!("{expr}.clone()"),
-            RirType::Lambda(sig) if self.policy.lambda_sig_has_heap_env(sig) => {
+            RirType::Lambda(sig) if !self.policy.lambda_sig_copyable(sig) => {
                 format!("{expr}.clone()")
             }
             RirType::Struct(_) | RirType::Tuple(_) | RirType::Array { .. } | RirType::Enum(_) => {
@@ -251,6 +258,7 @@ impl<'a> RustValues<'a> {
             RirParamSemantic::MutBorrow
             | RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
+            | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),
         }
     }
@@ -420,10 +428,11 @@ impl<'a> RustValues<'a> {
     fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
         match self.program.types[ty.index()] {
             RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
-            RirType::Lambda(sig) if self.policy.lambda_sig_has_heap_env(sig) => {
+            RirType::Lambda(sig) if self.policy.lambda_sig_copyable(sig) => format!("*({expr})"),
+            RirType::Lambda(sig) if self.policy.lambda_sig_cloneable(sig) => {
                 format!("({expr}).clone()")
             }
-            RirType::Lambda(_) => format!("*({expr})"),
+            RirType::Lambda(_) => unreachable!("verified cloneable lambda value"),
             RirType::Struct(id) => {
                 let strukt = &self.program.structs[id.index()];
                 self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)

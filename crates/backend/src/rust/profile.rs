@@ -318,11 +318,7 @@ impl ProfileCx<'_> {
                         self.check_scoped_borrow_decl(site, *borrow, *ty, *mutability);
                     }
                 }
-                air::LambdaCaptureDecl::CaptureCell { .. } => {
-                    if decl.escape != air::LambdaEscape::NonEscaping {
-                        self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
-                    }
-                }
+                air::LambdaCaptureDecl::CaptureCell { .. } => {}
             }
         }
     }
@@ -980,6 +976,7 @@ impl ProfileCx<'_> {
                     rir::RirParamSemantic::Value
                     | rir::RirParamSemantic::SharedBorrow
                     | rir::RirParamSemantic::StackCell
+                    | rir::RirParamSemantic::HeapCell
                     | rir::RirParamSemantic::ScopedPlaceCell => {
                         self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                     }

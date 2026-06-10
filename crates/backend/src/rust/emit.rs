@@ -3,13 +3,13 @@ use super::{
     place::RustPlaces,
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
-        RirCallArg, RirCallTarget, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLoop, RirLoopId,
-        RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirProgram, RirRValue,
-        RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirEnum, RirEnumMatch, RirEnumRepr,
+        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
+        RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLoop,
+        RirLoopId, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirProgram,
+        RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -112,6 +112,20 @@ impl EmitCx<'_> {
                 )
             })
             .collect::<Vec<_>>();
+        heap_types.extend(
+            self.program
+                .cells
+                .iter()
+                .filter(|cell| cell.storage == RirCellStorage::Heap)
+                .map(|cell| {
+                    let register = target::heap_register(policy.cell_storage_tracked(cell));
+                    (
+                        lambda_cell_heap_type_symbol(cell.id),
+                        policy.cell_storage_ty(cell),
+                        register,
+                    )
+                }),
+        );
         heap_types.extend(self.program.lambda_envs.iter().map(|env| {
             let register = target::heap_register(policy.lambda_env_storage_tracked(env));
             (
@@ -276,7 +290,7 @@ impl EmitCx<'_> {
                     w.line(format_args!(
                         "{}: {},",
                         field.symbol.as_str(),
-                        policy.rust_ty(field.ty)
+                        policy.lambda_env_field_ty(field)
                     ));
                 }
             },
@@ -531,8 +545,10 @@ impl EmitCx<'_> {
         if trace {
             let derives = if policy.lambda_sig_copyable(sig.id) {
                 ["Clone", "Copy"].as_slice()
-            } else {
+            } else if policy.lambda_sig_cloneable(sig.id) {
                 ["Clone"].as_slice()
+            } else {
+                [].as_slice()
             };
             self.w.line(target::trace_derive(derives));
             self.w.line(target::trace_crate_attr(
@@ -540,7 +556,7 @@ impl EmitCx<'_> {
             ));
         } else if policy.lambda_sig_copyable(sig.id) {
             self.w.line("#[derive(Clone, Copy)]");
-        } else if policy.lambda_sig_has_heap_env(sig.id) {
+        } else if policy.lambda_sig_cloneable(sig.id) {
             self.w.line("#[derive(Clone)]");
         }
         self.w.block(format_args!("enum {symbol}{lifetime}"), |w| {
@@ -603,9 +619,16 @@ impl EmitCx<'_> {
                                         for (index, field) in env.fields.iter().enumerate() {
                                             let capture = &captures[index];
                                             let source = format!("&env.{}", field.symbol.as_str());
+                                            let value = match field.kind {
+                                                RirLambdaEnvFieldKind::Value => {
+                                                    values.value_from_ref(capture.ty, &source)
+                                                }
+                                                RirLambdaEnvFieldKind::HeapCell { .. } => {
+                                                    format!("env.{}.clone()", field.symbol.as_str())
+                                                }
+                                            };
                                             w.line(format_args!(
-                                                "let c{index} = ctx.heap().with(env, |env| {});",
-                                                values.value_from_ref(capture.ty, &source)
+                                                "let c{index} = ctx.heap().with(env, |env| {value});"
                                             ));
                                         }
                                         let capture_args = (0..captures.len())
@@ -761,17 +784,21 @@ impl EmitCx<'_> {
     }
 
     fn emit_local_declarations(&mut self, function: &RirFunction) {
+        let policy = RustRepPolicy::new(self.program);
         for cell in self
             .program
             .cells
             .iter()
             .filter(|cell| cell.owner == function.id)
         {
-            self.w.line(format_args!(
-                "let {}: {};",
-                cell.symbol.as_str(),
-                target::stack_lambda_cell_ty(&self.ty(cell.payload_ty))
-            ));
+            let ty = match cell.storage {
+                RirCellStorage::StackScoped => {
+                    target::stack_lambda_cell_ty(&self.ty(cell.payload_ty))
+                }
+                RirCellStorage::Heap => target::handle_ty(&policy.cell_storage_ty(cell)),
+            };
+            self.w
+                .line(format_args!("let {}: {ty};", cell.symbol.as_str()));
         }
         for local in &function.locals {
             if local.payload_ref
@@ -844,9 +871,8 @@ impl EmitCx<'_> {
                 let places = RustPlaces::new(self.program, function);
                 if places.mut_place_root_param(dst) {
                     self.w.line(format_args!(
-                        "{}.set({})?;",
-                        places.local_place(dst),
-                        self.rvalue(function, value)
+                        "{};",
+                        self.mut_place_set(places.local_place(dst), self.rvalue(function, value))
                     ));
                 } else {
                     self.w.line(format_args!(
@@ -857,33 +883,27 @@ impl EmitCx<'_> {
                 }
             }
             RirStmt::CellInit { cell, value } => {
-                let payload_ty = self.cell_payload_ty(function, *cell);
+                let init = self.cell_init(function, *cell, value);
                 if predeclared {
-                    self.w.line(format_args!(
-                        "{} = {}::new({});",
-                        self.cell_ref(function, *cell),
-                        target::stack_lambda_cell_ctor(&payload_ty),
-                        self.rvalue(function, value)
-                    ));
+                    self.w
+                        .line(format_args!("{} = {init};", self.cell_ref(function, *cell)));
                 } else {
                     self.w.line(format_args!(
-                        "let {}: {} = {}::new({});",
+                        "let {}: {} = {init};",
                         self.cell_ref(function, *cell),
-                        target::stack_lambda_cell_ty(&payload_ty),
-                        target::stack_lambda_cell_ctor(&payload_ty),
-                        self.rvalue(function, value)
+                        self.cell_ty(function, *cell)
                     ));
                 }
             }
-            RirStmt::CellSet { cell, value } => self.w.line(format_args!(
-                "{}.set({})?;",
-                self.cell_ref(function, *cell),
-                self.rvalue(function, value)
-            )),
+            RirStmt::CellSet { cell, value } => self
+                .w
+                .line(format_args!("{};", self.cell_set(function, *cell, value))),
             RirStmt::ScopedPlaceCellSet { cell, value } => self.w.line(format_args!(
-                "{}.set({})?;",
-                self.scoped_place_cell_ref(function, *cell),
-                self.rvalue(function, value)
+                "{};",
+                self.mut_place_set(
+                    self.scoped_place_cell_ref(function, *cell),
+                    self.rvalue(function, value)
+                )
             )),
             RirStmt::DataRefSet {
                 object,
@@ -1099,9 +1119,7 @@ impl EmitCx<'_> {
                 projections,
                 ty,
             } => self.dataref_get(function, object, *dataref, projections, *ty),
-            RirRValue::CellGetCopy { cell, .. } => {
-                format!("{}.get_copy()?", self.cell_ref(function, *cell))
-            }
+            RirRValue::CellGetCopy { cell, .. } => self.cell_get_copy(function, *cell),
             RirRValue::ScopedPlaceCellGet { cell, ty } => {
                 values.scoped_place_cell_value(*cell, *ty)
             }
@@ -1345,6 +1363,10 @@ impl EmitCx<'_> {
         }
     }
 
+    fn mut_place_set(&self, place: String, value: String) -> String {
+        format!("{place}.set(ctx.runtime(), {value})?")
+    }
+
     fn mut_place_region(
         &self,
         function: &RirFunction,
@@ -1353,11 +1375,19 @@ impl EmitCx<'_> {
         body: String,
     ) -> String {
         format!(
-            "{}.{}(|value| {})?",
+            "{}.{}(ctx.runtime(), |value| {})?",
             RustPlaces::new(self.program, function).local_place(place),
             op,
             body
         )
+    }
+
+    fn cell_decl(&self, cell: super::rir::RirCellRef) -> &RirCellDecl {
+        match cell {
+            super::rir::RirCellRef::Owner(cell) | super::rir::RirCellRef::Capture { cell, .. } => {
+                &self.program.cells[cell.index()]
+            }
+        }
     }
 
     fn cell_ref(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
@@ -1396,12 +1426,78 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cell_payload_ty(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
-        let ty = match cell {
-            super::rir::RirCellRef::Owner(cell) => self.program.cells[cell.index()].payload_ty,
-            super::rir::RirCellRef::Capture { local, .. } => function.locals[local.index()].ty,
-        };
-        self.ty(ty)
+    fn cell_payload_ty(&self, cell: super::rir::RirCellRef) -> String {
+        self.ty(self.cell_decl(cell).payload_ty)
+    }
+
+    fn cell_ty(&self, _function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+        let payload = self.cell_payload_ty(cell);
+        match self.cell_decl(cell).storage {
+            RirCellStorage::StackScoped => target::stack_lambda_cell_ty(&payload),
+            RirCellStorage::Heap => target::handle_ty(&target::lambda_cell_ty(&payload)),
+        }
+    }
+
+    fn cell_init(
+        &self,
+        function: &RirFunction,
+        cell: super::rir::RirCellRef,
+        value: &RirRValue,
+    ) -> String {
+        let payload = self.cell_payload_ty(cell);
+        let value = self.rvalue(function, value);
+        match self.cell_decl(cell).storage {
+            RirCellStorage::StackScoped => {
+                format!("{}::new({value})", target::stack_lambda_cell_ctor(&payload))
+            }
+            RirCellStorage::Heap => {
+                let heap_type = format!(
+                    "ctx._types.{}",
+                    lambda_cell_heap_type_symbol(self.cell_decl(cell).id)
+                );
+                let storage = format!("{}::new(value)", target::lambda_cell_ctor(&payload));
+                format!(
+                    "{{ let value = {value}; let heap_type = {heap_type}; {} }}",
+                    target::ctx_heap_alloc("ctx", "heap_type", &storage)
+                )
+            }
+        }
+    }
+
+    fn cell_set(
+        &self,
+        function: &RirFunction,
+        cell: super::rir::RirCellRef,
+        value: &RirRValue,
+    ) -> String {
+        let value = self.rvalue(function, value);
+        match self.cell_decl(cell).storage {
+            RirCellStorage::StackScoped => {
+                format!("{}.set({value})?", self.cell_ref(function, cell))
+            }
+            RirCellStorage::Heap => {
+                target::ctx_heap_with(
+                    "ctx",
+                    &format!("&{}", self.cell_ref(function, cell)),
+                    "cell",
+                    &format!("cell.set({value})"),
+                ) + "?"
+            }
+        }
+    }
+
+    fn cell_get_copy(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+        match self.cell_decl(cell).storage {
+            RirCellStorage::StackScoped => format!("{}.get_copy()?", self.cell_ref(function, cell)),
+            RirCellStorage::Heap => {
+                target::ctx_heap_with(
+                    "ctx",
+                    &format!("&{}", self.cell_ref(function, cell)),
+                    "cell",
+                    "cell.get_copy()",
+                ) + "?"
+            }
+        }
     }
 
     fn lambda_capture_arg(
@@ -1440,6 +1536,11 @@ impl EmitCx<'_> {
                 super::rir::RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
                 super::rir::RirCellRef::Capture { .. } => self.cell_ref(function, *cell),
             },
+            (
+                RirLambdaCaptureKind::HeapCell { .. },
+                RirParamSemantic::HeapCell,
+                RirLambdaCaptureArg::HeapCell { cell },
+            ) => format!("{}.clone()", self.cell_ref(function, *cell)),
             (
                 RirLambdaCaptureKind::ScopedPlaceCell { .. },
                 RirParamSemantic::ScopedPlaceCell,
@@ -1804,6 +1905,10 @@ fn lambda_env_heap_type_symbol(id: RirLambdaEnvId) -> String {
     format!("lambda_env{}", id.index())
 }
 
+fn lambda_cell_heap_type_symbol(id: super::rir::RirCellId) -> String {
+    format!("lambda_cell{}", id.index())
+}
+
 fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
     match capture.kind {
         RirLambdaCaptureKind::Param => match capture.semantic {
@@ -1811,9 +1916,11 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
             RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
+            | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),
         },
         RirLambdaCaptureKind::StackCell { .. } => format!("*c{index}"),
+        RirLambdaCaptureKind::HeapCell { .. } => format!("c{index}.clone()"),
         RirLambdaCaptureKind::ScopedPlaceCell { .. } => format!("*c{index}"),
     }
 }

@@ -7,9 +7,10 @@ use anvyx_frontend::air::{
 
 use super::{
     rir::{
-        RirDataRef, RirEnum, RirEnumId, RirField, RirLambdaEnvLayout, RirLambdaSigId,
-        RirLambdaStorage, RirParamAbi, RirParamSemantic, RirProgram, RirStruct, RirStructId,
-        RirTuple, RirTupleId, RirType, RirTypeId,
+        RirCellDecl, RirCellStorage, RirDataRef, RirEnum, RirEnumId, RirField, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaSigId, RirLambdaStorage, RirParamAbi,
+        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirTuple, RirTupleId, RirType,
+        RirTypeId,
     },
     target,
 };
@@ -300,8 +301,8 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Map { .. } => RustValueRep::CowMap,
             RirType::Option(_) => RustValueRep::InlineEnum,
             RirType::Slice(_) => RustValueRep::Opaque,
-            RirType::Lambda(sig) if self.lambda_sig_has_heap_env(sig) => RustValueRep::InlineEnum,
-            RirType::Lambda(_) => RustValueRep::InlineCopy,
+            RirType::Lambda(sig) if self.lambda_sig_copyable(sig) => RustValueRep::InlineCopy,
+            RirType::Lambda(_) => RustValueRep::InlineEnum,
             RirType::Struct(_) | RirType::Tuple(_) => RustValueRep::InlineStruct,
             RirType::DataRef(_) => RustValueRep::HeapHandle,
             RirType::Enum(id) => self.enum_rep(id),
@@ -322,6 +323,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
             RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
+            RirParamSemantic::HeapCell => RirParamAbi::HeapCell,
             RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
         }
     }
@@ -345,7 +347,7 @@ impl<'a> RustRepPolicy<'a> {
                 RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
                     self.shareable_value(inner)
                 }
-                RirType::Lambda(sig) => self.lambda_sig_has_heap_env(sig),
+                RirType::Lambda(sig) => self.lambda_sig_cloneable(sig),
                 RirType::Struct(id) => self.program.structs[id.index()]
                     .fields
                     .iter()
@@ -445,6 +447,10 @@ impl<'a> RustRepPolicy<'a> {
                     target::stack_lambda_cell_ty(&payload)
                 )
             }
+            RirParamAbi::HeapCell => {
+                let payload = self.rust_ty(ty);
+                target::handle_ty(&target::lambda_cell_ty(&payload))
+            }
             RirParamAbi::ScopedPlaceCell => {
                 let payload = self.rust_ty(ty);
                 let source_lifetime = lifetime.unwrap_or("'_");
@@ -483,20 +489,27 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn lambda_sig_needs_lifetime(self, id: RirLambdaSigId) -> bool {
         self.program.lambdas_for_sig(id).any(|lambda| {
-            lambda
-                .captures
-                .iter()
-                .any(|capture| capture.abi != RirParamAbi::Value)
+            lambda.captures.iter().any(|capture| {
+                matches!(
+                    capture.abi,
+                    RirParamAbi::SharedBorrow
+                        | RirParamAbi::MutBorrow
+                        | RirParamAbi::StackCell
+                        | RirParamAbi::ScopedPlaceCell
+                )
+            })
         })
     }
 
     pub fn lambda_sig_needs_ctx_lifetime(self, id: RirLambdaSigId) -> bool {
         self.lambda_sig_has_heap_env(id)
             || self.program.lambdas_for_sig(id).any(|lambda| {
-                lambda
-                    .captures
-                    .iter()
-                    .any(|capture| capture.abi == RirParamAbi::ScopedPlaceCell)
+                lambda.captures.iter().any(|capture| {
+                    matches!(
+                        capture.abi,
+                        RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell
+                    )
+                })
             })
     }
 
@@ -508,7 +521,27 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn lambda_sig_copyable(self, id: RirLambdaSigId) -> bool {
         !self.lambda_sig_has_heap_env(id)
+            && self.program.lambdas_for_sig(id).all(|lambda| {
+                lambda
+                    .captures
+                    .iter()
+                    .all(|capture| capture.abi != RirParamAbi::HeapCell)
+            })
             && self.lambda_sig_copyable_inner(id, &mut BTreeSet::new())
+    }
+
+    pub fn lambda_sig_cloneable(self, id: RirLambdaSigId) -> bool {
+        self.lambda_sig_has_heap_env(id)
+            || self.program.lambdas_for_sig(id).all(|lambda| {
+                lambda.captures.iter().all(|capture| match capture.abi {
+                    RirParamAbi::Value => self.copyable(capture.ty),
+                    RirParamAbi::SharedBorrow
+                    | RirParamAbi::StackCell
+                    | RirParamAbi::HeapCell
+                    | RirParamAbi::ScopedPlaceCell => true,
+                    RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
+                })
+            })
     }
 
     fn lambda_sig_copyable_inner(
@@ -524,6 +557,7 @@ impl<'a> RustRepPolicy<'a> {
                 RirParamAbi::Value => self.copyable_inner(capture.ty, active),
                 RirParamAbi::SharedBorrow
                 | RirParamAbi::StackCell
+                | RirParamAbi::HeapCell
                 | RirParamAbi::ScopedPlaceCell => true,
                 RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
             })
@@ -591,7 +625,20 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn dataref_storage_tracked(self, dataref: &RirDataRef) -> bool {
-        dataref.cycle_capable || self.dataref_cx_dependent(dataref)
+        dataref.cycle_capable
+            || dataref
+                .fields
+                .iter()
+                .any(|field| self.type_owns_heap_edges(field.ty))
+    }
+
+    pub fn cell_storage_ty(self, cell: &RirCellDecl) -> String {
+        let payload = self.rust_ty(cell.payload_ty);
+        target::lambda_cell_ty(&payload)
+    }
+
+    pub fn cell_storage_tracked(self, cell: &RirCellDecl) -> bool {
+        self.type_owns_heap_edges(cell.payload_ty)
     }
 
     pub fn lambda_env_storage_ty(self, env: &RirLambdaEnvLayout) -> String {
@@ -599,13 +646,73 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn lambda_env_cx_dependent(self, env: &RirLambdaEnvLayout) -> bool {
-        env.fields
-            .iter()
-            .any(|field| self.type_cx_dependent(field.ty))
+        env.fields.iter().any(|field| match field.kind {
+            RirLambdaEnvFieldKind::Value => self.type_cx_dependent(field.ty),
+            RirLambdaEnvFieldKind::HeapCell { .. } => true,
+        })
+    }
+
+    pub fn lambda_env_field_ty(self, field: &RirLambdaEnvField) -> String {
+        match field.kind {
+            RirLambdaEnvFieldKind::Value => self.rust_ty(field.ty),
+            RirLambdaEnvFieldKind::HeapCell { .. } => {
+                let payload = self.rust_ty(field.ty);
+                target::handle_ty(&target::lambda_cell_ty(&payload))
+            }
+        }
     }
 
     pub fn lambda_env_storage_tracked(self, env: &RirLambdaEnvLayout) -> bool {
-        self.lambda_env_cx_dependent(env)
+        env.fields.iter().any(|field| match field.kind {
+            RirLambdaEnvFieldKind::Value => self.type_owns_heap_edges(field.ty),
+            RirLambdaEnvFieldKind::HeapCell { .. } => true,
+        })
+    }
+
+    pub fn type_owns_heap_edges(self, ty: RirTypeId) -> bool {
+        match self.ty(ty) {
+            RirType::DataRef(_) => true,
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } | RirType::List(inner) => {
+                self.type_owns_heap_edges(inner)
+            }
+            RirType::Map { key, value } => {
+                self.type_owns_heap_edges(key) || self.type_owns_heap_edges(value)
+            }
+            RirType::Lambda(sig) => self.lambda_sig_owns_heap_edges(sig),
+            RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_owns_heap_edges(field.ty)),
+            RirType::Tuple(id) => self.program.tuples[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_owns_heap_edges(field.ty)),
+            RirType::Enum(id) => self.program.enums[id.index()]
+                .variants
+                .iter()
+                .any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .any(|field| self.type_owns_heap_edges(field.ty))
+                }),
+            RirType::Int
+            | RirType::Float
+            | RirType::Bool
+            | RirType::String
+            | RirType::Void
+            | RirType::Slice(_) => false,
+        }
+    }
+
+    fn lambda_sig_owns_heap_edges(self, id: RirLambdaSigId) -> bool {
+        self.lambda_sig_has_heap_env(id)
+            || self.program.lambdas_for_sig(id).any(|lambda| {
+                lambda
+                    .captures
+                    .iter()
+                    .any(|capture| capture.abi == RirParamAbi::HeapCell)
+            })
     }
 
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
@@ -617,7 +724,7 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Map { key, value } => {
                 self.type_cx_dependent(key) || self.type_cx_dependent(value)
             }
-            RirType::Lambda(sig) => self.lambda_sig_has_heap_env(sig),
+            RirType::Lambda(sig) => self.lambda_sig_needs_ctx_lifetime(sig),
             RirType::Struct(id) => self.program.structs[id.index()]
                 .fields
                 .iter()
@@ -726,6 +833,7 @@ impl<'a> RustRepPolicy<'a> {
             },
             RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
+            | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => !matches!(ty, RirType::Void),
         }
     }
@@ -768,7 +876,7 @@ impl RustTracePlan {
             if matches!(
                 ty,
                 RirType::Struct(_) | RirType::Tuple(_) | RirType::Enum(_)
-            ) && policy.type_cx_dependent(id)
+            ) && policy.type_owns_heap_edges(id)
             {
                 plan.mark_type(program, id);
             }
@@ -778,6 +886,11 @@ impl RustTracePlan {
                 for field in &dataref.fields {
                     plan.mark_type(program, field.ty);
                 }
+            }
+        }
+        for cell in &program.cells {
+            if cell.storage == RirCellStorage::Heap && policy.cell_storage_tracked(cell) {
+                plan.mark_type(program, cell.payload_ty);
             }
         }
         for env in &program.lambda_envs {

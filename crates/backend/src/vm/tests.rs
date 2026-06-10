@@ -630,6 +630,34 @@ fn compiler_rejects_capture_cell_roots() {
 }
 
 #[test]
+fn compiler_rejects_mutable_upvalue_lambda_cells() {
+    for shared in [false, true] {
+        let errors = compile_errors(&mutable_upvalue_lambda_program(shared));
+        assert_function_errors(
+            &errors,
+            FunctionId::from_index(1),
+            &[
+                VmCompileErrorKind::UnsupportedLambdaValue,
+                VmCompileErrorKind::UnsupportedLambdaCell,
+            ],
+        );
+    }
+}
+
+#[test]
+fn compiler_rejects_lambda_body_capture_cell_access() {
+    let errors = compile_errors(&mutable_upvalue_lambda_program(false));
+    assert_function_errors(
+        &errors,
+        FunctionId::from_index(0),
+        &[
+            VmCompileErrorKind::UnsupportedLambdaValue,
+            VmCompileErrorKind::UnsupportedLambdaCell,
+        ],
+    );
+}
+
+#[test]
 fn compiler_rejects_lambda_extern_boundaries() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
@@ -721,6 +749,119 @@ fn compiler_rejects_noncheap_value_call_args() {
     ));
 }
 
+fn mutable_upvalue_lambda_program(shared: bool) -> Program {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let int = program.alloc_type(TypeData::Int);
+    let function_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let module = program.alloc_module(root_module());
+    let binding = BindingId::from_index(0);
+    let source = air::LocalId::from_index(0);
+    let body = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let cell = program.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner,
+        source_local: source,
+        ty: int,
+    });
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body,
+        signature: air::SignatureType::new(vec![], air::ReturnMode::Value(void)),
+        escape: LambdaEscape::Escaping,
+        captures: vec![air::LambdaCaptureDecl::CaptureCell {
+            binding,
+            cell,
+            ty: int,
+        }],
+    });
+    let lambda_body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Lambda(lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Use(Operand::Place(Place {
+                root: PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                projection: vec![],
+                ty: int,
+            })))],
+            air::AirTail::Return(None),
+        ),
+    });
+    debug_assert_eq!(lambda_body, body);
+    let zero = program.alloc_const(air::ConstData {
+        ty: int,
+        value: air::ConstValue::Int(0),
+    });
+    let first = air::LocalId::from_index(1);
+    let mut stmts = vec![
+        Statement::Assign {
+            dst: Place {
+                root: PlaceRoot::CaptureCell(cell),
+                projection: vec![],
+                ty: int,
+            },
+            value: RValue::Use(Operand::Const(zero)),
+        },
+        Statement::Init {
+            local: first,
+            value: RValue::MakeLambda {
+                lambda,
+                captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                ty: function_ty,
+            },
+        },
+    ];
+    let mut locals = vec![
+        Local {
+            name: None,
+            binding: Some(binding),
+            ty: int,
+            mutability: Mutability::Mutable,
+            kind: LocalKind::User,
+        },
+        local(function_ty, Mutability::Immutable, LocalKind::User),
+    ];
+    if shared {
+        let second = air::LocalId::from_index(2);
+        locals.push(local(function_ty, Mutability::Immutable, LocalKind::User));
+        stmts.push(Statement::Init {
+            local: second,
+            value: RValue::MakeLambda {
+                lambda,
+                captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                ty: function_ty,
+            },
+        });
+    }
+    let owner_fn = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals,
+        body: structured_body(stmts, air::AirTail::Return(None)),
+    });
+    debug_assert_eq!(owner_fn, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([lambda_body, owner_fn]);
+    program
+}
+
 fn compile_errors(program: &Program) -> Vec<VmCompileError> {
     let verified = air::verify(program).expect("AIR verify failed");
     VmCompiler::compile(verified).expect_err("VM compile should fail")
@@ -734,6 +875,16 @@ fn has_compile_error(
     errors
         .iter()
         .any(|error| error.site == VmCompileErrorSite::Function(function) && error.kind == kind)
+}
+
+fn assert_function_errors(
+    errors: &[VmCompileError],
+    function: FunctionId,
+    kinds: &[VmCompileErrorKind],
+) {
+    for kind in kinds {
+        assert!(has_compile_error(errors, function, *kind));
+    }
 }
 
 fn has_extern_compile_error(

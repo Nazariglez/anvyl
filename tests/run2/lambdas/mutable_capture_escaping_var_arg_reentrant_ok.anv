@@ -1,21 +1,23 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match-begin
-// 1
-// 2
-// @match-end
+// @match: 12
+
+fn apply(var x: int, cb: fn()) {
+    x += 1;
+    cb();
+    x += 1;
+}
 
 fn make() -> fn() -> int {
     var count = 0;
     || {
-        count = count + 1;
+        apply(count, || { count += 10; });
         count
     }
 }
 
 fn main() {
     let f = make();
-    println(f());
     println(f());
 }

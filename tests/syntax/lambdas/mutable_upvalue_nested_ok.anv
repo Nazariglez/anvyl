@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn make_nested() -> fn() -> fn() -> int {
+    var count = 0;
+    || {
+        || {
+            count = count + 1;
+            count
+        }
+    }
+}

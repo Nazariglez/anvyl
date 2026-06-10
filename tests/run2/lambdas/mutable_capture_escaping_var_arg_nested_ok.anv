@@ -6,10 +6,15 @@
 // 2
 // @match-end
 
+fn bump(var x: int) {
+    x += 1;
+}
+
 fn make() -> fn() -> int {
     var count = 0;
     || {
-        count = count + 1;
+        let inner = || { bump(count); };
+        inner();
         count
     }
 }
