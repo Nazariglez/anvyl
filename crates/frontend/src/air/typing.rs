@@ -337,11 +337,17 @@ pub(crate) fn array_elem_len(program: &Program, ty: TypeId) -> Option<(TypeId, u
     }
 }
 
-pub(crate) fn index_elem(program: &Program, ty: TypeId) -> Option<TypeId> {
+pub(crate) fn sequence_elem(program: &Program, ty: TypeId) -> Option<TypeId> {
     match program.type_arena.get(ty) {
-        Some(TypeData::List(elem) | TypeData::Array { elem, .. }) => Some(*elem),
+        Some(TypeData::List(elem) | TypeData::Array { elem, .. } | TypeData::Slice(elem)) => {
+            Some(*elem)
+        }
         _ => None,
     }
+}
+
+pub(crate) fn index_elem(program: &Program, ty: TypeId) -> Option<TypeId> {
+    sequence_elem(program, ty)
 }
 
 pub(crate) fn map_kv(program: &Program, ty: TypeId) -> Option<(TypeId, TypeId)> {
@@ -355,7 +361,12 @@ pub(crate) fn is_countable(program: &Program, primitives: &PrimitiveTypes, ty: T
     primitives.is_string(ty)
         || matches!(
             program.type_arena.get(ty),
-            Some(TypeData::List(_) | TypeData::Array { .. } | TypeData::Map { .. })
+            Some(
+                TypeData::List(_)
+                    | TypeData::Array { .. }
+                    | TypeData::Slice(_)
+                    | TypeData::Map { .. }
+            )
         )
 }
 

@@ -4395,6 +4395,64 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
 }
 
 #[test]
+fn slice_view_rejects_non_sequence_source_and_non_slice_result() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_slice_view", module, FunctionKind::Normal, void_ty);
+    let scalar = fb.push_param("x", int_ty, ParamRole::Normal);
+    let xs = fb.push_param("xs", list_ty, ParamRole::Normal);
+    let start = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let end = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(bb0, stmt_init(start, RValue::Use(op_const(zero))));
+    fb.add_statement(bb0, stmt_init(end, RValue::Use(op_const(one))));
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::SliceView {
+            source: place(scalar, int_ty),
+            start,
+            end,
+            inclusive: false,
+            ty: list_ty,
+        }),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::SliceView {
+            source: place(xs, list_ty),
+            start,
+            end,
+            inclusive: false,
+            ty: list_ty,
+        }),
+    );
+    let fid = builder.alloc_function(fb.finish());
+    builder.set_entry(fid);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::SliceViewSourceMustBeSequence(ty)) if ty == int_ty
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::SliceViewResultMustBeSlice { expected_elem, found })
+            if expected_elem == int_ty && found == list_ty
+    )));
+}
+
+#[test]
 fn map_entry_and_slice_view_indices_must_exist_and_be_int() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -5735,5 +5793,507 @@ fn optional_match_rejects_reused_or_mutable_payload_local() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadFunction(BadFunction::OptionalPayloadLocalMustBeImmutable(found)) if found == mutable
+    )));
+}
+
+#[test]
+fn collection_loan_root_kind_and_mode_must_match() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param("xs", list_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let root_kind_body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::Map,
+                mode: AirCollectionLoanMode::ReadonlyMap,
+                body: AirBlock::default(),
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let mode_body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlyMap,
+                body: AirBlock::default(),
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &root_kind_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanRootKindMismatch {
+            root_kind: AirCollectionRootKind::Map,
+            found,
+        }) if found == list_ty
+    )));
+
+    let errors = verify_structured_body(&program, func_id, &mode_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanModeRootKindMismatch {
+            root_kind: AirCollectionRootKind::List,
+            mode: AirCollectionLoanMode::ReadonlyMap,
+        })
+    )));
+}
+
+#[test]
+fn collection_slot_locals_cannot_outlive_scope() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let index = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let slot = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let out_of_scope_body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::MutableSequenceElement,
+                body: AirBlock {
+                    stmts: vec![
+                        stmt_init(index, RValue::Use(op_const(zero))),
+                        AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                            root: place(xs, list_ty),
+                            index,
+                            slots: vec![AirCollectionSlot {
+                                kind: AirCollectionSlotKind::SequenceElement,
+                                local: slot,
+                                ty: int_ty,
+                                mutable: true,
+                            }],
+                            body: AirBlock::default(),
+                        }),
+                        stmt_eval(RValue::Use(op_place(slot, int_ty))),
+                    ],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &out_of_scope_body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanSlotOutOfScope(local)) if local == slot
+    )));
+}
+
+#[test]
+fn collection_slot_scope_requires_matching_active_loan() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("slot_scope", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let index = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let slot = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![
+                stmt_init(index, RValue::Use(op_const(zero))),
+                AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                    root: place(xs, list_ty),
+                    index,
+                    slots: vec![AirCollectionSlot {
+                        kind: AirCollectionSlotKind::SequenceElement,
+                        local: slot,
+                        ty: int_ty,
+                        mutable: true,
+                    }],
+                    body: AirBlock {
+                        stmts: vec![stmt_eval(RValue::Use(op_place(slot, int_ty)))],
+                        tail: AirTail::None,
+                    },
+                }),
+            ],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanSlotOutOfScope(local)) if local == slot
+    )));
+}
+
+#[test]
+fn collection_slot_scope_index_must_be_int() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let truth = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let mut fb = FunctionBuilder::new("slot_scope", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let index = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::Temp);
+    let slot = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::MutableSequenceElement,
+                body: AirBlock {
+                    stmts: vec![
+                        stmt_init(index, RValue::Use(op_const(truth))),
+                        AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                            root: place(xs, list_ty),
+                            index,
+                            slots: vec![AirCollectionSlot {
+                                kind: AirCollectionSlotKind::SequenceElement,
+                                local: slot,
+                                ty: int_ty,
+                                mutable: true,
+                            }],
+                            body: AirBlock::default(),
+                        }),
+                    ],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::SliceIndexMustBeInt { which: "index", found }) if found == bool_ty
+    )));
+}
+
+#[test]
+fn collection_slot_locals_cannot_return() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, int_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let index = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let slot = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    fb.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::MutableSequenceElement,
+                body: AirBlock {
+                    stmts: vec![
+                        stmt_init(index, RValue::Use(op_const(zero))),
+                        AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                            root: place(xs, list_ty),
+                            index,
+                            slots: vec![AirCollectionSlot {
+                                kind: AirCollectionSlotKind::SequenceElement,
+                                local: slot,
+                                ty: int_ty,
+                                mutable: true,
+                            }],
+                            body: AirBlock {
+                                stmts: vec![],
+                                tail: AirTail::Return(Some(op_place(slot, int_ty))),
+                            },
+                        }),
+                    ],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Unreachable,
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanSlotEscapesBody(local)) if local == slot
+    )));
+}
+
+#[test]
+fn collection_loan_rejects_same_root_structural_ops() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body: AirBlock {
+                    stmts: vec![stmt_eval(RValue::ListPush {
+                        list: place(xs, list_ty),
+                        value: op_const(one),
+                    })],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanStructuralOpConflict {
+            mode: AirCollectionLoanMode::ReadonlySequence,
+            op: "ListPush",
+        })
+    )));
+}
+
+#[test]
+fn collection_loan_rejects_root_rebinding() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let ys = fb.push_param("ys", list_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body: AirBlock {
+                    stmts: vec![stmt_assign(
+                        place(xs, list_ty),
+                        RValue::Use(op_place(ys, list_ty)),
+                    )],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanRootRebindConflict {
+            mode: AirCollectionLoanMode::ReadonlySequence,
+        })
+    )));
+}
+
+#[test]
+fn collection_loan_rejects_containing_root_rebinding() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let outer_ty = builder.alloc_type(TypeData::List(list_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let zero = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(0),
+    });
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", outer_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let ys = fb.push_param("ys", outer_ty, ParamRole::Normal);
+    let index = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let mut root = place(xs, outer_ty);
+    root.projection.push(Projection::Index(index));
+    root.ty = list_ty;
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![
+                stmt_init(index, RValue::Use(op_const(zero))),
+                AirStmt::CollectionLoan(AirCollectionLoan {
+                    root,
+                    root_kind: AirCollectionRootKind::List,
+                    mode: AirCollectionLoanMode::ReadonlySequence,
+                    body: AirBlock {
+                        stmts: vec![stmt_assign(
+                            place(xs, outer_ty),
+                            RValue::Use(op_place(ys, outer_ty)),
+                        )],
+                        tail: AirTail::None,
+                    },
+                }),
+            ],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanRootRebindConflict {
+            mode: AirCollectionLoanMode::ReadonlySequence,
+        })
+    )));
+}
+
+#[test]
+fn escaping_lambda_cannot_capture_collection_slot() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let module = test_module(&mut builder);
+    let lambda = LambdaId::from_index(0);
+    let lambda_body_id = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let source = LocalId::from_index(2);
+    let binding = BindingId::from_index(0);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(void_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig.clone()));
+    assert_eq!(
+        builder.alloc_lambda(LambdaDecl {
+            source: crate::ast::ExprId(0),
+            module,
+            owner,
+            body: lambda_body_id,
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![LambdaCaptureDecl::ScopedLocal {
+                binding,
+                source: CaptureLocalSource {
+                    owner,
+                    local: source,
+                },
+                ty: int_ty,
+                mutability: Mutability::Mutable,
+            }],
+        }),
+        lambda
+    );
+    let mut lambda_body =
+        FunctionBuilder::new("lambda", module, FunctionKind::Lambda(lambda), void_ty);
+    lambda_body.push_block(term_return_void());
+    assert_eq!(builder.alloc_function(lambda_body.finish()), lambda_body_id);
+
+    let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, void_ty);
+    let xs = fb.push_param_with_mode("xs", list_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let index = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::Temp);
+    let slot = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::Temp);
+    assert_eq!(slot, source);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    assert_eq!(func_id, owner);
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(xs, list_ty),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::MutableSequenceElement,
+                body: AirBlock {
+                    stmts: vec![
+                        stmt_init(
+                            index,
+                            RValue::Use(op_const(builder.alloc_const(ConstData {
+                                ty: int_ty,
+                                value: ConstValue::Int(0),
+                            }))),
+                        ),
+                        AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                            root: place(xs, list_ty),
+                            index,
+                            slots: vec![AirCollectionSlot {
+                                kind: AirCollectionSlotKind::SequenceElement,
+                                local: slot,
+                                ty: int_ty,
+                                mutable: true,
+                            }],
+                            body: AirBlock {
+                                stmts: vec![stmt_eval(RValue::MakeLambda {
+                                    lambda,
+                                    captures: vec![LambdaCaptureArg::ScopedLocal {
+                                        place: place(slot, int_ty),
+                                    }],
+                                    ty: lambda_ty,
+                                })],
+                                tail: AirTail::None,
+                            },
+                        }),
+                    ],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanSlotEscapesBody(local)) if local == slot
     )));
 }

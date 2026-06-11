@@ -19,6 +19,8 @@ pub enum AirStmt {
     Eval(RValue),
     If(AirIf),
     Loop(AirLoop),
+    CollectionLoan(AirCollectionLoan),
+    CollectionSlotScope(AirCollectionSlotScope),
     EnumMatch(AirEnumMatch),
     OptionalMatch(AirOptionalMatch),
 }
@@ -44,6 +46,52 @@ pub struct AirIf {
 pub struct AirLoop {
     pub id: AirLoopId,
     pub body: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirCollectionLoan {
+    pub root: Place,
+    pub root_kind: AirCollectionRootKind,
+    pub mode: AirCollectionLoanMode,
+    pub body: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirCollectionSlotScope {
+    pub root: Place,
+    pub index: LocalId,
+    pub slots: Vec<AirCollectionSlot>,
+    pub body: AirBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirCollectionRootKind {
+    List,
+    FixedArray,
+    Slice,
+    Map,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirCollectionLoanMode {
+    ReadonlySequence,
+    MutableSequenceElement,
+    ReadonlyMap,
+    MutableMapValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AirCollectionSlot {
+    pub kind: AirCollectionSlotKind,
+    pub local: LocalId,
+    pub ty: TypeId,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirCollectionSlotKind {
+    SequenceElement,
+    MapValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -216,6 +264,12 @@ pub enum LambdaCaptureArg {
     CaptureCell { cell: CaptureCellId },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapWriteKind {
+    IndexedAssignment,
+    StructuralInsert,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
@@ -290,6 +344,7 @@ pub enum RValue {
         map: Place,
         key: Operand,
         value: Operand,
+        kind: MapWriteKind,
     },
     MapRemove {
         map: Place,
@@ -363,6 +418,8 @@ impl AirStmt {
                 }
             }
             Self::Loop(loop_) => loop_.body.for_each_rvalue(f),
+            Self::CollectionLoan(loan) => loan.body.for_each_rvalue(f),
+            Self::CollectionSlotScope(scope) => scope.body.for_each_rvalue(f),
             Self::EnumMatch(match_) => {
                 for arm in &match_.arms {
                     arm.block.for_each_rvalue(f);

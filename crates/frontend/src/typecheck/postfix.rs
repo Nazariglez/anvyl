@@ -7,7 +7,7 @@ use super::{
     annotation::{AccessPolicyOutput, emit_access_policy},
     body::check_specialized_callable_body,
     check_arg_count, check_arg_range, check_expected_value_expr, check_expr_checked,
-    check_value_expr_checked_with_hint, checked_from_type, checked_type,
+    check_value_expr_checked_with_hint, checked_from_type, checked_type, collection_loan,
     contracts::{self, DynamicMethodError},
     decls::{
         CallableKind, CallableParent, CallableRef, ContractRequirementSchema, ContractSetKey,
@@ -32,6 +32,7 @@ use crate::{
         CallNode, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg,
         Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type,
     },
+    collection_effect::CollectionStructuralEffect,
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
         ResolvedExternTy,
@@ -120,6 +121,7 @@ struct SourceReceiver {
     mutable: bool,
     use_: ReceiverUse,
     name: Ident,
+    collection_effect: Option<CollectionStructuralEffect>,
 }
 
 impl ReceiverUse {
@@ -626,7 +628,10 @@ fn apply_index(
         checked,
         place::projected_field_access(target.access),
         target.facts.clone(),
-        target.identity.clone().index(),
+        target
+            .identity
+            .clone()
+            .index_by(place::index_identity(&node.node.index, tc)),
     );
     if !optional_chain {
         tc.record_expr_place(id, &value);
@@ -794,7 +799,11 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
             checked,
             place::projected_field_access(target.value.access),
             target.value.facts.clone(),
-            target.value.identity.clone().index(),
+            target
+                .value
+                .identity
+                .clone()
+                .index_by(place::index_identity(&index.node.index, tc)),
         );
     }
 
@@ -821,6 +830,7 @@ fn source_receiver(
     global: Option<place::GlobalPlace>,
     expr_id: ExprId,
     name: Ident,
+    collection_effect: Option<CollectionStructuralEffect>,
 ) -> SourceReceiver {
     SourceReceiver {
         mutable: matches!(mode, MethodMode::Instance { mutable: true }),
@@ -833,6 +843,7 @@ fn source_receiver(
             id: expr_id,
         },
         name,
+        collection_effect,
     }
 }
 
@@ -911,6 +922,11 @@ fn apply_value_field(
                             receiver.global.clone(),
                             receiver_id,
                             name,
+                            collection_loan::classify_method_effect(
+                                receiver_ty,
+                                name,
+                                &method.origin,
+                            ),
                         )),
                     )
                 }
@@ -939,6 +955,11 @@ fn apply_value_field(
                             receiver.global.clone(),
                             receiver_id,
                             name,
+                            collection_loan::classify_method_effect(
+                                receiver_ty,
+                                name,
+                                &method.extend.origin,
+                            ),
                         )),
                     )
                 }
@@ -976,6 +997,7 @@ fn apply_value_field(
                                     receiver.global.as_ref().map(place::GlobalPlace::projected),
                                     field_id,
                                     name,
+                                    None,
                                 )),
                             )
                         }
@@ -1449,6 +1471,17 @@ fn check_source_receiver(
     tc: &mut TypeChecker,
 ) -> Option<MutableArg> {
     receiver.use_.check_root(span, tc);
+    if let Some(error) = receiver.collection_effect.and_then(|effect| {
+        collection_loan::structural_method_error(
+            &tc.active_collection_loans,
+            effect,
+            &receiver.use_.identity,
+            tc.error_span(span),
+        )
+    }) {
+        tc.push_error(error);
+        return None;
+    }
     if receiver.mutable {
         if let Some(error) = receiver.use_.access.error_for(
             MutableUseKind::MutatingReceiver(receiver.name),
@@ -1957,6 +1990,19 @@ fn finish_projected_var_arg(
     projected: &PlaceValue,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
+    if let Some(error) = collection_loan::mutable_collection_arg_error(
+        &tc.active_collection_loans,
+        &projected.identity,
+        &projected.checked.ty,
+        &tc.handle_type(&param.ty),
+        tc.error_span(arg.span),
+    ) {
+        tc.push_error(error);
+        return SourceArgCheck {
+            failed: true,
+            mutable_arg: None,
+        };
+    }
     tc.reject_extern_any_escape(&projected.checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,
@@ -1977,6 +2023,19 @@ fn finish_var_arg(
     place: place::CheckedPlace,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
+    if let Some(error) = collection_loan::mutable_collection_arg_error(
+        &tc.active_collection_loans,
+        &place.value.identity,
+        &place.value.checked.ty,
+        &tc.handle_type(&param.ty),
+        tc.error_span(arg.span),
+    ) {
+        tc.push_error(error);
+        return SourceArgCheck {
+            failed: true,
+            mutable_arg: None,
+        };
+    }
     place::record_var_argument(arg.node.id, &place.value, tc);
     let mutable_arg = Some(mutable_arg(arg.span, &place.value));
     let checked = place.into_checked();
@@ -2357,6 +2416,7 @@ fn check_qualified_extend_call(
         receiver.global.clone(),
         receiver_expr.node.id,
         name,
+        collection_loan::classify_method_effect(&receiver.checked.ty, name, &extend.origin),
     );
     check_extend_method_access(
         &mut AccessPolicyOutput {

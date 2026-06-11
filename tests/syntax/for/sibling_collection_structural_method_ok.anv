@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Bag {
+    left: [int],
+    right: [int],
+}
+
+fn main() {
+    var bag = Bag { left: [1, 2, 3], right: [] };
+    for x in bag.left {
+        bag.right.push(x);
+    }
+}

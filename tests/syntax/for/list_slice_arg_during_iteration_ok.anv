@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn take(xs: slice[int]) {}
+
+fn main() {
+    var xs = [1, 2, 3];
+    for x in xs {
+        take(xs);
+        let _: int = x;
+    }
+}

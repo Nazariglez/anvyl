@@ -45,6 +45,7 @@ pub enum VmCompileErrorKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
+    UnsupportedCollectionLoan,
     UnsupportedPlaceRoot,
     NonCheapValueParam,
     NonCheapValueArg,
@@ -150,6 +151,16 @@ impl CompileCx<'_> {
                     }
                 }
                 AirStmt::Loop(loop_) => self.check_block(function, &loop_.body, calls),
+                AirStmt::CollectionLoan(loan) => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.check_place(function, &loan.root);
+                    self.check_block(function, &loan.body, calls);
+                }
+                AirStmt::CollectionSlotScope(scope) => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.check_place(function, &scope.root);
+                    self.check_block(function, &scope.body, calls);
+                }
                 AirStmt::EnumMatch(match_) => {
                     self.check_place(function, &match_.discr);
                     for arm in &match_.arms {
@@ -237,7 +248,12 @@ impl CompileCx<'_> {
                 self.check_place(function, map);
                 self.check_operand(function, key);
             }
-            RValue::MapInsert { map, key, value } => {
+            RValue::MapInsert {
+                map,
+                key,
+                value,
+                kind: _,
+            } => {
                 self.check_place(function, map);
                 self.check_operand(function, key);
                 self.check_operand(function, value);

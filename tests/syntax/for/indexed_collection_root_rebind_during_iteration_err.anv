@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cannot rebind iterated collection
+// @frontend: new
+
+fn main() {
+    var lists: [[int]] = [[1], [2]];
+    let i = 0;
+    for _ in lists[i] {
+        lists[i] = [3];
+    }
+}

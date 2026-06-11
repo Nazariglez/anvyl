@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: cannot change map shape while iterating it
+// @frontend: new
+
+fn main() {
+    var hp = ["a": 1, "b": 2];
+    for key, value in hp {
+        hp.insert(key, value);
+    }
+}

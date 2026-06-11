@@ -5,7 +5,7 @@ use super::{
     postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
-    ast::{ExprId, ExprKind, ExprNode, Ident, Mutability, Type},
+    ast::{ExprId, ExprKind, ExprNode, Ident, Lit, Mutability, Type},
     externs::catalog::ExternFieldRef,
     span::Span,
 };
@@ -27,8 +27,12 @@ pub(super) enum PlaceIdentity {
     #[default]
     Unknown,
     Single(PlacePath),
+    ConstIndex(i64),
     UnknownDerived(PlaceRoot),
-    IndexedDerived(PlaceRoot),
+    IndexedDerived {
+        base: PlacePath,
+        index: Box<PlaceIdentity>,
+    },
     Alternatives {
         group: AliasAltGroupId,
         alternatives: Vec<PlaceIdentity>,
@@ -104,6 +108,10 @@ impl PlaceIdentity {
         Self::Single(PlacePath::root(root))
     }
 
+    pub(super) fn const_index(value: i64) -> Self {
+        Self::ConstIndex(value)
+    }
+
     pub(super) fn root_local(&self) -> Option<SemanticLocalId> {
         match self.place_root()? {
             PlaceRoot::Local(local) => Some(local),
@@ -131,15 +139,28 @@ impl PlaceIdentity {
     }
 
     pub(super) fn index(self) -> Self {
+        self.index_by(Self::Unknown)
+    }
+
+    pub(super) fn index_by(self, index: Self) -> Self {
         match self {
-            Self::Single(path) => Self::IndexedDerived(path.root),
-            Self::UnknownDerived(root) => Self::IndexedDerived(root),
+            Self::Single(base) => Self::IndexedDerived {
+                base,
+                index: Box::new(index),
+            },
+            Self::UnknownDerived(root) => Self::IndexedDerived {
+                base: PlacePath::root(root),
+                index: Box::new(index),
+            },
             Self::Alternatives {
                 group,
                 alternatives,
             } => Self::alternatives(
                 group,
-                alternatives.into_iter().map(PlaceIdentity::index).collect(),
+                alternatives
+                    .into_iter()
+                    .map(|identity| identity.index_by(index.clone()))
+                    .collect(),
             ),
             identity => identity,
         }
@@ -176,31 +197,49 @@ impl PlaceIdentity {
     pub(super) fn derives_from(&self, source: &Self) -> bool {
         match (self, source) {
             (Self::Unknown, _) | (_, Self::Unknown) => false,
+            (Self::ConstIndex(left), Self::ConstIndex(right)) => left == right,
+            (Self::ConstIndex(_), _) | (_, Self::ConstIndex(_)) => false,
             (Self::Alternatives { alternatives, .. }, source) => {
                 alternatives.iter().all(|alt| alt.derives_from(source))
             }
             (identity, Self::Alternatives { alternatives, .. }) => alternatives
                 .iter()
                 .any(|source| identity.derives_from(source)),
-            (Self::Single(path), Self::Single(source)) => path.starts_with(source),
-            _ => self.place_root() == source.place_root(),
+            _ => match (self.precise_path(), source.precise_path()) {
+                (Some(path), Some(source)) => path.starts_with(source),
+                _ => self.place_root() == source.place_root(),
+            },
         }
     }
 
     pub(super) fn is_indexed_derived(&self) -> bool {
         match self {
-            Self::IndexedDerived(_) => true,
+            Self::IndexedDerived { .. } => true,
             Self::Alternatives { alternatives, .. } => {
                 alternatives.iter().any(Self::is_indexed_derived)
             }
-            Self::Unknown | Self::Single(_) | Self::UnknownDerived(_) => false,
+            Self::Unknown | Self::Single(_) | Self::ConstIndex(_) | Self::UnknownDerived(_) => {
+                false
+            }
+        }
+    }
+
+    pub(super) fn indexed_base_path(&self) -> Option<&PlacePath> {
+        match self {
+            Self::IndexedDerived { base, .. } => Some(base),
+            Self::Alternatives { .. }
+            | Self::Unknown
+            | Self::Single(_)
+            | Self::ConstIndex(_)
+            | Self::UnknownDerived(_) => None,
         }
     }
 
     pub(super) fn conflicts_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Unknown, _) | (_, Self::Unknown) => true,
-            (Self::Single(left), Self::Single(right)) => left.conflicts_with(right),
+            (Self::ConstIndex(left), Self::ConstIndex(right)) => left == right,
+            (Self::ConstIndex(_), _) | (_, Self::ConstIndex(_)) => false,
             (
                 Self::Alternatives {
                     group: left_group,
@@ -217,15 +256,30 @@ impl PlaceIdentity {
             (_, Self::Alternatives { alternatives, .. }) => {
                 alternatives.iter().any(|alt| self.conflicts_with(alt))
             }
-            _ => self.place_root() == other.place_root(),
+            _ => match (self.precise_path(), other.precise_path()) {
+                (Some(left), Some(right)) => left.conflicts_with(right),
+                _ => self.place_root() == other.place_root(),
+            },
         }
     }
 
     fn place_root(&self) -> Option<PlaceRoot> {
         match self {
             Self::Single(path) => Some(path.root.clone()),
-            Self::UnknownDerived(root) | Self::IndexedDerived(root) => Some(root.clone()),
-            Self::Unknown | Self::Alternatives { .. } => None,
+            Self::IndexedDerived { base, .. } => Some(base.root.clone()),
+            Self::UnknownDerived(root) => Some(root.clone()),
+            Self::Unknown | Self::ConstIndex(_) | Self::Alternatives { .. } => None,
+        }
+    }
+
+    fn precise_path(&self) -> Option<&PlacePath> {
+        match self {
+            Self::Single(path) => Some(path),
+            Self::IndexedDerived { base, .. } => Some(base),
+            Self::Unknown
+            | Self::ConstIndex(_)
+            | Self::UnknownDerived(_)
+            | Self::Alternatives { .. } => None,
         }
     }
 
@@ -244,6 +298,16 @@ impl PlaceIdentity {
             ),
             identity => identity,
         }
+    }
+}
+
+pub(super) fn index_identity(index: &ExprNode, tc: &TypeChecker) -> PlaceIdentity {
+    if let Some(value) = tc.expr_place(index.node.id) {
+        return value.identity;
+    }
+    match &index.node.kind {
+        ExprKind::Lit(Lit::Int(value)) => PlaceIdentity::const_index(*value),
+        _ => PlaceIdentity::unknown(),
     }
 }
 
@@ -731,7 +795,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
                     PlaceAccess::NotPlace,
                 );
             }
-            super::ResolvedIdentSubject::Named(_, value_name, decl) => match decl {
+            super::ResolvedIdentSubject::Named(_, value_name, decl) => match *decl {
                 ValueDecl::Const(sig) => {
                     tc.warn_named_const_deprecated(value_name, expr.span);
                     let checked = super::checked_from_type(expr, sig.ty.clone(), tc);
@@ -784,7 +848,11 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
             checked,
             access,
             target.value.facts.clone(),
-            target.value.identity.clone().index(),
+            target
+                .value
+                .identity
+                .clone()
+                .index_by(index_identity(&index.node.index, tc)),
         );
         return CheckedPlace {
             value,
@@ -1254,6 +1322,17 @@ mod tests {
         let right = alternatives(2, vec![inner_right, identity(3)]);
 
         assert!(!left.conflicts_with(&right));
+    }
+
+    #[test]
+    fn indexed_projection_keeps_projected_base_path() {
+        let left = identity(1).field(ident("left")).index();
+        let same = identity(1).field(ident("left")).index();
+        let sibling = identity(1).field(ident("right")).index();
+
+        assert!(left.conflicts_with(&same));
+        assert!(!left.conflicts_with(&sibling));
+        assert!(left.derives_from(&identity(1).field(ident("left"))));
     }
 
     #[test]

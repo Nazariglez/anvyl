@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: cannot change list shape while iterating it
+// @frontend: new
+
+fn main() {
+    var xs: [int] = [1, 2, 3];
+    for var x in xs {
+        xs.push(x);
+    }
+}

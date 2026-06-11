@@ -82,6 +82,7 @@ pub enum ProfileErrorKind {
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
     UnsupportedMutablePlace,
+    UnsupportedCollectionLoan,
     UnsupportedMutablePlaceProjection,
     UnsupportedMutablePlaceDataRef,
     UnsupportedMutablePlaceNativeBoundary,
@@ -375,6 +376,14 @@ impl ProfileCx<'_> {
                     self.check_air_block(function, &match_.none_block);
                 }
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
+                air::AirStmt::CollectionLoan(loan) => {
+                    self.check_place(site, &loan.root);
+                    self.push(site, ProfileErrorKind::UnsupportedCollectionLoan);
+                }
+                air::AirStmt::CollectionSlotScope(scope) => {
+                    self.check_place(site, &scope.root);
+                    self.push(site, ProfileErrorKind::UnsupportedCollectionLoan);
+                }
             }
         }
         if let air::AirTail::Return(Some(value)) = &body.tail {
@@ -583,7 +592,12 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
             }
-            RValue::MapInsert { map, key, value } => {
+            RValue::MapInsert {
+                map,
+                key,
+                value,
+                kind: _,
+            } => {
                 self.check_place(site, map);
                 if self.place_crosses_dataref(site, map) {
                     self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);

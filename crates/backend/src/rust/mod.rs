@@ -183,6 +183,8 @@ pub enum RustTargetGapKind {
     UnsupportedStructuralStringify,
     UnsupportedContextBorrowAcrossCall,
     UnsupportedProviderNativeRepresentation,
+    UnsupportedCollectionLoan,
+    UnsupportedSliceView,
     UnsupportedMutablePlace,
     UnsupportedMutablePlaceProjection,
     UnsupportedMutablePlaceDataRef,
@@ -252,6 +254,9 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 }
                 ProfileErrorKind::UnsupportedMutablePlace => {
                     RustTargetGapKind::UnsupportedMutablePlace
+                }
+                ProfileErrorKind::UnsupportedCollectionLoan => {
+                    RustTargetGapKind::UnsupportedCollectionLoan
                 }
                 ProfileErrorKind::UnsupportedMutablePlaceProjection => {
                     RustTargetGapKind::UnsupportedMutablePlaceProjection
@@ -1896,6 +1901,12 @@ impl<'a> PlanCx<'a> {
                     body,
                 })])
             }
+            air::AirStmt::CollectionLoan(_) | air::AirStmt::CollectionSlotScope(_) => {
+                Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedCollectionLoan,
+                ))
+            }
             air::AirStmt::EnumMatch(match_) => {
                 let discr = self.lower_place_read(function, &match_.discr, locals);
                 let RirOperand::Place(discr_place) = discr.operand else {
@@ -2246,27 +2257,11 @@ impl<'a> PlanCx<'a> {
                     },
                 }
             }
-            RValue::SliceView {
-                source,
-                start,
-                end,
-                inclusive,
-                ty,
-            } => {
-                let source = self.lower_place_read(function, source, locals);
-                let RirOperand::Place(source_place) = source.operand else {
-                    unreachable!("place read returns a place operand")
-                };
-                PlannedRValue {
-                    stmts: source.stmts,
-                    value: RirRValue::SliceView {
-                        source: source_place,
-                        start: RirLocalId::from_index(start.index()),
-                        end: RirLocalId::from_index(end.index()),
-                        inclusive: *inclusive,
-                        ty: self.type_map[ty],
-                    },
-                }
+            RValue::SliceView { .. } => {
+                return Err(Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::UnsupportedSliceView,
+                ));
             }
             RValue::ListSlice {
                 source,
@@ -2307,7 +2302,12 @@ impl<'a> PlanCx<'a> {
                     },
                 }
             }
-            RValue::MapInsert { map, key, value } => {
+            RValue::MapInsert {
+                map,
+                key,
+                value,
+                kind: _,
+            } => {
                 if self.place_crosses_dataref(function, map) {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),

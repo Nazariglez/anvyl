@@ -10,13 +10,20 @@ use super::{
     ParamEscape, ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, ScopedBorrowDecl,
     ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
-        AggregateCtor, AirBlock, AirEnumMatch, AirIf, AirOptionalMatch, AirStmt, AirTail, CallArg,
-        Callee, LambdaCaptureArg, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
+        AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
+        AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
+        AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, LambdaCaptureArg, MapWriteKind,
+        Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
     },
     ids::*,
     typing::{self, PrimitiveTypes},
 };
-use crate::ast::{BinaryOp, UnaryOp};
+use crate::{
+    ast::{BinaryOp, UnaryOp},
+    collection_effect::{
+        CollectionStructuralEffect, MapStructuralEffect, SequenceStructuralEffect,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyError {
@@ -367,12 +374,55 @@ pub enum BadFunction {
         expected_elem: TypeId,
         found: TypeId,
     },
+    ListSliceSourceMustBeList(TypeId),
     ListSliceResultMustBeList {
+        found: TypeId,
+    },
+    SliceViewSourceMustBeSequence(TypeId),
+    SliceViewResultMustBeSlice {
+        expected_elem: TypeId,
         found: TypeId,
     },
     SliceIndexMustBeInt {
         which: &'static str,
         found: TypeId,
+    },
+    CollectionLoanRootKindMismatch {
+        root_kind: AirCollectionRootKind,
+        found: TypeId,
+    },
+    CollectionLoanModeRootKindMismatch {
+        root_kind: AirCollectionRootKind,
+        mode: AirCollectionLoanMode,
+    },
+    CollectionLoanSlotKindMismatch {
+        local: LocalId,
+        mode: AirCollectionLoanMode,
+        kind: AirCollectionSlotKind,
+    },
+    CollectionLoanSlotTypeMismatch {
+        local: LocalId,
+        expected: TypeId,
+        found: TypeId,
+    },
+    CollectionLoanSlotMutabilityMismatch {
+        local: LocalId,
+        expected: bool,
+        found: bool,
+    },
+    CollectionLoanSlotAlreadyInitialized(LocalId),
+    CollectionLoanSlotMustBeFreshLocal {
+        local: LocalId,
+        kind: LocalKind,
+    },
+    CollectionLoanSlotOutOfScope(LocalId),
+    CollectionLoanSlotEscapesBody(LocalId),
+    CollectionLoanStructuralOpConflict {
+        mode: AirCollectionLoanMode,
+        op: &'static str,
+    },
+    CollectionLoanRootRebindConflict {
+        mode: AirCollectionLoanMode,
     },
     IndexTypeUnavailable,
     ParamLocalMustBeArg {
@@ -642,6 +692,7 @@ pub(crate) fn verify_structured_body(
         &mut state,
         &mut Vec::new(),
     );
+    verify_collection_loan_contract(&mut cx, function_id, &body.block);
     if cx.errors.is_empty() {
         Ok(())
     } else {
@@ -2509,7 +2560,9 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
     cx.verify_type_ref(site, func.signature.return_type());
 
     let mut state = LocalInit::new(cx.program, func);
-    if verify_air_block(cx, id, &func.body.block, &mut state, &mut Vec::new()).is_some()
+    let falls_through = verify_air_block(cx, id, &func.body.block, &mut state, &mut Vec::new());
+    verify_collection_loan_contract(cx, id, &func.body.block);
+    if falls_through.is_some()
         && !matches!(
             cx.type_data(func.signature.return_type()),
             Some(TypeData::Void)
@@ -2619,12 +2672,1081 @@ fn verify_air_stmt(
             let loop_ctx = loops.pop().unwrap();
             LocalInit::join(loop_ctx.breaks)
         }
+        AirStmt::CollectionLoan(loan) => {
+            verify_collection_loan(cx, function_id, block_id, index, loan, state, loops)
+        }
+        AirStmt::CollectionSlotScope(scope) => {
+            verify_collection_slot_scope(cx, function_id, block_id, index, scope, state, loops)
+        }
         AirStmt::EnumMatch(match_) => {
             verify_air_match(cx, function_id, index, match_, state, loops)
         }
         AirStmt::OptionalMatch(match_) => {
             verify_air_optional_match(cx, function_id, index, match_, state, loops)
         }
+    }
+}
+
+fn verify_collection_loan(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    loan: &AirCollectionLoan,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    verify_air_place_read(cx, function_id, index, &loan.root, state);
+    let root_ty = verify_place(cx, function_id, block_id, Some(index), &loan.root);
+    verify_collection_loan_root(cx, &site, loan, root_ty);
+    if matches!(
+        loan.mode,
+        AirCollectionLoanMode::MutableSequenceElement | AirCollectionLoanMode::MutableMapValue
+    ) {
+        verify_mutable_place(cx, function_id, &site, &loan.root);
+    }
+    let mut body_state = state.clone();
+    verify_air_block(cx, function_id, &loan.body, &mut body_state, loops)
+}
+
+fn verify_collection_slot_scope(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    scope: &AirCollectionSlotScope,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    verify_air_place_read(cx, function_id, index, &scope.root, state);
+    verify_air_local_read(cx, function_id, index, scope.index, state);
+    verify_slice_index(cx, function_id, block_id, index, "index", scope.index);
+    let root_ty = verify_place(cx, function_id, block_id, Some(index), &scope.root);
+    for slot in &scope.slots {
+        let mode = match slot.kind {
+            AirCollectionSlotKind::SequenceElement => AirCollectionLoanMode::MutableSequenceElement,
+            AirCollectionSlotKind::MapValue => AirCollectionLoanMode::MutableMapValue,
+        };
+        let expected_slot = collection_slot_scope_expected(cx.program, slot.kind, root_ty);
+        verify_collection_loan_slot(cx, function_id, &site, mode, expected_slot, slot, state);
+    }
+    let mut body_state = state.clone();
+    for slot in &scope.slots {
+        body_state.init(slot.local);
+    }
+    let mut exits = verify_air_block(cx, function_id, &scope.body, &mut body_state, loops);
+    if let Some(next) = &mut exits {
+        for slot in &scope.slots {
+            next.clear(slot.local);
+        }
+    }
+    exits
+}
+
+fn collection_slot_scope_expected(
+    program: &Program,
+    kind: AirCollectionSlotKind,
+    root_ty: Option<TypeId>,
+) -> Option<(AirCollectionSlotKind, TypeId, bool)> {
+    let root_ty = root_ty?;
+    match kind {
+        AirCollectionSlotKind::SequenceElement => collection_sequence_elem(program, root_ty)
+            .map(|ty| (AirCollectionSlotKind::SequenceElement, ty, true)),
+        AirCollectionSlotKind::MapValue => typing::map_kv(program, root_ty)
+            .map(|(_, value)| (AirCollectionSlotKind::MapValue, value, true)),
+    }
+}
+
+fn verify_collection_loan_root(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    loan: &AirCollectionLoan,
+    root_ty: Option<TypeId>,
+) {
+    let Some(root_ty) = root_ty else {
+        return;
+    };
+    if !collection_root_kind_matches(cx.program, loan.root_kind, root_ty) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CollectionLoanRootKindMismatch {
+                root_kind: loan.root_kind,
+                found: root_ty,
+            }),
+        );
+    }
+    if !collection_mode_matches_root_kind(loan.mode, loan.root_kind) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CollectionLoanModeRootKindMismatch {
+                root_kind: loan.root_kind,
+                mode: loan.mode,
+            }),
+        );
+    }
+}
+
+fn verify_collection_loan_slot(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    site: &VerifySite,
+    mode: AirCollectionLoanMode,
+    expected_slot: Option<(AirCollectionSlotKind, TypeId, bool)>,
+    slot: &AirCollectionSlot,
+    state: &LocalInit,
+) {
+    let Some(local) = cx
+        .program
+        .function(function_id)
+        .locals
+        .get(slot.local.index())
+    else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidLocal(slot.local)),
+        );
+        return;
+    };
+    if state.is_possible(slot.local) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotAlreadyInitialized(
+                slot.local,
+            )),
+        );
+    }
+    if matches!(local.kind, LocalKind::Arg) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotMustBeFreshLocal {
+                local: slot.local,
+                kind: local.kind,
+            }),
+        );
+    }
+    if let Some((expected_kind, expected_ty, expected_mutable)) = expected_slot {
+        if slot.kind != expected_kind {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotKindMismatch {
+                    local: slot.local,
+                    mode,
+                    kind: slot.kind,
+                }),
+            );
+        }
+        if !same_type(cx, slot.ty, expected_ty) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotTypeMismatch {
+                    local: slot.local,
+                    expected: expected_ty,
+                    found: slot.ty,
+                }),
+            );
+        }
+        if !same_type(cx, local.ty, expected_ty) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotTypeMismatch {
+                    local: slot.local,
+                    expected: expected_ty,
+                    found: local.ty,
+                }),
+            );
+        }
+        let local_mutable = local.mutability == Mutability::Mutable;
+        if slot.mutable != expected_mutable {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotMutabilityMismatch {
+                    local: slot.local,
+                    expected: expected_mutable,
+                    found: slot.mutable,
+                }),
+            );
+        }
+        if local_mutable != expected_mutable {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotMutabilityMismatch {
+                    local: slot.local,
+                    expected: expected_mutable,
+                    found: local_mutable,
+                }),
+            );
+        }
+    } else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotKindMismatch {
+                local: slot.local,
+                mode,
+                kind: slot.kind,
+            }),
+        );
+    }
+}
+
+fn collection_root_kind_matches(
+    program: &Program,
+    root_kind: AirCollectionRootKind,
+    root_ty: TypeId,
+) -> bool {
+    matches!(
+        (root_kind, program.type_arena.get(root_ty)),
+        (AirCollectionRootKind::List, Some(TypeData::List(_)))
+            | (
+                AirCollectionRootKind::FixedArray,
+                Some(TypeData::Array { .. })
+            )
+            | (AirCollectionRootKind::Slice, Some(TypeData::Slice(_)))
+            | (AirCollectionRootKind::Map, Some(TypeData::Map { .. }))
+    )
+}
+
+fn collection_mode_matches_root_kind(
+    mode: AirCollectionLoanMode,
+    root_kind: AirCollectionRootKind,
+) -> bool {
+    match mode {
+        AirCollectionLoanMode::ReadonlySequence | AirCollectionLoanMode::MutableSequenceElement => {
+            matches!(
+                root_kind,
+                AirCollectionRootKind::List
+                    | AirCollectionRootKind::FixedArray
+                    | AirCollectionRootKind::Slice
+            )
+        }
+        AirCollectionLoanMode::ReadonlyMap | AirCollectionLoanMode::MutableMapValue => {
+            root_kind == AirCollectionRootKind::Map
+        }
+    }
+}
+
+fn collection_sequence_elem(program: &Program, root_ty: TypeId) -> Option<TypeId> {
+    typing::sequence_elem(program, root_ty)
+}
+
+fn verify_collection_loan_contract(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    body: &AirBlock,
+) {
+    let mut slot_locals = std::collections::HashSet::new();
+    collect_collection_loan_slot_locals(body, &mut slot_locals);
+    let mut active_slots = std::collections::HashSet::new();
+    let mut active_loans = vec![];
+    verify_collection_loan_contract_block(
+        cx,
+        function_id,
+        body,
+        &slot_locals,
+        &mut active_slots,
+        &mut active_loans,
+    );
+}
+
+fn collect_collection_loan_slot_locals(
+    block: &AirBlock,
+    slot_locals: &mut std::collections::HashSet<LocalId>,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            AirStmt::CollectionLoan(loan) => {
+                collect_collection_loan_slot_locals(&loan.body, slot_locals);
+            }
+            AirStmt::CollectionSlotScope(scope) => {
+                for slot in &scope.slots {
+                    slot_locals.insert(slot.local);
+                }
+                collect_collection_loan_slot_locals(&scope.body, slot_locals);
+            }
+            AirStmt::If(branch) => {
+                collect_collection_loan_slot_locals(&branch.then_block, slot_locals);
+                if let Some(block) = &branch.else_block {
+                    collect_collection_loan_slot_locals(block, slot_locals);
+                }
+            }
+            AirStmt::Loop(loop_) => collect_collection_loan_slot_locals(&loop_.body, slot_locals),
+            AirStmt::EnumMatch(match_) => {
+                for arm in &match_.arms {
+                    collect_collection_loan_slot_locals(&arm.block, slot_locals);
+                }
+                if let Some(block) = &match_.else_block {
+                    collect_collection_loan_slot_locals(block, slot_locals);
+                }
+            }
+            AirStmt::OptionalMatch(match_) => {
+                collect_collection_loan_slot_locals(&match_.some_block, slot_locals);
+                collect_collection_loan_slot_locals(&match_.none_block, slot_locals);
+            }
+            AirStmt::Init { .. } | AirStmt::Assign { .. } | AirStmt::Eval(_) => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CollectionLoanFrame {
+    root: Place,
+    mode: AirCollectionLoanMode,
+}
+
+fn verify_collection_loan_contract_block(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block: &AirBlock,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &mut std::collections::HashSet<LocalId>,
+    active_loans: &mut Vec<CollectionLoanFrame>,
+) {
+    for stmt in &block.stmts {
+        verify_collection_loan_contract_stmt(
+            cx,
+            function_id,
+            stmt,
+            slot_locals,
+            active_slots,
+            active_loans,
+        );
+    }
+    verify_collection_loan_contract_tail(cx, function_id, &block.tail, slot_locals, active_slots);
+}
+
+fn verify_collection_loan_contract_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    stmt: &AirStmt,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &mut std::collections::HashSet<LocalId>,
+    active_loans: &mut Vec<CollectionLoanFrame>,
+) {
+    match stmt {
+        AirStmt::Init { value, .. } | AirStmt::Eval(value) => {
+            verify_collection_loan_contract_rvalue(
+                cx,
+                function_id,
+                value,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
+        AirStmt::Assign { dst, value } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                dst,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_root_rebind(cx, function_id, active_loans, dst);
+            verify_collection_loan_contract_rvalue(
+                cx,
+                function_id,
+                value,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
+        AirStmt::If(branch) => {
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                &branch.cond,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &branch.then_block,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+            if let Some(block) = &branch.else_block {
+                verify_collection_loan_contract_block(
+                    cx,
+                    function_id,
+                    block,
+                    slot_locals,
+                    active_slots,
+                    active_loans,
+                );
+            }
+        }
+        AirStmt::Loop(loop_) => verify_collection_loan_contract_block(
+            cx,
+            function_id,
+            &loop_.body,
+            slot_locals,
+            active_slots,
+            active_loans,
+        ),
+        AirStmt::CollectionLoan(loan) => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                &loan.root,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            active_loans.push(CollectionLoanFrame {
+                root: loan.root.clone(),
+                mode: loan.mode,
+            });
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &loan.body,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+            active_loans.pop();
+        }
+        AirStmt::CollectionSlotScope(scope) => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                &scope.root,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_local(
+                cx,
+                function_id,
+                scope.index,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            for slot in &scope.slots {
+                if !active_loan_allows_slot_scope(
+                    cx.program,
+                    function_id,
+                    active_loans,
+                    &scope.root,
+                    slot,
+                ) {
+                    cx.push(
+                        VerifySite::Function(function_id),
+                        VerifyErrorKind::BadFunction(BadFunction::CollectionLoanSlotOutOfScope(
+                            slot.local,
+                        )),
+                    );
+                }
+                active_slots.insert(slot.local);
+            }
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &scope.body,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+            for slot in &scope.slots {
+                active_slots.remove(&slot.local);
+            }
+        }
+        AirStmt::EnumMatch(match_) => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                &match_.discr,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            for arm in &match_.arms {
+                verify_collection_loan_contract_block(
+                    cx,
+                    function_id,
+                    &arm.block,
+                    slot_locals,
+                    active_slots,
+                    active_loans,
+                );
+            }
+            if let Some(block) = &match_.else_block {
+                verify_collection_loan_contract_block(
+                    cx,
+                    function_id,
+                    block,
+                    slot_locals,
+                    active_slots,
+                    active_loans,
+                );
+            }
+        }
+        AirStmt::OptionalMatch(match_) => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                &match_.discr,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &match_.some_block,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &match_.none_block,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
+    }
+}
+
+fn verify_collection_loan_contract_tail(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    tail: &AirTail,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+) {
+    if let AirTail::Return(Some(value)) = tail {
+        verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            value,
+            slot_locals,
+            active_slots,
+            true,
+        );
+    }
+}
+
+fn verify_collection_loan_contract_rvalue(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    value: &RValue,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    active_loans: &[CollectionLoanFrame],
+) {
+    match value {
+        RValue::Use(op)
+        | RValue::Unary { value: op, .. }
+        | RValue::Cast { value: op, .. }
+        | RValue::OptionalSome { value: op, .. }
+        | RValue::Stringify { value: op, .. }
+        | RValue::Format { value: op, .. } => verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            op,
+            slot_locals,
+            active_slots,
+            false,
+        ),
+        RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                lhs,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                rhs,
+                slot_locals,
+                active_slots,
+                false,
+            );
+        }
+        RValue::Aggregate { fields, .. } => {
+            for field in fields {
+                verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    field,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
+        }
+        RValue::Call { args, .. } => {
+            for arg in args {
+                verify_collection_loan_contract_call_arg(
+                    cx,
+                    function_id,
+                    arg,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
+        }
+        RValue::StringConcat { parts } => {
+            for part in parts {
+                verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    part,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
+        }
+        RValue::Len { source } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                source,
+                slot_locals,
+                active_slots,
+                false,
+            );
+        }
+        RValue::ListPop { list, .. } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                list,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_structural_op(
+                cx,
+                function_id,
+                active_loans,
+                list,
+                CollectionStructuralEffect::Sequence(SequenceStructuralEffect::Pop),
+            );
+        }
+        RValue::SliceView {
+            source, start, end, ..
+        }
+        | RValue::ListSlice {
+            source, start, end, ..
+        } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                source,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_local(
+                cx,
+                function_id,
+                *start,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_local(
+                cx,
+                function_id,
+                *end,
+                slot_locals,
+                active_slots,
+                false,
+            );
+        }
+        RValue::ListPush { list, value } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                list,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                value,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_structural_op(
+                cx,
+                function_id,
+                active_loans,
+                list,
+                CollectionStructuralEffect::Sequence(SequenceStructuralEffect::Push),
+            );
+        }
+        RValue::MapGet { map, key, .. } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                map,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                key,
+                slot_locals,
+                active_slots,
+                false,
+            );
+        }
+        RValue::MapInsert {
+            map,
+            key,
+            value,
+            kind,
+        } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                map,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                key,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                value,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            if *kind == MapWriteKind::StructuralInsert {
+                verify_collection_loan_structural_op(
+                    cx,
+                    function_id,
+                    active_loans,
+                    map,
+                    CollectionStructuralEffect::Map(MapStructuralEffect::Insert),
+                );
+            }
+        }
+        RValue::MapRemove { map, key, .. } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                map,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                key,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_structural_op(
+                cx,
+                function_id,
+                active_loans,
+                map,
+                CollectionStructuralEffect::Map(MapStructuralEffect::Remove),
+            );
+        }
+        RValue::MapEntryAt { map, index, .. } => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                map,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_local(
+                cx,
+                function_id,
+                *index,
+                slot_locals,
+                active_slots,
+                false,
+            );
+        }
+        RValue::FunctionRef { .. } => {}
+        RValue::MakeLambda {
+            lambda, captures, ..
+        } => {
+            let escapes = cx
+                .program
+                .lambdas
+                .get(lambda.index())
+                .is_some_and(|decl| decl.escape == LambdaEscape::Escaping);
+            for capture in captures {
+                match capture {
+                    LambdaCaptureArg::NoRuntime | LambdaCaptureArg::CaptureCell { .. } => {}
+                    LambdaCaptureArg::ReadonlyLocal { value } => {
+                        verify_collection_loan_contract_operand(
+                            cx,
+                            function_id,
+                            value,
+                            slot_locals,
+                            active_slots,
+                            escapes,
+                        );
+                    }
+                    LambdaCaptureArg::ScopedLocal { place }
+                    | LambdaCaptureArg::ScopedBorrow { place } => {
+                        verify_collection_loan_contract_place(
+                            cx,
+                            function_id,
+                            place,
+                            slot_locals,
+                            active_slots,
+                            escapes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn verify_collection_loan_structural_op(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    active_loans: &[CollectionLoanFrame],
+    place: &Place,
+    op: CollectionStructuralEffect,
+) {
+    for loan in active_loans {
+        if is_conflicting_collection_structural_op(loan.mode, op)
+            && same_collection_root(cx.program, function_id, &loan.root, place)
+        {
+            cx.push(
+                VerifySite::Function(function_id),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanStructuralOpConflict {
+                    mode: loan.mode,
+                    op: op.name(),
+                }),
+            );
+        }
+    }
+}
+
+fn is_conflicting_collection_structural_op(
+    mode: AirCollectionLoanMode,
+    op: CollectionStructuralEffect,
+) -> bool {
+    match mode {
+        AirCollectionLoanMode::ReadonlySequence | AirCollectionLoanMode::MutableSequenceElement => {
+            op.sequence()
+        }
+        AirCollectionLoanMode::ReadonlyMap | AirCollectionLoanMode::MutableMapValue => op.map(),
+    }
+}
+
+fn same_collection_root(
+    program: &Program,
+    function_id: FunctionId,
+    left: &Place,
+    right: &Place,
+) -> bool {
+    if left.projection != right.projection {
+        return false;
+    }
+    if left.root == right.root {
+        return true;
+    }
+    let left_alias = matches!(
+        left.root,
+        PlaceRoot::ScopedBorrow(_) | PlaceRoot::LambdaCapture(_) | PlaceRoot::CaptureCell(_)
+    );
+    let right_alias = matches!(
+        right.root,
+        PlaceRoot::ScopedBorrow(_) | PlaceRoot::LambdaCapture(_) | PlaceRoot::CaptureCell(_)
+    );
+    let alias_root = left_alias || right_alias;
+    alias_root && program.places_may_overlap(function_id, left, right)
+}
+
+fn active_loan_allows_slot_scope(
+    program: &Program,
+    function_id: FunctionId,
+    active_loans: &[CollectionLoanFrame],
+    root: &Place,
+    slot: &AirCollectionSlot,
+) -> bool {
+    active_loans.iter().any(|loan| {
+        same_collection_root(program, function_id, &loan.root, root)
+            && matches!(
+                (loan.mode, slot.kind),
+                (
+                    AirCollectionLoanMode::MutableSequenceElement,
+                    AirCollectionSlotKind::SequenceElement,
+                ) | (
+                    AirCollectionLoanMode::MutableMapValue,
+                    AirCollectionSlotKind::MapValue
+                )
+            )
+    })
+}
+
+fn verify_collection_loan_root_rebind(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    active_loans: &[CollectionLoanFrame],
+    dst: &Place,
+) {
+    for loan in active_loans {
+        if collection_root_rebind_conflict(cx.program, function_id, &loan.root, dst) {
+            cx.push(
+                VerifySite::Function(function_id),
+                VerifyErrorKind::BadFunction(BadFunction::CollectionLoanRootRebindConflict {
+                    mode: loan.mode,
+                }),
+            );
+        }
+    }
+}
+
+fn collection_root_rebind_conflict(
+    program: &Program,
+    function_id: FunctionId,
+    root: &Place,
+    dst: &Place,
+) -> bool {
+    same_collection_root(program, function_id, root, dst) || place_replaces_root(dst, root)
+}
+
+fn place_replaces_root(dst: &Place, root: &Place) -> bool {
+    dst.root == root.root
+        && dst.projection.len() <= root.projection.len()
+        && dst
+            .projection
+            .iter()
+            .zip(&root.projection)
+            .all(|(left, right)| left == right)
+}
+
+fn verify_collection_loan_contract_call_arg(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    arg: &CallArg,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    escapes: bool,
+) {
+    match arg {
+        CallArg::Value(op) => verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            op,
+            slot_locals,
+            active_slots,
+            escapes,
+        ),
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+            verify_collection_loan_contract_place(
+                cx,
+                function_id,
+                place,
+                slot_locals,
+                active_slots,
+                escapes,
+            );
+        }
+        CallArg::SharedStringConst(_) => {}
+    }
+}
+
+fn verify_collection_loan_contract_operand(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    op: &Operand,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    escapes: bool,
+) {
+    if let Operand::Place(place) = op {
+        verify_collection_loan_contract_place(
+            cx,
+            function_id,
+            place,
+            slot_locals,
+            active_slots,
+            escapes,
+        );
+    }
+}
+
+fn verify_collection_loan_contract_place(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    place: &Place,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    escapes: bool,
+) {
+    place.for_each_read_local(&mut |local| {
+        let local = match local {
+            PlaceReadLocal::Root(local) | PlaceReadLocal::Index(local) => local,
+        };
+        verify_collection_loan_contract_local(
+            cx,
+            function_id,
+            local,
+            slot_locals,
+            active_slots,
+            escapes,
+        );
+    });
+}
+
+fn verify_collection_loan_contract_local(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    local: LocalId,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    escapes: bool,
+) {
+    if !slot_locals.contains(&local) {
+        return;
+    }
+    let error = if active_slots.contains(&local) {
+        escapes.then_some(BadFunction::CollectionLoanSlotEscapesBody(local))
+    } else {
+        Some(BadFunction::CollectionLoanSlotOutOfScope(local))
+    };
+    if let Some(error) = error {
+        cx.push(
+            VerifySite::Function(function_id),
+            VerifyErrorKind::BadFunction(error),
+        );
     }
 }
 
@@ -2977,7 +4099,9 @@ fn verify_air_rvalue_reads(
             verify_air_place_read(cx, function_id, index, map, state);
             verify_air_local_read(cx, function_id, index, *key, state);
         }
-        RValue::MapInsert { map, key, value } => {
+        RValue::MapInsert {
+            map, key, value, ..
+        } => {
             verify_air_place_read(cx, function_id, index, map, state);
             verify_air_operand_read(cx, function_id, index, key, state);
             verify_air_operand_read(cx, function_id, index, value, state);
@@ -3550,16 +4674,19 @@ fn verify_rvalue(
         } => {
             verify_place(cx, function_id, block_id, stmt_index, source);
             cx.verify_type_ref(site.clone(), *ty);
-            if let Some(expected_elem) = typing::list_elem(cx.program, source.ty) {
-                let valid = typing::list_elem(cx.program, *ty) == Some(expected_elem);
-                if !valid {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadFunction(BadFunction::ListSliceResultMustBeList {
-                            found: *ty,
-                        }),
-                    );
-                }
+            match typing::list_elem(cx.program, source.ty) {
+                Some(expected_elem)
+                    if typing::list_elem(cx.program, *ty) == Some(expected_elem) => {}
+                Some(_) => cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::ListSliceResultMustBeList {
+                        found: *ty,
+                    }),
+                ),
+                None => cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::ListSliceSourceMustBeList(source.ty)),
+                ),
             }
             verify_slice_index(cx, function_id, block_id, stmt_idx, "start", *start);
             verify_slice_index(cx, function_id, block_id, stmt_idx, "end", *end);
@@ -3583,7 +4710,12 @@ fn verify_rvalue(
                 verify_optional_map_value(cx, &site, *ty, expected_value);
             }
         }
-        RValue::MapInsert { map, key, value } => {
+        RValue::MapInsert {
+            map,
+            key,
+            value,
+            kind: _,
+        } => {
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, map);
             verify_mutable_place(cx, function_id, &site, map);
@@ -3599,7 +4731,8 @@ fn verify_rvalue(
             verify_slice_index(cx, function_id, block_id, stmt_idx, "index", *index);
             cx.verify_type_ref(site.clone(), *ty);
             match typing::map_kv(cx.program, map.ty) {
-                Some((_, value_ty)) if value_ty == *ty => {}
+                Some((key_ty, value_ty)) if matches!(cx.program.type_data(*ty), TypeData::Tuple(fields) if fields.as_slice() == [key_ty, value_ty]) =>
+                    {}
                 Some((_, value_ty)) => cx.push(
                     site,
                     VerifyErrorKind::BadFunction(BadFunction::MapEntryResultTypeMismatch {
@@ -3623,7 +4756,24 @@ fn verify_rvalue(
             verify_place(cx, function_id, block_id, stmt_index, source);
             verify_slice_index(cx, function_id, block_id, stmt_idx, "start", *start);
             verify_slice_index(cx, function_id, block_id, stmt_idx, "end", *end);
-            cx.verify_type_ref(site, *ty);
+            cx.verify_type_ref(site.clone(), *ty);
+            match collection_sequence_elem(cx.program, source.ty) {
+                Some(expected_elem) if matches!(cx.program.type_data(*ty), TypeData::Slice(elem) if *elem == expected_elem) =>
+                    {}
+                Some(expected_elem) => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::SliceViewResultMustBeSlice {
+                        expected_elem,
+                        found: *ty,
+                    }),
+                ),
+                None => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::SliceViewSourceMustBeSequence(
+                        source.ty,
+                    )),
+                ),
+            }
         }
         RValue::FunctionRef { function, ty } => {
             match cx.program.functions.get(function.index()) {

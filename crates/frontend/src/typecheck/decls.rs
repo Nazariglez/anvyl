@@ -90,6 +90,13 @@ impl ModuleScope {
         }
     }
 
+    pub(crate) fn is_core_module(&self, segment: &str) -> bool {
+        matches!(self, Self::Package(module)
+            if module.package_context() == Some(&PackageId::core())
+                && matches!(module.path(), PackageModulePath::Named(path)
+                    if path.segments().len() == 1 && path.segments()[0] == segment))
+    }
+
     pub(crate) fn from_nominal_origin(origin: &ModuleOrigin) -> Self {
         match origin {
             ModuleOrigin::Module(path) => Self::Named(

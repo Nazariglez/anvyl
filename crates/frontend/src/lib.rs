@@ -11,6 +11,7 @@ pub mod resolve;
 pub mod source;
 pub mod span;
 
+pub(crate) mod collection_effect;
 pub(crate) mod conditional;
 pub(crate) mod typecheck;
 

@@ -6,7 +6,7 @@ use super::{
     check_block_checked, check_block_checked_with_hint, check_expected_value_expr,
     check_expected_value_expr_deferred, check_expr_checked, check_place,
     check_value_expr_checked_with_hint, checked_from_checked, checked_type, checked_void, closure,
-    intrinsic_bool_value, join_checked, match_check, match_coverage,
+    collection_loan, intrinsic_bool_value, join_checked, match_check, match_coverage,
     pattern::{self, check_pattern_scrutinee, mode_for_head},
     place, projection,
 };
@@ -789,7 +789,15 @@ pub(super) fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
 
     tc.push_scope();
     pattern::check_roots(roots, PatternContext::For, tc);
+    let saved_loan_len = tc.active_collection_loans.len();
+    if let Some(loan) =
+        collection_loan::classify_for_loan(&iterable_ty, source.value.identity.clone())
+    {
+        tc.active_collection_loans.push(loan);
+    }
     check_loop_body(&node.body, tc);
+    tc.active_collection_loans.truncate(saved_loan_len);
+    debug_assert_eq!(tc.active_collection_loans.len(), saved_loan_len);
     tc.pop_scope();
 }
 

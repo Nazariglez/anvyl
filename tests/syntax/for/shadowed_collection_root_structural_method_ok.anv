@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs = [1, 2, 3];
+    for x in xs {
+        var xs: [int] = [x];
+        xs.push(1);
+    }
+}

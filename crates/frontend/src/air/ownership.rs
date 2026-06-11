@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    AggregateKind, AirBlock, AirStmt, AirTail, CallArg, Callee, ConstId, Function, FunctionId,
-    LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal, PlaceRoot, Program,
-    RValue, TypeData, TypeId, VariantShape, typing,
+    AggregateKind, AirBlock, AirCollectionLoanMode, AirStmt, AirTail, CallArg, Callee, ConstId,
+    Function, FunctionId, LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal,
+    PlaceRoot, Program, RValue, TypeData, TypeId, VariantShape, typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -362,6 +362,21 @@ impl ParamUseAnalyzer<'_> {
                 }
             }
             AirStmt::Loop(loop_) => self.observe_air_block(&loop_.body),
+            AirStmt::CollectionLoan(loan) => {
+                let root_use = match loan.mode {
+                    AirCollectionLoanMode::ReadonlySequence
+                    | AirCollectionLoanMode::ReadonlyMap => ParamUse::ReadOnly,
+                    AirCollectionLoanMode::MutableSequenceElement
+                    | AirCollectionLoanMode::MutableMapValue => ParamUse::ReborrowMut,
+                };
+                self.observe_place(&loan.root, root_use);
+                self.observe_air_block(&loan.body);
+            }
+            AirStmt::CollectionSlotScope(scope) => {
+                self.observe_place(&scope.root, ParamUse::ReadOnly);
+                self.observe_local(scope.index, ParamUse::ReadOnly);
+                self.observe_air_block(&scope.body);
+            }
             AirStmt::EnumMatch(match_) => {
                 self.observe_place(&match_.discr, ParamUse::ReadOnly);
                 for arm in &match_.arms {
@@ -450,7 +465,12 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_place(map, ParamUse::ReadOnly);
                 self.observe_local(*index, ParamUse::ReadOnly);
             }
-            RValue::MapInsert { map, key, value } => {
+            RValue::MapInsert {
+                map,
+                key,
+                value,
+                kind: _,
+            } => {
                 self.observe_place(map, ParamUse::ReborrowMut);
                 self.observe_operand(key, ValueContext::Store);
                 self.observe_operand(value, ValueContext::Store);
@@ -903,6 +923,28 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
                 block.stmts.push(AirStmt::Loop(loop_));
+            }
+            AirStmt::CollectionLoan(mut loan) => {
+                rewrite_air_block_call_args(
+                    &mut loan.body,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::CollectionLoan(loan));
+            }
+            AirStmt::CollectionSlotScope(mut scope) => {
+                rewrite_air_block_call_args(
+                    &mut scope.body,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::CollectionSlotScope(scope));
             }
             AirStmt::EnumMatch(mut match_) => {
                 for arm in &mut match_.arms {

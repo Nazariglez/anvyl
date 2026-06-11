@@ -656,6 +656,19 @@ pub(super) fn diagnose_type_error(
         TypeError::VarArgImmutableBinding { name, .. } => {
             format!("immutable binding '{name}' cannot be passed to var parameter")
         }
+        TypeError::SequenceStructuralMutationDuringLoan { .. } => {
+            "cannot change list shape while iterating it".to_string()
+        }
+        TypeError::MapStructuralMutationDuringLoan { .. } => {
+            "cannot change map shape while iterating it".to_string()
+        }
+        TypeError::ActiveCollectionRebind { .. } => {
+            "cannot rebind iterated collection".to_string()
+        }
+        TypeError::ActiveCollectionMutableArg { .. } => {
+            "cannot pass iterated collection as mutable collection parameter".to_string()
+        }
+        TypeError::StoredSliceLocal { .. } => "slice values cannot be stored".to_string(),
         TypeError::MutatingMethodImmutableReceiver { name, .. } => {
             format!("mutating method requires mutable receiver '{name}'")
         }

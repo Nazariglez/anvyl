@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var hp = ["a": 1, "b": 2];
+    for key, var value in hp {
+        value += 1;
+        hp[key] = value;
+    }
+}

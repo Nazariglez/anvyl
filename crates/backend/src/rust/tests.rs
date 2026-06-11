@@ -49,6 +49,41 @@ fn profile_accepts_empty_air() {
 }
 
 #[test]
+fn plan_rejects_collection_loan_scopes() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let xs = air::LocalId::from_index(0);
+    let function = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("xs", list, ParamMode::Value, xs)], void),
+        locals: vec![local(list, LocalKind::Arg)],
+        body: structured_body(
+            vec![Statement::CollectionLoan(air::AirCollectionLoan {
+                root: place(xs, list),
+                root_kind: air::AirCollectionRootKind::List,
+                mode: air::AirCollectionLoanMode::ReadonlySequence,
+                body: air::AirBlock::default(),
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    assert_plan_gap(
+        program,
+        RustPlanConfig::default(),
+        RustTargetGapKind::UnsupportedCollectionLoan,
+    );
+}
+
+#[test]
 fn profile_accepts_scalar_arithmetic_shape() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -12972,7 +13007,7 @@ mod slices {
     use super::*;
 
     #[test]
-    fn array_slice_view_compiles_with_checked_range() {
+    fn array_slice_view_is_backend_gap() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let array = program.alloc_type(TypeData::Array { elem: int, len: 3 });
@@ -13037,14 +13072,11 @@ mod slices {
         program.module_mut(module).functions.push(main);
         program.set_entry(main);
 
-        let source = plan_source(program);
-        let text = source.as_str();
-        assert!(text.contains("&[i64]"));
-        assert!(text.contains("&v0[anvyx_runtime::checked_range(v1, v2, false, v0.len())]"));
-        assert!(!text.contains("negative range bound"));
-        assert!(!text.contains("range out of bounds"));
-        let output = run_source(source);
-        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+        assert_plan_gap(
+            program,
+            RustPlanConfig::default(),
+            RustTargetGapKind::UnsupportedSliceView,
+        );
     }
 
     #[test]
@@ -13132,7 +13164,7 @@ mod slices {
     }
 
     #[test]
-    fn inclusive_negative_end_panics_without_wrapping() {
+    fn inclusive_slice_view_is_backend_gap() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
@@ -13192,15 +13224,11 @@ mod slices {
         program.module_mut(module).functions.push(main);
         program.set_entry(main);
 
-        let source = plan_source(program);
-        let output = run_source(source);
-        assert!(
-            matches!(output.status, SourceJobStatus::RunFailed(_)),
-            "{:?}\n{}",
-            output.status,
-            output.stderr
+        assert_plan_gap(
+            program,
+            RustPlanConfig::default(),
+            RustTargetGapKind::UnsupportedSliceView,
         );
-        assert!(output.stderr.contains("negative range bound"));
     }
 
     #[test]

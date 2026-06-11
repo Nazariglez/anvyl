@@ -3,15 +3,17 @@ use std::collections::HashMap;
 use anvyx_externs::ParamFlow;
 
 use super::{
-    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirEnumMatch, AirEnumMatchArm,
-    AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId,
-    CallArg, Callee, CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstData, ConstId,
-    ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
+    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionLoan,
+    AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
+    AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
+    AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee,
+    CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstData, ConstId, ConstValue,
+    CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
     ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
     FunctionSpecialization, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
-    LambdaEscape, LambdaId, Local, LocalId, LocalKind, Module, ModuleId,
+    LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
     Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
     Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
     ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
@@ -25,8 +27,9 @@ use crate::{
         ExprNode, Ident, Lit, Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode,
         Type,
     },
+    collection_effect,
     externs::catalog::{ExternCatalog, ExternLoweringInfo},
-    resolve::{PackageId, PackageModulePath, ResolveResult},
+    resolve::{PackageModulePath, ResolveResult},
     source::SourceId,
     span::SourceSpan,
     typecheck::{
@@ -2193,6 +2196,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             },
             Stmt::While(while_) => self.lower_while(&while_.node),
             Stmt::WhileLet(while_let) => self.lower_while_let(&while_let.node),
+            Stmt::For(for_) => self.lower_for(&for_.node),
             Stmt::Break => self.lower_loop_tail(stmt, AirTail::Break),
             Stmt::Continue => self.lower_loop_tail(stmt, AirTail::Continue),
             _ => Err(LowerError::UnsupportedStmt {
@@ -2200,6 +2204,601 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 span: Some(self.source_span(stmt.span)),
             }),
         }
+    }
+
+    fn lower_for(&mut self, for_: &ast::For) -> Result<(), LowerError> {
+        let plan = self.for_plan(for_)?;
+        let id = self.alloc_loop();
+        self.active_loops.push(id);
+        let body = self.with_nested_block(|this| this.lower_for_loan_body(id, for_, &plan));
+        self.active_loops.pop();
+        let body = body?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionLoan(AirCollectionLoan {
+                root: plan.root.clone(),
+                root_kind: plan.root_kind,
+                mode: plan.mode,
+                body,
+            }));
+        Ok(())
+    }
+
+    fn for_plan(&mut self, for_: &ast::For) -> Result<ForPlan, LowerError> {
+        let root = self.lower_place_arg(&for_.iterable, false)?;
+        let len = self.for_len_local()?;
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let step = self.lower_for_step(for_)?;
+        let type_data = self.cx.program.type_data(root.ty).clone();
+        match type_data {
+            TypeData::List(elem) => self.sequence_for_plan(
+                for_,
+                root,
+                AirCollectionRootKind::List,
+                elem,
+                len,
+                index,
+                step,
+            ),
+            TypeData::Array { elem, .. } => self.sequence_for_plan(
+                for_,
+                root,
+                AirCollectionRootKind::FixedArray,
+                elem,
+                len,
+                index,
+                step,
+            ),
+            TypeData::Slice(elem) => self.sequence_for_plan(
+                for_,
+                root,
+                AirCollectionRootKind::Slice,
+                elem,
+                len,
+                index,
+                step,
+            ),
+            TypeData::Map { key, value, .. } => {
+                self.map_for_plan(for_, root, key, value, len, index, step)
+            }
+            _ => Err(LowerError::UnsupportedStmt {
+                kind: "For",
+                span: Some(self.source_span(for_.iterable.span)),
+            }),
+        }
+    }
+
+    fn sequence_for_plan(
+        &mut self,
+        for_: &ast::For,
+        root: Place,
+        root_kind: AirCollectionRootKind,
+        elem: TypeId,
+        len: LocalId,
+        index: LocalId,
+        step: Operand,
+    ) -> Result<ForPlan, LowerError> {
+        let mut mode = AirCollectionLoanMode::ReadonlySequence;
+        let mut bindings = vec![];
+        let item = match for_.bindings.as_slice() {
+            [item] => item,
+            [index_binding, item] => {
+                bindings.push(ForBindingPlan::OwnedIndex {
+                    pattern: index_binding.pattern.clone(),
+                });
+                item
+            }
+            _ => return Err(unsupported_pattern_stmt(&for_.bindings[0].pattern)),
+        };
+        if item.mutable {
+            let local = self.push_for_slot_local(&item.pattern, elem)?;
+            bindings.push(ForBindingPlan::ElementSlot {
+                pattern: item.pattern.clone(),
+                local,
+                ty: elem,
+            });
+            mode = AirCollectionLoanMode::MutableSequenceElement;
+        } else {
+            bindings.push(ForBindingPlan::OwnedElement {
+                pattern: item.pattern.clone(),
+                ty: elem,
+            });
+        }
+        Ok(ForPlan {
+            root_kind,
+            mode,
+            root,
+            len,
+            index,
+            step,
+            bindings,
+        })
+    }
+
+    fn map_for_plan(
+        &mut self,
+        for_: &ast::For,
+        root: Place,
+        key: TypeId,
+        value: TypeId,
+        len: LocalId,
+        index: LocalId,
+        step: Operand,
+    ) -> Result<ForPlan, LowerError> {
+        let mut mode = AirCollectionLoanMode::ReadonlyMap;
+        let mut bindings = vec![];
+        match for_.bindings.as_slice() {
+            [entry] if !entry.mutable => bindings.push(ForBindingPlan::OwnedMapEntry {
+                pattern: entry.pattern.clone(),
+                ty: self.for_pattern_ty(&entry.pattern)?.unwrap_or_else(|| {
+                    self.cx
+                        .program
+                        .alloc_type(TypeData::Tuple(vec![key, value]))
+                }),
+            }),
+            [key_binding, value_binding] => {
+                bindings.push(ForBindingPlan::OwnedMapKey {
+                    pattern: key_binding.pattern.clone(),
+                    ty: key,
+                });
+                if value_binding.mutable {
+                    let local = self.push_for_slot_local(&value_binding.pattern, value)?;
+                    bindings.push(ForBindingPlan::MapValueSlot {
+                        pattern: value_binding.pattern.clone(),
+                        local,
+                        ty: value,
+                    });
+                    mode = AirCollectionLoanMode::MutableMapValue;
+                } else {
+                    bindings.push(ForBindingPlan::OwnedMapValue {
+                        pattern: value_binding.pattern.clone(),
+                        ty: value,
+                    });
+                }
+            }
+            _ => return Err(unsupported_pattern_stmt(&for_.bindings[0].pattern)),
+        }
+        Ok(ForPlan {
+            root_kind: AirCollectionRootKind::Map,
+            mode,
+            root,
+            len,
+            index,
+            step,
+            bindings,
+        })
+    }
+
+    fn lower_for_step(&mut self, for_: &ast::For) -> Result<Operand, LowerError> {
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let value = match &for_.step {
+            Some(step) => self.lower_value_to(step, int_ty, step)?,
+            None => self.int_const(1)?,
+        };
+        self.emit_typed_temp(int_ty, RValue::Use(value))
+    }
+
+    fn for_len_local(&mut self) -> Result<LocalId, LowerError> {
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        Ok(self.push_local(
+            None,
+            None,
+            int_ty,
+            AirMutability::Immutable,
+            LocalKind::Temp,
+        ))
+    }
+
+    fn lower_for_loan_body(
+        &mut self,
+        id: AirLoopId,
+        for_: &ast::For,
+        plan: &ForPlan,
+    ) -> Result<(), LowerError> {
+        self.emit_init(
+            plan.len,
+            RValue::Len {
+                source: plan.root.clone(),
+            },
+        )?;
+        self.init_for_index(for_.reversed, plan)?;
+        let body = self.with_nested_block(|this| this.lower_for_loop_body(id, for_, plan))?;
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::Loop(AirLoop { id, body }));
+        Ok(())
+    }
+
+    fn init_for_index(&mut self, reversed: bool, plan: &ForPlan) -> Result<(), LowerError> {
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let init = if reversed {
+            let one = self.int_const(1)?;
+            let offset = self.emit_typed_temp(
+                int_ty,
+                RValue::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: plan.step.clone(),
+                    rhs: one,
+                    ty: int_ty,
+                },
+            )?;
+            RValue::Binary {
+                op: BinaryOp::Add,
+                lhs: Operand::Place(self.local_place(plan.len)),
+                rhs: offset,
+                ty: int_ty,
+            }
+        } else {
+            RValue::Binary {
+                op: BinaryOp::Sub,
+                lhs: self.int_const(0)?,
+                rhs: plan.step.clone(),
+                ty: int_ty,
+            }
+        };
+        self.emit_init(plan.index, init)
+    }
+
+    fn lower_for_loop_body(
+        &mut self,
+        id: AirLoopId,
+        for_: &ast::For,
+        plan: &ForPlan,
+    ) -> Result<(), LowerError> {
+        self.advance_for_index(for_.reversed, plan)?;
+        let cond = self.for_loop_cond(for_.reversed, plan)?;
+        let then_block =
+            self.with_nested_block(|this| this.lower_for_iteration_scope(id, for_, plan))?;
+        let else_block = AirBlock {
+            stmts: vec![],
+            tail: AirTail::Break(id),
+        };
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::If(AirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }));
+        Ok(())
+    }
+
+    fn lower_for_iteration_scope(
+        &mut self,
+        id: AirLoopId,
+        for_: &ast::For,
+        plan: &ForPlan,
+    ) -> Result<(), LowerError> {
+        let slots = Self::active_for_slots(plan);
+        if slots.is_empty() {
+            return self.lower_for_iteration_body(id, for_, plan);
+        }
+        let body = self.with_nested_block(|this| this.lower_for_iteration_body(id, for_, plan))?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                root: plan.root.clone(),
+                index: plan.index,
+                slots,
+                body,
+            }));
+        Ok(())
+    }
+
+    fn lower_for_iteration_body(
+        &mut self,
+        id: AirLoopId,
+        for_: &ast::For,
+        plan: &ForPlan,
+    ) -> Result<(), LowerError> {
+        self.lower_for_iteration_bindings(plan)?;
+        self.lower_block_effect(&for_.body)?;
+        if !self.terminated {
+            self.terminate(AirTail::Continue(id))?;
+        }
+        Ok(())
+    }
+
+    fn active_for_slots(plan: &ForPlan) -> Vec<AirCollectionSlot> {
+        plan.bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                ForBindingPlan::ElementSlot { local, ty, .. } => Some(AirCollectionSlot {
+                    kind: AirCollectionSlotKind::SequenceElement,
+                    local: *local,
+                    ty: *ty,
+                    mutable: true,
+                }),
+                ForBindingPlan::MapValueSlot { local, ty, .. } => Some(AirCollectionSlot {
+                    kind: AirCollectionSlotKind::MapValue,
+                    local: *local,
+                    ty: *ty,
+                    mutable: true,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn advance_for_index(&mut self, reversed: bool, plan: &ForPlan) -> Result<(), LowerError> {
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let op = if reversed {
+            BinaryOp::Sub
+        } else {
+            BinaryOp::Add
+        };
+        self.emit_assign(
+            self.local_place(plan.index),
+            RValue::Binary {
+                op,
+                lhs: Operand::Place(self.local_place(plan.index)),
+                rhs: plan.step.clone(),
+                ty: int_ty,
+            },
+        )
+    }
+
+    fn for_loop_cond(&mut self, reversed: bool, plan: &ForPlan) -> Result<Operand, LowerError> {
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let cond = RValue::Binary {
+            op: if reversed {
+                BinaryOp::GreaterThanEq
+            } else {
+                BinaryOp::LessThan
+            },
+            lhs: Operand::Place(self.local_place(plan.index)),
+            rhs: if reversed {
+                self.int_const(0)?
+            } else {
+                Operand::Place(self.local_place(plan.len))
+            },
+            ty: bool_ty,
+        };
+        self.emit_typed_temp(bool_ty, cond)
+    }
+
+    fn lower_for_iteration_bindings(&mut self, plan: &ForPlan) -> Result<(), LowerError> {
+        let mut map_entry = None;
+        for binding in &plan.bindings {
+            match binding {
+                ForBindingPlan::OwnedIndex { pattern } => self.lower_for_pattern_binding(
+                    pattern,
+                    Operand::Place(self.local_place(plan.index)),
+                    false,
+                )?,
+                ForBindingPlan::OwnedElement { pattern, ty } => {
+                    let place = Self::sequence_element_place(&plan.root, plan.index, *ty);
+                    self.lower_for_pattern_binding(pattern, Operand::Place(place), false)?;
+                }
+                ForBindingPlan::ElementSlot { pattern, local, .. }
+                | ForBindingPlan::MapValueSlot { pattern, local, .. } => {
+                    if !matches!(pattern.node, Pattern::Ident(_) | Pattern::Wildcard) {
+                        self.lower_for_pattern_binding(
+                            pattern,
+                            Operand::Place(self.local_place(*local)),
+                            true,
+                        )?;
+                    }
+                }
+                ForBindingPlan::OwnedMapEntry { pattern, ty } => {
+                    if !matches!(pattern.node, Pattern::Wildcard) {
+                        let entry = self.map_entry_operand(plan, *ty, &mut map_entry)?;
+                        self.lower_for_pattern_binding(pattern, entry, false)?;
+                    }
+                }
+                ForBindingPlan::OwnedMapKey { pattern, ty } => {
+                    if !matches!(pattern.node, Pattern::Wildcard) {
+                        let entry_ty = self.map_entry_ty(plan)?;
+                        let entry = self.map_entry_operand(plan, entry_ty, &mut map_entry)?;
+                        let key = Self::tuple_field_operand(entry, 0, *ty);
+                        self.lower_for_pattern_binding(pattern, key, false)?;
+                    }
+                }
+                ForBindingPlan::OwnedMapValue { pattern, ty } => {
+                    if !matches!(pattern.node, Pattern::Wildcard) {
+                        let entry_ty = self.map_entry_ty(plan)?;
+                        let entry = self.map_entry_operand(plan, entry_ty, &mut map_entry)?;
+                        let value = Self::tuple_field_operand(entry, 1, *ty);
+                        self.lower_for_pattern_binding(pattern, value, false)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sequence_element_place(root: &Place, index: LocalId, ty: TypeId) -> Place {
+        let mut place = root.clone();
+        place.projection.push(crate::air::Projection::Index(index));
+        place.ty = ty;
+        place
+    }
+
+    fn for_pattern_ty(&mut self, pattern: &ast::PatternNode) -> Result<Option<TypeId>, LowerError> {
+        if !matches!(pattern.node, Pattern::Ident(_)) {
+            return Ok(None);
+        }
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        let source_ty = self.local_def(semantic)?.ty.clone();
+        self.cx.lower_ty(&source_ty).map(Some)
+    }
+
+    fn map_entry_ty(&mut self, plan: &ForPlan) -> Result<TypeId, LowerError> {
+        let TypeData::Map { key, value, .. } = self.cx.program.type_data(plan.root.ty) else {
+            return Err(LowerError::UnsupportedStmt {
+                kind: "For",
+                span: None,
+            });
+        };
+        Ok(self
+            .cx
+            .program
+            .alloc_type(TypeData::Tuple(vec![*key, *value])))
+    }
+
+    fn map_entry_operand(
+        &mut self,
+        plan: &ForPlan,
+        ty: TypeId,
+        entry: &mut Option<Operand>,
+    ) -> Result<Operand, LowerError> {
+        if let Some(entry) = entry {
+            return Ok(entry.clone());
+        }
+        let value = self.emit_typed_temp(
+            ty,
+            RValue::MapEntryAt {
+                map: plan.root.clone(),
+                index: plan.index,
+                ty,
+            },
+        )?;
+        *entry = Some(value.clone());
+        Ok(value)
+    }
+
+    fn tuple_field_operand(tuple: Operand, index: u32, ty: TypeId) -> Operand {
+        let mut place = match tuple {
+            Operand::Place(place) => place,
+            Operand::Const(_) => unreachable!("map entries are emitted as places"),
+        };
+        place
+            .projection
+            .push(crate::air::Projection::TupleField(index));
+        place.ty = ty;
+        Operand::Place(place)
+    }
+
+    fn lower_for_pattern_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        value: Operand,
+        alias: bool,
+    ) -> Result<(), LowerError> {
+        match &pattern.node {
+            Pattern::Wildcard => Ok(()),
+            Pattern::Ident(_) if alias => self.lower_pattern_alias_binding(pattern, value),
+            Pattern::Ident(_) => {
+                let local = self.push_for_owned_local(pattern)?;
+                self.emit_init(local, RValue::Use(value))
+            }
+            Pattern::Tuple(items) => {
+                let place = self.pattern_operand_place(value)?;
+                let TypeData::Tuple(types) = self.cx.program.type_data(place.ty) else {
+                    return Err(unsupported_pattern_stmt(pattern));
+                };
+                if items.len() != types.len() {
+                    return Err(unsupported_pattern_stmt(pattern));
+                }
+                let types = types.clone();
+                for (index, item) in items.iter().enumerate() {
+                    let mut field = place.clone();
+                    field
+                        .projection
+                        .push(crate::air::Projection::TupleField(index as u32));
+                    field.ty = types[index];
+                    self.lower_for_pattern_binding(item, Operand::Place(field), alias)?;
+                }
+                Ok(())
+            }
+            Pattern::Struct { fields, .. } => {
+                let place = self.pattern_operand_place(value)?;
+                for (name, item) in fields {
+                    let Some((field, ty)) =
+                        typing::field_by_name(&self.cx.program, place.ty, *name)
+                    else {
+                        return Err(unsupported_pattern_stmt(pattern));
+                    };
+                    let mut field_place = place.clone();
+                    field_place
+                        .projection
+                        .push(crate::air::Projection::Field(field));
+                    field_place.ty = ty;
+                    self.lower_for_pattern_binding(item, Operand::Place(field_place), alias)?;
+                }
+                Ok(())
+            }
+            _ => Err(unsupported_pattern_stmt(pattern)),
+        }
+    }
+
+    fn pattern_operand_place(&mut self, value: Operand) -> Result<Place, LowerError> {
+        match value {
+            Operand::Place(place) => Ok(place),
+            Operand::Const(_) => {
+                let ty = self.operand_ty(&value);
+                match self.emit_typed_temp(ty, RValue::Use(value))? {
+                    Operand::Place(place) => Ok(place),
+                    Operand::Const(_) => Err(LowerError::UnsupportedStmt {
+                        kind: "pattern",
+                        span: None,
+                    }),
+                }
+            }
+        }
+    }
+
+    fn push_for_owned_local(&mut self, pattern: &ast::PatternNode) -> Result<LocalId, LowerError> {
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        let def = self.local_def(semantic)?;
+        let name = def.name;
+        let binding = def.binding_id.map(air_binding_id);
+        let source_ty = def.ty.clone();
+        let mutable = def.mutable;
+        let ty = self.cx.lower_ty(&source_ty)?;
+        let local = self.push_local(
+            Some(name),
+            binding,
+            ty,
+            if mutable {
+                AirMutability::Mutable
+            } else {
+                AirMutability::Immutable
+            },
+            LocalKind::PatternBinding,
+        );
+        let place = self.local_place(local);
+        self.locals.insert(semantic, place.clone());
+        self.insert_capture_source(semantic, place)?;
+        Ok(local)
+    }
+
+    fn push_for_slot_local(
+        &mut self,
+        pattern: &ast::PatternNode,
+        ty: TypeId,
+    ) -> Result<LocalId, LowerError> {
+        if let Pattern::Ident(_) = &pattern.node {
+            let semantic = self.pattern_binding_semantic(pattern)?;
+            let def = self.local_def(semantic)?;
+            let local = self.push_local(
+                Some(def.name),
+                def.binding_id.map(air_binding_id),
+                ty,
+                AirMutability::Mutable,
+                LocalKind::PatternBinding,
+            );
+            let place = self.local_place(local);
+            self.locals.insert(semantic, place.clone());
+            self.insert_capture_source(semantic, place)?;
+            return Ok(local);
+        }
+        Ok(self.push_local(
+            None,
+            None,
+            ty,
+            AirMutability::Mutable,
+            LocalKind::PatternBinding,
+        ))
+    }
+
+    fn int_const(&mut self, value: i64) -> Result<Operand, LowerError> {
+        let ty = self.cx.lower_ty(&Type::Int)?;
+        Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
+            ty,
+            value: ConstValue::Int(value),
+        })))
     }
 
     fn lower_while(&mut self, while_: &ast::While) -> Result<(), LowerError> {
@@ -2578,11 +3177,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             };
             return Ok(CallArg::SharedStringConst(id));
         }
-        let place = self.lower_place_arg(expr, false)?;
-        if place.ty == ty {
-            Ok(CallArg::SharedBorrow(place))
-        } else {
-            Err(unsupported_expr(expr))
+        match self.lower_place_arg(expr, false) {
+            Ok(place) if place.ty == ty => Ok(CallArg::SharedBorrow(place)),
+            Ok(_) => Err(unsupported_expr(expr)),
+            Err(err) if matches!(self.cx.program.type_data(ty), TypeData::Slice(_)) => {
+                let value = self.lower_value_to(expr, ty, expr).map_err(|_| err)?;
+                self.materialize_shared_operand(expr, value, ty)
+                    .map(CallArg::SharedBorrow)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3360,6 +3963,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         index: &ast::IndexNode,
     ) -> Result<Operand, LowerError> {
         let mut target = self.place_from_operand(current, expr)?;
+        if let ExprKind::Range(range) = &index.node.index.node.kind {
+            let Some(_) = typing::sequence_elem(&self.cx.program, target.ty) else {
+                return Err(unsupported_expr(expr));
+            };
+            let (start, end, inclusive) = self.lower_range_bounds(range, &target)?;
+            let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+            return self.emit_typed_temp(
+                ty,
+                RValue::SliceView {
+                    source: target,
+                    start,
+                    end,
+                    inclusive,
+                    ty,
+                },
+            );
+        }
         if let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, target.ty) {
             let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
             let ty = self.cx.optional_ty(value_ty);
@@ -3738,6 +4358,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         index: &ast::IndexNode,
     ) -> Result<Operand, LowerError> {
+        if let Some(value) = self.lower_range_index_value(expr, index)? {
+            return Ok(value);
+        }
         let Ok(map) = self.lower_place_arg(&index.node.target, false) else {
             return self.lower_place_arg(expr, false).map(Operand::Place);
         };
@@ -3747,6 +4370,90 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
         let ty = self.cx.optional_ty(value_ty);
         self.emit_typed_temp(ty, RValue::MapGet { map, key, ty })
+    }
+
+    fn lower_range_index_value(
+        &mut self,
+        expr: &ExprNode,
+        index: &ast::IndexNode,
+    ) -> Result<Option<Operand>, LowerError> {
+        let ExprKind::Range(range) = &index.node.index.node.kind else {
+            return Ok(None);
+        };
+        let source = self.lower_place_arg(&index.node.target, false)?;
+        let Some(_) = typing::sequence_elem(&self.cx.program, source.ty) else {
+            return Ok(None);
+        };
+        let (start, end, inclusive) = self.lower_range_bounds(range, &source)?;
+        let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+        self.emit_typed_temp(
+            ty,
+            RValue::SliceView {
+                source,
+                start,
+                end,
+                inclusive,
+                ty,
+            },
+        )
+        .map(Some)
+    }
+
+    fn lower_range_bounds(
+        &mut self,
+        range: &ast::RangeNode,
+        source: &Place,
+    ) -> Result<(LocalId, LocalId, bool), LowerError> {
+        match &range.node {
+            ast::Range::Bounded {
+                start,
+                end,
+                inclusive,
+            } => Ok((
+                self.lower_index_local(start)?,
+                self.lower_index_local(end)?,
+                *inclusive,
+            )),
+            ast::Range::From { start } => {
+                let start = self.lower_index_local(start)?;
+                let end = self.len_local(source)?;
+                Ok((start, end, false))
+            }
+            ast::Range::To { end, inclusive } => {
+                let start = self.int_local(0)?;
+                let end = self.lower_index_local(end)?;
+                Ok((start, end, *inclusive))
+            }
+        }
+    }
+
+    fn len_local(&mut self, source: &Place) -> Result<LocalId, LowerError> {
+        let operand = self.emit_temp(RValue::Len {
+            source: source.clone(),
+        })?;
+        Self::local_from_operand(operand)
+    }
+
+    fn int_local(&mut self, value: i64) -> Result<LocalId, LowerError> {
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let value = self.int_const(value)?;
+        let operand = self.emit_typed_temp(int_ty, RValue::Use(value))?;
+        Self::local_from_operand(operand)
+    }
+
+    fn local_from_operand(operand: Operand) -> Result<LocalId, LowerError> {
+        match operand {
+            Operand::Place(place) if place.projection.is_empty() => {
+                place.root.local().ok_or(LowerError::UnsupportedStmt {
+                    kind: "local",
+                    span: None,
+                })
+            }
+            Operand::Place(_) | Operand::Const(_) => Err(LowerError::UnsupportedStmt {
+                kind: "local",
+                span: None,
+            }),
+        }
     }
 
     fn lower_map_index_assign(
@@ -3772,7 +4479,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         let key = self.lower_value_to(&index.node.index, key_ty, value_expr)?;
         let value = self.lower_value_to(value_expr, value_ty, value_expr)?;
-        Ok(Some(RValue::MapInsert { map, key, value }))
+        Ok(Some(RValue::MapInsert {
+            map,
+            key,
+            value,
+            kind: MapWriteKind::IndexedAssignment,
+        }))
     }
 
     fn lower_array_fill(
@@ -5035,7 +5747,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let ExprKind::Field(field) = &call.node.func.node.kind else {
             return Ok(None);
         };
-        if field.node.field != Ident::new("push") || call.node.args.len() != 1 {
+        if !matches!(
+            collection_effect::classify_sequence_method(field.node.field),
+            Some(collection_effect::SequenceStructuralEffect::Push)
+        ) || call.node.args.len() != 1
+        {
             return Ok(None);
         }
         let list = self.lower_method_target(&field.node.target)?;
@@ -5055,7 +5771,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let ExprKind::Field(field) = &call.node.func.node.kind else {
             return Ok(None);
         };
-        if field.node.field != Ident::new("insert") || call.node.args.len() != 2 {
+        if !matches!(
+            collection_effect::classify_map_method(field.node.field),
+            Some(collection_effect::MapStructuralEffect::Insert)
+        ) || call.node.args.len() != 2
+        {
             return Ok(None);
         }
         let map = self.lower_method_target(&field.node.target)?;
@@ -5065,7 +5785,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.require_mutable_place(expr, &map)?;
         let key = self.lower_value_to(&call.node.args[0], key_ty, expr)?;
         let value = self.lower_value_to(&call.node.args[1], value_ty, expr)?;
-        Ok(Some(RValue::MapInsert { map, key, value }))
+        Ok(Some(RValue::MapInsert {
+            map,
+            key,
+            value,
+            kind: MapWriteKind::StructuralInsert,
+        }))
     }
 
     fn lower_map_remove_call(
@@ -5076,7 +5801,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let ExprKind::Field(field) = &call.node.func.node.kind else {
             return Ok(None);
         };
-        if field.node.field != Ident::new("remove") || call.node.args.len() != 1 {
+        if !matches!(
+            collection_effect::classify_map_method(field.node.field),
+            Some(collection_effect::MapStructuralEffect::Remove)
+        ) || call.node.args.len() != 1
+        {
             return Ok(None);
         }
         let map = self.lower_method_target(&field.node.target)?;
@@ -6636,6 +7365,48 @@ struct OptionalSubject {
     inner_ty: TypeId,
 }
 
+struct ForPlan {
+    root_kind: AirCollectionRootKind,
+    mode: AirCollectionLoanMode,
+    root: Place,
+    len: LocalId,
+    index: LocalId,
+    step: Operand,
+    bindings: Vec<ForBindingPlan>,
+}
+
+enum ForBindingPlan {
+    OwnedIndex {
+        pattern: ast::PatternNode,
+    },
+    OwnedElement {
+        pattern: ast::PatternNode,
+        ty: TypeId,
+    },
+    ElementSlot {
+        pattern: ast::PatternNode,
+        local: LocalId,
+        ty: TypeId,
+    },
+    OwnedMapEntry {
+        pattern: ast::PatternNode,
+        ty: TypeId,
+    },
+    OwnedMapKey {
+        pattern: ast::PatternNode,
+        ty: TypeId,
+    },
+    OwnedMapValue {
+        pattern: ast::PatternNode,
+        ty: TypeId,
+    },
+    MapValueSlot {
+        pattern: ast::PatternNode,
+        local: LocalId,
+        ty: TypeId,
+    },
+}
+
 enum ChainStep<'a> {
     Field {
         expr: &'a ExprNode,
@@ -7404,10 +8175,7 @@ fn is_lowered_collection_stub(id: &CallableId) -> bool {
             CallableKind::ExtendMethod(MethodSurface::Instance),
             "push" | "insert" | "remove"
         )
-    ) && matches!(&id.module, ModuleScope::Package(module)
-        if module.package_context() == Some(&PackageId::core())
-            && matches!(module.path(), PackageModulePath::Named(path)
-                if path.segments().len() == 1 && path.segments()[0] == "collections"))
+    ) && id.module.is_core_module("collections")
 }
 
 fn queue_reachable(
@@ -7619,6 +8387,7 @@ mod tests {
     use crate::{
         ast, externs,
         externs::{ExternInputs, PackageExternInputs, RawExterns},
+        resolve::PackageId,
         test_support::{
             checked_with_full_core_shape, parse_program, resolved_modules_with_core_option,
             resolved_modules_with_core_option_external,
@@ -8522,6 +9291,194 @@ mod tests {
             err,
             LowerError::UnsupportedCallableInstance { .. }
         ));
+    }
+
+    #[test]
+    fn sequence_for_lowers_to_collection_loan_loop() {
+        let air = lower_root("fn f(xs: [int]) { for x in xs { x; } }", "f").expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+
+        assert!(function.body.block.stmts.iter().any(|stmt| matches!(
+            stmt,
+            AirStmt::CollectionLoan(AirCollectionLoan {
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body,
+                ..
+            }) if matches!(body.stmts.as_slice(), [AirStmt::Init { .. }, AirStmt::Init { .. }, AirStmt::Loop(_)])
+        )));
+    }
+
+    #[test]
+    fn sequence_for_var_lowers_slot_inside_collection_loan() {
+        let air = lower_root("fn f(var xs: [int]) { for var x in xs { x += 1; } }", "f")
+            .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::CollectionSlotScope(AirCollectionSlotScope { slots, .. })
+                    if matches!(slots.as_slice(), [AirCollectionSlot { kind: AirCollectionSlotKind::SequenceElement, mutable: true, .. }])
+            )
+        }));
+    }
+
+    #[test]
+    fn sequence_for_with_index_lowers_owned_index_and_item() {
+        let air =
+            lower_root("fn f(xs: [int]) { for i, x in xs { i; x; } }", "f").expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::Use(Operand::Place(place)),
+                    ..
+                } if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)])
+            )
+        }));
+    }
+
+    #[test]
+    fn sequence_for_tuple_pattern_lowers() {
+        lower_root(
+            "fn f(xs: [(int, string)]) { for (a, b) in xs { a; b; } }",
+            "f",
+        )
+        .expect("lower failed");
+    }
+
+    #[test]
+    fn sequence_for_var_tuple_pattern_lowers() {
+        lower_root(
+            "fn f(var xs: [(int, int)]) { for var (a, b) in xs { a += 1; b += 1; } }",
+            "f",
+        )
+        .expect("lower failed");
+    }
+
+    #[test]
+    fn reverse_step_sequence_for_starts_from_last_index() {
+        let air = lower_root("fn f(xs: [int]) { for x in rev xs step 2 { x; } }", "f")
+            .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn map_for_lowers_entry_index_loop() {
+        let air = lower_root("fn f(m: [string: int]) { for k, v in m { k; v; } }", "f")
+            .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::MapEntryAt { .. },
+                    ..
+                }
+            )
+        }));
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+        assert!(function.body.block.stmts.iter().any(|statement| {
+            matches!(
+                statement,
+                AirStmt::CollectionLoan(AirCollectionLoan {
+                    mode: AirCollectionLoanMode::ReadonlyMap,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn map_for_tuple_entry_pattern_lowers() {
+        lower_root("fn f(m: [string: int]) { for (k, v) in m { k; v; } }", "f")
+            .expect("lower failed");
+    }
+
+    #[test]
+    fn map_for_var_value_lowers_map_value_slot() {
+        let air = lower_root(
+            "fn f(var m: [string: int]) { for k, var v in m { v += 1; } }",
+            "f",
+        )
+        .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::CollectionSlotScope(AirCollectionSlotScope { slots, .. })
+                    if matches!(slots.as_slice(), [AirCollectionSlot { kind: AirCollectionSlotKind::MapValue, mutable: true, .. }])
+            )
+        }));
+    }
+
+    #[test]
+    fn for_body_break_and_continue_lower_inside_loan_loop() {
+        lower_root(
+            "fn f(xs: [int]) { for x in xs { if x == 0 { continue; } break; } }",
+            "f",
+        )
+        .expect("lower failed");
+    }
+
+    #[test]
+    fn range_index_lowers_to_slice_view() {
+        let air = lower_full_core_root(
+            "fn take(s: slice[int]) {} fn f(xs: [int]) { take(xs[1..3]); }",
+            "f",
+        )
+        .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::SliceView { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn slice_for_lowers_to_collection_loan_loop() {
+        let air =
+            lower_root("fn f(xs: slice[int]) { for x in xs { x; } }", "f").expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+
+        assert!(function.body.block.stmts.iter().any(|stmt| matches!(
+            stmt,
+            AirStmt::CollectionLoan(AirCollectionLoan {
+                root_kind: AirCollectionRootKind::Slice,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                ..
+            })
+        )));
     }
 
     #[test]
@@ -11129,6 +12086,13 @@ fn main() {}
                     }
                 }
                 AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
+                AirStmt::CollectionLoan(loan) => {
+                    collect_block_statements(&loan.body, statements);
+                }
+                AirStmt::CollectionSlotScope(scope) => {
+                    statements.push(AirStmt::CollectionSlotScope(scope.clone()));
+                    collect_block_statements(&scope.body, statements);
+                }
                 AirStmt::OptionalMatch(match_) => {
                     collect_block_statements(&match_.some_block, statements);
                     collect_block_statements(&match_.none_block, statements);

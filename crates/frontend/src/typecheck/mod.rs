@@ -62,6 +62,7 @@ use crate::{
 mod annotation;
 mod body;
 mod closure;
+mod collection_loan;
 mod const_eval;
 mod const_term;
 mod contracts;
@@ -332,6 +333,21 @@ pub(crate) enum TypeError {
     },
     VarArgImmutableBinding {
         name: Ident,
+        span: Option<SourceSpan>,
+    },
+    SequenceStructuralMutationDuringLoan {
+        span: Option<SourceSpan>,
+    },
+    MapStructuralMutationDuringLoan {
+        span: Option<SourceSpan>,
+    },
+    ActiveCollectionRebind {
+        span: Option<SourceSpan>,
+    },
+    ActiveCollectionMutableArg {
+        span: Option<SourceSpan>,
+    },
+    StoredSliceLocal {
         span: Option<SourceSpan>,
     },
     MutatingMethodImmutableReceiver {
@@ -856,6 +872,11 @@ impl TypeError {
             | TypeError::ConstAssignment { span, .. }
             | TypeError::VarArgNonLvalue { span, .. }
             | TypeError::VarArgImmutableBinding { span, .. }
+            | TypeError::SequenceStructuralMutationDuringLoan { span, .. }
+            | TypeError::MapStructuralMutationDuringLoan { span, .. }
+            | TypeError::ActiveCollectionRebind { span, .. }
+            | TypeError::ActiveCollectionMutableArg { span, .. }
+            | TypeError::StoredSliceLocal { span, .. }
             | TypeError::MutatingMethodImmutableReceiver { span, .. }
             | TypeError::MutableAlias { span, .. }
             | TypeError::InvalidFormatSpec { span, .. }
@@ -1153,7 +1174,7 @@ enum NameSubjectMode {
 enum ResolvedIdentSubject {
     Local(LocalSymbol, usize),
     Blocked(Box<TypeError>),
-    Named(ModuleScope, Ident, ValueDecl),
+    Named(ModuleScope, Ident, Box<ValueDecl>),
     Module(ModuleScope),
     Type(Type),
     Missing,
@@ -1226,6 +1247,18 @@ struct SourceModuleFactsInput {
     scope: ModuleScope,
     source: SourceId,
     program: Rc<Program>,
+}
+
+struct SemanticMethodLikeInput<'a> {
+    name: Ident,
+    receiver: Option<MethodReceiver>,
+    source_params: &'a [Param],
+    body_span: Span,
+    span: Span,
+    callable: &'a CallableRef,
+    args: GenericArgs,
+    param_types: Vec<FuncParam>,
+    ret: ReturnSpec,
 }
 
 struct LocalPlaceAccess {
@@ -1313,6 +1346,7 @@ struct ScopeState {
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
     local_type_scopes: LocalTypeScopes,
     closure: ClosureScopeState,
+    active_collection_loans: Vec<collection_loan::ActiveCollectionLoan>,
 }
 
 const MUT_DOWNCAST_ROOT_MESSAGE: &str =
@@ -1334,6 +1368,7 @@ struct TypeChecker {
     closure: ClosureClassifier,
     global_types: HashMap<GlobalKey, SemanticLocalId>,
     active_mut_alias_roots: Vec<ActiveMutAliasRoot>,
+    active_collection_loans: Vec<collection_loan::ActiveCollectionLoan>,
     dyn_infer_registered_modules: HashSet<ModuleScope>,
     dyn_infer: DynInference,
     used_imports: HashSet<ImportId>,
@@ -1382,6 +1417,7 @@ impl TypeChecker {
             closure: ClosureClassifier::default(),
             global_types: HashMap::new(),
             active_mut_alias_roots: vec![],
+            active_collection_loans: vec![],
             dyn_infer_registered_modules: HashSet::new(),
             dyn_infer: DynInference::default(),
             used_imports: HashSet::new(),
@@ -1639,6 +1675,7 @@ impl TypeChecker {
             scopes,
             local_type_scopes: self.local_type_scopes.clone(),
             closure,
+            active_collection_loans: vec![],
         }
     }
 
@@ -1649,6 +1686,7 @@ impl TypeChecker {
             closure: self
                 .closure
                 .replace_scope_state(ClosureScopeState::default()),
+            active_collection_loans: std::mem::take(&mut self.active_collection_loans),
         }
     }
 
@@ -1656,6 +1694,7 @@ impl TypeChecker {
         self.scopes = state.scopes;
         self.local_type_scopes = state.local_type_scopes;
         self.closure.restore_scope_state(state.closure);
+        self.active_collection_loans = state.active_collection_loans;
     }
 
     fn replace_scopes(&mut self, scopes: Vec<HashMap<Ident, LocalSymbol>>) {
@@ -1672,6 +1711,10 @@ impl TypeChecker {
                 state.local_type_scopes,
             ),
             closure: self.closure.replace_scope_state(state.closure),
+            active_collection_loans: std::mem::replace(
+                &mut self.active_collection_loans,
+                state.active_collection_loans,
+            ),
         }
     }
 
@@ -2677,7 +2720,7 @@ impl TypeChecker {
         if !matches!(mode, NameSubjectMode::Const)
             && let Some((module, name, value)) = self.lookup_named_value(name)
         {
-            return ResolvedIdentSubject::Named(module, name, value);
+            return ResolvedIdentSubject::Named(module, name, Box::new(value));
         }
 
         if matches!(mode, NameSubjectMode::PostfixBase) {
@@ -2737,6 +2780,11 @@ impl TypeChecker {
             .iter()
             .map(|p| {
                 let ty = self.resolve_callable_param_type(&p.ty, p.ty_span, exported);
+                if let Some(error) =
+                    collection_loan::stored_nested_slice_error(&ty, self.error_span(p.ty_span))
+                {
+                    self.push_error(error);
+                }
                 self.validate_func_param_escape(
                     p.escape,
                     matches!(p.mutability, Mutability::Mutable),
@@ -3001,15 +3049,17 @@ impl TypeChecker {
     ) -> SemanticFunctionInstanceFact {
         self.semantic_method_like_fact(
             module,
-            method.sig.name,
-            method.sig.receiver,
-            &method.sig.params,
-            method.body.span,
-            span,
-            callable,
-            args,
-            param_types,
-            ret,
+            SemanticMethodLikeInput {
+                name: method.sig.name,
+                receiver: method.sig.receiver,
+                source_params: &method.sig.params,
+                body_span: method.body.span,
+                span,
+                callable,
+                args,
+                param_types,
+                ret,
+            },
         )
     }
 
@@ -3025,51 +3075,58 @@ impl TypeChecker {
     ) -> SemanticFunctionInstanceFact {
         self.semantic_method_like_fact(
             module,
-            method.sig.name,
-            method.sig.receiver,
-            &method.sig.params,
-            method.body.span,
-            span,
-            callable,
-            args,
-            param_types,
-            ret,
+            SemanticMethodLikeInput {
+                name: method.sig.name,
+                receiver: method.sig.receiver,
+                source_params: &method.sig.params,
+                body_span: method.body.span,
+                span,
+                callable,
+                args,
+                param_types,
+                ret,
+            },
         )
     }
 
     fn semantic_method_like_fact(
         &self,
         module: &SourceModuleFactsInput,
-        name: Ident,
-        receiver: Option<MethodReceiver>,
-        source_params: &[Param],
-        body_span: Span,
-        span: Span,
-        callable: &CallableRef,
-        args: GenericArgs,
-        param_types: Vec<FuncParam>,
-        ret: ReturnSpec,
+        input: SemanticMethodLikeInput<'_>,
     ) -> SemanticFunctionInstanceFact {
         let mut params = vec![];
-        if let Some(receiver_ty) = &callable.receiver_ty {
+        if let Some(receiver_ty) = &input.callable.receiver_ty {
             params.push(SemanticParamSigFact {
                 name: Ident::new("self"),
-                span: SourceSpan::from_byte_span(module.source, span),
+                span: SourceSpan::from_byte_span(module.source, input.span),
                 ty: receiver_ty.clone(),
-                mutable: matches!(receiver, Some(MethodReceiver::Var)),
+                mutable: matches!(input.receiver, Some(MethodReceiver::Var)),
                 escape: EscapeMode::NonEscaping,
             });
         }
-        params.extend(source_params.iter().zip(param_types).map(|(source, sig)| {
-            SemanticParamSigFact {
-                name: source.name,
-                span: SourceSpan::from_byte_span(module.source, source.ty_span),
-                ty: sig.ty,
-                mutable: sig.mutable,
-                escape: sig.escape,
-            }
-        }));
-        self.semantic_callable_fact(module, callable, args, name, span, body_span, params, ret)
+        params.extend(
+            input
+                .source_params
+                .iter()
+                .zip(input.param_types)
+                .map(|(source, sig)| SemanticParamSigFact {
+                    name: source.name,
+                    span: SourceSpan::from_byte_span(module.source, source.ty_span),
+                    ty: sig.ty,
+                    mutable: sig.mutable,
+                    escape: sig.escape,
+                }),
+        );
+        self.semantic_callable_fact(
+            module,
+            input.callable,
+            input.args,
+            input.name,
+            input.span,
+            input.body_span,
+            params,
+            input.ret,
+        )
     }
 
     fn semantic_callable_fact(
@@ -4104,8 +4161,8 @@ fn check_expr_checked_with_hint(
                     checked_from_type(expr, Type::Infer, tc)
                 }
                 ResolvedIdentSubject::Named(module, value_name, value) => {
-                    tc.warn_named_value_deprecated(&value, value_name, expr.span);
-                    if let ValueDecl::Global(sig) = &value {
+                    tc.warn_named_value_deprecated(value.as_ref(), value_name, expr.span);
+                    if let ValueDecl::Global(sig) = value.as_ref() {
                         let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
                         let value = place::global_value(sig, checked);
                         tc.record_expr_place(expr.node.id, &value);
@@ -4120,7 +4177,7 @@ fn check_expr_checked_with_hint(
                     if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
                         module: module.clone(),
                         name: value_name,
-                        decl: value.clone(),
+                        decl: (*value).clone(),
                     }) && callee.def.sig.ret.is_infer()
                     {
                         tc.push_error(TypeError::InferReturnValue {
@@ -4128,7 +4185,7 @@ fn check_expr_checked_with_hint(
                         });
                         return checked_from_type(expr, Type::Infer, tc);
                     }
-                    match value {
+                    match *value {
                         ValueDecl::Const(_) => match tc.eval_visible_const(*name, expr.span) {
                             Some(Ok(value)) => {
                                 checked_from_type(expr, const_eval::const_type(&value), tc)
@@ -5095,6 +5152,13 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
     let target = check_place(&assign.node.target, tc);
     if let Some(error) = target.value.access.assign_error(
         assignment_target_name(&assign.node.target),
+        tc.error_span(assign.node.target.span),
+    ) {
+        tc.push_error(error);
+    }
+    if let Some(error) = collection_loan::root_rebind_error(
+        &tc.active_collection_loans,
+        &target.value.identity,
         tc.error_span(assign.node.target.span),
     ) {
         tc.push_error(error);

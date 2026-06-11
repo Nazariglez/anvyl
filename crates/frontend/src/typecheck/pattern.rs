@@ -1,7 +1,8 @@
 use super::{
     ActiveMutAliasRoot, CheckedType, MUT_ALIAS_ROOT_MESSAGE, MUT_DOWNCAST_ROOT_MESSAGE,
     TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint, check_expected_value_expr,
-    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, control_flow,
+    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, collection_loan,
+    control_flow,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -1309,7 +1310,17 @@ pub(super) fn check_roots(
 
     for root in roots {
         let (input, site) = match root.input {
-            PatternRootInput::Owned(ty) => (PatternInput::owned(ty, tc), None),
+            PatternRootInput::Owned(ty) => {
+                if matches!(root.mode, PatternBindMode::Owned { .. })
+                    && let Some(error) = collection_loan::stored_slice_local_error(
+                        &ty,
+                        tc.error_span(root.pattern.span),
+                    )
+                {
+                    tc.push_error(error);
+                }
+                (PatternInput::owned(ty, tc), None)
+            }
             PatternRootInput::Place(place, site) => (PatternInput::from_place(*place), Some(site)),
         };
         let mut checker = PatternChecker::new(tc, site, context, root.mode);
@@ -1519,6 +1530,15 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             (value_ty.clone(), value_ty)
         }
     };
+
+    if matches!(mode, PatternBindMode::Owned { .. })
+        && let Some(error) = collection_loan::stored_slice_local_error(
+            &binding_ty,
+            tc.error_span(binding.value.span),
+        )
+    {
+        tc.push_error(error);
+    }
 
     let binding_name = simple_owned_binding_name(binding);
     let function_value = matches!(value_ty, Type::Func { .. })

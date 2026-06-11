@@ -259,6 +259,28 @@ fn module_refs_stable() {
 }
 
 #[test]
+fn collection_loan_for_each_rvalue_visits_nested_body() {
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: place(LocalId::from_index(0), TypeId::from_index(0)),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body: AirBlock {
+                    stmts: vec![stmt_eval(RValue::Use(op_const(ConstId::from_index(0))))],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::None,
+        },
+    };
+
+    let mut count = 0;
+    body.for_each_rvalue(&mut |_| count += 1);
+    assert_eq!(count, 1);
+}
+
+#[test]
 fn program_accessors() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
