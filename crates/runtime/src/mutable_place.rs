@@ -370,8 +370,8 @@ mod tests {
     use std::mem::ManuallyDrop;
 
     use crate::{
-        AnvList, Ctx, DataRefPlaceOps, ErasedHandle, HeapType, LambdaCell, MutPlace, RuntimeError,
-        ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
+        AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, HeapType, LambdaCell, MutPlace,
+        RuntimeError, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -854,6 +854,116 @@ mod tests {
         assert_eq!(err.message(), "early");
         cell.set(&mut ctx, 2).unwrap();
         assert_eq!(cell.get_copy(&mut ctx).unwrap(), 2);
+            );
+    }
+
+    macro_rules! assert_unsupported_slice_views {
+        ($place:expr) => {{
+            let mut place = $place;
+            assert_unsupported_slice_view(place.slice_view(0, 2, false));
+            assert_unsupported_slice_view(place.slice_view_mut(0, 2, false));
+        }};
+    }
+
+    fn assert_unsupported_slice_view<T>(result: Result<AnvSlice<T>, RuntimeError>) {
+        let Err(err) = result else {
+            panic!("expected unsupported slice view");
+        };
+        assert_eq!(
+            err.message(),
+            "slice view over non-local mutable collection parameter is unsupported"
+        );
+    }
+
+    fn set_slice_second(slice: &mut AnvSlice<i64>) {
+        slice
+            .with_elem_mut_short(1, |value| {
+                *value = 9;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn local_slice_views_succeed() {
+        let mut list = AnvList::from_elems([1_i64, 2, 3]);
+        let mut place = MutPlace::local(&mut list);
+
+        let slice = place.slice_view(1, 3, false).unwrap();
+        assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
+        assert_eq!(slice.elem_at_shared(1).unwrap(), 3);
+        set_slice_second(&mut place.slice_view_mut(0, 2, false).unwrap());
+        assert_eq!(*list.get(1).unwrap(), 9);
+
+        let mut array = [1_i64, 2, 3];
+        let mut place = MutPlace::local(&mut array);
+
+        let slice = place.slice_view(1, 3, false).unwrap();
+        assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
+        assert_eq!(slice.elem_at_shared(1).unwrap(), 3);
+        set_slice_second(&mut place.slice_view_mut(0, 2, false).unwrap());
+        assert_eq!(array[1], 9);
+    }
+
+    #[test]
+    fn stack_cell_slice_views_are_unsupported() {
+        let list_cell = StackLambdaCell::new(AnvList::from_elems([1_i64, 2, 3]));
+        assert_unsupported_slice_views!(MutPlace::stack_cell(&list_cell));
+
+        let array_cell = StackLambdaCell::new([1_i64, 2, 3]);
+        assert_unsupported_slice_views!(MutPlace::stack_cell(&array_cell));
+    }
+
+    #[test]
+    fn heap_cell_slice_views_are_unsupported() {
+        with_ctx!(ctx;
+        let list_ty = ctx.heap().register_untracked::<LambdaCell<AnvList<i64>>>();
+        let list_cell = ctx
+            .heap()
+            .alloc(list_ty, LambdaCell::new(AnvList::from_elems([1_i64, 2, 3])));
+        assert_unsupported_slice_views!(MutPlace::heap_cell(list_cell));
+
+        let array_ty = ctx.heap().register_untracked::<LambdaCell<[i64; 3]>>();
+        let array_cell = ctx.heap().alloc(array_ty, LambdaCell::new([1_i64, 2, 3]));
+        assert_unsupported_slice_views!(MutPlace::heap_cell(array_cell));
+            );
+    }
+
+    #[test]
+    fn scoped_cell_slice_views_are_unsupported() {
+        let mut list = AnvList::from_elems([1_i64, 2, 3]);
+        let list_cell = ScopedMutPlaceCell::new(MutPlace::local(&mut list));
+        assert_unsupported_slice_views!(MutPlace::scoped_cell(&list_cell));
+
+        let mut array = [1_i64, 2, 3];
+        let array_cell = ScopedMutPlaceCell::new(MutPlace::local(&mut array));
+        assert_unsupported_slice_views!(MutPlace::scoped_cell(&array_cell));
+    }
+
+    #[test]
+    fn dataref_slice_views_are_unsupported() {
+        with_ctx!(ctx;
+        let list_ty = ctx.heap().register_untracked::<Storage<AnvList<i64>>>();
+        let list_object = ctx.heap().alloc(
+            list_ty,
+            Storage {
+                field: AnvList::from_elems([1_i64, 2, 3]),
+            },
+        );
+        let list_erased = ctx.heap().erase(&list_object).unwrap();
+        let list_ops = FieldOps { ty: list_ty };
+        assert_unsupported_slice_views!(MutPlace::dataref(list_erased, &list_ops));
+
+        let array_ty = ctx.heap().register_untracked::<Storage<[i64; 3]>>();
+        let array_object = ctx.heap().alloc(
+            array_ty,
+            Storage {
+                field: [1_i64, 2, 3],
+            },
+        );
+        let array_erased = ctx.heap().erase(&array_object).unwrap();
+        let array_ops = FieldOps { ty: array_ty };
+        assert_unsupported_slice_views!(MutPlace::dataref(array_erased, &array_ops));
             );
     }
 }

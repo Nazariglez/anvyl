@@ -2290,7 +2290,7 @@ impl<'a> PlanCx<'a> {
                 inclusive,
                 ty,
             } => PlannedRValue::from_value(RirRValue::SliceView {
-                source: self.plan_place_in_function(function, source),
+                source: self.plan_slice_view_source(function, source)?,
                 start: RirLocalId::from_index(start.index()),
                 end: RirLocalId::from_index(end.index()),
                 inclusive: *inclusive,
@@ -3415,6 +3415,26 @@ impl<'a> PlanCx<'a> {
     fn root_place(&self, function: FunctionId, place: &Place) -> (TypeId, RirPlace) {
         let (ty, local) = self.current_place_root(function, place);
         (ty, self.rir_root_place(local, ty))
+    }
+
+    fn plan_slice_view_source(
+        &self,
+        function: FunctionId,
+        place: &Place,
+    ) -> Result<RirPlace, RustPlanError> {
+        if matches!(
+            place.root,
+            air::PlaceRoot::CaptureCell(_)
+                | air::PlaceRoot::ScopedBorrow(_)
+                | air::PlaceRoot::Global(_)
+        ) || self.place_crosses_dataref(function, place)
+        {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function),
+                RustTargetGapKind::UnsupportedSliceView,
+            ));
+        }
+        Ok(self.plan_place_in_function(function, place))
     }
 
     fn dataref_root_place(

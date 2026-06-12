@@ -2998,34 +2998,114 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         slice_ty: TypeId,
     ) -> Result<Place, LowerError> {
-        if let Ok(place) = self.lower_mut_call_arg(expr)
-            && place.ty == slice_ty
-        {
+        let source = self.lower_slice_call_arg_source(expr, slice_ty, true)?;
+        self.lower_slice_view_call_arg(source, slice_ty, true, expr)
+    }
+
+    fn lower_slice_call_arg_source(
+        &mut self,
+        expr: &ExprNode,
+        slice_ty: TypeId,
+        mutable: bool,
+    ) -> Result<Place, LowerError> {
+        if let Some(place) = self.lower_range_slice_call_arg(expr, slice_ty, mutable)? {
             return Ok(place);
         }
-        let source = self.lower_place_arg_impl(expr, true, true)?;
-        let Some(source_elem) = typing::sequence_elem(&self.cx.program, source.ty) else {
-            return Err(unsupported_expr(expr));
+        self.lower_place_arg_impl(expr, mutable, mutable)
+    }
+
+    fn lower_range_slice_call_arg(
+        &mut self,
+        expr: &ExprNode,
+        slice_ty: TypeId,
+        mutable: bool,
+    ) -> Result<Option<Place>, LowerError> {
+        let ExprKind::Index(index) = &expr.node.kind else {
+            return Ok(None);
         };
-        let TypeData::Slice(slice_elem) = self.cx.program.type_data(slice_ty) else {
-            return Err(unsupported_expr(expr));
+        let ExprKind::Range(range) = &index.node.index.node.kind else {
+            return Ok(None);
         };
-        if source_elem != *slice_elem {
-            return Err(unsupported_expr(expr));
+        let target_ty = self
+            .cx
+            .lower_ty(&self.lower_expr_ty(index.node.target.node.id)?)?;
+        let source = if matches!(self.cx.program.type_data(target_ty), TypeData::Slice(_)) {
+            self.lower_slice_call_arg_source(&index.node.target, target_ty, mutable)?
+        } else {
+            self.lower_place_arg_impl(&index.node.target, mutable, mutable)?
+        };
+        self.check_slice_view_source(expr, &source, slice_ty)?;
+        if mutable {
+            self.require_mutable_place(expr, &source)?;
+        }
+        let (start, end, inclusive) = self.lower_range_bounds(range, &source)?;
+        self.emit_slice_view_temp(slice_ty, source, start, end, inclusive, mutable, expr)
+            .map(Some)
+    }
+
+    fn lower_slice_view_call_arg(
+        &mut self,
+        source: Place,
+        slice_ty: TypeId,
+        mutable: bool,
+        site: &ExprNode,
+    ) -> Result<Place, LowerError> {
+        let needs_view = source.ty != slice_ty;
+        if needs_view {
+            self.check_slice_view_source(site, &source, slice_ty)?;
+        }
+        if mutable {
+            self.require_mutable_place(site, &source)?;
+        }
+        if !needs_view {
+            return Ok(source);
         }
         let start = self.int_local(0)?;
         let end = self.len_local(&source)?;
-        let temp = self.emit_mut_typed_temp(
-            slice_ty,
-            RValue::SliceView {
-                source,
-                start,
-                end,
-                inclusive: false,
-                ty: slice_ty,
-            },
-        )?;
-        self.place_from_operand(temp, expr)
+        self.emit_slice_view_temp(slice_ty, source, start, end, false, mutable, site)
+    }
+
+    fn check_slice_view_source(
+        &self,
+        site: &ExprNode,
+        source: &Place,
+        slice_ty: TypeId,
+    ) -> Result<(), LowerError> {
+        let Some(source_elem) = typing::sequence_elem(&self.cx.program, source.ty) else {
+            return Err(unsupported_expr(site));
+        };
+        let TypeData::Slice(slice_elem) = self.cx.program.type_data(slice_ty) else {
+            return Err(unsupported_expr(site));
+        };
+        if source_elem != *slice_elem {
+            return Err(unsupported_expr(site));
+        }
+        Ok(())
+    }
+
+    fn emit_slice_view_temp(
+        &mut self,
+        ty: TypeId,
+        source: Place,
+        start: LocalId,
+        end: LocalId,
+        inclusive: bool,
+        mutable: bool,
+        site: &ExprNode,
+    ) -> Result<Place, LowerError> {
+        let value = RValue::SliceView {
+            source,
+            start,
+            end,
+            inclusive,
+            ty,
+        };
+        let temp = if mutable {
+            self.emit_mut_typed_temp(ty, value)?
+        } else {
+            self.emit_typed_temp(ty, value)?
+        };
+        self.place_from_operand(temp, site)
     }
 
     fn lower_place_arg_impl(
@@ -3201,34 +3281,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         slice_ty: TypeId,
     ) -> Result<Place, LowerError> {
-        if let Ok(place) = self.lower_place_arg(expr, false)
-            && place.ty == slice_ty
-        {
-            return Ok(place);
-        }
-        let source = self.lower_place_arg_impl(expr, false, false)?;
-        let Some(source_elem) = typing::sequence_elem(&self.cx.program, source.ty) else {
-            return Err(unsupported_expr(expr));
-        };
-        let TypeData::Slice(slice_elem) = self.cx.program.type_data(slice_ty) else {
-            return Err(unsupported_expr(expr));
-        };
-        if source_elem != *slice_elem {
-            return Err(unsupported_expr(expr));
-        }
-        let start = self.int_local(0)?;
-        let end = self.len_local(&source)?;
-        let temp = self.emit_typed_temp(
-            slice_ty,
-            RValue::SliceView {
-                source,
-                start,
-                end,
-                inclusive: false,
-                ty: slice_ty,
-            },
-        )?;
-        self.place_from_operand(temp, expr)
+        let source = self.lower_slice_call_arg_source(expr, slice_ty, false)?;
+        self.lower_slice_view_call_arg(source, slice_ty, false, expr)
     }
 
     fn lower_shared_call_arg(
@@ -5632,6 +5686,21 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         param: ParamType,
         site: &ExprNode,
     ) -> Result<CallArg, LowerError> {
+        if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) {
+            let place = self.place_from_operand(value, site)?;
+            let place = self.lower_slice_view_call_arg(
+                place,
+                param.ty,
+                matches!(param.mode, ParamMode::MutBorrow),
+                site,
+            )?;
+            return Ok(match param.mode {
+                ParamMode::Value => CallArg::Value(Operand::Place(place)),
+                ParamMode::SharedBorrow => CallArg::SharedBorrow(place),
+                ParamMode::MutBorrow => CallArg::MutBorrow(place),
+            });
+        }
+
         match param.mode {
             ParamMode::Value => {
                 let value = if self.operand_ty(&value) == param.ty {

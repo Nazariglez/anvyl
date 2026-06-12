@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: slice types are only allowed in function parameters
+// @frontend: new
+
+lazy var bad: slice[int] = [1, 2, 3];
+
+fn main() {}

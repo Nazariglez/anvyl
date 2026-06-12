@@ -1,0 +1,43 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 2
+// 7
+// 14
+// 15
+// 12
+// 17
+// @match-end
+
+fn head(xs: slice[int]) -> int {
+    xs[0]
+}
+
+fn head_forward(xs: slice[int]) -> int {
+    head(xs)
+}
+
+fn bump0(var xs: slice[int], amount: int) {
+    xs[0] += amount;
+}
+
+fn bump0_forward(var xs: slice[int], amount: int) {
+    bump0(xs, amount);
+}
+
+fn main() {
+    var list: [int] = [1, 2, 3];
+    println(head_forward(list[1..3]));
+    bump0_forward(list, 6);
+    println(list[0]);
+    bump0_forward(list[1..3], 12);
+    println(list[1]);
+    bump0_forward(list[1..3][0..1], 1);
+    println(list[1]);
+
+    var array = [10, 11, 12];
+    println(head_forward(array[2..3]));
+    bump0_forward(array, 7);
+    println(array[0]);
+}

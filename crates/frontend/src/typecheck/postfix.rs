@@ -776,6 +776,11 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     let ExprKind::Index(index) = &expr.node.kind else {
         return materialized_receiver_value(expr.node.id, place::check_place(expr, tc).value);
     };
+    if matches!(index.node.index.node.kind, ExprKind::Range(_))
+        && let Some(value) = slice_range_place_value(expr, tc)
+    {
+        return value;
+    }
 
     let target = place::check_place(&index.node.target, tc);
     let indexed = check_index_access(index, &target.value.checked, tc);
@@ -1945,6 +1950,10 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
 }
 
 fn check_mutable_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
+    if let Some(checked) = check_mutable_slice_range_arg(arg, param, tc) {
+        return checked;
+    }
+
     let place = place::check_place(arg, tc);
     let name = super::assignment_target_name(arg);
     let mutability_error = place
@@ -1954,79 +1963,98 @@ fn check_mutable_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) ->
     let target = tc.handle_type(&param.ty);
     if let Some(error) = mutability_error {
         tc.push_error(error);
-        let checked = place.into_checked();
-        tc.reject_extern_any_escape(&checked, arg.span);
-        tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
-        return SourceArgCheck {
-            failed: tc.solve_constraints(),
-            mutable_arg: None,
-        };
+        return reject_var_arg(arg, param, &place.value.checked, tc);
     }
 
     match expected_place_projection(tc, arg, &place.value, &target) {
-        ExpectedPlaceProjection::SourceAccepted => finish_var_arg(arg, param, place, tc),
-        ExpectedPlaceProjection::Projected(projected) => {
-            finish_projected_var_arg(arg, param, &projected, tc)
-        }
+        ExpectedPlaceProjection::SourceAccepted => finish_var_arg(arg, param, &place.value, tc),
+        ExpectedPlaceProjection::Projected(projected) => finish_var_arg(arg, param, &projected, tc),
         ExpectedPlaceProjection::Failed => SourceArgCheck {
             failed: true,
             mutable_arg: None,
         },
-        ExpectedPlaceProjection::NotNeeded => {
-            let checked = place.into_checked();
-            tc.reject_extern_any_escape(&checked, arg.span);
-            tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
-            SourceArgCheck {
-                failed: tc.solve_constraints(),
-                mutable_arg: None,
-            }
-        }
+        ExpectedPlaceProjection::NotNeeded => reject_var_arg(arg, param, &place.into_checked(), tc),
     }
 }
 
-fn finish_projected_var_arg(
+fn reject_var_arg(
     arg: &ExprNode,
     param: &CallParam,
-    projected: &PlaceValue,
+    checked: &CheckedType,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
-    if let Some(error) = collection_loan::mutable_collection_arg_error(
-        &tc.active_collection_loans,
-        &projected.identity,
-        &projected.checked.ty,
-        &tc.handle_type(&param.ty),
-        tc.error_span(arg.span),
-    ) {
-        tc.push_error(error);
-        return SourceArgCheck {
-            failed: true,
-            mutable_arg: None,
-        };
-    }
-    tc.reject_extern_any_escape(&projected.checked, arg.span);
+    tc.reject_extern_any_escape(checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,
         arg.node.id,
-        projected.checked.handle.clone(),
+        checked.handle.clone(),
         param.ty.clone(),
     );
-    place::record_var_argument(arg.node.id, projected, tc);
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_arg: Some(mutable_arg(arg.span, projected)),
+        mutable_arg: None,
     }
+}
+
+fn slice_range_place_value(expr: &ExprNode, tc: &mut TypeChecker) -> Option<PlaceValue> {
+    let ExprKind::Index(index) = &expr.node.kind else {
+        return None;
+    };
+    if !matches!(index.node.index.node.kind, ExprKind::Range(_)) {
+        return None;
+    }
+
+    let target = slice_range_place_value(&index.node.target, tc)
+        .unwrap_or_else(|| place::check_place(&index.node.target, tc).value);
+    let indexed = check_index_access(index, &target.checked, tc);
+    let mut checked = checked_from_type(expr, indexed.read_ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+    tc.closure
+        .copy_place_identity(index.node.target.node.id, expr.node.id);
+    Some(
+        target.projected(
+            checked,
+            place::projected_field_access(target.access),
+            target.facts.clone(),
+            target
+                .identity
+                .clone()
+                .index_by(place::index_identity(&index.node.index, tc)),
+        ),
+    )
+}
+
+fn check_mutable_slice_range_arg(
+    arg: &ExprNode,
+    param: &CallParam,
+    tc: &mut TypeChecker,
+) -> Option<SourceArgCheck> {
+    if !matches!(tc.handle_type(&param.ty), Type::Slice { .. }) {
+        return None;
+    }
+    let value = slice_range_place_value(arg, tc)?;
+
+    if let Some(error) = value.access.error_for(
+        MutableUseKind::VarArg(super::assignment_target_name(arg)),
+        tc.error_span(arg.span),
+    ) {
+        tc.push_error(error);
+        return Some(reject_var_arg(arg, param, &value.checked, tc));
+    }
+
+    Some(finish_var_arg(arg, param, &value, tc))
 }
 
 fn finish_var_arg(
     arg: &ExprNode,
     param: &CallParam,
-    place: place::CheckedPlace,
+    value: &PlaceValue,
     tc: &mut TypeChecker,
 ) -> SourceArgCheck {
     if let Some(error) = collection_loan::mutable_collection_arg_error(
         &tc.active_collection_loans,
-        &place.value.identity,
-        &place.value.checked.ty,
+        &value.identity,
+        &value.checked.ty,
         &tc.handle_type(&param.ty),
         tc.error_span(arg.span),
     ) {
@@ -2036,14 +2064,17 @@ fn finish_var_arg(
             mutable_arg: None,
         };
     }
-    place::record_var_argument(arg.node.id, &place.value, tc);
-    let mutable_arg = Some(mutable_arg(arg.span, &place.value));
-    let checked = place.into_checked();
-    tc.reject_extern_any_escape(&checked, arg.span);
-    tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
+    place::record_var_argument(arg.node.id, value, tc);
+    tc.reject_extern_any_escape(&value.checked, arg.span);
+    tc.expect_assignable_expr(
+        arg.span,
+        arg.node.id,
+        value.checked.handle.clone(),
+        param.ty.clone(),
+    );
     SourceArgCheck {
         failed: tc.solve_constraints(),
-        mutable_arg,
+        mutable_arg: Some(mutable_arg(arg.span, value)),
     }
 }
 
