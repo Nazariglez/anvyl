@@ -669,7 +669,78 @@ fn validate_native_abi(
     if !return_abi_matches(&signature.signature.ret, &abi.ret) {
         return Err(native_abi_error(descriptor, key, "return ABI mismatch"));
     }
+    if abi.support == RustAbiSupport::Direct {
+        if signature
+            .signature
+            .params
+            .iter()
+            .any(param_contains_callback)
+            || type_contains_callback(&signature.signature.ret)
+        {
+            return Err(native_abi_error(
+                descriptor,
+                key,
+                "direct callback ABI is unsupported",
+            ));
+        }
+        if signature
+            .signature
+            .params
+            .iter()
+            .any(|param| param.flow == ParamFlow::MutBorrow && type_contains_collection(&param.ty))
+        {
+            return Err(native_abi_error(
+                descriptor,
+                key,
+                "direct mutable collection ABI is unsupported",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn param_contains_callback(param: &ExternParam) -> bool {
+    param.escape == CallbackEscape::Escaping || type_contains_callback(&param.ty)
+}
+
+fn type_contains_callback(ty: &ExternTypeExpr) -> bool {
+    match ty {
+        ExternTypeExpr::Callback(_) => true,
+        ExternTypeExpr::List(inner) | ExternTypeExpr::Option(inner) => {
+            type_contains_callback(inner)
+        }
+        ExternTypeExpr::Map(key, value) => {
+            type_contains_callback(key) || type_contains_callback(value)
+        }
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::String
+        | ExternTypeExpr::Any
+        | ExternTypeExpr::Named { .. } => false,
+    }
+}
+
+fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
+    match ty {
+        ExternTypeExpr::List(_) | ExternTypeExpr::Map(_, _) => true,
+        ExternTypeExpr::Option(inner) => type_contains_collection(inner),
+        ExternTypeExpr::Callback(callback) => {
+            callback
+                .params
+                .iter()
+                .any(|param| type_contains_collection(&param.ty))
+                || type_contains_collection(&callback.ret)
+        }
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::String
+        | ExternTypeExpr::Any
+        | ExternTypeExpr::Named { .. } => false,
+    }
 }
 
 fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
@@ -763,6 +834,116 @@ mod tests {
         assert!(error.contains("parameter 0 ABI mismatch"));
     }
 
+    #[test]
+    fn rejects_direct_mutable_collection_abi() {
+        let descriptor = descriptor_with_param(
+            "filter",
+            ExternParam {
+                name: Some("xs".to_string()),
+                ty: ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
+                flow: ParamFlow::MutBorrow,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Void,
+        );
+        let mut binding = binding("filter");
+        binding.abi.params = vec![RustParamAbi::MutBorrow(ExternTypeExpr::List(Box::new(
+            ExternTypeExpr::Int,
+        )))];
+        binding.abi.ret = RustReturnAbi::Void;
+
+        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
+
+        assert!(error.contains("direct mutable collection ABI is unsupported"));
+    }
+
+    #[test]
+    fn rejects_direct_mutable_map_abi() {
+        let map = ExternTypeExpr::Map(
+            Box::new(ExternTypeExpr::String),
+            Box::new(ExternTypeExpr::Int),
+        );
+        let descriptor = descriptor_with_param(
+            "filter_map",
+            ExternParam {
+                name: Some("map".to_string()),
+                ty: map.clone(),
+                flow: ParamFlow::MutBorrow,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Void,
+        );
+        let mut binding = binding("filter_map");
+        binding.abi.params = vec![RustParamAbi::MutBorrow(map)];
+        binding.abi.ret = RustReturnAbi::Void;
+
+        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
+
+        assert!(error.contains("direct mutable collection ABI is unsupported"));
+    }
+
+    #[test]
+    fn rejects_direct_callback_abi() {
+        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+            params: vec![],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        });
+        let descriptor = descriptor_with_param(
+            "with_callback",
+            ExternParam {
+                name: Some("cb".to_string()),
+                ty: callback.clone(),
+                flow: ParamFlow::Value,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Void,
+        );
+        let mut binding = binding("with_callback");
+        binding.abi.params = vec![RustParamAbi::Value(callback)];
+        binding.abi.ret = RustReturnAbi::Void;
+
+        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
+
+        assert!(error.contains("direct callback ABI is unsupported"));
+    }
+
+    #[test]
+    fn rejects_nested_direct_callback_abi() {
+        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+            params: vec![ExternCallbackParam {
+                ty: ExternTypeExpr::Int,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        });
+        let nested = ExternTypeExpr::List(Box::new(callback.clone()));
+        let descriptor = descriptor_with_param(
+            "with_callbacks",
+            ExternParam {
+                name: Some("callbacks".to_string()),
+                ty: nested.clone(),
+                flow: ParamFlow::Value,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Void,
+        );
+        let mut binding = binding("with_callbacks");
+        binding.abi.params = vec![RustParamAbi::Value(nested)];
+        binding.abi.ret = RustReturnAbi::Void;
+
+        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
+
+        assert!(error.contains("direct callback ABI is unsupported"));
+    }
+
     fn provider() -> ProviderId {
         ProviderId {
             name: "test".to_string(),
@@ -776,22 +957,34 @@ mod tests {
     }
 
     fn descriptor() -> ProviderDescriptor {
+        descriptor_with_param(
+            "ping",
+            ExternParam {
+                name: Some("n".to_string()),
+                ty: ExternTypeExpr::Int,
+                flow: ParamFlow::Value,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Bool,
+        )
+    }
+
+    fn descriptor_with_param(
+        name: &str,
+        param: ExternParam,
+        ret: ExternTypeExpr,
+    ) -> ProviderDescriptor {
         ProviderDescriptor {
             provider: provider(),
             modules: vec![ExternModuleDescriptor {
                 path: module(),
                 types: vec![],
                 functions: vec![ExternFunctionDescriptor {
-                    name: "ping".to_string(),
+                    name: name.to_string(),
                     doc: None,
                     signature: ExternSignature {
-                        params: vec![ExternParam {
-                            name: Some("n".to_string()),
-                            ty: ExternTypeExpr::Int,
-                            flow: ParamFlow::Value,
-                            escape: CallbackEscape::NonEscaping,
-                        }],
-                        ret: ExternTypeExpr::Bool,
+                        params: vec![param],
+                        ret,
                     },
                     effects: ExternEffects::default(),
                 }],

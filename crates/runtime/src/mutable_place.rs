@@ -1,8 +1,8 @@
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
-    AccessError, Ctx, ErasedHandle, Handle, LambdaCell, RuntimeError, StackLambdaCell,
-    lambda_cell::CellBorrowFlag,
+    AccessError, AnvList, AnvSlice, Ctx, ErasedHandle, Handle, LambdaCell, RuntimeError,
+    StackLambdaCell, lambda_cell::CellBorrowFlag,
 };
 
 pub enum MutPlace<'place, 'cx, T> {
@@ -108,6 +108,104 @@ impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
         })?;
         Ok(out.expect("dataref place mutation did not invoke callback"))
     }
+}
+
+impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<T>> {
+    pub fn slice_view(
+        &self,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    ) -> Result<AnvSlice<T>, RuntimeError> {
+        match self {
+            Self::Local(list, _) => {
+                let range = crate::checked_range(start, end, inclusive, list.len());
+                let guard = list.begin_shape_loan()?;
+                Ok(unsafe {
+                    AnvSlice::from_list(
+                        std::ptr::from_ref(&**list),
+                        range.start,
+                        range.len(),
+                        guard,
+                    )
+                })
+            }
+            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+                Err(non_local_slice_view_error())
+            }
+        }
+    }
+
+    pub fn slice_view_mut(
+        &mut self,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    ) -> Result<AnvSlice<T>, RuntimeError> {
+        match self {
+            Self::Local(list, _) => {
+                let range = crate::checked_range(start, end, inclusive, list.len());
+                let guard = list.begin_shape_loan()?;
+                Ok(unsafe {
+                    AnvSlice::from_list_mut(
+                        std::ptr::from_mut(&mut **list),
+                        range.start,
+                        range.len(),
+                        guard,
+                    )
+                })
+            }
+            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+                Err(non_local_slice_view_error())
+            }
+        }
+    }
+}
+
+impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
+    pub fn slice_view(
+        &self,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    ) -> Result<AnvSlice<T>, RuntimeError> {
+        match self {
+            Self::Local(array, _) => {
+                let range = crate::checked_range(start, end, inclusive, N);
+                Ok(
+                    unsafe {
+                        AnvSlice::from_raw_parts(array.as_ptr(), N, range.start, range.len())
+                    },
+                )
+            }
+            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+                Err(non_local_slice_view_error())
+            }
+        }
+    }
+
+    pub fn slice_view_mut(
+        &mut self,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+    ) -> Result<AnvSlice<T>, RuntimeError> {
+        match self {
+            Self::Local(array, _) => {
+                let range = crate::checked_range(start, end, inclusive, N);
+                Ok(unsafe {
+                    AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
+                })
+            }
+            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+                Err(non_local_slice_view_error())
+            }
+        }
+    }
+}
+
+fn non_local_slice_view_error() -> RuntimeError {
+    RuntimeError::new("slice view over non-local mutable collection parameter is unsupported")
 }
 
 impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
@@ -366,7 +464,7 @@ mod tests {
 
         place
             .mutate(&mut ctx, |list| {
-                list.push(2);
+                list.push(2)?;
                 Ok(())
             })
             .unwrap();

@@ -1,10 +1,13 @@
 pub extend<T> [T] {
     fn push(var self, value: T) { }
     fn for_each(var self, f: fn(var T) -> void) { }
-    fn sort_by(var self, compare: fn(T, T) -> bool) { }
+    fn retain(var self, f: fn(T) -> bool) { }
+    fn remove_where(var self, f: fn(T) -> bool) { }
 }
 
 pub extend<K, V> [K: V] {
     fn insert(var self, key: K, value: V) { }
     fn remove(var self, key: K) -> V? { nil }
+    fn retain(var self, f: fn(K, V) -> bool) { }
+    fn remove_where(var self, f: fn(K, V) -> bool) { }
 }

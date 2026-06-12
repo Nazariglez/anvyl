@@ -1,0 +1,35 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// a
+// 1
+// c
+// 3
+// a
+// 1
+// 99
+// @match-end
+
+fn main() {
+    var m: [string: int] = ["b": 2, "a": 1, "c": 3];
+    m.retain(|k, v| v != 2);
+    for k, v in m {
+        println(k);
+        println(v);
+    }
+
+    m.remove_where(|k, v| v == 3);
+    for k, v in m {
+        println(k);
+        println(v);
+    }
+
+    var removed: [string: int] = ["x": 1, "y": 2];
+    removed.remove_where(|k, v| true);
+    println(99);
+    for k, v in removed {
+        println(k);
+        println(v);
+    }
+}

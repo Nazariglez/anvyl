@@ -38,21 +38,22 @@ use self::{
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
-        RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage, RirConst,
-        RirConstId, RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum,
-        RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId,
-        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
-        RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand,
-        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage,
+        RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirConst, RirConstId,
+        RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId,
+        RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind,
+        RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign,
+        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -1769,7 +1770,12 @@ impl<'a> PlanCx<'a> {
     ) -> Result<Vec<RirStmt>, RustPlanError> {
         match stmt {
             air::AirStmt::Init { local, value } => {
-                let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let mut planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                if locals[local.index()].mutable
+                    && let RirRValue::SliceView { mutable, .. } = &mut planned.value
+                {
+                    *mutable = true;
+                }
                 let known = self.known_lambda_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Init {
@@ -1901,12 +1907,32 @@ impl<'a> PlanCx<'a> {
                     body,
                 })])
             }
-            air::AirStmt::CollectionLoan(_) | air::AirStmt::CollectionSlotScope(_) => {
-                Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedCollectionLoan,
-                ))
+            air::AirStmt::CollectionLoan(loan) => {
+                let body = self.plan_air_block(
+                    function,
+                    &loan.body,
+                    locals,
+                    lambda_values,
+                    initialized_cells,
+                    possible_cells,
+                    in_loop,
+                )?;
+                Ok(vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                    root: self.plan_place_in_function(function, &loan.root),
+                    root_kind: rir_collection_root_kind(loan.root_kind),
+                    mode: rir_collection_loan_mode(loan.mode),
+                    body,
+                })])
             }
+            air::AirStmt::CollectionSlotScope(scope) => self.plan_collection_slot_scope(
+                function,
+                scope,
+                locals,
+                lambda_values,
+                initialized_cells,
+                possible_cells,
+                in_loop,
+            ),
             air::AirStmt::EnumMatch(match_) => {
                 let discr = self.lower_place_read(function, &match_.discr, locals);
                 let RirOperand::Place(discr_place) = discr.operand else {
@@ -2257,12 +2283,20 @@ impl<'a> PlanCx<'a> {
                     },
                 }
             }
-            RValue::SliceView { .. } => {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedSliceView,
-                ));
-            }
+            RValue::SliceView {
+                source,
+                start,
+                end,
+                inclusive,
+                ty,
+            } => PlannedRValue::from_value(RirRValue::SliceView {
+                source: self.plan_place_in_function(function, source),
+                start: RirLocalId::from_index(start.index()),
+                end: RirLocalId::from_index(end.index()),
+                inclusive: *inclusive,
+                mutable: false,
+                ty: self.type_map[ty],
+            }),
             RValue::ListSlice {
                 source,
                 start,
@@ -2364,7 +2398,14 @@ impl<'a> PlanCx<'a> {
                     ty: self.type_map[ty],
                 })
             }
-            RValue::ListPop { .. } | RValue::MapEntryAt { .. } => {
+            RValue::MapEntryAt { map, index, ty } => {
+                PlannedRValue::from_value(RirRValue::MapEntryAt {
+                    map: self.plan_place_in_function(function, map),
+                    index: RirLocalId::from_index(index.index()),
+                    ty: self.type_map[ty],
+                })
+            }
+            RValue::ListPop { .. } => {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::UnsupportedRValue,
@@ -2690,6 +2731,296 @@ impl<'a> PlanCx<'a> {
                 ty,
             },
         })
+    }
+
+    fn plan_collection_slot_scope(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
+    ) -> Result<Vec<RirStmt>, RustPlanError> {
+        let body = self.plan_air_block(
+            function,
+            &scope.body,
+            locals,
+            lambda_values,
+            initialized_cells,
+            possible_cells,
+            in_loop,
+        )?;
+        let (body, _) = self.collection_slot_block(function, scope, body, true)?;
+        Ok(vec![RirStmt::CollectionSlotScope(body)])
+    }
+
+    fn collection_slot_block(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        mut body: RirStructuredBlock,
+        init: bool,
+    ) -> Result<(RirStructuredBlock, bool), RustPlanError> {
+        let mut stmts = if init {
+            self.collection_slot_reads(function, scope, true)
+        } else {
+            vec![]
+        };
+        let mut first = init;
+        let mut block_updates_slot = false;
+        for stmt in std::mem::take(&mut body.stmts) {
+            if first {
+                first = false;
+            } else {
+                stmts.extend(self.collection_slot_reads(function, scope, false));
+            }
+            let (stmt, stmt_updates_slot) = self.collection_slot_stmt(function, scope, stmt)?;
+            block_updates_slot |= stmt_updates_slot;
+            stmts.push(stmt);
+            if stmt_updates_slot {
+                stmts.extend(self.collection_slot_writes(function, scope));
+            }
+        }
+        body.stmts = stmts;
+        Ok((body, block_updates_slot))
+    }
+
+    fn collection_slot_stmt(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        stmt: RirStmt,
+    ) -> Result<(RirStmt, bool), RustPlanError> {
+        Ok(match stmt {
+            RirStmt::If(mut branch) => {
+                let (then_block, mut updates_slot) =
+                    self.collection_slot_block(function, scope, branch.then_block, false)?;
+                branch.then_block = then_block;
+                if let Some(block) = branch.else_block {
+                    let (block, else_updates_slot) =
+                        self.collection_slot_block(function, scope, block, false)?;
+                    updates_slot |= else_updates_slot;
+                    branch.else_block = Some(block);
+                }
+                (RirStmt::If(branch), updates_slot)
+            }
+            RirStmt::Loop(mut loop_) => {
+                let (body, updates_slot) =
+                    self.collection_slot_block(function, scope, loop_.body, false)?;
+                loop_.body = body;
+                (RirStmt::Loop(loop_), updates_slot)
+            }
+            RirStmt::CollectionLoanScope(mut loan) => {
+                let (body, updates_slot) =
+                    self.collection_slot_block(function, scope, loan.body, false)?;
+                loan.body = body;
+                (RirStmt::CollectionLoanScope(loan), updates_slot)
+            }
+            RirStmt::CollectionSlotScope(block) => {
+                let (block, updates_slot) =
+                    self.collection_slot_block(function, scope, block, false)?;
+                (RirStmt::CollectionSlotScope(block), updates_slot)
+            }
+            RirStmt::EnumMatch(mut match_) => {
+                let mut updates_slot = false;
+                for arm in &mut match_.arms {
+                    let (block, arm_updates_slot) = self.collection_slot_block(
+                        function,
+                        scope,
+                        std::mem::take(&mut arm.block),
+                        false,
+                    )?;
+                    updates_slot |= arm_updates_slot;
+                    arm.block = block;
+                }
+                if let Some(block) = match_.else_block {
+                    let (block, else_updates_slot) =
+                        self.collection_slot_block(function, scope, block, false)?;
+                    updates_slot |= else_updates_slot;
+                    match_.else_block = Some(block);
+                }
+                (RirStmt::EnumMatch(match_), updates_slot)
+            }
+            RirStmt::OptionMatch(mut match_) => {
+                let (some_block, some_updates_slot) =
+                    self.collection_slot_block(function, scope, match_.some_block, false)?;
+                let (none_block, none_updates_slot) =
+                    self.collection_slot_block(function, scope, match_.none_block, false)?;
+                match_.some_block = some_block;
+                match_.none_block = none_block;
+                (
+                    RirStmt::OptionMatch(match_),
+                    some_updates_slot || none_updates_slot,
+                )
+            }
+            stmt => {
+                let updates_slot = self.direct_stmt_updates_collection_slot(scope, &stmt);
+                (stmt, updates_slot)
+            }
+        })
+    }
+
+    fn direct_stmt_updates_collection_slot(
+        &self,
+        scope: &air::AirCollectionSlotScope,
+        stmt: &RirStmt,
+    ) -> bool {
+        match stmt {
+            RirStmt::Assign { dst, .. } => self.place_is_collection_slot(scope, dst),
+            RirStmt::Eval(value)
+            | RirStmt::Init { value, .. }
+            | RirStmt::CellInit { value, .. }
+            | RirStmt::CellSet { value, .. }
+            | RirStmt::ScopedPlaceCellSet { value, .. } => {
+                self.rvalue_updates_collection_slot(scope, value)
+            }
+            _ => false,
+        }
+    }
+
+    fn rvalue_updates_collection_slot(
+        &self,
+        scope: &air::AirCollectionSlotScope,
+        value: &RirRValue,
+    ) -> bool {
+        match value {
+            RirRValue::Call { args, .. } => args
+                .iter()
+                .any(|arg| self.call_arg_updates_collection_slot(scope, arg)),
+            _ => false,
+        }
+    }
+
+    fn call_arg_updates_collection_slot(
+        &self,
+        scope: &air::AirCollectionSlotScope,
+        arg: &RirCallArg,
+    ) -> bool {
+        match arg {
+            RirCallArg::MutBorrow(place) => self.place_is_collection_slot(scope, place),
+            RirCallArg::MutPlace(RirMutPlaceArg::Local(place)) => {
+                self.place_is_collection_slot(scope, place)
+            }
+            _ => false,
+        }
+    }
+
+    fn place_is_collection_slot(
+        &self,
+        scope: &air::AirCollectionSlotScope,
+        place: &RirPlace,
+    ) -> bool {
+        scope
+            .slots
+            .iter()
+            .any(|slot| RirLocalId::from_index(slot.local.index()) == place.local)
+    }
+
+    fn collection_slot_reads(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        init: bool,
+    ) -> Vec<RirStmt> {
+        scope
+            .slots
+            .iter()
+            .map(|slot| {
+                let local = RirLocalId::from_index(slot.local.index());
+                let value = self.collection_slot_read(function, scope, slot);
+                if init {
+                    RirStmt::Init { local, value }
+                } else {
+                    RirStmt::Assign {
+                        dst: RirPlace {
+                            local,
+                            projections: vec![],
+                            ty: self.type_map[&slot.ty],
+                        },
+                        value,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn collection_slot_writes(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+    ) -> Vec<RirStmt> {
+        scope
+            .slots
+            .iter()
+            .filter(|slot| slot.mutable)
+            .map(|slot| self.collection_slot_write(function, scope, slot))
+            .collect()
+    }
+
+    fn collection_slot_read(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        slot: &air::AirCollectionSlot,
+    ) -> RirRValue {
+        match slot.kind {
+            air::AirCollectionSlotKind::SequenceElement => RirRValue::Use(RirOperand::Place(
+                self.collection_slot_place(function, scope, slot),
+            )),
+            air::AirCollectionSlotKind::MapValue => RirRValue::MapValueAt {
+                map: self.plan_place_in_function(function, &scope.root),
+                index: RirLocalId::from_index(scope.index.index()),
+                ty: self.type_map[&slot.ty],
+            },
+        }
+    }
+
+    fn collection_slot_write(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        slot: &air::AirCollectionSlot,
+    ) -> RirStmt {
+        let local = RirLocalId::from_index(slot.local.index());
+        let value = RirOperand::Place(RirPlace {
+            local,
+            projections: vec![],
+            ty: self.type_map[&slot.ty],
+        });
+        match slot.kind {
+            air::AirCollectionSlotKind::SequenceElement => RirStmt::Assign {
+                dst: self.collection_slot_place(function, scope, slot),
+                value: RirRValue::Use(value),
+            },
+            air::AirCollectionSlotKind::MapValue => RirStmt::MapValueSet {
+                map: self.plan_place_in_function(function, &scope.root),
+                index: RirLocalId::from_index(scope.index.index()),
+                value,
+            },
+        }
+    }
+
+    fn collection_slot_place(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        slot: &air::AirCollectionSlot,
+    ) -> RirPlace {
+        match slot.kind {
+            air::AirCollectionSlotKind::SequenceElement => {
+                let mut place = self.plan_place_in_function(function, &scope.root);
+                place
+                    .projections
+                    .push(RirProjection::Index(RirLocalId::from_index(
+                        scope.index.index(),
+                    )));
+                place.ty = self.type_map[&slot.ty];
+                place
+            }
+            air::AirCollectionSlotKind::MapValue => unreachable!("map value slots are not places"),
+        }
     }
 
     fn place_is_source_mut_place_param(&self, function: FunctionId, place: &Place) -> bool {
@@ -3479,6 +3810,26 @@ fn rir_param_escape(escape: ParamEscape) -> RirParamEscape {
     match escape {
         ParamEscape::NonEscaping => RirParamEscape::NonEscaping,
         ParamEscape::Escaping => RirParamEscape::Escaping,
+    }
+}
+
+fn rir_collection_root_kind(kind: air::AirCollectionRootKind) -> RirCollectionRootKind {
+    match kind {
+        air::AirCollectionRootKind::List => RirCollectionRootKind::List,
+        air::AirCollectionRootKind::FixedArray => RirCollectionRootKind::FixedArray,
+        air::AirCollectionRootKind::Slice => RirCollectionRootKind::Slice,
+        air::AirCollectionRootKind::Map => RirCollectionRootKind::Map,
+    }
+}
+
+fn rir_collection_loan_mode(mode: air::AirCollectionLoanMode) -> RirCollectionLoanMode {
+    match mode {
+        air::AirCollectionLoanMode::ReadonlySequence => RirCollectionLoanMode::ReadonlySequence,
+        air::AirCollectionLoanMode::MutableSequenceElement => {
+            RirCollectionLoanMode::MutableSequenceElement
+        }
+        air::AirCollectionLoanMode::ReadonlyMap => RirCollectionLoanMode::ReadonlyMap,
+        air::AirCollectionLoanMode::MutableMapValue => RirCollectionLoanMode::MutableMapValue,
     }
 }
 

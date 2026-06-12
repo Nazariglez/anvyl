@@ -32,7 +32,6 @@ pub(super) struct EnumVariantDef {
 pub(super) struct EnumDef {
     pub(super) defining_module: Option<ModulePath>,
     pub type_params: Vec<TypeParam>,
-    pub const_params: Vec<ConstParam>,
     pub variants: Vec<EnumVariantDef>,
     pub annotations: AppliedAnnotations,
 }
@@ -52,7 +51,6 @@ impl EnumDef {
         Self {
             defining_module: None,
             type_params: decl.type_params.clone(),
-            const_params: decl.const_params.clone(),
             variants,
             annotations: AppliedAnnotations::default(),
         }

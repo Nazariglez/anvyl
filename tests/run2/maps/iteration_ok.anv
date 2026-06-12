@@ -1,0 +1,38 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// a
+// b
+// c
+// 12
+// 0
+// 20
+// @match-end
+
+fn sum_values(map: [string: int]) -> int {
+    var sum = 0;
+    for key, value in map {
+        sum += value;
+    }
+    sum
+}
+
+fn main() {
+    let map = ["a": 1, "b": 2, "c": 9];
+    for key, value in map {
+        println(key);
+    }
+    println(sum_values(map));
+
+    let empty: [string: int] = [:];
+    println(sum_values(empty));
+
+    var nested = 0;
+    for key1, value1 in ["x": 1, "y": 2] {
+        for key2, value2 in ["a": 3, "b": 4] {
+            nested += value1 + value2;
+        }
+    }
+    println(nested);
+}

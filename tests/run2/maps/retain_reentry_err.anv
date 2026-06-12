@@ -1,0 +1,13 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @skip: callback capture shape currently reaches frontend/AIR lambda capture gaps before runtime reentry check
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+fn main() {
+    var m: [string: int] = ["a": 1, "b": 2];
+    m.retain(|key, value| {
+        m.insert("c", 3);
+        true
+    });
+}

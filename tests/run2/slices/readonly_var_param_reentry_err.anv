@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+fn mutate(xs: slice[int], var owner: [int]) {
+    owner.push(4);
+    println(xs[0]);
+}
+
+fn wrapper(var xs: [int]) {
+    mutate(xs, xs);
+}
+
+fn main() {
+    var list: [int] = [1, 2, 3];
+    wrapper(list);
+}

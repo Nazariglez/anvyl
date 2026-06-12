@@ -1,4 +1,5 @@
 mod check;
+pub mod collection;
 
 pub mod ctx;
 pub mod cycle_collector;
@@ -19,6 +20,7 @@ pub use anvyx_heap::{
 };
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
 pub use check::{checked_index, checked_range};
+pub use collection::{CollectionLoanState, ShapeLoanGuard};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;
@@ -47,4 +49,4 @@ pub use provider::{
 pub use type_registry::{
     get_type_entry, is_cycle_capable, register_child_traverser, register_cycle_capable,
 };
-pub use value::{AnvList, AnvMap, AnvString};
+pub use value::{AnvList, AnvMap, AnvSlice, AnvString};

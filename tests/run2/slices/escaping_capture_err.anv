@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @skip: escaping slice capture currently reaches backend lambda capture gap before frontend escape diagnostic
+// @contains: cannot capture borrowed parameter 'xs' in an escaping lambda
+
+fn hold(xs: slice[int]) -> fn() -> int {
+    || xs[0]
+}
+
+fn main() {
+    var list: [int] = [1, 2];
+    let f = hold(list);
+    println(f());
+}

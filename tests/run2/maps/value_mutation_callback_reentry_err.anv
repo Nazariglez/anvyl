@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @skip: callback capture shape currently reaches frontend/AIR lambda capture gaps before runtime reentry check
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+fn apply(cb: fn()) {
+    cb();
+}
+
+fn main() {
+    var map = ["a": 1, "b": 2];
+    let cb = || { map["z"] = 9; };
+    for _, var value in map {
+        apply(cb);
+        value += 1;
+    }
+}

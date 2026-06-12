@@ -1,0 +1,46 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 9
+// 2
+// 8
+// 5
+// 7
+// 6
+// @match-end
+
+fn set_first(var xs: slice[int], value: int) {
+    xs[0] = value;
+}
+
+fn copy_second(var xs: slice[int]) {
+    xs[0] = xs[1];
+}
+
+fn wrapper(var xs: [int]) {
+    set_first(xs, 7);
+}
+
+fn array_wrapper(var xs: [int; 3]) {
+    set_first(xs, 6);
+}
+
+fn main() {
+    var list: [int] = [1, 2, 3];
+    set_first(list, 9);
+    println(list[0]);
+    copy_second(list);
+    println(list[0]);
+
+    var array = [4, 5, 6];
+    set_first(array, 8);
+    println(array[0]);
+    copy_second(array);
+    println(array[0]);
+
+    wrapper(list);
+    println(list[0]);
+    array_wrapper(array);
+    println(array[0]);
+}

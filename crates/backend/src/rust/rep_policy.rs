@@ -142,20 +142,29 @@ impl<'a> AirRustRepPolicy<'a> {
 
     fn shareable_value(self, ty: TypeId) -> bool {
         match self.program.type_arena.data(ty) {
-            TypeData::String | TypeData::DataRef(_) | TypeData::List(_) | TypeData::Map { .. } => {
-                true
-            }
-            TypeData::Optional(inner) => self.value_place_shareable(*inner),
-            TypeData::Tuple(elems) => elems.iter().all(|elem| self.value_place_shareable(*elem)),
+            TypeData::String
+            | TypeData::DataRef(_)
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::Slice(_) => true,
+            TypeData::Optional(inner) => self.embedded_air_shareable_value(*inner),
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.embedded_air_shareable_value(*elem)),
             TypeData::Aggregate(id) => self
                 .program
                 .aggregate(*id)
                 .fields
                 .iter()
-                .all(|field| self.value_place_shareable(field.ty)),
+                .all(|field| self.embedded_air_shareable_value(field.ty)),
             TypeData::Enum(id) => self.enum_shareable(*id),
             _ => false,
         }
+    }
+
+    fn embedded_air_shareable_value(self, ty: TypeId) -> bool {
+        !matches!(self.program.type_arena.data(ty), TypeData::Slice(_))
+            && self.value_place_shareable(ty)
     }
 
     fn variant_field_tys(variant: &air::VariantDecl) -> Box<dyn Iterator<Item = TypeId> + '_> {
@@ -174,12 +183,12 @@ impl<'a> AirRustRepPolicy<'a> {
                 VariantShape::Struct(fields) => {
                     return fields
                         .iter()
-                        .all(|field| self.value_place_shareable(field.ty));
+                        .all(|field| self.embedded_air_shareable_value(field.ty));
                 }
             };
             fields
                 .iter()
-                .all(|field| self.value_place_shareable(*field))
+                .all(|field| self.embedded_air_shareable_value(*field))
         })
     }
 
@@ -232,9 +241,10 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Extern(_)
                 | TypeData::Array { .. }
                 | TypeData::List(_)
-                | TypeData::Map { .. } => true,
+                | TypeData::Map { .. }
+                | TypeData::Slice(_) => true,
                 TypeData::Function(_) => true,
-                TypeData::Any | TypeData::Slice(_) | TypeData::Dyn(_) => false,
+                TypeData::Any | TypeData::Dyn(_) => false,
             },
             ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
@@ -246,13 +256,13 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Extern(_)
                 | TypeData::Array { .. }
                 | TypeData::List(_)
-                | TypeData::Map { .. } => true,
+                | TypeData::Map { .. }
+                | TypeData::Slice(_) => true,
                 TypeData::Int
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::Void
                 | TypeData::Any
-                | TypeData::Slice(_)
                 | TypeData::Function(_)
                 | TypeData::Dyn(_) => false,
             },
@@ -269,12 +279,9 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Extern(_)
                 | TypeData::Array { .. }
                 | TypeData::List(_)
-                | TypeData::Map { .. } => true,
-                TypeData::Void
-                | TypeData::Any
-                | TypeData::Slice(_)
-                | TypeData::Function(_)
-                | TypeData::Dyn(_) => false,
+                | TypeData::Map { .. }
+                | TypeData::Slice(_) => true,
+                TypeData::Void | TypeData::Any | TypeData::Function(_) | TypeData::Dyn(_) => false,
             },
         }
     }
@@ -341,21 +348,23 @@ impl<'a> RustRepPolicy<'a> {
     pub fn shareable_value(self, ty: RirTypeId) -> bool {
         self.copyable(ty)
             || match self.ty(ty) {
-                RirType::String | RirType::DataRef(_) | RirType::List(_) | RirType::Map { .. } => {
-                    true
-                }
+                RirType::String
+                | RirType::DataRef(_)
+                | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Slice(_) => true,
                 RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                    self.shareable_value(inner)
+                    self.embedded_shareable_value(inner)
                 }
                 RirType::Lambda(sig) => self.lambda_sig_cloneable(sig),
                 RirType::Struct(id) => self.program.structs[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.shareable_value(field.ty)),
+                    .all(|field| self.embedded_shareable_value(field.ty)),
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.shareable_value(field.ty)),
+                    .all(|field| self.embedded_shareable_value(field.ty)),
                 RirType::Enum(id) => {
                     self.program.enums[id.index()]
                         .variants
@@ -364,11 +373,15 @@ impl<'a> RustRepPolicy<'a> {
                             variant
                                 .fields
                                 .iter()
-                                .all(|field| self.shareable_value(field.ty))
+                                .all(|field| self.embedded_shareable_value(field.ty))
                         })
                 }
                 _ => false,
             }
+    }
+
+    fn embedded_shareable_value(self, ty: RirTypeId) -> bool {
+        !matches!(self.ty(ty), RirType::Slice(_)) && self.shareable_value(ty)
     }
 
     pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
@@ -408,7 +421,7 @@ impl<'a> RustRepPolicy<'a> {
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
         match self.ty(ty) {
             RirType::String => RustBorrowView::Str,
-            RirType::Slice(_) => RustBorrowView::Slice,
+            RirType::Slice(_) => RustBorrowView::Ref,
             RirType::Void => RustBorrowView::TargetGap,
             _ => RustBorrowView::Ref,
         }
@@ -614,7 +627,7 @@ impl<'a> RustRepPolicy<'a> {
                 target::anv_map_ty(self.rust_ty(key), self.rust_ty(value))
             }
             RirType::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
-            RirType::Slice(elem) => format!("&[{}]", self.rust_ty(elem)),
+            RirType::Slice(elem) => target::anv_slice_ty(self.rust_ty(elem)),
             RirType::Lambda(id) => self.lambda_sig_ty(id),
         }
     }
@@ -794,12 +807,12 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Array { .. }
                 | RirType::List(_)
                 | RirType::Map { .. }
+                | RirType::Slice(_)
                 | RirType::Lambda(_) => true,
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
                     .all(|field| self.supports_param(field.ty, semantic)),
-                RirType::Slice(_) => false,
             },
             RirParamSemantic::SharedBorrow => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
@@ -810,12 +823,12 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Enum(_)
                 | RirType::Array { .. }
                 | RirType::List(_)
-                | RirType::Map { .. } => true,
+                | RirType::Map { .. }
+                | RirType::Slice(_) => true,
                 RirType::Int
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Void
-                | RirType::Slice(_)
                 | RirType::Lambda(_) => false,
             },
             RirParamSemantic::MutBorrow => match ty {

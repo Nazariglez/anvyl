@@ -4,10 +4,11 @@ use super::{
     place::RustPlaces,
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
-        RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirEnum, RirEnumMatch, RirEnumRepr,
-        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLoop,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirCollectionLoanScope,
+        RirCollectionRootKind, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign,
+        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
+        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLocalId, RirLoop,
         RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic,
         RirPlace, RirProgram, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
         RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
@@ -51,6 +52,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
         trace_plan: RustTracePlan::build(program),
         fallible_functions: analysis::fallible_functions(program),
         w: RustWriter::default(),
+        collection_loans: vec![],
     };
     cx.emit_program();
     RustSource::new(cx.w.finish())
@@ -62,6 +64,12 @@ struct EmitCx<'a> {
     trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
     w: RustWriter,
+    collection_loans: Vec<ActiveCollectionLoan>,
+}
+
+struct ActiveCollectionLoan {
+    root: RirPlace,
+    version: String,
 }
 
 impl EmitCx<'_> {
@@ -818,6 +826,8 @@ impl EmitCx<'_> {
                     stmt,
                     RirStmt::If(_)
                         | RirStmt::Loop(_)
+                        | RirStmt::CollectionLoanScope(_)
+                        | RirStmt::CollectionSlotScope(_)
                         | RirStmt::EnumMatch(_)
                         | RirStmt::OptionMatch(_)
                 )
@@ -826,10 +836,7 @@ impl EmitCx<'_> {
                 this.emit_local_declarations(function);
             }
             this.emit_scoped_place_cells(function);
-            for stmt in &block.stmts {
-                this.emit_stmt_mode(function, stmt, predeclare);
-            }
-            this.emit_term(function, &block.term);
+            this.emit_structured_block(function, block, predeclare);
             if this.fallible_functions[function.id.index()]
                 && matches!(block.term, RirTerm::None)
                 && matches!(this.program.types[function.ret.ty.index()], RirType::Void)
@@ -937,12 +944,10 @@ impl EmitCx<'_> {
         match stmt {
             RirStmt::Init { local, value } => {
                 let local_data = &function.locals[local.index()];
+                let value = self.rvalue(function, value);
                 if predeclared {
-                    self.w.line(format_args!(
-                        "{} = {};",
-                        local_data.symbol.as_str(),
-                        self.rvalue(function, value)
-                    ));
+                    self.w
+                        .line(format_args!("{} = {value};", local_data.symbol.as_str()));
                 } else {
                     let mutability =
                         if local_data.mutable || self.local_needs_mut_binding(local_data.ty) {
@@ -951,26 +956,31 @@ impl EmitCx<'_> {
                             ""
                         };
                     self.w.line(format_args!(
-                        "let {mutability}{}: {} = {};",
+                        "let {mutability}{}: {} = {value};",
                         local_data.symbol.as_str(),
-                        self.ty(local_data.ty),
-                        self.rvalue(function, value)
+                        self.ty(local_data.ty)
                     ));
                 }
             }
             RirStmt::Assign { dst, value } => {
                 let places = RustPlaces::new(self.program, function);
-                if places.mut_place_root_param(dst) {
+                let dst_expr = places.local_place(dst);
+                let value = self.rvalue(function, value);
+                if let Some(access) = places.slice_index_access(dst) {
+                    self.w
+                        .line(format_args!("{};", self.slice_index_set(access, value)));
+                } else if places.mut_place_root_param(dst) {
                     self.w.line(format_args!(
                         "{};",
-                        self.mut_place_set(places.local_place(dst), self.rvalue(function, value))
+                        self.mut_place_set(dst.ty, dst_expr, value)
+                    ));
+                } else if self.collection_replace_ty(dst.ty) {
+                    self.w.line(format_args!(
+                        "{};",
+                        target::replace_collection(&dst_expr, &value)
                     ));
                 } else {
-                    self.w.line(format_args!(
-                        "{} = {};",
-                        places.local_place(dst),
-                        self.rvalue(function, value)
-                    ));
+                    self.w.line(format_args!("{dst_expr} = {value};"));
                 }
             }
             RirStmt::CellInit { cell, value } => {
@@ -986,16 +996,23 @@ impl EmitCx<'_> {
                     ));
                 }
             }
-            RirStmt::CellSet { cell, value } => self
-                .w
-                .line(format_args!("{};", self.cell_set(function, *cell, value))),
-            RirStmt::ScopedPlaceCellSet { cell, value } => self.w.line(format_args!(
-                "{};",
-                self.mut_place_set(
-                    self.scoped_place_cell_ref(function, *cell),
-                    self.rvalue(function, value)
-                )
-            )),
+            RirStmt::CellSet { cell, value } => {
+                let set = self.cell_set(function, *cell, value);
+                self.w.line(format_args!("{set};"));
+            }
+            RirStmt::ScopedPlaceCellSet { cell, value } => {
+                let ty = match *cell {
+                    RirScopedPlaceCellRef::Owner(cell)
+                    | RirScopedPlaceCellRef::Capture { cell, .. } => {
+                        self.program.scoped_place_cells[cell.index()].payload_ty
+                    }
+                };
+                let value = self.rvalue(function, value);
+                self.w.line(format_args!(
+                    "{};",
+                    self.mut_place_set(ty, self.scoped_place_cell_ref(function, *cell), value)
+                ));
+            }
             RirStmt::DataRefSet {
                 object,
                 dataref,
@@ -1005,12 +1022,22 @@ impl EmitCx<'_> {
                 "{};",
                 self.dataref_set(function, object, *dataref, projections, value)
             )),
+            RirStmt::MapValueSet { map, index, value } => self.w.line(format_args!(
+                "{};",
+                self.map_value_set(function, map, *index, value)
+            )),
             RirStmt::Eval(value) => {
-                self.w
-                    .line(format_args!("{};", self.rvalue(function, value)));
+                let value = self.rvalue(function, value);
+                self.w.line(format_args!("{value};"));
             }
             RirStmt::If(branch) => self.emit_if(function, branch, predeclared),
             RirStmt::Loop(loop_) => self.emit_loop(function, loop_, predeclared),
+            RirStmt::CollectionLoanScope(scope) => {
+                self.emit_collection_loan_scope(function, scope, predeclared);
+            }
+            RirStmt::CollectionSlotScope(block) => {
+                self.emit_lexical_block(function, block, predeclared);
+            }
             RirStmt::EnumMatch(match_) => self.emit_match(function, match_, predeclared),
             RirStmt::OptionMatch(match_) => {
                 self.emit_option_match(function, match_, predeclared);
@@ -1022,6 +1049,62 @@ impl EmitCx<'_> {
         self.w
             .line(format_args!("{}: loop {{", loop_label(loop_.id)));
         self.indented(|this| this.emit_structured_block(function, &loop_.body, predeclared));
+        self.w.line("}");
+    }
+
+    fn emit_lexical_block(
+        &mut self,
+        function: &RirFunction,
+        block: &RirStructuredBlock,
+        predeclared: bool,
+    ) {
+        self.w.line("{");
+        self.indented(|this| this.emit_structured_block(function, block, predeclared));
+        self.w.line("}");
+    }
+
+    fn emit_collection_loan_scope(
+        &mut self,
+        function: &RirFunction,
+        scope: &RirCollectionLoanScope,
+        predeclared: bool,
+    ) {
+        self.w.line("{");
+        self.indented(|this| {
+            let track = matches!(
+                scope.root_kind,
+                RirCollectionRootKind::List | RirCollectionRootKind::Map
+            );
+            if track {
+                let places = RustPlaces::new(this.program, function);
+                let depth = this.collection_loans.len();
+                let loan_var = format!("__anv_collection_loan_{depth}");
+                let version_var = format!("__anv_collection_version_{depth}");
+                let loan = if places.mut_place_root_param(&scope.root) {
+                    this.mut_place_region(
+                        function,
+                        &scope.root,
+                        "access",
+                        target::begin_shape_loan_region(),
+                    )
+                } else {
+                    target::begin_shape_loan(&places.local_place(&scope.root))
+                };
+                this.w.line(format_args!("let {loan_var} = {loan};"));
+                this.w.line(format_args!(
+                    "let {version_var} = {};",
+                    target::shape_loan_version(&loan_var)
+                ));
+                this.collection_loans.push(ActiveCollectionLoan {
+                    root: scope.root.clone(),
+                    version: version_var,
+                });
+            }
+            this.emit_structured_block(function, &scope.body, predeclared);
+            if track {
+                this.collection_loans.pop();
+            }
+        });
         self.w.line("}");
     }
 
@@ -1157,10 +1240,59 @@ impl EmitCx<'_> {
         block: &RirStructuredBlock,
         predeclared: bool,
     ) {
-        for stmt in &block.stmts {
+        for (index, stmt) in block.stmts.iter().enumerate() {
             self.emit_stmt_mode(function, stmt, predeclared);
+            for local in self.slice_call_arg_drops(&block.stmts, index) {
+                self.w.line(format_args!(
+                    "drop({});",
+                    function.locals[local.index()].symbol.as_str()
+                ));
+            }
         }
         self.emit_term(function, &block.term);
+    }
+
+    fn slice_call_arg_drops(&self, stmts: &[RirStmt], index: usize) -> Vec<RirLocalId> {
+        let Some(args) = stmt_call_args(&stmts[index]) else {
+            return vec![];
+        };
+        let mut drops = vec![];
+        for local in args.iter().filter_map(call_arg_root_local) {
+            self.collect_slice_arg_drops(stmts, index, local, &mut drops);
+        }
+        drops
+    }
+
+    fn collect_slice_arg_drops(
+        &self,
+        stmts: &[RirStmt],
+        index: usize,
+        local: RirLocalId,
+        drops: &mut Vec<RirLocalId>,
+    ) {
+        let Some(stmt) = stmts[..index]
+            .iter()
+            .rev()
+            .find(|stmt| matches!(stmt, RirStmt::Init { local: initialized, .. } if *initialized == local))
+        else {
+            return;
+        };
+        match stmt {
+            RirStmt::Init {
+                value: RirRValue::SliceView { .. },
+                ..
+            } => drops.push(local),
+            RirStmt::Init {
+                value: RirRValue::Use(RirOperand::Place(source)),
+                ..
+            } if source.projections.is_empty()
+                && matches!(self.program.types[source.ty.index()], RirType::Slice(_)) =>
+            {
+                drops.push(local);
+                self.collect_slice_arg_drops(stmts, index, source.local, drops);
+            }
+            _ => {}
+        }
     }
 
     fn emit_term(&mut self, function: &RirFunction, term: &RirTerm) {
@@ -1196,7 +1328,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn rvalue(&self, function: &RirFunction, value: &RirRValue) -> String {
+    fn rvalue(&mut self, function: &RirFunction, value: &RirRValue) -> String {
         let values = RustValues::new(self.program, function);
         let places = RustPlaces::new(self.program, function);
         match value {
@@ -1319,27 +1451,19 @@ impl EmitCx<'_> {
                     function,
                     list,
                     "mutate",
-                    format!("{{ value.push({}); Ok(()) }}", values.value_operand(value)),
+                    target::list_push_region(&values.value_operand(value)),
                 ),
-            RirRValue::ListPush { list, value } => format!(
-                "{}.push({})",
-                places.local_place(list),
-                values.value_operand(value)
-            ),
+            RirRValue::ListPush { list, value } => {
+                target::list_push(&places.local_place(list), &values.value_operand(value))
+            }
             RirRValue::SliceView {
                 source,
                 start,
                 end,
                 inclusive,
+                mutable,
                 ..
-            } => {
-                let source = places.local_place(source);
-                let start = function.locals[start.index()].symbol.as_str();
-                let end = function.locals[end.index()].symbol.as_str();
-                let range =
-                    target::checked_range(start, end, *inclusive, &format!("{source}.len()"));
-                format!("&{source}[{range}]")
-            }
+            } => self.slice_view(function, source, *start, *end, *inclusive, *mutable),
             RirRValue::ListSlice {
                 source,
                 start,
@@ -1371,18 +1495,19 @@ impl EmitCx<'_> {
                     function,
                     map,
                     "mutate",
-                    format!(
-                        "{{ value.insert({}, {}); Ok(()) }}",
-                        values.value_operand(key),
-                        values.value_operand(value)
+                    target::map_insert_region(
+                        &values.value_operand(key),
+                        &values.value_operand(value),
                     ),
                 ),
             RirRValue::MapInsert { map, key, value } => block_expr(
                 [format!(
-                    "{}.insert({}, {});",
-                    places.local_place(map),
-                    values.value_operand(key),
-                    values.value_operand(value)
+                    "{};",
+                    target::map_insert(
+                        &places.local_place(map),
+                        &values.value_operand(key),
+                        &values.value_operand(value)
+                    )
                 )],
                 None,
             ),
@@ -1391,14 +1516,16 @@ impl EmitCx<'_> {
                     function,
                     map,
                     "mutate",
-                    format!("Ok(value.remove(&{}))", values.operand(key)),
+                    target::map_remove_region(&values.operand(key)),
                 ),
             RirRValue::MapRemove { map, key, .. } => {
-                format!(
-                    "{}.remove(&{})",
-                    places.local_place(map),
-                    values.operand(key)
-                )
+                target::map_remove(&places.local_place(map), &values.operand(key))
+            }
+            RirRValue::MapEntryAt { map, index, ty } => {
+                self.map_entry_at(function, map, *index, *ty)
+            }
+            RirRValue::MapValueAt { map, index, ty } => {
+                self.map_value_at(function, map, *index, *ty)
             }
             RirRValue::Lambda {
                 lambda, captures, ..
@@ -1451,8 +1578,203 @@ impl EmitCx<'_> {
         }
     }
 
-    fn mut_place_set(&self, place: String, value: String) -> String {
-        target::mut_place_set(&place, &target::ctx_runtime("ctx"), &value)
+    fn mut_place_set(&self, ty: RirTypeId, place: String, value: String) -> String {
+        if self.collection_replace_ty(ty) {
+            target::mut_place_replace_collection(&place, &target::ctx_runtime("ctx"), &value)
+        } else {
+            target::mut_place_set(&place, &target::ctx_runtime("ctx"), &value)
+        }
+    }
+
+    fn slice_index_set(&self, access: super::place::SliceIndexAccess, value: String) -> String {
+        let set = match (access.root_is_mut_place, access.list_root) {
+            (true, true) => {
+                let checked = target::checked_index(&access.index, "value.len()");
+                let version = target::collection_structural_version("value");
+                let update = target::list_with_elem_mut_short(
+                    "value",
+                    "index",
+                    "version",
+                    "*value = __anv_slice_value; Ok(())",
+                );
+                target::mut_place_region(
+                    &access.root,
+                    "mutate",
+                    &target::ctx_runtime("ctx"),
+                    &format!("{{ let index = {checked}; let version = {version}; {update} }}"),
+                )
+            }
+            (true, false) => target::mut_place_region(
+                &access.root,
+                "mutate",
+                &target::ctx_runtime("ctx"),
+                &target::slice_with_elem_mut_short(
+                    "value",
+                    &access.index,
+                    "*value = __anv_slice_value; Ok(())",
+                ),
+            ),
+            (false, true) => {
+                let checked =
+                    target::checked_index(&access.index, &format!("{}.len()", access.slice));
+                let version = target::collection_structural_version(&access.slice);
+                let update = target::list_with_elem_mut_short(
+                    &access.slice,
+                    "index",
+                    "version",
+                    "*value = __anv_slice_value; Ok(())",
+                );
+                format!("{{ let index = {checked}; let version = {version}; {update}?; }}")
+            }
+            (false, false) => format!(
+                "{}?",
+                target::slice_with_elem_mut_short(
+                    &access.slice,
+                    &access.index,
+                    "*value = __anv_slice_value; Ok(())",
+                )
+            ),
+        };
+        format!("{{ let __anv_slice_value = {value}; {set}; }}")
+    }
+
+    fn map_value_set(
+        &self,
+        function: &RirFunction,
+        map: &RirPlace,
+        index: RirLocalId,
+        value: &RirOperand,
+    ) -> String {
+        let value = RustValues::new(self.program, function).value_operand(value);
+        let set = self.map_index_update(function, map, index, |map, version| {
+            target::map_with_value_mut_short(
+                map,
+                "index",
+                version,
+                "*value = __anv_map_value; Ok(())",
+            )
+        });
+        format!("{{ let __anv_map_value = {value}; {set}; }}")
+    }
+
+    fn map_value_at(
+        &self,
+        function: &RirFunction,
+        map: &RirPlace,
+        index: RirLocalId,
+        _ty: RirTypeId,
+    ) -> String {
+        self.map_index_read(function, map, index, |map, version| {
+            target::map_value_at_shared(map, "index", version)
+        })
+    }
+
+    fn map_entry_at(
+        &self,
+        function: &RirFunction,
+        map: &RirPlace,
+        index: RirLocalId,
+        ty: RirTypeId,
+    ) -> String {
+        let tuple = match self.program.types[ty.index()] {
+            RirType::Tuple(id) => &self.program.tuples[id.index()],
+            _ => unreachable!("verified map entry tuple"),
+        };
+        self.map_index_read(function, map, index, |map, version| {
+            let key = target::map_key_at_shared(map, "index", version);
+            let value = target::map_value_at_shared(map, "index", version);
+            self.map_entry_tuple(tuple, &key, &value)
+        })
+    }
+
+    fn map_index_read(
+        &self,
+        function: &RirFunction,
+        map: &RirPlace,
+        index: RirLocalId,
+        value: impl FnOnce(&str, &str) -> String,
+    ) -> String {
+        let places = RustPlaces::new(self.program, function);
+        let index = function.locals[index.index()].symbol.as_str();
+        if places.mut_place_root_param(map) {
+            let checked = target::checked_index(index, "value.len()");
+            let version =
+                self.collection_version(map, target::collection_structural_version("value"));
+            return self.mut_place_region(
+                function,
+                map,
+                "access",
+                format!(
+                    "Ok({{ let index = {checked}; {} }})",
+                    value("value", &version)
+                ),
+            );
+        }
+
+        let map_expr = places.local_place(map);
+        let checked = target::checked_index(index, &format!("{map_expr}.len()"));
+        let version =
+            self.collection_version(map, target::collection_structural_version(&map_expr));
+        block_expr(
+            [format!("let index = {checked};")],
+            Some(value(&map_expr, &version)),
+        )
+    }
+
+    fn map_index_update(
+        &self,
+        function: &RirFunction,
+        map: &RirPlace,
+        index: RirLocalId,
+        update: impl FnOnce(&str, &str) -> String,
+    ) -> String {
+        let places = RustPlaces::new(self.program, function);
+        let index = function.locals[index.index()].symbol.as_str();
+        if places.mut_place_root_param(map) {
+            let checked = target::checked_index(index, "value.len()");
+            let version =
+                self.collection_version(map, target::collection_structural_version("value"));
+            return self.mut_place_region(
+                function,
+                map,
+                "mutate",
+                format!("{{ let index = {checked}; {} }}", update("value", &version)),
+            );
+        }
+
+        let map_expr = places.local_place(map);
+        let checked = target::checked_index(index, &format!("{map_expr}.len()"));
+        let version =
+            self.collection_version(map, target::collection_structural_version(&map_expr));
+        format!(
+            "{{ let index = {checked}; {}?; }}",
+            update(&map_expr, &version)
+        )
+    }
+
+    fn map_entry_tuple(&self, tuple: &super::rir::RirTuple, key: &str, value: &str) -> String {
+        struct_lit(
+            tuple.symbol.as_str(),
+            [
+                field_init(tuple.fields[0].symbol.as_str(), key.to_string()),
+                field_init(tuple.fields[1].symbol.as_str(), value.to_string()),
+            ],
+        )
+    }
+
+    fn collection_version(&self, root: &RirPlace, fallback: String) -> String {
+        self.collection_loans
+            .iter()
+            .rev()
+            .find(|loan| loan.root == *root)
+            .map_or(fallback, |loan| loan.version.clone())
+    }
+
+    fn collection_replace_ty(&self, ty: RirTypeId) -> bool {
+        matches!(
+            self.program.types[ty.index()],
+            RirType::List(_) | RirType::Map { .. }
+        )
     }
 
     fn mut_place_region(
@@ -1527,7 +1849,7 @@ impl EmitCx<'_> {
     }
 
     fn cell_init(
-        &self,
+        &mut self,
         function: &RirFunction,
         cell: super::rir::RirCellRef,
         value: &RirRValue,
@@ -1553,22 +1875,24 @@ impl EmitCx<'_> {
     }
 
     fn cell_set(
-        &self,
+        &mut self,
         function: &RirFunction,
         cell: super::rir::RirCellRef,
         value: &RirRValue,
     ) -> String {
         let value = self.rvalue(function, value);
-        match self.cell_decl(cell).storage {
+        let decl = self.cell_decl(cell);
+        let set = target::lambda_cell_set(&value, self.collection_replace_ty(decl.payload_ty));
+        match decl.storage {
             RirCellStorage::StackScoped => {
-                format!("{}.set({value})?", self.cell_ref(function, cell))
+                format!("{}.{}?", self.cell_ref(function, cell), set)
             }
             RirCellStorage::Heap => {
                 target::ctx_heap_with(
                     "ctx",
                     &format!("&{}", self.cell_ref(function, cell)),
                     "cell",
-                    &format!("cell.set({value})"),
+                    &format!("cell.{set}"),
                 ) + "?"
             }
         }
@@ -1775,12 +2099,77 @@ impl EmitCx<'_> {
         })
     }
 
+    fn slice_view(
+        &self,
+        function: &RirFunction,
+        source: &RirPlace,
+        start: RirLocalId,
+        end: RirLocalId,
+        inclusive: bool,
+        mutable: bool,
+    ) -> String {
+        let places = RustPlaces::new(self.program, function);
+        let source_expr = places.local_place(source);
+        let start = function.locals[start.index()].symbol.as_str();
+        let end = function.locals[end.index()].symbol.as_str();
+        if places.mut_place_root_param(source)
+            && matches!(
+                self.program.types[source.ty.index()],
+                RirType::Array { .. } | RirType::List(_)
+            )
+        {
+            return target::mut_place_slice_view(&source_expr, start, end, inclusive, mutable);
+        }
+        let range = target::checked_range(start, end, inclusive, &format!("{source_expr}.len()"));
+        let mut lines = vec![format!("let __anv_range = {range};")];
+        let view = match self.program.types[source.ty.index()] {
+            RirType::Array { .. } if mutable => target::anv_slice_from_raw_parts_mut(
+                &format!("{source_expr}.as_mut_ptr()"),
+                &format!("{source_expr}.len()"),
+                "__anv_range.start",
+                "__anv_range.len()",
+            ),
+            RirType::Array { .. } => target::anv_slice_from_raw_parts(
+                &format!("{source_expr}.as_ptr()"),
+                &format!("{source_expr}.len()"),
+                "__anv_range.start",
+                "__anv_range.len()",
+            ),
+            RirType::List(_) => {
+                lines.push(format!(
+                    "let __anv_slice_loan = {};",
+                    target::begin_shape_loan(&source_expr)
+                ));
+                if mutable {
+                    target::anv_slice_from_list_mut(
+                        &format!("&mut {source_expr} as *mut _"),
+                        "__anv_range.start",
+                        "__anv_range.len()",
+                        "__anv_slice_loan",
+                    )
+                } else {
+                    target::anv_slice_from_list(
+                        &format!("&{source_expr} as *const _"),
+                        "__anv_range.start",
+                        "__anv_range.len()",
+                        "__anv_slice_loan",
+                    )
+                }
+            }
+            RirType::Slice(_) => {
+                target::anv_slice_slice(&source_expr, "__anv_range.start", "__anv_range.len()")
+            }
+            _ => unreachable!("verified slice view source"),
+        };
+        block_expr(lines, Some(view))
+    }
+
     fn list_slice(
         &self,
         function: &RirFunction,
         source: &RirPlace,
-        start: super::rir::RirLocalId,
-        end: super::rir::RirLocalId,
+        start: RirLocalId,
+        end: RirLocalId,
         inclusive: bool,
     ) -> String {
         let source_expr = RustPlaces::new(self.program, function).local_place(source);
@@ -1791,16 +2180,10 @@ impl EmitCx<'_> {
             unreachable!("verified list slice source")
         };
         let values = RustValues::new(self.program, function);
-        block_expr(
-            [
-                format!("let mut out = {};", target::anv_list_default()),
-                format!(
-                    "for item in &{source_expr}[{range}] {{ out.push({}); }}",
-                    values.value_from_ref(elem, "item")
-                ),
-            ],
-            Some("out".to_string()),
-        )
+        target::anv_list_from_iter(&format!(
+            "{source_expr}[{range}].iter().map(|item| {})",
+            values.value_from_ref(elem, "item")
+        ))
     }
 
     fn string_concat(&self, function: &RirFunction, parts: &[RirOperand]) -> String {
@@ -1888,12 +2271,18 @@ impl EmitCx<'_> {
         let values = RustValues::new(self.program, function);
         let object = values.operand_ref(object);
         let path = RustPlaces::new(self.program, function).storage_path(dataref, projections);
-        target::ctx_heap_with_mut(
-            "ctx",
-            &object,
-            "storage",
-            &format!("{} = {};", path, values.value_operand(value)),
-        )
+        let value_ty = values.operand_ty(value);
+        let value = values.value_operand(value);
+        if self.collection_replace_ty(value_ty) {
+            target::ctx_heap_with_mut(
+                "ctx",
+                &object,
+                "storage",
+                &target::replace_collection(&path, &value),
+            ) + "?"
+        } else {
+            target::ctx_heap_with_mut("ctx", &object, "storage", &format!("{path} = {value};"))
+        }
     }
 
     fn struct_literal(
@@ -2022,6 +2411,35 @@ impl EmitCx<'_> {
         self.w.push_indent();
         f(self);
         self.w.pop_indent();
+    }
+}
+
+fn stmt_call_args(stmt: &RirStmt) -> Option<&[RirCallArg]> {
+    match stmt {
+        RirStmt::Init {
+            value: RirRValue::Call { args, .. },
+            ..
+        }
+        | RirStmt::Assign {
+            value: RirRValue::Call { args, .. },
+            ..
+        }
+        | RirStmt::Eval(RirRValue::Call { args, .. }) => Some(args),
+        _ => None,
+    }
+}
+
+fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
+    match arg {
+        RirCallArg::Value(RirOperand::Place(place))
+        | RirCallArg::SharedBorrow(place)
+        | RirCallArg::MutBorrow(place) => place.projections.is_empty().then_some(place.local),
+        RirCallArg::MutPlace(RirMutPlaceArg::Local(place)) => {
+            place.projections.is_empty().then_some(place.local)
+        }
+        RirCallArg::Value(RirOperand::Const(_))
+        | RirCallArg::SharedStringConst(_)
+        | RirCallArg::MutPlace(_) => None,
     }
 }
 

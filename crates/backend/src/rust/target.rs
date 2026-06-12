@@ -14,6 +14,10 @@ pub(super) fn anv_list_ty(elem: String) -> String {
     format!("{}<{elem}>", rt_path("AnvList"))
 }
 
+pub(super) fn anv_slice_ty(elem: String) -> String {
+    format!("{}<{elem}>", rt_path("AnvSlice"))
+}
+
 pub(super) fn anv_map_ty(key: String, value: String) -> String {
     format!("{}<{key}, {value}>", rt_path("AnvMap"))
 }
@@ -51,6 +55,14 @@ pub(super) fn stack_lambda_cell_ctor(payload: &str) -> String {
 
 pub(super) fn lambda_cell_ctor(payload: &str) -> String {
     format!("{}::<{payload}>", rt_path("LambdaCell"))
+}
+
+pub(super) fn lambda_cell_set(value: &str, replace_collection: bool) -> String {
+    if replace_collection {
+        format!("mutate(|slot| slot.replace_with({value}))")
+    } else {
+        format!("set({value})")
+    }
 }
 
 pub(super) fn scoped_mut_place_cell_new(source: &str) -> String {
@@ -126,12 +138,147 @@ pub(super) fn anv_list_from_elems(elems: &str) -> String {
     format!("{}::from_elems([{elems}])", rt_path("AnvList"))
 }
 
-pub(super) fn anv_list_default() -> String {
-    format!("{}::default()", rt_path("AnvList"))
+pub(super) fn anv_list_from_iter(iter: &str) -> String {
+    format!("{}::from_elems({iter})", rt_path("AnvList"))
+}
+
+pub(super) fn anv_slice_from_raw_parts(
+    ptr: &str,
+    root_len: &str,
+    start: &str,
+    len: &str,
+) -> String {
+    format!(
+        "unsafe {{ {}::from_raw_parts({ptr}, {root_len}, {start}, {len}) }}",
+        rt_path("AnvSlice")
+    )
+}
+
+pub(super) fn anv_slice_from_raw_parts_mut(
+    ptr: &str,
+    root_len: &str,
+    start: &str,
+    len: &str,
+) -> String {
+    format!(
+        "unsafe {{ {}::from_raw_parts_mut({ptr}, {root_len}, {start}, {len}) }}",
+        rt_path("AnvSlice")
+    )
+}
+
+pub(super) fn anv_slice_from_list(root: &str, start: &str, len: &str, guard: &str) -> String {
+    format!(
+        "unsafe {{ {}::from_list({root}, {start}, {len}, {guard}) }}",
+        rt_path("AnvSlice")
+    )
+}
+
+pub(super) fn anv_slice_from_list_mut(root: &str, start: &str, len: &str, guard: &str) -> String {
+    format!(
+        "unsafe {{ {}::from_list_mut({root}, {start}, {len}, {guard}) }}",
+        rt_path("AnvSlice")
+    )
+}
+
+pub(super) fn anv_slice_slice(source: &str, start: &str, len: &str) -> String {
+    format!("{source}.slice({start}, {len})")
+}
+
+pub(super) fn mut_place_slice_view(
+    place: &str,
+    start: &str,
+    end: &str,
+    inclusive: bool,
+    mutable: bool,
+) -> String {
+    let method = if mutable {
+        "slice_view_mut"
+    } else {
+        "slice_view"
+    };
+    format!("{place}.{method}({start}, {end}, {inclusive})?")
 }
 
 pub(super) fn anv_map_from_entries(entries: &str) -> String {
     format!("{}::from_entries([{entries}])", rt_path("AnvMap"))
+}
+
+pub(super) fn list_push(list: &str, value: &str) -> String {
+    format!("{list}.push({value})?")
+}
+
+pub(super) fn list_push_region(value: &str) -> String {
+    format!("{{ value.push({value})?; Ok(()) }}")
+}
+
+pub(super) fn map_insert(map: &str, key: &str, value: &str) -> String {
+    format!("{map}.insert({key}, {value})?")
+}
+
+pub(super) fn map_insert_region(key: &str, inserted: &str) -> String {
+    format!("{{ value.insert({key}, {inserted})?; Ok(()) }}")
+}
+
+pub(super) fn map_remove(map: &str, key: &str) -> String {
+    format!("{map}.remove(&{key})?")
+}
+
+pub(super) fn map_remove_region(key: &str) -> String {
+    format!("value.remove(&{key})")
+}
+
+pub(super) fn collection_structural_version(collection: &str) -> String {
+    format!("{collection}.structural_version()")
+}
+
+pub(super) fn list_elem_at_shared(list: &str, index: &str, version: &str) -> String {
+    format!("{list}.elem_at_shared({index}, {version})")
+}
+
+pub(super) fn list_with_elem_mut_short(
+    list: &str,
+    index: &str,
+    version: &str,
+    body: &str,
+) -> String {
+    format!("{list}.with_elem_mut_short({index}, {version}, |value| {{ {body} }})")
+}
+
+pub(super) fn slice_elem_at_shared(slice: &str, index: &str) -> String {
+    format!("{slice}.elem_at_shared({index})")
+}
+
+pub(super) fn slice_with_elem_mut_short(slice: &str, index: &str, body: &str) -> String {
+    format!("{slice}.with_elem_mut_short({index}, |value| {{ {body} }})")
+}
+
+pub(super) fn map_key_at_shared(map: &str, index: &str, version: &str) -> String {
+    format!("{map}.key_at_shared({index}, {version})?")
+}
+
+pub(super) fn map_value_at_shared(map: &str, index: &str, version: &str) -> String {
+    format!("{map}.value_at_shared({index}, {version})?")
+}
+
+pub(super) fn map_with_value_mut_short(
+    map: &str,
+    index: &str,
+    version: &str,
+    body: &str,
+) -> String {
+    format!("{map}.with_value_mut_short({index}, {version}, |value| {{ {body} }})")
+}
+
+pub(super) fn begin_shape_loan(root: &str) -> String {
+    format!("{root}.begin_shape_loan()?")
+}
+
+pub(super) fn begin_shape_loan_region() -> String {
+    "value.begin_shape_loan()".into()
+}
+
+pub(super) fn shape_loan_version(loan: &str) -> String {
+    format!("{loan}.version()")
 }
 
 pub(super) fn heap_register(tracked: bool) -> &'static str {
@@ -218,6 +365,14 @@ pub(super) fn mut_place_dataref(object: &str, ops: &str) -> String {
 
 pub(super) fn mut_place_set(place: &str, runtime: &str, value: &str) -> String {
     format!("{place}.set({runtime}, {value})?")
+}
+
+pub(super) fn mut_place_replace_collection(place: &str, runtime: &str, value: &str) -> String {
+    format!("{place}.mutate({runtime}, |slot| slot.replace_with({value}))?")
+}
+
+pub(super) fn replace_collection(place: &str, value: &str) -> String {
+    format!("{place}.replace_with({value})?")
 }
 
 pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String {

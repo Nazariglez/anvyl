@@ -1,6 +1,8 @@
 // @mode: check
 // @expect: error
+// @skip: sort_by is not clean core surface yet
 // @contains: mutating method
+// @frontend: new
 
 fn main() {
     let xs: [int] = [3, 1, 2];

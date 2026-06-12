@@ -1,10 +1,12 @@
+use std::collections::HashSet;
+
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, Local, LocalId,
         LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, PlaceRoot,
-        Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl, VariantShape,
-        VerifiedProgram,
+        Program, Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
+        VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
@@ -307,7 +309,7 @@ impl ProfileCx<'_> {
             match capture {
                 air::LambdaCaptureDecl::NoRuntime { .. } => {}
                 air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
-                    if !self.policy().value_place_shareable(*ty) {
+                    if !self.policy().value_place_shareable(*ty) || self.type_contains_slice(*ty) {
                         self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                     }
                 }
@@ -326,7 +328,11 @@ impl ProfileCx<'_> {
                         self.check_scoped_borrow_decl(site, *borrow, *ty, *mutability);
                     }
                 }
-                air::LambdaCaptureDecl::CaptureCell { .. } => {}
+                air::LambdaCaptureDecl::CaptureCell { ty, .. } => {
+                    if self.type_contains_slice(*ty) {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    }
+                }
             }
         }
     }
@@ -378,11 +384,11 @@ impl ProfileCx<'_> {
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
                 air::AirStmt::CollectionLoan(loan) => {
                     self.check_place(site, &loan.root);
-                    self.push(site, ProfileErrorKind::UnsupportedCollectionLoan);
+                    self.check_air_block(function, &loan.body);
                 }
                 air::AirStmt::CollectionSlotScope(scope) => {
                     self.check_place(site, &scope.root);
-                    self.push(site, ProfileErrorKind::UnsupportedCollectionLoan);
+                    self.check_air_block(function, &scope.body);
                 }
             }
         }
@@ -530,6 +536,7 @@ impl ProfileCx<'_> {
                     TypeData::String
                         | TypeData::Array { .. }
                         | TypeData::List(_)
+                        | TypeData::Map { .. }
                         | TypeData::Slice(_)
                 ) {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
@@ -634,9 +641,12 @@ impl ProfileCx<'_> {
                 self.check_place(site, list);
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
-            RValue::MapEntryAt { map, .. } => {
+            RValue::MapEntryAt { map, index, ty } => {
                 self.check_place(site, map);
-                self.push(site, ProfileErrorKind::UnsupportedRValue);
+                self.check_type_ref(site, *ty);
+                if self.current_local(site, *index).is_none() {
+                    self.push(site, ProfileErrorKind::UnsupportedRValue);
+                }
             }
             RValue::MakeLambda {
                 lambda, captures, ..
@@ -859,6 +869,13 @@ impl ProfileCx<'_> {
         }
     }
 
+    fn source_mut_place_collection_projection(&self, root_ty: TypeId, place: &Place) -> bool {
+        matches!(
+            self.program.type_arena.data(root_ty),
+            TypeData::List(_) | TypeData::Slice(_)
+        ) && matches!(place.projection.first(), Some(Projection::Index(_)))
+    }
+
     fn current_local(&self, site: ProfileSite, local: LocalId) -> Option<&Local> {
         let (ProfileSite::Statement(function, _) | ProfileSite::Terminator(function)) = site else {
             return None;
@@ -1010,7 +1027,9 @@ impl ProfileCx<'_> {
         let Operand::Place(place) = operand else {
             return false;
         };
-        self.non_copy_type(place.ty) && !self.policy().value_place_shareable(place.ty)
+        !matches!(self.program.type_arena.data(place.ty), TypeData::Slice(_))
+            && self.non_copy_type(place.ty)
+            && !self.policy().value_place_shareable(place.ty)
     }
 
     fn non_copy_type(&self, ty: TypeId) -> bool {
@@ -1061,6 +1080,7 @@ impl ProfileCx<'_> {
                 if self.local_is_source_mut_place_param(site, root)
                     && !place.projection.is_empty()
                     && !self.place_crosses_dataref(site, place)
+                    && !self.source_mut_place_collection_projection(local.ty, place)
                 {
                     self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
                     return;
@@ -1295,46 +1315,58 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn type_contains_function(&self, ty: TypeId) -> bool {
-        self.type_contains_function_inner(ty, &mut std::collections::HashSet::new())
+    fn type_contains_slice(&self, ty: TypeId) -> bool {
+        self.type_contains(ty, |data| matches!(data, TypeData::Slice(_)))
     }
 
-    fn type_contains_function_inner(
+    fn type_contains_function(&self, ty: TypeId) -> bool {
+        self.type_contains(ty, |data| matches!(data, TypeData::Function(_)))
+    }
+
+    fn type_contains(&self, ty: TypeId, target: impl Fn(&TypeData) -> bool + Copy) -> bool {
+        self.type_contains_inner(ty, &mut HashSet::new(), target)
+    }
+
+    fn type_contains_inner(
         &self,
         ty: TypeId,
-        visited: &mut std::collections::HashSet<TypeId>,
+        visited: &mut HashSet<TypeId>,
+        target: impl Fn(&TypeData) -> bool + Copy,
     ) -> bool {
         if !visited.insert(ty) {
             return false;
         }
-        match self.program.type_arena.data(ty) {
-            TypeData::Function(_) => true,
+        let data = self.program.type_arena.data(ty);
+        if target(data) {
+            return true;
+        }
+        match data {
             TypeData::Optional(inner)
             | TypeData::Array { elem: inner, .. }
-            | TypeData::Slice(inner) => self.type_contains_function_inner(*inner, visited),
-            TypeData::List(elem) => self.type_contains_function_inner(*elem, visited),
+            | TypeData::Slice(inner)
+            | TypeData::List(inner) => self.type_contains_inner(*inner, visited, target),
             TypeData::Map { key, value, .. } => {
-                self.type_contains_function_inner(*key, visited)
-                    || self.type_contains_function_inner(*value, visited)
+                self.type_contains_inner(*key, visited, target)
+                    || self.type_contains_inner(*value, visited, target)
             }
             TypeData::Tuple(elems) => elems
                 .iter()
-                .any(|elem| self.type_contains_function_inner(*elem, visited)),
+                .any(|elem| self.type_contains_inner(*elem, visited, target)),
             TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => self
                 .program
                 .aggregate(*aggregate)
                 .fields
                 .iter()
-                .any(|field| self.type_contains_function_inner(field.ty, visited)),
+                .any(|field| self.type_contains_inner(field.ty, visited, target)),
             TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().any(|variant| {
-                variant_field_tys(variant).any(|ty| self.type_contains_function_inner(ty, visited))
+                variant_field_tys(variant).any(|ty| self.type_contains_inner(ty, visited, target))
             }),
             TypeData::Extern(ext) => self
                 .program
                 .extern_type(*ext)
                 .fields
                 .iter()
-                .any(|field| self.type_contains_function_inner(field.ty, visited)),
+                .any(|field| self.type_contains_inner(field.ty, visited, target)),
             _ => false,
         }
     }

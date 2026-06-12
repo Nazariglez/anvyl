@@ -1,7 +1,8 @@
 use super::rir::{
-    RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirExternKind, RirFunction,
-    RirLambdaStorage, RirOperand, RirParamAbi, RirPlace, RirProgram, RirRValue, RirStmt,
-    RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
+    RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionLoanScope,
+    RirCollectionRootKind, RirExternKind, RirFunction, RirLambdaStorage, RirOperand, RirParamAbi,
+    RirPlace, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct, RirStructuredBlock,
+    RirType, RirTypeId,
 };
 
 pub(super) fn fallible_functions(program: &RirProgram) -> Vec<bool> {
@@ -32,6 +33,7 @@ fn block_calls_fallible(
         .stmts
         .iter()
         .any(|stmt| stmt_calls_fallible(program, fallible, function, stmt))
+        || term_calls_fallible(program, function, &block.term)
 }
 
 fn stmt_calls_fallible(
@@ -46,16 +48,41 @@ fn stmt_calls_fallible(
         }
         RirStmt::Assign { dst, value } => {
             place_is_mut_place_param(function, dst)
+                || place_has_indexed_collection_write(program, function, dst)
+                || collection_replace_ty(program, dst.ty)
                 || rvalue_calls_fallible(program, fallible, function, value)
         }
         RirStmt::CellSet { .. } | RirStmt::ScopedPlaceCellSet { .. } => true,
+        RirStmt::CollectionLoanScope(scope) => {
+            block_calls_fallible(program, fallible, function, &scope.body)
+                || loan_scope_is_fallible(program, scope)
+        }
         RirStmt::DataRefSet { object, value, .. } => {
             operand_uses_mut_place_param(function, object)
                 || operand_uses_mut_place_param(function, value)
+                || operand_ty(program, value).is_some_and(|ty| collection_replace_ty(program, ty))
         }
+        RirStmt::MapValueSet { .. } => true,
         _ => stmt_child_blocks_any(stmt, |block| {
             block_calls_fallible(program, fallible, function, block)
         }),
+    }
+}
+
+fn term_calls_fallible(
+    program: &RirProgram,
+    function: &RirFunction,
+    term: &super::rir::RirTerm,
+) -> bool {
+    match term {
+        super::rir::RirTerm::Return(Some(operand)) => {
+            operand_has_slice_index(program, function, operand)
+        }
+        super::rir::RirTerm::None
+        | super::rir::RirTerm::Return(None)
+        | super::rir::RirTerm::Break(_)
+        | super::rir::RirTerm::Continue(_)
+        | super::rir::RirTerm::Unreachable => false,
     }
 }
 
@@ -66,7 +93,14 @@ fn rvalue_calls_fallible(
     value: &RirRValue,
 ) -> bool {
     rvalue_uses_mut_place_param(function, value)
+        || rvalue_uses_fallible_place(program, function, value)
         || match value {
+            RirRValue::ListPush { .. }
+            | RirRValue::MapInsert { .. }
+            | RirRValue::MapRemove { .. }
+            | RirRValue::MapEntryAt { .. }
+            | RirRValue::MapValueAt { .. }
+            | RirRValue::SliceView { .. } => true,
             RirRValue::Call { callee, args, .. } => {
                 args.iter().any(call_arg_erases_dataref)
                     || match callee {
@@ -85,6 +119,160 @@ fn rvalue_calls_fallible(
             }
             _ => false,
         }
+}
+
+fn rvalue_uses_fallible_place(
+    program: &RirProgram,
+    function: &RirFunction,
+    value: &RirRValue,
+) -> bool {
+    match value {
+        RirRValue::Use(operand)
+        | RirRValue::Unary { value: operand, .. }
+        | RirRValue::Cast { value: operand, .. }
+        | RirRValue::OptionalSome { value: operand, .. }
+        | RirRValue::Stringify { value: operand, .. }
+        | RirRValue::Format { value: operand, .. }
+        | RirRValue::ListPush { value: operand, .. }
+        | RirRValue::MapGet { key: operand, .. }
+        | RirRValue::MapRemove { key: operand, .. } => {
+            operand_has_slice_index(program, function, operand)
+        }
+        RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
+            operand_has_slice_index(program, function, lhs)
+                || operand_has_slice_index(program, function, rhs)
+        }
+        RirRValue::Struct { fields, .. }
+        | RirRValue::Tuple { fields, .. }
+        | RirRValue::DataRefAlloc { fields, .. }
+        | RirRValue::Array { elems: fields, .. }
+        | RirRValue::List { elems: fields, .. }
+        | RirRValue::EnumVariant { fields, .. }
+        | RirRValue::StringConcat { parts: fields } => fields
+            .iter()
+            .any(|operand| operand_has_slice_index(program, function, operand)),
+        RirRValue::Map { entries, .. } => entries.iter().any(|(key, value)| {
+            operand_has_slice_index(program, function, key)
+                || operand_has_slice_index(program, function, value)
+        }),
+        RirRValue::MapInsert { key, value, .. } => {
+            operand_has_slice_index(program, function, key)
+                || operand_has_slice_index(program, function, value)
+        }
+        RirRValue::Call { args, .. } => args
+            .iter()
+            .any(|arg| call_arg_has_slice_index(program, function, arg)),
+        RirRValue::Lambda { captures, .. } => captures.iter().any(|capture| match capture {
+            super::rir::RirLambdaCaptureArg::Readonly { value } => {
+                operand_has_slice_index(program, function, value)
+            }
+            super::rir::RirLambdaCaptureArg::Scoped { place } => {
+                place_has_slice_index(program, function, place)
+            }
+            super::rir::RirLambdaCaptureArg::StackCell { .. }
+            | super::rir::RirLambdaCaptureArg::HeapCell { .. }
+            | super::rir::RirLambdaCaptureArg::ScopedPlaceCell { .. } => false,
+        }),
+        RirRValue::DataRefGet { object, .. } => operand_has_slice_index(program, function, object),
+        RirRValue::Len { source }
+        | RirRValue::SliceView { source, .. }
+        | RirRValue::ListSlice { source, .. } => place_has_slice_index(program, function, source),
+        RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
+            place_has_slice_index(program, function, map)
+        }
+        RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => false,
+    }
+}
+
+fn operand_has_slice_index(
+    program: &RirProgram,
+    function: &RirFunction,
+    operand: &RirOperand,
+) -> bool {
+    match operand {
+        RirOperand::Place(place) => place_has_slice_index(program, function, place),
+        RirOperand::Const(_) => false,
+    }
+}
+
+fn call_arg_has_slice_index(
+    program: &RirProgram,
+    function: &RirFunction,
+    arg: &RirCallArg,
+) -> bool {
+    match arg {
+        RirCallArg::Value(operand) => operand_has_slice_index(program, function, operand),
+        RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
+            place_has_slice_index(program, function, place)
+        }
+        RirCallArg::SharedStringConst(_) | RirCallArg::MutPlace(_) => false,
+    }
+}
+
+fn place_has_indexed_collection_write(
+    program: &RirProgram,
+    function: &RirFunction,
+    place: &RirPlace,
+) -> bool {
+    let Some(local) = function.locals.get(place.local.index()) else {
+        return false;
+    };
+    let mut ty = local.ty;
+    for projection in &place.projections {
+        match projection {
+            super::rir::RirProjection::Index(_) => match program.types[ty.index()] {
+                RirType::List(_) | RirType::Slice(_) => return true,
+                RirType::Array { elem, .. } => ty = elem,
+                _ => return false,
+            },
+            super::rir::RirProjection::Field(_) | super::rir::RirProjection::TupleField(_) => {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn place_has_slice_index(program: &RirProgram, function: &RirFunction, place: &RirPlace) -> bool {
+    let Some(local) = function.locals.get(place.local.index()) else {
+        return false;
+    };
+    let mut ty = local.ty;
+    for projection in &place.projections {
+        match projection {
+            super::rir::RirProjection::Index(_) => match program.types[ty.index()] {
+                RirType::Slice(_) => return true,
+                RirType::Array { elem, .. } | RirType::List(elem) => ty = elem,
+                _ => return false,
+            },
+            super::rir::RirProjection::Field(_) | super::rir::RirProjection::TupleField(_) => {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn operand_ty(program: &RirProgram, operand: &RirOperand) -> Option<RirTypeId> {
+    match operand {
+        RirOperand::Place(place) => Some(place.ty),
+        RirOperand::Const(id) => program.consts.get(id.index()).map(|konst| konst.ty),
+    }
+}
+
+fn collection_replace_ty(program: &RirProgram, ty: RirTypeId) -> bool {
+    matches!(
+        program.types[ty.index()],
+        RirType::List(_) | RirType::Map { .. }
+    )
+}
+
+fn loan_scope_is_fallible(program: &RirProgram, scope: &RirCollectionLoanScope) -> bool {
+    matches!(
+        (scope.root_kind, program.types[scope.root.ty.index()]),
+        (RirCollectionRootKind::List, RirType::List(_))
+            | (RirCollectionRootKind::Map, RirType::Map { .. })
+    )
 }
 
 fn stringify_calls_fallible(program: &RirProgram, fallible: &[bool], ty: RirTypeId) -> bool {
@@ -135,7 +323,12 @@ fn stmt_uses_ctx(program: &RirProgram, function: &RirFunction, stmt: &RirStmt) -
             cell_uses_ctx(program, *cell) || rvalue_uses_ctx(program, function, value)
         }
         RirStmt::ScopedPlaceCellSet { .. } => true,
-        RirStmt::DataRefSet { .. } => true,
+        RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => true,
+        RirStmt::CollectionLoanScope(scope) => {
+            place_is_mut_place_param(function, &scope.root)
+                || block_uses_ctx(program, function, &scope.body)
+        }
+        RirStmt::CollectionSlotScope(block) => block_uses_ctx(program, function, block),
         _ => stmt_child_blocks_any(stmt, |block| block_uses_ctx(program, function, block)),
     }
 }
@@ -153,6 +346,8 @@ fn stmt_child_blocks_any(
                 }
         }
         RirStmt::Loop(loop_) => block_matches(&loop_.body),
+        RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
+        RirStmt::CollectionSlotScope(block) => block_matches(block),
         RirStmt::OptionMatch(match_) => {
             block_matches(&match_.some_block) || block_matches(&match_.none_block)
         }
@@ -169,7 +364,8 @@ fn stmt_child_blocks_any(
         | RirStmt::CellSet { .. }
         | RirStmt::ScopedPlaceCellSet { .. }
         | RirStmt::Eval(_)
-        | RirStmt::DataRefSet { .. } => false,
+        | RirStmt::DataRefSet { .. }
+        | RirStmt::MapValueSet { .. } => false,
     }
 }
 
@@ -291,6 +487,9 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         RirRValue::MapInsert { map, key, value } => {
             place_is_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
+        }
+        RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
+            place_is_mut_place_param(function, map)
         }
         RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }

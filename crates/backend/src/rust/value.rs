@@ -145,6 +145,11 @@ impl<'a> RustValues<'a> {
         let RirOperand::Place(place) = operand else {
             return self.operand(operand);
         };
+        if let Some(access) = self.places.slice_index_access(place)
+            && access.root_is_mut_place
+        {
+            return self.mut_place_index_access(access);
+        }
         if self.places.mut_place_root_param(place) {
             return self.mut_place_value_operand(place);
         }
@@ -163,24 +168,38 @@ impl<'a> RustValues<'a> {
         self.operand(operand)
     }
 
+    pub(super) fn operand_ty(&self, operand: &RirOperand) -> RirTypeId {
+        match operand {
+            RirOperand::Place(place) => place.ty,
+            RirOperand::Const(id) => self.program.consts[id.index()].ty,
+        }
+    }
+
     pub(super) fn operand(&self, operand: &RirOperand) -> String {
         match operand {
             RirOperand::Place(place) if self.places.mut_place_root_param(place) => {
                 self.mut_place_value_operand(place)
             }
-            RirOperand::Place(place) => match self.program.types[place.ty.index()] {
-                RirType::Struct(id) if self.program.structs[id.index()].copyable => {
-                    self.copy_struct_place(place)
+            RirOperand::Place(place) => {
+                if let Some(access) = self.places.slice_index_access(place)
+                    && access.root_is_mut_place
+                {
+                    return self.mut_place_index_access(access);
                 }
-                RirType::Enum(id) if self.program.enums[id.index()].copyable => {
-                    self.copy_enum_place(place)
+                match self.program.types[place.ty.index()] {
+                    RirType::Struct(id) if self.program.structs[id.index()].copyable => {
+                        self.copy_struct_place(place)
+                    }
+                    RirType::Enum(id) if self.program.enums[id.index()].copyable => {
+                        self.copy_enum_place(place)
+                    }
+                    RirType::Tuple(id) if self.program.tuples[id.index()].copyable => {
+                        self.copy_tuple_place(place)
+                    }
+                    RirType::Array { .. } => self.copy_array_place(place),
+                    _ => self.place(place),
                 }
-                RirType::Tuple(id) if self.program.tuples[id.index()].copyable => {
-                    self.copy_tuple_place(place)
-                }
-                RirType::Array { .. } => self.copy_array_place(place),
-                _ => self.place(place),
-            },
+            }
             RirOperand::Const(id) => self.const_value(&self.program.consts[id.index()]),
         }
     }
@@ -191,6 +210,18 @@ impl<'a> RustValues<'a> {
 
     fn mut_place_value_operand(&self, place: &RirPlace) -> String {
         self.place_value_from_access(place.ty, &self.place(place))
+    }
+
+    fn mut_place_index_access(&self, access: super::place::SliceIndexAccess) -> String {
+        let body = if access.list_root {
+            let checked = target::checked_index(&access.index, "value.len()");
+            let version = target::collection_structural_version("value");
+            let elem = target::list_elem_at_shared("value", "index", "version");
+            format!("{{ let index = {checked}; let version = {version}; {elem} }}")
+        } else {
+            target::slice_elem_at_shared("value", &access.index)
+        };
+        target::mut_place_access(&access.root, &target::ctx_runtime("ctx"), &body)
     }
 
     pub(super) fn scoped_place_cell_value(
@@ -222,6 +253,7 @@ impl<'a> RustValues<'a> {
             RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
             RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
             RirType::DataRef(_) => format!("{expr}.clone()"),
+            RirType::Slice(_) => format!("{expr}.readonly()"),
             RirType::Lambda(sig) if !self.policy.lambda_sig_copyable(sig) => {
                 format!("{expr}.clone()")
             }
@@ -229,9 +261,7 @@ impl<'a> RustValues<'a> {
                 self.copy_from_ref(ty, &format!("&{expr}"))
             }
             RirType::Option(_) => self.copy_from_ref(ty, &format!("&{expr}")),
-            RirType::Slice(_) | RirType::Lambda(_) | RirType::Void => {
-                unreachable!("verified dataref field value")
-            }
+            RirType::Lambda(_) | RirType::Void => unreachable!("verified dataref field value"),
         }
     }
 
@@ -463,7 +493,8 @@ impl<'a> RustValues<'a> {
             RirType::String | RirType::List(_) | RirType::Map { .. } => {
                 format!("(*({expr})).share()")
             }
-            RirType::Slice(_) | RirType::Void => unreachable!("verified copy enum payload"),
+            RirType::Slice(_) => format!("(*({expr})).readonly()"),
+            RirType::Void => unreachable!("verified copy enum payload"),
         }
     }
 

@@ -55,7 +55,7 @@ impl DataRefPlaceDescriptors {
             | RirStmt::ScopedPlaceCellSet { value, .. } => {
                 self.collect_rvalue(program, value);
             }
-            RirStmt::DataRefSet { .. } => {}
+            RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => {}
             RirStmt::If(branch) => {
                 self.collect_block(program, &branch.then_block);
                 if let Some(block) = &branch.else_block {
@@ -63,6 +63,8 @@ impl DataRefPlaceDescriptors {
                 }
             }
             RirStmt::Loop(loop_) => self.collect_block(program, &loop_.body),
+            RirStmt::CollectionLoanScope(scope) => self.collect_block(program, &scope.body),
+            RirStmt::CollectionSlotScope(block) => self.collect_block(program, block),
             RirStmt::EnumMatch(match_) => {
                 for arm in &match_.arms {
                     self.collect_block(program, &arm.block);

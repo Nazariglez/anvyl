@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: error
+// @skip: sort_by is not clean core surface yet
 // @contains: cannot change list shape while iterating it
 // @frontend: new
 

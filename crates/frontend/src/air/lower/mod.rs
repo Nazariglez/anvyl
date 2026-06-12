@@ -2583,22 +2583,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
                 ForBindingPlan::OwnedMapEntry { pattern, ty } => {
                     if !matches!(pattern.node, Pattern::Wildcard) {
-                        let entry = self.map_entry_operand(plan, *ty, &mut map_entry)?;
+                        let entry = self.map_entry_operand(plan, &mut map_entry, |_, _| Ok(*ty))?;
                         self.lower_for_pattern_binding(pattern, entry, false)?;
                     }
                 }
                 ForBindingPlan::OwnedMapKey { pattern, ty } => {
                     if !matches!(pattern.node, Pattern::Wildcard) {
-                        let entry_ty = self.map_entry_ty(plan)?;
-                        let entry = self.map_entry_operand(plan, entry_ty, &mut map_entry)?;
+                        let entry =
+                            self.map_entry_operand(plan, &mut map_entry, Self::map_entry_ty)?;
                         let key = Self::tuple_field_operand(entry, 0, *ty);
                         self.lower_for_pattern_binding(pattern, key, false)?;
                     }
                 }
                 ForBindingPlan::OwnedMapValue { pattern, ty } => {
                     if !matches!(pattern.node, Pattern::Wildcard) {
-                        let entry_ty = self.map_entry_ty(plan)?;
-                        let entry = self.map_entry_operand(plan, entry_ty, &mut map_entry)?;
+                        let entry =
+                            self.map_entry_operand(plan, &mut map_entry, Self::map_entry_ty)?;
                         let value = Self::tuple_field_operand(entry, 1, *ty);
                         self.lower_for_pattern_binding(pattern, value, false)?;
                     }
@@ -2640,12 +2640,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn map_entry_operand(
         &mut self,
         plan: &ForPlan,
-        ty: TypeId,
         entry: &mut Option<Operand>,
+        ty: impl FnOnce(&mut Self, &ForPlan) -> Result<TypeId, LowerError>,
     ) -> Result<Operand, LowerError> {
         if let Some(entry) = entry {
             return Ok(entry.clone());
         }
+        let ty = ty(self, plan)?;
         let value = self.emit_typed_temp(
             ty,
             RValue::MapEntryAt {
@@ -2992,6 +2993,41 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.lower_place_arg_impl(expr, true, true)
     }
 
+    fn lower_mut_slice_call_arg(
+        &mut self,
+        expr: &ExprNode,
+        slice_ty: TypeId,
+    ) -> Result<Place, LowerError> {
+        if let Ok(place) = self.lower_mut_call_arg(expr)
+            && place.ty == slice_ty
+        {
+            return Ok(place);
+        }
+        let source = self.lower_place_arg_impl(expr, true, true)?;
+        let Some(source_elem) = typing::sequence_elem(&self.cx.program, source.ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let TypeData::Slice(slice_elem) = self.cx.program.type_data(slice_ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        if source_elem != *slice_elem {
+            return Err(unsupported_expr(expr));
+        }
+        let start = self.int_local(0)?;
+        let end = self.len_local(&source)?;
+        let temp = self.emit_mut_typed_temp(
+            slice_ty,
+            RValue::SliceView {
+                source,
+                start,
+                end,
+                inclusive: false,
+                ty: slice_ty,
+            },
+        )?;
+        self.place_from_operand(temp, expr)
+    }
+
     fn lower_place_arg_impl(
         &mut self,
         expr: &ExprNode,
@@ -3160,6 +3196,41 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(self.local_place(param.local_id))
     }
 
+    fn lower_shared_slice_call_arg(
+        &mut self,
+        expr: &ExprNode,
+        slice_ty: TypeId,
+    ) -> Result<Place, LowerError> {
+        if let Ok(place) = self.lower_place_arg(expr, false)
+            && place.ty == slice_ty
+        {
+            return Ok(place);
+        }
+        let source = self.lower_place_arg_impl(expr, false, false)?;
+        let Some(source_elem) = typing::sequence_elem(&self.cx.program, source.ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let TypeData::Slice(slice_elem) = self.cx.program.type_data(slice_ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        if source_elem != *slice_elem {
+            return Err(unsupported_expr(expr));
+        }
+        let start = self.int_local(0)?;
+        let end = self.len_local(&source)?;
+        let temp = self.emit_typed_temp(
+            slice_ty,
+            RValue::SliceView {
+                source,
+                start,
+                end,
+                inclusive: false,
+                ty: slice_ty,
+            },
+        )?;
+        self.place_from_operand(temp, expr)
+    }
+
     fn lower_shared_call_arg(
         &mut self,
         expr: &ExprNode,
@@ -3176,6 +3247,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 unreachable!("string literal lowers to const")
             };
             return Ok(CallArg::SharedStringConst(id));
+        }
+        if matches!(self.cx.program.type_data(ty), TypeData::Slice(_))
+            && let Ok(place) = self.lower_shared_slice_call_arg(expr, ty)
+        {
+            return Ok(CallArg::SharedBorrow(place));
         }
         match self.lower_place_arg(expr, false) {
             Ok(place) if place.ty == ty => Ok(CallArg::SharedBorrow(place)),
@@ -4182,8 +4258,18 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expected: TypeId,
         site: &ExprNode,
     ) -> Result<Operand, LowerError> {
-        if matches!(expr.node.kind, ExprKind::Lit(Lit::Nil)) {
-            return self.optional_none(expected, site);
+        if let ExprKind::Lit(lit) = &expr.node.kind {
+            if matches!(lit, Lit::Nil) {
+                return self.optional_none(expected, site);
+            }
+            if let Some(value) =
+                Self::literal_air_const_value(lit, self.cx.program.type_data(expected))
+            {
+                return Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
+                    ty: expected,
+                    value,
+                })));
+            }
         }
 
         let value = self.lower_value(expr)?;
@@ -5362,7 +5448,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     ParamMode::Value => CallArg::Value(self.lower_value_to(expr, param.ty, expr)?),
                     ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty)?,
                     ParamMode::MutBorrow => {
-                        let place = self.lower_mut_call_arg(expr)?;
+                        let place =
+                            if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) {
+                                self.lower_mut_slice_call_arg(expr, param.ty)?
+                            } else {
+                                self.lower_mut_call_arg(expr)?
+                            };
                         if place.ty != param.ty {
                             return Err(unsupported_expr(expr));
                         }
@@ -5593,6 +5684,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             return Err(unsupported_expr(expr));
         }
+        if let Some(value) = self.lower_list_push_call(expr, call)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.lower_map_insert_call(expr, call)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.lower_map_remove_call(expr, call)? {
+            return Ok(value);
+        }
         if let Some(targets) = self.facts.extern_uses.get(&expr.node.id) {
             let [target] = targets.as_slice() else {
                 return Err(LowerError::UnsupportedExternUse {
@@ -5739,6 +5839,493 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(RValue::Call { callee, args })
     }
 
+    fn lower_collection_filter_effect(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Ok(false);
+        };
+        if call.node.args.len() != 1 {
+            return Ok(false);
+        }
+        let Some(target) = self.facts.calls.get(&expr.node.id) else {
+            return Ok(false);
+        };
+        if !is_lowered_collection_stub(&target.id) {
+            return Ok(false);
+        }
+        let root = self.lower_method_target(&field.node.target)?;
+        self.require_mutable_place(expr, &root)?;
+        if let Some(elem) = typing::list_elem(&self.cx.program, root.ty) {
+            let Some(remove_matches) =
+                collection_effect::classify_sequence_method(field.node.field)
+                    .and_then(sequence_filter_remove_matches)
+            else {
+                return Ok(false);
+            };
+            self.lower_list_filter_effect(&root, elem, &call.node.args[0], remove_matches)?;
+            return Ok(true);
+        }
+        let Some((key, value)) = typing::map_kv(&self.cx.program, root.ty) else {
+            return Ok(false);
+        };
+        let Some(remove_matches) = collection_effect::classify_map_method(field.node.field)
+            .and_then(map_filter_remove_matches)
+        else {
+            return Ok(false);
+        };
+        self.lower_map_filter_effect(&root, key, value, &call.node.args[0], remove_matches)?;
+        Ok(true)
+    }
+
+    fn lower_list_filter_effect(
+        &mut self,
+        root: &Place,
+        elem: TypeId,
+        predicate: &ExprNode,
+        remove_matches: bool,
+    ) -> Result<(), LowerError> {
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let len = self.for_len_local()?;
+        let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let kept = self.push_local(None, None, root.ty, AirMutability::Mutable, LocalKind::Temp);
+        let one = self.int_const(1)?;
+        let step = self.emit_typed_temp(int_ty, RValue::Use(one))?;
+        let id = self.alloc_loop();
+        let callback = self.lower_filter_callback(predicate)?;
+        let body = self.with_nested_block(|this| {
+            this.emit_init(
+                kept,
+                RValue::Aggregate {
+                    kind: AggregateCtor::List,
+                    fields: vec![],
+                    ty: root.ty,
+                },
+            )?;
+            this.emit_init(
+                len,
+                RValue::Len {
+                    source: root.clone(),
+                },
+            )?;
+            let zero = this.int_const(0)?;
+            this.emit_init(
+                index,
+                RValue::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: zero,
+                    rhs: step.clone(),
+                    ty: int_ty,
+                },
+            )?;
+            let loop_body = this.with_nested_block(|this| {
+                this.emit_assign(
+                    this.local_place(index),
+                    RValue::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: step.clone(),
+                        ty: int_ty,
+                    },
+                )?;
+                let cond = this.emit_typed_temp(
+                    bool_ty,
+                    RValue::Binary {
+                        op: BinaryOp::LessThan,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: Operand::Place(this.local_place(len)),
+                        ty: bool_ty,
+                    },
+                )?;
+                let then_block = this.with_nested_block(|this| {
+                    let elem_value = this.emit_typed_temp(
+                        elem,
+                        RValue::Use(Operand::Place(Self::sequence_element_place(
+                            root, index, elem,
+                        ))),
+                    )?;
+                    let keep = this.lower_filter_keep(
+                        predicate,
+                        &callback,
+                        vec![elem_value.clone()],
+                        remove_matches,
+                    )?;
+                    let keep_block = this.with_nested_block(|this| {
+                        this.emit_eval(RValue::ListPush {
+                            list: this.local_place(kept),
+                            value: elem_value,
+                        })?;
+                        this.terminate(AirTail::Continue(id))
+                    })?;
+                    let discard_block = AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Continue(id),
+                    };
+                    this.ensure_open()?;
+                    this.block.stmts.push(AirStmt::If(AirIf {
+                        cond: keep,
+                        then_block: keep_block,
+                        else_block: Some(discard_block),
+                    }));
+                    Ok(())
+                })?;
+                let else_block = AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Break(id),
+                };
+                this.ensure_open()?;
+                this.block.stmts.push(AirStmt::If(AirIf {
+                    cond,
+                    then_block,
+                    else_block: Some(else_block),
+                }));
+                Ok(())
+            })?;
+            this.ensure_open()?;
+            this.block.stmts.push(AirStmt::Loop(AirLoop {
+                id,
+                body: loop_body,
+            }));
+            Ok(())
+        })?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionLoan(AirCollectionLoan {
+                root: root.clone(),
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body,
+            }));
+        self.emit_assign(
+            root.clone(),
+            RValue::Use(Operand::Place(self.local_place(kept))),
+        )
+    }
+
+    fn lower_map_filter_effect(
+        &mut self,
+        root: &Place,
+        key: TypeId,
+        value: TypeId,
+        predicate: &ExprNode,
+        remove_matches: bool,
+    ) -> Result<(), LowerError> {
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let len = self.for_len_local()?;
+        let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let kept = self.push_local(None, None, root.ty, AirMutability::Mutable, LocalKind::Temp);
+        let entry_ty = self
+            .cx
+            .program
+            .alloc_type(TypeData::Tuple(vec![key, value]));
+        let one = self.int_const(1)?;
+        let step = self.emit_typed_temp(int_ty, RValue::Use(one))?;
+        let id = self.alloc_loop();
+        let callback = self.lower_filter_callback(predicate)?;
+        let body = self.with_nested_block(|this| {
+            this.emit_init(
+                kept,
+                RValue::Aggregate {
+                    kind: AggregateCtor::Map,
+                    fields: vec![],
+                    ty: root.ty,
+                },
+            )?;
+            this.emit_init(
+                len,
+                RValue::Len {
+                    source: root.clone(),
+                },
+            )?;
+            let zero = this.int_const(0)?;
+            this.emit_init(
+                index,
+                RValue::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: zero,
+                    rhs: step.clone(),
+                    ty: int_ty,
+                },
+            )?;
+            let loop_body = this.with_nested_block(|this| {
+                this.emit_assign(
+                    this.local_place(index),
+                    RValue::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: step.clone(),
+                        ty: int_ty,
+                    },
+                )?;
+                let cond = this.emit_typed_temp(
+                    bool_ty,
+                    RValue::Binary {
+                        op: BinaryOp::LessThan,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: Operand::Place(this.local_place(len)),
+                        ty: bool_ty,
+                    },
+                )?;
+                let then_block = this.with_nested_block(|this| {
+                    let entry = this.emit_typed_temp(
+                        entry_ty,
+                        RValue::MapEntryAt {
+                            map: root.clone(),
+                            index,
+                            ty: entry_ty,
+                        },
+                    )?;
+                    let key_arg = Self::tuple_field_operand(entry.clone(), 0, key);
+                    let value_arg = Self::tuple_field_operand(entry.clone(), 1, value);
+                    let keep = this.lower_filter_keep(
+                        predicate,
+                        &callback,
+                        vec![key_arg.clone(), value_arg.clone()],
+                        remove_matches,
+                    )?;
+                    let keep_block = this.with_nested_block(|this| {
+                        this.emit_eval(RValue::MapInsert {
+                            map: this.local_place(kept),
+                            key: key_arg,
+                            value: value_arg,
+                            kind: MapWriteKind::StructuralInsert,
+                        })?;
+                        this.terminate(AirTail::Continue(id))
+                    })?;
+                    let discard_block = AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Continue(id),
+                    };
+                    this.ensure_open()?;
+                    this.block.stmts.push(AirStmt::If(AirIf {
+                        cond: keep,
+                        then_block: keep_block,
+                        else_block: Some(discard_block),
+                    }));
+                    Ok(())
+                })?;
+                let else_block = AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Break(id),
+                };
+                this.ensure_open()?;
+                this.block.stmts.push(AirStmt::If(AirIf {
+                    cond,
+                    then_block,
+                    else_block: Some(else_block),
+                }));
+                Ok(())
+            })?;
+            this.ensure_open()?;
+            this.block.stmts.push(AirStmt::Loop(AirLoop {
+                id,
+                body: loop_body,
+            }));
+            Ok(())
+        })?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionLoan(AirCollectionLoan {
+                root: root.clone(),
+                root_kind: AirCollectionRootKind::Map,
+                mode: AirCollectionLoanMode::ReadonlyMap,
+                body,
+            }));
+        self.emit_assign(
+            root.clone(),
+            RValue::Use(Operand::Place(self.local_place(kept))),
+        )
+    }
+
+    fn lower_filter_callback(&mut self, predicate: &ExprNode) -> Result<Operand, LowerError> {
+        self.lower_value(predicate)
+    }
+
+    fn lower_filter_call_args(
+        &self,
+        site: &ExprNode,
+        callback: &Operand,
+        args: Vec<Operand>,
+    ) -> Result<Vec<CallArg>, LowerError> {
+        let TypeData::Function(sig) = self.cx.program.type_data(self.operand_ty(callback)) else {
+            return Err(unsupported_expr(site));
+        };
+        if sig.params.len() != args.len() {
+            return Err(unsupported_expr(site));
+        }
+        args.into_iter()
+            .zip(&sig.params)
+            .map(|(arg, param)| match param.mode {
+                ParamMode::Value => Ok(CallArg::Value(arg)),
+                ParamMode::SharedBorrow => match arg {
+                    Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
+                    Operand::Const(_) => Err(unsupported_expr(site)),
+                },
+                ParamMode::MutBorrow => Err(unsupported_expr(site)),
+            })
+            .collect()
+    }
+
+    fn lower_filter_keep(
+        &mut self,
+        predicate: &ExprNode,
+        callback: &Operand,
+        args: Vec<Operand>,
+        remove_matches: bool,
+    ) -> Result<Operand, LowerError> {
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let args = self.lower_filter_call_args(predicate, callback, args)?;
+        let matched = self.emit_typed_temp(
+            bool_ty,
+            RValue::Call {
+                callee: Callee::Lambda(callback.clone()),
+                args,
+            },
+        )?;
+        if !remove_matches {
+            return Ok(matched);
+        }
+        self.emit_typed_temp(
+            bool_ty,
+            RValue::Unary {
+                op: ast::UnaryOp::Not,
+                value: matched,
+                ty: bool_ty,
+            },
+        )
+    }
+
+    fn lower_list_for_each_effect(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Ok(false);
+        };
+        if field.node.field.as_str() != "for_each" || call.node.args.len() != 1 {
+            return Ok(false);
+        }
+        let Some(target) = self.facts.calls.get(&expr.node.id) else {
+            return Ok(false);
+        };
+        if !is_lowered_collection_stub(&target.id) {
+            return Ok(false);
+        }
+        let root = self.lower_method_target(&field.node.target)?;
+        let Some(elem) = typing::list_elem(&self.cx.program, root.ty) else {
+            return Ok(false);
+        };
+        self.require_mutable_place(expr, &root)?;
+        let callback = self.lower_value(&call.node.args[0])?;
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
+        let len = self.for_len_local()?;
+        let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let slot = self.push_local(None, None, elem, AirMutability::Mutable, LocalKind::Temp);
+        let one = self.int_const(1)?;
+        let step = self.emit_typed_temp(int_ty, RValue::Use(one))?;
+        let id = self.alloc_loop();
+        let body = self.with_nested_block(|this| {
+            this.emit_init(
+                len,
+                RValue::Len {
+                    source: root.clone(),
+                },
+            )?;
+            let zero = this.int_const(0)?;
+            this.emit_init(
+                index,
+                RValue::Binary {
+                    op: BinaryOp::Sub,
+                    lhs: zero,
+                    rhs: step.clone(),
+                    ty: int_ty,
+                },
+            )?;
+            let loop_body = this.with_nested_block(|this| {
+                this.emit_assign(
+                    this.local_place(index),
+                    RValue::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: step.clone(),
+                        ty: int_ty,
+                    },
+                )?;
+                let cond = this.emit_typed_temp(
+                    bool_ty,
+                    RValue::Binary {
+                        op: BinaryOp::LessThan,
+                        lhs: Operand::Place(this.local_place(index)),
+                        rhs: Operand::Place(this.local_place(len)),
+                        ty: bool_ty,
+                    },
+                )?;
+                let then_block = this.with_nested_block(|this| {
+                    let slot_body = this.with_nested_block(|this| {
+                        this.emit_eval(RValue::Call {
+                            callee: Callee::Lambda(callback.clone()),
+                            args: vec![CallArg::MutBorrow(this.local_place(slot))],
+                        })?;
+                        if !this.terminated {
+                            this.terminate(AirTail::Continue(id))?;
+                        }
+                        Ok(())
+                    })?;
+                    this.ensure_open()?;
+                    this.block
+                        .stmts
+                        .push(AirStmt::CollectionSlotScope(AirCollectionSlotScope {
+                            root: root.clone(),
+                            index,
+                            slots: vec![AirCollectionSlot {
+                                kind: AirCollectionSlotKind::SequenceElement,
+                                local: slot,
+                                ty: elem,
+                                mutable: true,
+                            }],
+                            body: slot_body,
+                        }));
+                    Ok(())
+                })?;
+                let else_block = AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Break(id),
+                };
+                this.ensure_open()?;
+                this.block.stmts.push(AirStmt::If(AirIf {
+                    cond,
+                    then_block,
+                    else_block: Some(else_block),
+                }));
+                Ok(())
+            })?;
+            this.ensure_open()?;
+            this.block.stmts.push(AirStmt::Loop(AirLoop {
+                id,
+                body: loop_body,
+            }));
+            Ok(())
+        })?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionLoan(AirCollectionLoan {
+                root,
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::MutableSequenceElement,
+                body,
+            }));
+        Ok(true)
+    }
+
     fn lower_list_push_call(
         &mut self,
         expr: &ExprNode,
@@ -5821,10 +6408,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_method_target(&mut self, target: &ExprNode) -> Result<Place, LowerError> {
         match self.lower_place_arg(target, true) {
             Ok(place) => Ok(place),
-            Err(LowerError::MissingLocalUse { .. }) => self
-                .lambda_capture_place_by_name(target)
-                .or_else(|_| self.named_local_place(target)),
-            Err(LowerError::UnsupportedExpr { kind: "Ident", .. }) => self
+            Err(
+                LowerError::MissingLocalUse { .. }
+                | LowerError::UnsupportedExpr { kind: "Ident", .. }
+                | LowerError::MissingExprType { .. },
+            ) => self
                 .lambda_capture_place_by_name(target)
                 .or_else(|_| self.named_local_place(target)),
             Err(err) => Err(err),
@@ -6104,6 +6692,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ExprKind::IfLet(if_let) => self.lower_if_let_effect(if_let),
             ExprKind::Match(match_expr) => self.lower_match_effect(expr, match_expr),
             ExprKind::Call(call) => {
+                if self.lower_collection_filter_effect(expr, call)?
+                    || self.lower_list_for_each_effect(expr, call)?
+                {
+                    return Ok(());
+                }
                 let value = self.lower_call_rvalue(expr, call)?;
                 self.emit_eval(value)
             }
@@ -6395,6 +6988,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
 
     fn emit_typed_temp(&mut self, ty: TypeId, value: RValue) -> Result<Operand, LowerError> {
         let local = self.temp(ty);
+        self.emit_init(local, value)?;
+        Ok(self.operand_place(local))
+    }
+
+    fn emit_mut_typed_temp(&mut self, ty: TypeId, value: RValue) -> Result<Operand, LowerError> {
+        let local = self.push_local(None, None, ty, AirMutability::Mutable, LocalKind::Temp);
         self.emit_init(local, value)?;
         Ok(self.operand_place(local))
     }
@@ -8168,12 +8767,33 @@ fn enqueue_body_references(
     Ok(())
 }
 
+fn sequence_filter_remove_matches(
+    effect: collection_effect::SequenceStructuralEffect,
+) -> Option<bool> {
+    match effect {
+        collection_effect::SequenceStructuralEffect::Retain => Some(false),
+        collection_effect::SequenceStructuralEffect::RemoveWhere => Some(true),
+        collection_effect::SequenceStructuralEffect::Push
+        | collection_effect::SequenceStructuralEffect::Pop
+        | collection_effect::SequenceStructuralEffect::SortBy => None,
+    }
+}
+
+fn map_filter_remove_matches(effect: collection_effect::MapStructuralEffect) -> Option<bool> {
+    match effect {
+        collection_effect::MapStructuralEffect::Retain => Some(false),
+        collection_effect::MapStructuralEffect::RemoveWhere => Some(true),
+        collection_effect::MapStructuralEffect::Insert
+        | collection_effect::MapStructuralEffect::Remove => None,
+    }
+}
+
 fn is_lowered_collection_stub(id: &CallableId) -> bool {
     matches!(
         (id.kind, id.name.as_str()),
         (
             CallableKind::ExtendMethod(MethodSurface::Instance),
-            "push" | "insert" | "remove"
+            "push" | "for_each" | "retain" | "remove_where" | "insert" | "remove"
         )
     ) && id.module.is_core_module("collections")
 }
