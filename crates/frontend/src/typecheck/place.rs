@@ -599,6 +599,23 @@ impl PlaceValue {
     }
 }
 
+pub(super) fn project_index_value(
+    target: &PlaceValue,
+    checked: CheckedType,
+    target_id: ExprId,
+    index: &ExprNode,
+    value_id: ExprId,
+    tc: &mut TypeChecker,
+) -> PlaceValue {
+    tc.closure.copy_place_identity(target_id, value_id);
+    target.projected(
+        checked,
+        projected_field_access(target.access),
+        target.facts.clone(),
+        target.identity.clone().index_by(index_identity(index, tc)),
+    )
+}
+
 pub(super) enum FieldValueResult {
     Value(Box<PlaceValue>, bool),
     StaticOnValue(Type),
@@ -838,22 +855,26 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::Index(index) = &expr.node.kind {
         let target = check_place_inner(&index.node.target, tc);
-        tc.closure
-            .copy_place_identity(index.node.target.node.id, expr.node.id);
         let indexed = check_index_access(index, &target.value.checked, tc);
-        let mut checked = super::checked_from_type(expr, indexed.write_ty, tc);
+        let ty = indexed
+            .write_ty
+            .as_ref()
+            .unwrap_or(&indexed.read_ty)
+            .clone();
+        let mut checked = super::checked_from_type(expr, ty, tc);
         checked.contains_extern_any = indexed.contains_extern_any;
-        let access = projected_field_access(target.value.access);
-        let value = target.value.projected(
-            checked,
-            access,
-            target.value.facts.clone(),
-            target
-                .value
-                .identity
-                .clone()
-                .index_by(index_identity(&index.node.index, tc)),
-        );
+        let value = if indexed.write_ty.is_some() {
+            project_index_value(
+                &target.value,
+                checked,
+                index.node.target.node.id,
+                &index.node.index,
+                expr.node.id,
+                tc,
+            )
+        } else {
+            PlaceValue::not_place(checked)
+        };
         return CheckedPlace {
             value,
             accepts_extern_any: target.accepts_extern_any,

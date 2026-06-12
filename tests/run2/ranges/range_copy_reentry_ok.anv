@@ -1,11 +1,17 @@
 // @mode: run
 // @frontend: new
-// @expect: error
-// @contains: cannot structurally mutate collection during active iteration or slice view
+// @expect: success
+// @match-begin
+// 4
+// 1
+// @match-end
 
 fn mutate(xs: slice[int], var owner: [int]) {
     owner.push(4);
-    println(xs[0]);
+    let appended = owner[3];
+    let first = xs[0];
+    println(appended);
+    println(first);
 }
 
 fn main() {

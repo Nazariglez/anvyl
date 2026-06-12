@@ -540,6 +540,31 @@ impl<T> AnvSlice<T> {
         }
     }
 
+    /// # Safety
+    ///
+    /// `convert` must not access, mutate, move, or invalidate the slice root while it receives element references.
+    pub unsafe fn copy_range_with<U: Clone>(
+        &self,
+        range: Range<usize>,
+        mut convert: impl FnMut(&T) -> U,
+    ) -> Result<AnvList<U>, RuntimeError> {
+        let absolute = self.check_view_range(range)?;
+        match self.root {
+            SliceRoot::Raw { ptr, .. } => unsafe {
+                Ok(AnvList::from_elems(absolute.map(|index| {
+                    convert(ptr.as_ptr().add(index).as_ref().unwrap())
+                })))
+            },
+            SliceRoot::List { list } => unsafe {
+                let list = list.as_ref();
+                self.check_stable()?;
+                Ok(AnvList::from_elems(
+                    list.as_slice()[absolute].iter().map(convert),
+                ))
+            },
+        }
+    }
+
     pub fn with_elem_mut_short<R>(
         &mut self,
         index: i64,
@@ -579,17 +604,24 @@ impl<T> AnvSlice<T> {
             .version()
     }
 
-    fn check_view_index(&self, index: i64) -> Result<usize, RuntimeError> {
-        let Some(end) = self.start.checked_add(self.len) else {
+    fn check_view_range(&self, range: Range<usize>) -> Result<Range<usize>, RuntimeError> {
+        let Some(view_end) = self.start.checked_add(self.len) else {
             return Err(RuntimeError::new("slice range out of bounds"));
         };
         let root_len = match self.root {
             SliceRoot::Raw { len, .. } => len,
             SliceRoot::List { list } => unsafe { list.as_ref().len() },
         };
-        if end > root_len {
+        if view_end > root_len || range.start > range.end || range.end > self.len {
             return Err(RuntimeError::new("slice range out of bounds"));
         }
+        let start = self.start + range.start;
+        let end = self.start + range.end;
+        Ok(start..end)
+    }
+
+    fn check_view_index(&self, index: i64) -> Result<usize, RuntimeError> {
+        self.check_view_range(0..self.len)?;
         let index =
             usize::try_from(index).map_err(|_| RuntimeError::new("negative slice index"))?;
         if index < self.len {
@@ -952,6 +984,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(list.as_slice(), &[1, 2, 8]);
+    }
+
+    #[test]
+    fn slice_copy_range_copies_views() {
+        let values = [1_i64, 2, 3, 4];
+        let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
+        let copy = unsafe { slice.copy_range_with(1..3, |value| *value * 10) }.unwrap();
+        assert_eq!(copy.as_slice(), &[30, 40]);
+
+        let list = AnvList::from_elems(values);
+        let guard = list.begin_shape_loan().unwrap();
+        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 1, 3, guard) };
+        let copy = unsafe { slice.copy_range_with(0..2, |value| *value) }.unwrap();
+        assert_eq!(copy.as_slice(), &[2, 3]);
+
+        let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
+        let copy = unsafe { slice.slice(1, 2).copy_range_with(0..2, |value| *value) }.unwrap();
+        assert_eq!(copy.as_slice(), &[3, 4]);
+    }
+
+    #[test]
+    fn slice_copy_range_result_has_independent_loan_state() {
+        let mut list = AnvList::from_elems([1_i64, 2, 3]);
+        let guard = list.begin_shape_loan().unwrap();
+        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 0, 3, guard) };
+        let mut copy = unsafe { slice.copy_range_with(0..2, |value| *value) }.unwrap();
+
+        drop(slice);
+        list.push(4).unwrap();
+        copy.push(9).unwrap();
+
+        assert_eq!(list.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(copy.as_slice(), &[1, 2, 9]);
     }
 
     #[test]

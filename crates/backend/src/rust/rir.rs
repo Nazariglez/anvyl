@@ -622,7 +622,7 @@ pub enum RirRValue {
         mutable: bool,
         ty: RirTypeId,
     },
-    ListSlice {
+    RangeListCopy {
         source: RirPlace,
         start: RirLocalId,
         end: RirLocalId,
@@ -3468,19 +3468,12 @@ impl VerifyCx<'_> {
                 {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
-                match self.ty(source.ty) {
-                    Some(
-                        RirType::Array {
-                            elem: source_elem, ..
-                        }
-                        | RirType::List(source_elem)
-                        | RirType::Slice(source_elem),
-                    ) if source_elem == elem => {}
-                    _ => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                if self.sequence_elem(source.ty) != Some(elem) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 Some(*ty)
             }
-            RirRValue::ListSlice {
+            RirRValue::RangeListCopy {
                 source,
                 start,
                 end,
@@ -3492,13 +3485,10 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                match self.ty(source.ty) {
-                    Some(RirType::List(source_elem)) if source_elem == elem => {
-                        if !RustRepPolicy::new(self.program).shareable_value(elem) {
-                            self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
-                        }
-                    }
-                    _ => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                if self.sequence_elem(source.ty) != Some(elem) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                } else if !RustRepPolicy::new(self.program).shareable_value(elem) {
+                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
                 Some(*ty)
             }
@@ -4462,6 +4452,13 @@ impl VerifyCx<'_> {
 
     fn ty(&self, id: RirTypeId) -> Option<RirType> {
         self.program.types.get(id.index()).copied()
+    }
+
+    fn sequence_elem(&self, id: RirTypeId) -> Option<RirTypeId> {
+        match self.ty(id)? {
+            RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => Some(elem),
+            _ => None,
+        }
     }
 
     fn type_id(&self, target: RirType) -> Option<RirTypeId> {

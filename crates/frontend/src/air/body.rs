@@ -328,7 +328,7 @@ pub enum RValue {
         list: Place,
         ty: TypeId,
     },
-    ListSlice {
+    RangeListCopy {
         source: Place,
         start: LocalId,
         end: LocalId,

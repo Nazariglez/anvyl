@@ -298,7 +298,7 @@ pub(crate) fn rvalue_ty(
         | RValue::Aggregate { ty, .. }
         | RValue::OptionalSome { ty, .. }
         | RValue::ListPop { ty, .. }
-        | RValue::ListSlice { ty, .. }
+        | RValue::RangeListCopy { ty, .. }
         | RValue::MapGet { ty, .. }
         | RValue::MapRemove { ty, .. }
         | RValue::MapEntryAt { ty, .. }

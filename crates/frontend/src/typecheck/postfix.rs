@@ -619,20 +619,22 @@ fn apply_index(
     };
 
     place::record_value_read(node.node.target.node.id, target, tc);
-    tc.closure.copy_place_identity(node.node.target.node.id, id);
     let indexed = check_index_access_inner(node, &target.checked, tc);
     let mut checked = checked_type(indexed.read_ty, tc);
     checked.contains_extern_any = indexed.contains_extern_any;
 
-    let value = target.projected(
-        checked,
-        place::projected_field_access(target.access),
-        target.facts.clone(),
-        target
-            .identity
-            .clone()
-            .index_by(place::index_identity(&node.node.index, tc)),
-    );
+    let value = if indexed.write_ty.is_some() {
+        place::project_index_value(
+            target,
+            checked,
+            node.node.target.node.id,
+            &node.node.index,
+            id,
+            tc,
+        )
+    } else {
+        PlaceValue::not_place(checked)
+    };
     if !optional_chain {
         tc.record_expr_place(id, &value);
     }
@@ -776,44 +778,30 @@ fn check_receiver_value(expr: &ExprNode, tc: &mut TypeChecker) -> PlaceValue {
     let ExprKind::Index(index) = &expr.node.kind else {
         return materialized_receiver_value(expr.node.id, place::check_place(expr, tc).value);
     };
-    if matches!(index.node.index.node.kind, ExprKind::Range(_))
-        && let Some(value) = slice_range_place_value(expr, tc)
-    {
-        return value;
-    }
 
     let target = place::check_place(&index.node.target, tc);
     let indexed = check_index_access(index, &target.value.checked, tc);
-    let indexed_place = !index.node.safe
-        && matches!(
-            &target.value.checked.ty,
-            Type::List { .. } | Type::Array { .. } | Type::Slice { .. }
-        );
-    let ty = if indexed_place {
-        indexed.write_ty
-    } else {
-        indexed.read_ty
-    };
+    let ty = indexed
+        .write_ty
+        .as_ref()
+        .unwrap_or(&indexed.read_ty)
+        .clone();
     let mut checked = checked_from_type(expr, ty, tc);
     checked.contains_extern_any = indexed.contains_extern_any;
 
-    if indexed_place {
-        tc.closure
-            .copy_place_identity(index.node.target.node.id, expr.node.id);
-        return target.value.projected(
+    if indexed.write_ty.is_some() {
+        return place::project_index_value(
+            &target.value,
             checked,
-            place::projected_field_access(target.value.access),
-            target.value.facts.clone(),
-            target
-                .value
-                .identity
-                .clone()
-                .index_by(place::index_identity(&index.node.index, tc)),
+            index.node.target.node.id,
+            &index.node.index,
+            expr.node.id,
+            tc,
         );
     }
 
     place::record_value_read(index.node.target.node.id, &target.value, tc);
-    materialized_receiver_value(expr.node.id, PlaceValue::not_place(checked))
+    PlaceValue::not_place(checked)
 }
 
 fn materialized_receiver_value(expr_id: ExprId, mut value: PlaceValue) -> PlaceValue {
@@ -1950,10 +1938,6 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
 }
 
 fn check_mutable_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> SourceArgCheck {
-    if let Some(checked) = check_mutable_slice_range_arg(arg, param, tc) {
-        return checked;
-    }
-
     let place = place::check_place(arg, tc);
     let name = super::assignment_target_name(arg);
     let mutability_error = place
@@ -1994,55 +1978,6 @@ fn reject_var_arg(
         failed: tc.solve_constraints(),
         mutable_arg: None,
     }
-}
-
-fn slice_range_place_value(expr: &ExprNode, tc: &mut TypeChecker) -> Option<PlaceValue> {
-    let ExprKind::Index(index) = &expr.node.kind else {
-        return None;
-    };
-    if !matches!(index.node.index.node.kind, ExprKind::Range(_)) {
-        return None;
-    }
-
-    let target = slice_range_place_value(&index.node.target, tc)
-        .unwrap_or_else(|| place::check_place(&index.node.target, tc).value);
-    let indexed = check_index_access(index, &target.checked, tc);
-    let mut checked = checked_from_type(expr, indexed.read_ty, tc);
-    checked.contains_extern_any = indexed.contains_extern_any;
-    tc.closure
-        .copy_place_identity(index.node.target.node.id, expr.node.id);
-    Some(
-        target.projected(
-            checked,
-            place::projected_field_access(target.access),
-            target.facts.clone(),
-            target
-                .identity
-                .clone()
-                .index_by(place::index_identity(&index.node.index, tc)),
-        ),
-    )
-}
-
-fn check_mutable_slice_range_arg(
-    arg: &ExprNode,
-    param: &CallParam,
-    tc: &mut TypeChecker,
-) -> Option<SourceArgCheck> {
-    if !matches!(tc.handle_type(&param.ty), Type::Slice { .. }) {
-        return None;
-    }
-    let value = slice_range_place_value(arg, tc)?;
-
-    if let Some(error) = value.access.error_for(
-        MutableUseKind::VarArg(super::assignment_target_name(arg)),
-        tc.error_span(arg.span),
-    ) {
-        tc.push_error(error);
-        return Some(reject_var_arg(arg, param, &value.checked, tc));
-    }
-
-    Some(finish_var_arg(arg, param, &value, tc))
 }
 
 fn finish_var_arg(
@@ -2804,12 +2739,17 @@ pub(super) fn check_tuple_index_access(
 
 pub(super) struct CheckedIndex {
     pub(super) read_ty: Type,
-    pub(super) write_ty: Type,
+    pub(super) write_ty: Option<Type>,
     pub(super) contains_extern_any: bool,
 }
 
 impl CheckedIndex {
-    fn new(read_ty: Type, write_ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+    fn new(
+        read_ty: Type,
+        write_ty: Option<Type>,
+        target: &CheckedType,
+        index: &CheckedType,
+    ) -> Self {
         Self {
             read_ty,
             write_ty,
@@ -2817,12 +2757,20 @@ impl CheckedIndex {
         }
     }
 
-    fn same(ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
-        Self::new(ty.clone(), ty, target, index)
+    fn projected(read_ty: Type, write_ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self::new(read_ty, Some(write_ty), target, index)
+    }
+
+    fn same_projected(ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self::projected(ty.clone(), ty, target, index)
+    }
+
+    fn value(read_ty: Type, target: &CheckedType, index: &CheckedType) -> Self {
+        Self::new(read_ty, None, target, index)
     }
 
     fn infer(target: &CheckedType, index: &CheckedType) -> Self {
-        Self::same(Type::Infer, target, index)
+        Self::value(Type::Infer, target, index)
     }
 }
 
@@ -2856,7 +2804,7 @@ fn check_index_access_inner(
                     span: tc.error_span(node.node.index.span),
                 });
             }
-            CheckedIndex::same((**elem).clone(), target, &index)
+            CheckedIndex::same_projected((**elem).clone(), target, &index)
         }
         Type::Map { key, value } => {
             let key_handle = tc.type_handle(key);
@@ -2865,7 +2813,7 @@ fn check_index_access_inner(
             tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
             tc.solve_constraints();
             let value = (**value).clone();
-            CheckedIndex::new(
+            CheckedIndex::projected(
                 tc.core_option_or_infer(value.clone(), node.span),
                 value,
                 target,
@@ -2906,12 +2854,7 @@ fn check_range_index_access(
                     span: tc.error_span(node.node.index.span),
                 });
             }
-            CheckedIndex::new(
-                Type::Slice { elem: elem.clone() },
-                Type::Infer,
-                target,
-                &index,
-            )
+            CheckedIndex::value(Type::List { elem: elem.clone() }, target, &index)
         }
         Type::Infer => CheckedIndex::infer(target, &index),
         found => {

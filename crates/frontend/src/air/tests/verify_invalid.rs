@@ -370,7 +370,7 @@ fn structured_slice_bounds_must_be_initialized() {
     let func_id = builder.alloc_function(fb.finish());
     let body = AirBody {
         block: AirBlock {
-            stmts: vec![AirStmt::Eval(RValue::ListSlice {
+            stmts: vec![AirStmt::Eval(RValue::RangeListCopy {
                 source: place(list, list_ty),
                 start,
                 end,

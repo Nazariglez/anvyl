@@ -13461,88 +13461,134 @@ mod slices {
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
 
-    #[test]
-    fn list_slice_rebuilds_owned_list_without_clone() {
+    #[derive(Clone, Copy)]
+    enum RangeCopySource {
+        List,
+        Array,
+        SliceParam,
+    }
+
+    fn range_copy_len_program(source: RangeCopySource) -> Program {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let list = program.alloc_type(TypeData::List(int));
+        let array = program.alloc_type(TypeData::Array { elem: int, len: 3 });
+        let slice = program.alloc_type(TypeData::Slice(int));
+        let source_ty = match source {
+            RangeCopySource::List => list,
+            RangeCopySource::Array => array,
+            RangeCopySource::SliceParam => slice,
+        };
         let module = program.alloc_module(root_module());
         let zero = int_const(&mut program, int, 0);
         let two = int_const(&mut program, int, 2);
-        let list_local = air::LocalId::from_index(0);
+        let source_local = air::LocalId::from_index(0);
         let start_local = air::LocalId::from_index(1);
         let end_local = air::LocalId::from_index(2);
-        let slice_local = air::LocalId::from_index(3);
+        let copy_local = air::LocalId::from_index(3);
         let len_local = air::LocalId::from_index(4);
+        let mut stmts = vec![];
+        let source_ctor = match source {
+            RangeCopySource::List => Some(AggregateCtor::List),
+            RangeCopySource::Array => Some(AggregateCtor::Array),
+            RangeCopySource::SliceParam => None,
+        };
+        if let Some(kind) = source_ctor {
+            stmts.push(Statement::Init {
+                local: source_local,
+                value: RValue::Aggregate {
+                    kind,
+                    fields: vec![
+                        Operand::Const(zero),
+                        Operand::Const(two),
+                        Operand::Const(two),
+                    ],
+                    ty: source_ty,
+                },
+            });
+        }
+        stmts.extend([
+            Statement::Init {
+                local: start_local,
+                value: RValue::Use(Operand::Const(zero)),
+            },
+            Statement::Init {
+                local: end_local,
+                value: RValue::Use(Operand::Const(two)),
+            },
+            Statement::Init {
+                local: copy_local,
+                value: RValue::RangeListCopy {
+                    source: place(source_local, source_ty),
+                    start: start_local,
+                    end: end_local,
+                    inclusive: false,
+                    ty: list,
+                },
+            },
+            Statement::Init {
+                local: len_local,
+                value: RValue::Len {
+                    source: place(copy_local, list),
+                },
+            },
+        ]);
+        let source_is_param = matches!(source, RangeCopySource::SliceParam);
+        let source_kind = if source_is_param {
+            LocalKind::Arg
+        } else {
+            LocalKind::Temp
+        };
+        let params = if source_is_param {
+            vec![param("xs", slice, ParamMode::Value, source_local)]
+        } else {
+            vec![]
+        };
         let main = program.alloc_function(Function {
             name: Ident::new("main"),
             module,
             kind: FunctionKind::Normal,
             owner: None,
             specialization: None,
-            signature: Signature::new(vec![], int),
+            signature: Signature::new(params, int),
             locals: vec![
-                local(list, LocalKind::Temp),
+                local(source_ty, source_kind),
                 local(int, LocalKind::Temp),
                 local(int, LocalKind::Temp),
                 local(list, LocalKind::Temp),
                 local(int, LocalKind::Temp),
             ],
             body: structured_body(
-                vec![
-                    Statement::Init {
-                        local: list_local,
-                        value: RValue::Aggregate {
-                            kind: AggregateCtor::List,
-                            fields: vec![
-                                Operand::Const(zero),
-                                Operand::Const(two),
-                                Operand::Const(two),
-                            ],
-                            ty: list,
-                        },
-                    },
-                    Statement::Init {
-                        local: start_local,
-                        value: RValue::Use(Operand::Const(zero)),
-                    },
-                    Statement::Init {
-                        local: end_local,
-                        value: RValue::Use(Operand::Const(two)),
-                    },
-                    Statement::Init {
-                        local: slice_local,
-                        value: RValue::ListSlice {
-                            source: place(list_local, list),
-                            start: start_local,
-                            end: end_local,
-                            inclusive: true,
-                            ty: list,
-                        },
-                    },
-                    Statement::Init {
-                        local: len_local,
-                        value: RValue::Len {
-                            source: place(slice_local, list),
-                        },
-                    },
-                ],
+                stmts,
                 air::AirTail::Return(Some(Operand::Place(place(len_local, int)))),
             ),
         });
         program.module_mut(module).functions.push(main);
-        program.set_entry(main);
+        if !source_is_param {
+            program.set_entry(main);
+        }
+        program
+    }
 
-        let source = plan_source(program);
-        let text = source.as_str();
-        assert!(text.contains("anvyx_runtime::AnvList::from_elems("));
-        assert!(text.contains("anvyx_runtime::checked_range(v1, v2, true, v0.len())"));
-        assert!(text.contains(".iter().map(|item|"));
-        assert!(!text.contains("negative range bound"));
-        assert!(!text.contains("range out of bounds"));
-        assert!(!text.contains("clone"));
-        let output = run_source(source);
-        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    #[test]
+    fn list_and_array_range_list_copy_use_iter_branch() {
+        for source in [RangeCopySource::List, RangeCopySource::Array] {
+            let source = plan_source(range_copy_len_program(source));
+            let text = source.as_str();
+            assert!(text.contains("anvyx_runtime::AnvList::from_elems("));
+            assert!(text.contains("anvyx_runtime::checked_range(v1, v2, false, v0.len())"));
+            assert!(text.contains(".iter().map(|item| *(item))"));
+            assert!(!text.contains("copy_range_with"));
+            let output = run_source(source);
+            assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+        }
+    }
+
+    #[test]
+    fn slice_range_list_copy_uses_runtime_helper_and_fallible_result() {
+        let source = plan_source(range_copy_len_program(RangeCopySource::SliceParam)).into_string();
+        assert!(source.contains("unsafe { v0.copy_range_with(anvyx_runtime::checked_range(v1, v2, false, v0.len()), |item| *(item)) }?"));
+        assert!(source.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
     }
 
     #[test]
@@ -13614,7 +13660,7 @@ mod slices {
     }
 
     #[test]
-    fn string_list_slice_is_supported() {
+    fn string_range_list_copy_is_supported() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let int = program.alloc_type(TypeData::Int);
@@ -13665,7 +13711,7 @@ mod slices {
                     },
                     Statement::Init {
                         local: out_local,
-                        value: RValue::ListSlice {
+                        value: RValue::RangeListCopy {
                             source: place(list_local, list),
                             start: start_local,
                             end: end_local,

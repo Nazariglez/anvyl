@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extend<T> slice[T] {
+    fn first(self) -> T {
+        self[0]
+    }
+}
+
+fn main() {
+    let xs: [int] = [1, 2, 3, 4];
+    let first = xs[1..3].first();
+}

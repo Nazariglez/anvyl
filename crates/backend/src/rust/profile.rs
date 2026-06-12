@@ -565,14 +565,14 @@ impl ProfileCx<'_> {
                 end,
                 ty,
                 ..
-            } => self.check_slice_rvalue(site, source, *start, *end, *ty, false),
-            RValue::ListSlice {
+            } => self.check_range_rvalue(site, source, *start, *end, *ty, false),
+            RValue::RangeListCopy {
                 source,
                 start,
                 end,
                 ty,
                 ..
-            } => self.check_slice_rvalue(site, source, *start, *end, *ty, true),
+            } => self.check_range_rvalue(site, source, *start, *end, *ty, true),
             RValue::MapGet { map, key, ty } | RValue::MapRemove { map, key, ty } => {
                 self.check_place(site, map);
                 if matches!(value, RValue::MapRemove { .. })
@@ -827,14 +827,43 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn check_slice_rvalue(
+    fn check_range_rvalue(
         &mut self,
         site: ProfileSite,
         source: &Place,
         start: LocalId,
         end: LocalId,
         ty: TypeId,
-        owned: bool,
+        copied: bool,
+    ) {
+        self.check_range_locals(site, source, start, end);
+        let source_elem = match self.program.type_arena.data(source.ty) {
+            TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem) => *elem,
+            _ => {
+                self.push(site, ProfileErrorKind::UnsupportedRValue);
+                return;
+            }
+        };
+        let result_elem = match (copied, self.program.type_arena.data(ty)) {
+            (false, TypeData::Slice(elem)) | (true, TypeData::List(elem)) => *elem,
+            _ => {
+                self.push(site, ProfileErrorKind::UnsupportedRValue);
+                return;
+            }
+        };
+        if source_elem != result_elem {
+            self.push(site, ProfileErrorKind::UnsupportedRValue);
+        } else if copied && !self.policy().value_place_shareable(result_elem) {
+            self.push(site, ProfileErrorKind::NonCopyValueRequired);
+        }
+    }
+
+    fn check_range_locals(
+        &mut self,
+        site: ProfileSite,
+        source: &Place,
+        start: LocalId,
+        end: LocalId,
     ) {
         self.check_place(site, source);
         for local in [start, end] {
@@ -845,27 +874,6 @@ impl ProfileCx<'_> {
             if !matches!(self.program.type_arena.data(data.ty), TypeData::Int) {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
-        }
-        match (
-            owned,
-            self.program.type_arena.data(source.ty),
-            self.program.type_arena.data(ty),
-        ) {
-            (
-                false,
-                TypeData::Array {
-                    elem: source_elem, ..
-                }
-                | TypeData::List(source_elem)
-                | TypeData::Slice(source_elem),
-                TypeData::Slice(elem),
-            ) if source_elem == elem => {}
-            (true, TypeData::List(source_elem), TypeData::List(elem)) if source_elem == elem => {
-                if !self.policy().value_place_shareable(*elem) {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                }
-            }
-            _ => self.push(site, ProfileErrorKind::UnsupportedRValue),
         }
     }
 

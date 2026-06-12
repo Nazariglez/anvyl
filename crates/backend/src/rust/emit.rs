@@ -1464,13 +1464,13 @@ impl EmitCx<'_> {
                 mutable,
                 ..
             } => self.slice_view(function, source, *start, *end, *inclusive, *mutable),
-            RirRValue::ListSlice {
+            RirRValue::RangeListCopy {
                 source,
                 start,
                 end,
                 inclusive,
                 ..
-            } => self.list_slice(function, source, *start, *end, *inclusive),
+            } => self.range_list_copy(function, source, *start, *end, *inclusive),
             RirRValue::MapGet { map, key, ty } => {
                 let RirType::Option(value_ty) = self.program.types[ty.index()] else {
                     unreachable!("verified map get result")
@@ -2164,7 +2164,7 @@ impl EmitCx<'_> {
         block_expr(lines, Some(view))
     }
 
-    fn list_slice(
+    fn range_list_copy(
         &self,
         function: &RirFunction,
         source: &RirPlace,
@@ -2176,14 +2176,24 @@ impl EmitCx<'_> {
         let start = function.locals[start.index()].symbol.as_str();
         let end = function.locals[end.index()].symbol.as_str();
         let range = target::checked_range(start, end, inclusive, &format!("{source_expr}.len()"));
-        let RirType::List(elem) = self.program.types[source.ty.index()] else {
-            unreachable!("verified list slice source")
+        let (elem, slice_source) = match self.program.types[source.ty.index()] {
+            RirType::List(elem) | RirType::Array { elem, .. } => (elem, false),
+            RirType::Slice(elem) => (elem, true),
+            _ => unreachable!("verified range list copy source"),
         };
         let values = RustValues::new(self.program, function);
-        target::anv_list_from_iter(&format!(
-            "{source_expr}[{range}].iter().map(|item| {})",
-            values.value_from_ref(elem, "item")
-        ))
+        let item = "item";
+        let body = values.value_from_ref(elem, item);
+        if slice_source {
+            format!(
+                "{}?",
+                target::anv_slice_copy_range_with(&source_expr, &range, item, &body)
+            )
+        } else {
+            target::anv_list_from_iter(&format!(
+                "{source_expr}[{range}].iter().map(|{item}| {body})"
+            ))
+        }
     }
 
     fn string_concat(&self, function: &RirFunction, parts: &[RirOperand]) -> String {

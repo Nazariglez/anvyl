@@ -2297,7 +2297,7 @@ impl<'a> PlanCx<'a> {
                 mutable: false,
                 ty: self.type_map[ty],
             }),
-            RValue::ListSlice {
+            RValue::RangeListCopy {
                 source,
                 start,
                 end,
@@ -2310,7 +2310,7 @@ impl<'a> PlanCx<'a> {
                 };
                 PlannedRValue {
                     stmts: source.stmts,
-                    value: RirRValue::ListSlice {
+                    value: RirRValue::RangeListCopy {
                         source: source_place,
                         start: RirLocalId::from_index(start.index()),
                         end: RirLocalId::from_index(end.index()),

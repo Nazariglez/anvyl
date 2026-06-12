@@ -184,6 +184,15 @@ pub(super) fn anv_slice_slice(source: &str, start: &str, len: &str) -> String {
     format!("{source}.slice({start}, {len})")
 }
 
+pub(super) fn anv_slice_copy_range_with(
+    source: &str,
+    range: &str,
+    item: &str,
+    body: &str,
+) -> String {
+    format!("unsafe {{ {source}.copy_range_with({range}, |{item}| {body}) }}")
+}
+
 pub(super) fn mut_place_slice_view(
     place: &str,
     start: &str,

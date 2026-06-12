@@ -241,7 +241,7 @@ impl CompileCx<'_> {
                 self.check_place(function, list);
                 self.check_operand(function, value);
             }
-            RValue::ListSlice { source, .. } | RValue::SliceView { source, .. } => {
+            RValue::RangeListCopy { source, .. } | RValue::SliceView { source, .. } => {
                 self.check_place(function, source);
             }
             RValue::MapGet { map, key, .. } | RValue::MapRemove { map, key, .. } => {

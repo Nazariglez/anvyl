@@ -447,7 +447,7 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_operand(value, ValueContext::Store);
             }
             RValue::ListPop { list, .. } => self.observe_place(list, ParamUse::ReborrowMut),
-            RValue::ListSlice {
+            RValue::RangeListCopy {
                 source, start, end, ..
             }
             | RValue::SliceView {

@@ -101,6 +101,9 @@ fn rvalue_calls_fallible(
             | RirRValue::MapEntryAt { .. }
             | RirRValue::MapValueAt { .. }
             | RirRValue::SliceView { .. } => true,
+            RirRValue::RangeListCopy { source, .. } => {
+                matches!(program.types[source.ty.index()], RirType::Slice(_))
+            }
             RirRValue::Call { callee, args, .. } => {
                 args.iter().any(call_arg_erases_dataref)
                     || match callee {
@@ -176,7 +179,9 @@ fn rvalue_uses_fallible_place(
         RirRValue::DataRefGet { object, .. } => operand_has_slice_index(program, function, object),
         RirRValue::Len { source }
         | RirRValue::SliceView { source, .. }
-        | RirRValue::ListSlice { source, .. } => place_has_slice_index(program, function, source),
+        | RirRValue::RangeListCopy { source, .. } => {
+            place_has_slice_index(program, function, source)
+        }
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
             place_has_slice_index(program, function, map)
         }
@@ -476,7 +481,7 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
             .any(|arg| call_arg_uses_mut_place_param(function, arg)),
         RirRValue::Len { source }
         | RirRValue::SliceView { source, .. }
-        | RirRValue::ListSlice { source, .. } => place_is_mut_place_param(function, source),
+        | RirRValue::RangeListCopy { source, .. } => place_is_mut_place_param(function, source),
         RirRValue::ListPush { list, value } => {
             place_is_mut_place_param(function, list)
                 || operand_uses_mut_place_param(function, value)

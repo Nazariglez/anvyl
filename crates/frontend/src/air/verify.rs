@@ -374,8 +374,9 @@ pub enum BadFunction {
         expected_elem: TypeId,
         found: TypeId,
     },
-    ListSliceSourceMustBeList(TypeId),
-    ListSliceResultMustBeList {
+    RangeListCopySourceMustBeSequence(TypeId),
+    RangeListCopyResultMustBeList {
+        expected_elem: TypeId,
         found: TypeId,
     },
     SliceViewSourceMustBeSequence(TypeId),
@@ -3342,7 +3343,7 @@ fn verify_collection_loan_contract_rvalue(
         RValue::SliceView {
             source, start, end, ..
         }
-        | RValue::ListSlice {
+        | RValue::RangeListCopy {
             source, start, end, ..
         } => {
             verify_collection_loan_contract_place(
@@ -4075,7 +4076,7 @@ fn verify_air_rvalue_reads(
         RValue::Len { source } | RValue::ListPop { list: source, .. } => {
             verify_air_place_read(cx, function_id, index, source, state);
         }
-        RValue::ListSlice {
+        RValue::RangeListCopy {
             source, start, end, ..
         }
         | RValue::SliceView {
@@ -4665,7 +4666,7 @@ fn verify_rvalue(
                 }
             }
         }
-        RValue::ListSlice {
+        RValue::RangeListCopy {
             source,
             start,
             end,
@@ -4674,18 +4675,21 @@ fn verify_rvalue(
         } => {
             verify_place(cx, function_id, block_id, stmt_index, source);
             cx.verify_type_ref(site.clone(), *ty);
-            match typing::list_elem(cx.program, source.ty) {
+            match collection_sequence_elem(cx.program, source.ty) {
                 Some(expected_elem)
                     if typing::list_elem(cx.program, *ty) == Some(expected_elem) => {}
-                Some(_) => cx.push(
+                Some(expected_elem) => cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadFunction(BadFunction::ListSliceResultMustBeList {
+                    VerifyErrorKind::BadFunction(BadFunction::RangeListCopyResultMustBeList {
+                        expected_elem,
                         found: *ty,
                     }),
                 ),
                 None => cx.push(
                     site.clone(),
-                    VerifyErrorKind::BadFunction(BadFunction::ListSliceSourceMustBeList(source.ty)),
+                    VerifyErrorKind::BadFunction(BadFunction::RangeListCopySourceMustBeSequence(
+                        source.ty,
+                    )),
                 ),
             }
             verify_slice_index(cx, function_id, block_id, stmt_idx, "start", *start);

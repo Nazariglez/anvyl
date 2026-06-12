@@ -2990,7 +2990,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_mut_call_arg(&mut self, expr: &ExprNode) -> Result<Place, LowerError> {
-        self.lower_place_arg_impl(expr, true, true)
+        self.lower_place_or_temp(expr, true)
     }
 
     fn lower_mut_slice_call_arg(
@@ -2998,49 +2998,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         slice_ty: TypeId,
     ) -> Result<Place, LowerError> {
-        let source = self.lower_slice_call_arg_source(expr, slice_ty, true)?;
+        let source = self.lower_place_or_temp(expr, true)?;
         self.lower_slice_view_call_arg(source, slice_ty, true, expr)
     }
 
-    fn lower_slice_call_arg_source(
-        &mut self,
-        expr: &ExprNode,
-        slice_ty: TypeId,
-        mutable: bool,
-    ) -> Result<Place, LowerError> {
-        if let Some(place) = self.lower_range_slice_call_arg(expr, slice_ty, mutable)? {
-            return Ok(place);
+    fn lower_place_or_temp(&mut self, expr: &ExprNode, mutable: bool) -> Result<Place, LowerError> {
+        match self.lower_place_arg_impl(expr, mutable, mutable) {
+            Ok(place) => Ok(place),
+            Err(err) if !mutable => {
+                let value = self.lower_value(expr).map_err(|_| err)?;
+                self.place_from_operand(value, expr)
+            }
+            Err(err) => Err(err),
         }
-        self.lower_place_arg_impl(expr, mutable, mutable)
-    }
-
-    fn lower_range_slice_call_arg(
-        &mut self,
-        expr: &ExprNode,
-        slice_ty: TypeId,
-        mutable: bool,
-    ) -> Result<Option<Place>, LowerError> {
-        let ExprKind::Index(index) = &expr.node.kind else {
-            return Ok(None);
-        };
-        let ExprKind::Range(range) = &index.node.index.node.kind else {
-            return Ok(None);
-        };
-        let target_ty = self
-            .cx
-            .lower_ty(&self.lower_expr_ty(index.node.target.node.id)?)?;
-        let source = if matches!(self.cx.program.type_data(target_ty), TypeData::Slice(_)) {
-            self.lower_slice_call_arg_source(&index.node.target, target_ty, mutable)?
-        } else {
-            self.lower_place_arg_impl(&index.node.target, mutable, mutable)?
-        };
-        self.check_slice_view_source(expr, &source, slice_ty)?;
-        if mutable {
-            self.require_mutable_place(expr, &source)?;
-        }
-        let (start, end, inclusive) = self.lower_range_bounds(range, &source)?;
-        self.emit_slice_view_temp(slice_ty, source, start, end, inclusive, mutable, expr)
-            .map(Some)
     }
 
     fn lower_slice_view_call_arg(
@@ -3281,7 +3251,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         slice_ty: TypeId,
     ) -> Result<Place, LowerError> {
-        let source = self.lower_slice_call_arg_source(expr, slice_ty, false)?;
+        let source = self.lower_place_or_temp(expr, false)?;
         self.lower_slice_view_call_arg(source, slice_ty, false, expr)
     }
 
@@ -4097,18 +4067,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let Some(_) = typing::sequence_elem(&self.cx.program, target.ty) else {
                 return Err(unsupported_expr(expr));
             };
-            let (start, end, inclusive) = self.lower_range_bounds(range, &target)?;
-            let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
-            return self.emit_typed_temp(
-                ty,
-                RValue::SliceView {
-                    source: target,
-                    start,
-                    end,
-                    inclusive,
-                    ty,
-                },
-            );
+            return self.emit_range_list_copy(expr, target, range);
         }
         if let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, target.ty) {
             let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
@@ -4501,15 +4460,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Some(value) = self.lower_range_index_value(expr, index)? {
             return Ok(value);
         }
-        let Ok(map) = self.lower_place_arg(&index.node.target, false) else {
-            return self.lower_place_arg(expr, false).map(Operand::Place);
-        };
-        let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
-            return self.lower_place_arg(expr, false).map(Operand::Place);
-        };
-        let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
-        let ty = self.cx.optional_ty(value_ty);
-        self.emit_typed_temp(ty, RValue::MapGet { map, key, ty })
+
+        let target = self.lower_place_or_temp(&index.node.target, false)?;
+        if let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, target.ty) {
+            let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
+            let ty = self.cx.optional_ty(value_ty);
+            return self.emit_typed_temp(
+                ty,
+                RValue::MapGet {
+                    map: target,
+                    key,
+                    ty,
+                },
+            );
+        }
+        if let Some(elem) = typing::index_elem(&self.cx.program, target.ty) {
+            let index = self.lower_index_local(&index.node.index)?;
+            let mut place = target;
+            place.projection.push(crate::air::Projection::Index(index));
+            place.ty = elem;
+            return Ok(Operand::Place(place));
+        }
+        self.lower_place_arg(expr, false).map(Operand::Place)
     }
 
     fn lower_range_index_value(
@@ -4520,15 +4492,24 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let ExprKind::Range(range) = &index.node.index.node.kind else {
             return Ok(None);
         };
-        let source = self.lower_place_arg(&index.node.target, false)?;
+        let source = self.lower_place_or_temp(&index.node.target, false)?;
         let Some(_) = typing::sequence_elem(&self.cx.program, source.ty) else {
             return Ok(None);
         };
+        self.emit_range_list_copy(expr, source, range).map(Some)
+    }
+
+    fn emit_range_list_copy(
+        &mut self,
+        expr: &ExprNode,
+        source: Place,
+        range: &ast::RangeNode,
+    ) -> Result<Operand, LowerError> {
         let (start, end, inclusive) = self.lower_range_bounds(range, &source)?;
         let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         self.emit_typed_temp(
             ty,
-            RValue::SliceView {
+            RValue::RangeListCopy {
                 source,
                 start,
                 end,
@@ -4536,7 +4517,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 ty,
             },
         )
-        .map(Some)
     }
 
     fn lower_range_bounds(
@@ -10132,22 +10112,52 @@ mod tests {
     }
 
     #[test]
-    fn range_index_lowers_to_slice_view() {
+    fn range_index_slice_arg_lowers_to_copy_then_view() {
         let air = lower_full_core_root(
             "fn take(s: slice[int]) {} fn f(xs: [int]) { take(xs[1..3]); }",
             "f",
         )
         .expect("lower failed");
 
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::SliceView { .. },
-                    ..
-                }
-            )
-        }));
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        let range_copy = statements.iter().find_map(|statement| match statement {
+            AirStmt::Init {
+                local,
+                value: RValue::RangeListCopy { .. },
+            } => Some(*local),
+            _ => None,
+        });
+        let range_copy = range_copy.expect("missing range list copy");
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::SliceView { source, .. },
+                ..
+            } if source.root == PlaceRoot::Local(range_copy) && source.projection.is_empty()
+        )));
+    }
+
+    #[test]
+    fn direct_range_index_lowers_to_copy_without_slice_view() {
+        let air = lower_full_core_root("fn f(xs: [int]) { let ys = xs[1..3]; }", "f")
+            .expect("lower failed");
+
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::RangeListCopy { .. },
+                ..
+            }
+        )));
+        assert!(!statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::SliceView { .. },
+                ..
+            }
+        )));
     }
 
     #[test]
