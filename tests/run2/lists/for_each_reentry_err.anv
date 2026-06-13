@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: callback capture shape currently reaches frontend/AIR lambda capture gaps before runtime reentry check
+// @skip: callback reentry through active collection iteration is not executable yet
 // @contains: cannot structurally mutate collection during active iteration or slice view
 
 fn main() {

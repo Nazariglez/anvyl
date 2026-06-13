@@ -1,6 +1,6 @@
 // @mode: run
 // @expect: success
-// @skip: mixed heap-env and scoped lambda variants sharing one signature are still a backend representation gap
+// @skip: mixed escaping and non-escaping lambda values are not executable yet
 // @frontend: new
 
 fn make(seed: int) -> fn() -> int {

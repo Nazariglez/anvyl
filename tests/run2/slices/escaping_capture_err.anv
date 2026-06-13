@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: escaping slice capture currently reaches backend lambda capture gap before frontend escape diagnostic
+// @skip: escaping slice captures are not diagnosed at the source boundary yet
 // @contains: cannot capture borrowed parameter 'xs' in an escaping lambda
 
 fn hold(xs: slice[int]) -> fn() -> int {

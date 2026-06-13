@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: mutable pattern alias lowering reaches UnsupportedStmt before borrowed-origin backend gap
+// @skip: mutable pattern aliases of borrowed fields are not executable yet
 // @match: 1
 
 struct Point {

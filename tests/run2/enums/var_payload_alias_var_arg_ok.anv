@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: enum tuple payload mutable aliases await clean Rust enum payload match lowering
+// @skip: mutable enum tuple payload aliases are not executable yet
 // @match: 2
 
 enum Slot {

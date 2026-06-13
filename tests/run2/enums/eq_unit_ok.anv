@@ -1,6 +1,6 @@
 // @mode: run
 // @frontend: new
-// @skip: clean rust: enum equality binary lowering is not ready
+// @skip: enum equality is not executable yet
 // @expect: success
 // @match: true
 

@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: clean Rust nested optional map values are unsupported
+// @skip: maps with optional values are not executable yet
 // @match-begin
 // 1
 // 0

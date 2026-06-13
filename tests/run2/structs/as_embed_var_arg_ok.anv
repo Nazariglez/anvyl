@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: @as embed value projection hits AIR lowering Ident gap before clean Rust backend
+// @skip: @as embed projection for var arguments is not executable yet
 // @match: 2
 
 struct Entity {

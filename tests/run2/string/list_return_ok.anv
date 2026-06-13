@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: string split list returns are not executable yet
+// @match-begin
+// a
+// b
+// @match-end
+
+fn main() {
+    let parts = "a,b".split(",");
+    println(parts[0]);
+    println(parts[1]);
+}

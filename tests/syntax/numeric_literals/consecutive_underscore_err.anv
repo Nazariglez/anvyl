@@ -1,5 +1,6 @@
 // @mode: check
 // @expect: error
+// @contains: invalid underscore placement in numeric literal
 
 fn main() {
     let x = 1__000;

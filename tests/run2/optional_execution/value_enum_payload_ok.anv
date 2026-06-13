@@ -1,6 +1,6 @@
 // @mode: run
 // @frontend: new
-// @skip: clean rust enum tuple payload match lowering is not implemented
+// @skip: enum tuple payload matches are not executable yet
 // @expect: success
 // @match: 5
 
