@@ -9,9 +9,10 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    classify_param, classify_return, conversion_tokens, flow_tokens, merge_conversions,
-    param_abi_tokens, parse_type_expr, return_abi_tokens, type_expr_tokens,
-    validate_callable_signature, validate_ctx_param, validate_mut_place_ctx,
+    classify_param, classify_return, conversion_tokens, flow_tokens, has_scoped_lambda,
+    merge_conversions, param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow,
+    type_tokens_with_override, validate_callable_signature, validate_ctx_param,
+    validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -124,24 +125,41 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .copied()
         .map(|param| classify_param(param, args.ctx))
         .collect::<syn::Result<Vec<_>>>()?;
+    let scoped_lambda = has_scoped_lambda(&params);
     if let Some(ctx) = ctx_input {
         validate_mut_place_ctx(&func.sig, ctx, &params, "#[function(ctx)]")?;
+        if scoped_lambda {
+            return Err(syn::Error::new_spanned(
+                ctx,
+                "#[function(ctx)] cannot be combined with ScopedLambda parameters",
+            ));
+        }
+    }
+    if scoped_lambda_has_visible_borrow(&params) {
+        return Err(syn::Error::new_spanned(
+            &func.sig,
+            "ScopedLambda parameters cannot be combined with borrowed or mutable-place provider parameters",
+        ));
     }
     validate_overrides(&args, &params)?;
     let ret = classify_return(&func.sig.output)?;
-    let ret_ty = match args.ret.as_deref() {
-        Some(override_ty) => type_expr_tokens(&parse_type_expr(override_ty)?),
-        None => type_expr_tokens(&ret.ty),
-    };
+    let ret_ty = type_tokens_with_override(
+        &ret.ty,
+        args.ret.as_deref(),
+        proc_macro2::Span::call_site(),
+        "#[function(ret)] override does not match Rust return ABI",
+    )?;
 
     let descriptor_params = params
         .iter()
         .map(|param| {
             let name = &param.name;
-            let ty = match args.params.get(name) {
-                Some(override_ty) => parse_type_expr(override_ty).map(|ty| type_expr_tokens(&ty)),
-                None => Ok(type_expr_tokens(&param.ty)),
-            }?;
+            let ty = type_tokens_with_override(
+                &param.ty,
+                args.params.get(name).map(String::as_str),
+                proc_macro2::Span::call_site(),
+                format!("#[function(params)] override for `{name}` does not match Rust ABI"),
+            )?;
             let flow = flow_tokens(param.flow);
             Ok::<_, syn::Error>(quote! {
                 anvyx_runtime::ExternParam {
@@ -161,6 +179,11 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
             .map(|param| param.conversion)
             .chain(std::iter::once(ret.conversion)),
     ));
+    let wrapper_ctx = if scoped_lambda {
+        quote! { anvyx_runtime::RustWrapperCtx::None }
+    } else {
+        quote! { anvyx_runtime::RustWrapperCtx::HiddenRuntime }
+    };
     let fallible = ret.fallible;
     let native_ctx = if args.ctx {
         quote! { ctx }
@@ -168,6 +191,11 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         quote! { _ctx }
     };
     let native_inputs = visible_inputs.iter();
+    let wrapper_inputs = if scoped_lambda {
+        quote! { #(#native_inputs),* }
+    } else {
+        quote! { #native_ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#native_inputs),* }
+    };
     let native_output = &func.sig.output;
     let visible_args = params
         .iter()
@@ -202,6 +230,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                         ret: #ret_abi,
                         fallible: #fallible,
                         support: #support,
+                        ctx: #wrapper_ctx,
                     },
                 },
             }
@@ -211,7 +240,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         pub mod #native_mod {
             use super::*;
 
-            pub fn #wrapper<'cx>(#native_ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#native_inputs),*) #native_output {
+            pub fn #wrapper<'cx>(#wrapper_inputs) #native_output {
                 super::#ident(#native_args)
             }
         }

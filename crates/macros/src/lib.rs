@@ -6,6 +6,7 @@ mod clean_ref;
 mod clean_type_derive;
 mod clean_type_map;
 mod naming;
+mod provider_descriptor;
 mod util;
 
 // Legacy VM/provider macro implementation used by `anvyx-lang` re-exports.
@@ -14,7 +15,6 @@ mod expand;
 mod export_methods;
 mod export_type;
 mod provider;
-mod provider_descriptor;
 mod type_map;
 
 use proc_macro::TokenStream;
@@ -99,6 +99,10 @@ mod tests {
         ("clean_ref.rs", include_str!("clean_ref.rs")),
         ("clean_type_derive.rs", include_str!("clean_type_derive.rs")),
         ("clean_type_map.rs", include_str!("clean_type_map.rs")),
+        (
+            "provider_descriptor.rs",
+            include_str!("provider_descriptor.rs"),
+        ),
     ];
 
     #[test]

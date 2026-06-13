@@ -202,6 +202,7 @@ dependencies = [
 name = "anvyx-macros"
 version = "0.1.0"
 dependencies = [
+ "anvyx-externs",
  "anvyx-lang",
  "proc-macro2",
  "quote",

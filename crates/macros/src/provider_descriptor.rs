@@ -1,9 +1,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
-    Ident, LitStr, Token, bracketed,
+    Ident, LitStr, Token,
     parse::{Parse, ParseStream},
 };
+
+use crate::clean_type_map::{CleanCallback, CleanType, parse_descriptor_type_expr};
 
 struct DescriptorArgs {
     provider: LitStr,
@@ -14,23 +16,12 @@ struct DescriptorArgs {
 struct Function {
     name: Ident,
     params: Vec<Param>,
-    ret: TypeExpr,
+    ret: CleanType,
 }
 
 struct Param {
     name: Ident,
-    ty: TypeExpr,
-}
-
-#[derive(Clone)]
-enum TypeExpr {
-    Void,
-    Bool,
-    Int,
-    Float,
-    String,
-    List(Box<TypeExpr>),
-    Option(Box<TypeExpr>),
+    ty: CleanType,
 }
 
 impl Parse for DescriptorArgs {
@@ -79,7 +70,7 @@ impl Parse for Function {
             content.parse::<Token![,]>()?;
         }
         input.parse::<Token![->]>()?;
-        let ret = input.parse()?;
+        let ret = parse_descriptor_type_expr(input, false)?;
         input.parse::<Token![;]>()?;
         let _ = input.parse::<Token![,]>();
         Ok(Self { name, params, ret })
@@ -90,38 +81,8 @@ impl Parse for Param {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let name = input.parse()?;
         input.parse::<Token![:]>()?;
-        let ty = input.parse()?;
+        let ty = parse_descriptor_type_expr(input, true)?;
         Ok(Self { name, ty })
-    }
-}
-
-impl Parse for TypeExpr {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut ty = if input.peek(syn::token::Bracket) {
-            let content;
-            bracketed!(content in input);
-            Self::List(Box::new(content.parse()?))
-        } else {
-            let ident: Ident = input.parse()?;
-            match ident.to_string().as_str() {
-                "void" => Self::Void,
-                "bool" => Self::Bool,
-                "int" => Self::Int,
-                "float" => Self::Float,
-                "string" => Self::String,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        ident,
-                        "unsupported descriptor type",
-                    ));
-                }
-            }
-        };
-        if input.peek(Token![?]) {
-            input.parse::<Token![?]>()?;
-            ty = Self::Option(Box::new(ty));
-        }
-        Ok(ty)
     }
 }
 
@@ -190,20 +151,117 @@ fn function_tokens(function: &Function) -> TokenStream {
     }
 }
 
-fn type_tokens(ty: &TypeExpr) -> TokenStream {
+fn type_tokens(ty: &CleanType) -> TokenStream {
     match ty {
-        TypeExpr::Void => quote! { anvyx_externs::ExternTypeExpr::Void },
-        TypeExpr::Bool => quote! { anvyx_externs::ExternTypeExpr::Bool },
-        TypeExpr::Int => quote! { anvyx_externs::ExternTypeExpr::Int },
-        TypeExpr::Float => quote! { anvyx_externs::ExternTypeExpr::Float },
-        TypeExpr::String => quote! { anvyx_externs::ExternTypeExpr::String },
-        TypeExpr::List(item) => {
+        CleanType::Void => quote! { anvyx_externs::ExternTypeExpr::Void },
+        CleanType::Bool => quote! { anvyx_externs::ExternTypeExpr::Bool },
+        CleanType::Int => quote! { anvyx_externs::ExternTypeExpr::Int },
+        CleanType::Float => quote! { anvyx_externs::ExternTypeExpr::Float },
+        CleanType::String => quote! { anvyx_externs::ExternTypeExpr::String },
+        CleanType::Callback(callback) => callback_tokens(callback),
+        CleanType::List(item) => {
             let item = type_tokens(item);
             quote! { anvyx_externs::ExternTypeExpr::List(Box::new(#item)) }
         }
-        TypeExpr::Option(item) => {
+        CleanType::Option(item) => {
             let item = type_tokens(item);
             quote! { anvyx_externs::ExternTypeExpr::Option(Box::new(#item)) }
+        }
+    }
+}
+
+fn callback_tokens(callback: &CleanCallback) -> TokenStream {
+    let params = callback.params.iter().map(|ty| {
+        let ty = type_tokens(ty);
+        quote! {
+            anvyx_externs::ExternCallbackParam {
+                ty: #ty,
+                escape: anvyx_externs::CallbackEscape::NonEscaping,
+            }
+        }
+    });
+    let ret = type_tokens(&callback.ret);
+    quote! {
+        anvyx_externs::ExternTypeExpr::Callback(anvyx_externs::ExternCallbackSignature {
+            params: vec![#(#params),*],
+            ret: Box::new(#ret),
+            policy: anvyx_externs::CallbackPolicy {
+                escape: anvyx_externs::CallbackEscape::NonEscaping,
+                thread: anvyx_externs::CallbackThread::SameThread,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::*;
+
+    #[test]
+    fn rejects_callback_return() {
+        let err = match syn::parse2::<DescriptorArgs>(quote! {
+            provider = "host",
+            module = "host",
+            fn make() -> fn(int);
+        }) {
+            Ok(_) => panic!("expected callback return rejection"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("callbacks are only supported"));
+    }
+
+    #[test]
+    fn rejects_nested_callback() {
+        let err = match syn::parse2::<DescriptorArgs>(quote! {
+            provider = "host",
+            module = "host",
+            fn each(fs: [fn(int)]) -> void;
+        }) {
+            Ok(_) => panic!("expected nested callback rejection"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("callbacks are only supported"));
+    }
+
+    #[test]
+    fn rejects_callback_above_max_arity() {
+        let err = match syn::parse2::<DescriptorArgs>(quote! {
+            provider = "host",
+            module = "host",
+            fn bad(f: fn(int, int, int, int, int, int, int, int, int)) -> void;
+        }) {
+            Ok(_) => panic!("expected callback arity rejection"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("at most 8"));
+    }
+
+    #[test]
+    fn rejects_unsupported_callback_leaf_types() {
+        for source in [
+            quote! { fn bad(f: fn(void)) -> void; },
+            quote! { fn bad(f: fn([int])) -> void; },
+            quote! { fn bad(f: fn(int?)) -> void; },
+            quote! { fn bad(f: fn(string)) -> void; },
+            quote! { fn bad(f: fn(int) -> string) -> void; },
+            quote! { fn bad(f: fn(int) -> [int]) -> void; },
+            quote! { fn bad(f: fn(int) -> int?) -> void; },
+        ] {
+            let err = match syn::parse2::<DescriptorArgs>(quote! {
+                provider = "host",
+                module = "host",
+                #source
+            }) {
+                Ok(_) => panic!("expected unsupported callback leaf rejection"),
+                Err(err) => err,
+            };
+
+            assert!(err.to_string().contains("unsupported callback"));
         }
     }
 }

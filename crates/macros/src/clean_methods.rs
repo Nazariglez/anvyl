@@ -10,8 +10,9 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    classify_param, classify_return, flow_tokens, merge_conversions, param_abi_tokens,
-    return_abi_tokens, type_expr_tokens, validate_callable_signature, validate_ctx_param,
+    classify_param, classify_return, flow_tokens, has_scoped_lambda, merge_conversions,
+    param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow, type_expr_tokens,
+    type_tokens_with_override, type_with_override, validate_callable_signature, validate_ctx_param,
 };
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -71,11 +72,12 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         }
         let export = MethodExport::parse(&owner, method)?;
         validate_callable_signature(&method.sig, "#[methods]", "method", export.ctx)?;
+        let params = method_clean_params(method, &export)?;
         match &export.role {
             Role::Method(receiver) => {
-                descriptor_methods.push(method_descriptor(method, *receiver, &export)?);
+                descriptor_methods.push(method_descriptor(method, *receiver, &export, &params)?);
             }
-            Role::Static => descriptor_statics.push(static_descriptor(method, &export)?),
+            Role::Static => descriptor_statics.push(static_descriptor(method, &export, &params)?),
             Role::Init => {
                 if init.is_some() {
                     return Err(syn::Error::new_spanned(method, "duplicate #[anvyx(init)]"));
@@ -89,10 +91,17 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                 &export_name,
                 op,
                 &export,
+                &params,
             )?),
         }
-        bindings.push(member_binding(&owner, &export_name, method, &export)?);
-        wrappers.push(native_wrapper(&owner, method, &export));
+        bindings.push(member_binding(
+            &owner,
+            &export_name,
+            method,
+            &export,
+            &params,
+        )?);
+        wrappers.push(native_wrapper(&owner, method, &export, &params));
     }
     let descriptor_fields = computed_property_descriptors(&imp.items)?;
     for item in &mut imp.items {
@@ -567,11 +576,12 @@ fn method_descriptor(
     method: &ImplItemFn,
     receiver: Receiver,
     export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
 ) -> syn::Result<TokenStream> {
     let name = method.sig.ident.to_string();
     let doc = doc_tokens(&method.attrs);
     let receiver = receiver_tokens(receiver);
-    let signature = signature_tokens(method, Some(export))?;
+    let signature = signature_tokens(method, Some(export), params)?;
     let effects = effects_tokens(method)?;
     Ok(quote! {
         anvyx_runtime::ExternMethodDescriptor {
@@ -584,10 +594,14 @@ fn method_descriptor(
     })
 }
 
-fn static_descriptor(method: &ImplItemFn, export: &MethodExport) -> syn::Result<TokenStream> {
+fn static_descriptor(
+    method: &ImplItemFn,
+    export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
+) -> syn::Result<TokenStream> {
     let name = method.sig.ident.to_string();
     let doc = doc_tokens(&method.attrs);
-    let signature = signature_tokens(method, Some(export))?;
+    let signature = signature_tokens(method, Some(export), params)?;
     let effects = effects_tokens(method)?;
     Ok(quote! {
         anvyx_runtime::ExternStaticDescriptor {
@@ -710,10 +724,12 @@ fn getter_ty(
     attrs: &MethodAttrs,
 ) -> syn::Result<(crate::clean_type_map::CleanType, TokenStream)> {
     let ty = match &method.sig.output {
-        ReturnType::Type(_, _) => match attrs.ret.as_deref() {
-            Some(override_ty) => crate::clean_type_map::parse_type_expr(override_ty)?,
-            None => classify_return(&method.sig.output)?.ty,
-        },
+        ReturnType::Type(_, _) => type_with_override(
+            &classify_return(&method.sig.output)?.ty,
+            attrs.ret.as_deref(),
+            method.sig.span(),
+            "getter return override does not match Rust ABI",
+        )?,
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 &method.sig,
@@ -745,10 +761,12 @@ fn setter_ty(
             ));
         }
     }
-    match attrs.params.get(&param.name) {
-        Some(override_ty) => crate::clean_type_map::parse_type_expr(override_ty),
-        None => Ok(param.ty),
-    }
+    type_with_override(
+        &param.ty,
+        attrs.params.get(&param.name).map(String::as_str),
+        method.sig.span(),
+        "setter parameter override does not match Rust ABI",
+    )
 }
 
 fn setter_field_name(method: &ImplItemFn) -> syn::Result<String> {
@@ -786,11 +804,12 @@ fn operator_descriptor(
     export_name: &str,
     op: &OperatorRole,
     export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
 ) -> syn::Result<TokenStream> {
     let signature = if op.rhs_self {
         self_operator_signature(method, owner, export_name, export.ctx)?
     } else {
-        signature_tokens(method, Some(export))?
+        signature_tokens(method, Some(export), params)?
     };
     let effects = effects_tokens(method)
         .unwrap_or_else(|_| quote! { anvyx_runtime::ExternEffects { fallible: false } });
@@ -869,20 +888,23 @@ fn return_is_owner(output: &ReturnType, owner: &Ident) -> bool {
 fn signature_tokens(
     method: &ImplItemFn,
     export: Option<&MethodExport>,
+    params: &[crate::clean_type_map::CleanParam],
 ) -> syn::Result<TokenStream> {
     let mut used_overrides = std::collections::HashSet::new();
-    let params = visible_typed_params(method, export.is_some_and(|export| export.ctx))?
-        .into_iter()
+    let params = params
+        .iter()
         .map(|param| {
-            let param = classify_param(param, false)?;
-            let name = param.name;
-            let ty = match export.and_then(|export| export.param_overrides.get(&name)) {
-                Some(override_ty) => {
-                    used_overrides.insert(name.clone());
-                    type_expr_tokens(&crate::clean_type_map::parse_type_expr(override_ty)?)
-                }
-                None => type_expr_tokens(&param.ty),
-            };
+            let name = &param.name;
+            let override_ty = export.and_then(|export| export.param_overrides.get(name));
+            if override_ty.is_some() {
+                used_overrides.insert(name.clone());
+            }
+            let ty = type_tokens_with_override(
+                &param.ty,
+                override_ty.map(String::as_str),
+                method.sig.span(),
+                format!("parameter override `{name}` does not match Rust ABI"),
+            )?;
             let flow = flow_tokens(param.flow);
             Ok(quote! {
                 anvyx_runtime::ExternParam {
@@ -905,12 +927,12 @@ fn signature_tokens(
         }
     }
     let ret = classify_return(&method.sig.output)?;
-    let ret_ty = match export.and_then(|export| export.ret_override.as_deref()) {
-        Some(override_ty) => {
-            type_expr_tokens(&crate::clean_type_map::parse_type_expr(override_ty)?)
-        }
-        None => type_expr_tokens(&ret.ty),
-    };
+    let ret_ty = type_tokens_with_override(
+        &ret.ty,
+        export.and_then(|export| export.ret_override.as_deref()),
+        method.sig.span(),
+        "return override does not match Rust ABI",
+    )?;
     Ok(quote! { anvyx_runtime::ExternSignature { params: vec![#(#params),*], ret: #ret_ty } })
 }
 
@@ -920,14 +942,20 @@ fn effects_tokens(method: &ImplItemFn) -> syn::Result<TokenStream> {
     Ok(quote! { anvyx_runtime::ExternEffects { fallible: #fallible } })
 }
 
-fn native_wrapper(owner: &Ident, method: &ImplItemFn, export: &MethodExport) -> TokenStream {
+fn native_wrapper(
+    owner: &Ident,
+    method: &ImplItemFn,
+    export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
+) -> TokenStream {
     let ident = &method.sig.ident;
+    let scoped_lambda = has_scoped_lambda(params);
     let ctx = if export.ctx {
         quote! { ctx }
     } else {
         quote! { _ctx }
     };
-    let inputs = wrapper_inputs(owner, method, export, &ctx);
+    let inputs = wrapper_inputs(owner, method, export, &ctx, scoped_lambda);
     let output = wrapper_output(owner, method, &export.role);
     let args = visible_typed_params(method, export.ctx)
         .expect("validated method signature")
@@ -957,6 +985,7 @@ fn wrapper_inputs(
     method: &ImplItemFn,
     export: &MethodExport,
     ctx: &TokenStream,
+    scoped_lambda: bool,
 ) -> TokenStream {
     let params = visible_typed_params(method, export.ctx)
         .expect("validated method signature")
@@ -969,10 +998,18 @@ fn wrapper_inputs(
             } else {
                 quote! { receiver: &super::#owner }
             };
-            quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #receiver, #(#params),* }
+            if scoped_lambda {
+                quote! { #receiver, #(#params),* }
+            } else {
+                quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #receiver, #(#params),* }
+            }
         }
         Role::Static | Role::Init => {
-            quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#params),* }
+            if scoped_lambda {
+                quote! { #(#params),* }
+            } else {
+                quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#params),* }
+            }
         }
     }
 }
@@ -985,24 +1022,62 @@ fn wrapper_output(owner: &Ident, method: &ImplItemFn, role: &Role) -> TokenStrea
     quote! { #output }
 }
 
+fn method_clean_params(
+    method: &ImplItemFn,
+    export: &MethodExport,
+) -> syn::Result<Vec<crate::clean_type_map::CleanParam>> {
+    if matches!(&export.role, Role::Operator(op) if op.rhs_self) {
+        return Ok(vec![]);
+    }
+    let params = visible_typed_params(method, export.ctx)?
+        .into_iter()
+        .map(|param| classify_param(param, false))
+        .collect::<syn::Result<Vec<_>>>()?;
+    validate_scoped_lambda_method(method, export, &params)?;
+    Ok(params)
+}
+
+fn validate_scoped_lambda_method(
+    method: &ImplItemFn,
+    export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
+) -> syn::Result<()> {
+    if !has_scoped_lambda(params) {
+        return Ok(());
+    }
+    if export.ctx {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[anvyx(ctx)] cannot be combined with ScopedLambda parameters",
+        ));
+    }
+    if role_receiver(method, &export.role).is_some() {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "ScopedLambda parameters cannot be combined with method receivers",
+        ));
+    }
+    if scoped_lambda_has_visible_borrow(params) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "ScopedLambda parameters cannot be combined with borrowed or mutable-place provider parameters",
+        ));
+    }
+    Ok(())
+}
+
 fn member_binding(
     owner: &Ident,
     export_name: &str,
     method: &ImplItemFn,
     export: &MethodExport,
+    params: &[crate::clean_type_map::CleanParam],
 ) -> syn::Result<TokenStream> {
     let symbol = method.sig.ident.to_string();
     let module = methods_native_module_ident_string(owner);
     let owner_ty = named_type_expr(export_name);
     let self_operator = matches!(&export.role, Role::Operator(op) if op.rhs_self);
-    let params = if self_operator {
-        vec![]
-    } else {
-        visible_typed_params(method, export.ctx)?
-            .into_iter()
-            .map(|param| classify_param(param, false))
-            .collect::<syn::Result<Vec<_>>>()?
-    };
+    let scoped_lambda = has_scoped_lambda(params);
     let mut abis = match role_receiver(method, &export.role) {
         Some(Receiver::Shared) => vec![quote! { anvyx_runtime::RustParamAbi::Borrow(#owner_ty) }],
         Some(Receiver::Mutable) => {
@@ -1045,6 +1120,11 @@ fn member_binding(
         ));
         (ret_abi, support, ret.fallible)
     };
+    let wrapper_ctx = if scoped_lambda {
+        quote! { anvyx_runtime::RustWrapperCtx::None }
+    } else {
+        quote! { anvyx_runtime::RustWrapperCtx::HiddenRuntime }
+    };
     let selector = &export.selector;
     let operation = &export.operation;
     Ok(quote! {
@@ -1058,6 +1138,7 @@ fn member_binding(
                 ret: #ret_abi,
                 fallible: #fallible,
                 support: #support,
+                ctx: #wrapper_ctx,
             },
         }
     })
