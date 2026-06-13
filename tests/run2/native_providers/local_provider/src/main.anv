@@ -8,14 +8,38 @@
 // 42
 // 10
 // 101
+// 42
+// 46
+// 51
+// 77
+// 61
+// 41
+// 82
+// 3
 // @match-end
 
-import pkg:host.host { host_add, host_len, host_bump };
+import pkg:host.host { host_add, host_len, host_bump, host_apply, host_call0, host_each };
 
 struct Box { value: int }
 
 fn forward(var value: int) {
     host_bump(value);
+}
+
+fn add_one(x: int) -> int {
+    x + 1
+}
+
+fn make_adder(base: int) -> fn(int) -> int {
+    |x: int| { x + base }
+}
+
+fn make_counter() -> fn(int) -> int {
+    var count = 0;
+    |x: int| {
+        count = count + x;
+        count
+    }
 }
 
 fn main() {
@@ -30,4 +54,19 @@ fn main() {
     var forwarded = 100;
     forward(forwarded);
     println(forwarded);
+    println(host_apply(add_one));
+    println(host_apply(|x: int| { x + 5 }));
+    let base = 10;
+    println(host_apply(|x: int| { x + base }));
+    println(host_call0(|| { 77 }));
+    let add_twenty = make_adder(20);
+    println(host_apply(add_twenty));
+    let counter = make_counter();
+    println(host_apply(counter));
+    println(host_apply(counter));
+    var total = 0;
+    host_each(|x: int| {
+        total = total + x;
+    });
+    println(total);
 }

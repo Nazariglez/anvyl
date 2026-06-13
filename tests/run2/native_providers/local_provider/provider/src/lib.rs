@@ -1,4 +1,4 @@
-use anvyx_runtime::{function, Ctx, MutPlace, RuntimeError};
+use anvyx_runtime::{function, Ctx, MutPlace, RuntimeError, ScopedLambda};
 
 #[function]
 pub fn host_add(a: i64, b: i64) -> i64 {
@@ -18,8 +18,24 @@ pub fn host_bump<'cx>(
     value.update_copy(ctx, |n| n + 1)
 }
 
+#[function]
+pub fn host_apply(f: ScopedLambda<'_, '_, (i64,), i64>) -> Result<i64, RuntimeError> {
+    f.call(41)
+}
+
+#[function]
+pub fn host_call0(f: ScopedLambda<'_, '_, (), i64>) -> Result<i64, RuntimeError> {
+    f.call()
+}
+
+#[function]
+pub fn host_each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+    f.call(1)?;
+    f.call(2)
+}
+
 anvyx_runtime::builtin_module! {
     name: "host",
     source: "",
-    exports: [host_add, host_len, host_bump],
+    exports: [host_add, host_len, host_bump, host_apply, host_call0, host_each],
 }

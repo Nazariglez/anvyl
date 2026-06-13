@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @stderr-contains: index out of bounds
+
+import pkg:host.host { host_apply };
+
+fn main() {
+    let xs: [int; 2] = [1, 2];
+    host_apply(|i: int| { xs[i] });
+}

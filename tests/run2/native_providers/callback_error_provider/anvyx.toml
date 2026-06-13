@@ -1,0 +1,6 @@
+[project]
+name = "callback_error_provider_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }
