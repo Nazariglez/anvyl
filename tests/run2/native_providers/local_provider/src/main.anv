@@ -5,11 +5,29 @@
 // @match-begin
 // 12
 // 5
+// 42
+// 10
+// 101
 // @match-end
 
-import pkg:host.host { host_add, host_len };
+import pkg:host.host { host_add, host_len, host_bump };
+
+struct Box { value: int }
+
+fn forward(var value: int) {
+    host_bump(value);
+}
 
 fn main() {
     println(host_add(5, 7));
     println(host_len("hello"));
+    var n = 41;
+    host_bump(n);
+    println(n);
+    var box = Box { value: 9 };
+    host_bump(box.value);
+    println(box.value);
+    var forwarded = 100;
+    forward(forwarded);
+    println(forwarded);
 }

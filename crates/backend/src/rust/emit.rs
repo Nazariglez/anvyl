@@ -314,7 +314,7 @@ impl EmitCx<'_> {
             |w| {
                 Self::emit_dataref_place_op(
                     w,
-                    target::DataRefPlaceOp::Access,
+                    &target::DataRefPlaceOp::Access,
                     &payload,
                     &storage,
                     &path,
@@ -322,7 +322,7 @@ impl EmitCx<'_> {
                 w.blank();
                 Self::emit_dataref_place_op(
                     w,
-                    target::DataRefPlaceOp::Mutate,
+                    &target::DataRefPlaceOp::Mutate,
                     &payload,
                     &storage,
                     &path,
@@ -334,7 +334,7 @@ impl EmitCx<'_> {
 
     fn emit_dataref_place_op(
         w: &mut RustWriter,
-        op: target::DataRefPlaceOp,
+        op: &target::DataRefPlaceOp,
         payload: &str,
         storage: &str,
         path: &str,
@@ -972,16 +972,16 @@ impl EmitCx<'_> {
                     self.w.line(format_args!("{set};"));
                 } else if let Some(access) = places.map_slot_access(dst) {
                     self.w
-                        .line(format_args!("{};", self.map_slot_set(access, value)));
+                        .line(format_args!("{};", Self::map_slot_set(&access, &value)));
                 } else if let Some(access) = places.slice_index_access(dst) {
                     self.w
-                        .line(format_args!("{};", self.slice_index_set(access, value)));
+                        .line(format_args!("{};", Self::slice_index_set(&access, &value)));
                 } else {
                     let dst_expr = places.local_place(dst);
                     if places.mut_place_root_param(dst) {
                         self.w.line(format_args!(
                             "{};",
-                            self.mut_place_set(dst.ty, dst_expr, value)
+                            self.mut_place_set(dst.ty, &dst_expr, &value)
                         ));
                     } else if self.collection_replace_ty(dst.ty) {
                         self.w.line(format_args!(
@@ -1020,7 +1020,7 @@ impl EmitCx<'_> {
                 let value = self.rvalue(function, value);
                 self.w.line(format_args!(
                     "{};",
-                    self.mut_place_set(ty, self.scoped_place_cell_ref(function, *cell), value)
+                    self.mut_place_set(ty, &self.scoped_place_cell_ref(function, *cell), &value)
                 ));
             }
             RirStmt::DataRefSet {
@@ -1091,7 +1091,7 @@ impl EmitCx<'_> {
                 let loan_var = format!("__anv_collection_loan_{depth}");
                 let version_var = format!("__anv_collection_version_{depth}");
                 let loan = if places.mut_place_root_param(&scope.root) {
-                    this.mut_place_access(function, &scope.root, target::begin_shape_loan_region())
+                    this.mut_place_access(function, &scope.root, &target::begin_shape_loan_region())
                 } else {
                     target::begin_shape_loan(&places.local_place(&scope.root))
                 };
@@ -1138,7 +1138,7 @@ impl EmitCx<'_> {
             .iter()
             .map(|arm| {
                 let variant = &enm.variants[arm.variant.index()];
-                self.variant_pattern(enm, variant)
+                Self::variant_pattern(enm, variant)
             })
             .collect::<Vec<_>>();
         self.w.line(format_args!(
@@ -1197,7 +1197,7 @@ impl EmitCx<'_> {
             Some(payload) if match_.payload_ref => {
                 function.locals[payload.index()].symbol.as_str().to_string()
             }
-            _ => self.fresh_option_payload_ref(function),
+            _ => Self::fresh_option_payload_ref(function),
         };
         self.indented(|this| {
             this.w.line(format_args!("Some({payload_ref}) => {{"));
@@ -1224,7 +1224,7 @@ impl EmitCx<'_> {
         self.w.line("}");
     }
 
-    fn fresh_option_payload_ref(&self, function: &RirFunction) -> String {
+    fn fresh_option_payload_ref(function: &RirFunction) -> String {
         let base = "__anv_option_payload";
         let mut candidate = base.to_string();
         let mut index = 0;
@@ -1324,7 +1324,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn variant_pattern(&self, enm: &RirEnum, variant: &RirVariant) -> String {
+    fn variant_pattern(enm: &RirEnum, variant: &RirVariant) -> String {
         let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
         match variant.kind {
             RirVariantKind::Unit => unit_variant_pattern(&path),
@@ -1448,14 +1448,14 @@ impl EmitCx<'_> {
                 &values.format_arg(value, *source_ty),
             ),
             RirRValue::Len { source } if places.mut_place_root_param(source) => {
-                self.mut_place_access(function, source, "Ok(value.len() as i64)".into())
+                self.mut_place_access(function, source, "Ok(value.len() as i64)")
             }
             RirRValue::Len { source } => format!("{}.len() as i64", places.local_place(source)),
             RirRValue::ListPush { list, value } if places.mut_place_root_param(list) => self
                 .mut_place_mutate(
                     function,
                     list,
-                    target::list_push_region(&values.value_operand(value)),
+                    &target::list_push_region(&values.value_operand(value)),
                 ),
             RirRValue::ListPush { list, value } => {
                 target::list_push(&places.local_place(list), &values.value_operand(value))
@@ -1485,7 +1485,7 @@ impl EmitCx<'_> {
                     values.value_from_ref(value_ty, "value")
                 );
                 if places.mut_place_root_param(map) {
-                    self.mut_place_access(function, map, format!("Ok({body})"))
+                    self.mut_place_access(function, map, &format!("Ok({body})"))
                 } else {
                     format!(
                         "{}.get(&{key}).map(|value| {})",
@@ -1498,7 +1498,7 @@ impl EmitCx<'_> {
                 .mut_place_mutate(
                     function,
                     map,
-                    target::map_insert_region(
+                    &target::map_insert_region(
                         &values.value_operand(key),
                         &values.value_operand(value),
                     ),
@@ -1518,7 +1518,7 @@ impl EmitCx<'_> {
                 .mut_place_mutate(
                     function,
                     map,
-                    target::map_remove_region(&values.operand(key)),
+                    &target::map_remove_region(&values.operand(key)),
                 ),
             RirRValue::MapRemove { map, key, .. } => {
                 target::map_remove(&places.local_place(map), &values.operand(key))
@@ -1580,15 +1580,15 @@ impl EmitCx<'_> {
         }
     }
 
-    fn mut_place_set(&self, ty: RirTypeId, place: String, value: String) -> String {
+    fn mut_place_set(&self, ty: RirTypeId, place: &str, value: &str) -> String {
         if self.collection_replace_ty(ty) {
-            target::mut_place_replace_collection(&place, &target::ctx_runtime("ctx"), &value)
+            target::mut_place_replace_collection(place, &target::ctx_runtime("ctx"), value)
         } else {
-            target::mut_place_set(&place, &target::ctx_runtime("ctx"), &value)
+            target::mut_place_set(place, &target::ctx_runtime("ctx"), value)
         }
     }
 
-    fn slice_index_set(&self, access: super::place::SliceIndexAccess, value: String) -> String {
+    fn slice_index_set(access: &super::place::SliceIndexAccess, value: &str) -> String {
         let set = if access.list_root {
             let checked = target::checked_index_result(
                 &access.index,
@@ -1616,7 +1616,7 @@ impl EmitCx<'_> {
         format!("{{ let __anv_slice_value = {value}; {set}; }}")
     }
 
-    fn map_slot_set(&self, access: super::place::MapSlotAccess, value: String) -> String {
+    fn map_slot_set(access: &super::place::MapSlotAccess, value: &str) -> String {
         let set = target::map_optional_slot_set("value", "__anv_map_key", "__anv_map_slot");
         format!(
             "{{ let __anv_map_key = {}; let __anv_map_slot = {value}; let value = &mut {}; {set}?; }}",
@@ -1669,7 +1669,7 @@ impl EmitCx<'_> {
         self.map_index_read(function, map, index, |map, version| {
             let key = target::map_key_at_shared(map, "index", version);
             let value = target::map_value_at_shared(map, "index", version);
-            self.map_entry_tuple(tuple, &key, &value)
+            Self::map_entry_tuple(tuple, &key, &value)
         })
     }
 
@@ -1689,7 +1689,7 @@ impl EmitCx<'_> {
             return self.mut_place_access(
                 function,
                 map,
-                format!(
+                &format!(
                     "Ok({{ let index = {checked}; {} }})",
                     value("value", &version)
                 ),
@@ -1722,7 +1722,7 @@ impl EmitCx<'_> {
             return self.mut_place_mutate(
                 function,
                 map,
-                format!("{{ let index = {checked}; {} }}", update("value", &version)),
+                &format!("{{ let index = {checked}; {} }}", update("value", &version)),
             );
         }
 
@@ -1736,7 +1736,7 @@ impl EmitCx<'_> {
         )
     }
 
-    fn map_entry_tuple(&self, tuple: &super::rir::RirTuple, key: &str, value: &str) -> String {
+    fn map_entry_tuple(tuple: &super::rir::RirTuple, key: &str, value: &str) -> String {
         struct_lit(
             tuple.symbol.as_str(),
             [
@@ -1761,19 +1761,19 @@ impl EmitCx<'_> {
         )
     }
 
-    fn mut_place_access(&self, function: &RirFunction, place: &RirPlace, body: String) -> String {
+    fn mut_place_access(&self, function: &RirFunction, place: &RirPlace, body: &str) -> String {
         target::mut_place_access(
             &RustPlaces::new(self.program, function).local_place(place),
             &target::ctx_runtime("ctx"),
-            &body,
+            body,
         )
     }
 
-    fn mut_place_mutate(&self, function: &RirFunction, place: &RirPlace, body: String) -> String {
+    fn mut_place_mutate(&self, function: &RirFunction, place: &RirPlace, body: &str) -> String {
         target::mut_place_mutate(
             &RustPlaces::new(self.program, function).local_place(place),
             &target::ctx_runtime("ctx"),
-            &body,
+            body,
         )
     }
 
@@ -1913,8 +1913,17 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
         render: impl FnOnce(String) -> String,
     ) -> String {
+        self.prepared_call_expr(function, args, vec!["ctx".to_string()], render)
+    }
+
+    fn prepared_call_expr(
+        &self,
+        function: &RirFunction,
+        args: &[RirCallArg],
+        mut rendered: Vec<String>,
+        render: impl FnOnce(String) -> String,
+    ) -> String {
         let mut prelude = vec![];
-        let mut rendered = vec!["ctx".to_string()];
         for (index, arg) in args.iter().enumerate() {
             let (mut stmts, expr) = self.prepared_call_arg(function, index, arg);
             prelude.append(&mut stmts);
@@ -1941,7 +1950,7 @@ impl EmitCx<'_> {
         if !mut_place.projections.is_empty()
             && let Some((root_ty, root)) = values.mut_place_root_arg(&mut_place.root)
         {
-            return self.prepared_projected_call_arg(function, index, mut_place, root_ty, root);
+            return self.prepared_projected_call_arg(function, index, mut_place, root_ty, &root);
         }
         let RirMutPlaceRoot::DataRef { object, dataref } = &mut_place.root else {
             return (vec![], values.call_arg(arg));
@@ -1976,7 +1985,7 @@ impl EmitCx<'_> {
         index: usize,
         mut_place: &super::rir::RirMutPlaceArg,
         root_ty_id: RirTypeId,
-        root: String,
+        root: &str,
     ) -> (Vec<String>, String) {
         let ops = format!("__AnvProjectedPlaceOps{index}");
         let ops_tmp = format!("__anv_projected_place_ops_{index}");
@@ -1984,7 +1993,7 @@ impl EmitCx<'_> {
             .mut_place_projection_descriptor_for(
                 &ops,
                 root_ty_id,
-                &root,
+                root,
                 mut_place.ty,
                 &mut_place.projections,
             );
@@ -1994,7 +2003,7 @@ impl EmitCx<'_> {
                 descriptor.impl_decl,
                 format!("let {ops_tmp} = {};", descriptor.ctor),
             ],
-            target::mut_place_projected(&root, &format!("&{ops_tmp}")),
+            target::mut_place_projected(root, &format!("&{ops_tmp}")),
         )
     }
 
@@ -2053,7 +2062,7 @@ impl EmitCx<'_> {
             && let Some((enm, value)) = self.raw_enum_place(function, value, RirEnumRepr::RawInt)
         {
             return if enm.variants.is_empty() {
-                self.raw_enum_cast_match(&value, String::new())
+                Self::raw_enum_cast_match(&value, String::new())
             } else {
                 format!("{value} as {}", self.ty(target))
             };
@@ -2076,7 +2085,7 @@ impl EmitCx<'_> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return self.raw_enum_cast_match(&value, arms);
+            return Self::raw_enum_cast_match(&value, arms);
         }
         format!(
             "{} as {}",
@@ -2085,7 +2094,7 @@ impl EmitCx<'_> {
         )
     }
 
-    fn raw_enum_cast_match(&self, value: &str, arms: String) -> String {
+    fn raw_enum_cast_match(value: &str, arms: String) -> String {
         let scrutinee = format!("&{value}");
         if arms.is_empty() {
             match_expr(&scrutinee, ["_ => unreachable!()".to_string()])
@@ -2231,7 +2240,7 @@ impl EmitCx<'_> {
     ) -> String {
         let ext = &self.program.externs[id.index()];
         let values = RustValues::new(self.program, function);
-        let (symbol, mut rendered, fallible, ret_abi) = match &ext.kind {
+        let (symbol, rendered, fallible, ret_abi) = match &ext.kind {
             RirExternKind::Native(native) => (
                 native.path.join("::"),
                 vec![target::ctx_runtime("ctx")],
@@ -2239,10 +2248,11 @@ impl EmitCx<'_> {
                 &native.abi.ret,
             ),
         };
-        rendered.extend(args.iter().map(|arg| values.call_arg(arg)));
-        let call = format!("{symbol}({})", comma(rendered));
-        let call = if fallible { format!("{call}?") } else { call };
-        values.native_return_call(ext.ret, ret_abi, call)
+        self.prepared_call_expr(function, args, rendered, |rendered| {
+            let call = format!("{symbol}({rendered})");
+            let call = if fallible { format!("{call}?") } else { call };
+            values.native_return_call(ext.ret, ret_abi, call)
+        })
     }
 
     fn dataref_alloc(
@@ -2522,8 +2532,9 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),
         },
-        RirLambdaCaptureKind::StackCell { .. } => format!("*c{index}"),
+        RirLambdaCaptureKind::StackCell { .. } | RirLambdaCaptureKind::ScopedPlaceCell { .. } => {
+            format!("*c{index}")
+        }
         RirLambdaCaptureKind::HeapCell { .. } => format!("c{index}.clone()"),
-        RirLambdaCaptureKind::ScopedPlaceCell { .. } => format!("*c{index}"),
     }
 }

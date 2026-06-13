@@ -4534,6 +4534,35 @@ fn rir_rejects_projected_mut_borrow_arg() {
 }
 
 #[test]
+fn rir_rejects_payload_ref_mut_borrow_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let local = RirLocalId::from_index(0);
+    let mut payload = rir_local(local, int, true, "payload");
+    payload.payload_ref = true;
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int],
+        functions: vec![
+            mut_borrow_sink_function(RirFunctionId::from_index(0)),
+            rir_function(
+                RirFunctionId::from_index(1),
+                void,
+                vec![],
+                vec![payload],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(0)),
+                    args: vec![RirCallArg::MutBorrow(rir_place(local, int))],
+                    ty: void,
+                })],
+            ),
+        ],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
 fn rir_accepts_projected_local_field_mut_place_arg() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
@@ -5918,8 +5947,7 @@ fn profile_accepts_string_value_params() {
     });
     program.module_mut(module).functions.push(func);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    RustBackendProfile::check(&verified).expect("profile rejected string value param");
+    check(program);
 }
 
 #[test]
@@ -6497,8 +6525,7 @@ fn profile_accepts_zero_env_lambda_callees() {
     });
     program.module_mut(module).functions.push(func);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    RustBackendProfile::check(&verified).expect("profile rejected zero-env lambda callee");
+    check(program);
 }
 
 #[test]
@@ -7687,38 +7714,133 @@ fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
 }
 
 #[test]
+fn profile_and_plan_accept_direct_local_to_native_mut_borrow() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let ext = host_mut_extern(&mut program, int, void, "touch");
+    let module = program.alloc_module(root_module());
+    let x = air::LocalId::from_index(0);
+    let one = int_const(&mut program, int, 1);
+    let caller = caller_function(
+        &mut program,
+        module,
+        Signature::new(vec![], void),
+        vec![mut_local(int, LocalKind::User)],
+        vec![
+            Statement::Init {
+                local: x,
+                value: RValue::Use(Operand::Const(one)),
+            },
+            call_mut_ext(ext, place(x, int)),
+        ],
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let config = rust_plan_config();
+    RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
+        .expect("profile rejected direct native mut borrow");
+
+    let plan = plan(&verified, config).expect("plan failed");
+    let caller = rir_function_for_air(plan.program(), caller);
+    assert!(matches!(only_call_arg(caller), RirCallArg::MutBorrow(_)));
+}
+
+#[test]
+fn profile_rejects_temp_to_native_mut_borrow() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let ext = host_mut_extern(&mut program, int, void, "touch");
+    let module = program.alloc_module(root_module());
+    let x = air::LocalId::from_index(0);
+    let one = int_const(&mut program, int, 1);
+    caller_function(
+        &mut program,
+        module,
+        Signature::new(vec![], void),
+        vec![mut_local(int, LocalKind::Temp)],
+        vec![
+            Statement::Init {
+                local: x,
+                value: RValue::Use(Operand::Const(one)),
+            },
+            call_mut_ext(ext, place(x, int)),
+        ],
+    );
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
+}
+
+#[test]
+fn plan_lowers_projected_local_to_native_mut_place() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let ext = host_mut_extern(&mut program, int, void, "touch_place");
+    let module = program.alloc_module(root_module());
+    let pair = air::LocalId::from_index(0);
+    let one = int_const(&mut program, int, 1);
+    let caller = caller_function(
+        &mut program,
+        module,
+        Signature::new(vec![], void),
+        vec![mut_local(tuple, LocalKind::User)],
+        vec![
+            Statement::Init {
+                local: pair,
+                value: RValue::Aggregate {
+                    kind: AggregateCtor::Tuple,
+                    fields: vec![Operand::Const(one)],
+                    ty: tuple,
+                },
+            },
+            call_mut_ext(
+                ext,
+                Place {
+                    root: PlaceRoot::Local(pair),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: int,
+                },
+            ),
+        ],
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let caller = rir_function_for_air(plan.program(), caller);
+
+    assert!(matches!(
+        only_call_arg(caller),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::Local { .. },
+            projections,
+            ..
+        }) if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
+    ));
+    let source = emit::emit(&plan.verified()).into_string();
+    assert!(source.contains("host::touch_place(ctx.runtime(),"));
+    assert!(source.contains("MutPlace::projected("));
+    assert!(!source.contains("host::touch_place(ctx.runtime(), &mut"));
+}
+
+#[test]
 fn profile_rejects_source_var_param_to_native_mut_borrow() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
-    let ext = extern_in_module(
-        &mut program,
-        &["host"],
-        "touch",
-        vec![(int, ParamMode::MutBorrow)],
-        void,
-        ExternMember::FreeFunction,
-    );
-    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let ext = host_mut_extern(&mut program, int, void, "touch");
     let module = program.alloc_module(root_module());
     let x = air::LocalId::from_index(0);
-    let caller = program.alloc_function(Function {
-        name: Ident::new("caller"),
+    caller_function(
+        &mut program,
         module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, x)], void),
-        locals: vec![mut_local(int, LocalKind::Arg)],
-        body: structured_body(
-            vec![Statement::Eval(RValue::Call {
-                callee: Callee::Extern(ext),
-                args: vec![CallArg::MutBorrow(place(x, int))],
-            })],
-            air::AirTail::Return(None),
-        ),
-    });
-    program.module_mut(module).functions.push(caller);
+        Signature::new(vec![param("x", int, ParamMode::MutBorrow, x)], void),
+        vec![mut_local(int, LocalKind::Arg)],
+        vec![call_mut_ext(ext, place(x, int))],
+    );
 
     expect_reject(
         program,
@@ -7731,43 +7853,28 @@ fn profile_rejects_dataref_field_to_native_mut_borrow() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
-    let ext = extern_in_module(
-        &mut program,
-        &["host"],
-        "touch",
-        vec![(int, ParamMode::MutBorrow)],
-        void,
-        ExternMember::FreeFunction,
-    );
-    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let ext = host_mut_extern(&mut program, int, void, "touch");
     let module = program.alloc_module(root_module());
     let aggregate = dataref_decl(&mut program, module, int);
     let node = program.alloc_type(TypeData::DataRef(aggregate));
     let node_local = air::LocalId::from_index(0);
-    let caller = program.alloc_function(Function {
-        name: Ident::new("caller"),
+    caller_function(
+        &mut program,
         module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(
+        Signature::new(
             vec![param("node", node, ParamMode::Value, node_local)],
             void,
         ),
-        locals: vec![local(node, LocalKind::Arg)],
-        body: structured_body(
-            vec![Statement::Eval(RValue::Call {
-                callee: Callee::Extern(ext),
-                args: vec![CallArg::MutBorrow(Place {
-                    root: PlaceRoot::Local(node_local),
-                    projection: vec![Projection::Field(air::FieldId::from_index(0))],
-                    ty: int,
-                })],
-            })],
-            air::AirTail::Return(None),
-        ),
-    });
-    program.module_mut(module).functions.push(caller);
+        vec![local(node, LocalKind::Arg)],
+        vec![call_mut_ext(
+            ext,
+            Place {
+                root: PlaceRoot::Local(node_local),
+                projection: vec![Projection::Field(air::FieldId::from_index(0))],
+                ty: int,
+            },
+        )],
+    );
 
     expect_reject(
         program,
@@ -7781,49 +7888,34 @@ fn profile_rejects_projected_local_to_native_mut_borrow() {
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
-    let ext = extern_in_module(
-        &mut program,
-        &["host"],
-        "touch",
-        vec![(int, ParamMode::MutBorrow)],
-        void,
-        ExternMember::FreeFunction,
-    );
-    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let ext = host_mut_extern(&mut program, int, void, "touch");
     let module = program.alloc_module(root_module());
     let pair = air::LocalId::from_index(0);
     let one = int_const(&mut program, int, 1);
-    let caller = program.alloc_function(Function {
-        name: Ident::new("caller"),
+    caller_function(
+        &mut program,
         module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], void),
-        locals: vec![mut_local(tuple, LocalKind::Temp)],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: pair,
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::Tuple,
-                        fields: vec![Operand::Const(one)],
-                        ty: tuple,
-                    },
+        Signature::new(vec![], void),
+        vec![mut_local(tuple, LocalKind::Temp)],
+        vec![
+            Statement::Init {
+                local: pair,
+                value: RValue::Aggregate {
+                    kind: AggregateCtor::Tuple,
+                    fields: vec![Operand::Const(one)],
+                    ty: tuple,
                 },
-                Statement::Eval(RValue::Call {
-                    callee: Callee::Extern(ext),
-                    args: vec![CallArg::MutBorrow(Place {
-                        root: PlaceRoot::Local(pair),
-                        projection: vec![Projection::TupleField(0)],
-                        ty: int,
-                    })],
-                }),
-            ],
-            air::AirTail::Return(None),
-        ),
-    });
-    program.module_mut(module).functions.push(caller);
+            },
+            call_mut_ext(
+                ext,
+                Place {
+                    root: PlaceRoot::Local(pair),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: int,
+                },
+            ),
+        ],
+    );
 
     expect_reject(
         program,
@@ -16061,7 +16153,9 @@ fn rust_plan_config() -> RustPlanConfig {
         native_providers: vec![
             core2_runtime_support(),
             core2_string_support(),
+            core_int_support(),
             fallible_host_support(),
+            host_mut_support(),
         ],
     }
 }
@@ -16131,7 +16225,9 @@ fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
 
 fn check(program: Program) {
     let verified = air::verify(&program).expect("AIR verify failed");
-    RustBackendProfile::check(&verified).expect("profile rejected AIR");
+    let config = rust_plan_config();
+    RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
+        .expect("profile rejected AIR");
 }
 
 fn assert_plan_gap(program: Program, config: RustPlanConfig, kind: RustTargetGapKind) {
@@ -16149,7 +16245,9 @@ fn expect_reject(program: Program, kind: ProfileErrorKind) {
 
 fn profile_errors(program: Program) -> Vec<RustBackendProfileError> {
     let verified = air::verify(&program).expect("AIR verify failed");
-    RustBackendProfile::check(&verified).expect_err("profile accepted invalid AIR")
+    let config = rust_plan_config();
+    RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
+        .expect_err("profile accepted invalid AIR")
 }
 
 fn has_error(errors: &[RustBackendProfileError], kind: ProfileErrorKind) -> bool {
@@ -16204,6 +16302,23 @@ fn core2_string_support() -> anvyx_runtime::RustProviderSupport {
     )
 }
 
+fn core_int_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+
+    provider_support(
+        "core_int",
+        vec![function_binding(
+            "core_int",
+            "anvyx_core2",
+            &["__anvyx_native", "core_int", "int_abs"],
+            "int_abs",
+            vec![RustParamAbi::Value(ExternTypeExpr::Int)],
+            RustReturnAbi::Value(ExternTypeExpr::Int),
+            false,
+        )],
+    )
+}
+
 fn fallible_host_support() -> anvyx_runtime::RustProviderSupport {
     use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
 
@@ -16218,6 +16333,34 @@ fn fallible_host_support() -> anvyx_runtime::RustProviderSupport {
             RustReturnAbi::Value(ExternTypeExpr::Int),
             true,
         )],
+    )
+}
+
+fn host_mut_support() -> anvyx_runtime::RustProviderSupport {
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
+
+    provider_support(
+        "host",
+        vec![
+            function_binding(
+                "host",
+                "host",
+                &["host", "touch"],
+                "touch",
+                vec![RustParamAbi::MutBorrow(ExternTypeExpr::Int)],
+                RustReturnAbi::Void,
+                false,
+            ),
+            function_binding(
+                "host",
+                "host",
+                &["host", "touch_place"],
+                "touch_place",
+                vec![RustParamAbi::MutPlace(ExternTypeExpr::Int)],
+                RustReturnAbi::Void,
+                false,
+            ),
+        ],
     )
 }
 
@@ -16361,6 +16504,52 @@ fn fallible_extern(program: &mut Program, int: air::TypeId) -> air::ExternId {
     decl.binding = Some(provider_binding("fallible_host", "fallible"));
     decl.effects.fallible = true;
     id
+}
+
+fn host_mut_extern(
+    program: &mut Program,
+    int: air::TypeId,
+    void: air::TypeId,
+    name: &str,
+) -> air::ExternId {
+    let id = extern_in_module(
+        program,
+        &["host"],
+        name,
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[id.index()].binding = Some(provider_binding("host", name));
+    id
+}
+
+fn caller_function(
+    program: &mut Program,
+    module: air::ModuleId,
+    signature: Signature,
+    locals: Vec<Local>,
+    stmts: Vec<Statement>,
+) -> FunctionId {
+    let id = program.alloc_function(Function {
+        name: Ident::new("caller"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature,
+        locals,
+        body: structured_body(stmts, air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(id);
+    id
+}
+
+fn call_mut_ext(ext: air::ExternId, arg: Place) -> Statement {
+    Statement::Eval(RValue::Call {
+        callee: Callee::Extern(ext),
+        args: vec![CallArg::MutBorrow(arg)],
+    })
 }
 
 fn provider_binding(provider: &str, name: &str) -> ExternBindingDecl {

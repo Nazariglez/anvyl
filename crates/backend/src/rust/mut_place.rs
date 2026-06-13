@@ -1,10 +1,77 @@
-use anvyx_frontend::air::{self, FunctionId, Place};
+use anvyx_frontend::air::{
+    self, FunctionId, LocalKind, Mutability, ParamMode, Place, PlaceRoot, Program,
+};
 
 use super::{
     PlanCx, PlannedCallArg, RustPlanError, RustTargetGapKind, RustTargetGapSite,
     dataref_mut_place::{DataRefMutPlace, DataRefMutPlaceSupport, projected_ty},
     rir::{RirCallArg, RirLocal, RirLocalId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand},
 };
+
+pub(super) fn projected_mut_place_supported(
+    program: &Program,
+    root_ty: air::TypeId,
+    place: &Place,
+    allow_collections: bool,
+) -> bool {
+    let mut ty = root_ty;
+    let mut slice_dynamic = false;
+    for projection in &place.projection {
+        let data = program.type_arena.data(ty);
+        let direct = matches!(
+            (data, projection),
+            (
+                air::TypeData::Aggregate(_) | air::TypeData::Tuple(_),
+                air::Projection::Field(_) | air::Projection::TupleField(_),
+            ) | (air::TypeData::Array { .. }, air::Projection::Index(_))
+        );
+        let collection = allow_collections
+            && !slice_dynamic
+            && matches!(
+                (data, projection),
+                (air::TypeData::List(_), air::Projection::Index(_))
+                    | (air::TypeData::Map { .. }, air::Projection::MapIndex(_))
+            );
+        let slice = allow_collections
+            && matches!(
+                (data, projection),
+                (air::TypeData::Slice(_), air::Projection::Index(_))
+            );
+        if !(direct || collection || slice) {
+            return false;
+        }
+        let Some(next) = projected_ty(program, ty, projection) else {
+            return false;
+        };
+        ty = next;
+        slice_dynamic |= slice;
+    }
+    true
+}
+
+pub(super) fn direct_native_mut_borrow_supported(
+    program: &Program,
+    function: FunctionId,
+    place: &Place,
+) -> bool {
+    let PlaceRoot::Local(local_id) = place.root else {
+        return false;
+    };
+    if !place.projection.is_empty() {
+        return false;
+    }
+    let function = program.function(function);
+    let Some(local) = function.locals.get(local_id.index()) else {
+        return false;
+    };
+    local.kind == LocalKind::User
+        && local.mutability == Mutability::Mutable
+        && !function
+            .signature
+            .params
+            .iter()
+            .any(|param| param.local_id == local_id && param.mode == ParamMode::MutBorrow)
+}
 
 impl PlanCx<'_> {
     pub(super) fn plan_source_mut_place_arg(
@@ -15,7 +82,7 @@ impl PlanCx<'_> {
     ) -> Result<PlannedCallArg, RustPlanError> {
         match self.dataref_mut_place_support(function, place) {
             DataRefMutPlaceSupport::Supported(supported) => {
-                return Ok(self.plan_dataref_mut_place_arg(function, place, locals, supported));
+                return Ok(self.plan_dataref_mut_place_arg(function, place, locals, &supported));
             }
             DataRefMutPlaceSupport::UnsupportedDataRef => {
                 return Self::unsupported_mut_place(
@@ -38,7 +105,7 @@ impl PlanCx<'_> {
         function: FunctionId,
         place: &Place,
         locals: &mut Vec<RirLocal>,
-        supported: DataRefMutPlace,
+        supported: &DataRefMutPlace,
     ) -> PlannedCallArg {
         let mut stmts = vec![];
         let (_, object) = self.dataref_root_place(function, place, locals, &mut stmts);
@@ -109,7 +176,7 @@ impl PlanCx<'_> {
                 };
                 (root_ty, root, true)
             };
-        if !self.projected_mut_place_supported(root_ty, place, allow_collections) {
+        if !projected_mut_place_supported(self.air, root_ty, place, allow_collections) {
             return Self::unsupported_mut_place(
                 function,
                 RustTargetGapKind::UnsupportedMutablePlaceProjection,
@@ -122,48 +189,6 @@ impl PlanCx<'_> {
                 self.type_map[&place.ty],
             ),
         )))
-    }
-
-    fn projected_mut_place_supported(
-        &self,
-        root_ty: air::TypeId,
-        place: &Place,
-        allow_collections: bool,
-    ) -> bool {
-        let mut ty = root_ty;
-        let mut slice_dynamic = false;
-        for projection in &place.projection {
-            match (self.air.type_arena.data(ty), projection) {
-                (
-                    air::TypeData::Aggregate(_) | air::TypeData::Tuple(_),
-                    air::Projection::Field(_) | air::Projection::TupleField(_),
-                )
-                | (air::TypeData::Array { .. }, air::Projection::Index(_)) => {
-                    let Some(next) = projected_ty(self.air, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                }
-                (air::TypeData::List(_), air::Projection::Index(_))
-                | (air::TypeData::Map { .. }, air::Projection::MapIndex(_))
-                    if allow_collections && !slice_dynamic =>
-                {
-                    let Some(next) = projected_ty(self.air, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                }
-                (air::TypeData::Slice(_), air::Projection::Index(_)) if allow_collections => {
-                    let Some(next) = projected_ty(self.air, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                    slice_dynamic = true;
-                }
-                _ => return false,
-            }
-        }
-        true
     }
 
     fn plan_root_mut_place_arg(
@@ -207,25 +232,15 @@ impl PlanCx<'_> {
         function: FunctionId,
         place: &Place,
     ) -> Result<PlannedCallArg, RustPlanError> {
-        if !place.projection.is_empty()
-            || self.place_is_source_mut_place_param(function, place)
-            || self.place_capture_cell(function, place).is_some()
-            || self.place_scoped_borrow(function, place).is_some()
-        {
-            return Self::unsupported_mut_place(
-                function,
-                RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary,
-            );
+        if direct_native_mut_borrow_supported(self.air, function, place) {
+            return Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
+                self.plan_place_in_function(function, place),
+            )));
         }
-        if self.place_crosses_dataref(function, place) {
-            return Self::unsupported_mut_place(
-                function,
-                RustTargetGapKind::UnsupportedMutablePlaceDataRef,
-            );
-        }
-        Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
-            self.plan_place_in_function(function, place),
-        )))
+        Self::unsupported_mut_place(
+            function,
+            RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary,
+        )
     }
 
     fn unsupported_mut_place<T>(
@@ -241,10 +256,10 @@ impl PlanCx<'_> {
         place: &Place,
     ) -> DataRefMutPlaceSupport {
         let root_ty = match place.root {
-            air::PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
-            air::PlaceRoot::ScopedBorrow(borrow) => self.air.scoped_borrows[borrow.index()].ty,
-            air::PlaceRoot::Global(_) => return DataRefMutPlaceSupport::Ordinary,
-            air::PlaceRoot::Local(_) | air::PlaceRoot::LambdaCapture(_) => {
+            PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
+            PlaceRoot::ScopedBorrow(borrow) => self.air.scoped_borrows[borrow.index()].ty,
+            PlaceRoot::Global(_) => return DataRefMutPlaceSupport::Ordinary,
+            PlaceRoot::Local(_) | PlaceRoot::LambdaCapture(_) => {
                 self.current_place_root(function, place).0
             }
         };

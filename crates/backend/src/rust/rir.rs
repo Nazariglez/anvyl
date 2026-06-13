@@ -1139,19 +1139,36 @@ fn native_extern_signature_ok(
         && native_return_abi_ok(program, &native.abi.ret, ext.ret, void)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NativeParamAbi {
+    pub semantic: RirParamSemantic,
+    pub abi: RirParamAbi,
+}
+
+pub(super) fn rust_param_abi(abi: &RustParamAbi) -> Option<NativeParamAbi> {
+    let (semantic, abi) = match abi {
+        RustParamAbi::Value(_) => (RirParamSemantic::Value, RirParamAbi::Value),
+        RustParamAbi::Borrow(_) => (RirParamSemantic::SharedBorrow, RirParamAbi::SharedBorrow),
+        RustParamAbi::MutBorrow(_) => (RirParamSemantic::MutBorrow, RirParamAbi::MutBorrow),
+        RustParamAbi::MutPlace(_) => (RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
+        RustParamAbi::Option(_) | RustParamAbi::List(_) => return None,
+    };
+    Some(NativeParamAbi { semantic, abi })
+}
+
 fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExternParam) -> bool {
-    match abi {
-        RustParamAbi::Value(ty) => {
-            param.abi == RirParamAbi::Value && rir_type_matches_extern(program, param.ty, ty)
+    let Some(native) = rust_param_abi(abi) else {
+        return false;
+    };
+    param.semantic == native.semantic
+        && param.abi == native.abi
+        && match abi {
+            RustParamAbi::Value(ty)
+            | RustParamAbi::Borrow(ty)
+            | RustParamAbi::MutBorrow(ty)
+            | RustParamAbi::MutPlace(ty) => rir_type_matches_extern(program, param.ty, ty),
+            RustParamAbi::Option(_) | RustParamAbi::List(_) => false,
         }
-        RustParamAbi::Borrow(ty) => {
-            param.abi == RirParamAbi::SharedBorrow && rir_type_matches_extern(program, param.ty, ty)
-        }
-        RustParamAbi::MutBorrow(ty) => {
-            param.abi == RirParamAbi::MutBorrow && rir_type_matches_extern(program, param.ty, ty)
-        }
-        RustParamAbi::Option(_) | RustParamAbi::List(_) => false,
-    }
 }
 
 fn native_return_abi_ok(
@@ -1184,6 +1201,14 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
                 && strukt.native_key.as_ref().is_some_and(|key| {
                     module.as_ref().is_none_or(|module| key.module == *module) && key.name == *name
                 })
+        }
+        (RirType::List(elem), ExternTypeExpr::List(expected))
+        | (RirType::Option(elem), ExternTypeExpr::Option(expected)) => {
+            rir_type_matches_extern(program, *elem, expected)
+        }
+        (RirType::Map { key, value }, ExternTypeExpr::Map(expected_key, expected_value)) => {
+            rir_type_matches_extern(program, *key, expected_key)
+                && rir_type_matches_extern(program, *value, expected_value)
         }
         _ => false,
     }
@@ -1718,7 +1743,7 @@ impl VerifyCx<'_> {
                     },
                 );
             }
-            Some(_) if !self.function_local_is_mut_place_param(owner, cell.source_local) => {
+            Some(_) if !Self::function_local_is_mut_place_param(owner, cell.source_local) => {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
             Some(_) => {}
@@ -2444,7 +2469,7 @@ impl VerifyCx<'_> {
                 }
                 if let Some(decl) = self.check_function_cell_ref(site, function_id, *cell) {
                     if decl.storage == RirCellStorage::Heap
-                        && matches!(value, RirRValue::Use(RirOperand::Place(place)) if self.place_is_mut_place_param_root(function, place))
+                        && matches!(value, RirRValue::Use(RirOperand::Place(place)) if Self::place_is_mut_place_param_root(function, place))
                     {
                         self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
                     }
@@ -2855,7 +2880,7 @@ impl VerifyCx<'_> {
         if matches!(
             scope.mode,
             RirCollectionLoanMode::MutableSequenceElement | RirCollectionLoanMode::MutableMapValue
-        ) && !self.place_is_mutable_root(function, &scope.root)
+        ) && !Self::place_is_mutable_root(function, &scope.root)
         {
             self.push(site, RirVerifyErrorKind::ImmutableAssign);
         }
@@ -2875,12 +2900,12 @@ impl VerifyCx<'_> {
         self.merge_structured_states([state]);
     }
 
-    fn place_is_mutable_root(&self, function: &RirFunction, place: &RirPlace) -> bool {
+    fn place_is_mutable_root(function: &RirFunction, place: &RirPlace) -> bool {
         function
             .locals
             .get(place.local.index())
             .is_some_and(|local| local.mutable)
-            || self.place_is_mut_place_param_root(function, place)
+            || Self::place_is_mut_place_param_root(function, place)
     }
 
     fn assignment_replaces_active_collection_root(&self, dst: &RirPlace) -> bool {
@@ -3538,7 +3563,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if self.place_is_mut_place_param_root(function, list) {
+                if Self::place_is_mut_place_param_root(function, list) {
                     self.check_short_region_operand(site, function, value);
                 }
                 self.check_value_operand_ty(site, function, value, elem);
@@ -3617,7 +3642,7 @@ impl VerifyCx<'_> {
                         },
                     );
                 }
-                if self.place_is_mut_place_param_root(function, map) {
+                if Self::place_is_mut_place_param_root(function, map) {
                     self.check_short_region_operand(site, function, key);
                 }
                 self.check_value_operand_ty(site, function, key, key_ty);
@@ -3716,7 +3741,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if self.place_is_mut_place_param_root(function, map) {
+                if Self::place_is_mut_place_param_root(function, map) {
                     self.check_short_region_operand(site, function, key);
                     self.check_short_region_operand(site, function, value);
                 }
@@ -3854,15 +3879,20 @@ impl VerifyCx<'_> {
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
                 RirCallArg::SharedBorrow(place) => {
                     self.check_place(site, function, place);
-                    if self.function_local_is_mut_place_param(function, place.local) {
+                    if Self::function_local_is_mut_place_param(function, place.local) {
                         self.push(site, RirVerifyErrorKind::CallArgMode);
                     }
                     Some(place.ty)
                 }
                 RirCallArg::MutBorrow(place) => {
                     self.check_place(site, function, place);
-                    if self.function_local_is_mut_place_param(function, place.local)
+                    let direct_local = function
+                        .locals
+                        .get(place.local.index())
+                        .is_some_and(|local| local.mutable && !local.payload_ref);
+                    if Self::function_local_is_mut_place_param(function, place.local)
                         || !place.projections.is_empty()
+                        || !direct_local
                     {
                         self.push(site, RirVerifyErrorKind::CallArgMode);
                     }
@@ -3909,7 +3939,7 @@ impl VerifyCx<'_> {
                         ty: arg.ty,
                     },
                 );
-                if self.function_local_is_mut_place_param(function, *local) {
+                if Self::function_local_is_mut_place_param(function, *local) {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
                 }
                 match function.locals.get(local.index()) {
@@ -4201,12 +4231,12 @@ impl VerifyCx<'_> {
             self.push(site, RirVerifyErrorKind::BadId);
             return None;
         };
-        if self.function_local_is_hidden_cell_param(function, local)
+        if Self::function_local_is_hidden_cell_param(function, local)
             || self.function_local_is_scoped_place_source(function.id, local)
         {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
-        if self.function_local_is_mut_place_param(function, local) {
+        if Self::function_local_is_mut_place_param(function, local) {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         if !self
@@ -4482,12 +4512,12 @@ impl VerifyCx<'_> {
         operand: &RirOperand,
     ) {
         if let RirOperand::Place(place) = operand {
-            if self.function_local_is_hidden_cell_param(function, place.local)
+            if Self::function_local_is_hidden_cell_param(function, place.local)
                 || self.function_local_is_scoped_place_source(function.id, place.local)
             {
                 self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             }
-            if self.function_local_is_mut_place_param(function, place.local) {
+            if Self::function_local_is_mut_place_param(function, place.local) {
                 self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             }
         }
@@ -4642,7 +4672,7 @@ impl VerifyCx<'_> {
             Some(local) => local.ty,
             None => return,
         };
-        if self.function_local_is_hidden_cell_param(function, place.local) {
+        if Self::function_local_is_hidden_cell_param(function, place.local) {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             return;
         }
@@ -4650,7 +4680,7 @@ impl VerifyCx<'_> {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             return;
         }
-        if self.function_local_is_mut_place_param(function, place.local)
+        if Self::function_local_is_mut_place_param(function, place.local)
             && !place.projections.is_empty()
             && !self.projected_mut_place_arg_supported(current, &place.projections, true)
         {
@@ -4854,13 +4884,9 @@ impl VerifyCx<'_> {
             .unwrap_or(false)
     }
 
-    fn function_local_is_hidden_cell_param(
-        &self,
-        function: &RirFunction,
-        local: RirLocalId,
-    ) -> bool {
+    fn function_local_is_hidden_cell_param(function: &RirFunction, local: RirLocalId) -> bool {
         matches!(
-            self.function_local_param_abi(function, local),
+            Self::function_local_param_abi(function, local),
             Some(RirParamAbi::StackCell | RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell)
         )
     }
@@ -4876,13 +4902,13 @@ impl VerifyCx<'_> {
             .any(|cell| cell.owner == function && cell.source_local == local)
     }
 
-    fn function_local_is_mut_place_param(&self, function: &RirFunction, local: RirLocalId) -> bool {
-        self.function_local_param_abi(function, local) == Some(RirParamAbi::MutPlace)
+    fn function_local_is_mut_place_param(function: &RirFunction, local: RirLocalId) -> bool {
+        Self::function_local_param_abi(function, local) == Some(RirParamAbi::MutPlace)
     }
 
-    fn place_is_mut_place_param_root(&self, function: &RirFunction, place: &RirPlace) -> bool {
+    fn place_is_mut_place_param_root(function: &RirFunction, place: &RirPlace) -> bool {
         place.projections.is_empty()
-            && self.function_local_is_mut_place_param(function, place.local)
+            && Self::function_local_is_mut_place_param(function, place.local)
     }
 
     fn projected_mut_place_arg_supported(
@@ -4962,11 +4988,7 @@ impl VerifyCx<'_> {
             .map(RirTypeId::from_index)
     }
 
-    fn function_local_param_abi(
-        &self,
-        function: &RirFunction,
-        local: RirLocalId,
-    ) -> Option<RirParamAbi> {
+    fn function_local_param_abi(function: &RirFunction, local: RirLocalId) -> Option<RirParamAbi> {
         function
             .params
             .iter()
@@ -5249,13 +5271,5 @@ pub fn source_param_semantic(mode: air::ParamMode) -> RirParamSemantic {
         air::ParamMode::Value => RirParamSemantic::Value,
         air::ParamMode::SharedBorrow => RirParamSemantic::SharedBorrow,
         air::ParamMode::MutBorrow => RirParamSemantic::MutPlace,
-    }
-}
-
-pub fn native_param_semantic(mode: air::ParamMode) -> RirParamSemantic {
-    match mode {
-        air::ParamMode::Value => RirParamSemantic::Value,
-        air::ParamMode::SharedBorrow => RirParamSemantic::SharedBorrow,
-        air::ParamMode::MutBorrow => RirParamSemantic::MutBorrow,
     }
 }

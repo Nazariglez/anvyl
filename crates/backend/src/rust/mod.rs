@@ -4,6 +4,7 @@ mod dataref_mut_place;
 mod dataref_place;
 pub mod emit;
 mod mut_place;
+mod native;
 mod place;
 pub mod profile;
 pub mod rep_policy;
@@ -29,7 +30,7 @@ use anvyx_frontend::{
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
-use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustPath, RustProviderSupport};
+use anvyx_runtime::{RustPath, RustProviderSupport};
 
 use self::{
     dataref_mut_place::projected_ty as air_projected_ty,
@@ -241,6 +242,7 @@ impl From<RustBackendProfileError> for RustTargetGap {
                     RustTargetGapKind::UnsupportedExternMember
                 }
                 ProfileErrorKind::UnsupportedEntry => RustTargetGapKind::UnsupportedEntry,
+                ProfileErrorKind::UnsupportedRustAbi => RustTargetGapKind::UnsupportedRustAbi,
                 ProfileErrorKind::UnsupportedLambdaValue => {
                     RustTargetGapKind::UnsupportedLambdaValue
                 }
@@ -394,9 +396,10 @@ impl<'a> PlanCx<'a> {
     }
 
     fn check_support(&self) -> Result<(), RustPlanError> {
-        RustBackendProfile::check(self.verified).map_err(|errors| {
-            RustPlanError::TargetGaps(errors.into_iter().map(RustTargetGap::from).collect())
-        })
+        RustBackendProfile::check_with_native_support(self.verified, &self.config.native_providers)
+            .map_err(|errors| {
+                RustPlanError::TargetGaps(errors.into_iter().map(RustTargetGap::from).collect())
+            })
     }
 
     fn gap(site: RustTargetGapSite, kind: RustTargetGapKind) -> RustPlanError {
@@ -1086,8 +1089,9 @@ impl<'a> PlanCx<'a> {
             let air_id = ExternId::from_index(index);
             let decl = self.air.extern_decl(air_id);
             let id = RirExternId::from_index(program.externs.len());
-            let params = self.extern_params(program, decl);
-            let kind = self.extern_kind(air_id, decl)?;
+            let native = self.native_extern(air_id, decl)?;
+            let params = self.extern_params(decl, &native);
+            let kind = Self::extern_kind(&native);
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -1104,49 +1108,26 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
-    fn extern_params(&self, program: &RirProgram, decl: &air::ExternDecl) -> Vec<RirExternParam> {
-        let policy = RustRepPolicy::new(program);
+    fn extern_params(
+        &self,
+        decl: &air::ExternDecl,
+        native: &native::ResolvedExtern<'_>,
+    ) -> Vec<RirExternParam> {
         decl.call_params()
-            .map(|param| {
-                let ty = self.type_map[&param.ty];
-                let semantic = rir::native_param_semantic(param.mode);
-                RirExternParam {
-                    ty,
-                    semantic,
-                    abi: policy.param_abi(semantic),
-                }
+            .zip(&native.params)
+            .map(|(param, abi)| RirExternParam {
+                ty: self.type_map[&param.ty],
+                semantic: abi.semantic,
+                abi: abi.abi,
             })
             .collect()
     }
 
-    fn extern_kind(
-        &self,
-        air_id: ExternId,
-        decl: &air::ExternDecl,
-    ) -> Result<RirExternKind, RustPlanError> {
-        if let Some(binding) = &decl.binding {
-            let native = self.native_binding(binding).ok_or_else(|| {
-                Self::gap(
-                    RustTargetGapSite::Extern(air_id),
-                    RustTargetGapKind::UnsupportedExtern,
-                )
-            })?;
-            if native.abi.support != RustAbiSupport::Direct {
-                return Err(Self::gap(
-                    RustTargetGapSite::Extern(air_id),
-                    RustTargetGapKind::UnsupportedRustAbi,
-                ));
-            }
-            return Ok(RirExternKind::Native(RirNativeExtern {
-                path: native_path(&native.path),
-                abi: native.abi.clone(),
-            }));
-        }
-
-        Err(Self::gap(
-            RustTargetGapSite::Extern(air_id),
-            RustTargetGapKind::UnsupportedExtern,
-        ))
+    fn extern_kind(native: &native::ResolvedExtern<'_>) -> RirExternKind {
+        RirExternKind::Native(RirNativeExtern {
+            path: native_path(&native.binding.path),
+            abi: native.binding.abi.clone(),
+        })
     }
 
     fn native_type_binding(
@@ -1160,43 +1141,30 @@ impl<'a> PlanCx<'a> {
                 RustTargetGapKind::UnsupportedExtern,
             ));
         };
-        self.config
-            .native_providers
-            .iter()
-            .find(|provider| {
-                provider.package == binding.package.as_str()
-                    && provider.provider == binding.provider
-            })
-            .and_then(|provider| {
-                provider
-                    .modules
-                    .iter()
-                    .flat_map(|module| &module.types)
-                    .find(|native| native.key == binding.key)
-            })
-            .ok_or_else(|| {
-                Self::gap(
-                    RustTargetGapSite::Type(type_id),
-                    RustTargetGapKind::UnsupportedExtern,
-                )
-            })
+        native::type_binding(&self.config.native_providers, binding).ok_or_else(|| {
+            Self::gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedExtern,
+            )
+        })
     }
 
-    fn native_binding(&self, binding: &air::ExternBindingDecl) -> Option<&RustExternBinding> {
-        self.config
-            .native_providers
-            .iter()
-            .find(|provider| {
-                provider.package == binding.package.as_str()
-                    && provider.provider == binding.provider
-            })
-            .and_then(|provider| {
-                provider
-                    .modules
-                    .iter()
-                    .flat_map(|module| &module.bindings)
-                    .find(|native| native.key == binding.key)
-            })
+    fn native_extern(
+        &self,
+        id: ExternId,
+        decl: &air::ExternDecl,
+    ) -> Result<native::ResolvedExtern<'_>, RustPlanError> {
+        native::resolve_extern(&self.config.native_providers, decl).map_err(|error| {
+            let kind = match error {
+                native::ResolveExternError::UnsupportedExtern => {
+                    RustTargetGapKind::UnsupportedExtern
+                }
+                native::ResolveExternError::UnsupportedRustAbi => {
+                    RustTargetGapKind::UnsupportedRustAbi
+                }
+            };
+            Self::gap(RustTargetGapSite::Extern(id), kind)
+        })
     }
 
     fn plan_function_ids(&mut self) {
@@ -1774,18 +1742,18 @@ impl<'a> PlanCx<'a> {
                 {
                     *mutable = true;
                 }
-                let known = self.known_lambda_rvalue(&planned.value);
+                let known = Self::known_lambda_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Init {
                     local: RirLocalId::from_index(local.index()),
                     value: planned.value,
                 });
-                self.set_known_lambda(lambda_values, RirLocalId::from_index(local.index()), known);
+                Self::set_known_lambda(lambda_values, RirLocalId::from_index(local.index()), known);
                 Ok(stmts)
             }
             air::AirStmt::Assign { dst, value } => {
                 let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
-                let known = self.known_lambda_rvalue(&planned.value);
+                let known = Self::known_lambda_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 self.lower_place_write(
                     function,
@@ -1797,7 +1765,7 @@ impl<'a> PlanCx<'a> {
                     possible_cells,
                     in_loop,
                 )?;
-                self.set_place_known_lambda(lambda_values, dst, known);
+                Self::set_place_known_lambda(lambda_values, dst, known);
                 Ok(stmts)
             }
             air::AirStmt::Eval(value) => {
@@ -1842,7 +1810,7 @@ impl<'a> PlanCx<'a> {
                     }
                     None => (None, entry_lambdas, entry_cells, entry_possible),
                 };
-                self.merge_known_lambdas(
+                Self::merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&then_lambdas, &else_lambdas],
@@ -1883,7 +1851,7 @@ impl<'a> PlanCx<'a> {
                     &mut body_possible,
                     true,
                 )?;
-                self.merge_known_lambdas(
+                Self::merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&entry_lambdas, &body_lambdas],
@@ -1990,7 +1958,7 @@ impl<'a> PlanCx<'a> {
                     None => None,
                 };
                 if !states.is_empty() {
-                    self.merge_known_lambdas(lambda_values, locals.len(), states.iter());
+                    Self::merge_known_lambdas(lambda_values, locals.len(), states.iter());
                     for index in 0..initialized_cells.len() {
                         initialized_cells[index] = cell_states.iter().all(|state| state[index]);
                         possible_cells[index] = possible_states.iter().any(|state| state[index]);
@@ -2045,7 +2013,7 @@ impl<'a> PlanCx<'a> {
                     &mut none_possible,
                     in_loop,
                 )?;
-                self.merge_known_lambdas(
+                Self::merge_known_lambdas(
                     lambda_values,
                     locals.len(),
                     [&some_lambdas, &none_lambdas],
@@ -2076,7 +2044,6 @@ impl<'a> PlanCx<'a> {
     }
 
     fn set_known_lambda(
-        &self,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
         local: RirLocalId,
         known: Option<KnownLambdaValue>,
@@ -2088,7 +2055,6 @@ impl<'a> PlanCx<'a> {
     }
 
     fn set_place_known_lambda(
-        &self,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
         place: &Place,
         known: Option<KnownLambdaValue>,
@@ -2096,7 +2062,7 @@ impl<'a> PlanCx<'a> {
         let Some(local) = place.root.local() else {
             return;
         };
-        self.set_known_lambda(
+        Self::set_known_lambda(
             lambda_values,
             RirLocalId::from_index(local.index()),
             place.projection.is_empty().then_some(known).flatten(),
@@ -2104,7 +2070,6 @@ impl<'a> PlanCx<'a> {
     }
 
     fn merge_known_lambdas<'b>(
-        &self,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
         len: usize,
         states: impl IntoIterator<Item = &'b Vec<Option<KnownLambdaValue>>>,
@@ -2472,7 +2437,7 @@ impl<'a> PlanCx<'a> {
         self.rust_copyable_air_type(ty) || self.rust_shareable_air_type(ty)
     }
 
-    fn known_lambda_rvalue(&self, value: &RirRValue) -> Option<KnownLambdaValue> {
+    fn known_lambda_rvalue(value: &RirRValue) -> Option<KnownLambdaValue> {
         let RirRValue::Lambda {
             lambda,
             captures,
@@ -2674,13 +2639,12 @@ impl<'a> PlanCx<'a> {
             }
             Callee::Extern(id) => {
                 let ext = self.air.extern_decl(*id);
+                let native = self.native_extern(*id, ext)?;
                 (
                     RirCallTarget::Extern(self.extern_map[id]),
                     self.type_map[&ext.return_type],
                     vec![],
-                    ext.call_params()
-                        .map(|param| rir::native_param_semantic(param.mode))
-                        .collect::<Vec<_>>(),
+                    native.params.iter().map(|param| param.semantic).collect(),
                 )
             }
             Callee::Lambda(operand) => {
@@ -2854,52 +2818,49 @@ impl<'a> PlanCx<'a> {
                 )
             }
             stmt => {
-                let updates_slot = self.direct_stmt_updates_collection_slot(scope, &stmt);
+                let updates_slot = Self::direct_stmt_updates_collection_slot(scope, &stmt);
                 (stmt, updates_slot)
             }
         })
     }
 
     fn direct_stmt_updates_collection_slot(
-        &self,
         scope: &air::AirCollectionSlotScope,
         stmt: &RirStmt,
     ) -> bool {
         match stmt {
-            RirStmt::Assign { dst, .. } => self.place_is_collection_slot(scope, dst),
+            RirStmt::Assign { dst, .. } => Self::place_is_collection_slot(scope, dst),
             RirStmt::Eval(value)
             | RirStmt::Init { value, .. }
             | RirStmt::CellInit { value, .. }
             | RirStmt::CellSet { value, .. }
             | RirStmt::ScopedPlaceCellSet { value, .. } => {
-                self.rvalue_updates_collection_slot(scope, value)
+                Self::rvalue_updates_collection_slot(scope, value)
             }
             _ => false,
         }
     }
 
     fn rvalue_updates_collection_slot(
-        &self,
         scope: &air::AirCollectionSlotScope,
         value: &RirRValue,
     ) -> bool {
         match value {
             RirRValue::Call { args, .. } => args
                 .iter()
-                .any(|arg| self.call_arg_updates_collection_slot(scope, arg)),
+                .any(|arg| Self::call_arg_updates_collection_slot(scope, arg)),
             _ => false,
         }
     }
 
     fn call_arg_updates_collection_slot(
-        &self,
         scope: &air::AirCollectionSlotScope,
         arg: &RirCallArg,
     ) -> bool {
         match arg {
-            RirCallArg::MutBorrow(place) => self.place_is_collection_slot(scope, place),
+            RirCallArg::MutBorrow(place) => Self::place_is_collection_slot(scope, place),
             RirCallArg::MutPlace(arg) => match &arg.root {
-                RirMutPlaceRoot::Local { local, ty } => self.place_is_collection_slot(
+                RirMutPlaceRoot::Local { local, ty } => Self::place_is_collection_slot(
                     scope,
                     &RirPlace {
                         local: *local,
@@ -2913,11 +2874,7 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn place_is_collection_slot(
-        &self,
-        scope: &air::AirCollectionSlotScope,
-        place: &RirPlace,
-    ) -> bool {
+    fn place_is_collection_slot(scope: &air::AirCollectionSlotScope, place: &RirPlace) -> bool {
         scope
             .slots
             .iter()
@@ -3069,7 +3026,7 @@ impl<'a> PlanCx<'a> {
                     && let Some(known) = self.known_lambda_place(place, lambda_values)
                 {
                     let local = self.alloc_temp(locals, place.ty);
-                    self.set_known_lambda(lambda_values, local, Some(known));
+                    Self::set_known_lambda(lambda_values, local, Some(known));
                     return Ok(PlannedCallArg {
                         stmts: vec![RirStmt::Init {
                             local,

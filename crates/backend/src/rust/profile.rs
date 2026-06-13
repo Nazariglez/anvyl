@@ -10,12 +10,18 @@ use anvyx_frontend::{
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
+use anvyx_runtime::RustProviderSupport;
 
 use super::{
     dataref_mut_place::{
         DataRefMutPlace, DataRefMutPlaceSupport, classify as classify_dataref_mut_place,
         projected_ty as air_projected_ty,
     },
+    mut_place::{
+        direct_native_mut_borrow_supported,
+        projected_mut_place_supported as mut_place_projection_supported,
+    },
+    native,
     rep_policy::AirRustRepPolicy,
     rir,
 };
@@ -24,10 +30,14 @@ use super::{
 pub struct RustBackendProfile;
 
 impl RustBackendProfile {
-    pub fn check(program: &VerifiedProgram<'_>) -> Result<(), Vec<RustBackendProfileError>> {
+    pub fn check_with_native_support(
+        program: &VerifiedProgram<'_>,
+        native_providers: &[RustProviderSupport],
+    ) -> Result<(), Vec<RustBackendProfileError>> {
         let program = program.program();
         let mut cx = ProfileCx {
             program,
+            native_providers,
             classes: TypePassClasses::analyze(program),
             errors: vec![],
         };
@@ -79,6 +89,7 @@ pub enum ProfileErrorKind {
     UnsupportedExtern,
     UnsupportedExternMember,
     UnsupportedEntry,
+    UnsupportedRustAbi,
     UnsupportedLambdaValue,
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
@@ -93,6 +104,7 @@ pub enum ProfileErrorKind {
 
 struct ProfileCx<'a> {
     program: &'a Program,
+    native_providers: &'a [RustProviderSupport],
     classes: TypePassClasses,
     errors: Vec<RustBackendProfileError>,
 }
@@ -869,7 +881,7 @@ impl ProfileCx<'_> {
     }
 
     fn optional_payload_ref_discr_supported(&self, site: ProfileSite, place: &Place) -> bool {
-        let Some(function) = self.current_function_id(site) else {
+        let Some(function) = Self::current_function_id(site) else {
             return false;
         };
         let PlaceRoot::Local(local) = place.root else {
@@ -941,50 +953,8 @@ impl ProfileCx<'_> {
             PlaceRoot::Global(_) => None,
         };
         root_ty.is_some_and(|root_ty| {
-            self.projected_mut_place_supported_from(root_ty, place, allow_collections)
+            mut_place_projection_supported(self.program, root_ty, place, allow_collections)
         })
-    }
-
-    fn projected_mut_place_supported_from(
-        &self,
-        root_ty: TypeId,
-        place: &Place,
-        allow_collections: bool,
-    ) -> bool {
-        let mut ty = root_ty;
-        let mut slice_dynamic = false;
-        for projection in &place.projection {
-            match (self.program.type_arena.data(ty), projection) {
-                (
-                    TypeData::Aggregate(_) | TypeData::Tuple(_),
-                    Projection::Field(_) | Projection::TupleField(_),
-                )
-                | (TypeData::Array { .. }, Projection::Index(_)) => {
-                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                }
-                (TypeData::List(_), Projection::Index(_))
-                | (TypeData::Map { .. }, Projection::MapIndex(_))
-                    if allow_collections && !slice_dynamic =>
-                {
-                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                }
-                (TypeData::Slice(_), Projection::Index(_)) if allow_collections => {
-                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
-                        return false;
-                    };
-                    ty = next;
-                    slice_dynamic = true;
-                }
-                _ => return false,
-            }
-        }
-        true
     }
 
     fn current_local(&self, site: ProfileSite, local: LocalId) -> Option<&Local> {
@@ -1044,12 +1014,7 @@ impl ProfileCx<'_> {
                 .iter()
                 .map(|param| rir::source_param_semantic(param.mode))
                 .collect(),
-            Callee::Extern(id) => self
-                .program
-                .extern_decl(*id)
-                .call_params()
-                .map(|param| rir::native_param_semantic(param.mode))
-                .collect(),
+            Callee::Extern(id) => self.extern_param_semantics(*id),
             Callee::Lambda(operand) => match self.program.type_arena.data(self.operand_ty(operand))
             {
                 TypeData::Function(sig) => sig
@@ -1060,6 +1025,12 @@ impl ProfileCx<'_> {
                 _ => vec![],
             },
         }
+    }
+
+    fn extern_param_semantics(&self, id: ExternId) -> Vec<rir::RirParamSemantic> {
+        native::resolve_extern(self.native_providers, self.program.extern_decl(id))
+            .map(|native| native.params.iter().map(|param| param.semantic).collect())
+            .unwrap_or_default()
     }
 
     fn check_call_arg(
@@ -1083,7 +1054,12 @@ impl ProfileCx<'_> {
             }
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
-                match expected.unwrap_or(rir::RirParamSemantic::MutBorrow) {
+                let Some(expected) = expected else {
+                    self.check_place(site, place);
+                    self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                    return;
+                };
+                match expected {
                     rir::RirParamSemantic::MutPlace => {
                         if !place.projection.is_empty() {
                             match self.dataref_mut_place_support(site, place) {
@@ -1109,19 +1085,14 @@ impl ProfileCx<'_> {
                         self.check_place(site, place);
                     }
                     rir::RirParamSemantic::MutBorrow => {
-                        let source_place = place
-                            .root
-                            .local()
-                            .is_some_and(|local| self.local_is_source_mut_place_param(site, local));
-                        if !place.projection.is_empty()
-                            || source_place
-                            || self.place_capture_cell(site, place).is_some()
-                            || self.place_scoped_borrow(site, place).is_some()
-                            || !matches!(
-                                self.dataref_mut_place_support(site, place),
-                                DataRefMutPlaceSupport::Ordinary
-                            )
-                        {
+                        let Some(function) = Self::current_function_id(site) else {
+                            self.push(
+                                site,
+                                ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+                            );
+                            return;
+                        };
+                        if !direct_native_mut_borrow_supported(self.program, function, place) {
                             self.push(
                                 site,
                                 ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
@@ -1202,7 +1173,7 @@ impl ProfileCx<'_> {
                 if self.local_is_source_mut_place_param(site, root)
                     && !place.projection.is_empty()
                     && !self.place_crosses_dataref(site, place)
-                    && !self.projected_mut_place_supported_from(local.ty, place, true)
+                    && !mut_place_projection_supported(self.program, local.ty, place, true)
                 {
                     self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
                     return;
@@ -1273,7 +1244,7 @@ impl ProfileCx<'_> {
     }
 
     fn local_is_source_mut_place_param(&self, site: ProfileSite, local: LocalId) -> bool {
-        self.current_function_id(site)
+        Self::current_function_id(site)
             .is_some_and(|function| self.function_local_is_source_mut_place_param(function, local))
     }
 
@@ -1291,7 +1262,7 @@ impl ProfileCx<'_> {
     }
 
     fn place_scoped_borrow(&self, site: ProfileSite, place: &Place) -> Option<air::ScopedBorrowId> {
-        let function = self.current_function_id(site)?;
+        let function = Self::current_function_id(site)?;
         self.program.scoped_borrow_root(function, place.root)
     }
 
@@ -1319,7 +1290,7 @@ impl ProfileCx<'_> {
     }
 
     fn check_scoped_borrow_place(&mut self, site: ProfileSite, place: &Place) -> Option<TypeId> {
-        let function = self.current_function_id(site)?;
+        let function = Self::current_function_id(site)?;
         let borrow = self.place_scoped_borrow(site, place)?;
         let Some(decl) = self.program.scoped_borrows.get(borrow.index()) else {
             self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
@@ -1349,7 +1320,7 @@ impl ProfileCx<'_> {
         Some(projected_ty.unwrap_or(decl.ty))
     }
 
-    fn current_function_id(&self, site: ProfileSite) -> Option<FunctionId> {
+    fn current_function_id(site: ProfileSite) -> Option<FunctionId> {
         match site {
             ProfileSite::Function(function)
             | ProfileSite::Local(function, _)
@@ -1365,7 +1336,7 @@ impl ProfileCx<'_> {
     }
 
     fn place_capture_cell(&self, site: ProfileSite, place: &Place) -> Option<air::CaptureCellId> {
-        let function = self.current_function_id(site)?;
+        let function = Self::current_function_id(site)?;
         self.program.capture_cell_root(function, place.root)
     }
 
@@ -1434,18 +1405,22 @@ impl ProfileCx<'_> {
     }
 
     fn check_extern(&mut self, id: ExternId, decl: &ExternDecl) {
-        if decl.binding.is_none() {
-            self.push(ProfileSite::Extern(id), ProfileErrorKind::UnsupportedExtern);
+        let site = ProfileSite::Extern(id);
+        match native::resolve_extern(self.native_providers, decl) {
+            Ok(_) => {}
+            Err(native::ResolveExternError::UnsupportedExtern) => {
+                self.push(site, ProfileErrorKind::UnsupportedExtern);
+            }
+            Err(native::ResolveExternError::UnsupportedRustAbi) => {
+                self.push(site, ProfileErrorKind::UnsupportedRustAbi);
+            }
         }
         if decl
             .call_params()
             .any(|param| self.type_contains_function(param.ty))
             || self.type_contains_function(decl.return_type)
         {
-            self.push(
-                ProfileSite::Extern(id),
-                ProfileErrorKind::UnsupportedLambdaExternBoundary,
-            );
+            self.push(site, ProfileErrorKind::UnsupportedLambdaExternBoundary);
         }
     }
 
