@@ -34,12 +34,14 @@ pub enum CleanType {
 pub enum CleanFlow {
     Value,
     Borrow,
+    MutBorrow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanParamAbi {
     Value(CleanType),
     Borrow(CleanType),
+    MutPlace(CleanType),
     Option(Box<CleanParamAbi>),
     List(Box<CleanParamAbi>),
 }
@@ -122,34 +124,82 @@ pub fn validate_ctx_param(param: &syn::PatType, macro_name: &str) -> syn::Result
     Ok(())
 }
 
+pub fn validate_mut_place_ctx(
+    sig: &Signature,
+    ctx: &syn::PatType,
+    params: &[CleanParam],
+    macro_name: &str,
+) -> syn::Result<()> {
+    if !params
+        .iter()
+        .any(|param| param.flow == CleanFlow::MutBorrow)
+    {
+        return Ok(());
+    }
+    if !sig.generics.params.iter().any(|param| {
+        matches!(param, syn::GenericParam::Lifetime(lifetime) if lifetime.lifetime.ident == "cx")
+    }) {
+        return Err(syn::Error::new_spanned(
+            &sig.generics,
+            format!("{macro_name} MutPlace parameters require a `'cx` lifetime"),
+        ));
+    }
+    if !ctx_has_explicit_brand(&ctx.ty) {
+        return Err(syn::Error::new_spanned(
+            &ctx.ty,
+            format!(
+                "{macro_name} MutPlace parameters require ctx type `&mut anvyx_runtime::Ctx<'cx, '_>`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_ctx_type(ty: &Type) -> bool {
-    let Type::Reference(reference) = ty else {
+    ctx_args(ty).is_some_and(valid_ctx_args)
+}
+
+fn ctx_has_explicit_brand(ty: &Type) -> bool {
+    let Some(PathArguments::AngleBracketed(args)) = ctx_args(ty) else {
         return false;
     };
-    if reference.lifetime.is_some() || reference.mutability.is_none() {
+    if args.args.len() != 2 {
         return false;
     }
+    let mut args = args.args.iter();
+    matches!(args.next(), Some(GenericArgument::Lifetime(lifetime)) if lifetime.ident == "cx")
+        && matches!(args.next(), Some(arg) if valid_inferred_lifetime(arg))
+}
+
+fn ctx_args(ty: &Type) -> Option<&PathArguments> {
+    let Type::Reference(reference) = ty else {
+        return None;
+    };
+    if reference.lifetime.is_some() || reference.mutability.is_none() {
+        return None;
+    }
     let Type::Path(path) = reference.elem.as_ref() else {
-        return false;
+        return None;
     };
     if path.qself.is_some() {
-        return false;
+        return None;
     }
     let mut segments = path.path.segments.iter();
     let first = segments.next();
     let second = segments.next();
     if segments.next().is_some() {
-        return false;
+        return None;
     }
     match (first, second) {
-        (Some(ctx), None) => ctx.ident == "Ctx" && valid_ctx_args(&ctx.arguments),
-        (Some(runtime), Some(ctx)) => {
-            runtime.ident == "anvyx_runtime"
+        (Some(ctx), None) if ctx.ident == "Ctx" => Some(&ctx.arguments),
+        (Some(runtime), Some(ctx))
+            if runtime.ident == "anvyx_runtime"
                 && matches!(runtime.arguments, PathArguments::None)
-                && ctx.ident == "Ctx"
-                && valid_ctx_args(&ctx.arguments)
+                && ctx.ident == "Ctx" =>
+        {
+            Some(&ctx.arguments)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -174,7 +224,7 @@ fn valid_inferred_lifetime(arg: &GenericArgument) -> bool {
     matches!(arg, GenericArgument::Lifetime(lifetime) if lifetime.ident == "_")
 }
 
-pub fn classify_param(pat_ty: &syn::PatType) -> syn::Result<CleanParam> {
+pub fn classify_param(pat_ty: &syn::PatType, has_ctx: bool) -> syn::Result<CleanParam> {
     let syn::Pat::Ident(ident) = pat_ty.pat.as_ref() else {
         return Err(syn::Error::new_spanned(
             &pat_ty.pat,
@@ -182,6 +232,18 @@ pub fn classify_param(pat_ty: &syn::PatType) -> syn::Result<CleanParam> {
         ));
     };
     let (ty, flow) = classify_type(&pat_ty.ty, Position::Param)?;
+    if flow == CleanFlow::MutBorrow && !has_ctx {
+        return Err(syn::Error::new_spanned(
+            &pat_ty.ty,
+            "MutPlace parameters require #[function(ctx)]",
+        ));
+    }
+    if flow == CleanFlow::MutBorrow && !mut_place_macro_payload_supported(&ty) {
+        return Err(syn::Error::new_spanned(
+            &pat_ty.ty,
+            "#[function(ctx)] MutPlace parameters only support bool, i64, f64, and Option of those payloads",
+        ));
+    }
     if ty == CleanType::Void {
         return Err(syn::Error::new_spanned(
             &pat_ty.ty,
@@ -189,7 +251,7 @@ pub fn classify_param(pat_ty: &syn::PatType) -> syn::Result<CleanParam> {
         ));
     }
     let abi = param_abi(&ty, flow);
-    let conversion = param_conversion_for_type(&ty);
+    let conversion = param_conversion(&ty, flow);
     Ok(CleanParam {
         name: ident.ident.to_string(),
         ty,
@@ -265,7 +327,7 @@ fn classify_type(ty: &Type, position: Position) -> syn::Result<(CleanType, Clean
             if reference.mutability.is_some() {
                 return Err(syn::Error::new_spanned(
                     reference,
-                    "#[function] does not support mutable references yet",
+                    "#[function] does not support direct mutable references; use #[function(ctx)] with MutPlace<'_, 'cx, T>",
                 ));
             }
             if matches!(reference.elem.as_ref(), Type::Path(path) if path_is(path, &["str"])) {
@@ -276,7 +338,7 @@ fn classify_type(ty: &Type, position: Position) -> syn::Result<(CleanType, Clean
                 "#[function] only supports &str references in the MVP",
             ))
         }
-        Type::Path(path) => classify_path(path).map(|ty| (ty, CleanFlow::Value)),
+        Type::Path(path) => classify_path(path, position),
         _ => Err(syn::Error::new_spanned(
             ty,
             "unsupported #[function] boundary type",
@@ -284,24 +346,35 @@ fn classify_type(ty: &Type, position: Position) -> syn::Result<(CleanType, Clean
     }
 }
 
-fn classify_path(path: &TypePath) -> syn::Result<CleanType> {
+fn classify_path(path: &TypePath, position: Position) -> syn::Result<(CleanType, CleanFlow)> {
     if path.qself.is_some() {
         return Err(syn::Error::new_spanned(
             path,
             "qualified boundary types are not supported",
         ));
     }
+    if let Some(inner) = mut_place_type_arg(path)? {
+        if position != Position::Param {
+            return Err(syn::Error::new_spanned(
+                path,
+                "MutPlace is only supported in parameter position",
+            ));
+        }
+        let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
+        reject_wrapper_element(inner, &ty, flow)?;
+        return Ok((ty, CleanFlow::MutBorrow));
+    }
     if path_is(path, &["bool"]) {
-        return Ok(CleanType::Bool);
+        return Ok((CleanType::Bool, CleanFlow::Value));
     }
     if path_is(path, &["i64"]) {
-        return Ok(CleanType::Int);
+        return Ok((CleanType::Int, CleanFlow::Value));
     }
     if path_is(path, &["f64"]) {
-        return Ok(CleanType::Float);
+        return Ok((CleanType::Float, CleanFlow::Value));
     }
     if path_is(path, &["String"]) || path_is(path, &["std", "string", "String"]) {
-        return Ok(CleanType::String);
+        return Ok((CleanType::String, CleanFlow::Value));
     }
     for rejected in [
         "f32", "usize", "isize", "i8", "i16", "i32", "u8", "u16", "u32", "u64",
@@ -316,12 +389,12 @@ fn classify_path(path: &TypePath) -> syn::Result<CleanType> {
     if let Some(inner) = one_type_arg(path, &[&["Option"], &["std", "option", "Option"]])? {
         let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
         reject_wrapper_element(inner, &ty, flow)?;
-        return Ok(CleanType::Option(Box::new(ty)));
+        return Ok((CleanType::Option(Box::new(ty)), CleanFlow::Value));
     }
     if let Some(inner) = one_type_arg(path, &[&["Vec"], &["std", "vec", "Vec"]])? {
         let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
         reject_wrapper_element(inner, &ty, flow)?;
-        return Ok(CleanType::List(Box::new(ty)));
+        return Ok((CleanType::List(Box::new(ty)), CleanFlow::Value));
     }
     Err(syn::Error::new_spanned(
         path,
@@ -351,6 +424,7 @@ pub fn flow_tokens(flow: CleanFlow) -> TokenStream {
     match flow {
         CleanFlow::Value => quote! { anvyx_runtime::ParamFlow::Value },
         CleanFlow::Borrow => quote! { anvyx_runtime::ParamFlow::Borrow },
+        CleanFlow::MutBorrow => quote! { anvyx_runtime::ParamFlow::MutBorrow },
     }
 }
 
@@ -363,6 +437,10 @@ pub fn param_abi_tokens(abi: &CleanParamAbi) -> TokenStream {
         CleanParamAbi::Borrow(ty) => {
             let ty = type_expr_tokens(ty);
             quote! { anvyx_runtime::RustParamAbi::Borrow(#ty) }
+        }
+        CleanParamAbi::MutPlace(ty) => {
+            let ty = type_expr_tokens(ty);
+            quote! { anvyx_runtime::RustParamAbi::MutPlace(#ty) }
         }
         CleanParamAbi::Option(inner) => {
             let inner = param_abi_tokens(inner);
@@ -394,14 +472,17 @@ pub fn return_abi_tokens(abi: &CleanReturnAbi) -> TokenStream {
 }
 
 fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
-    match ty {
-        CleanType::Option(inner) => {
-            CleanParamAbi::Option(Box::new(param_abi(inner, CleanFlow::Value)))
-        }
-        CleanType::List(inner) => CleanParamAbi::List(Box::new(param_abi(inner, CleanFlow::Value))),
-        _ => match flow {
-            CleanFlow::Value => CleanParamAbi::Value(ty.clone()),
-            CleanFlow::Borrow => CleanParamAbi::Borrow(ty.clone()),
+    match flow {
+        CleanFlow::MutBorrow => CleanParamAbi::MutPlace(ty.clone()),
+        CleanFlow::Borrow => CleanParamAbi::Borrow(ty.clone()),
+        CleanFlow::Value => match ty {
+            CleanType::Option(inner) => {
+                CleanParamAbi::Option(Box::new(param_abi(inner, CleanFlow::Value)))
+            }
+            CleanType::List(inner) => {
+                CleanParamAbi::List(Box::new(param_abi(inner, CleanFlow::Value)))
+            }
+            _ => CleanParamAbi::Value(ty.clone()),
         },
     }
 }
@@ -445,7 +526,18 @@ pub fn merge_conversions(
         })
 }
 
-fn param_conversion_for_type(ty: &CleanType) -> BoundaryConversion {
+fn mut_place_macro_payload_supported(ty: &CleanType) -> bool {
+    match ty {
+        CleanType::Bool | CleanType::Int | CleanType::Float => true,
+        CleanType::Option(inner) => mut_place_macro_payload_supported(inner),
+        CleanType::Void | CleanType::String | CleanType::List(_) => false,
+    }
+}
+
+fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
+    if flow == CleanFlow::MutBorrow {
+        return BoundaryConversion::Direct;
+    }
     match ty {
         CleanType::Option(_) | CleanType::List(_) => BoundaryConversion::Unsupported,
         _ => BoundaryConversion::Direct,
@@ -500,6 +592,47 @@ fn path_is(path: &TypePath, segments: &[&str]) -> bool {
             .iter()
             .zip(segments)
             .all(|(actual, expected)| actual.ident == expected)
+}
+
+fn mut_place_type_arg(path: &TypePath) -> syn::Result<Option<&Type>> {
+    if !path_is(path, &["MutPlace"]) && !path_is(path, &["anvyx_runtime", "MutPlace"]) {
+        return Ok(None);
+    }
+    let segment = path.path.segments.last().expect("matched path has segment");
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            segment,
+            "MutPlace requires lifetimes and a type argument",
+        ));
+    };
+    if args.args.len() != 3 {
+        return Err(syn::Error::new_spanned(
+            args,
+            "MutPlace parameters must be `MutPlace<'_, 'cx, T>`",
+        ));
+    }
+    let mut args = args.args.iter();
+    let region = args.next().expect("checked len");
+    if !valid_inferred_lifetime(region) {
+        return Err(syn::Error::new_spanned(
+            region,
+            "MutPlace first lifetime must be `'_`",
+        ));
+    }
+    let cx = args.next().expect("checked len");
+    if !matches!(cx, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx") {
+        return Err(syn::Error::new_spanned(
+            cx,
+            "MutPlace second lifetime must be `'cx`",
+        ));
+    }
+    match args.next().expect("checked len") {
+        GenericArgument::Type(ty) => Ok(Some(ty)),
+        arg => Err(syn::Error::new_spanned(
+            arg,
+            "MutPlace requires a type argument",
+        )),
+    }
 }
 
 fn one_type_arg<'a>(path: &'a TypePath, names: &[&[&str]]) -> syn::Result<Option<&'a Type>> {
@@ -610,11 +743,15 @@ mod tests {
     use super::*;
 
     fn first_param(tokens: TokenStream) -> syn::Result<CleanParam> {
+        first_param_with_ctx(tokens, false)
+    }
+
+    fn first_param_with_ctx(tokens: TokenStream, has_ctx: bool) -> syn::Result<CleanParam> {
         let func: ItemFn = syn::parse2(quote! { fn f(#tokens) {} }).unwrap();
         let Some(syn::FnArg::Typed(param)) = func.sig.inputs.first() else {
             unreachable!();
         };
-        classify_param(param)
+        classify_param(param, has_ctx)
     }
 
     fn ret(output: ReturnType) -> syn::Result<CleanReturn> {
@@ -639,6 +776,43 @@ mod tests {
         assert_eq!(param.ty, CleanType::String);
         assert_eq!(param.flow, CleanFlow::Borrow);
         assert_eq!(param.abi, CleanParamAbi::Borrow(CleanType::String));
+    }
+
+    #[test]
+    fn maps_mut_place_param() {
+        let param = first_param_with_ctx(
+            quote! { value: anvyx_runtime::MutPlace<'_, 'cx, i64> },
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(param.ty, CleanType::Int);
+        assert_eq!(param.flow, CleanFlow::MutBorrow);
+        assert_eq!(param.abi, CleanParamAbi::MutPlace(CleanType::Int));
+        assert_eq!(param.conversion, BoundaryConversion::Direct);
+    }
+
+    #[test]
+    fn rejects_mut_place_without_ctx_or_runtime_payload() {
+        assert!(first_param(quote! { value: MutPlace<'_, 'cx, i64> }).is_err());
+        assert!(
+            first_param_with_ctx(quote! { value: MutPlace<'_, 'cx, String> }, true)
+                .unwrap_err()
+                .to_string()
+                .contains("only support")
+        );
+        assert!(
+            first_param_with_ctx(quote! { value: MutPlace<'_, 'cx, Vec<i64>> }, true)
+                .unwrap_err()
+                .to_string()
+                .contains("only support")
+        );
+        assert_eq!(
+            first_param_with_ctx(quote! { value: MutPlace<'_, 'cx, Option<i64>> }, true)
+                .unwrap()
+                .ty,
+            CleanType::Option(Box::new(CleanType::Int))
+        );
     }
 
     #[test]

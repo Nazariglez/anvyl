@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, BinaryOp, Ctx, ExternBindingOp, ExternMemberSelector, ExternOperator, Heap,
-    ReceiverMode, RustParamAbi, methods,
+    AnvyxInline, BinaryOp, Ctx, ExternBindingOp, ExternMemberSelector, ExternOperator,
+    ExternTypeExpr, Heap, ReceiverMode, RustParamAbi, methods,
 };
 
 #[derive(AnvyxInline)]
@@ -39,7 +39,14 @@ fn ctx_method_hides_ctx_from_metadata_and_wrapper_uses_ctx_first() {
     assert_eq!(export.descriptor.methods[0].signature.params.len(), 1);
     assert_eq!(
         export.bindings[0].abi.params,
-        [RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::Int)]
+        [
+            RustParamAbi::Borrow(ExternTypeExpr::Named {
+                module: None,
+                name: "CtxBox".to_string(),
+                args: vec![],
+            }),
+            RustParamAbi::Value(ExternTypeExpr::Int),
+        ]
     );
     Heap::scope(|heap| {
         let mut ctx = Ctx::new(heap);
@@ -226,10 +233,32 @@ fn duplicate_operator_fragments_are_rejected() {
 fn method_bindings_use_member_keys_and_operations() {
     let export = __anvyx_methods_vec2();
 
-    assert!(export.bindings.iter().any(|binding| matches!(
-        (&binding.selector, binding.operation, binding.receiver),
-        (ExternMemberSelector::Method(name), ExternBindingOp::Call, Some(ReceiverMode::Shared)) if name == "len2"
-    )));
+    let len2 = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "len2"))
+        .unwrap();
+    assert_eq!(len2.operation, ExternBindingOp::Call);
+    let owner = ExternTypeExpr::Named {
+        module: None,
+        name: "Vec2".to_string(),
+        args: vec![],
+    };
+    assert_eq!(len2.abi.params[0], RustParamAbi::Borrow(owner.clone()));
+    let reset = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "reset"))
+        .unwrap();
+    assert_eq!(reset.abi.params[0], RustParamAbi::MutBorrow(owner.clone()));
+    let setter = export
+        .bindings
+        .iter()
+        .find(|binding| {
+            matches!((&binding.selector, binding.operation), (ExternMemberSelector::Field(name), ExternBindingOp::Set) if name == "length")
+        })
+        .unwrap();
+    assert_eq!(setter.abi.params[0], RustParamAbi::MutBorrow(owner));
     assert!(export.bindings.iter().any(|binding| matches!(
         (&binding.selector, binding.operation),
         (ExternMemberSelector::Static(name), ExternBindingOp::Call) if name == "unit"

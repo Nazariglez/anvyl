@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{Ctx, ExternTypeExpr, Heap, ParamFlow, RustAbiSupport, RustParamAbi, function};
+use anvyx_runtime::{
+    Ctx, ExternTypeExpr, Heap, MutPlace, ParamFlow, RustAbiSupport, RustParamAbi, function,
+};
 
 /// Adds numbers.
 #[function]
@@ -47,6 +49,16 @@ fn with_ctx(ctx: &mut Ctx<'_, '_>, value: i64) -> i64 {
 fn with_ctx_lifetime<'cx>(ctx: &mut Ctx<'cx, '_>, name: &'cx str) -> i64 {
     let _ = ctx.heap();
     name.len() as i64
+}
+
+#[function(ctx)]
+fn bump_place<'cx>(ctx: &mut Ctx<'cx, '_>, mut value: MutPlace<'_, 'cx, i64>) {
+    let _ = value.update_copy(ctx, |n| n + 1);
+}
+
+#[function(ctx)]
+fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, mut value: MutPlace<'_, 'cx, Option<i64>>) {
+    let _ = value.update_copy(ctx, |n| n.map(|n| n + 1));
 }
 
 #[test]
@@ -139,4 +151,31 @@ fn ctx_is_hidden_from_metadata_and_passed_to_authored_function() {
 
     let export = __anvyx_export_with_ctx_lifetime();
     assert_eq!(export.descriptor.signature.params.len(), 1);
+}
+
+#[test]
+fn mut_place_param_uses_place_aware_mutable_abi() {
+    let export = __anvyx_export_bump_place();
+
+    assert_eq!(export.descriptor.signature.params.len(), 1);
+    assert_eq!(
+        export.descriptor.signature.params[0].flow,
+        ParamFlow::MutBorrow
+    );
+    assert_eq!(
+        export.descriptor.signature.params[0].ty,
+        ExternTypeExpr::Int
+    );
+    assert_eq!(export.rust.abi.params.len(), 1);
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::MutPlace(ExternTypeExpr::Int)
+    );
+    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+
+    let export = __anvyx_export_maybe_place();
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::MutPlace(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)))
+    );
 }

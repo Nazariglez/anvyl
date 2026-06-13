@@ -1,0 +1,5 @@
+error: #[function(ctx)] MutPlace parameters only support bool, i64, f64, and Option of those payloads
+ --> tests/ui/function/mut_place_string.rs:4:44
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, String>) {
+  |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^

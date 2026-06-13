@@ -736,7 +736,7 @@ fn setter_ty(
             "computed setters require exactly one value parameter",
         ));
     };
-    let param = classify_param(param)?;
+    let param = classify_param(param, false)?;
     for override_name in attrs.params.keys() {
         if override_name != &param.name {
             return Err(syn::Error::new_spanned(
@@ -874,7 +874,7 @@ fn signature_tokens(
     let params = visible_typed_params(method, export.is_some_and(|export| export.ctx))?
         .into_iter()
         .map(|param| {
-            let param = classify_param(param)?;
+            let param = classify_param(param, false)?;
             let name = param.name;
             let ty = match export.and_then(|export| export.param_overrides.get(&name)) {
                 Some(override_ty) => {
@@ -995,14 +995,26 @@ fn member_binding(
     let module = methods_native_module_ident_string(owner);
     let owner_ty = named_type_expr(export_name);
     let self_operator = matches!(&export.role, Role::Operator(op) if op.rhs_self);
-    let abis = if self_operator {
-        vec![quote! { anvyx_runtime::RustParamAbi::Value(#owner_ty) }]
+    let params = if self_operator {
+        vec![]
     } else {
         visible_typed_params(method, export.ctx)?
             .into_iter()
-            .map(|param| classify_param(param).map(|param| param_abi_tokens(&param.abi)))
+            .map(|param| classify_param(param, false))
             .collect::<syn::Result<Vec<_>>>()?
     };
+    let mut abis = match role_receiver(method, &export.role) {
+        Some(Receiver::Shared) => vec![quote! { anvyx_runtime::RustParamAbi::Borrow(#owner_ty) }],
+        Some(Receiver::Mutable) => {
+            vec![quote! { anvyx_runtime::RustParamAbi::MutBorrow(#owner_ty) }]
+        }
+        None => vec![],
+    };
+    if self_operator {
+        abis.push(quote! { anvyx_runtime::RustParamAbi::Value(#owner_ty) });
+    } else {
+        abis.extend(params.iter().map(|param| param_abi_tokens(&param.abi)));
+    }
     let (ret_abi, support, fallible) = if matches!(export.role, Role::Init) {
         (
             quote! { anvyx_runtime::RustReturnAbi::Void },
@@ -1026,11 +1038,8 @@ fn member_binding(
         let ret = classify_return(&method.sig.output)?;
         let ret_abi = return_abi_tokens(&ret.abi);
         let support = crate::clean_type_map::conversion_tokens(merge_conversions(
-            visible_typed_params(method, export.ctx)?
-                .into_iter()
-                .map(classify_param)
-                .collect::<syn::Result<Vec<_>>>()?
-                .into_iter()
+            params
+                .iter()
                 .map(|param| param.conversion)
                 .chain(std::iter::once(ret.conversion)),
         ));
@@ -1038,18 +1047,12 @@ fn member_binding(
     };
     let selector = &export.selector;
     let operation = &export.operation;
-    let receiver = match role_receiver(method, &export.role) {
-        Some(Receiver::Shared) => quote! { Some(anvyx_runtime::ReceiverMode::Shared) },
-        Some(Receiver::Mutable) => quote! { Some(anvyx_runtime::ReceiverMode::Mutable) },
-        None => quote! { None },
-    };
     Ok(quote! {
         anvyx_runtime::RustMemberBinding {
             selector: #selector,
             operation: #operation,
             module: #module.to_string(),
             symbol: #symbol.to_string(),
-            receiver: #receiver,
             abi: anvyx_runtime::RustExternAbi {
                 params: vec![#(#abis),*],
                 ret: #ret_abi,
@@ -1078,10 +1081,7 @@ fn methods_native_module_ident(owner: &Ident) -> Ident {
 }
 
 fn methods_native_module_ident_string(owner: &Ident) -> String {
-    format!(
-        "__anvyx_methods_native_{}",
-        owner.to_string().to_lowercase()
-    )
+    methods_native_module_ident(owner).to_string()
 }
 
 fn receiver_tokens(receiver: Receiver) -> TokenStream {

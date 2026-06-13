@@ -1,0 +1,29 @@
+error: #[function(ctx)] MutPlace parameters require a `'cx` lifetime
+ --> tests/ui/function/ctx_missing_lifetime_mut_place.rs:3:1
+  |
+3 | #[function(ctx)]
+  | ^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `function` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0261]: use of undeclared lifetime name `'cx`
+ --> tests/ui/function/ctx_missing_lifetime_mut_place.rs:4:22
+  |
+4 | fn bad(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
+  |                      ^^^ undeclared lifetime
+  |
+help: consider introducing lifetime `'cx` here
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
+  |       +++++
+
+error[E0261]: use of undeclared lifetime name `'cx`
+ --> tests/ui/function/ctx_missing_lifetime_mut_place.rs:4:52
+  |
+4 | fn bad(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
+  |                                                    ^^^ undeclared lifetime
+  |
+help: consider introducing lifetime `'cx` here
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
+  |       +++++

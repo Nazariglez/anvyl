@@ -79,5 +79,33 @@ Supported scalar mapping for `#[function]`:
 ABIs are described in metadata but rejected by the clean Rust backend until
 wrapper conversion support exists.
 
+Mutable provider parameters have two Rust ABI shapes:
+
+- `&mut T` is a low-level/manual ABI. The clean Rust backend only passes whole
+  mutable local lvalues to it.
+- `#[function(ctx)]` with `MutPlace<'_, 'cx, T>` is the normal place-aware ABI.
+  It accepts supported projected/source mutable places without copy-back. The
+  macro currently supports `bool`, `i64`, `f64`, and `Option` of those payloads;
+  provider authors needing runtime payloads such as strings or lists must use
+  manual metadata with the runtime representation type.
+
+```rust
+use anvyx_runtime::{function, Ctx, MutPlace, RuntimeError};
+
+#[function(ctx)]
+pub fn bump<'cx>(
+    ctx: &mut Ctx<'cx, '_>,
+    mut value: MutPlace<'_, 'cx, i64>,
+) -> Result<(), RuntimeError> {
+    value.update_copy(ctx, |n| n + 1)
+}
+```
+
+Use `MutPlace` only during the call. Access or mutate it through the provided
+short closures and do not store it. `#[methods] fn method(&mut self, ...)` stays
+a direct mutable receiver ABI; manual/final provider metadata may use
+`RustParamAbi::MutPlace(owner)` as receiver parameter 0 for place-aware receiver
+bindings.
+
 Provider crates must export `provider_descriptor()` and `rust_module_support()`;
 `builtin_module!` generates both.

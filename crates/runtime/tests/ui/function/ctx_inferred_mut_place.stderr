@@ -1,0 +1,5 @@
+error: #[function(ctx)] MutPlace parameters require ctx type `&mut anvyx_runtime::Ctx<'cx, '_>`
+ --> tests/ui/function/ctx_inferred_mut_place.rs:4:18
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'_, '_>, value: MutPlace<'_, 'cx, i64>) {
+  |                  ^^^^^^^^^^^^^^^^

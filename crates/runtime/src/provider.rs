@@ -98,7 +98,10 @@ fn retarget_abi(abi: &mut RustExternAbi, source_name: &str, target_name: &str) {
 
 fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &str) {
     match abi {
-        RustParamAbi::Value(ty) | RustParamAbi::Borrow(ty) | RustParamAbi::MutBorrow(ty) => {
+        RustParamAbi::Value(ty)
+        | RustParamAbi::Borrow(ty)
+        | RustParamAbi::MutBorrow(ty)
+        | RustParamAbi::MutPlace(ty) => {
             retarget_type(ty, source_name, target_name);
         }
         RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
@@ -117,28 +120,73 @@ fn retarget_return_abi(abi: &mut RustReturnAbi, source_name: &str, target_name: 
     }
 }
 
+fn member_binding_has_receiver(
+    selector: &ExternMemberSelector,
+    operation: ExternBindingOp,
+) -> bool {
+    matches!(
+        (selector, operation),
+        (
+            ExternMemberSelector::Method(_) | ExternMemberSelector::Operator(_),
+            ExternBindingOp::Call
+        ) | (
+            ExternMemberSelector::Field(_),
+            ExternBindingOp::Get | ExternBindingOp::Set
+        )
+    )
+}
+
+fn qualify_param_abi_owner(abi: &mut RustParamAbi, owner: &ExternTypeKey) {
+    match abi {
+        RustParamAbi::Value(ty)
+        | RustParamAbi::Borrow(ty)
+        | RustParamAbi::MutBorrow(ty)
+        | RustParamAbi::MutPlace(ty) => qualify_owner_type(ty, owner),
+        RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
+            qualify_param_abi_owner(inner, owner);
+        }
+    }
+}
+
+fn qualify_owner_type(ty: &mut ExternTypeExpr, owner: &ExternTypeKey) {
+    rewrite_type_names(ty, &mut |module, name| {
+        if module.is_none() && name.as_str() == owner.name.as_str() {
+            *module = Some(owner.module.clone());
+        }
+    });
+}
+
 fn retarget_type(ty: &mut ExternTypeExpr, source_name: &str, target_name: &str) {
+    rewrite_type_names(ty, &mut |module, name| {
+        if module.is_none() && name.as_str() == source_name {
+            *name = target_name.to_string();
+        }
+    });
+}
+
+fn rewrite_type_names(
+    ty: &mut ExternTypeExpr,
+    rewrite: &mut impl FnMut(&mut Option<ModulePath>, &mut String),
+) {
     match ty {
         ExternTypeExpr::Named { module, name, args } => {
-            if module.is_none() && name == source_name {
-                *name = target_name.to_string();
-            }
+            rewrite(module, name);
             for arg in args {
-                retarget_type(arg, source_name, target_name);
+                rewrite_type_names(arg, rewrite);
             }
         }
         ExternTypeExpr::List(inner) | ExternTypeExpr::Option(inner) => {
-            retarget_type(inner, source_name, target_name);
+            rewrite_type_names(inner, rewrite);
         }
         ExternTypeExpr::Map(key, value) => {
-            retarget_type(key, source_name, target_name);
-            retarget_type(value, source_name, target_name);
+            rewrite_type_names(key, rewrite);
+            rewrite_type_names(value, rewrite);
         }
         ExternTypeExpr::Callback(callback) => {
             for param in &mut callback.params {
-                retarget_type(&mut param.ty, source_name, target_name);
+                rewrite_type_names(&mut param.ty, rewrite);
             }
-            retarget_type(&mut callback.ret, source_name, target_name);
+            rewrite_type_names(&mut callback.ret, rewrite);
         }
         ExternTypeExpr::Void
         | ExternTypeExpr::Bool
@@ -192,7 +240,6 @@ pub struct RustMemberBinding {
     pub operation: ExternBindingOp,
     pub module: String,
     pub symbol: String,
-    pub receiver: Option<ReceiverMode>,
     pub abi: RustExternAbi,
 }
 
@@ -249,18 +296,10 @@ impl ModuleExportItem for TypeExport {
             .into_iter()
             .map(|binding| {
                 let mut abi = binding.abi;
-                if let Some(receiver) = binding.receiver {
-                    let ty = ExternTypeExpr::Named {
-                        module: Some(owner.module.clone()),
-                        name: owner.name.clone(),
-                        args: vec![],
-                    };
-                    let abi_receiver = match receiver {
-                        ReceiverMode::Shared => RustParamAbi::Borrow(ty),
-                        ReceiverMode::Mutable => RustParamAbi::MutBorrow(ty),
-                        ReceiverMode::Value => RustParamAbi::Value(ty),
-                    };
-                    abi.params.insert(0, abi_receiver);
+                if member_binding_has_receiver(&binding.selector, binding.operation)
+                    && let Some(receiver) = abi.params.first_mut()
+                {
+                    qualify_param_abi_owner(receiver, &owner);
                 }
                 RustExternBinding {
                     key: ExternBindingKey {
@@ -386,6 +425,7 @@ pub enum RustParamAbi {
     Value(ExternTypeExpr),
     Borrow(ExternTypeExpr),
     MutBorrow(ExternTypeExpr),
+    MutPlace(ExternTypeExpr),
     Option(Box<RustParamAbi>),
     List(Box<RustParamAbi>),
 }
@@ -683,12 +723,7 @@ fn validate_native_abi(
                 "direct callback ABI is unsupported",
             ));
         }
-        if signature
-            .signature
-            .params
-            .iter()
-            .any(|param| param.flow == ParamFlow::MutBorrow && type_contains_collection(&param.ty))
-        {
+        if abi.params.iter().any(direct_mut_collection_abi) {
             return Err(native_abi_error(
                 descriptor,
                 key,
@@ -697,6 +732,10 @@ fn validate_native_abi(
         }
     }
     Ok(())
+}
+
+fn direct_mut_collection_abi(abi: &RustParamAbi) -> bool {
+    matches!(abi, RustParamAbi::MutBorrow(ty) if type_contains_collection(ty))
 }
 
 fn param_contains_callback(param: &ExternParam) -> bool {
@@ -751,7 +790,11 @@ fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
         }
         (ty, ParamFlow::Value, RustParamAbi::Value(abi_ty))
         | (ty, ParamFlow::Borrow, RustParamAbi::Borrow(abi_ty))
-        | (ty, ParamFlow::MutBorrow, RustParamAbi::MutBorrow(abi_ty)) => ty == abi_ty,
+        | (
+            ty,
+            ParamFlow::MutBorrow,
+            RustParamAbi::MutBorrow(abi_ty) | RustParamAbi::MutPlace(abi_ty),
+        ) => ty == abi_ty,
         _ => false,
     }
 }
@@ -835,51 +878,77 @@ mod tests {
     }
 
     #[test]
-    fn rejects_direct_mutable_collection_abi() {
-        let descriptor = descriptor_with_param(
-            "filter",
-            ExternParam {
-                name: Some("xs".to_string()),
-                ty: ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
-                flow: ParamFlow::MutBorrow,
-                escape: CallbackEscape::NonEscaping,
-            },
-            ExternTypeExpr::Void,
+    fn accepts_direct_mutable_scalar_abi() {
+        assert_abi_ok(
+            mutable_descriptor("bump", ExternTypeExpr::Int),
+            void_binding("bump", RustParamAbi::MutBorrow(ExternTypeExpr::Int)),
         );
-        let mut binding = binding("filter");
-        binding.abi.params = vec![RustParamAbi::MutBorrow(ExternTypeExpr::List(Box::new(
-            ExternTypeExpr::Int,
-        )))];
-        binding.abi.ret = RustReturnAbi::Void;
-
-        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
-
-        assert!(error.contains("direct mutable collection ABI is unsupported"));
     }
 
     #[test]
-    fn rejects_direct_mutable_map_abi() {
+    fn accepts_place_aware_mutable_scalar_abi() {
+        assert_abi_ok(
+            mutable_descriptor("bump", ExternTypeExpr::Int),
+            void_binding("bump", RustParamAbi::MutPlace(ExternTypeExpr::Int)),
+        );
+    }
+
+    #[test]
+    fn rejects_place_aware_abi_mismatches() {
+        let cases = vec![
+            (
+                descriptor(),
+                binding_with_abi(
+                    "ping",
+                    RustParamAbi::MutPlace(ExternTypeExpr::Int),
+                    RustReturnAbi::Value(ExternTypeExpr::Bool),
+                ),
+            ),
+            (
+                param_descriptor(
+                    "peek",
+                    ExternTypeExpr::Int,
+                    ParamFlow::Borrow,
+                    ExternTypeExpr::Void,
+                ),
+                void_binding("peek", RustParamAbi::MutPlace(ExternTypeExpr::Int)),
+            ),
+            (
+                mutable_descriptor("bump", ExternTypeExpr::Int),
+                void_binding("bump", RustParamAbi::MutPlace(ExternTypeExpr::Float)),
+            ),
+        ];
+        for (descriptor, binding) in cases {
+            assert_abi_error(descriptor, binding, "parameter 0 ABI mismatch");
+        }
+    }
+
+    #[test]
+    fn validates_mutable_collection_abis() {
+        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
+        assert_abi_error(
+            mutable_descriptor("filter", list.clone()),
+            void_binding("filter", RustParamAbi::MutBorrow(list.clone())),
+            "direct mutable collection ABI is unsupported",
+        );
+        assert_abi_ok(
+            mutable_descriptor("filter", list.clone()),
+            void_binding("filter", RustParamAbi::MutPlace(list)),
+        );
+
         let map = ExternTypeExpr::Map(
             Box::new(ExternTypeExpr::String),
             Box::new(ExternTypeExpr::Int),
         );
-        let descriptor = descriptor_with_param(
-            "filter_map",
-            ExternParam {
-                name: Some("map".to_string()),
-                ty: map.clone(),
-                flow: ParamFlow::MutBorrow,
-                escape: CallbackEscape::NonEscaping,
-            },
-            ExternTypeExpr::Void,
+        assert_abi_error(
+            mutable_descriptor("filter_map", map.clone()),
+            void_binding("filter_map", RustParamAbi::MutBorrow(map.clone())),
+            "direct mutable collection ABI is unsupported",
         );
-        let mut binding = binding("filter_map");
-        binding.abi.params = vec![RustParamAbi::MutBorrow(map)];
-        binding.abi.ret = RustReturnAbi::Void;
-
-        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
-
-        assert!(error.contains("direct mutable collection ABI is unsupported"));
+        assert_abi_ok(
+            mutable_descriptor("filter_map", map.clone()),
+            void_binding("filter_map", RustParamAbi::MutPlace(map)),
+        );
     }
 
     #[test]
@@ -967,6 +1036,48 @@ mod tests {
             },
             ExternTypeExpr::Bool,
         )
+    }
+
+    fn mutable_descriptor(name: &str, ty: ExternTypeExpr) -> ProviderDescriptor {
+        param_descriptor(name, ty, ParamFlow::MutBorrow, ExternTypeExpr::Void)
+    }
+
+    fn param_descriptor(
+        name: &str,
+        ty: ExternTypeExpr,
+        flow: ParamFlow,
+        ret: ExternTypeExpr,
+    ) -> ProviderDescriptor {
+        descriptor_with_param(
+            name,
+            ExternParam {
+                name: Some("n".to_string()),
+                ty,
+                flow,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ret,
+        )
+    }
+
+    fn assert_abi_ok(descriptor: ProviderDescriptor, binding: RustExternBinding) {
+        validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap();
+    }
+
+    fn assert_abi_error(descriptor: ProviderDescriptor, binding: RustExternBinding, message: &str) {
+        let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
+        assert!(error.contains(message));
+    }
+
+    fn void_binding(name: &str, abi: RustParamAbi) -> RustExternBinding {
+        binding_with_abi(name, abi, RustReturnAbi::Void)
+    }
+
+    fn binding_with_abi(name: &str, abi: RustParamAbi, ret: RustReturnAbi) -> RustExternBinding {
+        let mut binding = binding(name);
+        binding.abi.params = vec![abi];
+        binding.abi.ret = ret;
+        binding
     }
 
     fn descriptor_with_param(

@@ -11,7 +11,7 @@ use syn::{
 use crate::clean_type_map::{
     classify_param, classify_return, conversion_tokens, flow_tokens, merge_conversions,
     param_abi_tokens, parse_type_expr, return_abi_tokens, type_expr_tokens,
-    validate_callable_signature, validate_ctx_param,
+    validate_callable_signature, validate_ctx_param, validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -118,12 +118,15 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
     let native_mod = crate::naming::native_export_module_ident(ident);
     let wrapper = format_ident!("{}", export_name);
 
-    let visible_inputs = visible_function_inputs(&func.sig.inputs, args.ctx)?;
+    let (ctx_input, visible_inputs) = visible_function_inputs(&func.sig.inputs, args.ctx)?;
     let params = visible_inputs
         .iter()
         .copied()
-        .map(classify_param)
+        .map(|param| classify_param(param, args.ctx))
         .collect::<syn::Result<Vec<_>>>()?;
+    if let Some(ctx) = ctx_input {
+        validate_mut_place_ctx(&func.sig, ctx, &params, "#[function(ctx)]")?;
+    }
     validate_overrides(&args, &params)?;
     let ret = classify_return(&func.sig.output)?;
     let ret_ty = match args.ret.as_deref() {
@@ -166,9 +169,9 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
     };
     let native_inputs = visible_inputs.iter();
     let native_output = &func.sig.output;
-    let visible_args = visible_inputs
+    let visible_args = params
         .iter()
-        .map(|pat_ty| &pat_ty.pat)
+        .map(|param| format_ident!("{}", param.name))
         .collect::<Vec<_>>();
     let native_args = if args.ctx {
         quote! { ctx, #(#visible_args),* }
@@ -218,7 +221,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
 fn visible_function_inputs(
     inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
     needs_ctx: bool,
-) -> syn::Result<Vec<&syn::PatType>> {
+) -> syn::Result<(Option<&syn::PatType>, Vec<&syn::PatType>)> {
     let typed = inputs
         .iter()
         .map(|arg| match arg {
@@ -230,7 +233,7 @@ fn visible_function_inputs(
         })
         .collect::<syn::Result<Vec<_>>>()?;
     if !needs_ctx {
-        return Ok(typed);
+        return Ok((None, typed));
     }
     let Some((ctx, rest)) = typed.split_first() else {
         return Err(syn::Error::new(
@@ -239,7 +242,7 @@ fn visible_function_inputs(
         ));
     };
     validate_ctx_param(ctx, "#[function(ctx)]")?;
-    Ok(rest.to_vec())
+    Ok((Some(ctx), rest.to_vec()))
 }
 
 fn validate_overrides(
