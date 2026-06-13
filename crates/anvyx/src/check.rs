@@ -170,11 +170,17 @@ fn emit_text_report(report: &DiagnosticReport, warnings_are_errors: bool) {
 }
 
 fn render_text_report(report: &DiagnosticReport, warnings_are_errors: bool) -> Option<String> {
+    render_text_report_with_color(report, warnings_are_errors, std::io::stderr().is_terminal())
+}
+
+fn render_text_report_with_color(
+    report: &DiagnosticReport,
+    warnings_are_errors: bool,
+    color: bool,
+) -> Option<String> {
     let mut rendered = render_rich_report_with_overrides(
         report,
-        anvyx_lang2::RenderConfig {
-            color: std::io::stderr().is_terminal(),
-        },
+        anvyx_lang2::RenderConfig { color },
         |diagnostic| diagnostic_projection(diagnostic, warnings_are_errors),
     );
     if rendered.is_empty() {
@@ -523,7 +529,7 @@ mod tests {
                     "warning here",
                 )],
             };
-        let rendered = render_text_report(&report, true).unwrap();
+        let rendered = render_text_report_with_color(&report, true, false).unwrap();
 
         assert!(rendered.contains("Error: careful"), "{rendered}");
         assert!(rendered.contains(WARN_AS_ERROR_NOTE), "{rendered}");
@@ -820,7 +826,7 @@ mod tests {
         fn text_type_error_renders_rich_report_and_short_summary() {
             let code = "fn main() { let hp: int = true; }";
             let error = frontend_error(code);
-            let rendered = render_text_report(&error.report, false).unwrap();
+            let rendered = render_text_report_with_color(&error.report, false, false).unwrap();
 
             assert!(rendered.contains("Error: mismatched types"), "{rendered}");
             assert!(rendered.contains("main.anv"), "{rendered}");
@@ -840,7 +846,7 @@ mod tests {
         #[test]
         fn text_parse_error_renders_label_and_short_summary() {
             let error = frontend_error("fn");
-            let rendered = render_text_report(&error.report, false).unwrap();
+            let rendered = render_text_report_with_color(&error.report, false, false).unwrap();
 
             assert!(rendered.contains("Unexpected end of input"), "{rendered}");
             assert!(rendered.contains("end of file"), "{rendered}");
@@ -851,7 +857,7 @@ mod tests {
         fn text_message_only_report_renders_plain_message() {
             let report = message_report("bad path");
 
-            assert!(render_text_report(&report, false).is_some());
+            assert!(render_text_report_with_color(&report, false, false).is_some());
         }
 
         #[test]
@@ -870,7 +876,7 @@ mod tests {
                     "compile warning emitted here",
                 )],
             };
-            let rendered = render_text_report(&report, false).unwrap();
+            let rendered = render_text_report_with_color(&report, false, false).unwrap();
 
             assert!(rendered.contains("Warning: careful"), "{rendered}");
             assert!(
