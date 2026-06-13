@@ -347,6 +347,14 @@ impl ProfileCx<'_> {
                 }
                 air::AirStmt::Assign { dst, value } => {
                     self.check_rvalue(site, value);
+                    if !dst.projection.is_empty()
+                        && !self.place_crosses_dataref(site, dst)
+                        && (self.place_capture_cell(site, dst).is_some()
+                            || self.place_scoped_borrow(site, dst).is_some())
+                    {
+                        self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
+                        continue;
+                    }
                     self.check_place(site, dst);
                 }
                 air::AirStmt::If(branch) => {
@@ -367,7 +375,9 @@ impl ProfileCx<'_> {
                 }
                 air::AirStmt::OptionalMatch(match_) => {
                     self.check_place(site, &match_.discr);
-                    if match_.payload_ref && self.place_crosses_dataref(site, &match_.discr) {
+                    if match_.payload_ref
+                        && !self.optional_payload_ref_discr_supported(site, &match_.discr)
+                    {
                         self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
                     }
                     if match_.payload.is_some()
@@ -858,6 +868,36 @@ impl ProfileCx<'_> {
         }
     }
 
+    fn optional_payload_ref_discr_supported(&self, site: ProfileSite, place: &Place) -> bool {
+        let Some(function) = self.current_function_id(site) else {
+            return false;
+        };
+        let PlaceRoot::Local(local) = place.root else {
+            return false;
+        };
+        if self.function_local_is_source_mut_place_param(function, local)
+            || self.place_crosses_dataref(site, place)
+        {
+            return false;
+        }
+        let Some(mut ty) = self.current_local(site, local).map(|local| local.ty) else {
+            return false;
+        };
+        for projection in &place.projection {
+            match (self.program.type_arena.data(ty), projection) {
+                (TypeData::Aggregate(_) | TypeData::Tuple(_), Projection::Field(_))
+                | (TypeData::Tuple(_), Projection::TupleField(_))
+                | (TypeData::Array { .. }, Projection::Index(_)) => {}
+                _ => return false,
+            }
+            let Some(next) = air_projected_ty(self.program, ty, projection) else {
+                return false;
+            };
+            ty = next;
+        }
+        true
+    }
+
     fn check_range_locals(
         &mut self,
         site: ProfileSite,
@@ -877,11 +917,74 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn source_mut_place_collection_projection(&self, root_ty: TypeId, place: &Place) -> bool {
-        matches!(
-            self.program.type_arena.data(root_ty),
-            TypeData::List(_) | TypeData::Slice(_)
-        ) && matches!(place.projection.first(), Some(Projection::Index(_)))
+    fn projected_mut_place_supported(
+        &self,
+        site: ProfileSite,
+        place: &Place,
+        allow_collections: bool,
+    ) -> bool {
+        let root_ty = match place.root {
+            PlaceRoot::Local(local) => self.current_local(site, local).map(|local| local.ty),
+            PlaceRoot::LambdaCapture(slot) => self
+                .current_lambda_capture(site, slot)
+                .map(air::LambdaCaptureDecl::ty),
+            PlaceRoot::CaptureCell(cell) => self
+                .program
+                .capture_cells
+                .get(cell.index())
+                .map(|cell| cell.ty),
+            PlaceRoot::ScopedBorrow(borrow) => self
+                .program
+                .scoped_borrows
+                .get(borrow.index())
+                .map(|borrow| borrow.ty),
+            PlaceRoot::Global(_) => None,
+        };
+        root_ty.is_some_and(|root_ty| {
+            self.projected_mut_place_supported_from(root_ty, place, allow_collections)
+        })
+    }
+
+    fn projected_mut_place_supported_from(
+        &self,
+        root_ty: TypeId,
+        place: &Place,
+        allow_collections: bool,
+    ) -> bool {
+        let mut ty = root_ty;
+        let mut slice_dynamic = false;
+        for projection in &place.projection {
+            match (self.program.type_arena.data(ty), projection) {
+                (
+                    TypeData::Aggregate(_) | TypeData::Tuple(_),
+                    Projection::Field(_) | Projection::TupleField(_),
+                )
+                | (TypeData::Array { .. }, Projection::Index(_)) => {
+                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
+                        return false;
+                    };
+                    ty = next;
+                }
+                (TypeData::List(_), Projection::Index(_))
+                | (TypeData::Map { .. }, Projection::MapIndex(_))
+                    if allow_collections && !slice_dynamic =>
+                {
+                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
+                        return false;
+                    };
+                    ty = next;
+                }
+                (TypeData::Slice(_), Projection::Index(_)) if allow_collections => {
+                    let Some(next) = air_projected_ty(self.program, ty, projection) else {
+                        return false;
+                    };
+                    ty = next;
+                    slice_dynamic = true;
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn current_local(&self, site: ProfileSite, local: LocalId) -> Option<&Local> {
@@ -982,16 +1085,26 @@ impl ProfileCx<'_> {
             CallArg::MutBorrow(place) => {
                 match expected.unwrap_or(rir::RirParamSemantic::MutBorrow) {
                     rir::RirParamSemantic::MutPlace => {
-                        if !place.projection.is_empty()
-                            && self
-                                .check_dataref_mut_place(
-                                    site,
-                                    place,
-                                    ProfileErrorKind::UnsupportedMutablePlaceProjection,
-                                )
-                                .is_none()
-                        {
-                            return;
+                        if !place.projection.is_empty() {
+                            match self.dataref_mut_place_support(site, place) {
+                                DataRefMutPlaceSupport::Supported(_) => {}
+                                DataRefMutPlaceSupport::UnsupportedDataRef => {
+                                    self.push(
+                                        site,
+                                        ProfileErrorKind::UnsupportedMutablePlaceDataRef,
+                                    );
+                                    return;
+                                }
+                                DataRefMutPlaceSupport::Ordinary
+                                    if self.projected_mut_place_supported(site, place, true) => {}
+                                DataRefMutPlaceSupport::Ordinary => {
+                                    self.push(
+                                        site,
+                                        ProfileErrorKind::UnsupportedMutablePlaceProjection,
+                                    );
+                                    return;
+                                }
+                            }
                         }
                         self.check_place(site, place);
                     }
@@ -1000,7 +1113,8 @@ impl ProfileCx<'_> {
                             .root
                             .local()
                             .is_some_and(|local| self.local_is_source_mut_place_param(site, local));
-                        if source_place
+                        if !place.projection.is_empty()
+                            || source_place
                             || self.place_capture_cell(site, place).is_some()
                             || self.place_scoped_borrow(site, place).is_some()
                             || !matches!(
@@ -1088,7 +1202,7 @@ impl ProfileCx<'_> {
                 if self.local_is_source_mut_place_param(site, root)
                     && !place.projection.is_empty()
                     && !self.place_crosses_dataref(site, place)
-                    && !self.source_mut_place_collection_projection(local.ty, place)
+                    && !self.projected_mut_place_supported_from(local.ty, place, true)
                 {
                     self.push(site, ProfileErrorKind::UnsupportedMutablePlaceProjection);
                     return;
@@ -1102,6 +1216,7 @@ impl ProfileCx<'_> {
                 };
                 if self.place_capture_cell(site, place).is_some()
                     && !place.projection.is_empty()
+                    && !self.projected_mut_place_supported(site, place, false)
                     && self
                         .check_dataref_mut_place(
                             site,
@@ -1120,6 +1235,7 @@ impl ProfileCx<'_> {
                     return;
                 };
                 if !place.projection.is_empty()
+                    && !self.projected_mut_place_supported(site, place, false)
                     && self
                         .check_dataref_mut_place(
                             site,
@@ -1131,6 +1247,12 @@ impl ProfileCx<'_> {
                     return;
                 }
                 decl.ty
+            }
+            PlaceRoot::ScopedBorrow(_) if !place.projection.is_empty() => {
+                let Some(ty) = self.check_scoped_borrow_place(site, place) else {
+                    return;
+                };
+                ty
             }
             PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
                 self.push(site, unsupported_place_root(place.root));
@@ -1209,6 +1331,10 @@ impl ProfileCx<'_> {
         }
         let projected_ty = if place.projection.is_empty() {
             None
+        } else if self.projected_mut_place_supported(site, place, false) {
+            place.projection.iter().try_fold(decl.ty, |ty, projection| {
+                air_projected_ty(self.program, ty, projection)
+            })
         } else {
             Some(
                 self.check_dataref_mut_place(
@@ -1449,6 +1575,9 @@ impl ProfileCx<'_> {
             TypeData::Function(sig) => {
                 for param in &sig.params {
                     self.check_type_ref(site, param.ty);
+                }
+                if matches!(sig.ret, ReturnMode::Place(_)) {
+                    self.push(site, ProfileErrorKind::UnsupportedReturnMode);
                 }
                 self.check_type_ref(site, sig.ret.ty());
                 true

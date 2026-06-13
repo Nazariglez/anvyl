@@ -5,7 +5,11 @@
 
 fn main() {
     var opt: int? = 3;
-    var value? = opt else return;
-    value = 8;
-    println(opt ?? 0);
+    {
+        var value? = opt else return;
+        value = 8;
+    }
+    if let value? = opt {
+        println(value);
+    }
 }

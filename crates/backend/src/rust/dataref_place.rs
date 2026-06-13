@@ -1,5 +1,5 @@
 use super::rir::{
-    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceArg, RirOptionMatch, RirProgram,
+    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceRoot, RirOptionMatch, RirProgram,
     RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
 };
 
@@ -87,14 +87,10 @@ impl DataRefPlaceDescriptors {
             return;
         };
         for arg in args {
-            if let RirCallArg::MutPlace(RirMutPlaceArg::DataRefProjection {
-                dataref,
-                projections,
-                ty,
-                ..
-            }) = arg
+            if let RirCallArg::MutPlace(arg) = arg
+                && let RirMutPlaceRoot::DataRef { dataref, .. } = arg.root
             {
-                self.intern(program, *dataref, projections, *ty);
+                self.intern(program, dataref, &arg.projections, arg.ty);
             }
         }
     }
@@ -166,7 +162,9 @@ pub(super) fn storage_path(
                 path.push_str(field.symbol.as_str());
                 ty = container_for(program, field.ty);
             }
-            RirProjection::Index(_) => unreachable!("verified dataref place descriptor projection"),
+            RirProjection::Index(_) | RirProjection::MapIndex(_) => {
+                unreachable!("verified dataref place descriptor projection")
+            }
         }
     }
     path
@@ -202,7 +200,9 @@ fn descriptor_symbol(
                 parts.push(tuple_field_part(*field_id));
                 ty = container_for(program, field.ty);
             }
-            RirProjection::Index(_) => unreachable!("verified dataref place descriptor projection"),
+            RirProjection::Index(_) | RirProjection::MapIndex(_) => {
+                unreachable!("verified dataref place descriptor projection")
+            }
         }
     }
     parts.push("place".to_string());

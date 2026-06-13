@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: @as embed value projection hits AIR lowering Ident gap before clean Rust backend
+// @match: 2
+
+struct Entity {
+    x: int,
+}
+
+struct Enemy {
+    @as embed entity: Entity,
+}
+
+fn bump(var entity: Entity) {
+    entity.x += 1;
+}
+
+fn main() {
+    var enemy = Enemy { entity: Entity { x: 1 } };
+    bump(enemy);
+    println(enemy.entity.x);
+}

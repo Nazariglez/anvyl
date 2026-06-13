@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 4
+
+struct Box { item: int? }
+
+fn main() {
+    var box = Box { item: 1 };
+    if var value? = box.item {
+        value = 4;
+    }
+    println(box.item ?? 0);
+}

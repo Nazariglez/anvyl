@@ -1,0 +1,24 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 20
+
+fn set_ten(var slot: int?) {
+    slot = 10;
+}
+
+fn sum_values(map: [string: int]) -> int {
+    var sum = 0;
+    for key, value in map {
+        sum += value;
+    }
+    sum
+}
+
+fn main() {
+    var counts: [string: int] = ["a": 1, "b": 2];
+    for key, value in counts {
+        set_ten(counts[key]);
+    }
+    println(sum_values(counts));
+}

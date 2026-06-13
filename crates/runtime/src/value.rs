@@ -131,6 +131,22 @@ impl<T> AnvList<T> {
         self.loan.current_version()
     }
 
+    pub fn with_elem_shared_short<R>(
+        &self,
+        index: usize,
+        expected_version: u64,
+        f: impl FnOnce(&T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        self.loan.check_stable(expected_version)?;
+        let Some(elem) = self.elems.get(index) else {
+            return Err(RuntimeError::new(format!(
+                "list index {index} out of bounds for len {}",
+                self.len()
+            )));
+        };
+        f(elem)
+    }
+
     pub fn with_elem_mut_short<R>(
         &mut self,
         index: usize,
@@ -182,13 +198,7 @@ impl<T: Clone> AnvList<T> {
     }
 
     pub fn elem_at_shared(&self, index: usize, expected_version: u64) -> Result<T, RuntimeError> {
-        self.loan.check_stable(expected_version)?;
-        self.elems.get(index).cloned().ok_or_else(|| {
-            RuntimeError::new(format!(
-                "list index {index} out of bounds for len {}",
-                self.len()
-            ))
-        })
+        self.with_elem_shared_short(index, expected_version, |elem| Ok(elem.clone()))
     }
 
     pub fn push(&mut self, elem: T) -> Result<(), RuntimeError> {

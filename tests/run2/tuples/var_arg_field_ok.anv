@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn main() {
+    var pair = (1, 10);
+    bump(pair.0);
+    println(pair.0);
+}

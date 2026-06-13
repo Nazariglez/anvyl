@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: mutable receivers through capture cells await mutable_place_projected_values
+// @skip: mutating receiver capture promotion remains a frontend capture-cell gap
 // @match: 1
 
 fn main() {

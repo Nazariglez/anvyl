@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: non-Copy heap-cell reads need shareable cell read operation
 // @match: hi
 
 fn make() -> fn() -> string {

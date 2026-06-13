@@ -7,12 +7,12 @@ struct Point {
     x: int,
 }
 
-fn bump(var point: Point) {
-    point.x += 1;
+fn bump(var x: int) {
+    x += 1;
 }
 
 fn main() {
     var point = Point { x: 1 };
-    bump(point);
+    bump(point.x);
     println(point.x);
 }

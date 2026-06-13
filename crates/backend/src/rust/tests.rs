@@ -28,15 +28,16 @@ use super::{
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
         RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
         RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
-        RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
-        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind, RirVerifySite,
+        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand,
+        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirProgram, RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
+    target,
 };
 use crate::test_support::{
     immutable_local as local, mutable_local as mut_local, param, place, root_module,
@@ -46,6 +47,156 @@ use crate::test_support::{
 #[test]
 fn profile_accepts_empty_air() {
     check(Program::default());
+}
+
+#[test]
+fn analysis_detects_nested_list_indexed_write() {
+    let program = nested_index_write_program(RirType::List(RirTypeId::from_index(1)));
+    assert!(super::analysis::fallible_functions(&program)[0]);
+}
+
+#[test]
+fn analysis_detects_nested_slice_indexed_write() {
+    let program = nested_index_write_program(RirType::Slice(RirTypeId::from_index(1)));
+    assert!(super::analysis::fallible_functions(&program)[0]);
+}
+
+#[test]
+fn analysis_keeps_nested_array_indexed_write_non_fallible() {
+    let program = nested_index_write_program(RirType::Array {
+        elem: RirTypeId::from_index(1),
+        len: 4,
+    });
+    assert!(!super::analysis::fallible_functions(&program)[0]);
+}
+
+#[test]
+fn analysis_detects_tuple_before_index_write() {
+    let program = nested_tuple_index_write_program();
+    assert!(super::analysis::fallible_functions(&program)[0]);
+}
+
+#[test]
+fn analysis_keeps_map_index_projection_unsupported() {
+    let program = nested_index_write_program(RirType::Map {
+        key: RirTypeId::from_index(1),
+        value: RirTypeId::from_index(1),
+    });
+    assert!(!super::analysis::fallible_functions(&program)[0]);
+}
+
+fn nested_index_write_program(indexed_ty: RirType) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let indexed = RirTypeId::from_index(2);
+    let root_ty = RirTypeId::from_index(3);
+    let strukt = RirStructId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let root = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let replacement = RirConstId::from_index(0);
+    RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            indexed_ty,
+            RirType::Struct(strukt),
+        ],
+        structs: vec![RirStruct {
+            id: strukt,
+            air_id: None,
+            symbol: RirSymbol::new("Box"),
+            display: RirSymbol::new("Box"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("xs"),
+                ty: indexed,
+            }],
+        }],
+        consts: vec![RirConst {
+            id: replacement,
+            ty: int,
+            value: RirConstValue::Int(1),
+        }],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(root, root_ty, true, "box"),
+                rir_local(index, int, false, "index"),
+            ],
+            vec![RirStmt::Assign {
+                dst: RirPlace {
+                    local: root,
+                    projections: vec![RirProjection::Field(field), RirProjection::Index(index)],
+                    ty: int,
+                },
+                value: RirRValue::Use(RirOperand::Const(replacement)),
+            }],
+        )],
+        ..RirProgram::default()
+    }
+}
+
+fn nested_tuple_index_write_program() -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let tuple_ty = RirTypeId::from_index(3);
+    let tuple = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let root = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let replacement = RirConstId::from_index(0);
+    RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::List(int),
+            RirType::Tuple(tuple),
+        ],
+        tuples: vec![RirTuple {
+            id: tuple,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            copyable: false,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: list,
+            }],
+        }],
+        consts: vec![RirConst {
+            id: replacement,
+            ty: int,
+            value: RirConstValue::Int(1),
+        }],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(root, tuple_ty, true, "pair"),
+                rir_local(index, int, false, "index"),
+            ],
+            vec![RirStmt::Assign {
+                dst: RirPlace {
+                    local: root,
+                    projections: vec![
+                        RirProjection::TupleField(field),
+                        RirProjection::Index(index),
+                    ],
+                    ty: int,
+                },
+                value: RirRValue::Use(RirOperand::Const(replacement)),
+            }],
+        )],
+        ..RirProgram::default()
+    }
 }
 
 #[test]
@@ -1132,10 +1283,14 @@ fn plan_lowers_projected_source_mut_call_arg_to_dataref_place() {
     let source = plan_source(projected_mut_call_arg_program()).into_string();
 
     assert!(source.contains("let __anv_dataref_place_object_0 = ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?;"));
-    assert!(source.contains(
-        "anvyx_runtime::MutPlace::dataref(__anv_dataref_place_object_0, &__anv_dataref_place_ops_0)"
-    ));
-    assert!(source.contains("try_with_erased(object, self.heap_type"));
+    assert!(source.contains(&target::mut_place_dataref(
+        "__anv_dataref_place_object_0",
+        "&__anv_dataref_place_ops_0",
+    )));
+    assert!(source.contains(&format!(
+        "try_with_erased(object, {}",
+        target::dataref_place_heap_type_access("self")
+    )));
     assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
 }
 
@@ -1143,12 +1298,14 @@ fn plan_lowers_projected_source_mut_call_arg_to_dataref_place() {
 fn plan_lowers_multiple_projected_source_mut_call_args_without_copyback() {
     let source = plan_source(multi_projected_mut_call_arg_program()).into_string();
 
-    assert_eq!(
-        source.matches("anvyx_runtime::MutPlace::dataref").count(),
-        2
-    );
-    assert!(source.contains("__anv_dataref_place_object_0"));
-    assert!(source.contains("__anv_dataref_place_object_1"));
+    assert!(source.contains(&target::mut_place_dataref(
+        "__anv_dataref_place_object_0",
+        "&__anv_dataref_place_ops_0",
+    )));
+    assert!(source.contains(&target::mut_place_dataref(
+        "__anv_dataref_place_object_1",
+        "&__anv_dataref_place_ops_1",
+    )));
     assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
     assert!(!source.contains("ctx.heap().with_mut(&v1, |storage| { storage.value ="));
 }
@@ -2306,6 +2463,49 @@ fn profile_accepts_function_types() {
 }
 
 #[test]
+fn profile_rejects_function_place_returns() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let x = air::LocalId::from_index(0);
+    let function = program.alloc_function(Function {
+        name: Ident::new("id"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::with_return_mode(
+            vec![param("x", int, ParamMode::MutBorrow, x)],
+            air::ReturnMode::Place(int),
+        ),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(place(x, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedReturnMode);
+}
+
+#[test]
+fn profile_rejects_function_type_place_returns() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![air::ParamType {
+            ty: int,
+            mode: ParamMode::MutBorrow,
+            escape: ParamEscape::NonEscaping,
+        }],
+        air::ReturnMode::Place(int),
+    )));
+
+    expect_reject(program, ProfileErrorKind::UnsupportedReturnMode);
+}
+
+#[test]
 fn profile_rejects_function_value_containers() {
     let mut program = Program::default();
     let void = program.alloc_type(TypeData::Void);
@@ -3056,10 +3256,10 @@ fn rir_accepts_scoped_place_cell_mut_place_arg() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
-            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-                ty: RirTypeId::from_index(1),
-            })],
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::scoped_place_cell(
+                RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                RirTypeId::from_index(1),
+            ))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -3092,10 +3292,10 @@ fn rir_rejects_promoted_scoped_place_source_param_forwarding() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
-            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::Param {
-                local: RirLocalId::from_index(0),
-                ty: RirTypeId::from_index(1),
-            })],
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::param(
+                RirLocalId::from_index(0),
+                RirTypeId::from_index(1),
+            ))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -3131,10 +3331,10 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Extern(RirExternId::from_index(0)),
-            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-                ty: RirTypeId::from_index(1),
-            })],
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::scoped_place_cell(
+                RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                RirTypeId::from_index(1),
+            ))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -3166,10 +3366,10 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_payload_type_mismatch() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
-            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-                ty: RirTypeId::from_index(0),
-            })],
+            args: vec![RirCallArg::MutPlace(RirMutPlaceArg::scoped_place_cell(
+                RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+                RirTypeId::from_index(0),
+            ))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -3527,10 +3727,10 @@ fn rir_rejects_heap_cell_set_value_mut_place_param() {
 fn rir_accepts_heap_cell_mut_place_arg() {
     rir::verify(&cell_mut_place_call_rir(
         valid_heap_cell_decl(),
-        RirMutPlaceArg::HeapCell {
-            cell: RirCellRef::Owner(RirCellId::from_index(0)),
-            ty: RirTypeId::from_index(1),
-        },
+        RirMutPlaceArg::heap_cell(
+            RirCellRef::Owner(RirCellId::from_index(0)),
+            RirTypeId::from_index(1),
+        ),
     ))
     .expect("RIR rejected heap cell mut-place arg");
 }
@@ -3540,10 +3740,10 @@ fn rir_rejects_heap_cell_as_stack_mut_place_arg() {
     assert_rir_error(
         cell_mut_place_call_rir(
             valid_heap_cell_decl(),
-            RirMutPlaceArg::StackCell {
-                cell: RirCellRef::Owner(RirCellId::from_index(0)),
-                ty: RirTypeId::from_index(1),
-            },
+            RirMutPlaceArg::stack_cell(
+                RirCellRef::Owner(RirCellId::from_index(0)),
+                RirTypeId::from_index(1),
+            ),
         ),
         RirVerifyErrorKind::CallArgMode,
     );
@@ -3554,10 +3754,10 @@ fn rir_rejects_stack_cell_as_heap_mut_place_arg() {
     assert_rir_error(
         cell_mut_place_call_rir(
             valid_stack_cell_decl(),
-            RirMutPlaceArg::HeapCell {
-                cell: RirCellRef::Owner(RirCellId::from_index(0)),
-                ty: RirTypeId::from_index(1),
-            },
+            RirMutPlaceArg::heap_cell(
+                RirCellRef::Owner(RirCellId::from_index(0)),
+                RirTypeId::from_index(1),
+            ),
         ),
         RirVerifyErrorKind::CallArgMode,
     );
@@ -3568,10 +3768,10 @@ fn rir_rejects_heap_cell_mut_place_arg_payload_mismatch() {
     assert_rir_error(
         cell_mut_place_call_rir(
             valid_heap_cell_decl(),
-            RirMutPlaceArg::HeapCell {
-                cell: RirCellRef::Owner(RirCellId::from_index(0)),
-                ty: RirTypeId::from_index(0),
-            },
+            RirMutPlaceArg::heap_cell(
+                RirCellRef::Owner(RirCellId::from_index(0)),
+                RirTypeId::from_index(0),
+            ),
         ),
         RirVerifyErrorKind::TypeMismatch {
             expected: RirTypeId::from_index(1),
@@ -3584,10 +3784,10 @@ fn rir_rejects_heap_cell_mut_place_arg_payload_mismatch() {
 fn rir_rejects_uninitialized_heap_cell_mut_place_arg() {
     let mut program = cell_mut_place_call_rir(
         valid_heap_cell_decl(),
-        RirMutPlaceArg::HeapCell {
-            cell: RirCellRef::Owner(RirCellId::from_index(0)),
-            ty: RirTypeId::from_index(1),
-        },
+        RirMutPlaceArg::heap_cell(
+            RirCellRef::Owner(RirCellId::from_index(0)),
+            RirTypeId::from_index(1),
+        ),
     );
     program.functions[0].body.stmts.remove(0);
 
@@ -3605,13 +3805,13 @@ fn rir_accepts_capture_heap_cell_mut_place_arg() {
         .push(mut_place_sink_function(RirFunctionId::from_index(2)));
     program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Call {
         callee: RirCallTarget::Function(RirFunctionId::from_index(2)),
-        args: vec![RirCallArg::MutPlace(RirMutPlaceArg::HeapCell {
-            cell: RirCellRef::Capture {
+        args: vec![RirCallArg::MutPlace(RirMutPlaceArg::heap_cell(
+            RirCellRef::Capture {
                 cell: RirCellId::from_index(0),
                 local: RirLocalId::from_index(0),
             },
-            ty: RirTypeId::from_index(1),
-        })],
+            RirTypeId::from_index(1),
+        ))],
         ty: RirTypeId::from_index(0),
     })];
 
@@ -4193,7 +4393,7 @@ fn rir_accepts_mut_place_local_call_arg() {
     let program = mut_place_call_rir(
         vec![rir_local(local, int, true, "n")],
         vec![],
-        RirCallArg::MutPlace(RirMutPlaceArg::Local(rir_place(local, int))),
+        RirCallArg::MutPlace(RirMutPlaceArg::local(rir_place(local, int))),
     );
 
     rir::verify(&program).expect("RIR verify failed");
@@ -4224,7 +4424,7 @@ fn rir_rejects_mut_place_local_arg_from_mut_place_param() {
             RirParamSemantic::MutPlace,
             RirParamAbi::MutPlace,
         )],
-        RirCallArg::MutPlace(RirMutPlaceArg::Local(rir_place(local, int))),
+        RirCallArg::MutPlace(RirMutPlaceArg::local(rir_place(local, int))),
     );
 
     assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
@@ -4276,19 +4476,75 @@ fn rir_rejects_mut_place_param_as_mut_borrow_arg() {
 }
 
 #[test]
-fn rir_rejects_projected_mut_place_param() {
+fn rir_rejects_projected_mut_borrow_arg() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
-    let tuple_ty = RirTypeId::from_index(2);
-    let tuple = RirTupleId::from_index(0);
+    let pair_ty = RirTypeId::from_index(2);
+    let pair = RirTupleId::from_index(0);
     let field = RirFieldId::from_index(0);
     let local = RirLocalId::from_index(0);
-    let mut place = rir_place(local, int);
-    place.projections.push(RirProjection::TupleField(field));
+    let callee = RirFunctionId::from_index(0);
+    let caller = RirFunctionId::from_index(1);
     let program = RirProgram {
-        types: vec![RirType::Void, RirType::Int, RirType::Tuple(tuple)],
+        types: vec![RirType::Void, RirType::Int, RirType::Tuple(pair)],
         tuples: vec![RirTuple {
-            id: tuple,
+            id: pair,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("(int)"),
+            copyable: true,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: int,
+            }],
+        }],
+        functions: vec![
+            rir_function(
+                callee,
+                void,
+                vec![rir_param(
+                    local,
+                    int,
+                    RirParamSemantic::MutBorrow,
+                    RirParamAbi::MutBorrow,
+                )],
+                vec![rir_local(local, int, true, "x")],
+                vec![],
+            ),
+            rir_function(
+                caller,
+                void,
+                vec![],
+                vec![rir_local(local, pair_ty, true, "pair")],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(callee),
+                    args: vec![RirCallArg::MutBorrow(RirPlace {
+                        local,
+                        projections: vec![RirProjection::TupleField(field)],
+                        ty: int,
+                    })],
+                    ty: void,
+                })],
+            ),
+        ],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_accepts_projected_local_field_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let pair_ty = RirTypeId::from_index(2);
+    let pair = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let local = RirLocalId::from_index(0);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Tuple(pair)],
+        tuples: vec![RirTuple {
+            id: pair,
             symbol: RirSymbol::new("Pair"),
             display: RirSymbol::new("Pair"),
             copyable: true,
@@ -4298,18 +4554,440 @@ fn rir_rejects_projected_mut_place_param() {
                 ty: int,
             }],
         }],
+        functions: vec![
+            rir_function(
+                RirFunctionId::from_index(0),
+                void,
+                vec![],
+                vec![rir_local(local, pair_ty, true, "pair")],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Local { local, ty: pair_ty },
+                        vec![RirProjection::TupleField(field)],
+                        int,
+                    ))],
+                    ty: void,
+                })],
+            ),
+            mut_place_sink_function(RirFunctionId::from_index(1)),
+        ],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("projected local mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_projected_param_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let pair_ty = RirTypeId::from_index(2);
+    let pair = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let local = RirLocalId::from_index(0);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Tuple(pair)],
+        tuples: vec![RirTuple {
+            id: pair,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            copyable: true,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: int,
+            }],
+        }],
+        functions: vec![
+            rir_function(
+                RirFunctionId::from_index(0),
+                void,
+                vec![rir_param(
+                    local,
+                    pair_ty,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                )],
+                vec![rir_local(local, pair_ty, true, "pair")],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Param { local, ty: pair_ty },
+                        vec![RirProjection::TupleField(field)],
+                        int,
+                    ))],
+                    ty: void,
+                })],
+            ),
+            mut_place_sink_function(RirFunctionId::from_index(1)),
+        ],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("projected param mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_projected_stack_cell_mut_place_arg() {
+    let program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::StackCell {
+        cell: RirCellRef::Owner(RirCellId::from_index(0)),
+        ty: RirTypeId::from_index(2),
+    });
+
+    rir::verify(&program).expect("projected stack-cell mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_projected_heap_cell_mut_place_arg() {
+    let program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::HeapCell {
+        cell: RirCellRef::Owner(RirCellId::from_index(0)),
+        ty: RirTypeId::from_index(2),
+    });
+
+    rir::verify(&program).expect("projected heap-cell mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_projected_scoped_place_cell_mut_place_arg() {
+    let program = projected_scoped_place_cell_mut_place_arg_program();
+
+    rir::verify(&program).expect("projected scoped-place-cell mut-place arg should verify");
+}
+
+#[test]
+fn rir_rejects_projected_cell_bad_index_local() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let array = RirTypeId::from_index(2);
+    let mut program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Array { elem: int, len: 2 },
+        ],
+        cells: vec![RirCellDecl {
+            payload_ty: array,
+            ..valid_stack_cell_decl()
+        }],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
-            vec![rir_param(
-                local,
-                tuple_ty,
-                RirParamSemantic::MutPlace,
-                RirParamAbi::MutPlace,
-            )],
-            vec![rir_local(local, tuple_ty, true, "x")],
-            vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(place)))],
+            vec![],
+            vec![rir_local(RirLocalId::from_index(0), array, true, "source")],
+            vec![RirStmt::Eval(RirRValue::Call {
+                callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                    RirMutPlaceRoot::StackCell {
+                        cell: RirCellRef::Owner(RirCellId::from_index(0)),
+                        ty: array,
+                    },
+                    vec![RirProjection::Index(RirLocalId::from_index(1))],
+                    int,
+                ))],
+                ty: void,
+            })],
         )],
+        ..RirProgram::default()
+    };
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_rejects_dynamic_projected_cell_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let index = RirLocalId::from_index(1);
+    let mut program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        cells: vec![RirCellDecl {
+            payload_ty: list,
+            ..valid_stack_cell_decl()
+        }],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(RirLocalId::from_index(0), list, true, "source"),
+                rir_local(index, int, false, "i"),
+            ],
+            vec![
+                RirStmt::CellInit {
+                    cell: RirCellRef::Owner(RirCellId::from_index(0)),
+                    value: RirRValue::List {
+                        ty: list,
+                        elems: vec![],
+                    },
+                },
+                RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::StackCell {
+                            cell: RirCellRef::Owner(RirCellId::from_index(0)),
+                            ty: list,
+                        },
+                        vec![RirProjection::Index(index)],
+                        int,
+                    ))],
+                    ty: void,
+                }),
+            ],
+        )],
+        ..RirProgram::default()
+    };
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_accepts_single_dynamic_projected_param_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        functions: vec![
+            rir_function(
+                RirFunctionId::from_index(0),
+                void,
+                vec![rir_param(
+                    xs,
+                    list,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                )],
+                vec![
+                    rir_local(xs, list, true, "xs"),
+                    rir_local(index, int, false, "i"),
+                ],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Param {
+                            local: xs,
+                            ty: list,
+                        },
+                        vec![RirProjection::Index(index)],
+                        int,
+                    ))],
+                    ty: void,
+                })],
+            ),
+            mut_place_sink_function(RirFunctionId::from_index(1)),
+        ],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("single dynamic projected param should verify");
+}
+
+#[test]
+fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let nested = RirTypeId::from_index(3);
+    let xs = RirLocalId::from_index(0);
+    let outer = RirLocalId::from_index(1);
+    let inner = RirLocalId::from_index(2);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::List(int),
+            RirType::List(list),
+        ],
+        functions: vec![
+            rir_function(
+                RirFunctionId::from_index(0),
+                void,
+                vec![],
+                vec![
+                    rir_local(xs, nested, true, "xs"),
+                    rir_local(outer, int, false, "i"),
+                    rir_local(inner, int, false, "j"),
+                ],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Local {
+                            local: xs,
+                            ty: nested,
+                        },
+                        vec![RirProjection::Index(outer), RirProjection::Index(inner)],
+                        int,
+                    ))],
+                    ty: void,
+                })],
+            ),
+            mut_place_sink_function(RirFunctionId::from_index(1)),
+        ],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("multi-dynamic projected mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_map_slot_projected_param_mut_place_arg() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let string = RirTypeId::from_index(2);
+    let slot = RirTypeId::from_index(3);
+    let map = RirTypeId::from_index(4);
+    let counts = RirLocalId::from_index(0);
+    let key = RirLocalId::from_index(1);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::String,
+            RirType::Option(int),
+            RirType::Map {
+                key: string,
+                value: int,
+            },
+        ],
+        functions: vec![
+            rir_function(
+                RirFunctionId::from_index(0),
+                void,
+                vec![rir_param(
+                    counts,
+                    map,
+                    RirParamSemantic::MutPlace,
+                    RirParamAbi::MutPlace,
+                )],
+                vec![
+                    rir_local(counts, map, true, "counts"),
+                    rir_local(key, string, false, "key"),
+                ],
+                vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Param {
+                            local: counts,
+                            ty: map,
+                        },
+                        vec![RirProjection::MapIndex(key)],
+                        slot,
+                    ))],
+                    ty: void,
+                })],
+            ),
+            mut_place_optional_sink_function(RirFunctionId::from_index(1), slot),
+        ],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("map slot projected mut-place arg should verify");
+}
+
+#[test]
+fn rir_accepts_nested_dynamic_map_slot_projection() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let string = RirTypeId::from_index(2);
+    let slot = RirTypeId::from_index(3);
+    let map = RirTypeId::from_index(4);
+    let list = RirTypeId::from_index(5);
+    let maps = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let key = RirLocalId::from_index(2);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::String,
+            RirType::Option(int),
+            RirType::Map {
+                key: string,
+                value: int,
+            },
+            RirType::List(map),
+        ],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(maps, list, true, "maps"),
+                rir_local(index, int, false, "i"),
+                rir_local(key, string, false, "key"),
+            ],
+            vec![RirStmt::Assign {
+                dst: RirPlace {
+                    local: maps,
+                    projections: vec![RirProjection::Index(index), RirProjection::MapIndex(key)],
+                    ty: slot,
+                },
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }],
+        )],
+        consts: vec![RirConst {
+            id: RirConstId::from_index(0),
+            ty: slot,
+            value: RirConstValue::Nil,
+        }],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("nested dynamic map slot projection should verify");
+}
+
+#[test]
+fn rir_rejects_map_slot_bad_key_type() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let string = RirTypeId::from_index(2);
+    let slot = RirTypeId::from_index(3);
+    let map = RirTypeId::from_index(4);
+    let counts = RirLocalId::from_index(0);
+    let key = RirLocalId::from_index(1);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::String,
+            RirType::Option(int),
+            RirType::Map {
+                key: string,
+                value: int,
+            },
+        ],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(counts, map, true, "counts"),
+                rir_local(key, int, false, "key"),
+            ],
+            vec![RirStmt::Assign {
+                dst: RirPlace {
+                    local: counts,
+                    projections: vec![RirProjection::MapIndex(key)],
+                    ty: slot,
+                },
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }],
+        )],
+        consts: vec![RirConst {
+            id: RirConstId::from_index(0),
+            ty: slot,
+            value: RirConstValue::Nil,
+        }],
         ..RirProgram::default()
     };
 
@@ -4520,7 +5198,11 @@ fn emit_collection_loan_scope_uses_short_mut_place_access() {
     let source = emit::emit(&verified);
     let text = source.as_str();
 
-    assert!(text.contains("xs.access(ctx.runtime(), |value| value.begin_shape_loan())?"));
+    assert!(text.contains(&target::mut_place_access(
+        "xs",
+        "ctx.runtime()",
+        &target::begin_shape_loan_region(),
+    )));
     assert!(!text.contains("iter_mut"));
 }
 
@@ -6559,8 +7241,8 @@ fn plan_lowers_owner_heap_capture_cell_source_var_arg_to_heap_cell() {
 
     assert!(matches!(
         arg,
-        RirCallArg::MutPlace(RirMutPlaceArg::HeapCell {
-            cell: RirCellRef::Owner(id),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::HeapCell { cell: RirCellRef::Owner(id), .. },
             ..
         }) if *id == RirCellId::from_index(0)
     ));
@@ -6576,8 +7258,8 @@ fn plan_lowers_lambda_heap_capture_cell_source_var_arg_to_heap_cell() {
 
     assert!(matches!(
         arg,
-        RirCallArg::MutPlace(RirMutPlaceArg::HeapCell {
-            cell: RirCellRef::Capture { cell, .. },
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::HeapCell { cell: RirCellRef::Capture { cell, .. }, .. },
             ..
         }) if *cell == RirCellId::from_index(0)
     ));
@@ -6593,8 +7275,8 @@ fn plan_lowers_owner_capture_cell_source_var_arg_to_stack_cell() {
 
     assert!(matches!(
         arg,
-        RirCallArg::MutPlace(RirMutPlaceArg::StackCell {
-            cell: RirCellRef::Owner(id),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::StackCell { cell: RirCellRef::Owner(id), .. },
             ..
         }) if *id == RirCellId::from_index(0)
     ));
@@ -6610,8 +7292,8 @@ fn plan_lowers_lambda_capture_cell_source_var_arg_to_stack_cell() {
 
     assert!(matches!(
         arg,
-        RirCallArg::MutPlace(RirMutPlaceArg::StackCell {
-            cell: RirCellRef::Capture { cell, .. },
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::StackCell { cell: RirCellRef::Capture { cell, .. }, .. },
             ..
         }) if *cell == RirCellId::from_index(0)
     ));
@@ -6704,9 +7386,12 @@ fn plan_lowers_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
 
     assert!(matches!(
         arg,
-        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-            cell: RirScopedPlaceCellRef::Capture {
-                cell: RirScopedPlaceCellId(0),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Capture {
+                    cell: RirScopedPlaceCellId(0),
+                    ..
+                },
                 ..
             },
             ..
@@ -6740,10 +7425,13 @@ fn plan_lowers_nested_scoped_borrow_recapture_to_same_cell() {
     ));
     assert!(matches!(
         only_call_arg(inner_body),
-        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-            cell: RirScopedPlaceCellRef::Capture {
-                cell: RirScopedPlaceCellId(0),
-                local: RirLocalId(0),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Capture {
+                    cell: RirScopedPlaceCellId(0),
+                    local: RirLocalId(0),
+                },
+                ..
             },
             ..
         })
@@ -6860,8 +7548,11 @@ fn plan_lowers_owner_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
 
     assert!(matches!(
         only_call_arg(owner),
-        RirCallArg::MutPlace(RirMutPlaceArg::ScopedPlaceCell {
-            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+        RirCallArg::MutPlace(RirMutPlaceArg {
+            root: RirMutPlaceRoot::ScopedPlaceCell {
+                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+                ..
+            },
             ..
         })
     ));
@@ -6913,7 +7604,7 @@ fn emit_passes_capture_cell_var_arg_as_stack_cell_mut_place() {
 fn emit_passes_owner_heap_cell_var_arg_as_heap_cell_mut_place() {
     let source = plan_source(heap_capture_cell_source_var_arg_program()).into_string();
 
-    assert!(source.contains("MutPlace::heap_cell(__cell0.clone())"));
+    assert!(source.contains(&target::mut_place_heap_cell("__cell0")));
     assert!(!source.contains("MutPlace::local(&mut"));
     assert!(!source.contains("__cell0.get_copy"));
     assert!(!source.contains("__cell0.set"));
@@ -6927,7 +7618,7 @@ fn emit_passes_owner_heap_cell_var_arg_as_heap_cell_mut_place() {
 fn emit_passes_capture_heap_cell_var_arg_as_heap_cell_mut_place() {
     let source = plan_source(escaping_lambda_capture_cell_source_var_arg_program()).into_string();
 
-    assert!(source.contains("MutPlace::heap_cell(v0.clone())"));
+    assert!(source.contains(&target::mut_place_heap_cell("v0")));
     assert!(!source.contains("MutPlace::local(&mut"));
     assert!(!source.contains("v0.get_copy"));
     assert!(!source.contains("v0.set"));
@@ -6968,7 +7659,7 @@ fn emit_scoped_borrowed_param_uses_scoped_mut_place_cell() {
     assert!(source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new(v0);"));
     assert!(source.contains("c0: &'env anvyx_runtime::ScopedMutPlaceCell<'env, 'cx, i64>"));
     assert!(source.contains("c0: &__scoped0"));
-    assert!(source.contains("anvyx_runtime::MutPlace::scoped_cell(v0)"));
+    assert!(source.contains(&target::mut_place_scoped_cell("v0")));
     assert!(!source.contains("&mut **c0"));
     assert!(!source.contains("MutPlace::local(&mut v0)"));
     assert!(!source.contains("MutPlace::stack_cell"));
@@ -6990,7 +7681,7 @@ fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
         ));
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("anvyx_runtime::MutPlace::scoped_cell(&__scoped0)"));
+    assert!(source.contains(&target::mut_place_scoped_cell("&__scoped0")));
     assert!(!source.contains("MutPlace::local(&mut v0)"));
     assert!(!source.contains("v0.reborrow()"));
 }
@@ -7073,6 +7764,62 @@ fn profile_rejects_dataref_field_to_native_mut_borrow() {
                     ty: int,
                 })],
             })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(caller);
+
+    expect_reject(
+        program,
+        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
+    );
+}
+
+#[test]
+fn profile_rejects_projected_local_to_native_mut_borrow() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let ext = extern_in_module(
+        &mut program,
+        &["host"],
+        "touch",
+        vec![(int, ParamMode::MutBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[ext.index()].binding = Some(provider_binding("host", "touch"));
+    let module = program.alloc_module(root_module());
+    let pair = air::LocalId::from_index(0);
+    let one = int_const(&mut program, int, 1);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("caller"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![mut_local(tuple, LocalKind::Temp)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: pair,
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::Tuple,
+                        fields: vec![Operand::Const(one)],
+                        ty: tuple,
+                    },
+                },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Extern(ext),
+                    args: vec![CallArg::MutBorrow(Place {
+                        root: PlaceRoot::Local(pair),
+                        projection: vec![Projection::TupleField(0)],
+                        ty: int,
+                    })],
+                }),
+            ],
             air::AirTail::Return(None),
         ),
     });
@@ -8054,18 +8801,15 @@ fn dataref_place_descriptor_inventory_finds_call_arg_descriptor() {
     let RirStmt::Eval(RirRValue::Call { args, .. }) = &program.functions[0].body.stmts[0] else {
         unreachable!();
     };
-    let RirCallArg::MutPlace(RirMutPlaceArg::DataRefProjection {
-        dataref,
-        projections,
-        ty,
-        ..
-    }) = &args[0]
-    else {
+    let RirCallArg::MutPlace(arg) = &args[0] else {
+        unreachable!();
+    };
+    let RirMutPlaceRoot::DataRef { dataref, .. } = arg.root else {
         unreachable!();
     };
 
     let descriptor = descriptors
-        .find(*dataref, projections, *ty)
+        .find(dataref, &arg.projections, arg.ty)
         .expect("descriptor missing for dataref arg");
 
     assert_eq!(descriptor.symbol, "anvP0_Node_value_place");
@@ -8081,17 +8825,48 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
     )
     .into_string();
 
+    let heap_type = target::dataref_place_heap_type_access("self");
     for needle in [
-        "struct anvP0_Node_value_place<'cx>",
-        "heap_type: anvyx_runtime::HeapType<'cx, NodeStorage<'cx>>",
-        "impl<'cx> anvyx_runtime::DataRefPlaceOps<'cx, i64> for anvP0_Node_value_place<'cx>",
-        "try_with_erased(object, self.heap_type, |storage: &NodeStorage<'cx>| f(&storage.value))",
-        "try_with_erased_mut(object, self.heap_type, |storage: &mut NodeStorage<'cx>| f(&mut storage.value))",
-        "let __anv_dataref_place_object_0 = ctx.heap().erase(&node).map_err(anvyx_runtime::heap_access_error)?;",
-        "let __anv_dataref_place_ops_0 = anvP0_Node_value_place { heap_type: ctx._types.NodeHeapType };",
-        "sink(ctx, anvyx_runtime::MutPlace::dataref(__anv_dataref_place_object_0, &__anv_dataref_place_ops_0))",
+        "struct anvP0_Node_value_place<'cx>".to_string(),
+        format!(
+            "{}: {}",
+            target::dataref_place_heap_type_field(),
+            target::heap_type_ty("NodeStorage<'cx>")
+        ),
+        format!(
+            "impl<'cx> {} for anvP0_Node_value_place<'cx>",
+            target::dataref_place_ops_ty("i64")
+        ),
+        target::ctx_heap_try_with_erased(
+            "ctx",
+            "object",
+            &heap_type,
+            "storage",
+            "NodeStorage<'cx>",
+            "f(&storage.value)",
+        ),
+        target::ctx_heap_try_with_erased_mut(
+            "ctx",
+            "object",
+            &heap_type,
+            "storage",
+            "NodeStorage<'cx>",
+            "f(&mut storage.value)",
+        ),
+        format!(
+            "let __anv_dataref_place_object_0 = {};",
+            target::ctx_heap_erase("ctx", "&node")
+        ),
+        format!(
+            "let __anv_dataref_place_ops_0 = anvP0_Node_value_place {{ {}: ctx._types.NodeHeapType }};",
+            target::dataref_place_heap_type_field()
+        ),
+        format!(
+            "sink(ctx, {})",
+            target::mut_place_dataref("__anv_dataref_place_object_0", "&__anv_dataref_place_ops_0")
+        ),
     ] {
-        assert!(source.contains(needle), "missing {needle}");
+        assert!(source.contains(&needle), "missing {needle}");
     }
     assert!(!source.contains("\"value\""));
 }
@@ -8299,6 +9074,26 @@ fn rir_verify_accepts_dataref_get_set_projection_ops() {
             ],
             value: RirOperand::Const(RirConstId::from_index(0)),
         },
+    ]);
+
+    rir::verify(&program).expect("dataref access ops should verify");
+}
+
+#[test]
+fn rir_verify_rejects_dataref_get_set_index_projection_ops() {
+    let program = dataref_access_rir(vec![
+        RirStmt::Init {
+            local: RirLocalId::from_index(2),
+            value: RirRValue::DataRefGet {
+                object: RirOperand::Place(dataref_access_place(0, 1)),
+                dataref: RirDataRefId::from_index(0),
+                projections: vec![
+                    RirProjection::Field(RirFieldId::from_index(4)),
+                    RirProjection::Index(RirLocalId::from_index(1)),
+                ],
+                ty: RirTypeId::from_index(0),
+            },
+        },
         RirStmt::DataRefSet {
             object: RirOperand::Place(dataref_access_place(0, 1)),
             dataref: RirDataRefId::from_index(0),
@@ -8310,7 +9105,7 @@ fn rir_verify_accepts_dataref_get_set_projection_ops() {
         },
     ]);
 
-    rir::verify(&program).expect("dataref access ops should verify");
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -9002,6 +9797,100 @@ fn stack_cell_rir(cell: RirCellDecl) -> RirProgram {
     }
 }
 
+fn projected_cell_mut_place_arg_program(root: RirMutPlaceRoot) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let tuple_ty = RirTypeId::from_index(2);
+    let tuple = RirTupleId::from_index(0);
+    let field = RirFieldId::from_index(0);
+    let storage = match root {
+        RirMutPlaceRoot::HeapCell { .. } => RirCellStorage::Heap,
+        _ => RirCellStorage::StackScoped,
+    };
+    let mut program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Tuple(tuple)],
+        tuples: vec![RirTuple {
+            id: tuple,
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            copyable: true,
+            fields: vec![RirField {
+                id: field,
+                symbol: RirSymbol::new("_0"),
+                ty: int,
+            }],
+        }],
+        cells: vec![RirCellDecl {
+            payload_ty: tuple_ty,
+            storage,
+            ..valid_stack_cell_decl()
+        }],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![rir_local(
+                RirLocalId::from_index(0),
+                tuple_ty,
+                true,
+                "source",
+            )],
+            vec![
+                RirStmt::CellInit {
+                    cell: RirCellRef::Owner(RirCellId::from_index(0)),
+                    value: RirRValue::Tuple {
+                        ty: tuple_ty,
+                        fields: vec![RirOperand::Const(RirConstId::from_index(0))],
+                    },
+                },
+                RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
+                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
+                        root,
+                        vec![RirProjection::TupleField(field)],
+                        int,
+                    ))],
+                    ty: void,
+                }),
+            ],
+        )],
+        consts: vec![RirConst {
+            id: RirConstId::from_index(0),
+            ty: int,
+            value: RirConstValue::Int(1),
+        }],
+        ..RirProgram::default()
+    };
+    program
+        .functions
+        .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+    program
+}
+
+fn projected_scoped_place_cell_mut_place_arg_program() -> RirProgram {
+    let mut program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::ScopedPlaceCell {
+        cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+        ty: RirTypeId::from_index(2),
+    });
+    program.cells.clear();
+    program.scoped_place_cells = vec![RirScopedPlaceCellDecl {
+        id: RirScopedPlaceCellId::from_index(0),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(0),
+        payload_ty: RirTypeId::from_index(2),
+        symbol: RirSymbol::new("__place_cell0"),
+    }];
+    program.functions[0].params = vec![RirParam {
+        local: RirLocalId::from_index(0),
+        ty: RirTypeId::from_index(2),
+        semantic: RirParamSemantic::MutPlace,
+        abi: RirParamAbi::MutPlace,
+        escape: RirParamEscape::NonEscaping,
+    }];
+    program.functions[0].body.stmts.remove(0);
+    program
+}
+
 fn cell_mut_place_call_rir(cell: RirCellDecl, arg: RirMutPlaceArg) -> RirProgram {
     let mut program = stack_cell_rir(cell);
     program
@@ -9355,6 +10244,14 @@ fn scoped_place_cell_capture() -> RirLambdaCapture {
 }
 
 fn mut_place_sink_function(id: RirFunctionId) -> RirFunction {
+    mut_place_sink_function_with_ty(id, RirTypeId::from_index(1))
+}
+
+fn mut_place_optional_sink_function(id: RirFunctionId, ty: RirTypeId) -> RirFunction {
+    mut_place_sink_function_with_ty(id, ty)
+}
+
+fn mut_place_sink_function_with_ty(id: RirFunctionId, ty: RirTypeId) -> RirFunction {
     let source = RirLocalId::from_index(0);
     RirFunction {
         id,
@@ -9362,7 +10259,7 @@ fn mut_place_sink_function(id: RirFunctionId) -> RirFunction {
         symbol: RirSymbol::new("mut_place_sink"),
         params: vec![RirParam {
             local: source,
-            ty: RirTypeId::from_index(1),
+            ty,
             semantic: RirParamSemantic::MutPlace,
             abi: RirParamAbi::MutPlace,
             escape: RirParamEscape::NonEscaping,
@@ -9372,7 +10269,7 @@ fn mut_place_sink_function(id: RirFunctionId) -> RirFunction {
         },
         locals: vec![RirLocal {
             id: source,
-            ty: RirTypeId::from_index(1),
+            ty,
             mutable: true,
             symbol: RirSymbol::new("p"),
             initialized: true,
@@ -9837,12 +10734,12 @@ fn dataref_projection_mut_place_arg(
     projections: Vec<RirProjection>,
     ty: RirTypeId,
 ) -> RirMutPlaceArg {
-    RirMutPlaceArg::DataRefProjection {
-        object: RirOperand::Place(dataref_access_place(0, 1)),
-        dataref: RirDataRefId::from_index(0),
+    RirMutPlaceArg::dataref(
+        RirOperand::Place(dataref_access_place(0, 1)),
+        RirDataRefId::from_index(0),
         projections,
         ty,
-    }
+    )
 }
 
 fn valid_dataref_projection_mut_place_arg() -> RirMutPlaceArg {
@@ -9866,16 +10763,10 @@ fn edit_dataref_projection_mut_place_arg(
     edit: impl FnOnce(&mut RirOperand, &mut RirDataRefId, &mut Vec<RirProjection>, &mut RirTypeId),
 ) -> RirMutPlaceArg {
     let mut arg = valid_dataref_projection_mut_place_arg();
-    let RirMutPlaceArg::DataRefProjection {
-        object,
-        dataref,
-        projections,
-        ty,
-    } = &mut arg
-    else {
+    let RirMutPlaceRoot::DataRef { object, dataref } = &mut arg.root else {
         unreachable!();
     };
-    edit(object, dataref, projections, ty);
+    edit(object, dataref, &mut arg.projections, &mut arg.ty);
     arg
 }
 

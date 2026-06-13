@@ -114,6 +114,14 @@ pub(super) fn projected_ty(
             TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem),
             Projection::Index(_),
         ) => Some(*elem),
+        (TypeData::Map { value, .. }, Projection::MapIndex(_)) => program
+            .type_arena
+            .iter()
+            .enumerate()
+            .find_map(|(index, ty)| {
+                matches!(ty, TypeData::Optional(inner) if *inner == *value)
+                    .then(|| TypeId::from_index(index))
+            }),
         (TypeData::Tuple(fields), Projection::TupleField(field)) => {
             fields.get(*field as usize).copied()
         }

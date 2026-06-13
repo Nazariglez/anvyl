@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: clean Rust aggregate fields with collection payloads are unsupported before projected collection replacement can run
+// @match: 3
+
+struct Box {
+    xs: [int],
+}
+
+fn replace(var box: Box) {
+    box.xs = [1, 2, 3];
+}
+
+fn main() {
+    var box = Box { xs: [0] };
+    replace(box);
+    println(box.xs[2]);
+}

@@ -1,10 +1,10 @@
 use super::{
-    place::RustPlaces,
+    place::{MutPlaceProjection, MutPlaceProjectionStep, RustPlaces, projected_ops_ctor},
     rep_policy::{RustBorrowView, RustRepPolicy},
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
-        RirMutPlaceArg, RirOperand, RirParamSemantic, RirPlace, RirProgram, RirScopedPlaceCellRef,
-        RirType, RirTypeId, RirVariant, RirVariantKind,
+        RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace, RirProgram,
+        RirScopedPlaceCellRef, RirType, RirTypeId, RirVariant, RirVariantKind,
     },
     syntax::{
         comma, field_init, match_expr, rust_string, struct_lit, struct_variant, tuple_variant,
@@ -18,6 +18,12 @@ pub(super) struct RustValues<'a> {
     function: &'a RirFunction,
     policy: RustRepPolicy<'a>,
     places: RustPlaces<'a>,
+}
+
+pub(super) struct ProjectedPlaceDescriptor {
+    pub(super) struct_decl: String,
+    pub(super) ctor: String,
+    pub(super) impl_decl: String,
 }
 
 impl<'a> RustValues<'a> {
@@ -61,46 +67,42 @@ impl<'a> RustValues<'a> {
     }
 
     pub(super) fn mut_place_arg(&self, arg: &RirMutPlaceArg) -> String {
-        match arg {
-            RirMutPlaceArg::Local(place) => {
-                format!(
-                    "{}::local(&mut {})",
-                    target::mut_place_ty(),
-                    self.place(place)
-                )
+        debug_assert!(arg.projections.is_empty());
+        self.mut_place_root_arg(&arg.root)
+            .expect("dataref mut-place args must be prepared before rendering")
+            .1
+    }
+
+    pub(super) fn mut_place_root_arg(&self, root: &RirMutPlaceRoot) -> Option<(RirTypeId, String)> {
+        match root {
+            RirMutPlaceRoot::Local { local, ty } => Some((
+                *ty,
+                target::mut_place_local(&self.place(&RirPlace {
+                    local: *local,
+                    projections: vec![],
+                    ty: *ty,
+                })),
+            )),
+            RirMutPlaceRoot::Param { local, ty } => Some((
+                *ty,
+                target::mut_place_reborrow(self.function.locals[local.index()].symbol.as_str()),
+            )),
+            RirMutPlaceRoot::StackCell { cell, ty } => {
+                Some((*ty, target::mut_place_stack_cell(&self.cell_ref(*cell))))
             }
-            RirMutPlaceArg::Param { local, .. } => {
-                format!(
-                    "{}.reborrow()",
-                    self.function.locals[local.index()].symbol.as_str()
-                )
+            RirMutPlaceRoot::HeapCell { cell, ty } => {
+                Some((*ty, target::mut_place_heap_cell(&self.cell_ref(*cell))))
             }
-            RirMutPlaceArg::StackCell { cell, .. } => {
-                format!(
-                    "{}::stack_cell(&{})",
-                    target::mut_place_ty(),
-                    self.cell_ref(*cell)
-                )
-            }
-            RirMutPlaceArg::HeapCell { cell, .. } => {
-                format!(
-                    "{}::heap_cell({}.clone())",
-                    target::mut_place_ty(),
-                    self.cell_ref(*cell)
-                )
-            }
-            RirMutPlaceArg::ScopedPlaceCell { cell, .. } => {
+            RirMutPlaceRoot::ScopedPlaceCell { cell, ty } => {
                 let cell = match cell {
                     RirScopedPlaceCellRef::Owner(_) => {
                         format!("&{}", self.scoped_place_cell_ref(*cell))
                     }
                     RirScopedPlaceCellRef::Capture { .. } => self.scoped_place_cell_ref(*cell),
                 };
-                format!("{}::scoped_cell({cell})", target::mut_place_ty())
+                Some((*ty, target::mut_place_scoped_cell(&cell)))
             }
-            RirMutPlaceArg::DataRefProjection { .. } => {
-                unreachable!("dataref mut-place args must be prepared before rendering")
-            }
+            RirMutPlaceRoot::DataRef { .. } => None,
         }
     }
 
@@ -145,13 +147,14 @@ impl<'a> RustValues<'a> {
         let RirOperand::Place(place) = operand else {
             return self.operand(operand);
         };
-        if let Some(access) = self.places.slice_index_access(place)
-            && access.root_is_mut_place
-        {
-            return self.mut_place_index_access(access);
-        }
         if self.places.mut_place_root_param(place) {
             return self.mut_place_value_operand(place);
+        }
+        if self.places.mut_place_projection(place).is_some() {
+            return self.mut_place_projected_value_operand(place);
+        }
+        if let Some(value) = self.map_slot_value_operand(place) {
+            return value;
         }
         let place_expr = self.place(place);
         if self.policy.cow_value(place.ty) {
@@ -180,11 +183,12 @@ impl<'a> RustValues<'a> {
             RirOperand::Place(place) if self.places.mut_place_root_param(place) => {
                 self.mut_place_value_operand(place)
             }
+            RirOperand::Place(place) if self.places.mut_place_projection(place).is_some() => {
+                self.mut_place_projected_value_operand(place)
+            }
             RirOperand::Place(place) => {
-                if let Some(access) = self.places.slice_index_access(place)
-                    && access.root_is_mut_place
-                {
-                    return self.mut_place_index_access(access);
+                if let Some(value) = self.map_slot_value_operand(place) {
+                    return value;
                 }
                 match self.program.types[place.ty.index()] {
                     RirType::Struct(id) if self.program.structs[id.index()].copyable => {
@@ -212,16 +216,235 @@ impl<'a> RustValues<'a> {
         self.place_value_from_access(place.ty, &self.place(place))
     }
 
-    fn mut_place_index_access(&self, access: super::place::SliceIndexAccess) -> String {
-        let body = if access.list_root {
-            let checked = target::checked_index(&access.index, "value.len()");
-            let version = target::collection_structural_version("value");
-            let elem = target::list_elem_at_shared("value", "index", "version");
-            format!("{{ let index = {checked}; let version = {version}; {elem} }}")
+    fn map_slot_value_operand(&self, place: &RirPlace) -> Option<String> {
+        let access = self.places.map_slot_access(place)?;
+        let value = self.value_from_ref(access.value_ty, "value");
+        Some(format!(
+            "{}.get(&{}).map(|value| {value})",
+            access.map, access.key
+        ))
+    }
+
+    pub(super) fn mut_place_projected_set(&self, place: &RirPlace, value: &str) -> Option<String> {
+        let projection = self.places.mut_place_projection(place)?;
+        let set = if self.collection_replace_ty(place.ty) {
+            target::mut_place_replace_collection(
+                "__anv_place",
+                &target::ctx_runtime("ctx"),
+                "__anv_value",
+            )
         } else {
-            target::slice_elem_at_shared("value", &access.index)
+            target::mut_place_set("__anv_place", &target::ctx_runtime("ctx"), "__anv_value")
         };
-        target::mut_place_access(&access.root, &target::ctx_runtime("ctx"), &body)
+        Some(self.mut_place_projected_region(
+            &projection,
+            &format!("let __anv_value = {value};"),
+            &set,
+        ))
+    }
+
+    fn mut_place_projected_value_operand(&self, place: &RirPlace) -> String {
+        let projection = self
+            .places
+            .mut_place_projection(place)
+            .expect("checked mut-place projection");
+        self.mut_place_projected_region(
+            &projection,
+            "",
+            &self.place_value_from_access(place.ty, "__anv_place"),
+        )
+    }
+
+    fn collection_replace_ty(&self, ty: RirTypeId) -> bool {
+        matches!(
+            self.program.types[ty.index()],
+            RirType::List(_) | RirType::Map { .. }
+        )
+    }
+
+    fn mut_place_projected_region(
+        &self,
+        projection: &MutPlaceProjection,
+        before_place: &str,
+        body: &str,
+    ) -> String {
+        let descriptor = self.mut_place_projection_descriptor("__AnvProjectedPlaceOps", projection);
+        format!(
+            "{{ {before_place} {} {} let __anv_ops = {}; let mut __anv_place = {}; {body} }}",
+            descriptor.struct_decl,
+            descriptor.impl_decl,
+            descriptor.ctor,
+            target::mut_place_projected(
+                &target::mut_place_reborrow(&projection.root),
+                "&__anv_ops"
+            ),
+        )
+    }
+
+    pub(super) fn mut_place_projection_descriptor_for(
+        &self,
+        ops: &str,
+        root_ty: RirTypeId,
+        root: &str,
+        slot_ty: RirTypeId,
+        projections: &[super::rir::RirProjection],
+    ) -> ProjectedPlaceDescriptor {
+        let projection = self
+            .places
+            .projected_place(root_ty, root, slot_ty, projections)
+            .expect("verified projected place descriptor");
+        self.mut_place_projection_descriptor(ops, &projection)
+    }
+
+    pub(super) fn mut_place_projection_descriptor(
+        &self,
+        ops: &str,
+        projection: &MutPlaceProjection,
+    ) -> ProjectedPlaceDescriptor {
+        let struct_decl = if projection.fields.is_empty() {
+            format!("struct {ops};")
+        } else {
+            format!(
+                "struct {ops} {{ {} }}",
+                comma(projection.fields.iter().cloned())
+            )
+        };
+        let root_ty = self.policy.rust_ty(projection.root_ty);
+        let slot_ty = self.policy.rust_ty(projection.slot_ty);
+        ProjectedPlaceDescriptor {
+            struct_decl,
+            ctor: projected_ops_ctor(ops, &projection.inits),
+            impl_decl: self.mut_place_projection_ops_impl(
+                ops,
+                &root_ty,
+                &slot_ty,
+                &projection.steps,
+            ),
+        }
+    }
+
+    fn mut_place_projection_ops_impl(
+        &self,
+        ops: &str,
+        root_ty: &str,
+        slot_ty: &str,
+        steps: &[MutPlaceProjectionStep],
+    ) -> String {
+        let access = self.projected_access("root", true, steps);
+        let mutate = self.projected_mutate("root", true, steps);
+        format!(
+            "impl<'cx> {} for {ops} {{ fn access(&self, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
+            target::projection_ops_ty(root_ty, slot_ty),
+            target::result_ty("()"),
+            target::result_ty("()"),
+            target::result_ty("()"),
+            target::result_ty("()"),
+        )
+    }
+
+    fn projected_access(
+        &self,
+        expr: &str,
+        by_ref: bool,
+        steps: &[MutPlaceProjectionStep],
+    ) -> String {
+        let Some((step, rest)) = steps.split_first() else {
+            return if by_ref {
+                format!("f({expr})")
+            } else {
+                format!("f(&{expr})")
+            };
+        };
+        match step {
+            MutPlaceProjectionStep::Field(field) => {
+                self.projected_access(&format!("{expr}.{field}"), false, rest)
+            }
+            MutPlaceProjectionStep::ArrayIndex { index, len } => {
+                let checked = target::checked_index_result(
+                    &format!("self.{index}"),
+                    &len.to_string(),
+                    "array",
+                );
+                let body = self.projected_access(&format!("{expr}[index]"), false, rest);
+                format!("{{ let index = {checked}; {body} }}")
+            }
+            MutPlaceProjectionStep::ListIndex { index, version } => {
+                let checked = target::checked_index_result(
+                    &format!("self.{index}"),
+                    &format!("{expr}.len()"),
+                    "list",
+                );
+                let body = self.projected_access("value", true, rest);
+                let access = target::list_with_elem_shared_short(
+                    expr,
+                    "index",
+                    &format!("self.{version}"),
+                    &body,
+                );
+                format!("{{ let index = {checked}; {access} }}")
+            }
+            MutPlaceProjectionStep::SliceIndex { index } => {
+                let body = self.projected_access("value", false, rest);
+                format!("{{ let value = {expr}.elem_at_shared(self.{index})?; {body} }}")
+            }
+            MutPlaceProjectionStep::MapIndex { key, value_ty } => {
+                debug_assert!(rest.is_empty());
+                let value = self.value_from_ref(*value_ty, "value");
+                format!("{{ let value = {expr}.get(&self.{key}).map(|value| {value}); f(&value) }}")
+            }
+        }
+    }
+
+    fn projected_mutate(
+        &self,
+        expr: &str,
+        by_ref: bool,
+        steps: &[MutPlaceProjectionStep],
+    ) -> String {
+        let Some((step, rest)) = steps.split_first() else {
+            return if by_ref {
+                format!("f({expr})")
+            } else {
+                format!("f(&mut {expr})")
+            };
+        };
+        match step {
+            MutPlaceProjectionStep::Field(field) => {
+                self.projected_mutate(&format!("{expr}.{field}"), false, rest)
+            }
+            MutPlaceProjectionStep::ArrayIndex { index, len } => {
+                let checked = target::checked_index_result(
+                    &format!("self.{index}"),
+                    &len.to_string(),
+                    "array",
+                );
+                let body = self.projected_mutate(&format!("{expr}[index]"), false, rest);
+                format!("{{ let index = {checked}; {body} }}")
+            }
+            MutPlaceProjectionStep::ListIndex { index, version } => {
+                let checked = target::checked_index_result(
+                    &format!("self.{index}"),
+                    &format!("{expr}.len()"),
+                    "list",
+                );
+                let body = self.projected_mutate("value", true, rest);
+                format!(
+                    "{{ let index = {checked}; {expr}.with_elem_mut_short(index, self.{version}, |value| {{ {body} }}) }}"
+                )
+            }
+            MutPlaceProjectionStep::SliceIndex { index } => {
+                let body = self.projected_mutate("value", true, rest);
+                format!("{expr}.with_elem_mut_short(self.{index}, |value| {{ {body} }})")
+            }
+            MutPlaceProjectionStep::MapIndex { key, value_ty } => {
+                debug_assert!(rest.is_empty());
+                let value = self.value_from_ref(*value_ty, "value");
+                let set = target::map_optional_slot_set(expr, &format!("self.{key}"), "slot");
+                format!(
+                    "{{ let mut slot = {expr}.get(&self.{key}).map(|value| {value}); f(&mut slot)?; {set} }}"
+                )
+            }
+        }
     }
 
     pub(super) fn scoped_place_cell_value(

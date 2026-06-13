@@ -1,0 +1,16 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: optional payload aliases over projected collection slots need projected-place owner
+// @match: 2
+
+fn main() {
+    var xs: [int?] = [1];
+    {
+        var value? = xs[0] else return;
+        value = 2;
+    }
+    if let value? = xs[0] {
+        println(value);
+    }
+}

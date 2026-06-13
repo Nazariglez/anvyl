@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: clean Rust backend place-return ABI is delegated to mutable place returns owner
+// @match: 2
+
+fn id(var x: int) -> var int {
+    x
+}
+
+fn main() {
+    var n = 1;
+    id(n) = 2;
+    println(n);
+}

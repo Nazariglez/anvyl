@@ -19,7 +19,7 @@ pub use anvyx_heap::{
     Visitor,
 };
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
-pub use check::{checked_index, checked_range};
+pub use check::{checked_index, checked_index_result, checked_range};
 pub use collection::{CollectionLoanState, ShapeLoanGuard};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
@@ -31,7 +31,8 @@ pub use managed_rc::{
     managed_alloc_details, typed_dropper,
 };
 pub use mutable_place::{
-    DataRefPlace, DataRefPlaceOps, MutPlace, ScopedMutPlaceCell, heap_access_error,
+    DataRefPlace, DataRefPlaceOps, MutPlace, ProjectedPlace, ProjectionOps, ScopedMutPlaceCell,
+    heap_access_error,
 };
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,

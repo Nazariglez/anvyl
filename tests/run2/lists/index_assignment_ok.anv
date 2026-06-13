@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+fn main() {
+    var xs: [int] = [0, 1, 2];
+    let i = 1;
+    xs[i] = 4;
+    xs[i] += 3;
+    println(xs[1]);
+}

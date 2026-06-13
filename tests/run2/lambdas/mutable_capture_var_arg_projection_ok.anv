@@ -1,16 +1,23 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: direct projected capture-cell writes remain a named clean Rust backend gap
 // @match: 1
 
 struct Point { x: int }
 
+fn inc(var x: int) {
+    x += 1;
+}
+
+fn print_x(var p: Point) {
+    println(p.x);
+}
+
 fn main() {
     var p = Point { x: 0 };
     let f = || {
-        p.x = 1;
+        inc(p.x);
     };
     f();
-    println(p.x);
+    print_x(p);
 }

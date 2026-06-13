@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::{cell::UnsafeCell, marker::PhantomData, rc::Rc};
 
 use crate::{
     AccessError, AnvList, AnvSlice, Ctx, ErasedHandle, Handle, LambdaCell, RuntimeError,
@@ -9,7 +9,7 @@ pub enum MutPlace<'place, 'cx, T> {
     Local(&'place mut T, PhantomData<&'cx ()>),
     StackCell(&'place StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
-    DataRef(DataRefPlace<'place, 'cx, T>),
+    Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'place>),
     ScopedCell(&'place ScopedMutPlaceCell<'place, 'cx, T>),
 }
 
@@ -17,6 +17,42 @@ pub struct DataRefPlace<'ops, 'cx, T> {
     object: ErasedHandle<'cx>,
     ops: &'ops dyn DataRefPlaceOps<'cx, T>,
     _not_send_sync: PhantomData<Rc<()>>,
+}
+
+pub struct ProjectedPlace<'place, 'cx, R, T> {
+    root: UnsafeCell<MutPlace<'place, 'cx, R>>,
+    ops: &'place dyn ProjectionOps<'cx, R, T>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+pub trait ProjectedPlaceObject<'cx, T> {
+    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a>;
+
+    fn access(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
+
+    fn mutate(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
+}
+
+pub trait ProjectionOps<'cx, R, T> {
+    fn access(
+        &self,
+        root: &R,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
+
+    fn mutate(
+        &self,
+        root: &mut R,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError>;
 }
 
 pub trait DataRefPlaceOps<'cx, T> {
@@ -45,7 +81,7 @@ enum ScopedMutPlaceRoot<'source, 'cx, T> {
     Local(*mut T, PhantomData<&'source mut T>, PhantomData<&'cx ()>),
     StackCell(&'source StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
-    DataRef(DataRefPlace<'source, 'cx, T>),
+    Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'source>),
     ScopedCell(&'source ScopedMutPlaceCell<'source, 'cx, T>),
 }
 
@@ -65,6 +101,69 @@ pub fn heap_access_error(error: AccessError) -> RuntimeError {
     RuntimeError::new(message)
 }
 
+impl<'place, 'cx, R: 'cx, T: 'cx> ProjectedPlace<'place, 'cx, R, T> {
+    pub fn new(root: MutPlace<'place, 'cx, R>, ops: &'place dyn ProjectionOps<'cx, R, T>) -> Self {
+        Self {
+            root: UnsafeCell::new(root),
+            ops,
+            _not_send_sync: PhantomData,
+        }
+    }
+}
+
+impl<'cx, R: 'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for ProjectedPlace<'_, 'cx, R, T> {
+    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a> {
+        let root = unsafe { &mut *self.root.get() }.reborrow();
+        Box::new(ProjectedPlace::new(root, self.ops))
+    }
+
+    fn access(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        unsafe { &mut *self.root.get() }.access(ctx, |root| self.ops.access(root, f))
+    }
+
+    fn mutate(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        unsafe { &mut *self.root.get() }.mutate(ctx, |root| self.ops.mutate(root, f))
+    }
+}
+
+fn projected_access<'cx, T: 'cx, R>(
+    place: &dyn ProjectedPlaceObject<'cx, T>,
+    ctx: &mut Ctx<'cx, '_>,
+    f: impl FnOnce(&T) -> Result<R, RuntimeError>,
+) -> Result<R, RuntimeError> {
+    let mut f = Some(f);
+    let mut out = None;
+    place.access(ctx, &mut |slot| {
+        let f = f.take().expect("projected place access invoked twice");
+        out = Some(f(slot)?);
+        Ok(())
+    })?;
+    Ok(out.expect("projected place access did not invoke callback"))
+}
+
+fn projected_mutate<'cx, T: 'cx, R>(
+    place: &dyn ProjectedPlaceObject<'cx, T>,
+    ctx: &mut Ctx<'cx, '_>,
+    f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
+) -> Result<R, RuntimeError> {
+    let mut f = Some(f);
+    let mut out = None;
+    place.mutate(ctx, &mut |slot| {
+        let f = f.take().expect("projected place mutation invoked twice");
+        out = Some(f(slot)?);
+        Ok(())
+    })?;
+    Ok(out.expect("projected place mutation did not invoke callback"))
+}
+
 impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
     pub fn new(object: ErasedHandle<'cx>, ops: &'ops dyn DataRefPlaceOps<'cx, T>) -> Self {
         Self {
@@ -73,40 +172,27 @@ impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
             _not_send_sync: PhantomData,
         }
     }
+}
 
-    #[must_use]
-    pub fn reborrow(&self) -> DataRefPlace<'ops, 'cx, T> {
-        Self::new(self.object.clone(), self.ops)
+impl<'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for DataRefPlace<'_, 'cx, T> {
+    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a> {
+        Box::new(Self::new(self.object.clone(), self.ops))
     }
 
-    fn access<'rt, R>(
+    fn access(
         &self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        f: impl FnOnce(&T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError> {
-        let mut f = Some(f);
-        let mut out = None;
-        self.ops.access(ctx, &self.object, &mut |slot| {
-            let f = f.take().expect("dataref place access invoked twice");
-            out = Some(f(slot)?);
-            Ok(())
-        })?;
-        Ok(out.expect("dataref place access did not invoke callback"))
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.ops.access(ctx, &self.object, f)
     }
 
-    fn mutate<'rt, R>(
+    fn mutate(
         &self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError> {
-        let mut f = Some(f);
-        let mut out = None;
-        self.ops.mutate(ctx, &self.object, &mut |slot| {
-            let f = f.take().expect("dataref place mutation invoked twice");
-            out = Some(f(slot)?);
-            Ok(())
-        })?;
-        Ok(out.expect("dataref place mutation did not invoke callback"))
+        ctx: &mut Ctx<'cx, '_>,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.ops.mutate(ctx, &self.object, f)
     }
 }
 
@@ -130,7 +216,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<T>> {
                     )
                 })
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
                 Err(non_local_slice_view_error())
             }
         }
@@ -155,7 +241,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<T>> {
                     )
                 })
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
                 Err(non_local_slice_view_error())
             }
         }
@@ -178,7 +264,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
                     },
                 )
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
                 Err(non_local_slice_view_error())
             }
         }
@@ -197,7 +283,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
                     AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
                 })
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::DataRef(_) | Self::ScopedCell(_) => {
+            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
                 Err(non_local_slice_view_error())
             }
         }
@@ -222,7 +308,14 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
     }
 
     pub fn dataref(object: ErasedHandle<'cx>, ops: &'place dyn DataRefPlaceOps<'cx, T>) -> Self {
-        Self::DataRef(DataRefPlace::new(object, ops))
+        Self::Projected(Box::new(DataRefPlace::new(object, ops)))
+    }
+
+    pub fn projected<R: 'cx>(
+        root: MutPlace<'place, 'cx, R>,
+        ops: &'place dyn ProjectionOps<'cx, R, T>,
+    ) -> Self {
+        Self::Projected(Box::new(ProjectedPlace::new(root, ops)))
     }
 
     pub fn scoped_cell(cell: &'place ScopedMutPlaceCell<'place, 'cx, T>) -> Self {
@@ -234,7 +327,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => MutPlace::local(&mut **value),
             Self::StackCell(cell, _) => MutPlace::stack_cell(cell),
             Self::HeapCell(cell) => MutPlace::heap_cell(cell.clone()),
-            Self::DataRef(place) => MutPlace::DataRef(place.reborrow()),
+            Self::Projected(place) => MutPlace::Projected(place.reborrow()),
             Self::ScopedCell(cell) => MutPlace::scoped_cell(cell),
         }
     }
@@ -248,7 +341,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(value),
             Self::StackCell(cell, _) => cell.access(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.access(f)),
-            Self::DataRef(place) => place.access(ctx, f),
+            Self::Projected(place) => projected_access(&**place, ctx, f),
             Self::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
@@ -262,7 +355,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(*value),
             Self::StackCell(cell, _) => cell.mutate(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
-            Self::DataRef(place) => place.mutate(ctx, f),
+            Self::Projected(place) => projected_mutate(&**place, ctx, f),
             Self::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
@@ -315,7 +408,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &*value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.access(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.access(f)),
-            ScopedMutPlaceRoot::DataRef(ref place) => place.access(ctx, f),
+            ScopedMutPlaceRoot::Projected(ref place) => projected_access(&**place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
@@ -330,7 +423,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &mut *value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.mutate(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
-            ScopedMutPlaceRoot::DataRef(ref place) => place.mutate(ctx, f),
+            ScopedMutPlaceRoot::Projected(ref place) => projected_mutate(&**place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
@@ -353,7 +446,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceRoot<'source, 'cx, T> {
             MutPlace::Local(value, _) => Self::Local(value, PhantomData, PhantomData),
             MutPlace::StackCell(cell, _) => Self::StackCell(cell, PhantomData),
             MutPlace::HeapCell(cell) => Self::HeapCell(cell),
-            MutPlace::DataRef(place) => Self::DataRef(place),
+            MutPlace::Projected(place) => Self::Projected(place),
             MutPlace::ScopedCell(cell) => Self::ScopedCell(cell),
         }
     }
@@ -367,11 +460,11 @@ impl<'cx, T: Copy + 'cx> ScopedMutPlaceCell<'_, 'cx, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::ManuallyDrop;
+    use std::{cell::Cell, mem::ManuallyDrop};
 
     use crate::{
         AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, HeapType, LambdaCell, MutPlace,
-        RuntimeError, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
+        ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -381,6 +474,159 @@ mod tests {
                 $($body)*
             })
         };
+    }
+
+    struct Pair {
+        x: i64,
+        y: i64,
+    }
+
+    struct PairYOps {
+        access_calls: Cell<usize>,
+        mutate_calls: Cell<usize>,
+    }
+
+    struct ListElemOps {
+        index: i64,
+        version: u64,
+    }
+
+    struct SliceElemOps {
+        index: i64,
+    }
+
+    impl ProjectionOps<'_, Pair, i64> for PairYOps {
+        fn access(
+            &self,
+            root: &Pair,
+            f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            self.access_calls.set(self.access_calls.get() + 1);
+            f(&root.y)
+        }
+
+        fn mutate(
+            &self,
+            root: &mut Pair,
+            f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            self.mutate_calls.set(self.mutate_calls.get() + 1);
+            f(&mut root.y)
+        }
+    }
+
+    impl ProjectionOps<'_, AnvList<i64>, i64> for ListElemOps {
+        fn access(
+            &self,
+            root: &AnvList<i64>,
+            f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let index = crate::checked_index_result(self.index, root.len(), "list")?;
+            root.with_elem_shared_short(index, self.version, f)
+        }
+
+        fn mutate(
+            &self,
+            root: &mut AnvList<i64>,
+            f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let index = crate::checked_index_result(self.index, root.len(), "list")?;
+            root.with_elem_mut_short(index, self.version, f)
+        }
+    }
+
+    impl ProjectionOps<'_, AnvSlice<i64>, i64> for SliceElemOps {
+        fn access(
+            &self,
+            root: &AnvSlice<i64>,
+            f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let value = root.elem_at_shared(self.index)?;
+            f(&value)
+        }
+
+        fn mutate(
+            &self,
+            root: &mut AnvSlice<i64>,
+            f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            root.with_elem_mut_short(self.index, f)
+        }
+    }
+
+    #[test]
+    fn projected_field_access_mutate_and_reborrow() {
+        with_ctx!(ctx;
+        let mut pair = Pair { x: 1, y: 2 };
+        let ops = PairYOps {
+            access_calls: Cell::new(0),
+            mutate_calls: Cell::new(0),
+        };
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut pair), &ops);
+
+            assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
+            place.update_copy(&mut ctx, |value| value + 10).unwrap();
+            {
+                let mut reborrowed = place.reborrow();
+                reborrowed.set(&mut ctx, 5).unwrap();
+            }
+        }
+
+        assert_eq!(pair.x, 1);
+        assert_eq!(pair.y, 5);
+        assert_eq!(ops.access_calls.get(), 1);
+        assert_eq!(ops.mutate_calls.get(), 2);
+            );
+    }
+
+    #[test]
+    fn projected_list_stale_version_rejects_access_and_mutate() {
+        with_ctx!(ctx;
+        let mut list = AnvList::from_elems([1_i64, 2]);
+        let ops = ListElemOps {
+            index: 0,
+            version: list.structural_version(),
+        };
+        list.push(3).unwrap();
+        let mut place = MutPlace::projected(MutPlace::local(&mut list), &ops);
+
+        assert!(place.get_copy(&mut ctx).is_err());
+        assert!(place.set(&mut ctx, 4).is_err());
+            );
+    }
+
+    #[test]
+    fn projected_list_callback_error_restores_access() {
+        with_ctx!(ctx;
+        let mut list = AnvList::from_elems([1_i64, 2]);
+        let ops = ListElemOps {
+            index: 1,
+            version: list.structural_version(),
+        };
+        let mut place = MutPlace::projected(MutPlace::local(&mut list), &ops);
+
+        let err = place
+            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
+            .unwrap_err();
+        assert_eq!(err.message(), "early");
+        place.set(&mut ctx, 5).unwrap();
+        drop(place);
+        assert_eq!(list.elem_at_shared(1, list.structural_version()).unwrap(), 5);
+            );
+    }
+
+    #[test]
+    fn projected_slice_bounds_checked_per_operation() {
+        with_ctx!(ctx;
+        let mut list = AnvList::from_elems([1_i64, 2]);
+        let mut root = MutPlace::local(&mut list).slice_view_mut(0, 2, false).unwrap();
+        let ops = SliceElemOps { index: 2 };
+        let mut place = MutPlace::projected(MutPlace::local(&mut root), &ops);
+
+        assert!(place.get_copy(&mut ctx).is_err());
+        assert!(place.set(&mut ctx, 3).is_err());
+            );
     }
 
     #[test]
@@ -421,6 +667,7 @@ mod tests {
             forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
         }
         place.update_copy(&mut ctx, |value| value + 1).unwrap();
+        drop(place);
 
         assert_eq!(value, 3);
             );
@@ -452,6 +699,7 @@ mod tests {
         let old = place.replace(&mut ctx, NonClone(2)).unwrap();
         assert_eq!(old.0, 1);
         place.set(&mut ctx, NonClone(3)).unwrap();
+        drop(place);
         assert_eq!(value.0, 3);
             );
     }
@@ -497,6 +745,7 @@ mod tests {
 
         assert_eq!(err.message(), "early");
         place.set(&mut ctx, 2).unwrap();
+        drop(place);
         assert_eq!(value, 2);
             );
     }
@@ -893,6 +1142,7 @@ mod tests {
         assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
         assert_eq!(slice.elem_at_shared(1).unwrap(), 3);
         set_slice_second(&mut place.slice_view_mut(0, 2, false).unwrap());
+        drop(place);
         assert_eq!(*list.get(1).unwrap(), 9);
 
         let mut array = [1_i64, 2, 3];
@@ -902,6 +1152,7 @@ mod tests {
         assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
         assert_eq!(slice.elem_at_shared(1).unwrap(), 3);
         set_slice_second(&mut place.slice_view_mut(0, 2, false).unwrap());
+        drop(place);
         assert_eq!(array[1], 9);
     }
 

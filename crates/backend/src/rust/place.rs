@@ -1,9 +1,11 @@
 use super::{
     dataref_place::storage_path as dataref_storage_path,
+    rep_policy::RustRepPolicy,
     rir::{
-        RirDataRefId, RirField, RirFunction, RirParamAbi, RirPlace, RirProgram, RirProjection,
-        RirType, RirTypeId,
+        RirDataRefId, RirField, RirFunction, RirLocalId, RirParamAbi, RirPlace, RirProgram,
+        RirProjection, RirType, RirTypeId,
     },
+    syntax::comma,
     target,
 };
 
@@ -14,10 +16,45 @@ struct RenderedPlace {
 
 pub(super) struct SliceIndexAccess {
     pub slice: String,
-    pub root: String,
     pub index: String,
-    pub root_is_mut_place: bool,
     pub list_root: bool,
+}
+
+pub(super) struct MutPlaceProjection {
+    pub root: String,
+    pub root_ty: RirTypeId,
+    pub slot_ty: RirTypeId,
+    pub fields: Vec<String>,
+    pub inits: Vec<(String, String)>,
+    pub steps: Vec<MutPlaceProjectionStep>,
+}
+
+pub(super) enum MutPlaceProjectionStep {
+    Field(String),
+    ArrayIndex { index: String, len: u64 },
+    ListIndex { index: String, version: String },
+    SliceIndex { index: String },
+    MapIndex { key: String, value_ty: RirTypeId },
+}
+
+pub(super) struct MapSlotAccess {
+    pub map: String,
+    pub key: String,
+    pub key_value: String,
+    pub value_ty: RirTypeId,
+}
+
+pub(super) fn projected_ops_ctor(ops: &str, inits: &[(String, String)]) -> String {
+    if inits.is_empty() {
+        return ops.to_string();
+    }
+    let mut lets = vec![];
+    let mut fields = vec![];
+    for (field, value) in inits {
+        lets.push(format!("let {field} = {value};"));
+        fields.push(field.clone());
+    }
+    format!("{{ {} {ops} {{ {} }} }}", lets.join(" "), comma(fields))
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +115,174 @@ impl<'a> RustPlaces<'a> {
         place.projections.is_empty() && self.local_is_mut_place_param(place.local)
     }
 
+    pub(super) fn mut_place_projection(&self, place: &RirPlace) -> Option<MutPlaceProjection> {
+        if place.projections.is_empty() || !self.local_is_mut_place_param(place.local) {
+            return None;
+        }
+        let local = &self.function.locals[place.local.index()];
+        self.projected_place(
+            local.ty,
+            local.symbol.as_str(),
+            place.ty,
+            &place.projections,
+        )
+    }
+
+    pub(super) fn projected_place(
+        &self,
+        root_ty: RirTypeId,
+        root: &str,
+        slot_ty: RirTypeId,
+        projections: &[RirProjection],
+    ) -> Option<MutPlaceProjection> {
+        let mut ty = root_ty;
+        let mut fields = vec![];
+        let mut inits = vec![];
+        let mut steps = vec![];
+        for projection in projections {
+            match projection {
+                RirProjection::Field(field_id) => {
+                    let RirType::Struct(struct_id) = self.program.types[ty.index()] else {
+                        return None;
+                    };
+                    let field = &self.program.structs[struct_id.index()].fields[field_id.index()];
+                    steps.push(MutPlaceProjectionStep::Field(
+                        field.symbol.as_str().to_string(),
+                    ));
+                    ty = field.ty;
+                }
+                RirProjection::TupleField(field_id) => {
+                    let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
+                        return None;
+                    };
+                    let field = &self.program.tuples[tuple_id.index()].fields[field_id.index()];
+                    steps.push(MutPlaceProjectionStep::Field(
+                        field.symbol.as_str().to_string(),
+                    ));
+                    ty = field.ty;
+                }
+                RirProjection::MapIndex(index) => {
+                    let RirType::Map { key, value } = self.program.types[ty.index()] else {
+                        return None;
+                    };
+                    let field = format!("__k{}", fields.len());
+                    fields.push(format!(
+                        "{field}: {}",
+                        RustRepPolicy::new(self.program).rust_ty(key)
+                    ));
+                    inits.push((field.clone(), self.captured_local_value(*index, key)));
+                    steps.push(MutPlaceProjectionStep::MapIndex {
+                        key: field,
+                        value_ty: value,
+                    });
+                    ty = self.option_ty(value)?;
+                }
+                RirProjection::Index(index) => {
+                    let local = self.function.locals[index.index()].symbol.as_str();
+                    let field = format!("__i{}", fields.len());
+                    fields.push(format!("{field}: i64"));
+                    inits.push((field.clone(), local.to_string()));
+                    match self.program.types[ty.index()] {
+                        RirType::Array { elem, len } => {
+                            steps.push(MutPlaceProjectionStep::ArrayIndex { index: field, len });
+                            ty = elem;
+                        }
+                        RirType::List(elem) => {
+                            let version = format!("__v{}", fields.len());
+                            let body = self.projection_version_body(&steps)?;
+                            fields.push(format!("{version}: u64"));
+                            inits.push((
+                                version.clone(),
+                                target::mut_place_access(root, &target::ctx_runtime("ctx"), &body),
+                            ));
+                            steps.push(MutPlaceProjectionStep::ListIndex {
+                                index: field,
+                                version,
+                            });
+                            ty = elem;
+                        }
+                        RirType::Slice(elem) => {
+                            steps.push(MutPlaceProjectionStep::SliceIndex { index: field });
+                            ty = elem;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+        (ty == slot_ty).then(|| MutPlaceProjection {
+            root: root.to_string(),
+            root_ty,
+            slot_ty,
+            fields,
+            inits,
+            steps,
+        })
+    }
+
+    fn projection_version_body(&self, steps: &[MutPlaceProjectionStep]) -> Option<String> {
+        Self::projection_version_body_from("value", steps)
+    }
+
+    fn projection_version_body_from(
+        expr: &str,
+        steps: &[MutPlaceProjectionStep],
+    ) -> Option<String> {
+        let Some((step, rest)) = steps.split_first() else {
+            return Some(format!("Ok({expr}.structural_version())"));
+        };
+        match step {
+            MutPlaceProjectionStep::Field(field) => {
+                Self::projection_version_body_from(&format!("{expr}.{field}"), rest)
+            }
+            MutPlaceProjectionStep::ArrayIndex { index, len } => {
+                let checked = target::checked_index_result(index, &len.to_string(), "array");
+                let body = Self::projection_version_body_from(&format!("{expr}[index]"), rest)?;
+                Some(format!("{{ let index = {checked}; {body} }}"))
+            }
+            MutPlaceProjectionStep::ListIndex { index, .. } => {
+                let checked = target::checked_index_result(index, &format!("{expr}.len()"), "list");
+                let body = Self::projection_version_body_from("value", rest)?;
+                Some(format!(
+                    "{{ let index = {checked}; let value = &{expr}.as_slice()[index]; {body} }}"
+                ))
+            }
+            MutPlaceProjectionStep::SliceIndex { .. } | MutPlaceProjectionStep::MapIndex { .. } => {
+                None
+            }
+        }
+    }
+
+    pub(super) fn map_slot_access(&self, place: &RirPlace) -> Option<MapSlotAccess> {
+        let (last, prefix) = place.projections.split_last()?;
+        let RirProjection::MapIndex(index) = last else {
+            return None;
+        };
+        let local = &self.function.locals[place.local.index()];
+        let root = local.symbol.as_str().to_string();
+        let mut rendered = RenderedPlace {
+            expr: if self.root_needs_deref(place) {
+                format!("(*{})", local.symbol.as_str())
+            } else {
+                root.clone()
+            },
+            ty: local.ty,
+        };
+        self.apply_projections(&mut rendered, prefix, true);
+        let RirType::Map { key, value } = self.program.types[rendered.ty.index()] else {
+            return None;
+        };
+        Some(MapSlotAccess {
+            map: rendered.expr,
+            key: self.function.locals[index.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+            key_value: self.captured_local_value(*index, key),
+            value_ty: value,
+        })
+    }
+
     pub(super) fn slice_index_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
         let (last, prefix) = place.projections.split_last()?;
         let RirProjection::Index(index) = last else {
@@ -103,24 +308,17 @@ impl<'a> RustPlaces<'a> {
             };
         }
         let rendered = self.local_place_with_ty(&base);
-        let root_is_mut_place = self.local_is_mut_place_param(place.local);
         let list_root = match self.program.types[rendered.ty.index()] {
             RirType::Slice(_) => false,
             RirType::List(_) => true,
             _ => return None,
         };
-        let root = self.function.locals[place.local.index()]
-            .symbol
-            .as_str()
-            .to_string();
         Some(SliceIndexAccess {
             slice: rendered.expr,
-            root,
             index: self.function.locals[index.index()]
                 .symbol
                 .as_str()
                 .to_string(),
-            root_is_mut_place,
             list_root,
         })
     }
@@ -130,11 +328,31 @@ impl<'a> RustPlaces<'a> {
             || self.param_abi_for_local(place.local) == Some(RirParamAbi::MutBorrow)
     }
 
-    fn local_is_mut_place_param(&self, local: super::rir::RirLocalId) -> bool {
+    fn captured_local_value(&self, local: RirLocalId, ty: RirTypeId) -> String {
+        let symbol = self.function.locals[local.index()].symbol.as_str();
+        let policy = RustRepPolicy::new(self.program);
+        if policy.cow_value(ty) {
+            format!("{symbol}.share()")
+        } else if policy.copyable(ty) {
+            symbol.to_string()
+        } else {
+            format!("{symbol}.clone()")
+        }
+    }
+
+    fn option_ty(&self, inner: RirTypeId) -> Option<RirTypeId> {
+        self.program
+            .types
+            .iter()
+            .position(|ty| matches!(ty, RirType::Option(found) if *found == inner))
+            .map(RirTypeId::from_index)
+    }
+
+    fn local_is_mut_place_param(&self, local: RirLocalId) -> bool {
         self.param_abi_for_local(local) == Some(RirParamAbi::MutPlace)
     }
 
-    fn param_abi_for_local(&self, local: super::rir::RirLocalId) -> Option<RirParamAbi> {
+    fn param_abi_for_local(&self, local: RirLocalId) -> Option<RirParamAbi> {
         self.function
             .params
             .iter()
@@ -167,6 +385,9 @@ impl<'a> RustPlaces<'a> {
                     rendered.expr.push('.');
                     rendered.expr.push_str(field.symbol.as_str());
                     rendered.ty = field.ty;
+                }
+                RirProjection::MapIndex(_) => {
+                    unreachable!("map slot projection has no Rust lvalue path")
                 }
                 RirProjection::Index(index) => {
                     let index = self.function.locals[index.index()].symbol.as_str();

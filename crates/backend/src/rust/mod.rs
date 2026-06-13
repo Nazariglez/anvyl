@@ -3,6 +3,7 @@ pub mod cargo_job;
 mod dataref_mut_place;
 mod dataref_place;
 pub mod emit;
+mod mut_place;
 mod place;
 pub mod profile;
 pub mod rep_policy;
@@ -31,10 +32,7 @@ use anvyx_frontend::{
 use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustPath, RustProviderSupport};
 
 use self::{
-    dataref_mut_place::{
-        DataRefMutPlaceSupport, classify as classify_dataref_mut_place,
-        projected_ty as air_projected_ty,
-    },
+    dataref_mut_place::projected_ty as air_projected_ty,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
@@ -47,7 +45,7 @@ use self::{
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceArg, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
+        RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
         RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
         RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
         RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
@@ -2900,9 +2898,17 @@ impl<'a> PlanCx<'a> {
     ) -> bool {
         match arg {
             RirCallArg::MutBorrow(place) => self.place_is_collection_slot(scope, place),
-            RirCallArg::MutPlace(RirMutPlaceArg::Local(place)) => {
-                self.place_is_collection_slot(scope, place)
-            }
+            RirCallArg::MutPlace(arg) => match &arg.root {
+                RirMutPlaceRoot::Local { local, ty } => self.place_is_collection_slot(
+                    scope,
+                    &RirPlace {
+                        local: *local,
+                        projections: arg.projections.clone(),
+                        ty: *ty,
+                    },
+                ),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -3102,92 +3108,9 @@ impl<'a> PlanCx<'a> {
                 RirCallArg::SharedStringConst(self.const_map[id]),
             )),
             CallArg::MutBorrow(place) if expected == RirParamSemantic::MutPlace => {
-                match self.dataref_mut_place_support(function, place) {
-                    DataRefMutPlaceSupport::Supported(supported) => {
-                        let mut stmts = vec![];
-                        let (_, object) =
-                            self.dataref_root_place(function, place, locals, &mut stmts);
-                        let arg = RirMutPlaceArg::DataRefProjection {
-                            object: RirOperand::Place(object),
-                            dataref: self.dataref_map[&supported.dataref],
-                            projections: supported
-                                .projections
-                                .iter()
-                                .map(Self::rir_projection)
-                                .collect(),
-                            ty: self.type_map[&supported.ty],
-                        };
-                        return Ok(PlannedCallArg {
-                            stmts,
-                            arg: RirCallArg::MutPlace(arg),
-                        });
-                    }
-                    DataRefMutPlaceSupport::UnsupportedDataRef => {
-                        return Err(Self::gap(
-                            RustTargetGapSite::Function(function),
-                            RustTargetGapKind::UnsupportedMutablePlaceDataRef,
-                        ));
-                    }
-                    DataRefMutPlaceSupport::Ordinary => {}
-                }
-                if !place.projection.is_empty() {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedMutablePlaceProjection,
-                    ));
-                }
-                let ty = self.type_map[&place.ty];
-                if let Some(cell) = self.place_capture_cell(function, place) {
-                    let cell_ref = self.capture_cell_ref(function, cell);
-                    let arg = match self.classify_capture_cell_storage(cell) {
-                        RirCellStorage::StackScoped => {
-                            RirMutPlaceArg::StackCell { cell: cell_ref, ty }
-                        }
-                        RirCellStorage::Heap => RirMutPlaceArg::HeapCell { cell: cell_ref, ty },
-                    };
-                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
-                }
-                if let Some(borrow) = self.place_scoped_borrow(function, place) {
-                    let arg = RirMutPlaceArg::ScopedPlaceCell {
-                        cell: self.scoped_place_cell_ref(function, borrow),
-                        ty,
-                    };
-                    return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
-                }
-                let Some(root) = place.root.local() else {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedMutablePlace,
-                    ));
-                };
-                let local = RirLocalId::from_index(root.index());
-                let arg = if self.place_is_source_mut_place_param(function, place) {
-                    RirMutPlaceArg::Param { local, ty }
-                } else {
-                    RirMutPlaceArg::Local(self.rir_root_place(local, place.ty))
-                };
-                Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)))
+                self.plan_source_mut_place_arg(function, place, locals)
             }
-            CallArg::MutBorrow(place) => {
-                if self.place_is_source_mut_place_param(function, place)
-                    || self.place_capture_cell(function, place).is_some()
-                    || self.place_scoped_borrow(function, place).is_some()
-                {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary,
-                    ));
-                }
-                if self.place_crosses_dataref(function, place) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedMutablePlaceDataRef,
-                    ));
-                }
-                Ok(PlannedCallArg::from_arg(RirCallArg::MutBorrow(
-                    self.plan_place_in_function(function, place),
-                )))
-            }
+            CallArg::MutBorrow(place) => self.plan_native_mut_borrow_arg(function, place),
         }
     }
 
@@ -3255,7 +3178,25 @@ impl<'a> PlanCx<'a> {
                 return PlannedOperand { stmts, operand };
             }
             if !crosses_dataref {
-                unreachable!("Rust backend profile rejects projected capture-cell places")
+                let root_ty = self.air.capture_cells[cell.index()].ty;
+                let mut stmts = vec![];
+                let root = self.rvalue_temp_place(
+                    RirRValue::CellGetCopy {
+                        cell: self.capture_cell_ref(function, cell),
+                        ty: self.type_map[&root_ty],
+                    },
+                    root_ty,
+                    locals,
+                    &mut stmts,
+                );
+                return PlannedOperand {
+                    stmts,
+                    operand: RirOperand::Place(RirPlace {
+                        local: root.local,
+                        projections: place.projection.iter().map(Self::rir_projection).collect(),
+                        ty: self.type_map[&place.ty],
+                    }),
+                };
             }
         }
         if let Some(borrow) = self.place_scoped_borrow(function, place) {
@@ -3273,12 +3214,29 @@ impl<'a> PlanCx<'a> {
                 return PlannedOperand { stmts, operand };
             }
             if !crosses_dataref {
-                unreachable!("Rust backend profile rejects projected scoped-borrow places")
+                let root_ty = self.air.scoped_borrows[borrow.index()].ty;
+                let mut stmts = vec![];
+                let root = self.rvalue_temp_place(
+                    RirRValue::ScopedPlaceCellGet {
+                        cell: self.scoped_place_cell_ref(function, borrow),
+                        ty: self.type_map[&root_ty],
+                    },
+                    root_ty,
+                    locals,
+                    &mut stmts,
+                );
+                return PlannedOperand {
+                    stmts,
+                    operand: RirOperand::Place(RirPlace {
+                        local: root.local,
+                        projections: place.projection.iter().map(Self::rir_projection).collect(),
+                        ty: self.type_map[&place.ty],
+                    }),
+                };
             }
         }
         if !crosses_dataref {
-            if self.place_is_source_mut_place_param(function, place) && place.projection.is_empty()
-            {
+            if self.place_is_source_mut_place_param(function, place) {
                 let mut stmts = vec![];
                 let operand = self.rvalue_temp(
                     RirRValue::Use(RirOperand::Place(
@@ -3374,9 +3332,7 @@ impl<'a> PlanCx<'a> {
             }
         }
         if !crosses_dataref {
-            let value = if self.place_is_source_mut_place_param(function, place)
-                && place.projection.is_empty()
-            {
+            let value = if self.place_is_source_mut_place_param(function, place) {
                 RirRValue::Use(
                     self.rvalue_short_region_operand(function, value, place.ty, locals, stmts),
                 )
@@ -3617,22 +3573,6 @@ impl<'a> PlanCx<'a> {
         (segment, current_ty, index)
     }
 
-    fn dataref_mut_place_support(
-        &self,
-        function: FunctionId,
-        place: &Place,
-    ) -> DataRefMutPlaceSupport {
-        let root_ty = match place.root {
-            air::PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
-            air::PlaceRoot::ScopedBorrow(borrow) => self.air.scoped_borrows[borrow.index()].ty,
-            air::PlaceRoot::Global(_) => return DataRefMutPlaceSupport::Ordinary,
-            air::PlaceRoot::Local(_) | air::PlaceRoot::LambdaCapture(_) => {
-                self.current_place_root(function, place).0
-            }
-        };
-        classify_dataref_mut_place(self.air, root_ty, place)
-    }
-
     fn place_crosses_dataref(&self, function: FunctionId, place: &Place) -> bool {
         let mut ty = match place.root {
             air::PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
@@ -3769,6 +3709,9 @@ impl<'a> PlanCx<'a> {
         match projection {
             Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
             Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
+            Projection::MapIndex(local) => {
+                RirProjection::MapIndex(RirLocalId::from_index(local.index()))
+            }
             Projection::TupleField(index) => {
                 RirProjection::TupleField(RirFieldId::from_index(*index as usize))
             }

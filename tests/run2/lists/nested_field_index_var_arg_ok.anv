@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: clean Rust aggregate fields with collection payloads are unsupported
+// @match: 8
+
+struct Bag { xs: [int] }
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn main() {
+    var bag = Bag { xs: [0, 7] };
+    bump(bag.xs[1]);
+    println(bag.xs[1]);
+}

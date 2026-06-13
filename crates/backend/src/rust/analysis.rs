@@ -1,8 +1,8 @@
 use super::rir::{
     RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionLoanScope,
     RirCollectionRootKind, RirExternKind, RirFunction, RirLambdaStorage, RirOperand, RirParamAbi,
-    RirPlace, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct, RirStructuredBlock,
-    RirType, RirTypeId,
+    RirPlace, RirProgram, RirProjection, RirRValue, RirStmt, RirStringifyReqKind, RirStruct,
+    RirStructuredBlock, RirType, RirTypeId,
 };
 
 pub(super) fn fallible_functions(program: &RirProgram) -> Vec<bool> {
@@ -105,7 +105,8 @@ fn rvalue_calls_fallible(
                 matches!(program.types[source.ty.index()], RirType::Slice(_))
             }
             RirRValue::Call { callee, args, .. } => {
-                args.iter().any(call_arg_erases_dataref)
+                args.iter()
+                    .any(|arg| call_arg_preparation_fallible(program, arg))
                     || match callee {
                         RirCallTarget::Function(id) => fallible[id.index()],
                         RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
@@ -219,43 +220,79 @@ fn place_has_indexed_collection_write(
     function: &RirFunction,
     place: &RirPlace,
 ) -> bool {
-    let Some(local) = function.locals.get(place.local.index()) else {
-        return false;
-    };
-    let mut ty = local.ty;
-    for projection in &place.projections {
-        match projection {
-            super::rir::RirProjection::Index(_) => match program.types[ty.index()] {
-                RirType::List(_) | RirType::Slice(_) => return true,
-                RirType::Array { elem, .. } => ty = elem,
-                _ => return false,
-            },
-            super::rir::RirProjection::Field(_) | super::rir::RirProjection::TupleField(_) => {
-                return false;
-            }
-        }
-    }
-    false
+    projection_facts(program, function, place).is_some_and(|facts| facts.indexed_collection_write)
 }
 
 fn place_has_slice_index(program: &RirProgram, function: &RirFunction, place: &RirPlace) -> bool {
-    let Some(local) = function.locals.get(place.local.index()) else {
-        return false;
+    projection_facts(program, function, place).is_some_and(|facts| facts.slice_index)
+}
+
+struct ProjectionFacts {
+    slice_index: bool,
+    indexed_collection_write: bool,
+}
+
+fn projection_facts(
+    program: &RirProgram,
+    function: &RirFunction,
+    place: &RirPlace,
+) -> Option<ProjectionFacts> {
+    let mut ty = function.locals.get(place.local.index())?.ty;
+    let mut facts = ProjectionFacts {
+        slice_index: false,
+        indexed_collection_write: false,
     };
-    let mut ty = local.ty;
     for projection in &place.projections {
         match projection {
-            super::rir::RirProjection::Index(_) => match program.types[ty.index()] {
-                RirType::Slice(_) => return true,
-                RirType::Array { elem, .. } | RirType::List(elem) => ty = elem,
-                _ => return false,
+            RirProjection::Field(field) => {
+                let RirType::Struct(id) = program.types.get(ty.index())? else {
+                    return None;
+                };
+                ty = program
+                    .structs
+                    .get(id.index())?
+                    .fields
+                    .get(field.index())?
+                    .ty;
+            }
+            RirProjection::TupleField(field) => {
+                let RirType::Tuple(id) = program.types.get(ty.index())? else {
+                    return None;
+                };
+                ty = program
+                    .tuples
+                    .get(id.index())?
+                    .fields
+                    .get(field.index())?
+                    .ty;
+            }
+            RirProjection::Index(_) => match program.types.get(ty.index())? {
+                RirType::Array { elem, .. } => ty = *elem,
+                RirType::List(elem) => {
+                    facts.indexed_collection_write = true;
+                    ty = *elem;
+                }
+                RirType::Slice(elem) => {
+                    facts.slice_index = true;
+                    facts.indexed_collection_write = true;
+                    ty = *elem;
+                }
+                _ => return None,
             },
-            super::rir::RirProjection::Field(_) | super::rir::RirProjection::TupleField(_) => {
-                return false;
+            RirProjection::MapIndex(_) => {
+                let RirType::Map { value, .. } = program.types.get(ty.index())? else {
+                    return None;
+                };
+                facts.indexed_collection_write = true;
+                ty = program
+                    .types
+                    .iter()
+                    .position(|ty| matches!(ty, RirType::Option(inner) if inner == value))
+                    .map(RirTypeId::from_index)?;
             }
         }
     }
-    false
+    Some(facts)
 }
 
 fn operand_ty(program: &RirProgram, operand: &RirOperand) -> Option<RirTypeId> {
@@ -374,11 +411,59 @@ fn stmt_child_blocks_any(
     }
 }
 
-fn call_arg_erases_dataref(arg: &RirCallArg) -> bool {
-    matches!(
-        arg,
-        RirCallArg::MutPlace(super::rir::RirMutPlaceArg::DataRefProjection { .. })
-    )
+fn call_arg_preparation_fallible(program: &RirProgram, arg: &RirCallArg) -> bool {
+    let RirCallArg::MutPlace(arg) = arg else {
+        return false;
+    };
+    let Some(mut ty) = arg.root.ty() else {
+        return true;
+    };
+    for projection in &arg.projections {
+        match (program.types.get(ty.index()), projection) {
+            (Some(RirType::List(_)), RirProjection::Index(_)) => return true,
+            (Some(RirType::Struct(id)), RirProjection::Field(field)) => {
+                let Some(next) = program
+                    .structs
+                    .get(id.index())
+                    .and_then(|strukt| strukt.fields.get(field.index()))
+                    .map(|field| field.ty)
+                else {
+                    return false;
+                };
+                ty = next;
+            }
+            (Some(RirType::Tuple(id)), RirProjection::TupleField(field)) => {
+                let Some(next) = program
+                    .tuples
+                    .get(id.index())
+                    .and_then(|tuple| tuple.fields.get(field.index()))
+                    .map(|field| field.ty)
+                else {
+                    return false;
+                };
+                ty = next;
+            }
+            (Some(RirType::Array { elem, .. } | RirType::Slice(elem)), RirProjection::Index(_)) => {
+                ty = *elem;
+            }
+            (Some(RirType::Map { value, .. }), RirProjection::MapIndex(_)) => {
+                let Some(next) = option_ty(program, *value) else {
+                    return false;
+                };
+                ty = next;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn option_ty(program: &RirProgram, inner: RirTypeId) -> Option<RirTypeId> {
+    program
+        .types
+        .iter()
+        .position(|ty| matches!(ty, RirType::Option(found) if *found == inner))
+        .map(RirTypeId::from_index)
 }
 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {

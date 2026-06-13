@@ -34,8 +34,59 @@ pub(super) fn mut_place_ty() -> String {
     rt_path("MutPlace")
 }
 
+pub(super) enum DataRefPlaceOp {
+    Access,
+    Mutate,
+}
+
+impl DataRefPlaceOp {
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Mutate => "mutate",
+        }
+    }
+
+    pub(super) fn payload_ref(&self, payload: &str) -> String {
+        match self {
+            Self::Access => format!("&{payload}"),
+            Self::Mutate => format!("&mut {payload}"),
+        }
+    }
+
+    pub(super) fn path_ref(&self) -> &'static str {
+        match self {
+            Self::Access => "&",
+            Self::Mutate => "&mut ",
+        }
+    }
+
+    pub(super) fn heap_access(
+        &self,
+        ctx: &str,
+        object: &str,
+        heap_type: &str,
+        storage: &str,
+        storage_ty: &str,
+        body: &str,
+    ) -> String {
+        match self {
+            Self::Access => {
+                ctx_heap_try_with_erased(ctx, object, heap_type, storage, storage_ty, body)
+            }
+            Self::Mutate => {
+                ctx_heap_try_with_erased_mut(ctx, object, heap_type, storage, storage_ty, body)
+            }
+        }
+    }
+}
+
 pub(super) fn dataref_place_ops_ty(payload: &str) -> String {
     format!("{}<'cx, {payload}>", rt_path("DataRefPlaceOps"))
+}
+
+pub(super) fn projection_ops_ty(root: &str, payload: &str) -> String {
+    format!("{}<'cx, {root}, {payload}>", rt_path("ProjectionOps"))
 }
 
 pub(super) fn erased_handle_ty() -> String {
@@ -236,12 +287,23 @@ pub(super) fn map_remove_region(key: &str) -> String {
     format!("value.remove(&{key})")
 }
 
+pub(super) fn map_optional_slot_set(map: &str, key: &str, slot: &str) -> String {
+    format!(
+        "match {slot} {{ Some(slot) => {{ {map}.insert({key}.clone(), slot)?; Ok(()) }} None => {{ {map}.remove(&{key})?; Ok(()) }} }}"
+    )
+}
+
 pub(super) fn collection_structural_version(collection: &str) -> String {
     format!("{collection}.structural_version()")
 }
 
-pub(super) fn list_elem_at_shared(list: &str, index: &str, version: &str) -> String {
-    format!("{list}.elem_at_shared({index}, {version})")
+pub(super) fn list_with_elem_shared_short(
+    list: &str,
+    index: &str,
+    version: &str,
+    body: &str,
+) -> String {
+    format!("{list}.with_elem_shared_short({index}, {version}, |value| {{ {body} }})")
 }
 
 pub(super) fn list_with_elem_mut_short(
@@ -368,16 +430,58 @@ pub(super) fn ctx_runtime(ctx: &str) -> String {
     format!("{ctx}.runtime()")
 }
 
+pub(super) fn mut_place_local(slot: &str) -> String {
+    format!("{}::local(&mut {slot})", mut_place_ty())
+}
+
+pub(super) fn mut_place_reborrow(place: &str) -> String {
+    format!("{place}.reborrow()")
+}
+
+pub(super) fn mut_place_stack_cell(cell: &str) -> String {
+    format!("{}::stack_cell(&{cell})", mut_place_ty())
+}
+
+pub(super) fn mut_place_heap_cell(cell: &str) -> String {
+    format!("{}::heap_cell({cell}.clone())", mut_place_ty())
+}
+
+pub(super) fn mut_place_scoped_cell(cell: &str) -> String {
+    format!("{}::scoped_cell({cell})", mut_place_ty())
+}
+
 pub(super) fn mut_place_dataref(object: &str, ops: &str) -> String {
     format!("{}::dataref({object}, {ops})", mut_place_ty())
+}
+
+pub(super) fn mut_place_projected(root: &str, ops: &str) -> String {
+    format!("{}::projected({root}, {ops})", mut_place_ty())
+}
+
+pub(super) fn dataref_place_heap_type_field() -> &'static str {
+    "heap_type"
+}
+
+pub(super) fn dataref_place_heap_type_access(receiver: &str) -> String {
+    format!("{receiver}.{}", dataref_place_heap_type_field())
 }
 
 pub(super) fn mut_place_set(place: &str, runtime: &str, value: &str) -> String {
     format!("{place}.set({runtime}, {value})?")
 }
 
-pub(super) fn mut_place_replace_collection(place: &str, runtime: &str, value: &str) -> String {
-    format!("{place}.mutate({runtime}, |slot| slot.replace_with({value}))?")
+pub(super) fn mut_place_replace_collection(
+    place: &str,
+    runtime: &str,
+    replacement: &str,
+) -> String {
+    mut_place_region(
+        place,
+        "mutate",
+        runtime,
+        "slot",
+        &format!("slot.replace_with({replacement})"),
+    )
 }
 
 pub(super) fn replace_collection(place: &str, value: &str) -> String {
@@ -385,15 +489,19 @@ pub(super) fn replace_collection(place: &str, value: &str) -> String {
 }
 
 pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String {
-    mut_place_region(place, "access", runtime, body)
+    mut_place_region(place, "access", runtime, "value", body)
+}
+
+pub(super) fn mut_place_mutate(place: &str, runtime: &str, body: &str) -> String {
+    mut_place_region(place, "mutate", runtime, "value", body)
 }
 
 pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {
     format!("{place}.get_copy({runtime})?")
 }
 
-pub(super) fn mut_place_region(place: &str, op: &str, runtime: &str, body: &str) -> String {
-    format!("{place}.{op}({runtime}, |value| {body})?")
+fn mut_place_region(place: &str, op: &str, runtime: &str, slot: &str, body: &str) -> String {
+    format!("{place}.{op}({runtime}, |{slot}| {body})?")
 }
 
 pub(super) fn heap_scope() -> String {
@@ -406,6 +514,13 @@ pub(super) fn runtime_ctx_new(heap: &str) -> String {
 
 pub(super) fn checked_index(index: &str, len: &str) -> String {
     format!("{}({index}, {len})", rt_path("checked_index"))
+}
+
+pub(super) fn checked_index_result(index: &str, len: &str, kind: &str) -> String {
+    format!(
+        "{}({index}, {len}, {kind:?})?",
+        rt_path("checked_index_result")
+    )
 }
 
 pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) -> String {
@@ -421,9 +536,12 @@ mod tests {
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
         checked_range, ctx_heap_alloc, ctx_heap_erase, ctx_heap_try_with_erased,
         ctx_heap_try_with_erased_mut, ctx_heap_with, ctx_heap_with_mut, ctx_runtime,
-        dataref_place_ops_ty, erased_handle_ty, heap_access_error, heap_register, heap_scope,
-        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
-        mut_place_get_copy, mut_place_set, mut_place_ty, result_ty, runtime_ctx_new,
+        dataref_place_heap_type_access, dataref_place_heap_type_field, dataref_place_ops_ty,
+        erased_handle_ty, heap_access_error, heap_register, heap_scope, lambda_cell_ctor,
+        map_heap_access_error, mut_place_access, mut_place_dataref, mut_place_get_copy,
+        mut_place_heap_cell, mut_place_local, mut_place_mutate, mut_place_projected,
+        mut_place_reborrow, mut_place_replace_collection, mut_place_scoped_cell, mut_place_set,
+        mut_place_stack_cell, mut_place_ty, projection_ops_ty, result_ty, runtime_ctx_new,
         runtime_ctx_ty_with, scoped_mut_place_cell_new, scoped_mut_place_cell_ty,
         stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
@@ -446,6 +564,10 @@ mod tests {
         assert_eq!(
             dataref_place_ops_ty("i64"),
             "anvyx_runtime::DataRefPlaceOps<'cx, i64>"
+        );
+        assert_eq!(
+            projection_ops_ty("Point", "i64"),
+            "anvyx_runtime::ProjectionOps<'cx, Point, i64>"
         );
         assert_eq!(erased_handle_ty(), "anvyx_runtime::ErasedHandle<'cx>");
         assert_eq!(
@@ -549,9 +671,32 @@ mod tests {
         );
         assert_eq!(ctx_runtime("ctx"), "ctx.runtime()");
         assert_eq!(
+            mut_place_local("slot"),
+            "anvyx_runtime::MutPlace::local(&mut slot)"
+        );
+        assert_eq!(mut_place_reborrow("place"), "place.reborrow()");
+        assert_eq!(
+            mut_place_stack_cell("cell"),
+            "anvyx_runtime::MutPlace::stack_cell(&cell)"
+        );
+        assert_eq!(
+            mut_place_heap_cell("cell"),
+            "anvyx_runtime::MutPlace::heap_cell(cell.clone())"
+        );
+        assert_eq!(
+            mut_place_scoped_cell("&cell"),
+            "anvyx_runtime::MutPlace::scoped_cell(&cell)"
+        );
+        assert_eq!(
             mut_place_dataref("object", "&ops"),
             "anvyx_runtime::MutPlace::dataref(object, &ops)"
         );
+        assert_eq!(
+            mut_place_projected("root", "&ops"),
+            "anvyx_runtime::MutPlace::projected(root, &ops)"
+        );
+        assert_eq!(dataref_place_heap_type_field(), "heap_type");
+        assert_eq!(dataref_place_heap_type_access("self"), "self.heap_type");
         assert_eq!(
             mut_place_set("place", "ctx.runtime()", "value"),
             "place.set(ctx.runtime(), value)?"
@@ -559,6 +704,14 @@ mod tests {
         assert_eq!(
             mut_place_access("place", "ctx.runtime()", "Ok(value.share())"),
             "place.access(ctx.runtime(), |value| Ok(value.share()))?"
+        );
+        assert_eq!(
+            mut_place_mutate("place", "ctx.runtime()", "value.replace_with(next)"),
+            "place.mutate(ctx.runtime(), |value| value.replace_with(next))?"
+        );
+        assert_eq!(
+            mut_place_replace_collection("place", "ctx.runtime()", "next"),
+            "place.mutate(ctx.runtime(), |slot| slot.replace_with(next))?"
         );
         assert_eq!(
             mut_place_get_copy("place", "ctx.runtime()"),

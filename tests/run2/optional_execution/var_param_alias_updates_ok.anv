@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: optional payload aliases over source var params need projected-place owner
+// @match: 2
+
+fn touch(var opt: int?) {
+    var value? = opt else return;
+    value = 2;
+}
+
+fn main() {
+    var opt: int? = 1;
+    touch(opt);
+    if let value? = opt {
+        println(value);
+    }
+}

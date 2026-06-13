@@ -1,0 +1,13 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @stderr-contains: array index 2 out of bounds for len 2
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn main() {
+    var xs: [int; 2] = [0, 1];
+    bump(xs[2]);
+}

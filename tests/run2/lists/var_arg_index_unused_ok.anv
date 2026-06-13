@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+fn ignore(var x: int) {}
+
+fn main() {
+    var xs = [1];
+    ignore(xs[0]);
+    println(xs[0]);
+}
