@@ -4,7 +4,10 @@ use anvyx_frontend::{
     air::{self, FunctionId},
     ast::{BinaryOp, ScalarKind, UnaryOp},
 };
-use anvyx_runtime::{ExternTypeExpr, ExternTypeKey, RustExternAbi, RustParamAbi, RustReturnAbi};
+use anvyx_runtime::{
+    CallbackEscape, ExternCallbackSignature, ExternTypeExpr, ExternTypeKey, RustExternAbi,
+    RustParamAbi, RustReturnAbi,
+};
 
 use super::rep_policy::RustRepPolicy;
 
@@ -381,6 +384,7 @@ pub enum RirParamSemantic {
     SharedBorrow,
     MutBorrow,
     MutPlace,
+    ScopedLambda,
     StackCell,
     HeapCell,
     ScopedPlaceCell,
@@ -392,6 +396,7 @@ pub enum RirParamAbi {
     SharedBorrow,
     MutBorrow,
     MutPlace,
+    ScopedLambda,
     StackCell,
     HeapCell,
     ScopedPlaceCell,
@@ -723,6 +728,10 @@ pub enum RirCallArg {
     SharedStringConst(RirConstId),
     MutBorrow(RirPlace),
     MutPlace(RirMutPlaceArg),
+    ScopedLambda {
+        callee: RirOperand,
+        sig: RirLambdaSigId,
+    },
 }
 
 impl RirCallArg {
@@ -732,6 +741,7 @@ impl RirCallArg {
             Self::SharedBorrow(_) | Self::SharedStringConst(_) => RirParamSemantic::SharedBorrow,
             Self::MutBorrow(_) => RirParamSemantic::MutBorrow,
             Self::MutPlace(_) => RirParamSemantic::MutPlace,
+            Self::ScopedLambda { .. } => RirParamSemantic::ScopedLambda,
         }
     }
 }
@@ -945,6 +955,7 @@ pub struct RirExternParam {
     pub ty: RirTypeId,
     pub semantic: RirParamSemantic,
     pub abi: RirParamAbi,
+    pub escape: RirParamEscape,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1128,7 +1139,7 @@ fn native_extern_signature_ok(
 ) -> bool {
     !native.path.is_empty()
         && native.path.iter().all(|segment| !segment.is_empty())
-        && native.abi.support == anvyx_runtime::RustAbiSupport::Direct
+        && rust_extern_abi_supported(&native.abi)
         && native.abi.params.len() == ext.params.len()
         && native
             .abi
@@ -1137,6 +1148,34 @@ fn native_extern_signature_ok(
             .zip(&ext.params)
             .all(|(abi, param)| native_param_abi_ok(program, abi, *param))
         && native_return_abi_ok(program, &native.abi.ret, ext.ret, void)
+}
+
+pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
+    match abi.support {
+        anvyx_runtime::RustAbiSupport::Direct => {
+            abi.ctx == anvyx_runtime::RustWrapperCtx::HiddenRuntime
+                && !abi
+                    .params
+                    .iter()
+                    .any(|param| matches!(param, RustParamAbi::ScopedLambda(_)))
+        }
+        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
+            abi.ctx == anvyx_runtime::RustWrapperCtx::None
+                && abi
+                    .params
+                    .iter()
+                    .any(|param| matches!(param, RustParamAbi::ScopedLambda(_)))
+                && !abi.params.iter().any(|param| {
+                    matches!(
+                        param,
+                        RustParamAbi::Borrow(_)
+                            | RustParamAbi::MutBorrow(_)
+                            | RustParamAbi::MutPlace(_)
+                    )
+                })
+        }
+        anvyx_runtime::RustAbiSupport::Unsupported => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1190,9 @@ pub(super) fn rust_param_abi(abi: &RustParamAbi) -> Option<NativeParamAbi> {
         RustParamAbi::Borrow(_) => (RirParamSemantic::SharedBorrow, RirParamAbi::SharedBorrow),
         RustParamAbi::MutBorrow(_) => (RirParamSemantic::MutBorrow, RirParamAbi::MutBorrow),
         RustParamAbi::MutPlace(_) => (RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
+        RustParamAbi::ScopedLambda(_) => {
+            (RirParamSemantic::ScopedLambda, RirParamAbi::ScopedLambda)
+        }
         RustParamAbi::Option(_) | RustParamAbi::List(_) => return None,
     };
     Some(NativeParamAbi { semantic, abi })
@@ -1162,13 +1204,46 @@ fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExter
     };
     param.semantic == native.semantic
         && param.abi == native.abi
+        && param.escape == native_param_escape(abi)
         && match abi {
             RustParamAbi::Value(ty)
             | RustParamAbi::Borrow(ty)
             | RustParamAbi::MutBorrow(ty)
             | RustParamAbi::MutPlace(ty) => rir_type_matches_extern(program, param.ty, ty),
+            RustParamAbi::ScopedLambda(callback) => {
+                rir_type_matches_callback(program, param.ty, callback)
+            }
             RustParamAbi::Option(_) | RustParamAbi::List(_) => false,
         }
+}
+
+fn native_param_escape(_abi: &RustParamAbi) -> RirParamEscape {
+    RirParamEscape::NonEscaping
+}
+
+fn rir_type_matches_callback(
+    program: &RirProgram,
+    ty: RirTypeId,
+    callback: &ExternCallbackSignature,
+) -> bool {
+    if !callback.scoped_lambda_supported() {
+        return false;
+    }
+    let Some(RirType::Lambda(sig)) = program.types.get(ty.index()) else {
+        return false;
+    };
+    let sig = &program.lambda_sigs[sig.index()];
+    sig.params.len() == callback.params.len()
+        && sig
+            .params
+            .iter()
+            .zip(&callback.params)
+            .all(|(param, callback)| {
+                param.escape == RirParamEscape::NonEscaping
+                    && callback.escape == CallbackEscape::NonEscaping
+                    && rir_type_matches_extern(program, param.ty, &callback.ty)
+            })
+        && rir_type_matches_extern(program, sig.ret, &callback.ret)
 }
 
 fn native_return_abi_ok(
@@ -1372,13 +1447,15 @@ impl VerifyCx<'_> {
                 if matches!(
                     (param.semantic, param.abi),
                     (
-                        RirParamSemantic::StackCell
+                        RirParamSemantic::ScopedLambda
+                            | RirParamSemantic::StackCell
                             | RirParamSemantic::HeapCell
                             | RirParamSemantic::ScopedPlaceCell,
                         _
                     ) | (
                         _,
-                        RirParamAbi::StackCell
+                        RirParamAbi::ScopedLambda
+                            | RirParamAbi::StackCell
                             | RirParamAbi::HeapCell
                             | RirParamAbi::ScopedPlaceCell,
                     )
@@ -1534,6 +1611,7 @@ impl VerifyCx<'_> {
                             (capture.semantic, capture.abi),
                             (
                                 RirParamSemantic::MutBorrow
+                                    | RirParamSemantic::ScopedLambda
                                     | RirParamSemantic::StackCell
                                     | RirParamSemantic::HeapCell
                                     | RirParamSemantic::ScopedPlaceCell,
@@ -1541,6 +1619,7 @@ impl VerifyCx<'_> {
                             ) | (
                                 _,
                                 RirParamAbi::MutBorrow
+                                    | RirParamAbi::ScopedLambda
                                     | RirParamAbi::StackCell
                                     | RirParamAbi::HeapCell
                                     | RirParamAbi::ScopedPlaceCell
@@ -2276,6 +2355,11 @@ impl VerifyCx<'_> {
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedAbi);
                 }
+            }
+            if matches!(param.semantic, RirParamSemantic::ScopedLambda)
+                || matches!(param.abi, RirParamAbi::ScopedLambda)
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
             if (matches!(param.semantic, RirParamSemantic::ScopedPlaceCell)
                 || matches!(param.abi, RirParamAbi::ScopedPlaceCell))
@@ -3763,7 +3847,10 @@ impl VerifyCx<'_> {
         arg: &RirCallArg,
     ) -> Option<RirLambdaEscape> {
         match arg {
-            RirCallArg::Value(operand) => self.operand_lambda_escape(function, operand),
+            RirCallArg::Value(operand)
+            | RirCallArg::ScopedLambda {
+                callee: operand, ..
+            } => self.operand_lambda_escape(function, operand),
             RirCallArg::SharedBorrow(_)
             | RirCallArg::MutBorrow(_)
             | RirCallArg::MutPlace(_)
@@ -3780,6 +3867,7 @@ impl VerifyCx<'_> {
         args: &[RirCallArg],
         ret: RirTypeId,
     ) {
+        let native_call = matches!(callee, RirCallTarget::Extern(_));
         let (expected, callee_ret) = match callee {
             RirCallTarget::Function(id) => {
                 self.check_function_id(RirVerifySite::RValue(function_id, stmt), id);
@@ -3801,14 +3889,7 @@ impl VerifyCx<'_> {
                     Some(ext) => (
                         ext.params
                             .iter()
-                            .map(|param| {
-                                (
-                                    param.ty,
-                                    param.semantic,
-                                    param.abi,
-                                    RirParamEscape::NonEscaping,
-                                )
-                            })
+                            .map(|param| (param.ty, param.semantic, param.abi, param.escape))
                             .collect::<Vec<_>>(),
                         ext.ret,
                     ),
@@ -3863,7 +3944,9 @@ impl VerifyCx<'_> {
         }
         for (index, (arg, (ty, mode, abi, escape))) in args.iter().zip(expected).enumerate() {
             let site = RirVerifySite::CallArg(function_id, stmt, index);
-            if arg.semantic() != mode {
+            if arg.semantic() != mode
+                || matches!(arg, RirCallArg::ScopedLambda { .. }) && !native_call
+            {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
             if RustRepPolicy::new(self.program).call_arg_abi(ty, arg.semantic()) != Some(abi) {
@@ -3900,6 +3983,30 @@ impl VerifyCx<'_> {
                 }
                 RirCallArg::MutPlace(arg) => {
                     Some(self.check_mut_place_arg(site, function_id, function, arg))
+                }
+                RirCallArg::ScopedLambda { callee, sig } => {
+                    self.check_lambda_sig_id(site, *sig);
+                    let found = self.value_operand_ty(site, function, callee);
+                    match found.and_then(|ty| match self.ty(ty) {
+                        Some(RirType::Lambda(found_sig)) => Some((ty, found_sig)),
+                        _ => None,
+                    }) {
+                        Some((ty, found_sig)) if found_sig == *sig => Some(ty),
+                        Some((ty, _)) => {
+                            match self.type_id(RirType::Lambda(*sig)) {
+                                Some(expected) => self.push(
+                                    site,
+                                    RirVerifyErrorKind::TypeMismatch {
+                                        expected,
+                                        found: ty,
+                                    },
+                                ),
+                                None => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                            }
+                            Some(ty)
+                        }
+                        None => found,
+                    }
                 }
                 RirCallArg::SharedStringConst(id) => {
                     self.check_const_id(site, *id);

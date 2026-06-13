@@ -50,6 +50,163 @@ fn profile_accepts_empty_air() {
 }
 
 #[test]
+fn profile_accepts_native_scoped_lambda_param() {
+    let program = native_scoped_lambda_air();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let config = host_lambda_plan_config();
+
+    RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
+        .expect("profile rejected scoped native lambda");
+}
+
+#[test]
+fn profile_rejects_escaping_native_scoped_lambda_param() {
+    let mut program = native_scoped_lambda_air();
+    program.externs[0].params[0].escape = ParamEscape::Escaping;
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let errors = RustBackendProfile::check_with_native_support(
+        &verified,
+        &host_lambda_plan_config().native_providers,
+    )
+    .expect_err("profile accepted escaping native lambda");
+
+    assert!(has_error(
+        &errors,
+        ProfileErrorKind::UnsupportedLambdaExternBoundary
+    ));
+}
+
+#[test]
+fn profile_rejects_direct_native_scoped_lambda_provider_abi() {
+    let mut support = host_lambda_support();
+    let binding = &mut support.modules[0].bindings[0];
+    binding.abi.support = anvyx_runtime::RustAbiSupport::Direct;
+    binding.abi.ctx = anvyx_runtime::RustWrapperCtx::HiddenRuntime;
+    let program = native_scoped_lambda_air();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let errors = RustBackendProfile::check_with_native_support(&verified, &[support])
+        .expect_err("profile accepted direct scoped native lambda ABI");
+
+    assert!(has_error(&errors, ProfileErrorKind::UnsupportedRustAbi));
+}
+
+#[test]
+fn native_scoped_lambda_provider_abi_rejects_visible_borrows() {
+    let callback = native_callback_sig();
+    let abi = anvyx_runtime::RustExternAbi {
+        params: vec![
+            anvyx_runtime::RustParamAbi::Borrow(anvyx_runtime::ExternTypeExpr::String),
+            anvyx_runtime::RustParamAbi::ScopedLambda(callback),
+        ],
+        ret: anvyx_runtime::RustReturnAbi::Void,
+        fallible: false,
+        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+        ctx: anvyx_runtime::RustWrapperCtx::None,
+    };
+
+    assert!(!rir::rust_extern_abi_supported(&abi));
+}
+
+#[test]
+fn plan_lowers_native_scoped_lambda_call_arg() {
+    let program = native_scoped_lambda_air();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
+    let call_args = plan
+        .program()
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.stmts)
+        .find_map(|stmt| match stmt {
+            RirStmt::Eval(RirRValue::Call { args, .. }) => Some(args.as_slice()),
+            _ => None,
+        })
+        .expect("missing native call");
+
+    assert!(matches!(call_args, [RirCallArg::ScopedLambda { .. }]));
+}
+
+#[test]
+fn plan_lowers_native_scoped_lambda_value_forms() {
+    for kind in [
+        NativeLambdaArgKind::ZeroCapture,
+        NativeLambdaArgKind::ReadonlyCapture,
+        NativeLambdaArgKind::EscapingReadonlyCapture,
+        NativeLambdaArgKind::CaptureCell,
+    ] {
+        let program = native_scoped_lambda_air_with(kind);
+        let verified = air::verify(&program).expect("AIR verify failed");
+        let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
+        let has_scoped_arg = plan
+            .program()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.stmts)
+            .any(|stmt| matches!(stmt, RirStmt::Eval(RirRValue::Call { args, .. }) if matches!(args.as_slice(), [RirCallArg::ScopedLambda { .. }])));
+
+        assert!(has_scoped_arg);
+    }
+}
+
+#[test]
+fn emit_native_scoped_lambda_uses_scoped_runtime_state() {
+    for kind in [
+        NativeLambdaArgKind::FunctionRef,
+        NativeLambdaArgKind::ZeroCapture,
+    ] {
+        let program = native_scoped_lambda_air_with(kind);
+        let verified = air::verify(&program).expect("AIR verify failed");
+        let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
+        let source = emit::emit(&plan.verified()).into_string();
+
+        assert!(source.contains("anvyx_runtime::ScopedLambda"));
+        assert!(source.contains("__anv_scoped_lambda_state_0"));
+        assert!(source.contains("__anv_scoped_call"));
+        assert!(!source.contains("Box<dyn Fn"));
+        assert!(!source.contains("Rc<dyn Fn"));
+        assert!(!source.contains("Vec<Value"));
+        assert!(!source.contains("thread_local!"));
+        assert!(!source.contains("LambdaEnv"));
+    }
+}
+
+#[test]
+fn native_scoped_lambda_invokes_provider_callback() {
+    for kind in [
+        NativeLambdaArgKind::FunctionRef,
+        NativeLambdaArgKind::ZeroCapture,
+        NativeLambdaArgKind::ReadonlyCapture,
+        NativeLambdaArgKind::EscapingReadonlyCapture,
+        NativeLambdaArgKind::CaptureCell,
+    ] {
+        let program = native_scoped_lambda_air_with(kind);
+        let verified = air::verify(&program).expect("AIR verify failed");
+        let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
+        let output = run_source(with_lambda_host(emit::emit(&plan.verified())));
+
+        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    }
+}
+
+#[test]
+fn profile_rejects_native_lambda_return() {
+    let mut program = native_scoped_lambda_air();
+    let lambda_ty = program.externs[0].params[0].ty;
+    program.externs[0].return_type = lambda_ty;
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let errors = RustBackendProfile::check_with_native_support(
+        &verified,
+        &host_lambda_plan_config().native_providers,
+    )
+    .expect_err("profile accepted native lambda return");
+
+    assert!(has_error(
+        &errors,
+        ProfileErrorKind::UnsupportedLambdaExternBoundary
+    ));
+}
+
+#[test]
 fn analysis_detects_nested_list_indexed_write() {
     let program = nested_index_write_program(RirType::List(RirTypeId::from_index(1)));
     assert!(super::analysis::fallible_functions(&program)[0]);
@@ -3317,12 +3474,14 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Void),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(1),
             semantic: RirParamSemantic::MutBorrow,
             abi: RirParamAbi::MutBorrow,
+            escape: RirParamEscape::NonEscaping,
         }],
         ret: RirTypeId::from_index(0),
     });
@@ -9395,12 +9554,14 @@ fn rir_verify_rejects_bad_extern_signature() {
                 ret: anvyx_runtime::RustReturnAbi::Void,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
             semantic: RirParamSemantic::Value,
             abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
         }],
         ret: RirTypeId::from_index(2),
     });
@@ -9424,17 +9585,203 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
                 ret: anvyx_runtime::RustReturnAbi::Void,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
             semantic: RirParamSemantic::Value,
             abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
         }],
         ret: RirTypeId::from_index(1),
     });
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_accepts_native_scoped_lambda_arg() {
+    let program = native_scoped_lambda_rir();
+
+    rir::verify(&program).expect("scoped native lambda RIR should verify");
+}
+
+#[test]
+fn rir_verify_rejects_scoped_lambda_arg_to_source_call() {
+    let mut program = native_scoped_lambda_rir();
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(2);
+    program.externs.clear();
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(1),
+        air_id: None,
+        symbol: RirSymbol::new("accept"),
+        params: vec![RirParam {
+            local: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: lambda_ty,
+            mutable: false,
+            symbol: RirSymbol::new("f"),
+            initialized: true,
+            payload_ref: false,
+        }],
+        body: RirStructuredBlock {
+            stmts: vec![],
+            term: RirTerm::Return(None),
+        },
+    });
+    let RirStmt::Eval(RirRValue::Call { callee, .. }) = &mut program.functions[0].body.stmts[0]
+    else {
+        unreachable!()
+    };
+    *callee = RirCallTarget::Function(RirFunctionId::from_index(1));
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_verify_rejects_native_scoped_lambda_signature_mismatch() {
+    let mut program = native_scoped_lambda_rir();
+    let sig = RirLambdaSigId::from_index(1);
+    program.types.push(RirType::Lambda(sig));
+    program.lambda_sigs.push(RirLambdaSig {
+        id: sig,
+        params: vec![],
+        ret: RirTypeId::from_index(0),
+    });
+    let RirStmt::Eval(RirRValue::Call { args, .. }) = &mut program.functions[0].body.stmts[0]
+    else {
+        unreachable!()
+    };
+    let RirCallArg::ScopedLambda { sig: arg_sig, .. } = &mut args[0] else {
+        unreachable!()
+    };
+    *arg_sig = sig;
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_native_scoped_lambda_above_max_arity() {
+    let mut program = native_scoped_lambda_rir();
+    let int = RirTypeId::from_index(1);
+    program.lambda_sigs[0].params = (0..=anvyx_runtime::SCOPED_LAMBDA_MAX_ARITY)
+        .map(|_| RirLambdaParam {
+            ty: int,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        })
+        .collect();
+    let mut callback = native_callback_sig();
+    callback.params = (0..=anvyx_runtime::SCOPED_LAMBDA_MAX_ARITY)
+        .map(|_| anvyx_runtime::ExternCallbackParam {
+            ty: anvyx_runtime::ExternTypeExpr::Int,
+            escape: anvyx_runtime::CallbackEscape::NonEscaping,
+        })
+        .collect();
+    let RirExternKind::Native(native) = &mut program.externs[0].kind;
+    native.abi.params[0] = anvyx_runtime::RustParamAbi::ScopedLambda(callback);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_native_scoped_lambda_non_lambda_operand() {
+    let mut program = native_scoped_lambda_rir();
+    let int = RirTypeId::from_index(1);
+    program.functions[0].locals[0].ty = int;
+    let RirStmt::Eval(RirRValue::Call { args, .. }) = &mut program.functions[0].body.stmts[0]
+    else {
+        unreachable!()
+    };
+    let RirCallArg::ScopedLambda { callee, .. } = &mut args[0] else {
+        unreachable!()
+    };
+    *callee = RirOperand::Place(rir_place(RirLocalId::from_index(0), int));
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_escaping_native_scoped_lambda_slot() {
+    let mut program = native_scoped_lambda_rir();
+    program.externs[0].params[0].escape = RirParamEscape::Escaping;
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
+}
+
+#[test]
+fn rir_verify_rejects_scoped_lambda_without_provider_abi() {
+    let mut program = native_scoped_lambda_rir();
+    program.externs[0].params[0].semantic = RirParamSemantic::Value;
+    program.externs[0].params[0].abi = RirParamAbi::Value;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_direct_scoped_lambda_provider_abi() {
+    let mut program = native_scoped_lambda_rir();
+    let RirExternKind::Native(native) = &mut program.externs[0].kind;
+    native.abi.support = anvyx_runtime::RustAbiSupport::Direct;
+    native.abi.ctx = anvyx_runtime::RustWrapperCtx::HiddenRuntime;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_scoped_lambda_source_param_abi() {
+    let mut program = native_scoped_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    program.functions[0].params.push(RirParam {
+        local: RirLocalId::from_index(0),
+        ty: lambda_ty,
+        semantic: RirParamSemantic::ScopedLambda,
+        abi: RirParamAbi::ScopedLambda,
+        escape: RirParamEscape::NonEscaping,
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+}
+
+#[test]
+fn rir_verify_rejects_scoped_lambda_signature_param_abi() {
+    let mut program = native_scoped_lambda_rir();
+    program.lambda_sigs[0].params[0].semantic = RirParamSemantic::ScopedLambda;
+    program.lambda_sigs[0].params[0].abi = RirParamAbi::ScopedLambda;
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedAbi);
+}
+
+#[test]
+fn rir_verify_rejects_scoped_lambda_capture_abi() {
+    let mut program = native_scoped_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    program.lambdas.push(RirLambda {
+        id: RirLambdaId::from_index(0),
+        source: RirLambdaSource::Lambda(air::LambdaId::from_index(0)),
+        function: RirFunctionId::from_index(0),
+        sig: RirLambdaSigId::from_index(0),
+        escape: RirLambdaEscape::NonEscaping,
+        storage: RirLambdaStorage::ScopedCaptures,
+        captures: vec![RirLambdaCapture {
+            ty: lambda_ty,
+            semantic: RirParamSemantic::ScopedLambda,
+            abi: RirParamAbi::ScopedLambda,
+            kind: RirLambdaCaptureKind::Param,
+        }],
+    });
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
 
 #[test]
@@ -9464,6 +9811,7 @@ fn rir_verify_rejects_native_extern_return_type_mismatch() {
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Bool),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![],
@@ -15187,6 +15535,7 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 )),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![],
@@ -15208,6 +15557,7 @@ fn native_string_return_program() -> RirProgram {
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }),
         params: vec![],
@@ -15235,6 +15585,318 @@ fn native_string_return_program() -> RirProgram {
         },
     });
     program
+}
+
+fn native_callback_sig() -> anvyx_runtime::ExternCallbackSignature {
+    anvyx_runtime::ExternCallbackSignature {
+        params: vec![anvyx_runtime::ExternCallbackParam {
+            ty: anvyx_runtime::ExternTypeExpr::Int,
+            escape: anvyx_runtime::CallbackEscape::NonEscaping,
+        }],
+        ret: Box::new(anvyx_runtime::ExternTypeExpr::Int),
+        policy: anvyx_runtime::CallbackPolicy {
+            escape: anvyx_runtime::CallbackEscape::NonEscaping,
+            thread: anvyx_runtime::CallbackThread::SameThread,
+        },
+    }
+}
+
+fn host_lambda_support() -> anvyx_runtime::RustProviderSupport {
+    let mut binding = function_binding(
+        "host_lambda",
+        "host",
+        &["host", "apply"],
+        "apply",
+        vec![anvyx_runtime::RustParamAbi::ScopedLambda(
+            native_callback_sig(),
+        )],
+        anvyx_runtime::RustReturnAbi::Void,
+        false,
+    );
+    binding.abi.support = anvyx_runtime::RustAbiSupport::NeedsWrapperConversion;
+    binding.abi.ctx = anvyx_runtime::RustWrapperCtx::None;
+    provider_support("host_lambda", vec![binding])
+}
+
+fn host_lambda_extern(
+    program: &mut Program,
+    lambda_ty: air::TypeId,
+    void: air::TypeId,
+) -> air::ExternId {
+    let id = extern_in_module(
+        program,
+        &["host_lambda"],
+        "apply",
+        vec![(lambda_ty, ParamMode::Value)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[id.index()].binding = Some(provider_binding("host_lambda", "apply"));
+    id
+}
+
+#[derive(Clone, Copy)]
+enum NativeLambdaArgKind {
+    FunctionRef,
+    ZeroCapture,
+    ReadonlyCapture,
+    EscapingReadonlyCapture,
+    CaptureCell,
+}
+
+fn native_scoped_lambda_air() -> Program {
+    native_scoped_lambda_air_with(NativeLambdaArgKind::FunctionRef)
+}
+
+fn native_scoped_lambda_air_with(kind: NativeLambdaArgKind) -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let sig = air::SignatureType::new(
+        vec![air::ParamType {
+            ty: int,
+            mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
+        }],
+        air::ReturnMode::Value(int),
+    );
+    let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
+    let module = program.alloc_module(root_module());
+    let arg = air::LocalId::from_index(0);
+    let callback = program.alloc_function(Function {
+        name: Ident::new("callback"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::Value, arg)], int),
+        locals: vec![local(int, LocalKind::Arg)],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(place(arg, int)))),
+        ),
+    });
+    let lambda_body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::Value, arg)], int),
+        locals: vec![local(int, LocalKind::Arg)],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(place(arg, int)))),
+        ),
+    });
+    let ext = host_lambda_extern(&mut program, lambda_ty, void);
+    let has_source_local = !matches!(
+        kind,
+        NativeLambdaArgKind::ZeroCapture | NativeLambdaArgKind::FunctionRef
+    );
+    let lambda_local = air::LocalId::from_index(usize::from(has_source_local));
+    let captured = air::LocalId::from_index(0);
+    let binding = BindingId::from_index(0);
+    let owner = FunctionId::from_index(2);
+    let cell = if matches!(kind, NativeLambdaArgKind::CaptureCell) {
+        Some(capture_cell(&mut program, owner, captured, binding, int))
+    } else {
+        None
+    };
+    let lambda = if matches!(kind, NativeLambdaArgKind::FunctionRef) {
+        None
+    } else {
+        let escape = match kind {
+            NativeLambdaArgKind::EscapingReadonlyCapture => LambdaEscape::Escaping,
+            _ => LambdaEscape::NonEscaping,
+        };
+        let captures = match kind {
+            NativeLambdaArgKind::ReadonlyCapture | NativeLambdaArgKind::EscapingReadonlyCapture => {
+                vec![air::LambdaCaptureDecl::ReadonlyLocal {
+                    binding,
+                    source: CaptureLocalSource {
+                        owner,
+                        local: captured,
+                    },
+                    ty: int,
+                }]
+            }
+            NativeLambdaArgKind::CaptureCell => vec![air::LambdaCaptureDecl::CaptureCell {
+                binding,
+                cell: cell.expect("capture cell missing"),
+                ty: int,
+            }],
+            NativeLambdaArgKind::ZeroCapture | NativeLambdaArgKind::FunctionRef => vec![],
+        };
+        Some(program.alloc_lambda(LambdaDecl {
+            source: ExprId(0),
+            module,
+            owner,
+            body: lambda_body,
+            signature: sig,
+            escape,
+            captures,
+        }))
+    };
+    program.function_mut(lambda_body).kind = lambda
+        .map(FunctionKind::Lambda)
+        .unwrap_or(FunctionKind::Normal);
+
+    let mut locals = vec![
+        Local {
+            name: None,
+            binding: Some(binding),
+            ty: int,
+            mutability: if matches!(kind, NativeLambdaArgKind::CaptureCell) {
+                Mutability::Mutable
+            } else {
+                Mutability::Immutable
+            },
+            kind: LocalKind::User,
+        },
+        local(lambda_ty, LocalKind::Temp),
+    ];
+    if !has_source_local {
+        locals.remove(0);
+    }
+    let mut stmts = vec![];
+    if has_source_local && !matches!(kind, NativeLambdaArgKind::CaptureCell) {
+        stmts.push(Statement::Init {
+            local: captured,
+            value: RValue::Use(Operand::Const(int_const(&mut program, int, 1))),
+        });
+    }
+    if let Some(cell) = cell {
+        stmts.push(init_cell(&mut program, cell, int));
+    }
+    let lambda_value = match kind {
+        NativeLambdaArgKind::FunctionRef => RValue::FunctionRef {
+            function: callback,
+            ty: lambda_ty,
+        },
+        NativeLambdaArgKind::ZeroCapture => RValue::MakeLambda {
+            lambda: lambda.expect("lambda missing"),
+            captures: vec![],
+            ty: lambda_ty,
+        },
+        NativeLambdaArgKind::ReadonlyCapture | NativeLambdaArgKind::EscapingReadonlyCapture => {
+            RValue::MakeLambda {
+                lambda: lambda.expect("lambda missing"),
+                captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
+                    value: Operand::Place(place(captured, int)),
+                }],
+                ty: lambda_ty,
+            }
+        }
+        NativeLambdaArgKind::CaptureCell => RValue::MakeLambda {
+            lambda: lambda.expect("lambda missing"),
+            captures: vec![air::LambdaCaptureArg::CaptureCell {
+                cell: cell.expect("capture cell missing"),
+            }],
+            ty: lambda_ty,
+        },
+    };
+    stmts.extend([
+        Statement::Init {
+            local: lambda_local,
+            value: lambda_value,
+        },
+        Statement::Eval(RValue::Call {
+            callee: Callee::Extern(ext),
+            args: vec![CallArg::Value(Operand::Place(place(
+                lambda_local,
+                lambda_ty,
+            )))],
+        }),
+    ]);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals,
+        body: structured_body(stmts, air::AirTail::Return(None)),
+    });
+    program
+        .module_mut(module)
+        .functions
+        .extend([callback, lambda_body, main]);
+    program.set_entry(main);
+    program
+}
+
+fn native_scoped_lambda_rir() -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let lambda_ty = RirTypeId::from_index(2);
+    let sig = RirLambdaSigId::from_index(0);
+    let local = RirLocalId::from_index(0);
+    RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![RirLambdaParam {
+                ty: int,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: int,
+        }],
+        externs: vec![RirExtern {
+            id: RirExternId::from_index(0),
+            symbol: RirSymbol::new("apply"),
+            kind: RirExternKind::Native(rir::RirNativeExtern {
+                path: vec!["host".to_string(), "apply".to_string()],
+                abi: anvyx_runtime::RustExternAbi {
+                    params: vec![anvyx_runtime::RustParamAbi::ScopedLambda(
+                        native_callback_sig(),
+                    )],
+                    ret: anvyx_runtime::RustReturnAbi::Void,
+                    fallible: false,
+                    support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+                    ctx: anvyx_runtime::RustWrapperCtx::None,
+                },
+            }),
+            params: vec![RirExternParam {
+                ty: lambda_ty,
+                semantic: RirParamSemantic::ScopedLambda,
+                abi: RirParamAbi::ScopedLambda,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: void,
+        }],
+        functions: vec![RirFunction {
+            id: RirFunctionId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("main"),
+            params: vec![],
+            ret: RirReturn { ty: void },
+            locals: vec![RirLocal {
+                id: local,
+                ty: lambda_ty,
+                mutable: false,
+                symbol: RirSymbol::new("f"),
+                initialized: true,
+                payload_ref: false,
+            }],
+            body: RirStructuredBlock {
+                stmts: vec![RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Extern(RirExternId::from_index(0)),
+                    args: vec![RirCallArg::ScopedLambda {
+                        callee: RirOperand::Place(rir_place(local, lambda_ty)),
+                        sig,
+                    }],
+                    ty: void,
+                })],
+                term: RirTerm::Return(None),
+            },
+        }],
+        entry: Some(RirFunctionId::from_index(0)),
+        ..RirProgram::default()
+    }
 }
 
 fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId {
@@ -16160,6 +16822,13 @@ fn rust_plan_config() -> RustPlanConfig {
     }
 }
 
+fn host_lambda_plan_config() -> RustPlanConfig {
+    RustPlanConfig {
+        symbol_prefix: "anv".into(),
+        native_providers: vec![host_lambda_support()],
+    }
+}
+
 fn workspace_crate_path(name: &str) -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -16172,6 +16841,13 @@ fn workspace_crate_path(name: &str) -> String {
 fn with_fallible_host(source: emit::RustSource) -> emit::RustSource {
     emit::RustSource::new(format!(
         "mod host {{ pub fn fallible<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>, value: i64) -> Result<i64, anvyx_runtime::RuntimeError> {{ Ok(value) }} }}\n{}",
+        source.into_string()
+    ))
+}
+
+fn with_lambda_host(source: emit::RustSource) -> emit::RustSource {
+    emit::RustSource::new(format!(
+        "mod host {{ pub mod host {{ pub fn apply(f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), i64>) {{ assert_eq!(f.call(41).unwrap(), 41); }} }} }}\n{}",
         source.into_string()
     ))
 }
@@ -16414,6 +17090,7 @@ fn function_binding(
             ret,
             fallible,
             support: anvyx_runtime::RustAbiSupport::Direct,
+            ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
         },
     }
 }

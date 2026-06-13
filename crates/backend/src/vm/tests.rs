@@ -658,35 +658,23 @@ fn compiler_rejects_lambda_body_capture_cell_access() {
 }
 
 #[test]
-fn compiler_rejects_lambda_extern_boundaries() {
-    let mut program = Program::default();
-    let void = program.alloc_type(TypeData::Void);
-    let function_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
-        vec![],
-        air::ReturnMode::Value(void),
-    )));
-    let module = program.alloc_module(root_module());
-    let ext = program.alloc_extern(ExternDecl {
-        name: Ident::new("retain"),
-        module,
-        member: ExternMember::FreeFunction,
-        params: vec![ExternParamDecl {
-            ty: function_ty,
-            mode: ParamMode::Value,
-            escape: ParamEscape::NonEscaping,
-        }],
-        return_type: void,
-        binding: None,
-        effects: anvyx_runtime::ExternEffects::default(),
-    });
-    program.module_mut(module).externs.push(ext);
-
-    let errors = compile_errors(&program);
-    assert!(has_extern_compile_error(
-        &errors,
-        ext,
-        VmCompileErrorKind::UnsupportedLambdaExternBoundary
-    ));
+fn vm_rejects_native_lambda_extern_boundaries() {
+    for (name, params, returns_lambda) in [
+        ("non_escaping", vec![ParamEscape::NonEscaping], false),
+        ("escaping", vec![ParamEscape::Escaping], false),
+        ("returns_lambda", vec![], true),
+    ] {
+        let (program, ext) = lambda_extern_boundary_program(name, params, returns_lambda);
+        let errors = compile_errors(&program);
+        assert!(
+            has_extern_compile_error(
+                &errors,
+                ext,
+                VmCompileErrorKind::UnsupportedLambdaExternBoundary
+            ),
+            "missing VM native lambda boundary gap for {name}"
+        );
+    }
 }
 
 #[test]
@@ -860,6 +848,39 @@ fn mutable_upvalue_lambda_program(shared: bool) -> Program {
         .functions
         .extend([lambda_body, owner_fn]);
     program
+}
+
+fn lambda_extern_boundary_program(
+    name: &str,
+    escapes: Vec<ParamEscape>,
+    returns_lambda: bool,
+) -> (Program, air::ExternId) {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let function_ty = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let module = program.alloc_module(root_module());
+    let params = escapes
+        .into_iter()
+        .map(|escape| ExternParamDecl {
+            ty: function_ty,
+            mode: ParamMode::Value,
+            escape,
+        })
+        .collect();
+    let ext = program.alloc_extern(ExternDecl {
+        name: Ident::new(name),
+        module,
+        member: ExternMember::FreeFunction,
+        params,
+        return_type: if returns_lambda { function_ty } else { void },
+        binding: None,
+        effects: anvyx_runtime::ExternEffects::default(),
+    });
+    program.module_mut(module).externs.push(ext);
+    (program, ext)
 }
 
 fn compile_errors(program: &Program) -> Vec<VmCompileError> {

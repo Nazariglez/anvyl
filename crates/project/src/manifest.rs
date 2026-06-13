@@ -1061,6 +1061,7 @@ mod tests {
                 ret: anvyx_runtime::RustReturnAbi::Void,
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
+                ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
         }
     }

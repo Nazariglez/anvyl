@@ -1,5 +1,5 @@
 use anvyx_frontend::air;
-use anvyx_runtime::{RustAbiSupport, RustExternBinding, RustProviderSupport, RustTypeBinding};
+use anvyx_runtime::{RustExternBinding, RustProviderSupport, RustTypeBinding};
 
 use super::rir::{self, NativeParamAbi};
 
@@ -24,7 +24,7 @@ pub(super) fn resolve_extern<'a>(
         .ok_or(ResolveExternError::UnsupportedExtern)?;
     let binding =
         extern_binding(providers, binding).ok_or(ResolveExternError::UnsupportedExtern)?;
-    if binding.abi.support != RustAbiSupport::Direct
+    if !rir::rust_extern_abi_supported(&binding.abi)
         || binding.abi.params.len() != decl.call_params().count()
     {
         return Err(ResolveExternError::UnsupportedRustAbi);

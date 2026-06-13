@@ -1106,6 +1106,7 @@ impl ProfileCx<'_> {
                     }
                     rir::RirParamSemantic::Value
                     | rir::RirParamSemantic::SharedBorrow
+                    | rir::RirParamSemantic::ScopedLambda
                     | rir::RirParamSemantic::StackCell
                     | rir::RirParamSemantic::HeapCell
                     | rir::RirParamSemantic::ScopedPlaceCell => {
@@ -1406,22 +1407,42 @@ impl ProfileCx<'_> {
 
     fn check_extern(&mut self, id: ExternId, decl: &ExternDecl) {
         let site = ProfileSite::Extern(id);
-        match native::resolve_extern(self.native_providers, decl) {
-            Ok(_) => {}
+        let native = match native::resolve_extern(self.native_providers, decl) {
+            Ok(native) => Some(native),
             Err(native::ResolveExternError::UnsupportedExtern) => {
                 self.push(site, ProfileErrorKind::UnsupportedExtern);
+                None
             }
             Err(native::ResolveExternError::UnsupportedRustAbi) => {
                 self.push(site, ProfileErrorKind::UnsupportedRustAbi);
+                None
             }
-        }
-        if decl
-            .call_params()
-            .any(|param| self.type_contains_function(param.ty))
-            || self.type_contains_function(decl.return_type)
-        {
+        };
+        if self.unsupported_lambda_extern_boundary(decl, native.as_ref()) {
             self.push(site, ProfileErrorKind::UnsupportedLambdaExternBoundary);
         }
+    }
+
+    fn unsupported_lambda_extern_boundary(
+        &self,
+        decl: &ExternDecl,
+        native: Option<&native::ResolvedExtern<'_>>,
+    ) -> bool {
+        self.type_contains_function(decl.return_type)
+            || decl.call_params().enumerate().any(|(index, param)| {
+                self.type_contains_function(param.ty)
+                    && !(self.type_is_function(param.ty)
+                        && native.is_some_and(|native| {
+                            param.escape == air::ParamEscape::NonEscaping
+                                && native.params.get(index).is_some_and(|native_param| {
+                                    native_param.semantic == rir::RirParamSemantic::ScopedLambda
+                                })
+                        }))
+            })
+    }
+
+    fn type_is_function(&self, ty: TypeId) -> bool {
+        matches!(self.program.type_arena.data(ty), TypeData::Function(_))
     }
 
     fn type_contains_slice(&self, ty: TypeId) -> bool {

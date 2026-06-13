@@ -46,6 +46,9 @@ impl<'a> RustValues<'a> {
             },
             RirCallArg::MutBorrow(place) => self.mut_borrow_arg(place),
             RirCallArg::MutPlace(arg) => self.mut_place_arg(arg),
+            RirCallArg::ScopedLambda { .. } => {
+                unreachable!("scoped lambda arguments must be prepared before rendering")
+            }
         }
     }
 
@@ -514,6 +517,7 @@ impl<'a> RustValues<'a> {
             }
             RirParamSemantic::MutBorrow
             | RirParamSemantic::MutPlace
+            | RirParamSemantic::ScopedLambda
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),

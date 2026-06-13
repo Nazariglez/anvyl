@@ -1119,6 +1119,7 @@ impl<'a> PlanCx<'a> {
                 ty: self.type_map[&param.ty],
                 semantic: abi.semantic,
                 abi: abi.abi,
+                escape: rir_param_escape(param.escape),
             })
             .collect()
     }
@@ -3020,6 +3021,23 @@ impl<'a> PlanCx<'a> {
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
+            CallArg::Value(operand) if expected == RirParamSemantic::ScopedLambda => {
+                let air_ty = self.operand_ty(operand);
+                let TypeData::Function(_) = self.air.type_arena.data(air_ty) else {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedLambdaExternBoundary,
+                    ));
+                };
+                let planned = self.plan_operand_read(function, operand, locals);
+                Ok(PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::ScopedLambda {
+                        callee: planned.operand,
+                        sig: self.lambda_sig_map[&air_ty],
+                    },
+                })
+            }
             CallArg::Value(operand) => {
                 if let Operand::Place(place) = operand
                     && !self.air_place_value_readable(place.ty)

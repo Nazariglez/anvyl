@@ -30,6 +30,26 @@ pub(super) fn lambda_cell_ty(payload: &str) -> String {
     format!("{}<{payload}>", rt_path("LambdaCell"))
 }
 
+pub(super) fn scoped_lambda_ty(args: &str, ret: &str) -> String {
+    format!("{}<'_, 'cx, {args}, {ret}>", rt_path("ScopedLambda"))
+}
+
+pub(super) fn scoped_lambda_ctor(args: &str, ret: &str) -> String {
+    format!("{}::<'_, 'cx, {args}, {ret}>", rt_path("ScopedLambda"))
+}
+
+pub(super) fn scoped_lambda_thunk() -> &'static str {
+    "__anv_scoped_call"
+}
+
+pub(super) fn non_null_unit_ty() -> &'static str {
+    "std::ptr::NonNull<()>"
+}
+
+pub(super) fn non_null_from_mut(value: &str) -> String {
+    format!("std::ptr::NonNull::from({value})")
+}
+
 pub(super) fn mut_place_ty() -> String {
     rt_path("MutPlace")
 }

@@ -207,7 +207,10 @@ fn call_arg_has_slice_index(
     arg: &RirCallArg,
 ) -> bool {
     match arg {
-        RirCallArg::Value(operand) => operand_has_slice_index(program, function, operand),
+        RirCallArg::Value(operand)
+        | RirCallArg::ScopedLambda {
+            callee: operand, ..
+        } => operand_has_slice_index(program, function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_has_slice_index(program, function, place)
         }
@@ -468,7 +471,10 @@ fn option_ty(program: &RirProgram, inner: RirTypeId) -> Option<RirTypeId> {
 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {
     match arg {
-        RirCallArg::Value(operand) => operand_uses_mut_place_param(function, operand),
+        RirCallArg::Value(operand)
+        | RirCallArg::ScopedLambda {
+            callee: operand, ..
+        } => operand_uses_mut_place_param(function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_is_mut_place_param(function, place)
         }

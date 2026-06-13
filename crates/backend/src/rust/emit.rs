@@ -8,11 +8,11 @@ use super::{
         RirCollectionRootKind, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign,
         RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture,
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaStorage, RirLocalId, RirLoop,
-        RirLoopId, RirMutPlaceRoot, RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic,
-        RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef,
-        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
+        RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirOperand, RirOptionMatch, RirParamAbi,
+        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
+        RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -630,15 +630,7 @@ impl EmitCx<'_> {
         let arity = sig.params.len();
         let program = self.program;
         let fallible_functions = &self.fallible_functions;
-        let lifetime = match (
-            policy.lambda_sig_needs_lifetime(sig.id),
-            policy.lambda_sig_needs_ctx_lifetime(sig.id),
-        ) {
-            (true, true) => "<'env, 'cx>",
-            (true, false) => "<'env>",
-            (false, true) => "<'cx>",
-            (false, false) => "",
-        };
+        let lifetime = policy.lambda_sig_impl_generics(sig.id);
 
         let trace = self.trace_plan.needs_lambda_sig_trace(sig.id);
         if trace {
@@ -768,7 +760,74 @@ impl EmitCx<'_> {
                 });
                 w.line("}");
             });
+        if self.lambda_sig_used_as_scoped_arg(sig.id) {
+            self.emit_scoped_lambda_thunk(sig, fallible);
+        }
         self.w.blank();
+    }
+
+    fn lambda_sig_used_as_scoped_arg(&self, sig: RirLambdaSigId) -> bool {
+        self.program
+            .functions
+            .iter()
+            .any(|function| block_uses_scoped_lambda_sig(&function.body, sig))
+    }
+
+    fn emit_scoped_lambda_thunk(&mut self, sig: &RirLambdaSig, fallible: bool) {
+        let policy = RustRepPolicy::new(self.program);
+        let symbol = policy.lambda_sig_symbol(sig.id);
+        let lifetime = policy.lambda_sig_impl_generics(sig.id);
+        let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig.id);
+        let result_ty = target::result_ty(&ret_ty);
+        let args = (0..sig.params.len())
+            .map(|index| format!("arg_{index}"))
+            .collect::<Vec<_>>();
+        let destructure = match args.as_slice() {
+            [] => "let () = args;".to_string(),
+            [arg] => format!("let ({arg},) = args;"),
+            _ => format!("let ({}) = args;", comma(args.clone())),
+        };
+        let needs_ctx_lifetime = policy.lambda_sig_needs_ctx_lifetime(sig.id);
+        let ctx_lifetime = if needs_ctx_lifetime {
+            "'cx"
+        } else {
+            "'scoped_cx"
+        };
+        let ctx_ty = format!("{}<{ctx_lifetime}, '_>", self.program.ctx.symbol.as_str());
+        let thunk_generics = if needs_ctx_lifetime {
+            ""
+        } else {
+            "<'scoped_cx>"
+        };
+        let thunk = target::scoped_lambda_thunk();
+        let state_ty = target::non_null_unit_ty();
+        self.w
+            .block(format_args!("impl{lifetime} {symbol}{lifetime}"), |w| {
+                w.block(
+                    format_args!(
+                        "unsafe fn {thunk}{thunk_generics}(state: {state_ty}, args: {args_ty}) -> {result_ty}"
+                    ),
+                    |w| {
+                        w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<(Self, {state_ty})>() }};"));
+                        w.line(format_args!(
+                            "let ctx = unsafe {{ state.1.cast::<{ctx_ty}>().as_mut() }};"
+                        ));
+                        w.line(destructure);
+                        let call_args = std::iter::once("ctx".to_string())
+                            .chain(args)
+                            .collect::<Vec<_>>();
+                        let call = format!("state.0.call({})", comma(call_args));
+                        if fallible {
+                            w.line(call);
+                        } else if ret_ty == "()" {
+                            w.line(format_args!("{call};"));
+                            w.line("Ok(())");
+                        } else {
+                            w.line(format_args!("Ok({call})"));
+                        }
+                    },
+                );
+            });
     }
 
     fn lambda_sig_fallible(&self, sig: &RirLambdaSig) -> bool {
@@ -873,7 +932,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn lambda_sig_needs_mut_self(&self, sig: super::rir::RirLambdaSigId) -> bool {
+    fn lambda_sig_needs_mut_self(&self, sig: RirLambdaSigId) -> bool {
         self.program.lambdas_for_sig(sig).any(|lambda| {
             lambda
                 .captures
@@ -1944,6 +2003,9 @@ impl EmitCx<'_> {
         arg: &RirCallArg,
     ) -> (Vec<String>, String) {
         let values = RustValues::new(self.program, function);
+        if let RirCallArg::ScopedLambda { callee, sig } = arg {
+            return self.prepared_scoped_lambda_call_arg(function, index, callee, *sig);
+        }
         let RirCallArg::MutPlace(mut_place) = arg else {
             return (vec![], values.call_arg(arg));
         };
@@ -1976,6 +2038,33 @@ impl EmitCx<'_> {
                 ),
             ],
             target::mut_place_dataref(&object_tmp, &format!("&{ops_tmp}")),
+        )
+    }
+
+    fn prepared_scoped_lambda_call_arg(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        callee: &RirOperand,
+        sig: RirLambdaSigId,
+    ) -> (Vec<String>, String) {
+        let values = RustValues::new(self.program, function);
+        let policy = RustRepPolicy::new(self.program);
+        let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig);
+        let state = format!("__anv_scoped_lambda_state_{index}");
+        let lambda = values.value_operand(callee);
+        let ctx_ptr = target::non_null_from_mut("&mut *ctx");
+        let ctor = target::scoped_lambda_ctor(&args_ty, &ret_ty);
+        let thunk = format!(
+            "{}::{}",
+            policy.lambda_sig_assoc_path(sig),
+            target::scoped_lambda_thunk()
+        );
+        (
+            vec![format!(
+                "let mut {state} = ({lambda}, {ctx_ptr}.cast::<()>());"
+            )],
+            format!("unsafe {{ {ctor}::__anvyx_from_raw(&mut {state}, {thunk}) }}"),
         )
     }
 
@@ -2241,12 +2330,20 @@ impl EmitCx<'_> {
         let ext = &self.program.externs[id.index()];
         let values = RustValues::new(self.program, function);
         let (symbol, rendered, fallible, ret_abi) = match &ext.kind {
-            RirExternKind::Native(native) => (
-                native.path.join("::"),
-                vec![target::ctx_runtime("ctx")],
-                native.abi.fallible,
-                &native.abi.ret,
-            ),
+            RirExternKind::Native(native) => {
+                let rendered = match native.abi.ctx {
+                    anvyx_runtime::RustWrapperCtx::HiddenRuntime => {
+                        vec![target::ctx_runtime("ctx")]
+                    }
+                    anvyx_runtime::RustWrapperCtx::None => vec![],
+                };
+                (
+                    native.path.join("::"),
+                    rendered,
+                    native.abi.fallible,
+                    &native.abi.ret,
+                )
+            }
         };
         self.prepared_call_expr(function, args, rendered, |rendered| {
             let call = format!("{symbol}({rendered})");
@@ -2465,9 +2562,70 @@ fn stmt_call_args(stmt: &RirStmt) -> Option<&[RirCallArg]> {
     }
 }
 
+fn block_uses_scoped_lambda_sig(block: &RirStructuredBlock, sig: RirLambdaSigId) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_uses_scoped_lambda_sig(stmt, sig))
+}
+
+fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
+    match stmt {
+        RirStmt::Init { value, .. }
+        | RirStmt::Assign { value, .. }
+        | RirStmt::CellInit { value, .. }
+        | RirStmt::CellSet { value, .. }
+        | RirStmt::ScopedPlaceCellSet { value, .. }
+        | RirStmt::Eval(value) => rvalue_uses_scoped_lambda_sig(value, sig),
+        RirStmt::If(RirIf {
+            then_block,
+            else_block,
+            ..
+        }) => {
+            block_uses_scoped_lambda_sig(then_block, sig)
+                || else_block
+                    .as_ref()
+                    .is_some_and(|block| block_uses_scoped_lambda_sig(block, sig))
+        }
+        RirStmt::Loop(RirLoop { body, .. })
+        | RirStmt::CollectionLoanScope(RirCollectionLoanScope { body, .. })
+        | RirStmt::CollectionSlotScope(body) => block_uses_scoped_lambda_sig(body, sig),
+        RirStmt::EnumMatch(RirEnumMatch {
+            arms, else_block, ..
+        }) => {
+            arms.iter()
+                .any(|arm| block_uses_scoped_lambda_sig(&arm.block, sig))
+                || else_block
+                    .as_ref()
+                    .is_some_and(|block| block_uses_scoped_lambda_sig(block, sig))
+        }
+        RirStmt::OptionMatch(RirOptionMatch {
+            some_block,
+            none_block,
+            ..
+        }) => {
+            block_uses_scoped_lambda_sig(some_block, sig)
+                || block_uses_scoped_lambda_sig(none_block, sig)
+        }
+        RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => false,
+    }
+}
+
+fn rvalue_uses_scoped_lambda_sig(value: &RirRValue, sig: RirLambdaSigId) -> bool {
+    let RirRValue::Call { args, .. } = value else {
+        return false;
+    };
+    args.iter()
+        .any(|arg| matches!(arg, RirCallArg::ScopedLambda { sig: arg_sig, .. } if *arg_sig == sig))
+}
+
 fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
     match arg {
         RirCallArg::Value(RirOperand::Place(place))
+        | RirCallArg::ScopedLambda {
+            callee: RirOperand::Place(place),
+            ..
+        }
         | RirCallArg::SharedBorrow(place)
         | RirCallArg::MutBorrow(place) => place.projections.is_empty().then_some(place.local),
         RirCallArg::MutPlace(mut_place) => match &mut_place.root {
@@ -2476,7 +2634,12 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             }
             _ => None,
         },
-        RirCallArg::Value(RirOperand::Const(_)) | RirCallArg::SharedStringConst(_) => None,
+        RirCallArg::Value(RirOperand::Const(_))
+        | RirCallArg::ScopedLambda {
+            callee: RirOperand::Const(_),
+            ..
+        }
+        | RirCallArg::SharedStringConst(_) => None,
     }
 }
 
@@ -2528,6 +2691,7 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
             RirParamSemantic::MutPlace
+            | RirParamSemantic::ScopedLambda
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),

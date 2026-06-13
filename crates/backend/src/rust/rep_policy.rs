@@ -329,6 +329,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::SharedBorrow => RirParamAbi::SharedBorrow,
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
             RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
+            RirParamSemantic::ScopedLambda => RirParamAbi::ScopedLambda,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
             RirParamSemantic::HeapCell => RirParamAbi::HeapCell,
             RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
@@ -453,6 +454,7 @@ impl<'a> RustRepPolicy<'a> {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
             }
+            RirParamAbi::ScopedLambda => self.scoped_lambda_ty(ty),
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!(
@@ -475,6 +477,31 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
+    pub fn scoped_lambda_sig_args_ret(self, sig: RirLambdaSigId) -> (String, String) {
+        let sig = &self.program.lambda_sigs[sig.index()];
+        let args = match sig.params.as_slice() {
+            [] => "()".to_string(),
+            [param] => format!("({},)", self.rust_ty(param.ty)),
+            params => format!(
+                "({})",
+                params
+                    .iter()
+                    .map(|param| self.rust_ty(param.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        (args, self.rust_ty(sig.ret))
+    }
+
+    fn scoped_lambda_ty(self, ty: RirTypeId) -> String {
+        let RirType::Lambda(sig) = self.ty(ty) else {
+            return target::scoped_lambda_ty("()", "()");
+        };
+        let (args, ret) = self.scoped_lambda_sig_args_ret(sig);
+        target::scoped_lambda_ty(&args, &ret)
+    }
+
     pub fn dataref_storage_ty(self, dataref: &RirDataRef) -> String {
         let storage = dataref.storage_symbol();
         if self.dataref_cx_dependent(dataref) {
@@ -485,15 +512,54 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn lambda_sig_ty(self, id: RirLambdaSigId) -> String {
-        let symbol = self.lambda_sig_symbol(id);
+        format!(
+            "{}{}",
+            self.lambda_sig_symbol(id),
+            self.lambda_sig_ty_generics(id)
+        )
+    }
+
+    pub fn lambda_sig_impl_generics(self, id: RirLambdaSigId) -> &'static str {
         match (
             self.lambda_sig_needs_lifetime(id),
             self.lambda_sig_needs_ctx_lifetime(id),
         ) {
-            (true, true) => format!("{symbol}<'_, 'cx>"),
-            (true, false) => format!("{symbol}<'_>"),
-            (false, true) => format!("{symbol}<'cx>"),
-            (false, false) => symbol,
+            (true, true) => "<'env, 'cx>",
+            (true, false) => "<'env>",
+            (false, true) => "<'cx>",
+            (false, false) => "",
+        }
+    }
+
+    pub fn lambda_sig_assoc_path(self, id: RirLambdaSigId) -> String {
+        format!(
+            "{}{}",
+            self.lambda_sig_symbol(id),
+            self.lambda_sig_assoc_generics(id)
+        )
+    }
+
+    fn lambda_sig_ty_generics(self, id: RirLambdaSigId) -> &'static str {
+        match (
+            self.lambda_sig_needs_lifetime(id),
+            self.lambda_sig_needs_ctx_lifetime(id),
+        ) {
+            (true, true) => "<'_, 'cx>",
+            (true, false) => "<'_>",
+            (false, true) => "<'cx>",
+            (false, false) => "",
+        }
+    }
+
+    fn lambda_sig_assoc_generics(self, id: RirLambdaSigId) -> &'static str {
+        match (
+            self.lambda_sig_needs_lifetime(id),
+            self.lambda_sig_needs_ctx_lifetime(id),
+        ) {
+            (true, true) => "::<'_, 'cx>",
+            (true, false) => "::<'_>",
+            (false, true) => "::<'cx>",
+            (false, false) => "",
         }
     }
 
@@ -554,7 +620,9 @@ impl<'a> RustRepPolicy<'a> {
                     | RirParamAbi::StackCell
                     | RirParamAbi::HeapCell
                     | RirParamAbi::ScopedPlaceCell => true,
-                    RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
+                    RirParamAbi::MutBorrow | RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => {
+                        false
+                    }
                 })
             })
     }
@@ -574,7 +642,7 @@ impl<'a> RustRepPolicy<'a> {
                 | RirParamAbi::StackCell
                 | RirParamAbi::HeapCell
                 | RirParamAbi::ScopedPlaceCell => true,
-                RirParamAbi::MutBorrow | RirParamAbi::MutPlace => false,
+                RirParamAbi::MutBorrow | RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => false,
             })
         });
         active.remove(&id);
@@ -846,6 +914,7 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
+            RirParamSemantic::ScopedLambda => matches!(ty, RirType::Lambda(_)),
             RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
