@@ -9564,6 +9564,102 @@ mod tests {
     }
 
     #[test]
+    fn extern_callback_param_lowers_as_non_escaping_function() {
+        let air = lower_root(
+            "extern fn native_apply(value: int, cb: fn(int) -> int) -> int; fn mul2(x: int) -> int { x * 2 } fn main() { let result = native_apply(5, mul2); }",
+            "main",
+        )
+        .expect("lower failed");
+        let native = air
+            .externs
+            .iter()
+            .find(|decl| decl.name == Ident::new("native_apply"))
+            .expect("missing extern");
+
+        assert_eq!(native.params[1].mode, ParamMode::Value);
+        assert_eq!(native.params[1].escape, ParamEscape::NonEscaping);
+        let TypeData::Function(sig) = air.type_data(native.params[1].ty) else {
+            panic!("expected function param type");
+        };
+        assert_eq!(sig.params[0].escape, ParamEscape::NonEscaping);
+    }
+
+    #[test]
+    fn extern_callback_non_capturing_lambda_arg_lowers_as_value_arg() {
+        let air = lower_root(
+            "extern fn native_each(cb: fn(int)); fn main() { native_each(|x: int| { x; }); }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.lambdas.len(), 1);
+        assert!(air.lambdas[0].captures.is_empty());
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if captures.is_empty())
+        }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Extern(_), args })
+                if matches!(args.as_slice(), [CallArg::Value(Operand::Place(place))]
+                    if matches!(air.type_data(place.ty), TypeData::Function(_))))
+        }));
+    }
+
+    #[test]
+    fn extern_callback_captured_lambda_arg_preserves_capture_metadata() {
+        let air = lower_root(
+            "extern fn native_each(cb: fn()); fn main(seed: int) { let x = seed + 1; native_each(|| { x; }); }",
+            "main",
+        )
+        .expect("lower failed");
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ReadonlyLocal { .. }]
+        ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
+                if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal { .. }]))
+        }));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Extern(_), args })
+                if matches!(args.as_slice(), [CallArg::Value(Operand::Place(place))]
+                    if matches!(air.type_data(place.ty), TypeData::Function(_))))
+        }));
+    }
+
+    #[test]
+    fn escaping_extern_callback_param_remains_lowering_gap() {
+        let err = lower_root(
+            "extern fn retain(cb: escaping fn(int)); fn callback(x: int) {} fn main() { retain(callback); }",
+            "main",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, LowerError::UnsupportedExternSignature { .. }));
+    }
+
+    #[test]
+    fn extern_callback_return_lowers_as_function_type_gap_input() {
+        let air = lower_root(
+            "extern fn native_make() -> fn(int) -> int; fn main() { let f = native_make(); }",
+            "main",
+        )
+        .expect("lower failed");
+        let native = air
+            .externs
+            .iter()
+            .find(|decl| decl.name == Ident::new("native_make"))
+            .expect("missing extern");
+
+        assert!(matches!(
+            air.type_data(native.return_type),
+            TypeData::Function(_)
+        ));
+    }
+
+    #[test]
     fn function_type_escape_affects_type_identity_and_rendering() {
         let air = lower_root("fn main(non: fn(fn()), esc: fn(escaping fn())) {}", "main")
             .expect("lower failed");
