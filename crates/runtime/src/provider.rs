@@ -104,10 +104,20 @@ fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &s
         | RustParamAbi::MutPlace(ty) => {
             retarget_type(ty, source_name, target_name);
         }
+        RustParamAbi::ScopedLambda(callback) => {
+            retarget_callback(callback, source_name, target_name);
+        }
         RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
             retarget_param_abi(inner, source_name, target_name);
         }
     }
+}
+
+fn retarget_callback(callback: &mut ExternCallbackSignature, source_name: &str, target_name: &str) {
+    for param in &mut callback.params {
+        retarget_type(&mut param.ty, source_name, target_name);
+    }
+    retarget_type(&mut callback.ret, source_name, target_name);
 }
 
 fn retarget_return_abi(abi: &mut RustReturnAbi, source_name: &str, target_name: &str) {
@@ -142,10 +152,18 @@ fn qualify_param_abi_owner(abi: &mut RustParamAbi, owner: &ExternTypeKey) {
         | RustParamAbi::Borrow(ty)
         | RustParamAbi::MutBorrow(ty)
         | RustParamAbi::MutPlace(ty) => qualify_owner_type(ty, owner),
+        RustParamAbi::ScopedLambda(callback) => qualify_callback_owner(callback, owner),
         RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
             qualify_param_abi_owner(inner, owner);
         }
     }
+}
+
+fn qualify_callback_owner(callback: &mut ExternCallbackSignature, owner: &ExternTypeKey) {
+    for param in &mut callback.params {
+        qualify_owner_type(&mut param.ty, owner);
+    }
+    qualify_owner_type(&mut callback.ret, owner);
 }
 
 fn qualify_owner_type(ty: &mut ExternTypeExpr, owner: &ExternTypeKey) {
@@ -411,6 +429,7 @@ pub struct RustExternAbi {
     pub ret: RustReturnAbi,
     pub fallible: bool,
     pub support: RustAbiSupport,
+    pub ctx: RustWrapperCtx,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,12 +439,19 @@ pub enum RustAbiSupport {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RustWrapperCtx {
+    HiddenRuntime,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RustParamAbi {
     Value(ExternTypeExpr),
     Borrow(ExternTypeExpr),
     MutBorrow(ExternTypeExpr),
     MutPlace(ExternTypeExpr),
+    ScopedLambda(ExternCallbackSignature),
     Option(Box<RustParamAbi>),
     List(Box<RustParamAbi>),
 }
@@ -691,47 +717,169 @@ fn validate_native_abi(
             "parameter count mismatch",
         ));
     }
-    for (index, (param, abi)) in signature
+    let has_scoped_lambda = abi.params.iter().any(rust_param_abi_is_scoped_lambda);
+    validate_wrapper_ctx(descriptor, key, abi, has_scoped_lambda)?;
+    validate_scoped_lambda_isolated(descriptor, key, abi, has_scoped_lambda)?;
+    for (index, (param, param_abi)) in signature
         .signature
         .params
         .iter()
         .zip(&abi.params)
         .enumerate()
     {
-        if !param_abi_matches(param, abi) {
+        if !param_abi_matches(param, param_abi) {
             return Err(native_abi_error(
                 descriptor,
                 key,
                 &format!("parameter {index} ABI mismatch"),
             ));
         }
+        validate_param_callback_abi(descriptor, key, param, param_abi, abi)?;
     }
     if !return_abi_matches(&signature.signature.ret, &abi.ret) {
         return Err(native_abi_error(descriptor, key, "return ABI mismatch"));
     }
-    if abi.support == RustAbiSupport::Direct {
-        if signature
-            .signature
-            .params
-            .iter()
-            .any(param_contains_callback)
-            || type_contains_callback(&signature.signature.ret)
-        {
-            return Err(native_abi_error(
-                descriptor,
-                key,
-                "direct callback ABI is unsupported",
-            ));
-        }
-        if abi.params.iter().any(direct_mut_collection_abi) {
-            return Err(native_abi_error(
-                descriptor,
-                key,
-                "direct mutable collection ABI is unsupported",
-            ));
-        }
+    if type_contains_callback(&signature.signature.ret) {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "native callback return ABI is unsupported",
+        ));
+    }
+    if abi.params.iter().any(direct_mut_collection_abi) {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "direct mutable collection ABI is unsupported",
+        ));
     }
     Ok(())
+}
+
+fn validate_wrapper_ctx(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustExternAbi,
+    has_scoped_lambda: bool,
+) -> Result<(), String> {
+    let expected = if has_scoped_lambda {
+        RustWrapperCtx::None
+    } else {
+        RustWrapperCtx::HiddenRuntime
+    };
+    if abi.ctx == expected {
+        Ok(())
+    } else {
+        Err(native_abi_error(
+            descriptor,
+            key,
+            "wrapper ctx mode mismatch",
+        ))
+    }
+}
+
+fn validate_scoped_lambda_isolated(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustExternAbi,
+    has_scoped_lambda: bool,
+) -> Result<(), String> {
+    if !has_scoped_lambda {
+        return Ok(());
+    }
+    if matches!(
+        &key.target,
+        ExternBindingTarget::Member(member)
+            if !matches!(member.selector, ExternMemberSelector::Static(_))
+    ) {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "scoped Lambda ABI cannot be combined with method receivers",
+        ));
+    }
+    if abi.params.iter().any(|param| {
+        matches!(
+            param,
+            RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::MutPlace(_)
+        )
+    }) {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "scoped Lambda ABI cannot be combined with borrowed provider parameters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_param_callback_abi(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    param: &ExternParam,
+    param_abi: &RustParamAbi,
+    abi: &RustExternAbi,
+) -> Result<(), String> {
+    match (&param.ty, param_abi) {
+        (ExternTypeExpr::Callback(callback), RustParamAbi::ScopedLambda(_)) => {
+            validate_scoped_lambda_abi(descriptor, key, param, callback, abi.support)
+        }
+        _ if param_contains_callback(param) || param_abi_contains_callback(param_abi) => Err(
+            native_abi_error(descriptor, key, "direct callback ABI is unsupported"),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_scoped_lambda_abi(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    param: &ExternParam,
+    callback: &ExternCallbackSignature,
+    support: RustAbiSupport,
+) -> Result<(), String> {
+    if param.flow != ParamFlow::Value
+        || param.escape != CallbackEscape::NonEscaping
+        || !callback.scoped_lambda_policy_supported()
+    {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "scoped Lambda ABI requires non-escaping same-thread callback policy",
+        ));
+    }
+    if support != RustAbiSupport::NeedsWrapperConversion {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "scoped Lambda ABI requires wrapper conversion",
+        ));
+    }
+    if !callback.scoped_lambda_signature_supported() {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "unsupported scoped Lambda ABI signature",
+        ));
+    }
+    Ok(())
+}
+
+fn rust_param_abi_is_scoped_lambda(abi: &RustParamAbi) -> bool {
+    matches!(abi, RustParamAbi::ScopedLambda(_))
+}
+
+fn param_abi_contains_callback(abi: &RustParamAbi) -> bool {
+    match abi {
+        RustParamAbi::Value(ty)
+        | RustParamAbi::Borrow(ty)
+        | RustParamAbi::MutBorrow(ty)
+        | RustParamAbi::MutPlace(ty) => type_contains_callback(ty),
+        RustParamAbi::ScopedLambda(_) => true,
+        RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
+            param_abi_contains_callback(inner)
+        }
+    }
 }
 
 fn direct_mut_collection_abi(abi: &RustParamAbi) -> bool {
@@ -787,6 +935,9 @@ fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
         (ExternTypeExpr::Option(inner), ParamFlow::Value, RustParamAbi::Option(abi))
         | (ExternTypeExpr::List(inner), ParamFlow::Value, RustParamAbi::List(abi)) => {
             param_abi_matches(&value_param((**inner).clone()), abi)
+        }
+        (ExternTypeExpr::Callback(callback), ParamFlow::Value, RustParamAbi::ScopedLambda(abi)) => {
+            callback == abi
         }
         (ty, ParamFlow::Value, RustParamAbi::Value(abi_ty))
         | (ty, ParamFlow::Borrow, RustParamAbi::Borrow(abi_ty))
@@ -952,6 +1103,335 @@ mod tests {
     }
 
     #[test]
+    fn accepts_scoped_lambda_abi() {
+        let callback = callback_signature(
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::Int,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ExternTypeExpr::Bool,
+        );
+        let descriptor = callback_descriptor(
+            "with_callback",
+            callback.clone(),
+            CallbackEscape::NonEscaping,
+        );
+        let binding = scoped_lambda_binding("with_callback", callback);
+
+        assert_abi_ok(descriptor, binding);
+    }
+
+    #[test]
+    fn rejects_escaping_scoped_lambda_abi() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor =
+            callback_descriptor("with_callback", callback.clone(), CallbackEscape::Escaping);
+        let binding = scoped_lambda_binding("with_callback", callback);
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI requires non-escaping same-thread callback policy",
+        );
+    }
+
+    #[test]
+    fn rejects_scoped_lambda_hidden_runtime_ctx() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = callback_descriptor(
+            "with_callback",
+            callback.clone(),
+            CallbackEscape::NonEscaping,
+        );
+        let mut binding = scoped_lambda_binding("with_callback", callback);
+        binding.abi.ctx = RustWrapperCtx::HiddenRuntime;
+
+        assert_abi_error(descriptor, binding, "wrapper ctx mode mismatch");
+    }
+
+    #[test]
+    fn rejects_no_hidden_ctx_without_scoped_lambda() {
+        let descriptor = descriptor();
+        let mut binding = binding("ping");
+        binding.abi.ctx = RustWrapperCtx::None;
+
+        assert_abi_error(descriptor, binding, "wrapper ctx mode mismatch");
+    }
+
+    #[test]
+    fn rejects_direct_mutable_collection_with_scoped_lambda() {
+        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = descriptor_with_params(
+            "mixed",
+            vec![
+                ExternParam {
+                    name: Some("items".to_string()),
+                    ty: list.clone(),
+                    flow: ParamFlow::MutBorrow,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("cb".to_string()),
+                    ty: ExternTypeExpr::Callback(callback.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+            ],
+            ExternTypeExpr::Void,
+        );
+        let mut binding = scoped_lambda_binding("mixed", callback);
+        binding.abi.params.insert(0, RustParamAbi::MutBorrow(list));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI cannot be combined with borrowed provider parameters",
+        );
+    }
+
+    #[test]
+    fn rejects_borrowed_param_with_scoped_lambda() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = descriptor_with_params(
+            "mixed",
+            vec![
+                ExternParam {
+                    name: Some("text".to_string()),
+                    ty: ExternTypeExpr::String,
+                    flow: ParamFlow::Borrow,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("cb".to_string()),
+                    ty: ExternTypeExpr::Callback(callback.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+            ],
+            ExternTypeExpr::Void,
+        );
+        let mut binding = scoped_lambda_binding("mixed", callback);
+        binding
+            .abi
+            .params
+            .insert(0, RustParamAbi::Borrow(ExternTypeExpr::String));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI cannot be combined with borrowed provider parameters",
+        );
+    }
+
+    #[test]
+    fn rejects_mut_place_param_with_scoped_lambda() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = descriptor_with_params(
+            "mixed",
+            vec![
+                ExternParam {
+                    name: Some("n".to_string()),
+                    ty: ExternTypeExpr::Int,
+                    flow: ParamFlow::MutBorrow,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("cb".to_string()),
+                    ty: ExternTypeExpr::Callback(callback.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+            ],
+            ExternTypeExpr::Void,
+        );
+        let mut binding = scoped_lambda_binding("mixed", callback);
+        binding
+            .abi
+            .params
+            .insert(0, RustParamAbi::MutPlace(ExternTypeExpr::Int));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI cannot be combined with borrowed provider parameters",
+        );
+    }
+
+    #[test]
+    fn rejects_method_receiver_with_scoped_lambda() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let owner = ExternTypeKey {
+            module: module(),
+            name: "Host".to_string(),
+        };
+        let descriptor = ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ExternTypeDescriptor {
+                    name: "Host".to_string(),
+                    doc: None,
+                    rep: ExternRep::Shared,
+                    fields: vec![],
+                    init: None,
+                    methods: vec![ExternMethodDescriptor {
+                        name: "mixed".to_string(),
+                        doc: None,
+                        receiver: ReceiverMode::Shared,
+                        signature: ExternSignature {
+                            params: vec![ExternParam {
+                                name: Some("cb".to_string()),
+                                ty: ExternTypeExpr::Callback(callback.clone()),
+                                flow: ParamFlow::Value,
+                                escape: CallbackEscape::NonEscaping,
+                            }],
+                            ret: ExternTypeExpr::Void,
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+                functions: vec![],
+            }],
+        };
+        let mut binding = scoped_lambda_binding("mixed", callback);
+        binding.key = ExternBindingKey {
+            target: ExternBindingTarget::Member(ExternMemberKey {
+                owner,
+                selector: ExternMemberSelector::Method("mixed".to_string()),
+            }),
+            operation: ExternBindingOp::Call,
+        };
+        binding.abi.params.insert(
+            0,
+            RustParamAbi::Borrow(ExternTypeExpr::Named {
+                module: Some(module()),
+                name: "Host".to_string(),
+                args: vec![],
+            }),
+        );
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI cannot be combined with method receivers",
+        );
+    }
+
+    #[test]
+    fn rejects_string_scoped_lambda_signature() {
+        let callback = callback_signature(
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::String,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ExternTypeExpr::Void,
+        );
+        let descriptor = callback_descriptor(
+            "with_callback",
+            callback.clone(),
+            CallbackEscape::NonEscaping,
+        );
+        let binding = scoped_lambda_binding("with_callback", callback);
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "unsupported scoped Lambda ABI signature",
+        );
+    }
+
+    #[test]
+    fn rejects_scoped_lambda_signature_mismatch() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor =
+            callback_descriptor("with_callback", callback, CallbackEscape::NonEscaping);
+        let binding = scoped_lambda_binding(
+            "with_callback",
+            callback_signature(
+                vec![ExternCallbackParam {
+                    ty: ExternTypeExpr::Int,
+                    escape: CallbackEscape::NonEscaping,
+                }],
+                ExternTypeExpr::Void,
+            ),
+        );
+
+        assert_abi_error(descriptor, binding, "parameter 0 ABI mismatch");
+    }
+
+    #[test]
+    fn rejects_scoped_lambda_callback_return() {
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = descriptor_with_param(
+            "make_callback",
+            ExternParam {
+                name: Some("n".to_string()),
+                ty: ExternTypeExpr::Int,
+                flow: ParamFlow::Value,
+                escape: CallbackEscape::NonEscaping,
+            },
+            ExternTypeExpr::Callback(callback.clone()),
+        );
+        let mut binding = binding("make_callback");
+        binding.abi.ret = RustReturnAbi::Value(ExternTypeExpr::Callback(callback));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "native callback return ABI is unsupported",
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_scoped_lambda_signature() {
+        let callback = callback_signature(
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ExternTypeExpr::Void,
+        );
+        let descriptor = callback_descriptor(
+            "with_callback",
+            callback.clone(),
+            CallbackEscape::NonEscaping,
+        );
+        let binding = scoped_lambda_binding("with_callback", callback);
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "unsupported scoped Lambda ABI signature",
+        );
+    }
+
+    #[test]
+    fn rejects_scoped_lambda_above_max_arity() {
+        let params = (0..=crate::SCOPED_LAMBDA_MAX_ARITY)
+            .map(|_| ExternCallbackParam {
+                ty: ExternTypeExpr::Int,
+                escape: CallbackEscape::NonEscaping,
+            })
+            .collect();
+        let callback = callback_signature(params, ExternTypeExpr::Void);
+        let descriptor = callback_descriptor(
+            "with_callback",
+            callback.clone(),
+            CallbackEscape::NonEscaping,
+        );
+        let binding = scoped_lambda_binding("with_callback", callback);
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "unsupported scoped Lambda ABI signature",
+        );
+    }
+
+    #[test]
     fn rejects_direct_callback_abi() {
         let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
             params: vec![],
@@ -1011,6 +1491,44 @@ mod tests {
         let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
 
         assert!(error.contains("direct callback ABI is unsupported"));
+    }
+
+    fn callback_signature(
+        params: Vec<ExternCallbackParam>,
+        ret: ExternTypeExpr,
+    ) -> ExternCallbackSignature {
+        ExternCallbackSignature {
+            params,
+            ret: Box::new(ret),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        }
+    }
+
+    fn callback_descriptor(
+        name: &str,
+        callback: ExternCallbackSignature,
+        escape: CallbackEscape,
+    ) -> ProviderDescriptor {
+        descriptor_with_param(
+            name,
+            ExternParam {
+                name: Some("cb".to_string()),
+                ty: ExternTypeExpr::Callback(callback),
+                flow: ParamFlow::Value,
+                escape,
+            },
+            ExternTypeExpr::Void,
+        )
+    }
+
+    fn scoped_lambda_binding(name: &str, callback: ExternCallbackSignature) -> RustExternBinding {
+        let mut binding = void_binding(name, RustParamAbi::ScopedLambda(callback));
+        binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
+        binding.abi.ctx = RustWrapperCtx::None;
+        binding
     }
 
     fn provider() -> ProviderId {
@@ -1085,6 +1603,14 @@ mod tests {
         param: ExternParam,
         ret: ExternTypeExpr,
     ) -> ProviderDescriptor {
+        descriptor_with_params(name, vec![param], ret)
+    }
+
+    fn descriptor_with_params(
+        name: &str,
+        params: Vec<ExternParam>,
+        ret: ExternTypeExpr,
+    ) -> ProviderDescriptor {
         ProviderDescriptor {
             provider: provider(),
             modules: vec![ExternModuleDescriptor {
@@ -1093,10 +1619,7 @@ mod tests {
                 functions: vec![ExternFunctionDescriptor {
                     name: name.to_string(),
                     doc: None,
-                    signature: ExternSignature {
-                        params: vec![param],
-                        ret,
-                    },
+                    signature: ExternSignature { params, ret },
                     effects: ExternEffects::default(),
                 }],
             }],
@@ -1140,6 +1663,7 @@ mod tests {
                 ret: RustReturnAbi::Value(ExternTypeExpr::Bool),
                 fallible: false,
                 support: RustAbiSupport::Direct,
+                ctx: RustWrapperCtx::HiddenRuntime,
             },
         }
     }

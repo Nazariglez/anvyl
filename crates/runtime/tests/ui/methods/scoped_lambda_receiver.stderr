@@ -1,0 +1,9 @@
+error: ScopedLambda parameters cannot be combined with method receivers
+  --> tests/ui/methods/scoped_lambda_receiver.rs:7:9
+   |
+ 7 |       pub fn bad(
+   |  _________^
+ 8 | |         &self,
+ 9 | |         f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), ()>,
+10 | |     ) -> Result<(), anvyx_runtime::RuntimeError> {
+   | |________________________________________________^

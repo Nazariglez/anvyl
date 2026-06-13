@@ -1,0 +1,5 @@
+error: unsupported ScopedLambda parameter type
+ --> tests/ui/function/scoped_lambda_option_param.rs:4:33
+  |
+4 | fn bad(f: ScopedLambda<'_, '_, (Option<i64>,), ()>) -> Result<(), RuntimeError> {
+  |                                 ^^^^^^^^^^^

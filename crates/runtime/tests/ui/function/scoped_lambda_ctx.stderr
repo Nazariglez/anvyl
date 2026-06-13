@@ -1,0 +1,5 @@
+error: #[function(ctx)] cannot be combined with ScopedLambda parameters
+ --> tests/ui/function/scoped_lambda_ctx.rs:4:13
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+  |             ^^^^^^^^^^^^^^^^^^^^^^

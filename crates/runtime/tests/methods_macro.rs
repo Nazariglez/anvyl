@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, BinaryOp, Ctx, ExternBindingOp, ExternMemberSelector, ExternOperator,
-    ExternTypeExpr, Heap, ReceiverMode, RustParamAbi, methods,
+    AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, ExternBindingOp,
+    ExternMemberSelector, ExternOperator, ExternTypeExpr, Heap, ReceiverMode, RuntimeError,
+    RustAbiSupport, RustParamAbi, RustWrapperCtx, ScopedLambda, methods,
 };
 
 #[derive(AnvyxInline)]
@@ -19,6 +20,15 @@ impl DerivedVec2 {
     }
 }
 
+struct CallbackOps;
+
+#[methods]
+impl CallbackOps {
+    pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+        f.call(1)
+    }
+}
+
 struct CtxBox {
     value: i64,
 }
@@ -30,6 +40,29 @@ impl CtxBox {
         let _ = ctx.heap();
         self.value + value
     }
+}
+
+#[test]
+fn scoped_lambda_method_uses_callback_descriptor_and_no_hidden_ctx() {
+    let export = __anvyx_methods_callbackops();
+    let method = &export.descriptor.statics[0];
+    let ExternTypeExpr::Callback(callback) = &method.signature.params[0].ty else {
+        panic!("expected callback descriptor");
+    };
+
+    assert_eq!(callback.params[0].ty, ExternTypeExpr::Int);
+    assert_eq!(callback.params[0].escape, CallbackEscape::NonEscaping);
+    assert_eq!(*callback.ret, ExternTypeExpr::Void);
+    assert_eq!(callback.policy.thread, CallbackThread::SameThread);
+    assert_eq!(
+        export.bindings[0].abi.support,
+        RustAbiSupport::NeedsWrapperConversion
+    );
+    assert_eq!(export.bindings[0].abi.ctx, RustWrapperCtx::None);
+    assert!(matches!(
+        export.bindings[0].abi.params[0],
+        RustParamAbi::ScopedLambda(_)
+    ));
 }
 
 #[test]
@@ -160,11 +193,11 @@ fn self_operator_uses_derive_owned_type_name() {
 
     assert!(matches!(
         &op.signature.params[0].ty,
-        anvyx_runtime::ExternTypeExpr::Named { name, .. } if name == "NamedOps"
+        ExternTypeExpr::Named { name, .. } if name == "NamedOps"
     ));
     assert!(matches!(
         &op.signature.ret,
-        anvyx_runtime::ExternTypeExpr::Named { name, .. } if name == "NamedOps"
+        ExternTypeExpr::Named { name, .. } if name == "NamedOps"
     ));
 }
 

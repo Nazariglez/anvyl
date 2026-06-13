@@ -107,5 +107,22 @@ a direct mutable receiver ABI; manual/final provider metadata may use
 `RustParamAbi::MutPlace(owner)` as receiver parameter 0 for place-aware receiver
 bindings.
 
+Provider functions can accept non-escaping Anvyx function values with
+`ScopedLambda<'_, '_, Args, Ret>`. `Args` is a tuple of up to 8 supported
+callback ABI leaves (`bool`, `i64`, `f64`); `Ret` may also be `()`. Call it
+synchronously and return or handle `RuntimeError`; do not store it.
+`ScopedLambda` cannot be combined with `#[function(ctx)]`, method receivers,
+borrowed params, or mutable provider params in this slice.
+
+```rust
+use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+
+#[function]
+pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+    f.call(1)?;
+    f.call(2)
+}
+```
+
 Provider crates must export `provider_descriptor()` and `rust_module_support()`;
 `builtin_module!` generates both.

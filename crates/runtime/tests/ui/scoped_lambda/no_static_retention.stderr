@@ -1,0 +1,7 @@
+error: lifetime may not live long enough
+ --> tests/ui/scoped_lambda/no_static_retention.rs:4:5
+  |
+3 | fn retain<'call, 'cx>(f: ScopedLambda<'call, 'cx, (), ()>) -> ScopedLambda<'static, 'cx, (), ()> {
+  |           ----- lifetime `'call` defined here
+4 |     f
+  |     ^ returning this value requires that `'call` must outlive `'static`

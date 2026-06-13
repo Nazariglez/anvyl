@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    Ctx, ExternTypeExpr, Heap, MutPlace, ParamFlow, RustAbiSupport, RustParamAbi, function,
+    CallbackEscape, CallbackThread, Ctx, ExternCallbackParam, ExternCallbackSignature,
+    ExternTypeExpr, Heap, MutPlace, ParamFlow, RuntimeError, RustAbiSupport, RustParamAbi,
+    RustWrapperCtx, ScopedLambda, function,
 };
 
 /// Adds numbers.
@@ -21,9 +23,9 @@ fn renamed_type(value: i64) -> i64 {
 }
 
 #[function]
-fn maybe(value: Option<i64>) -> Result<Option<i64>, anvyx_runtime::RuntimeError> {
+fn maybe(value: Option<i64>) -> Result<Option<i64>, RuntimeError> {
     if value == Some(i64::MIN) {
-        Err(anvyx_runtime::RuntimeError::new("sentinel"))
+        Err(RuntimeError::new("sentinel"))
     } else {
         Ok(value)
     }
@@ -52,13 +54,26 @@ fn with_ctx_lifetime<'cx>(ctx: &mut Ctx<'cx, '_>, name: &'cx str) -> i64 {
 }
 
 #[function(ctx)]
-fn bump_place<'cx>(ctx: &mut Ctx<'cx, '_>, mut value: MutPlace<'_, 'cx, i64>) {
-    let _ = value.update_copy(ctx, |n| n + 1);
+fn bump_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
+    let _ = ctx.heap();
+    let _ = value;
 }
 
 #[function(ctx)]
-fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, mut value: MutPlace<'_, 'cx, Option<i64>>) {
-    let _ = value.update_copy(ctx, |n| n.map(|n| n + 1));
+fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Option<i64>>) {
+    let _ = ctx.heap();
+    let _ = value;
+}
+
+#[function]
+fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+    f.call(1)
+}
+
+#[function(params(f = "fn(int) -> bool"))]
+fn callback_override(f: ScopedLambda<'_, '_, (i64,), bool>) -> Result<(), RuntimeError> {
+    let _ = f;
+    Ok(())
 }
 
 #[test]
@@ -151,6 +166,47 @@ fn ctx_is_hidden_from_metadata_and_passed_to_authored_function() {
 
     let export = __anvyx_export_with_ctx_lifetime();
     assert_eq!(export.descriptor.signature.params.len(), 1);
+}
+
+#[test]
+fn scoped_lambda_param_infers_callback_descriptor_and_abi() {
+    let export = __anvyx_export_each();
+    let expected = ExternCallbackSignature {
+        params: vec![ExternCallbackParam {
+            ty: ExternTypeExpr::Int,
+            escape: CallbackEscape::NonEscaping,
+        }],
+        ret: Box::new(ExternTypeExpr::Void),
+        policy: anvyx_runtime::CallbackPolicy {
+            escape: CallbackEscape::NonEscaping,
+            thread: CallbackThread::SameThread,
+        },
+    };
+
+    assert_eq!(export.descriptor.signature.params.len(), 1);
+    assert_eq!(
+        export.descriptor.signature.params[0].ty,
+        ExternTypeExpr::Callback(expected.clone())
+    );
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::ScopedLambda(expected)
+    );
+    assert_eq!(
+        export.rust.abi.support,
+        RustAbiSupport::NeedsWrapperConversion
+    );
+    assert_eq!(export.rust.abi.ctx, RustWrapperCtx::None);
+}
+
+#[test]
+fn scoped_lambda_override_must_match_rust_abi() {
+    let export = __anvyx_export_callback_override();
+
+    let ExternTypeExpr::Callback(callback) = &export.descriptor.signature.params[0].ty else {
+        panic!("expected callback descriptor");
+    };
+    assert_eq!(*callback.ret, ExternTypeExpr::Bool);
 }
 
 #[test]

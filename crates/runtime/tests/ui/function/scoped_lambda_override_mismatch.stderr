@@ -1,0 +1,7 @@
+error: #[function(params)] override for `f` does not match Rust ABI
+ --> tests/ui/function/scoped_lambda_override_mismatch.rs:3:1
+  |
+3 | #[function(params(f = "fn(float) -> void"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `function` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,5 @@
+error: ScopedLambda supports at most 8 parameters
+ --> tests/ui/function/scoped_lambda_too_many_args.rs:5:29
+  |
+5 |     f: ScopedLambda<'_, '_, (i64, i64, i64, i64, i64, i64, i64, i64, i64), ()>,
+  |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
