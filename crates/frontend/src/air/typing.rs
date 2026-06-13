@@ -350,6 +350,19 @@ pub(crate) fn index_elem(program: &Program, ty: TypeId) -> Option<TypeId> {
     sequence_elem(program, ty)
 }
 
+pub(crate) fn map_slot(program: &Program, ty: TypeId) -> Option<(TypeId, TypeId)> {
+    let (key, value) = map_kv(program, ty)?;
+    let slot = program
+        .type_arena
+        .iter()
+        .enumerate()
+        .find_map(|(index, data)| {
+            matches!(data, TypeData::Optional(inner) if *inner == value)
+                .then(|| TypeId::from_index(index))
+        })?;
+    Some((key, slot))
+}
+
 pub(crate) fn map_kv(program: &Program, ty: TypeId) -> Option<(TypeId, TypeId)> {
     match program.type_arena.get(ty) {
         Some(TypeData::Map { key, value, .. }) => Some((*key, *value)),

@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Box { value: int }
+
+fn value(var box: Box) -> var int {
+    box.value
+}
+
+fn main() {
+    var box = Box { value: 1 };
+    value(box) = 2;
+}

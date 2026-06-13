@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn clear(var slot: int?) {
+    slot = nil;
+}
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    let key = "a";
+
+    clear(counts[key]);
+}

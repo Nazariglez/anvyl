@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn bump_slice(var xs: slice[int], i: int) {
+    xs[i] += 1;
+}
+
+fn main() {
+    var fixed: [int; 3] = [0, 1, 2];
+    var list: [int] = [0, 1, 2];
+    let i = 1;
+
+    fixed[i] += 1;
+    list[i] += 1;
+    bump_slice(list, i);
+}

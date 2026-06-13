@@ -624,7 +624,10 @@ impl<'tc> PatternChecker<'tc> {
                     let target = place::AliasTarget::merged(group, targets);
                     if matches!(
                         self.context,
-                        PatternContext::IfLet | PatternContext::WhileLet | PatternContext::Match
+                        PatternContext::IfLet
+                            | PatternContext::WhileLet
+                            | PatternContext::LetElse
+                            | PatternContext::Match
                     ) {
                         self.tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
                             identity: target.identity.clone(),

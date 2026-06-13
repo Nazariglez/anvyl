@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var slots: [string: int?] = ["a": 1, "b": nil];
+    slots["a"] = nil;
+    slots["b"] = 2;
+    slots["c"] = .Some(3);
+    slots["d"] = .None;
+
+    var nested: [string: Option<int?>] = ["a": .Some(nil)];
+    nested["a"] = .Some(.Some(3));
+    nested["b"] = .Some(nil);
+    nested["c"] = nil;
+    nested["d"] = .None;
+}

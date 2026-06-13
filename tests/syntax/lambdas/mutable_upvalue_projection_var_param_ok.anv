@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: success
 // @frontend: new
-// @skip: projected heap-cell source var calls await mutable_place_projected_values
 
 struct Point { x: int }
 

@@ -2812,13 +2812,8 @@ fn check_index_access_inner(
                 check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
             tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
             tc.solve_constraints();
-            let value = (**value).clone();
-            CheckedIndex::projected(
-                tc.core_option_or_infer(value.clone(), node.span),
-                value,
-                target,
-                &index,
-            )
+            let value = tc.core_option_or_infer((**value).clone(), node.span);
+            CheckedIndex::same_projected(value, target, &index)
         }
         Type::Infer => {
             let index = check_expr_checked(&node.node.index, tc);

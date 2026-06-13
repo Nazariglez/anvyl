@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: mutable alias binding
+
+fn main() {
+    var opt: int? = 1;
+    var value? = opt else return;
+    println(opt ?? 0);
+    value = 2;
+}

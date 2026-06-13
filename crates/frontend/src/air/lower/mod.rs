@@ -3160,7 +3160,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if matches!(expr.node.kind, ExprKind::Ident(_)) {
             return Ok(root);
         }
-        if self.promoted_dataref_projection_root(&root) {
+        if self.promoted_dataref_projection_root(&root)
+            || self.place_is_capture_cell(&root)
+            || self.place_is_scoped_borrow(&root)
+        {
             return self.lower_projected_place(expr, root);
         }
         Err(mutable_place_projection_gap(expr.node.id))
@@ -3324,16 +3327,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
         match &expr.node.kind {
             ExprKind::Ident(_) => Ok(root),
-            _ if self.place_is_scoped_borrow(&root)
-                && !self.promoted_dataref_projection_root(&root) =>
-            {
-                Err(mutable_place_projection_gap(expr.node.id))
-            }
-            _ if self.place_is_capture_cell(&root)
-                && !self.promoted_dataref_projection_root(&root) =>
-            {
-                Err(lambda_capture_gap(expr.node.id))
-            }
             ExprKind::Field(field) => {
                 if field.node.safe {
                     return Err(unsupported_expr(expr));
@@ -3350,7 +3343,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     return Err(unsupported_expr(expr));
                 }
                 let mut place = self.lower_projected_place(&index.node.target, root)?;
+                if self.place_is_capture_cell(&place) || self.place_is_scoped_borrow(&place) {
+                    match self.cx.program.type_data(place.ty) {
+                        TypeData::List(_) | TypeData::Slice(_) | TypeData::Map { .. } => {
+                            return Err(mutable_place_projection_gap(expr.node.id));
+                        }
+                        _ => {}
+                    }
+                }
                 let index_local = self.lower_index_local(&index.node.index)?;
+                if let Some((_, value_ty)) = typing::map_kv(&self.cx.program, place.ty) {
+                    place
+                        .projection
+                        .push(crate::air::Projection::MapIndex(index_local));
+                    place.ty = self.cx.optional_ty(value_ty);
+                    return Ok(place);
+                }
                 let Some(ty) = typing::index_elem(&self.cx.program, place.ty) else {
                     return Err(unsupported_expr(expr));
                 };
@@ -4574,37 +4582,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 span: None,
             }),
         }
-    }
-
-    fn lower_map_index_assign(
-        &mut self,
-        index: &ast::IndexNode,
-        value_expr: &ExprNode,
-    ) -> Result<Option<RValue>, LowerError> {
-        let map = match self.lower_place_arg(&index.node.target, true) {
-            Ok(place) => place,
-            Err(LowerError::MissingLocalUse { .. }) => {
-                self.named_local_place(&index.node.target)?
-            }
-            Err(_) => return Ok(None),
-        };
-        let Some(map_root) = map.root.local() else {
-            return Err(unsupported_expr(value_expr));
-        };
-        if self.function.locals[map_root.index()].mutability != AirMutability::Mutable {
-            return Err(unsupported_expr(value_expr));
-        }
-        let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
-            return Ok(None);
-        };
-        let key = self.lower_value_to(&index.node.index, key_ty, value_expr)?;
-        let value = self.lower_value_to(value_expr, value_ty, value_expr)?;
-        Ok(Some(RValue::MapInsert {
-            map,
-            key,
-            value,
-            kind: MapWriteKind::IndexedAssignment,
-        }))
     }
 
     fn lower_array_fill(
@@ -6455,7 +6432,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_method_target(&mut self, target: &ExprNode) -> Result<Place, LowerError> {
-        match self.lower_place_arg(target, true) {
+        match self.lower_place_or_temp(target, true) {
             Ok(place) => Ok(place),
             Err(
                 LowerError::MissingLocalUse { .. }
@@ -6774,11 +6751,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         &assign.node.value,
                         target,
                     )?;
-                    return self.emit_eval(value);
-                }
-                if let ExprKind::Index(index) = &assign.node.target.node.kind
-                    && let Some(value) = self.lower_map_index_assign(index, &assign.node.value)?
-                {
                     return self.emit_eval(value);
                 }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
@@ -11306,20 +11278,18 @@ mod tests {
     }
 
     #[test]
-    fn projected_capture_var_arg_remains_gap() {
+    fn projected_capture_var_arg_lowers_owner_cell_projection() {
         let source = "struct Point { x: int } fn bump(var x: int) {} fn f() { var p = Point { x: 0 }; let g: fn() = || { bump(p.x); }; g; }";
-        let err = lower_root(source, "f").expect_err("expected projection gap");
+        let air = lower_root(source, "f").expect("lower failed");
+        let body = air.lambdas[0].body;
 
-        assert!(
+        assert!(function_statements(air.function(body)).any(|statement| {
             matches!(
-                err,
-                LowerError::UnsupportedExpr {
-                    kind: "UnsupportedMutablePlaceProjection",
-                    ..
-                }
-            ),
-            "unexpected error: {err:?}"
-        );
+                statement,
+                AirStmt::Eval(RValue::Call { args, .. })
+                    if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.root, PlaceRoot::LambdaCapture(_)) && !place.projection.is_empty())
+            )
+        }));
     }
 
     #[test]
@@ -11435,6 +11405,40 @@ fn f() {
                     callee: Callee::Function(_),
                     args,
                 }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn source_var_map_index_lowers_to_mut_borrow_projection() {
+        let air = lower_root(
+            "fn clear(var slot: int?) {} fn f(var counts: [string: int]) { clear(counts[\"a\"]); }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Eval(RValue::Call {
+                    callee: Callee::Function(_),
+                    args,
+                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::MapIndex(_)]))
+            )
+        }));
+    }
+
+    #[test]
+    fn map_index_assignment_lowers_to_optional_slot_place() {
+        let air = lower_root(
+            "fn f(var counts: [string: int]) { counts[\"a\"] = 1; }",
+            "f",
+        )
+        .expect("lower failed");
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Assign { dst, value: RValue::Use(_) }
+                    if matches!(dst.projection.as_slice(), [crate::air::Projection::MapIndex(_)])
             )
         }));
     }
@@ -12062,9 +12066,14 @@ fn main() {}
     }
 
     #[test]
-    fn projected_mutable_capture_is_named_gap() {
+    fn projected_mutable_capture_assignment_lowers_to_capture_cell_projection() {
         let source = "struct Point { x: int } fn f() { var p = Point { x: 0 }; let g: fn() = || { p.x = 1; }; g; }";
-        assert!(lower_root(source, "f").is_err());
+        let air = lower_root(source, "f").expect("lower failed");
+        let body = air.lambdas[0].body;
+
+        assert!(function_statements(air.function(body)).any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. } if matches!(dst.root, PlaceRoot::LambdaCapture(_)) && !dst.projection.is_empty())
+        }));
     }
 
     #[test]
@@ -12254,18 +12263,15 @@ fn main() {}
     }
 
     #[test]
-    fn escaping_projected_mutable_capture_is_named_gap() {
+    fn escaping_projected_mutable_capture_assignment_lowers_to_capture_cell_projection() {
         let source =
             "struct Point { x: int } fn make() -> fn() { var p = Point { x: 0 }; || { p.x = 1; } }";
-        let err = lower_root(source, "make").expect_err("projected capture should gap");
+        let air = lower_root(source, "make").expect("lower failed");
+        let body = air.lambdas[0].body;
 
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedExpr {
-                kind: "UnsupportedLambdaCapture",
-                ..
-            }
-        ));
+        assert!(function_statements(air.function(body)).any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. } if matches!(dst.root, PlaceRoot::LambdaCapture(_)) && !dst.projection.is_empty())
+        }));
     }
 
     #[test]

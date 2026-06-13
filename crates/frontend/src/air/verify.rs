@@ -4175,7 +4175,7 @@ fn verify_air_place_write(
     state: &LocalInit,
 ) {
     for projection in &place.projection {
-        if let Projection::Index(local) = projection {
+        if let Projection::Index(local) | Projection::MapIndex(local) = projection {
             verify_air_local_read(cx, function_id, index, *local, state);
         }
     }
@@ -5120,14 +5120,6 @@ fn verify_mutable_place(
     if place_crosses_dataref(cx.program, function_id, place) {
         return;
     }
-    if let Some(cell) = cx.program.capture_cell_root(function_id, place.root)
-        && !place.projection.is_empty()
-    {
-        cx.push(
-            site.clone(),
-            VerifyErrorKind::BadPlace(BadPlace::UnsupportedCaptureCellProjection(cell)),
-        );
-    }
     if place_mutability(cx.program, function_id, place.root) == Some(Mutability::Immutable) {
         cx.push(
             site.clone(),
@@ -5560,6 +5552,7 @@ fn projection_ty(program: &Program, ty: TypeId, projection: &Projection) -> Opti
             typing::enum_variant_field(program, ty, *variant, *field)
         }
         Projection::Index(_) => typing::index_elem(program, ty),
+        Projection::MapIndex(_) => typing::map_slot(program, ty).map(|(_, slot)| slot),
     }
 }
 
@@ -5588,17 +5581,6 @@ fn verify_place(
         );
         return None;
     }
-    if !place.projection.is_empty()
-        && !matches!(cx.program.type_data(current_ty), TypeData::DataRef(_))
-        && let Some(borrow) = cx.program.scoped_borrow_root(function_id, place.root)
-    {
-        cx.push(
-            site,
-            VerifyErrorKind::BadPlace(BadPlace::UnsupportedScopedBorrowProjection(borrow)),
-        );
-        return None;
-    }
-
     for proj in &place.projection {
         let Some(data) = cx.type_data(current_ty) else {
             cx.push(
@@ -5768,6 +5750,36 @@ fn verify_place(
                     return None;
                 }
                 current_ty = elem;
+            }
+            Projection::MapIndex(local) => {
+                let Some(key_local) = cx.program.function(function_id).locals.get(local.index())
+                else {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadReference(BadReference::InvalidLocal(*local)),
+                    );
+                    return None;
+                };
+                let Some((key, slot)) = typing::map_slot(cx.program, current_ty) else {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadPlace(BadPlace::IndexProjectionOnNonIndexable(
+                            current_ty,
+                        )),
+                    );
+                    return None;
+                };
+                if key_local.ty != key {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadPlace(BadPlace::IndexLocalTypeMismatch {
+                            expected: key,
+                            found: key_local.ty,
+                        }),
+                    );
+                    return None;
+                }
+                current_ty = slot;
             }
         }
     }

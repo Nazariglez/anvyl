@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs: [int] = [1, 2, 3];
+    xs[1] = 4;
+
+    let i = 2;
+    xs[i] = xs[0];
+}
