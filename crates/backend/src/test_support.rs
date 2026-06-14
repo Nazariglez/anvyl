@@ -50,12 +50,36 @@ pub(crate) fn place(local: air::LocalId, ty: air::TypeId) -> Place {
 }
 
 pub(crate) fn root_module() -> air::Module {
-    air::Module {
-        path: vec![],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
-    }
+    air::Module::default()
+}
+
+pub(crate) fn global_with_init(
+    program: &mut air::Program,
+    module: air::ModuleId,
+    name: &str,
+    ty: air::TypeId,
+    mutability: Mutability,
+) -> air::GlobalId {
+    let (global, _) = program.alloc_global_with_init(|global, init| {
+        (
+            air::GlobalDecl {
+                name: Ident::new(name),
+                module,
+                ty,
+                mutability,
+                init,
+            },
+            air::Function {
+                name: Ident::new(name),
+                module,
+                kind: air::FunctionKind::GlobalInit(global),
+                owner: None,
+                specialization: None,
+                signature: air::Signature::new(vec![], ty),
+                locals: vec![],
+                body: structured_body(vec![], air::AirTail::Unreachable),
+            },
+        )
+    });
+    global
 }

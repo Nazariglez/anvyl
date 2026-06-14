@@ -1,5 +1,5 @@
 use anvyx_frontend::air::{
-    AirBlock, AirStmt, AirTail, CallArg, Callee, ExternId, FunctionId, FunctionKind,
+    AirBlock, AirStmt, AirTail, CallArg, Callee, ExternId, FunctionId, FunctionKind, GlobalId,
     LambdaCaptureArg, Operand, ParamMode, Place, PlaceRoot, Program, RValue, TypeData, TypeId,
     TypePassClass, TypePassClasses, VerifiedProgram,
 };
@@ -34,6 +34,7 @@ pub struct VmCompileError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmCompileErrorSite {
     Function(FunctionId),
+    Global(GlobalId),
     Extern(ExternId),
 }
 
@@ -46,7 +47,7 @@ pub enum VmCompileErrorKind {
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
     UnsupportedCollectionLoan,
-    UnsupportedPlaceRoot,
+    UnsupportedGlobal,
     NonCheapValueParam,
     NonCheapValueArg,
 }
@@ -59,6 +60,12 @@ struct CompileCx<'a> {
 
 impl CompileCx<'_> {
     fn compile(&mut self) -> VirProgram {
+        for index in 0..self.program.globals.len() {
+            self.push_global(
+                GlobalId::from_index(index),
+                VmCompileErrorKind::UnsupportedGlobal,
+            );
+        }
         let functions = self
             .program
             .functions
@@ -66,8 +73,17 @@ impl CompileCx<'_> {
             .enumerate()
             .map(|(index, function)| {
                 let id = FunctionId::from_index(index);
-                if matches!(function.kind, FunctionKind::Lambda(_)) {
-                    self.push_function(id, VmCompileErrorKind::UnsupportedLambdaValue);
+                match function.kind {
+                    FunctionKind::Lambda(_) => {
+                        self.push_function(id, VmCompileErrorKind::UnsupportedLambdaValue);
+                    }
+                    FunctionKind::GlobalInit(_) => {
+                        self.push_function(id, VmCompileErrorKind::UnsupportedGlobal);
+                    }
+                    FunctionKind::Normal
+                    | FunctionKind::Method
+                    | FunctionKind::ExtendMethod
+                    | FunctionKind::Helper => {}
                 }
                 if self.type_contains_function(function.signature.return_type()) {
                     self.push_function(id, VmCompileErrorKind::UnsupportedLambdaType);
@@ -143,6 +159,16 @@ impl CompileCx<'_> {
                         calls.push(call);
                     }
                 }
+                AirStmt::GlobalEnsure { .. } => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
+                }
+                AirStmt::GlobalSetRoot { value, .. } => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
+                    self.check_rvalue(function, value);
+                    if let Some(call) = self.compile_rvalue_call(function, value) {
+                        calls.push(call);
+                    }
+                }
                 AirStmt::If(branch) => {
                     self.check_operand(function, &branch.cond);
                     self.check_block(function, &branch.then_block, calls);
@@ -205,7 +231,7 @@ impl CompileCx<'_> {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
             }
             PlaceRoot::Global(_) => {
-                self.push_function(function, VmCompileErrorKind::UnsupportedPlaceRoot);
+                self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
             }
             PlaceRoot::Local(_) => {}
         }
@@ -362,6 +388,13 @@ impl CompileCx<'_> {
     fn push_extern(&mut self, ext: ExternId, kind: VmCompileErrorKind) {
         self.errors.push(VmCompileError {
             site: VmCompileErrorSite::Extern(ext),
+            kind,
+        });
+    }
+
+    fn push_global(&mut self, global: GlobalId, kind: VmCompileErrorKind) {
+        self.errors.push(VmCompileError {
+            site: VmCompileErrorSite::Global(global),
             kind,
         });
     }

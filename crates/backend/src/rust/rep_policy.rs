@@ -1189,14 +1189,7 @@ mod tests {
     fn air_policy_shares_aggregates_with_shareable_fields() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
-        let module = program.alloc_module(air::Module {
-            path: vec![],
-            functions: vec![],
-            aggregates: vec![],
-            enums: vec![],
-            extern_types: vec![],
-            externs: vec![],
-        });
+        let module = program.alloc_module(air::Module::default());
         let aggregate = program.alloc_aggregate(air::AggregateDecl {
             name: Ident::new("Label"),
             module,
@@ -1222,14 +1215,7 @@ mod tests {
     fn air_policy_treats_datarefs_as_shared_handles_not_copy_payloads() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
-        let module = program.alloc_module(air::Module {
-            path: vec![],
-            functions: vec![],
-            aggregates: vec![],
-            enums: vec![],
-            extern_types: vec![],
-            externs: vec![],
-        });
+        let module = program.alloc_module(air::Module::default());
         let aggregate = program.alloc_aggregate(air::AggregateDecl {
             name: Ident::new("Node"),
             module,

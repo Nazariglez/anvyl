@@ -13,7 +13,7 @@ use super::{
     compile::{VmCompileError, VmCompileErrorKind, VmCompileErrorSite, VmCompiler},
     runtime::{ExternDispatcher, NoExterns, unsupported_callback},
 };
-use crate::test_support::{local, param, place, root_module, structured_body};
+use crate::test_support::{global_with_init, local, param, place, root_module, structured_body};
 
 #[test]
 fn compiler_lowers_value_and_shared_borrow_modes() {
@@ -545,12 +545,7 @@ fn compiler_rejects_global_roots() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
-    let global = program.alloc_global(air::GlobalDecl {
-        name: Ident::new("g"),
-        module,
-        ty: int,
-        mutability: Mutability::Immutable,
-    });
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Immutable);
     let func = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
@@ -574,7 +569,7 @@ fn compiler_rejects_global_roots() {
     assert!(has_compile_error(
         &errors,
         func,
-        VmCompileErrorKind::UnsupportedPlaceRoot
+        VmCompileErrorKind::UnsupportedGlobal
     ));
 }
 

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
-        EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, Local, LocalId,
+        EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, GlobalId, Local, LocalId,
         LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, PlaceRoot,
         Program, Projection, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
         VariantShape, VerifiedProgram,
@@ -62,6 +62,7 @@ pub enum ProfileSite {
     Type(TypeId),
     Const(ConstId),
     Module(usize),
+    Global(GlobalId),
     Function(FunctionId),
     Extern(ExternId),
     Local(FunctionId, LocalId),
@@ -82,7 +83,6 @@ pub enum ProfileErrorKind {
     UnsupportedReturnMode,
     UnsupportedLocalKind,
     UnsupportedPlaceProjection,
-    UnsupportedPlaceRoot,
     UnsupportedTerminator,
     UnsupportedRValue,
     UnsupportedCallee,
@@ -94,6 +94,7 @@ pub enum ProfileErrorKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
+    UnsupportedGlobal,
     UnsupportedMutablePlace,
     UnsupportedCollectionLoan,
     UnsupportedMutablePlaceProjection,
@@ -115,7 +116,7 @@ fn unsupported_place_root(root: PlaceRoot) -> ProfileErrorKind {
         PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
             ProfileErrorKind::UnsupportedLambdaCapture
         }
-        PlaceRoot::Global(_) => ProfileErrorKind::UnsupportedPlaceRoot,
+        PlaceRoot::Global(_) => ProfileErrorKind::UnsupportedGlobal,
         PlaceRoot::Local(_) => unreachable!("local roots are supported"),
     }
 }
@@ -131,6 +132,12 @@ impl ProfileCx<'_> {
         }
         for (index, module) in self.program.modules.iter().enumerate() {
             self.check_module(index, module);
+        }
+        for index in 0..self.program.globals.len() {
+            self.push(
+                ProfileSite::Global(GlobalId::from_index(index)),
+                ProfileErrorKind::UnsupportedGlobal,
+            );
         }
         for index in 0..self.program.externs.len() {
             let id = ExternId::from_index(index);
@@ -274,14 +281,20 @@ impl ProfileCx<'_> {
     }
 
     fn check_function(&mut self, id: FunctionId, function: &Function) {
-        if !matches!(
-            function.kind,
-            FunctionKind::Normal | FunctionKind::Method | FunctionKind::Lambda(_)
-        ) {
-            self.push(
-                ProfileSite::Function(id),
-                ProfileErrorKind::UnsupportedFunctionKind,
-            );
+        match function.kind {
+            FunctionKind::GlobalInit(_) => {
+                self.push(
+                    ProfileSite::Function(id),
+                    ProfileErrorKind::UnsupportedGlobal,
+                );
+            }
+            FunctionKind::Normal | FunctionKind::Method | FunctionKind::Lambda(_) => {}
+            FunctionKind::ExtendMethod | FunctionKind::Helper => {
+                self.push(
+                    ProfileSite::Function(id),
+                    ProfileErrorKind::UnsupportedFunctionKind,
+                );
+            }
         }
         if let FunctionKind::Lambda(lambda) = function.kind {
             match self.program.lambdas.get(lambda.index()) {
@@ -359,6 +372,10 @@ impl ProfileCx<'_> {
                 }
                 air::AirStmt::Assign { dst, value } => {
                     self.check_rvalue(site, value);
+                    if matches!(dst.root, PlaceRoot::Global(_)) {
+                        self.check_place(site, dst);
+                        continue;
+                    }
                     if !dst.projection.is_empty()
                         && !self.place_crosses_dataref(site, dst)
                         && (self.place_capture_cell(site, dst).is_some()
@@ -368,6 +385,13 @@ impl ProfileCx<'_> {
                         continue;
                     }
                     self.check_place(site, dst);
+                }
+                air::AirStmt::GlobalEnsure { .. } => {
+                    self.push(site, ProfileErrorKind::UnsupportedGlobal);
+                }
+                air::AirStmt::GlobalSetRoot { value, .. } => {
+                    self.check_rvalue(site, value);
+                    self.push(site, ProfileErrorKind::UnsupportedGlobal);
                 }
                 air::AirStmt::If(branch) => {
                     self.check_operand(site, &branch.cond);
@@ -1054,6 +1078,10 @@ impl ProfileCx<'_> {
             }
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
+                if matches!(place.root, PlaceRoot::Global(_)) {
+                    self.check_place(site, place);
+                    return;
+                }
                 let Some(expected) = expected else {
                     self.check_place(site, place);
                     self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
@@ -1332,6 +1360,7 @@ impl ProfileCx<'_> {
             | ProfileSite::Type(_)
             | ProfileSite::Const(_)
             | ProfileSite::Module(_)
+            | ProfileSite::Global(_)
             | ProfileSite::Extern(_) => None,
         }
     }

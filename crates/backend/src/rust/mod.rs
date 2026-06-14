@@ -146,6 +146,7 @@ pub enum RustTargetGapSite {
     Type(TypeId),
     Const(ConstId),
     Module(usize),
+    Global(air::GlobalId),
     Function(FunctionId),
     Extern(ExternId),
     Local(FunctionId, LocalId),
@@ -166,7 +167,6 @@ pub enum RustTargetGapKind {
     UnsupportedReturnMode,
     UnsupportedLocalKind,
     UnsupportedPlaceProjection,
-    UnsupportedPlaceRoot,
     UnsupportedTerminator,
     UnsupportedRValue,
     UnsupportedCallee,
@@ -179,6 +179,7 @@ pub enum RustTargetGapKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
+    UnsupportedGlobal,
     NonCopyValueRequired,
     UnsupportedStructuralStringify,
     UnsupportedContextBorrowAcrossCall,
@@ -207,6 +208,7 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileSite::Type(id) => RustTargetGapSite::Type(id),
                 ProfileSite::Const(id) => RustTargetGapSite::Const(id),
                 ProfileSite::Module(index) => RustTargetGapSite::Module(index),
+                ProfileSite::Global(id) => RustTargetGapSite::Global(id),
                 ProfileSite::Function(id) => RustTargetGapSite::Function(id),
                 ProfileSite::Extern(id) => RustTargetGapSite::Extern(id),
                 ProfileSite::Local(function, local) => RustTargetGapSite::Local(function, local),
@@ -233,7 +235,6 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedPlaceProjection => {
                     RustTargetGapKind::UnsupportedPlaceProjection
                 }
-                ProfileErrorKind::UnsupportedPlaceRoot => RustTargetGapKind::UnsupportedPlaceRoot,
                 ProfileErrorKind::UnsupportedTerminator => RustTargetGapKind::UnsupportedTerminator,
                 ProfileErrorKind::UnsupportedRValue => RustTargetGapKind::UnsupportedRValue,
                 ProfileErrorKind::UnsupportedCallee => RustTargetGapKind::UnsupportedCallee,
@@ -253,6 +254,7 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedLambdaExternBoundary => {
                     RustTargetGapKind::UnsupportedLambdaExternBoundary
                 }
+                ProfileErrorKind::UnsupportedGlobal => RustTargetGapKind::UnsupportedGlobal,
                 ProfileErrorKind::UnsupportedMutablePlace => {
                     RustTargetGapKind::UnsupportedMutablePlace
                 }
@@ -1774,6 +1776,9 @@ impl<'a> PlanCx<'a> {
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Eval(planned.value));
                 Ok(stmts)
+            }
+            air::AirStmt::GlobalEnsure { .. } | air::AirStmt::GlobalSetRoot { .. } => {
+                unreachable!("AIR globals are rejected by the Rust backend profile")
             }
             air::AirStmt::If(branch) => {
                 let cond = self.plan_operand_read(function, &branch.cond, locals);

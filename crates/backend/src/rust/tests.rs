@@ -4,10 +4,10 @@ use anvyx_frontend::{
         self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
         CaptureCellDecl, CaptureLocalSource, ConstData, ConstValue, EnumDecl, ExternBindingDecl,
         ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
-        FunctionId, FunctionKind, FunctionSpecialization, GlobalDecl, LambdaDecl, LambdaEscape,
-        Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
-        PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature, TypeData, VariantDecl,
-        VariantId, VariantShape,
+        FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl, LambdaEscape, Local,
+        LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot,
+        Program, Projection, RValue, RawEnumValue, Signature, TypeData, VariantDecl, VariantId,
+        VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -40,8 +40,8 @@ use super::{
     target,
 };
 use crate::test_support::{
-    immutable_local as local, mutable_local as mut_local, param, place, root_module,
-    structured_body,
+    global_with_init, immutable_local as local, mutable_local as mut_local, param, place,
+    root_module, structured_body,
 };
 
 #[test]
@@ -987,16 +987,11 @@ fn profile_accepts_dataref_field_projections() {
 }
 
 #[test]
-fn profile_rejects_non_local_place_roots() {
+fn profile_rejects_global_roots() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
-    let global = program.alloc_global(GlobalDecl {
-        name: Ident::new("g"),
-        module,
-        ty: int,
-        mutability: Mutability::Mutable,
-    });
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Mutable);
     let function = Function {
         name: Ident::new("f"),
         module,
@@ -1018,7 +1013,59 @@ fn profile_rejects_non_local_place_roots() {
     program.module_mut(module).functions.push(id);
     program.set_entry(id);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedPlaceRoot);
+    let errors = profile_errors(program);
+    assert_profile_error(
+        &errors,
+        ProfileSite::Terminator(id),
+        ProfileErrorKind::UnsupportedGlobal,
+    );
+}
+
+#[test]
+fn profile_rejects_global_statements_at_statement_site() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Mutable);
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::GlobalSetRoot {
+                    global,
+                    value: RValue::Use(Operand::Const(value)),
+                    init: air::GlobalInitEffect::StoreWithoutInit,
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Const(value))),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    let errors = profile_errors(program);
+    assert_profile_error(
+        &errors,
+        ProfileSite::Statement(id, 0),
+        ProfileErrorKind::UnsupportedGlobal,
+    );
+    assert_profile_error(
+        &errors,
+        ProfileSite::Statement(id, 1),
+        ProfileErrorKind::UnsupportedGlobal,
+    );
 }
 
 #[test]
@@ -16930,6 +16977,19 @@ fn has_error(errors: &[RustBackendProfileError], kind: ProfileErrorKind) -> bool
     errors.iter().any(|error| error.kind == kind)
 }
 
+fn assert_profile_error(
+    errors: &[RustBackendProfileError],
+    site: ProfileSite,
+    kind: ProfileErrorKind,
+) {
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.site == site && error.kind == kind),
+        "missing profile error {kind:?} at {site:?}: {errors:?}"
+    );
+}
+
 fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
     use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
 
@@ -17102,11 +17162,7 @@ fn runtime_module() -> air::Module {
 fn air_module(path: &[&str]) -> air::Module {
     air::Module {
         path: path.iter().map(|segment| Ident::new(*segment)).collect(),
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
+        ..air::Module::default()
     }
 }
 
