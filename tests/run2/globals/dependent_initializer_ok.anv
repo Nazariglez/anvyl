@@ -1,0 +1,11 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 12
+
+lazy let base = 5;
+lazy let total = base + 7;
+
+fn main() {
+    println(total);
+}

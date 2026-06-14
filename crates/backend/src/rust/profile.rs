@@ -94,7 +94,13 @@ pub enum ProfileErrorKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
-    UnsupportedGlobal,
+    UnsupportedGlobalType,
+    UnsupportedGlobalAccess,
+    UnsupportedGlobalBorrow,
+    UnsupportedGlobalProjection,
+    UnsupportedGlobalInitializer,
+    UnsupportedGlobalValueRead,
+    UnsupportedGlobalRooting,
     UnsupportedMutablePlace,
     UnsupportedCollectionLoan,
     UnsupportedMutablePlaceProjection,
@@ -116,8 +122,16 @@ fn unsupported_place_root(root: PlaceRoot) -> ProfileErrorKind {
         PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
             ProfileErrorKind::UnsupportedLambdaCapture
         }
-        PlaceRoot::Global(_) => ProfileErrorKind::UnsupportedGlobal,
+        PlaceRoot::Global(_) => unreachable!("global roots require use-site gap classification"),
         PlaceRoot::Local(_) => unreachable!("local roots are supported"),
+    }
+}
+
+fn unsupported_global_place(place: &Place, root: ProfileErrorKind) -> ProfileErrorKind {
+    if place.projection.is_empty() {
+        root
+    } else {
+        ProfileErrorKind::UnsupportedGlobalProjection
     }
 }
 
@@ -134,10 +148,8 @@ impl ProfileCx<'_> {
             self.check_module(index, module);
         }
         for index in 0..self.program.globals.len() {
-            self.push(
-                ProfileSite::Global(GlobalId::from_index(index)),
-                ProfileErrorKind::UnsupportedGlobal,
-            );
+            let id = GlobalId::from_index(index);
+            self.check_global(id, &self.program.globals[index]);
         }
         for index in 0..self.program.externs.len() {
             let id = ExternId::from_index(index);
@@ -147,6 +159,48 @@ impl ProfileCx<'_> {
             let id = FunctionId::from_index(index);
             self.check_function(id, self.program.function(id));
         }
+    }
+
+    fn check_global(&mut self, id: GlobalId, decl: &air::GlobalDecl) {
+        if let Some(gap) = self.global_payload_gap(decl.ty) {
+            self.push(ProfileSite::Global(id), gap);
+        }
+    }
+
+    fn global_payload_gap(&self, ty: TypeId) -> Option<ProfileErrorKind> {
+        match self.program.type_arena.data(ty) {
+            TypeData::Int | TypeData::Float | TypeData::Bool => None,
+            TypeData::String
+            | TypeData::Optional(_)
+            | TypeData::Tuple(_)
+            | TypeData::List(_)
+            | TypeData::Array { .. }
+            | TypeData::Map { .. }
+            | TypeData::Slice(_)
+            | TypeData::Aggregate(_)
+            | TypeData::Enum(_)
+            | TypeData::DataRef(_)
+            | TypeData::Extern(_) => Some(ProfileErrorKind::UnsupportedGlobalRooting),
+            TypeData::Void | TypeData::Any | TypeData::Function(_) | TypeData::Dyn(_) => {
+                Some(ProfileErrorKind::UnsupportedGlobalType)
+            }
+        }
+    }
+
+    fn global_supported(&self, global: GlobalId) -> bool {
+        self.program
+            .globals
+            .get(global.index())
+            .is_some_and(|decl| self.global_payload_gap(decl.ty).is_none())
+    }
+
+    fn global_root_set_supported(&self, global: GlobalId) -> bool {
+        self.program
+            .globals
+            .get(global.index())
+            .is_some_and(|decl| {
+                decl.mutability == Mutability::Mutable && self.global_payload_gap(decl.ty).is_none()
+            })
     }
 
     fn check_entry(&mut self) {
@@ -282,11 +336,13 @@ impl ProfileCx<'_> {
 
     fn check_function(&mut self, id: FunctionId, function: &Function) {
         match function.kind {
-            FunctionKind::GlobalInit(_) => {
-                self.push(
-                    ProfileSite::Function(id),
-                    ProfileErrorKind::UnsupportedGlobal,
-                );
+            FunctionKind::GlobalInit(global) => {
+                if !self.global_supported(global) {
+                    self.push(
+                        ProfileSite::Function(id),
+                        ProfileErrorKind::UnsupportedGlobalInitializer,
+                    );
+                }
             }
             FunctionKind::Normal | FunctionKind::Method | FunctionKind::Lambda(_) => {}
             FunctionKind::ExtendMethod | FunctionKind::Helper => {
@@ -373,7 +429,13 @@ impl ProfileCx<'_> {
                 air::AirStmt::Assign { dst, value } => {
                     self.check_rvalue(site, value);
                     if matches!(dst.root, PlaceRoot::Global(_)) {
-                        self.check_place(site, dst);
+                        self.push(
+                            site,
+                            unsupported_global_place(
+                                dst,
+                                ProfileErrorKind::UnsupportedGlobalRooting,
+                            ),
+                        );
                         continue;
                     }
                     if !dst.projection.is_empty()
@@ -386,12 +448,16 @@ impl ProfileCx<'_> {
                     }
                     self.check_place(site, dst);
                 }
-                air::AirStmt::GlobalEnsure { .. } => {
-                    self.push(site, ProfileErrorKind::UnsupportedGlobal);
+                air::AirStmt::GlobalEnsure { global } => {
+                    if !self.global_supported(*global) {
+                        self.push(site, ProfileErrorKind::UnsupportedGlobalAccess);
+                    }
                 }
-                air::AirStmt::GlobalSetRoot { value, .. } => {
+                air::AirStmt::GlobalSetRoot { global, value, .. } => {
                     self.check_rvalue(site, value);
-                    self.push(site, ProfileErrorKind::UnsupportedGlobal);
+                    if !self.global_root_set_supported(*global) {
+                        self.push(site, ProfileErrorKind::UnsupportedGlobalRooting);
+                    }
                 }
                 air::AirStmt::If(branch) => {
                     self.check_operand(site, &branch.cond);
@@ -506,8 +572,15 @@ impl ProfileCx<'_> {
                 .current_lambda_capture(site, slot)
                 .map(|capture| matches!(capture, air::LambdaCaptureDecl::CaptureCell { .. })),
             PlaceRoot::CaptureCell(_) => Some(true),
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::ScopedBorrow(_) => {
                 self.push(site, unsupported_place_root(place.root));
+                None
+            }
+            PlaceRoot::Global(_) => {
+                self.push(
+                    site,
+                    unsupported_global_place(place, ProfileErrorKind::UnsupportedGlobalRooting),
+                );
                 None
             }
         }
@@ -1071,6 +1144,13 @@ impl ProfileCx<'_> {
                 }
             }
             CallArg::SharedBorrow(place) => {
+                if matches!(place.root, PlaceRoot::Global(_)) {
+                    self.push(
+                        site,
+                        unsupported_global_place(place, ProfileErrorKind::UnsupportedGlobalBorrow),
+                    );
+                    return;
+                }
                 self.check_place(site, place);
                 if self.place_capture_cell(site, place).is_some() {
                     self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
@@ -1079,7 +1159,10 @@ impl ProfileCx<'_> {
             CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
                 if matches!(place.root, PlaceRoot::Global(_)) {
-                    self.check_place(site, place);
+                    self.push(
+                        site,
+                        unsupported_global_place(place, ProfileErrorKind::UnsupportedGlobalBorrow),
+                    );
                     return;
                 }
                 let Some(expected) = expected else {
@@ -1254,9 +1337,24 @@ impl ProfileCx<'_> {
                 };
                 ty
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => {
+            PlaceRoot::ScopedBorrow(_) => {
                 self.push(site, unsupported_place_root(place.root));
                 return;
+            }
+            PlaceRoot::Global(global) => {
+                let Some(decl) = self.program.globals.get(global.index()) else {
+                    self.push(site, ProfileErrorKind::UnsupportedGlobalAccess);
+                    return;
+                };
+                if !place.projection.is_empty() {
+                    self.push(site, ProfileErrorKind::UnsupportedGlobalProjection);
+                    return;
+                }
+                if self.global_payload_gap(decl.ty).is_some() {
+                    self.push(site, ProfileErrorKind::UnsupportedGlobalValueRead);
+                    return;
+                }
+                decl.ty
             }
         };
         for projection in &place.projection {

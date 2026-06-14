@@ -31,6 +31,7 @@ macro_rules! rir_id {
 
 rir_id!(RirFunctionId);
 rir_id!(RirExternId);
+rir_id!(RirGlobalId);
 rir_id!(RirTypeId);
 rir_id!(RirConstId);
 rir_id!(RirLocalId);
@@ -65,6 +66,7 @@ impl RirSymbol {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RirProgram {
     pub ctx: RirCtxPlan,
+    pub globals: Vec<RirGlobal>,
     pub functions: Vec<RirFunction>,
     pub externs: Vec<RirExtern>,
     pub types: Vec<RirType>,
@@ -87,6 +89,18 @@ impl RirProgram {
     pub fn lambdas_for_sig(&self, sig: RirLambdaSigId) -> impl Iterator<Item = &RirLambda> {
         self.lambdas.iter().filter(move |lambda| lambda.sig == sig)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirGlobal {
+    pub id: RirGlobalId,
+    pub air_id: air::GlobalId,
+    pub module: air::ModuleId,
+    pub name: RirSymbol,
+    pub slot_symbol: RirSymbol,
+    pub ty: RirTypeId,
+    pub mutable: bool,
+    pub init: RirFunctionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,13 +361,15 @@ pub struct RirStringifyHelper {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirCtxPlan {
-    pub symbol: RirSymbol,
+    pub types_symbol: RirSymbol,
+    pub globals_symbol: RirSymbol,
 }
 
 impl Default for RirCtxPlan {
     fn default() -> Self {
         Self {
-            symbol: RirSymbol::new("AnvCtx"),
+            types_symbol: RirSymbol::new("AnvTypes"),
+            globals_symbol: RirSymbol::new("AnvGlobals"),
         }
     }
 }
@@ -421,6 +437,13 @@ pub struct RirLocal {
 pub enum RirStmt {
     Init {
         local: RirLocalId,
+        value: RirRValue,
+    },
+    GlobalEnsure {
+        global: RirGlobalId,
+    },
+    GlobalSetRoot {
+        global: RirGlobalId,
         value: RirRValue,
     },
     Assign {
@@ -808,9 +831,12 @@ impl RirMutPlaceArg {
     }
 
     pub fn local(place: RirPlace) -> Self {
+        let RirPlaceRoot::Local(local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
         Self {
             root: RirMutPlaceRoot::Local {
-                local: place.local,
+                local,
                 ty: place.ty,
             },
             projections: place.projections,
@@ -864,11 +890,35 @@ impl RirMutPlaceArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirPlaceRoot {
+    Local(RirLocalId),
+    Global(RirGlobalId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirPlace {
-    pub local: RirLocalId,
+    pub root: RirPlaceRoot,
     pub projections: Vec<RirProjection>,
     pub ty: RirTypeId,
+}
+
+impl RirPlace {
+    pub fn local(local: RirLocalId, projections: Vec<RirProjection>, ty: RirTypeId) -> Self {
+        Self {
+            root: RirPlaceRoot::Local(local),
+            projections,
+            ty,
+        }
+    }
+
+    pub fn global(global: RirGlobalId, projections: Vec<RirProjection>, ty: RirTypeId) -> Self {
+        Self {
+            root: RirPlaceRoot::Global(global),
+            projections,
+            ty,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1000,6 +1050,7 @@ pub struct RirVerifyError {
 pub enum RirVerifySite {
     Program,
     Context,
+    Global(RirGlobalId),
     Type(RirTypeId),
     Const(RirConstId),
     Extern(RirExternId),
@@ -1122,7 +1173,7 @@ struct ActiveRirCollectionLoan {
 }
 
 fn place_prefix(prefix: &RirPlace, place: &RirPlace) -> bool {
-    prefix.local == place.local
+    prefix.root == place.root
         && prefix.projections.len() <= place.projections.len()
         && prefix
             .projections
@@ -1304,7 +1355,9 @@ impl VerifyCx<'_> {
         if let Some(entry) = self.program.entry {
             self.check_function_id(RirVerifySite::Program, entry);
         }
-        if self.program.ctx.symbol.as_str().is_empty() {
+        if self.program.ctx.types_symbol.as_str().is_empty()
+            || self.program.ctx.globals_symbol.as_str().is_empty()
+        {
             self.push(RirVerifySite::Context, RirVerifyErrorKind::BadId);
         }
         for (index, ty) in self.program.types.iter().enumerate() {
@@ -1333,6 +1386,7 @@ impl VerifyCx<'_> {
                 _ => {}
             }
         }
+        self.check_globals();
         self.check_lambda_sigs();
         self.check_lambdas();
         self.check_lambda_envs();
@@ -1364,6 +1418,51 @@ impl VerifyCx<'_> {
                 self.push(RirVerifySite::Function(id), RirVerifyErrorKind::BadId);
             }
             self.check_function(id, function);
+        }
+    }
+
+    fn check_globals(&mut self) {
+        let mut slots = std::collections::HashSet::new();
+        for (index, global) in self.program.globals.iter().enumerate() {
+            let id = RirGlobalId::from_index(index);
+            let site = RirVerifySite::Global(id);
+            if global.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            self.check_type_id(site, global.ty);
+            if !matches!(
+                self.ty(global.ty),
+                Some(RirType::Int | RirType::Float | RirType::Bool)
+            ) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
+            self.check_function_id(site, global.init);
+            if let Some(function) = self.program.functions.get(global.init.index()) {
+                if function.ret.ty != global.ty {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: global.ty,
+                            found: function.ret.ty,
+                        },
+                    );
+                }
+                if !function.params.is_empty() {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::CallArgCount {
+                            expected: 0,
+                            found: function.params.len(),
+                        },
+                    );
+                }
+            }
+            if global.name.as_str().is_empty() || global.slot_symbol.as_str().is_empty() {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            if !slots.insert(global.slot_symbol.as_str()) {
+                self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+            }
         }
     }
 
@@ -2510,17 +2609,30 @@ impl VerifyCx<'_> {
                     *possible = true;
                 }
             }
-            RirStmt::Assign { dst, value } => {
-                self.check_place(site, function, dst);
-                if let Some(local) = function.locals.get(dst.local.index())
-                    && !local.mutable
-                {
+            RirStmt::GlobalEnsure { global } => {
+                self.check_global_id(site, *global);
+            }
+            RirStmt::GlobalSetRoot { global, value } => {
+                let Some(global_decl) = self.check_global_id(site, *global).cloned() else {
+                    self.check_rvalue(function_id, function, index, value, None);
+                    return;
+                };
+                if !global_decl.mutable {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
+                self.check_rvalue(function_id, function, index, value, Some(global_decl.ty));
+            }
+            RirStmt::Assign { dst, value } => {
+                self.check_place(site, function, dst);
+                let Some(dst_local) = self.local_root(site, dst) else {
+                    self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                    return;
+                };
+                self.check_mutable_local_root(site, function, Some(dst_local));
                 if self.assignment_replaces_active_collection_root(dst) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                if let Some(local) = function.locals.get(dst.local.index())
+                if let Some(local) = function.locals.get(dst_local.index())
                     && !self.projected_mut_place_arg_supported(local.ty, &dst.projections, true)
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -2528,7 +2640,7 @@ impl VerifyCx<'_> {
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
                 if dst.projections.is_empty() {
                     let escape = self.rvalue_lambda_escape(function, value);
-                    self.set_local_lambda_escape(function, dst.local, escape);
+                    self.set_local_lambda_escape(function, dst_local, escape);
                 }
             }
             RirStmt::CellInit { cell, value } => {
@@ -2592,6 +2704,11 @@ impl VerifyCx<'_> {
             }
             RirStmt::MapValueSet { map, index, value } => {
                 self.check_place(site, function, map);
+                let Some(map_local) = self.local_root(site, map) else {
+                    self.check_local_id(site, function, *index);
+                    self.check_value_operand_ty(site, function, value, map.ty);
+                    return;
+                };
                 self.check_local_id(site, function, *index);
                 let Some(RirType::Map {
                     value: value_ty, ..
@@ -2600,13 +2717,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if function
-                    .locals
-                    .get(map.local.index())
-                    .is_some_and(|local| !local.mutable)
-                {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
-                }
+                self.check_mutable_local_root(site, function, Some(map_local));
                 if function
                     .locals
                     .get(index.index())
@@ -2745,6 +2856,7 @@ impl VerifyCx<'_> {
                 self.merge_structured_states(states);
             }
             RirStmt::OptionMatch(match_) => {
+                let discr_local = self.local_root(site, &match_.discr);
                 self.check_place(site, function, &match_.discr);
                 let inner = match self.ty(match_.discr.ty) {
                     Some(RirType::Option(inner)) => Some(inner),
@@ -2821,10 +2933,7 @@ impl VerifyCx<'_> {
                     }
                 }
                 if match_.payload_ref
-                    && function
-                        .locals
-                        .get(match_.discr.local.index())
-                        .is_some_and(|local| !local.mutable)
+                    && discr_local.is_some_and(|local| Self::local_root_immutable(function, local))
                 {
                     self.push(
                         site,
@@ -2911,19 +3020,19 @@ impl VerifyCx<'_> {
         let RirOperand::Place(place) = operand else {
             return None;
         };
+        let RirPlaceRoot::Local(local) = place.root else {
+            return None;
+        };
         if !place.projections.is_empty()
             || !matches!(self.ty(place.ty), Some(RirType::Lambda(_)))
             || function
                 .locals
-                .get(place.local.index())
+                .get(local.index())
                 .is_none_or(|local| local.ty != place.ty)
         {
             return None;
         }
-        self.lambda_escapes
-            .get(place.local.index())
-            .copied()
-            .flatten()
+        self.lambda_escapes.get(local.index()).copied().flatten()
     }
 
     fn check_collection_loan_scope(
@@ -2934,6 +3043,7 @@ impl VerifyCx<'_> {
         scope: &RirCollectionLoanScope,
     ) {
         self.check_place(site, function, &scope.root);
+        self.check_collection_loan_root(site, &scope.root);
         let root_ty = self.ty(scope.root.ty);
         let compatible_root = matches!(
             (scope.root_kind, root_ty),
@@ -2984,12 +3094,53 @@ impl VerifyCx<'_> {
         self.merge_structured_states([state]);
     }
 
-    fn place_is_mutable_root(function: &RirFunction, place: &RirPlace) -> bool {
+    fn check_collection_loan_root(&mut self, site: RirVerifySite, root: &RirPlace) {
+        self.local_root(site, root);
+    }
+
+    fn local_root(&mut self, site: RirVerifySite, place: &RirPlace) -> Option<RirLocalId> {
+        match place.root {
+            RirPlaceRoot::Local(local) => Some(local),
+            RirPlaceRoot::Global(_) => {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                None
+            }
+        }
+    }
+
+    fn local_root_mutable(function: &RirFunction, local: RirLocalId) -> bool {
         function
             .locals
-            .get(place.local.index())
+            .get(local.index())
             .is_some_and(|local| local.mutable)
-            || Self::place_is_mut_place_param_root(function, place)
+    }
+
+    fn local_root_immutable(function: &RirFunction, local: RirLocalId) -> bool {
+        function
+            .locals
+            .get(local.index())
+            .is_some_and(|local| !local.mutable)
+    }
+
+    fn check_mutable_local_root(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        local: Option<RirLocalId>,
+    ) {
+        if local.is_some_and(|local| Self::local_root_immutable(function, local)) {
+            self.push(site, RirVerifyErrorKind::ImmutableAssign);
+        }
+    }
+
+    fn place_is_mutable_root(function: &RirFunction, place: &RirPlace) -> bool {
+        match place.root {
+            RirPlaceRoot::Local(local) => {
+                Self::local_root_mutable(function, local)
+                    || Self::place_is_mut_place_param_root(function, place)
+            }
+            RirPlaceRoot::Global(_) => false,
+        }
     }
 
     fn assignment_replaces_active_collection_root(&self, dst: &RirPlace) -> bool {
@@ -3086,6 +3237,8 @@ impl VerifyCx<'_> {
             RirStmt::Loop(_)
             | RirStmt::CollectionLoanScope(_)
             | RirStmt::Init { .. }
+            | RirStmt::GlobalEnsure { .. }
+            | RirStmt::GlobalSetRoot { .. }
             | RirStmt::Assign { .. }
             | RirStmt::CellInit { .. }
             | RirStmt::CellSet { .. }
@@ -3213,14 +3366,9 @@ impl VerifyCx<'_> {
                     self.check_lambda_capture_place(site, function, place, decl.ty);
                 }
                 (RirLambdaCaptureArg::Scoped { place }, RirParamSemantic::MutBorrow) => {
+                    let local = self.local_root(site, place);
                     self.check_lambda_capture_place(site, function, place, decl.ty);
-                    if !function
-                        .locals
-                        .get(place.local.index())
-                        .is_some_and(|local| local.mutable)
-                    {
-                        self.push(site, RirVerifyErrorKind::ImmutableAssign);
-                    }
+                    self.check_mutable_local_root(site, function, local);
                 }
                 (RirLambdaCaptureArg::StackCell { cell }, RirParamSemantic::StackCell) => {
                     let Some(expected) =
@@ -3635,14 +3783,9 @@ impl VerifyCx<'_> {
                 self.type_id(RirType::Int)
             }
             RirRValue::ListPush { list, value } => {
+                let list_local = self.local_root(site, list);
                 self.check_place(site, function, list);
-                if function
-                    .locals
-                    .get(list.local.index())
-                    .is_some_and(|local| !local.mutable)
-                {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
-                }
+                self.check_mutable_local_root(site, function, list_local);
                 let Some(RirType::List(elem)) = self.ty(list.ty) else {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
@@ -3666,13 +3809,9 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if *mutable
-                    && function
-                        .locals
-                        .get(source.local.index())
-                        .is_some_and(|local| !local.mutable)
-                {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                let source_local = self.local_root(site, source);
+                if *mutable {
+                    self.check_mutable_local_root(site, function, source_local);
                 }
                 if self.sequence_elem(source.ty) != Some(elem) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -3700,13 +3839,9 @@ impl VerifyCx<'_> {
             }
             RirRValue::MapGet { map, key, ty } | RirRValue::MapRemove { map, key, ty } => {
                 self.check_place(site, function, map);
-                if matches!(value, RirRValue::MapRemove { .. })
-                    && function
-                        .locals
-                        .get(map.local.index())
-                        .is_some_and(|local| !local.mutable)
-                {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                let map_local = self.local_root(site, map);
+                if matches!(value, RirRValue::MapRemove { .. }) {
+                    self.check_mutable_local_root(site, function, map_local);
                 }
                 self.check_type_id(site, *ty);
                 let Some(RirType::Map { key: key_ty, value }) = self.ty(map.ty) else {
@@ -3809,14 +3944,9 @@ impl VerifyCx<'_> {
                 Some(*ty)
             }
             RirRValue::MapInsert { map, key, value } => {
+                let map_local = self.local_root(site, map);
                 self.check_place(site, function, map);
-                if function
-                    .locals
-                    .get(map.local.index())
-                    .is_some_and(|local| !local.mutable)
-                {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
-                }
+                self.check_mutable_local_root(site, function, map_local);
                 let Some(RirType::Map {
                     key: key_ty,
                     value: value_ty,
@@ -3961,19 +4091,29 @@ impl VerifyCx<'_> {
             let found = match arg {
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
                 RirCallArg::SharedBorrow(place) => {
+                    let RirPlaceRoot::Local(local) = place.root else {
+                        self.check_place(site, function, place);
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return;
+                    };
                     self.check_place(site, function, place);
-                    if Self::function_local_is_mut_place_param(function, place.local) {
+                    if Self::function_local_is_mut_place_param(function, local) {
                         self.push(site, RirVerifyErrorKind::CallArgMode);
                     }
                     Some(place.ty)
                 }
                 RirCallArg::MutBorrow(place) => {
+                    let RirPlaceRoot::Local(local) = place.root else {
+                        self.check_place(site, function, place);
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        return;
+                    };
                     self.check_place(site, function, place);
                     let direct_local = function
                         .locals
-                        .get(place.local.index())
+                        .get(local.index())
                         .is_some_and(|local| local.mutable && !local.payload_ref);
-                    if Self::function_local_is_mut_place_param(function, place.local)
+                    if Self::function_local_is_mut_place_param(function, local)
                         || !place.projections.is_empty()
                         || !direct_local
                     {
@@ -4040,11 +4180,7 @@ impl VerifyCx<'_> {
                 self.check_place(
                     site,
                     function,
-                    &RirPlace {
-                        local: *local,
-                        projections: arg.projections.clone(),
-                        ty: arg.ty,
-                    },
+                    &RirPlace::local(*local, arg.projections.clone(), arg.ty),
                 );
                 if Self::function_local_is_mut_place_param(function, *local) {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
@@ -4106,11 +4242,7 @@ impl VerifyCx<'_> {
                     self.check_place(
                         site,
                         function,
-                        &RirPlace {
-                            local: *local,
-                            projections: arg.projections.clone(),
-                            ty: arg.ty,
-                        },
+                        &RirPlace::local(*local, arg.projections.clone(), arg.ty),
                     );
                     if !self.projected_mut_place_arg_supported(*ty, &arg.projections, true) {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -4619,12 +4751,16 @@ impl VerifyCx<'_> {
         operand: &RirOperand,
     ) {
         if let RirOperand::Place(place) = operand {
-            if Self::function_local_is_hidden_cell_param(function, place.local)
-                || self.function_local_is_scoped_place_source(function.id, place.local)
+            let RirPlaceRoot::Local(local) = place.root else {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                return;
+            };
+            if Self::function_local_is_hidden_cell_param(function, local)
+                || self.function_local_is_scoped_place_source(function.id, local)
             {
                 self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
             }
-            if Self::function_local_is_mut_place_param(function, place.local) {
+            if Self::function_local_is_mut_place_param(function, local) {
                 self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             }
         }
@@ -4773,27 +4909,50 @@ impl VerifyCx<'_> {
     }
 
     fn check_place(&mut self, site: RirVerifySite, function: &RirFunction, place: &RirPlace) {
-        self.check_local_id(site, function, place.local);
         self.check_type_id(site, place.ty);
-        let current = match function.locals.get(place.local.index()) {
-            Some(local) => local.ty,
-            None => return,
+        let current = match place.root {
+            RirPlaceRoot::Local(local) => {
+                self.check_local_id(site, function, local);
+                let current = match function.locals.get(local.index()) {
+                    Some(local) => local.ty,
+                    None => return,
+                };
+                if Self::function_local_is_hidden_cell_param(function, local) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    return;
+                }
+                if self.function_local_is_scoped_place_source(function.id, local) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                    return;
+                }
+                if Self::function_local_is_mut_place_param(function, local)
+                    && !place.projections.is_empty()
+                    && !self.projected_mut_place_arg_supported(current, &place.projections, true)
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                }
+                if !self
+                    .initialized
+                    .get(local.index())
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    self.push(site, RirVerifyErrorKind::UninitializedLocal(local));
+                }
+                current
+            }
+            RirPlaceRoot::Global(global) => {
+                let Some(global) = self.check_global_id(site, global) else {
+                    return;
+                };
+                if !place.projections.is_empty() {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                }
+                global.ty
+            }
         };
-        if Self::function_local_is_hidden_cell_param(function, place.local) {
-            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
-            return;
-        }
-        if self.function_local_is_scoped_place_source(function.id, place.local) {
-            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
-            return;
-        }
-        if Self::function_local_is_mut_place_param(function, place.local)
-            && !place.projections.is_empty()
-            && !self.projected_mut_place_arg_supported(current, &place.projections, true)
-        {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-            return;
-        }
         let Some(current) =
             self.check_projection_chain(site, function, current, &place.projections, true)
         else {
@@ -4807,14 +4966,6 @@ impl VerifyCx<'_> {
                     found: place.ty,
                 },
             );
-        }
-        if !self
-            .initialized
-            .get(place.local.index())
-            .copied()
-            .unwrap_or(false)
-        {
-            self.push(site, RirVerifyErrorKind::UninitializedLocal(place.local));
         }
     }
 
@@ -5014,8 +5165,10 @@ impl VerifyCx<'_> {
     }
 
     fn place_is_mut_place_param_root(function: &RirFunction, place: &RirPlace) -> bool {
-        place.projections.is_empty()
-            && Self::function_local_is_mut_place_param(function, place.local)
+        let RirPlaceRoot::Local(local) = place.root else {
+            return false;
+        };
+        place.projections.is_empty() && Self::function_local_is_mut_place_param(function, local)
     }
 
     fn projected_mut_place_arg_supported(
@@ -5353,6 +5506,16 @@ impl VerifyCx<'_> {
     fn check_lambda_env_id(&mut self, site: RirVerifySite, id: RirLambdaEnvId) {
         if id.index() >= self.program.lambda_envs.len() {
             self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn check_global_id(&mut self, site: RirVerifySite, id: RirGlobalId) -> Option<&RirGlobal> {
+        match self.program.globals.get(id.index()) {
+            Some(global) => Some(global),
+            None => {
+                self.push(site, RirVerifyErrorKind::BadId);
+                None
+            }
         }
     }
 

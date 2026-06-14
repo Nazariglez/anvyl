@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+lazy let score = 7;
+
+fn main() {
+    println(score);
+}

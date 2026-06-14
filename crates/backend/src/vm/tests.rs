@@ -541,6 +541,26 @@ fn compiler_rejects_lambda_calls() {
 }
 
 #[test]
+fn compiler_rejects_global_declarations_and_initializers() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Immutable);
+    let init = program.globals[global.index()].init;
+
+    let errors = compile_errors(&program);
+    assert!(errors.iter().any(|error| {
+        error.site == VmCompileErrorSite::Global(global)
+            && error.kind == VmCompileErrorKind::UnsupportedGlobal
+    }));
+    assert!(has_compile_error(
+        &errors,
+        init,
+        VmCompileErrorKind::UnsupportedGlobal
+    ));
+}
+
+#[test]
 fn compiler_rejects_global_roots() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -571,6 +591,54 @@ fn compiler_rejects_global_roots() {
         func,
         VmCompileErrorKind::UnsupportedGlobal
     ));
+}
+
+#[test]
+fn compiler_rejects_global_statements() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(air::ConstData {
+        ty: int,
+        value: air::ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Mutable);
+    let func = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::GlobalSetRoot {
+                    global,
+                    value: RValue::Use(Operand::Const(value)),
+                    init: air::GlobalInitEffect::StoreWithoutInit,
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Const(value))),
+        ),
+    });
+    program.module_mut(module).functions.push(func);
+
+    let errors = compile_errors(&program);
+    assert!(has_compile_error(
+        &errors,
+        func,
+        VmCompileErrorKind::UnsupportedGlobal
+    ));
+    assert!(
+        errors
+            .iter()
+            .filter(|error| error.site == VmCompileErrorSite::Function(func)
+                && error.kind == VmCompileErrorKind::UnsupportedGlobal)
+            .count()
+            >= 2
+    );
 }
 
 #[test]

@@ -49,13 +49,16 @@ impl DataRefPlaceDescriptors {
         match stmt {
             RirStmt::Init { value, .. }
             | RirStmt::Assign { value, .. }
+            | RirStmt::GlobalSetRoot { value, .. }
             | RirStmt::Eval(value)
             | RirStmt::CellInit { value, .. }
             | RirStmt::CellSet { value, .. }
             | RirStmt::ScopedPlaceCellSet { value, .. } => {
                 self.collect_rvalue(program, value);
             }
-            RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => {}
+            RirStmt::GlobalEnsure { .. }
+            | RirStmt::DataRefSet { .. }
+            | RirStmt::MapValueSet { .. } => {}
             RirStmt::If(branch) => {
                 self.collect_block(program, &branch.then_block);
                 if let Some(block) = &branch.else_block {

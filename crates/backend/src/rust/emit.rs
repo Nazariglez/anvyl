@@ -6,13 +6,14 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirCollectionLoanScope,
         RirCollectionRootKind, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign,
-        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirOperand, RirOptionMatch, RirParamAbi,
-        RirParamSemantic, RirPlace, RirProgram, RirProjection, RirRValue, RirRawEnumValue,
-        RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId,
-        RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirGlobal, RirIf,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
+        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirOperand,
+        RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
+        RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -110,7 +111,8 @@ impl EmitCx<'_> {
     }
 
     fn emit_ctx(&mut self) {
-        let ctx = self.program.ctx.symbol.as_str();
+        let types = target::generated_types_symbol(&self.program.ctx);
+        let globals = target::generated_globals_symbol(&self.program.ctx);
         let policy = RustRepPolicy::new(self.program);
         let mut heap_types = self
             .program
@@ -148,7 +150,7 @@ impl EmitCx<'_> {
             )
         }));
 
-        self.w.block("struct AnvTypes<'cx>", |w| {
+        self.w.block(format_args!("struct {types}<'cx>"), |w| {
             for (heap_type, storage, _) in &heap_types {
                 w.line(format_args!(
                     "{heap_type}: {},",
@@ -158,9 +160,17 @@ impl EmitCx<'_> {
             w.line("_brand: std::marker::PhantomData<&'cx ()>,");
         });
         self.w.blank();
-        self.w.block("impl<'cx> AnvTypes<'cx>", |w| {
+        self.w.block(format_args!("impl<'cx> {types}<'cx>"), |w| {
             w.block(
-                format_args!("fn register(heap: &mut {}) -> Self", target::heap_ty()),
+                format_args!(
+                    "fn register({}: &mut {}) -> Self",
+                    if heap_types.is_empty() {
+                        "_heap"
+                    } else {
+                        "heap"
+                    },
+                    target::heap_ty()
+                ),
                 |w| {
                     w.block("Self", |w| {
                         for (heap_type, storage, register) in &heap_types {
@@ -172,31 +182,31 @@ impl EmitCx<'_> {
             );
         });
         self.w.blank();
-        self.w.block(format_args!("struct {ctx}<'cx, 'rt>"), |w| {
-            w.line(format_args!("rt: {},", target::runtime_ctx_ty()));
-            w.line("_types: AnvTypes<'cx>,");
-        });
+        self.w.line(format_args!("struct {globals}<'cx> {{"));
+        self.w.push_indent();
+        for global in &self.program.globals {
+            let slot_ty = target::global_slot_ty(&self.ty(global.ty));
+            self.w
+                .line(format_args!("{}: {slot_ty},", global.slot_symbol.as_str()));
+        }
+        self.w.line("_brand: std::marker::PhantomData<&'cx ()>,");
+        self.w.pop_indent();
+        self.w.line("}");
         self.w.blank();
-        self.w
-            .block(format_args!("impl<'cx, 'rt> {ctx}<'cx, 'rt>"), |w| {
-                w.block(
-                    format_args!(
-                        "fn new(rt: {}, types: AnvTypes<'cx>) -> Self",
-                        target::runtime_ctx_ty()
-                    ),
-                    |w| w.line(format_args!("Self {{ rt, _types: types }}")),
-                );
-                w.blank();
-                w.block(
-                    format_args!("fn heap(&mut self) -> &mut {}", target::heap_ty()),
-                    |w| w.line("self.rt.heap()"),
-                );
-                w.blank();
-                w.block(
-                    format_args!("fn runtime(&mut self) -> &mut {}", target::runtime_ctx_ty()),
-                    |w| w.line("&mut self.rt"),
-                );
+        self.w.block(format_args!("impl<'cx> {globals}<'cx>"), |w| {
+            w.block("fn new() -> Self", |w| {
+                w.block("Self", |w| {
+                    for global in &self.program.globals {
+                        w.line(format_args!(
+                            "{}: {},",
+                            global.slot_symbol.as_str(),
+                            target::global_slot_new(global.name.as_str())
+                        ));
+                    }
+                    w.line("_brand: std::marker::PhantomData,");
+                });
             });
+        });
         self.w.blank();
     }
 
@@ -208,18 +218,19 @@ impl EmitCx<'_> {
         } else {
             String::new()
         };
-        let ctx = self.program.ctx.symbol.as_str();
+        let types_ty = target::generated_types_symbol(&self.program.ctx);
+        let globals_ty = target::generated_globals_symbol(&self.program.ctx);
         self.w.block(format_args!("fn main(){ret}"), |w| {
             w.line(format_args!("{}(|heap| {{", target::heap_scope()));
             w.indented(|w| {
-                w.line("let types = AnvTypes::register(heap);");
+                w.line(format_args!("let types = {types_ty}::register(heap);"));
                 w.line(format_args!(
-                    "let rt = {};",
+                    "let mut rt = {};",
                     target::runtime_ctx_new("heap")
                 ));
-                w.line(format_args!("let mut ctx = {ctx}::new(rt, types);"));
+                w.line(format_args!("let globals = {globals_ty}::new();"));
                 w.line(format_args!(
-                    "let _ = {symbol}(&mut ctx){};",
+                    "let _ = {symbol}(&mut rt, &types, &globals){};",
                     if fallible { "?" } else { "" }
                 ));
                 if fallible {
@@ -344,7 +355,7 @@ impl EmitCx<'_> {
         w.indented(|w| {
             w.line("&self,");
             w.line(format_args!(
-                "ctx: &mut {},",
+                "rt: &mut {},",
                 target::runtime_ctx_ty_with("'_")
             ));
             w.line(format_args!("object: &{},", target::erased_handle_ty()));
@@ -356,7 +367,7 @@ impl EmitCx<'_> {
         w.line(format_args!(") -> {} {{", target::result_ty("()")));
         w.indented(|w| {
             w.line(op.heap_access(
-                "ctx",
+                "rt",
                 "object",
                 &target::dataref_place_heap_type_access("self"),
                 "storage",
@@ -509,11 +520,14 @@ impl EmitCx<'_> {
             unreachable!("verified stringify helper target")
         };
         let strukt = &self.program.structs[struct_id.index()];
-        let ctx = self.stringify_helper_ctx_name(strukt);
+        let ctx_use = analysis::stringify_helper_context_use(self.program, strukt);
         let header = format!(
-            "fn {}<'cx, 'rt>({ctx}: &mut {}, value: &{}) -> {}",
+            "fn {}<'cx, 'rt>({}: {}, {}: {}, value: &{}) -> {}",
             helper.symbol.as_str(),
-            self.ctx_ty(),
+            target::runtime_param(ctx_use.rt),
+            target::runtime_ctx_ref_ty(),
+            target::types_param(ctx_use.types),
+            target::types_ref_ty(target::generated_types_symbol(&self.program.ctx)),
             self.ty(helper.ty),
             target::anv_string_ty()
         );
@@ -553,7 +567,7 @@ impl EmitCx<'_> {
                     RirType::Struct(_) => {
                         let nested = nested.as_deref().expect("struct field has helper");
                         w.line(format_args!(
-                            "out.push_str({nested}(ctx, &value.{field}).as_str());"
+                            "out.push_str({nested}(rt, types, &value.{field}).as_str());"
                         ));
                     }
                     RirType::Void
@@ -589,7 +603,19 @@ impl EmitCx<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        let params = std::iter::once(format!("ctx: &mut {}", self.ctx_ty()))
+        let params =
+            [
+                format!("rt: {}", target::runtime_ctx_ref_ty()),
+                format!(
+                    "types: {}",
+                    target::types_ref_ty(target::generated_types_symbol(&self.program.ctx))
+                ),
+                format!(
+                    "globals: {}",
+                    target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
+                ),
+            ]
+            .into_iter()
             .chain(sig.params.iter().enumerate().map(|(index, param)| {
                 format!("arg_{index}: {}", policy.param_ty(param.ty, param.abi))
             }))
@@ -682,10 +708,12 @@ impl EmitCx<'_> {
         });
         self.w.blank();
         let body_call = |function: &RirFunction, capture_args: Vec<String>| {
-            let args = std::iter::once("ctx".to_string())
-                .chain(capture_args)
-                .chain((0..arity).map(|index| format!("arg_{index}")));
-            let call = format!("{}({})", function.symbol.as_str(), comma(args));
+            let call = target::generated_call(
+                function.symbol.as_str(),
+                capture_args
+                    .into_iter()
+                    .chain((0..arity).map(|index| format!("arg_{index}"))),
+            );
             if fallible && !fallible_functions[function.id.index()] {
                 format!("Ok({call})")
             } else {
@@ -720,7 +748,7 @@ impl EmitCx<'_> {
                                             };
                                             w.line(format_args!(
                                                 "let c{index} = {};",
-                                                target::ctx_heap_with("ctx", "env", "env", &value)
+                                                target::rt_heap_with("rt", "env", "env", &value)
                                             ));
                                         }
                                         let capture_args = (0..captures.len())
@@ -793,7 +821,15 @@ impl EmitCx<'_> {
         } else {
             "'scoped_cx"
         };
-        let ctx_ty = format!("{}<{ctx_lifetime}, '_>", self.program.ctx.symbol.as_str());
+        let rt_ty = format!("anvyx_runtime::Ctx<{ctx_lifetime}, '_>");
+        let types_ty = format!(
+            "{}<{ctx_lifetime}>",
+            target::generated_types_symbol(&self.program.ctx)
+        );
+        let globals_ty = format!(
+            "{}<{ctx_lifetime}>",
+            target::generated_globals_symbol(&self.program.ctx)
+        );
         let thunk_generics = if needs_ctx_lifetime {
             ""
         } else {
@@ -808,14 +844,18 @@ impl EmitCx<'_> {
                         "unsafe fn {thunk}{thunk_generics}(state: {state_ty}, args: {args_ty}) -> {result_ty}"
                     ),
                     |w| {
-                        w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<(Self, {state_ty})>() }};"));
+                        w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<(Self, {state_ty}, {state_ty}, {state_ty})>() }};"));
                         w.line(format_args!(
-                            "let ctx = unsafe {{ state.1.cast::<{ctx_ty}>().as_mut() }};"
+                            "let rt = unsafe {{ state.1.cast::<{rt_ty}>().as_mut() }};"
+                        ));
+                        w.line(format_args!(
+                            "let types = unsafe {{ state.2.cast::<{types_ty}>().as_ref() }};"
+                        ));
+                        w.line(format_args!(
+                            "let globals = unsafe {{ state.3.cast::<{globals_ty}>().as_ref() }};"
                         ));
                         w.line(destructure);
-                        let call_args = std::iter::once("ctx".to_string())
-                            .chain(args)
-                            .collect::<Vec<_>>();
+                        let call_args = target::generated_call_args(args);
                         let call = format!("state.0.call({})", comma(call_args));
                         if fallible {
                             w.line(call);
@@ -849,12 +889,24 @@ impl EmitCx<'_> {
     }
 
     fn emit_function(&mut self, function: &RirFunction) {
-        let ctx = if analysis::function_uses_ctx(self.program, function) {
-            "ctx"
-        } else {
-            "_ctx"
-        };
-        let mut params = vec![format!("{ctx}: &mut {}", self.ctx_ty())];
+        let ctx_use = analysis::function_context_use(self.program, function);
+        let mut params = vec![
+            format!(
+                "{}: {}",
+                target::runtime_param(ctx_use.rt),
+                target::runtime_ctx_ref_ty()
+            ),
+            format!(
+                "{}: {}",
+                target::types_param(ctx_use.types),
+                target::types_ref_ty(target::generated_types_symbol(&self.program.ctx))
+            ),
+            format!(
+                "{}: {}",
+                target::globals_param(ctx_use.globals),
+                target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
+            ),
+        ];
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
             let mutability =
@@ -919,10 +971,6 @@ impl EmitCx<'_> {
         } else {
             target::result_ty(&ret)
         }
-    }
-
-    fn ctx_ty(&self) -> String {
-        format!("{}<'cx, 'rt>", self.program.ctx.symbol.as_str())
     }
 
     fn local_needs_mut_binding(&self, ty: RirTypeId) -> bool {
@@ -993,14 +1041,6 @@ impl EmitCx<'_> {
         }
     }
 
-    fn stringify_helper_ctx_name(&self, strukt: &super::rir::RirStruct) -> &'static str {
-        if analysis::stringify_helper_uses_ctx(self.program, strukt) {
-            "ctx"
-        } else {
-            "_ctx"
-        }
-    }
-
     fn emit_stmt_mode(&mut self, function: &RirFunction, stmt: &RirStmt, predeclared: bool) {
         match stmt {
             RirStmt::Init { local, value } => {
@@ -1022,6 +1062,24 @@ impl EmitCx<'_> {
                         self.ty(local_data.ty)
                     ));
                 }
+            }
+            RirStmt::GlobalEnsure { global } => {
+                let global = &self.program.globals[global.index()];
+                self.w.line(format_args!(
+                    "{};",
+                    target::global_ensure(
+                        &self.global_slot_expr(global),
+                        &self.global_init_call(global.init),
+                    )
+                ));
+            }
+            RirStmt::GlobalSetRoot { global, value } => {
+                let global = &self.program.globals[global.index()];
+                let value = self.rvalue(function, value);
+                self.w.line(format_args!(
+                    "{};",
+                    target::global_set_without_init(&self.global_slot_expr(global), &value)
+                ));
             }
             RirStmt::Assign { dst, value } => {
                 let places = RustPlaces::new(self.program, function);
@@ -1112,6 +1170,14 @@ impl EmitCx<'_> {
                 self.emit_option_match(function, match_, predeclared);
             }
         }
+    }
+
+    fn global_slot_expr(&self, global: &RirGlobal) -> String {
+        target::global_slot_field(target::globals_param_name(), global.slot_symbol.as_str())
+    }
+
+    fn global_init_call(&self, init: super::rir::RirFunctionId) -> String {
+        target::generated_call(self.program.functions[init.index()].symbol.as_str(), [])
     }
 
     fn emit_loop(&mut self, function: &RirFunction, loop_: &RirLoop, predeclared: bool) {
@@ -1352,8 +1418,11 @@ impl EmitCx<'_> {
             } if source.projections.is_empty()
                 && matches!(self.program.types[source.ty.index()], RirType::Slice(_)) =>
             {
+                let RirPlaceRoot::Local(source_local) = source.root else {
+                    unreachable!("global RIR places are not supported here")
+                };
                 drops.push(local);
-                self.collect_slice_arg_drops(stmts, index, source.local, drops);
+                self.collect_slice_arg_drops(stmts, index, source_local, drops);
             }
             _ => {}
         }
@@ -1611,10 +1680,9 @@ impl EmitCx<'_> {
                                 )
                             })
                             .collect::<Vec<_>>();
-                        let heap_type =
-                            format!("ctx._types.{}", lambda_env_heap_type_symbol(env.id));
+                        let heap_type = format!("types.{}", lambda_env_heap_type_symbol(env.id));
                         let storage = format!("{} {{ {} }}", env.symbol.as_str(), comma(fields));
-                        let alloc = target::ctx_heap_alloc("ctx", "heap_type", &storage);
+                        let alloc = target::rt_heap_alloc("rt", "heap_type", &storage);
                         format!(
                             "{{ let heap_type = {heap_type}; {sig}::{variant} {{ env: {alloc} }} }}"
                         )
@@ -1641,9 +1709,9 @@ impl EmitCx<'_> {
 
     fn mut_place_set(&self, ty: RirTypeId, place: &str, value: &str) -> String {
         if self.collection_replace_ty(ty) {
-            target::mut_place_replace_collection(place, &target::ctx_runtime("ctx"), value)
+            target::mut_place_replace_collection(place, target::runtime_param_name(), value)
         } else {
-            target::mut_place_set(place, &target::ctx_runtime("ctx"), value)
+            target::mut_place_set(place, target::runtime_param_name(), value)
         }
     }
 
@@ -1823,7 +1891,7 @@ impl EmitCx<'_> {
     fn mut_place_access(&self, function: &RirFunction, place: &RirPlace, body: &str) -> String {
         target::mut_place_access(
             &RustPlaces::new(self.program, function).local_place(place),
-            &target::ctx_runtime("ctx"),
+            target::runtime_param_name(),
             body,
         )
     }
@@ -1831,7 +1899,7 @@ impl EmitCx<'_> {
     fn mut_place_mutate(&self, function: &RirFunction, place: &RirPlace, body: &str) -> String {
         target::mut_place_mutate(
             &RustPlaces::new(self.program, function).local_place(place),
-            &target::ctx_runtime("ctx"),
+            target::runtime_param_name(),
             body,
         )
     }
@@ -1906,13 +1974,13 @@ impl EmitCx<'_> {
             }
             RirCellStorage::Heap => {
                 let heap_type = format!(
-                    "ctx._types.{}",
+                    "types.{}",
                     lambda_cell_heap_type_symbol(self.cell_decl(cell).id)
                 );
                 let storage = format!("{}::new(value)", target::lambda_cell_ctor(&payload));
                 format!(
                     "{{ let value = {value}; let heap_type = {heap_type}; {} }}",
-                    target::ctx_heap_alloc("ctx", "heap_type", &storage)
+                    target::rt_heap_alloc("rt", "heap_type", &storage)
                 )
             }
         }
@@ -1932,8 +2000,8 @@ impl EmitCx<'_> {
                 format!("{}.{}?", self.cell_ref(function, cell), set)
             }
             RirCellStorage::Heap => {
-                target::ctx_heap_with(
-                    "ctx",
+                target::rt_heap_with(
+                    "rt",
                     &format!("&{}", self.cell_ref(function, cell)),
                     "cell",
                     &format!("cell.{set}"),
@@ -1956,8 +2024,8 @@ impl EmitCx<'_> {
         match decl.storage {
             RirCellStorage::StackScoped => format!("{}.{}?", self.cell_ref(function, cell), access),
             RirCellStorage::Heap => {
-                target::ctx_heap_with(
-                    "ctx",
+                target::rt_heap_with(
+                    "rt",
                     &format!("&{}", self.cell_ref(function, cell)),
                     "cell",
                     &format!("cell.{access}"),
@@ -1972,7 +2040,7 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
         render: impl FnOnce(String) -> String,
     ) -> String {
-        self.prepared_call_expr(function, args, vec!["ctx".to_string()], render)
+        self.prepared_call_expr(function, args, target::generated_call_args([]), render)
     }
 
     fn prepared_call_expr(
@@ -2006,6 +2074,15 @@ impl EmitCx<'_> {
         if let RirCallArg::ScopedLambda { callee, sig } = arg {
             return self.prepared_scoped_lambda_call_arg(function, index, callee, *sig);
         }
+        if let RirCallArg::Value(operand @ RirOperand::Place(place)) = arg
+            && matches!(place.root, RirPlaceRoot::Global(_))
+        {
+            let tmp = format!("__anv_arg_{index}");
+            return (
+                vec![format!("let {tmp} = {};", values.value_operand(operand))],
+                tmp,
+            );
+        }
         let RirCallArg::MutPlace(mut_place) = arg else {
             return (vec![], values.call_arg(arg));
         };
@@ -2029,12 +2106,13 @@ impl EmitCx<'_> {
             vec![
                 format!(
                     "let {object_tmp} = {};",
-                    target::ctx_heap_erase("ctx", &object)
+                    target::rt_heap_erase("rt", &object)
                 ),
                 format!(
-                    "let {ops_tmp} = {} {{ {}: ctx._types.{heap_type} }};",
+                    "let {ops_tmp} = {} {{ {}: {} }};",
                     descriptor.symbol,
-                    target::dataref_place_heap_type_field()
+                    target::dataref_place_heap_type_field(),
+                    target::heap_type_access("types", &heap_type)
                 ),
             ],
             target::mut_place_dataref(&object_tmp, &format!("&{ops_tmp}")),
@@ -2053,7 +2131,9 @@ impl EmitCx<'_> {
         let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig);
         let state = format!("__anv_scoped_lambda_state_{index}");
         let lambda = values.value_operand(callee);
-        let ctx_ptr = target::non_null_from_mut("&mut *ctx");
+        let rt_ptr = target::non_null_from_mut("&mut *rt");
+        let types_ptr = target::non_null_from_mut("types");
+        let globals_ptr = target::non_null_from_mut("globals");
         let ctor = target::scoped_lambda_ctor(&args_ty, &ret_ty);
         let thunk = format!(
             "{}::{}",
@@ -2062,7 +2142,7 @@ impl EmitCx<'_> {
         );
         (
             vec![format!(
-                "let mut {state} = ({lambda}, {ctx_ptr}.cast::<()>());"
+                "let mut {state} = ({lambda}, {rt_ptr}.cast::<()>(), {types_ptr}.cast::<()>(), {globals_ptr}.cast::<()>());"
             )],
             format!("unsafe {{ {ctor}::__anvyx_from_raw(&mut {state}, {thunk}) }}"),
         )
@@ -2332,9 +2412,7 @@ impl EmitCx<'_> {
         let (symbol, rendered, fallible, ret_abi) = match &ext.kind {
             RirExternKind::Native(native) => {
                 let rendered = match native.abi.ctx {
-                    anvyx_runtime::RustWrapperCtx::HiddenRuntime => {
-                        vec![target::ctx_runtime("ctx")]
-                    }
+                    anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
                     anvyx_runtime::RustWrapperCtx::None => vec![],
                 };
                 (
@@ -2366,11 +2444,11 @@ impl EmitCx<'_> {
         let fields = comma(dataref.fields.iter().zip(fields).map(|(field, value)| {
             format!("{}: {}", field.symbol.as_str(), values.value_operand(value))
         }));
-        let heap_type = format!("ctx._types.{}", dataref.heap_type_symbol());
+        let heap_type = format!("types.{}", dataref.heap_type_symbol());
         let storage = format!("{} {{ {} }}", dataref.storage_symbol(), fields);
         format!(
             "{{ let heap_type = {heap_type}; {} }}",
-            target::ctx_heap_alloc("ctx", "heap_type", &storage)
+            target::rt_heap_alloc("rt", "heap_type", &storage)
         )
     }
 
@@ -2385,8 +2463,8 @@ impl EmitCx<'_> {
         let values = RustValues::new(self.program, function);
         let object = values.operand_ref(object);
         let path = RustPlaces::new(self.program, function).storage_path(dataref, projections);
-        target::ctx_heap_with(
-            "ctx",
+        target::rt_heap_with(
+            "rt",
             &object,
             "storage",
             &values.value_from_place(ty, &path),
@@ -2407,14 +2485,14 @@ impl EmitCx<'_> {
         let value_ty = values.operand_ty(value);
         let value = values.value_operand(value);
         if self.collection_replace_ty(value_ty) {
-            target::ctx_heap_with_mut(
-                "ctx",
+            target::rt_heap_with_mut(
+                "rt",
                 &object,
                 "storage",
                 &target::replace_collection(&path, &value),
             ) + "?"
         } else {
-            target::ctx_heap_with_mut("ctx", &object, "storage", &format!("{path} = {value};"))
+            target::rt_heap_with_mut("rt", &object, "storage", &format!("{path} = {value};"))
         }
     }
 
@@ -2505,7 +2583,7 @@ impl EmitCx<'_> {
                     unreachable!("verified place operand")
                 };
                 format!(
-                    "{}(ctx, &{})",
+                    "{}(rt, types, &{})",
                     self.stringify_helper(ty),
                     RustPlaces::new(self.program, function).local_place(place)
                 )
@@ -2516,7 +2594,7 @@ impl EmitCx<'_> {
             } => {
                 let symbol = self.program.functions[target.index()].symbol.as_str();
                 let arg = RustValues::new(self.program, function).stringify_arg(mode, value);
-                let call = format!("{symbol}(ctx, {arg})");
+                let call = target::generated_call(symbol, [arg]);
                 if self.fallible_functions[target.index()] {
                     format!("{call}?")
                 } else {
@@ -2573,6 +2651,7 @@ fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
     match stmt {
         RirStmt::Init { value, .. }
         | RirStmt::Assign { value, .. }
+        | RirStmt::GlobalSetRoot { value, .. }
         | RirStmt::CellInit { value, .. }
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
@@ -2607,7 +2686,9 @@ fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
             block_uses_scoped_lambda_sig(some_block, sig)
                 || block_uses_scoped_lambda_sig(none_block, sig)
         }
-        RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => false,
+        RirStmt::GlobalEnsure { .. } | RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => {
+            false
+        }
     }
 }
 
@@ -2627,7 +2708,12 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             ..
         }
         | RirCallArg::SharedBorrow(place)
-        | RirCallArg::MutBorrow(place) => place.projections.is_empty().then_some(place.local),
+        | RirCallArg::MutBorrow(place) => {
+            let RirPlaceRoot::Local(local) = place.root else {
+                return None;
+            };
+            place.projections.is_empty().then_some(local)
+        }
         RirCallArg::MutPlace(mut_place) => match &mut_place.root {
             RirMutPlaceRoot::Local { local, .. } => {
                 mut_place.projections.is_empty().then_some(*local)

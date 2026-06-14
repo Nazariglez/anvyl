@@ -24,17 +24,18 @@ use super::{
         RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirConst, RirConstId,
         RirConstValue, RirCoreEnumKind, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
         RirEnumMatchArm, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField,
-        RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand,
-        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirProgram, RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal,
+        RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
+        RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
+        RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
+        RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
+        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
+        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
     target,
@@ -287,11 +288,11 @@ fn nested_index_write_program(indexed_ty: RirType) -> RirProgram {
                 rir_local(index, int, false, "index"),
             ],
             vec![RirStmt::Assign {
-                dst: RirPlace {
-                    local: root,
-                    projections: vec![RirProjection::Field(field), RirProjection::Index(index)],
-                    ty: int,
-                },
+                dst: RirPlace::local(
+                    root,
+                    vec![RirProjection::Field(field), RirProjection::Index(index)],
+                    int,
+                ),
                 value: RirRValue::Use(RirOperand::Const(replacement)),
             }],
         )],
@@ -341,14 +342,14 @@ fn nested_tuple_index_write_program() -> RirProgram {
                 rir_local(index, int, false, "index"),
             ],
             vec![RirStmt::Assign {
-                dst: RirPlace {
-                    local: root,
-                    projections: vec![
+                dst: RirPlace::local(
+                    root,
+                    vec![
                         RirProjection::TupleField(field),
                         RirProjection::Index(index),
                     ],
-                    ty: int,
-                },
+                    int,
+                ),
                 value: RirRValue::Use(RirOperand::Const(replacement)),
             }],
         )],
@@ -987,7 +988,735 @@ fn profile_accepts_dataref_field_projections() {
 }
 
 #[test]
-fn profile_rejects_global_roots() {
+fn rir_verifies_valid_global_declaration_and_operations() {
+    let program = valid_global_rir(|_| {});
+
+    rir::verify(&program).expect("valid global RIR failed verification");
+}
+
+#[test]
+fn rir_rejects_bad_global_id() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].id = RirGlobalId::from_index(1)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_bad_global_init_id() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].init = RirFunctionId::from_index(99)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_global_init_return_mismatch() {
+    assert_rir_type_error(valid_global_rir(|program| {
+        program.functions[0].ret.ty = RirTypeId::from_index(1);
+    }));
+}
+
+#[test]
+fn rir_rejects_global_init_params() {
+    let local = RirLocalId::from_index(0);
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[0].params = vec![rir_param(
+                local,
+                RirTypeId::from_index(0),
+                RirParamSemantic::Value,
+                RirParamAbi::Value,
+            )];
+            program.functions[0].locals =
+                vec![rir_local(local, RirTypeId::from_index(0), false, "x")];
+        }),
+        RirVerifyErrorKind::CallArgCount {
+            expected: 0,
+            found: 1,
+        },
+    );
+}
+
+#[test]
+fn rir_rejects_empty_global_symbols() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].slot_symbol = RirSymbol::new("")),
+        RirVerifyErrorKind::BadId,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].name = RirSymbol::new("")),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_ordinary_global_assignment() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].body.stmts.push(RirStmt::Assign {
+                dst: rir_global_place(RirTypeId::from_index(0)),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            });
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_rejects_immutable_global_root_set() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].mutable = false),
+        RirVerifyErrorKind::ImmutableAssign,
+    );
+}
+
+#[test]
+fn rir_rejects_duplicate_global_slot_symbol() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let mut second = program.globals[0].clone();
+            second.id = RirGlobalId::from_index(1);
+            program.globals.push(second);
+        }),
+        RirVerifyErrorKind::DuplicateSymbol,
+    );
+}
+
+#[test]
+fn rir_rejects_global_projection() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].ret.ty = RirTypeId::from_index(0);
+            program.functions[1].body.term =
+                RirTerm::Return(Some(RirOperand::Place(RirPlace::global(
+                    RirGlobalId::from_index(0),
+                    vec![RirProjection::TupleField(RirFieldId::from_index(0))],
+                    RirTypeId::from_index(0),
+                ))));
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_rejects_global_borrow_call_arg() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let local = RirLocalId::from_index(0);
+            let callee = RirFunctionId::from_index(2);
+            program.functions.push(RirFunction {
+                id: callee,
+                air_id: None,
+                symbol: RirSymbol::new("borrow"),
+                params: vec![rir_param(
+                    local,
+                    RirTypeId::from_index(0),
+                    RirParamSemantic::SharedBorrow,
+                    RirParamAbi::SharedBorrow,
+                )],
+                ret: RirReturn {
+                    ty: RirTypeId::from_index(1),
+                },
+                locals: vec![rir_local(local, RirTypeId::from_index(0), false, "x")],
+                body: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(None),
+                },
+            });
+            program.functions[1]
+                .body
+                .stmts
+                .push(RirStmt::Eval(RirRValue::Call {
+                    callee: RirCallTarget::Function(callee),
+                    args: vec![RirCallArg::SharedBorrow(rir_global_place(
+                        RirTypeId::from_index(0),
+                    ))],
+                    ty: RirTypeId::from_index(1),
+                }));
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_rejects_global_root_type_mismatch() {
+    assert_rir_type_error(valid_global_rir(|program| {
+        program.functions[1].ret.ty = RirTypeId::from_index(0);
+        program.functions[1].body.term = RirTerm::Return(Some(RirOperand::Place(
+            rir_global_place(RirTypeId::from_index(1)),
+        )));
+    }));
+}
+
+#[test]
+fn rir_rejects_void_global_payload() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].ty = RirTypeId::from_index(1)),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_rejects_non_scalar_global_payload() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let string = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::String);
+            program.globals[0].ty = string;
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn rir_rejects_global_collection_loan_root() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1]
+                .body
+                .stmts
+                .push(RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                    root: rir_global_place(RirTypeId::from_index(0)),
+                    root_kind: RirCollectionRootKind::List,
+                    mode: RirCollectionLoanMode::MutableSequenceElement,
+                    body: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(None),
+                    },
+                }));
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn emit_direct_rir_global_read_uses_named_context_params() {
+    let program = valid_global_rir(|program| {
+        let int = RirTypeId::from_index(0);
+        let local = RirLocalId::from_index(0);
+        program.functions[1].ret.ty = int;
+        program.functions[1].locals = vec![RirLocal {
+            id: local,
+            ty: int,
+            mutable: false,
+            symbol: RirSymbol::new("value"),
+            initialized: false,
+            payload_ref: false,
+        }];
+        program.functions[1].body = RirStructuredBlock {
+            stmts: vec![RirStmt::Init {
+                local,
+                value: RirRValue::Use(RirOperand::Place(rir_global_place(int))),
+            }],
+            term: RirTerm::Return(Some(RirOperand::Place(rir_place(local, int)))),
+        };
+    });
+    let verified = rir::verify(&program).expect("valid direct global read RIR");
+    let source = emit::emit(&verified).into_string();
+
+    assert!(source.contains(
+        "fn main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"
+    ));
+}
+
+#[test]
+fn emit_global_call_arg_temps_read_before_runtime_call() {
+    let program = valid_global_rir(|program| {
+        let int = RirTypeId::from_index(0);
+        let void = RirTypeId::from_index(1);
+        program.externs.push(RirExtern {
+            id: RirExternId::from_index(0),
+            symbol: RirSymbol::new("sink"),
+            kind: RirExternKind::Native(rir::RirNativeExtern {
+                path: vec!["host".to_string(), "sink".to_string()],
+                abi: anvyx_runtime::RustExternAbi {
+                    params: vec![anvyx_runtime::RustParamAbi::Value(
+                        anvyx_runtime::ExternTypeExpr::Int,
+                    )],
+                    ret: anvyx_runtime::RustReturnAbi::Void,
+                    fallible: false,
+                    support: anvyx_runtime::RustAbiSupport::Direct,
+                    ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+                },
+            }),
+            params: vec![RirExternParam {
+                ty: int,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: void,
+        });
+        program.functions[1].symbol = RirSymbol::new("entry");
+        program.entry = Some(RirFunctionId::from_index(1));
+        program.functions[1].body = RirStructuredBlock {
+            stmts: vec![RirStmt::Eval(RirRValue::Call {
+                callee: RirCallTarget::Extern(RirExternId::from_index(0)),
+                args: vec![RirCallArg::Value(RirOperand::Place(rir_global_place(int)))],
+                ty: void,
+            })],
+            term: RirTerm::Return(None),
+        };
+    });
+    let verified = rir::verify(&program).expect("valid global call arg RIR");
+    let source = emit::emit(&verified);
+    let text = source.as_str();
+
+    assert!(text.contains(
+        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, types, globals))?; *__global }; host::sink(rt, __anv_arg_0)"
+    ), "{text}");
+
+    let source = emit::RustSource::new(format!(
+        "mod host {{ pub fn sink<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, value: i64) {{ assert_eq!(value, 7); }} }}\n{}",
+        source.into_string()
+    ));
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn rir_rejects_global_roots_in_unsupported_collection_operations() {
+    for value in [
+        RirRValue::ListPush {
+            list: rir_global_place(RirTypeId::from_index(0)),
+            value: RirOperand::Const(RirConstId::from_index(0)),
+        },
+        RirRValue::MapGet {
+            map: rir_global_place(RirTypeId::from_index(0)),
+            key: RirOperand::Const(RirConstId::from_index(0)),
+            ty: RirTypeId::from_index(0),
+        },
+        RirRValue::MapInsert {
+            map: rir_global_place(RirTypeId::from_index(0)),
+            key: RirOperand::Const(RirConstId::from_index(0)),
+            value: RirOperand::Const(RirConstId::from_index(0)),
+        },
+    ] {
+        assert_rir_error(
+            valid_global_rir(|program| program.functions[1].body.stmts.push(RirStmt::Eval(value))),
+            RirVerifyErrorKind::UnsupportedRValueType,
+        );
+    }
+}
+
+#[test]
+fn rir_rejects_global_option_match_discriminant() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1]
+                .body
+                .stmts
+                .push(RirStmt::OptionMatch(RirOptionMatch {
+                    discr: rir_global_place(RirTypeId::from_index(0)),
+                    payload: None,
+                    payload_ref: false,
+                    payload_escapes: false,
+                    some_block: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(None),
+                    },
+                    none_block: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(None),
+                    },
+                }));
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+}
+
+#[test]
+fn profile_rejects_unsupported_global_declaration_and_initializer_by_named_gaps() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", string, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+
+    let errors = profile_errors(program);
+    assert_profile_error(
+        &errors,
+        ProfileSite::Global(global),
+        ProfileErrorKind::UnsupportedGlobalRooting,
+    );
+    assert_profile_error(
+        &errors,
+        ProfileSite::Function(init),
+        ProfileErrorKind::UnsupportedGlobalInitializer,
+    );
+}
+
+#[test]
+fn profile_accepts_scalar_global_declaration_and_initializer() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    global_with_init(&mut program, module, "g", int, Mutability::Mutable);
+
+    check(program);
+}
+
+#[test]
+fn plan_global_slot_symbols_are_id_based() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let left_module = program.alloc_module(root_module());
+    let mut right = root_module();
+    right.path = vec![Ident::new("other")];
+    let right_module = program.alloc_module(right);
+    let left = global_with_init(
+        &mut program,
+        left_module,
+        "score",
+        int,
+        Mutability::Immutable,
+    );
+    let right = global_with_init(
+        &mut program,
+        right_module,
+        "score",
+        int,
+        Mutability::Immutable,
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let rir = plan.program();
+
+    assert_eq!(rir.globals.len(), 2);
+    assert_eq!(rir.globals[0].air_id, left);
+    assert_eq!(rir.globals[1].air_id, right);
+    assert_eq!(rir.globals[0].slot_symbol.as_str(), "g0_score");
+    assert_eq!(rir.globals[1].slot_symbol.as_str(), "g1_score");
+}
+
+#[test]
+fn plan_lowers_scalar_global_declaration() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+    program.function_mut(init).body =
+        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let rir = plan.program();
+
+    assert_eq!(rir.globals.len(), 1);
+    assert_eq!(rir.globals[0].air_id, global);
+    assert_eq!(rir.globals[0].module, module);
+    assert_eq!(rir.globals[0].ty, RirTypeId::from_index(int.index()));
+    assert!(rir.globals[0].mutable);
+    assert_eq!(rir.globals[0].init, RirFunctionId::from_index(init.index()));
+    assert_eq!(rir.globals[0].slot_symbol.as_str(), "g0_score");
+}
+
+#[test]
+fn plan_lowers_scalar_global_read_into_var_param_assignment() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Immutable);
+    let target = air::LocalId::from_index(0);
+    let callee = program.alloc_function(Function {
+        name: Ident::new("set"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("x", int, ParamMode::MutBorrow, target)], void),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::Assign {
+                    dst: place(target, int),
+                    value: RValue::Use(Operand::Place(root_place(PlaceRoot::Global(global), int))),
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(callee);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), callee);
+
+    assert!(matches!(
+        function.body.stmts[0],
+        RirStmt::GlobalEnsure { .. }
+    ));
+    assert!(matches!(
+        &function.body.stmts[1],
+        RirStmt::Init {
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                root: RirPlaceRoot::Global(_),
+                ..
+            })),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &function.body.stmts[2],
+        RirStmt::Assign {
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                root: RirPlaceRoot::Local(_),
+                ..
+            })),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn plan_temps_global_root_set_rhs_that_uses_generated_context() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let target = global_with_init(&mut program, module, "target", int, Mutability::Mutable);
+    let source = global_with_init(&mut program, module, "source", int, Mutability::Immutable);
+    for global in [target, source] {
+        let init = program.globals[global.index()].init;
+        program.function_mut(init).body =
+            structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    }
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global: source },
+                Statement::GlobalSetRoot {
+                    global: target,
+                    value: RValue::Use(Operand::Place(root_place(PlaceRoot::Global(source), int))),
+                    init: air::GlobalInitEffect::StoreWithoutInit,
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), main);
+
+    assert!(matches!(
+        function.body.stmts[0],
+        RirStmt::GlobalEnsure { .. }
+    ));
+    assert!(matches!(
+        &function.body.stmts[1],
+        RirStmt::Init {
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                root: RirPlaceRoot::Global(_),
+                ..
+            })),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &function.body.stmts[2],
+        RirStmt::GlobalSetRoot {
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                root: RirPlaceRoot::Local(_),
+                ..
+            })),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn plan_lowers_global_initializer_body_calls() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Immutable);
+    let helper = program.alloc_function(Function {
+        name: Ident::new("make_score"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value)))),
+    });
+    program.module_mut(module).functions.push(helper);
+    let init = program.globals[global.index()].init;
+    let tmp = air::LocalId::from_index(0);
+    program.function_mut(init).locals = vec![local(int, LocalKind::Temp)];
+    program.function_mut(init).body = structured_body(
+        vec![Statement::Init {
+            local: tmp,
+            value: RValue::Call {
+                callee: Callee::Function(helper),
+                args: vec![],
+            },
+        }],
+        air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let init = rir_function_for_air(plan.program(), init);
+
+    assert!(matches!(
+        init.body.stmts.as_slice(),
+        [RirStmt::Init {
+            value: RirRValue::Call {
+                callee: RirCallTarget::Function(_),
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn plan_lowers_scalar_global_root_read_and_statements() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+    program.function_mut(init).body =
+        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::GlobalSetRoot {
+                    global,
+                    value: RValue::Use(Operand::Const(value)),
+                    init: air::GlobalInitEffect::StoreWithoutInit,
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                int,
+            )))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), main);
+
+    assert!(matches!(
+        function.body.stmts[0],
+        RirStmt::GlobalEnsure {
+            global: RirGlobalId(0)
+        }
+    ));
+    assert!(matches!(
+        function.body.stmts[1],
+        RirStmt::GlobalSetRoot {
+            global: RirGlobalId(0),
+            ..
+        }
+    ));
+    assert!(matches!(
+        function.body.stmts[2],
+        RirStmt::Init {
+            value: RirRValue::Use(RirOperand::Place(RirPlace {
+                root: RirPlaceRoot::Global(RirGlobalId(0)),
+                ..
+            })),
+            ..
+        }
+    ));
+    assert!(matches!(
+        function.body.term,
+        RirTerm::Return(Some(RirOperand::Place(RirPlace {
+            root: RirPlaceRoot::Local(_),
+            ..
+        })))
+    ));
+}
+
+#[test]
+fn emit_scalar_global_slots_and_operations() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+    program.function_mut(init).body =
+        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::GlobalSetRoot {
+                    global,
+                    value: RValue::Use(Operand::Const(value)),
+                    init: air::GlobalInitEffect::StoreWithoutInit,
+                },
+            ],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                int,
+            )))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("g0_score: anvyx_runtime::GlobalSlot<i64>"));
+    assert!(source.contains("g0_score: anvyx_runtime::GlobalSlot::new(\"score\")"));
+    assert!(source.contains("globals.g0_score.ensure(||"));
+    assert!(source.contains("globals.g0_score.set_without_init(1)?;"));
+    assert!(source.contains("globals.g0_score.read(||"));
+    assert!(!source.contains("static "));
+    assert!(!source.contains("OnceLock"));
+}
+
+#[test]
+fn profile_accepts_scalar_global_root_value_reads() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
@@ -1002,9 +1731,72 @@ fn profile_rejects_global_roots() {
         locals: vec![],
         body: structured_body(
             vec![],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                int,
+            )))),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    check(program);
+}
+
+#[test]
+fn plan_maps_profile_global_value_read_to_target_gap() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", string, Mutability::Mutable);
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], string),
+        locals: vec![],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                string,
+            )))),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    assert_plan_gap(
+        program,
+        rust_plan_config(),
+        RustTargetGapKind::UnsupportedGlobalValueRead,
+    );
+}
+
+#[test]
+fn profile_rejects_global_projection_by_named_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", tuple, Mutability::Mutable);
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(
+            vec![],
             air::AirTail::Return(Some(Operand::Place(Place {
                 root: PlaceRoot::Global(global),
-                projection: vec![],
+                projection: vec![Projection::TupleField(0)],
                 ty: int,
             }))),
         ),
@@ -1017,12 +1809,12 @@ fn profile_rejects_global_roots() {
     assert_profile_error(
         &errors,
         ProfileSite::Terminator(id),
-        ProfileErrorKind::UnsupportedGlobal,
+        ProfileErrorKind::UnsupportedGlobalProjection,
     );
 }
 
 #[test]
-fn profile_rejects_global_statements_at_statement_site() {
+fn profile_accepts_scalar_global_statements() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let value = program.alloc_const(ConstData {
@@ -1055,16 +1847,61 @@ fn profile_rejects_global_statements_at_statement_site() {
     program.module_mut(module).functions.push(id);
     program.set_entry(id);
 
+    check(program);
+}
+
+#[test]
+fn profile_rejects_global_borrow_by_named_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", int, Mutability::Mutable);
+    let param_local = air::LocalId::from_index(0);
+    let callee = program.alloc_function(Function {
+        name: Ident::new("mutate"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("x", int, ParamMode::MutBorrow, param_local)],
+            void,
+        ),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let caller = program.alloc_function(Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::Eval(RValue::Call {
+                callee: Callee::Function(callee),
+                args: vec![CallArg::MutBorrow(Place {
+                    root: PlaceRoot::Global(global),
+                    projection: vec![],
+                    ty: int,
+                })],
+            })],
+            air::AirTail::Return(None),
+        ),
+    });
+    program
+        .module_mut(module)
+        .functions
+        .extend([callee, caller]);
+    program.set_entry(caller);
+
     let errors = profile_errors(program);
     assert_profile_error(
         &errors,
-        ProfileSite::Statement(id, 0),
-        ProfileErrorKind::UnsupportedGlobal,
-    );
-    assert_profile_error(
-        &errors,
-        ProfileSite::Statement(id, 1),
-        ProfileErrorKind::UnsupportedGlobal,
+        ProfileSite::Statement(caller, 0),
+        ProfileErrorKind::UnsupportedGlobalBorrow,
     );
 }
 
@@ -1298,7 +2135,7 @@ fn source_job_compiles_hand_built_air_capture_cell_lambdas() {
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig1<'env>"));
     assert!(text.contains("c0: &'env anvyx_runtime::StackLambdaCell<i64>"));
-    assert!(text.contains("fn call<'cx, 'rt>(&self, ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains(".set(1)?;"));
     assert!(text.contains(".get_copy()?"));
     assert!(text.contains("c0: &__cell0"));
@@ -1469,8 +2306,8 @@ fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
 fn emit_dataref_get_uses_short_heap_borrow() {
     let source = plan_source(nested_dataref_read_program()).into_string();
 
-    assert!(source.contains("ctx.heap().with(&v0, |storage| storage.child.clone())"));
-    assert!(source.contains("ctx.heap().with(&v2, |storage| storage.value)"));
+    assert!(source.contains("rt.heap().with(&v0, |storage| storage.child.clone())"));
+    assert!(source.contains("rt.heap().with(&v2, |storage| storage.value)"));
     assert!(!source.contains("|storage| anv_f"));
 }
 
@@ -1478,7 +2315,7 @@ fn emit_dataref_get_uses_short_heap_borrow() {
 fn emit_dataref_set_uses_short_mut_heap_borrow() {
     let source = plan_source(dataref_field_projection_program()).into_string();
 
-    assert!(source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value = 1; })"));
+    assert!(source.contains("rt.heap().with_mut(&v0, |storage| { storage.value = 1; })"));
     assert!(!source.contains("with_mut(&v0, |storage| { anv"));
 }
 
@@ -1486,7 +2323,7 @@ fn emit_dataref_set_uses_short_mut_heap_borrow() {
 fn plan_lowers_projected_source_mut_call_arg_to_dataref_place() {
     let source = plan_source(projected_mut_call_arg_program()).into_string();
 
-    assert!(source.contains("let __anv_dataref_place_object_0 = ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?;"));
+    assert!(source.contains("let __anv_dataref_place_object_0 = rt.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?;"));
     assert!(source.contains(&target::mut_place_dataref(
         "__anv_dataref_place_object_0",
         "&__anv_dataref_place_ops_0",
@@ -1495,7 +2332,7 @@ fn plan_lowers_projected_source_mut_call_arg_to_dataref_place() {
         "try_with_erased(object, {}",
         target::dataref_place_heap_type_access("self")
     )));
-    assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
+    assert!(!source.contains("rt.heap().with_mut(&v0, |storage| { storage.value ="));
 }
 
 #[test]
@@ -1510,8 +2347,8 @@ fn plan_lowers_multiple_projected_source_mut_call_args_without_copyback() {
         "__anv_dataref_place_object_1",
         "&__anv_dataref_place_ops_1",
     )));
-    assert!(!source.contains("ctx.heap().with_mut(&v0, |storage| { storage.value ="));
-    assert!(!source.contains("ctx.heap().with_mut(&v1, |storage| { storage.value ="));
+    assert!(!source.contains("rt.heap().with_mut(&v0, |storage| { storage.value ="));
+    assert!(!source.contains("rt.heap().with_mut(&v1, |storage| { storage.value ="));
 }
 
 #[test]
@@ -1521,7 +2358,7 @@ fn emit_dataref_mut_borrow_root_rebinds_handle() {
     assert!(source.contains(
         "mut v0: anvyx_runtime::MutPlace<'_, 'cx, anvT2_Node<'cx>>, v1: anvT2_Node<'cx>"
     ));
-    assert!(source.contains("v0.set(ctx.runtime(), v1.clone())?;"));
+    assert!(source.contains("v0.set(rt, v1.clone())?;"));
 }
 
 #[test]
@@ -1601,7 +2438,7 @@ fn stringify_override_value_receiver_uses_copy_reconstruction() {
     let source = plan_source(program);
     let text = source.as_str();
 
-    assert!(text.contains("anv_f1_Point_to_string(ctx, anvT3_Point { x: v0.x })"));
+    assert!(text.contains("anv_f1_Point_to_string(rt, types, globals, anvT3_Point { x: v0.x })"));
     assert!(!text.contains(".clone()"));
 
     let output = run_source(source);
@@ -1671,12 +2508,12 @@ fn stringify_override_propagates_fallible_receiver_function() {
     let text = source.as_str();
 
     assert!(
-        text.contains("Point_to_string<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>, v0: &anvT3_Point)")
+        text.contains("Point_to_string<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>, v0: &anvT3_Point)")
     );
     assert!(text.contains("-> Result<anvyx_runtime::AnvString, anvyx_runtime::RuntimeError>"));
-    assert!(text.contains("host::fallible(ctx.runtime(), 41)?;"));
-    assert!(text.contains("Point_to_string(ctx, &v0)?"));
-    assert!(text.contains("fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("host::fallible(rt, 41)?;"));
+    assert!(text.contains("Point_to_string(rt, types, globals, &v0)?"));
+    assert!(text.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
 
     let output = run_source(with_fallible_host(source));
@@ -1929,9 +2766,9 @@ fn source_job_compiles_methods_as_free_functions() {
     let text = source.as_str();
 
     assert!(text.contains(
-        "fn anv_f0_Point_value<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, v0: anvT3_Point) -> i64"
+        "fn anv_f0_Point_value<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>, v0: anvT3_Point) -> i64"
     ));
-    assert!(text.contains("anv_f0_Point_value(ctx, anvT3_Point { x: v0.x })"));
+    assert!(text.contains("anv_f0_Point_value(rt, types, globals, anvT3_Point { x: v0.x })"));
     assert!(!text.contains("impl "));
     assert!(!text.contains("trait "));
     assert!(!text.contains(".clone()"));
@@ -2380,11 +3217,13 @@ fn rir_verify_rejects_bad_tuple_projection() {
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![RirProjection::TupleField(RirFieldId::from_index(2))],
-            ty: RirTypeId::from_index(0),
-        }))));
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+            RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![RirProjection::TupleField(RirFieldId::from_index(2))],
+                RirTypeId::from_index(0),
+            ),
+        ))));
 
     assert_rir_error(program, RirVerifyErrorKind::BadId);
 }
@@ -2403,11 +3242,13 @@ fn rir_verify_rejects_tuple_projection_on_non_tuple_place() {
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(1),
-            projections: vec![RirProjection::TupleField(RirFieldId::from_index(0))],
-            ty: RirTypeId::from_index(0),
-        }))));
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+            RirPlace::local(
+                RirLocalId::from_index(1),
+                vec![RirProjection::TupleField(RirFieldId::from_index(0))],
+                RirTypeId::from_index(0),
+            ),
+        ))));
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
@@ -2533,11 +3374,11 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
                 body: RirStructuredBlock {
                     stmts: vec![RirStmt::Eval(RirRValue::Call {
                         callee: RirCallTarget::Function(RirFunctionId::from_index(0)),
-                        args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
-                            local: RirLocalId::from_index(0),
-                            projections: vec![],
-                            ty: strukt,
-                        }))],
+                        args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
+                            RirLocalId::from_index(0),
+                            vec![],
+                            strukt,
+                        )))],
                         ty: void,
                     })],
                     term: RirTerm::Return(None),
@@ -2632,11 +3473,11 @@ fn rir_verify_rejects_bad_struct_construction_and_projection() {
             },
         },
         RirStmt::Assign {
-            dst: RirPlace {
-                local: RirLocalId::from_index(1),
-                projections: vec![RirProjection::Field(RirFieldId::from_index(0))],
-                ty: RirTypeId::from_index(1),
-            },
+            dst: RirPlace::local(
+                RirLocalId::from_index(1),
+                vec![RirProjection::Field(RirFieldId::from_index(0))],
+                RirTypeId::from_index(1),
+            ),
             value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
         },
     ];
@@ -3152,11 +3993,11 @@ fn rir_rejects_unknown_function_value_captured_by_heap_env() {
         panic!("missing lambda init");
     };
     captures[0] = RirLambdaCaptureArg::Readonly {
-        value: RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: lambda_ty,
-        }),
+        value: RirOperand::Place(RirPlace::local(
+            RirLocalId::from_index(0),
+            vec![],
+            lambda_ty,
+        )),
     };
 
     assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
@@ -3218,11 +4059,11 @@ fn rir_accepts_returning_heap_env_lambda_local() {
     let lambda_ty = RirTypeId::from_index(2);
     let f = RirLocalId::from_index(1);
     program.functions[1].ret.ty = lambda_ty;
-    program.functions[1].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace {
-        local: f,
-        projections: vec![],
-        ty: lambda_ty,
-    })));
+    program.functions[1].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+        f,
+        vec![],
+        lambda_ty,
+    ))));
 
     rir::verify(&program).expect("RIR verify failed");
 }
@@ -3245,19 +4086,11 @@ fn rir_accepts_heap_env_lambda_local_alias_and_repeated_calls() {
     program.functions[1].body.stmts.extend([
         RirStmt::Init {
             local: g,
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                local: f,
-                projections: vec![],
-                ty: lambda_ty,
-            })),
+            value: RirRValue::Use(RirOperand::Place(RirPlace::local(f, vec![], lambda_ty))),
         },
         RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::LambdaValue {
-                callee: RirOperand::Place(RirPlace {
-                    local: g,
-                    projections: vec![],
-                    ty: lambda_ty,
-                }),
+                callee: RirOperand::Place(RirPlace::local(g, vec![], lambda_ty)),
                 sig: RirLambdaSigId::from_index(0),
             },
             args: vec![],
@@ -3265,11 +4098,7 @@ fn rir_accepts_heap_env_lambda_local_alias_and_repeated_calls() {
         }),
         RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::LambdaValue {
-                callee: RirOperand::Place(RirPlace {
-                    local: g,
-                    projections: vec![],
-                    ty: lambda_ty,
-                }),
+                callee: RirOperand::Place(RirPlace::local(g, vec![], lambda_ty)),
                 sig: RirLambdaSigId::from_index(0),
             },
             args: vec![],
@@ -3314,11 +4143,11 @@ fn rir_accepts_heap_env_lambda_passed_to_escaping_param() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(consumer),
-            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
-                local: f,
-                projections: vec![],
-                ty: lambda_ty,
-            }))],
+            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
+                f,
+                vec![],
+                lambda_ty,
+            )))],
             ty: void,
         }));
 
@@ -3347,11 +4176,7 @@ fn rir_rejects_heap_env_lambda_call_signature_mismatch() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::LambdaValue {
-                callee: RirOperand::Place(RirPlace {
-                    local: f,
-                    projections: vec![],
-                    ty: lambda_ty,
-                }),
+                callee: RirOperand::Place(RirPlace::local(f, vec![], lambda_ty)),
                 sig: RirLambdaSigId::from_index(1),
             },
             args: vec![],
@@ -3476,11 +4301,9 @@ fn rir_rejects_promoted_scoped_place_source_local_use() {
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: RirTypeId::from_index(1),
-        }))));
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+            RirPlace::local(RirLocalId::from_index(0), vec![], RirTypeId::from_index(1)),
+        ))));
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
@@ -3735,8 +4558,8 @@ fn emit_heap_cell_owner_read_write_use_heap_handle() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
-    assert!(text.contains("ctx.heap().with(&__cell0, |cell| cell.set(2))?;"));
-    assert!(text.contains("let tmp: i64 = ctx.heap().with(&__cell0, |cell| cell.get_copy())?;"));
+    assert!(text.contains("rt.heap().with(&__cell0, |cell| cell.set(2))?;"));
+    assert!(text.contains("let tmp: i64 = rt.heap().with(&__cell0, |cell| cell.get_copy())?;"));
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
 }
@@ -3772,9 +4595,9 @@ fn emit_heap_cell_init_hoists_ctx_using_value_before_alloc() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
-    assert!(text.contains("let value = seed(ctx);"));
+    assert!(text.contains("let value = seed(rt, types, globals);"));
     assert!(
-        text.contains("ctx.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value))")
+        text.contains("rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value))")
     );
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -3805,13 +4628,13 @@ fn emit_heap_cell_alloc_env_and_access_use_handles() {
             .contains("let __cell0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>> =")
     );
     assert!(source.contains(
-        "= { let value = 1; let heap_type = ctx._types.lambda_cell0; ctx.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value)) };"
+        "= { let value = 1; let heap_type = types.lambda_cell0; rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value)) };"
     ));
     assert!(source.contains("c0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>>,"));
     assert!(source.contains("c0: __cell0.clone()"));
-    assert!(source.contains("let c0 = ctx.heap().with(env, |env| env.c0.clone());"));
-    assert!(source.contains("target(ctx, c0)"));
-    assert!(source.contains("ctx.heap().with(&cell, |cell| cell.get_copy())?"));
+    assert!(source.contains("let c0 = rt.heap().with(env, |env| env.c0.clone());"));
+    assert!(source.contains("target(rt, types, globals, c0)"));
+    assert!(source.contains("rt.heap().with(&cell, |cell| cell.get_copy())?"));
     assert!(!source.contains("StackLambdaCell"));
     assert!(!source.contains("RefCell"));
     assert!(!source.contains("Rc<"));
@@ -4148,19 +4971,11 @@ fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
     program.functions[0].body.stmts.extend([
         RirStmt::Init {
             local: g,
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                local: f,
-                projections: vec![],
-                ty: lambda_ty,
-            })),
+            value: RirRValue::Use(RirOperand::Place(RirPlace::local(f, vec![], lambda_ty))),
         },
         RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::LambdaValue {
-                callee: RirOperand::Place(RirPlace {
-                    local: f,
-                    projections: vec![],
-                    ty: lambda_ty,
-                }),
+                callee: RirOperand::Place(RirPlace::local(f, vec![], lambda_ty)),
                 sig: RirLambdaSigId::from_index(0),
             },
             args: vec![],
@@ -4168,11 +4983,7 @@ fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
         }),
         RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::LambdaValue {
-                callee: RirOperand::Place(RirPlace {
-                    local: g,
-                    projections: vec![],
-                    ty: lambda_ty,
-                }),
+                callee: RirOperand::Place(RirPlace::local(g, vec![], lambda_ty)),
                 sig: RirLambdaSigId::from_index(0),
             },
             args: vec![],
@@ -4184,9 +4995,9 @@ fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
     let text = source.as_str();
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
     assert!(text.contains("L0 { c0: &'env anvyx_runtime::StackLambdaCell<i64> }"));
-    assert!(text.contains("fn call<'cx, 'rt>(&self, ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains("c0: &__cell0"));
-    assert!(text.contains("target(ctx, *c0)"));
+    assert!(text.contains("target(rt, types, globals, *c0)"));
     assert!(!text.contains("&'env mut"));
     assert!(!text.contains("fn call<'cx, 'rt>(&mut self"));
     assert!(!text.contains("&mut source"));
@@ -4201,12 +5012,9 @@ fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
 #[test]
 fn rir_rejects_ordinary_place_use_of_stack_cell_capture_param() {
     let mut program = valid_stack_cell_lambda_rir();
-    program.functions[1].body.stmts =
-        vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: RirTypeId::from_index(1),
-        })))];
+    program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+        RirPlace::local(RirLocalId::from_index(0), vec![], RirTypeId::from_index(1)),
+    )))];
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
@@ -4214,12 +5022,9 @@ fn rir_rejects_ordinary_place_use_of_stack_cell_capture_param() {
 #[test]
 fn rir_rejects_ordinary_place_use_of_scoped_place_cell_capture_param() {
     let mut program = valid_scoped_place_cell_lambda_rir();
-    program.functions[1].body.stmts =
-        vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: RirTypeId::from_index(1),
-        })))];
+    program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+        RirPlace::local(RirLocalId::from_index(0), vec![], RirTypeId::from_index(1)),
+    )))];
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
@@ -4232,11 +5037,11 @@ fn rir_rejects_mut_borrow_call_arg_use_of_scoped_place_cell_capture_param() {
         .push(mut_borrow_sink_function(RirFunctionId::from_index(2)));
     program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Call {
         callee: RirCallTarget::Function(RirFunctionId::from_index(2)),
-        args: vec![RirCallArg::MutBorrow(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: RirTypeId::from_index(1),
-        })],
+        args: vec![RirCallArg::MutBorrow(RirPlace::local(
+            RirLocalId::from_index(0),
+            vec![],
+            RirTypeId::from_index(1),
+        ))],
         ty: RirTypeId::from_index(0),
     })];
 
@@ -4569,11 +5374,11 @@ fn rir_rejects_non_escaping_lambda_arg_to_escaping_param() {
                         },
                         RirStmt::Eval(RirRValue::Call {
                             callee: RirCallTarget::Function(callee),
-                            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
-                                local: f,
-                                projections: vec![],
-                                ty: lambda_ty,
-                            }))],
+                            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
+                                f,
+                                vec![],
+                                lambda_ty,
+                            )))],
                             ty: void,
                         }),
                     ],
@@ -4724,11 +5529,11 @@ fn rir_rejects_projected_mut_borrow_arg() {
                 vec![rir_local(local, pair_ty, true, "pair")],
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(callee),
-                    args: vec![RirCallArg::MutBorrow(RirPlace {
+                    args: vec![RirCallArg::MutBorrow(RirPlace::local(
                         local,
-                        projections: vec![RirProjection::TupleField(field)],
-                        ty: int,
-                    })],
+                        vec![RirProjection::TupleField(field)],
+                        int,
+                    ))],
                     ty: void,
                 })],
             ),
@@ -5162,11 +5967,11 @@ fn rir_accepts_nested_dynamic_map_slot_projection() {
                 rir_local(key, string, false, "key"),
             ],
             vec![RirStmt::Assign {
-                dst: RirPlace {
-                    local: maps,
-                    projections: vec![RirProjection::Index(index), RirProjection::MapIndex(key)],
-                    ty: slot,
-                },
+                dst: RirPlace::local(
+                    maps,
+                    vec![RirProjection::Index(index), RirProjection::MapIndex(key)],
+                    slot,
+                ),
                 value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
             }],
         )],
@@ -5210,11 +6015,7 @@ fn rir_rejects_map_slot_bad_key_type() {
                 rir_local(key, int, false, "key"),
             ],
             vec![RirStmt::Assign {
-                dst: RirPlace {
-                    local: counts,
-                    projections: vec![RirProjection::MapIndex(key)],
-                    ty: slot,
-                },
+                dst: RirPlace::local(counts, vec![RirProjection::MapIndex(key)], slot),
                 value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
             }],
         )],
@@ -5435,7 +6236,7 @@ fn emit_collection_loan_scope_uses_short_mut_place_access() {
 
     assert!(text.contains(&target::mut_place_access(
         "xs",
-        "ctx.runtime()",
+        "rt",
         &target::begin_shape_loan_region(),
     )));
     assert!(!text.contains("iter_mut"));
@@ -5591,11 +6392,7 @@ fn rir_accepts_scoped_capture_lambda_descriptor_and_value() {
         int,
         false,
         RirLambdaCaptureArg::Readonly {
-            value: RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: int,
-            }),
+            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], int)),
         },
     );
 
@@ -5644,11 +6441,7 @@ fn rir_rejects_noncopy_value_capture() {
         string,
         false,
         RirLambdaCaptureArg::Readonly {
-            value: RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: string,
-            }),
+            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], string)),
         },
     );
 
@@ -5683,11 +6476,11 @@ fn rir_rejects_projected_scoped_capture() {
         tuple_ty,
         true,
         RirLambdaCaptureArg::Scoped {
-            place: RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![RirProjection::TupleField(field)],
-                ty: int,
-            },
+            place: RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![RirProjection::TupleField(field)],
+                int,
+            ),
         },
     );
 
@@ -5709,11 +6502,11 @@ fn rir_accepts_copying_stack_cell_lambda_value() {
     });
     program.functions[0].body.stmts.push(RirStmt::Init {
         local: g,
-        value: RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(1),
-            projections: vec![],
-            ty: lambda_ty,
-        })),
+        value: RirRValue::Use(RirOperand::Place(RirPlace::local(
+            RirLocalId::from_index(1),
+            vec![],
+            lambda_ty,
+        ))),
     });
 
     rir::verify(&program).expect("RIR verify failed");
@@ -5741,11 +6534,11 @@ fn rir_rejects_copying_mut_borrow_lambda_value() {
     });
     program.functions[1].body.stmts.push(RirStmt::Init {
         local: g,
-        value: RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(1),
-            projections: vec![],
-            ty: lambda_ty,
-        })),
+        value: RirRValue::Use(RirOperand::Place(RirPlace::local(
+            RirLocalId::from_index(1),
+            vec![],
+            lambda_ty,
+        ))),
     });
 
     assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
@@ -5785,11 +6578,11 @@ fn rir_rejects_passing_mut_borrow_lambda_value() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(callee),
-            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(1),
-                projections: vec![],
-                ty: lambda_ty,
-            }))],
+            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(1),
+                vec![],
+                lambda_ty,
+            )))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -5886,11 +6679,11 @@ fn rir_rejects_returning_non_escaping_lambda() {
                             ty: lambda_ty,
                         },
                     }],
-                    term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
-                        local: f,
-                        projections: vec![],
-                        ty: lambda_ty,
-                    }))),
+                    term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                        f,
+                        vec![],
+                        lambda_ty,
+                    )))),
                 },
             },
         ],
@@ -5964,11 +6757,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
                 },
                 RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::LambdaValue {
-                        callee: RirOperand::Place(RirPlace {
-                            local,
-                            projections: vec![],
-                            ty: lambda_ty,
-                        }),
+                        callee: RirOperand::Place(RirPlace::local(local, vec![], lambda_ty)),
                         sig,
                     },
                     args: vec![],
@@ -5982,7 +6771,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
     assert!(text.contains("enum LambdaSig0"));
-    assert!(text.contains("fn call<'cx, 'rt>(self, ctx: &mut AnvCtx<'cx, 'rt>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains("LambdaSig0::L0"));
     assert!(!text.contains("Box<dyn"));
     assert!(!text.contains("LambdaEnv"));
@@ -6060,11 +6849,7 @@ fn rir_rejects_internal_direct_mut_borrow_lambda_capture() {
         }],
         body: RirStructuredBlock {
             stmts: vec![RirStmt::Assign {
-                dst: RirPlace {
-                    local: hidden,
-                    projections: vec![],
-                    ty: int,
-                },
+                dst: RirPlace::local(hidden, vec![], int),
                 value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(1))),
             }],
             term: RirTerm::Return(None),
@@ -6105,22 +6890,14 @@ fn rir_rejects_internal_direct_mut_borrow_lambda_capture() {
                     value: RirRValue::Lambda {
                         lambda,
                         captures: vec![RirLambdaCaptureArg::Scoped {
-                            place: RirPlace {
-                                local: capture,
-                                projections: vec![],
-                                ty: int,
-                            },
+                            place: RirPlace::local(capture, vec![], int),
                         }],
                         ty: lambda_ty,
                     },
                 },
                 RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::LambdaValue {
-                        callee: RirOperand::Place(RirPlace {
-                            local: f,
-                            projections: vec![],
-                            ty: lambda_ty,
-                        }),
+                        callee: RirOperand::Place(RirPlace::local(f, vec![], lambda_ty)),
                         sig,
                     },
                     args: vec![],
@@ -6457,11 +7234,11 @@ fn emit_traces_tracked_lambda_env_and_lambda_value_fields() {
         panic!("missing lambda init");
     };
     captures[0] = RirLambdaCaptureArg::Readonly {
-        value: RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(0),
-            projections: vec![],
-            ty: lambda_ty,
-        }),
+        value: RirOperand::Place(RirPlace::local(
+            RirLocalId::from_index(0),
+            vec![],
+            lambda_ty,
+        )),
     };
 
     let verified = rir::verify(&program).expect("RIR verify failed");
@@ -6677,13 +7454,13 @@ fn plan_lowers_escaping_readonly_capture_to_heap_env() {
     assert!(source.contains("lambda_env0: heap.register_untracked::<LambdaEnv0>()"));
     assert!(source.contains("struct LambdaEnv0"));
     assert!(source.contains("c0: i64,"));
-    assert!(source.contains("ctx.heap().alloc(heap_type, LambdaEnv0 { c0:"));
+    assert!(source.contains("rt.heap().alloc(heap_type, LambdaEnv0 { c0:"));
     assert!(source.contains("L0 { env: anvyx_runtime::Handle<'cx, LambdaEnv0> }"));
     let materialize = source
-        .find("let c0 = ctx.heap().with(env, |env|")
+        .find("let c0 = rt.heap().with(env, |env|")
         .expect("missing env field materialization");
     let call = source[materialize..]
-        .find("(ctx, c0)")
+        .find("(rt, types, globals, c0)")
         .expect("missing materialized body call");
     assert!(call > 0);
     for forbidden in [
@@ -7841,9 +8618,9 @@ fn emit_passes_owner_heap_cell_var_arg_as_heap_cell_mut_place() {
     assert!(!source.contains("MutPlace::local(&mut"));
     assert!(!source.contains("__cell0.get_copy"));
     assert!(!source.contains("__cell0.set"));
-    assert!(!source.contains("ctx.heap().with(&__cell0, |cell| cell.get_copy())?"));
-    assert!(!source.contains("ctx.heap().with(&__cell0, |cell| cell.set"));
-    assert!(!source.contains("ctx.heap().with(&__cell0, |cell| bump"));
+    assert!(!source.contains("rt.heap().with(&__cell0, |cell| cell.get_copy())?"));
+    assert!(!source.contains("rt.heap().with(&__cell0, |cell| cell.set"));
+    assert!(!source.contains("rt.heap().with(&__cell0, |cell| bump"));
     assert!(!source.contains("StackLambdaCell"));
 }
 
@@ -7855,9 +8632,9 @@ fn emit_passes_capture_heap_cell_var_arg_as_heap_cell_mut_place() {
     assert!(!source.contains("MutPlace::local(&mut"));
     assert!(!source.contains("v0.get_copy"));
     assert!(!source.contains("v0.set"));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| cell.get_copy())?"));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| cell.set"));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| bump"));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| cell.get_copy())?"));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| cell.set"));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| bump"));
     assert!(!source.contains("StackLambdaCell"));
 }
 
@@ -7865,24 +8642,20 @@ fn emit_passes_capture_heap_cell_var_arg_as_heap_cell_mut_place() {
 fn emit_reentrant_heap_cell_var_arg_call_is_not_wrapped_in_cell_borrow() {
     let source = plan_source(heap_capture_cell_reentrant_source_var_arg_program()).into_string();
 
-    assert!(source.contains("apply(ctx, anvyx_runtime::MutPlace::heap_cell("));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| apply"));
+    assert!(source.contains("apply(rt, types, globals, anvyx_runtime::MutPlace::heap_cell("));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| apply"));
     assert!(!source.contains("cell.mutate(|value| apply"));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| cell.get_copy())?"));
-    assert!(!source.contains("ctx.heap().with(&v0, |cell| cell.set"));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| cell.get_copy())?"));
+    assert!(!source.contains("rt.heap().with(&v0, |cell| cell.set"));
 }
 
 #[test]
 fn emit_temps_mut_place_read_before_heap_cell_set() {
     let source = plan_source(heap_cell_set_from_mut_place_param_program()).into_string();
 
-    assert!(source.contains(".get_copy(ctx.runtime())?;"));
-    assert!(source.contains("ctx.heap().with(&__cell0, |cell| cell.set(v"));
-    assert!(
-        !source.contains(
-            "ctx.heap().with(&__cell0, |cell| cell.set(v0_x.get_copy(ctx.runtime())?))?;"
-        )
-    );
+    assert!(source.contains(".get_copy(rt)?;"));
+    assert!(source.contains("rt.heap().with(&__cell0, |cell| cell.set(v"));
+    assert!(!source.contains("rt.heap().with(&__cell0, |cell| cell.set(v0_x.get_copy(rt)?))?;"));
 }
 
 #[test]
@@ -8027,9 +8800,9 @@ fn plan_lowers_projected_local_to_native_mut_place() {
         }) if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
     ));
     let source = emit::emit(&plan.verified()).into_string();
-    assert!(source.contains("host::touch_place(ctx.runtime(),"));
+    assert!(source.contains("host::touch_place(rt,"));
     assert!(source.contains("MutPlace::projected("));
-    assert!(!source.contains("host::touch_place(ctx.runtime(), &mut"));
+    assert!(!source.contains("host::touch_place(rt, &mut"));
 }
 
 #[test]
@@ -8293,10 +9066,10 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
     assert!(source.contains("fn anv_f1_Second_value"));
     assert!(source.contains("fn anv_f2_First_value"));
     assert!(source.contains("fn anv_f3_value"));
-    assert!(source.contains("anv_f0_First_value(ctx,"));
-    assert!(source.contains("anv_f1_Second_value(ctx,"));
-    assert!(source.contains("anv_f2_First_value(ctx)"));
-    assert!(source.contains("anv_f3_value(ctx)"));
+    assert!(source.contains("anv_f0_First_value(rt, types, globals,"));
+    assert!(source.contains("anv_f1_Second_value(rt, types, globals,"));
+    assert!(source.contains("anv_f2_First_value(rt, types, globals)"));
+    assert!(source.contains("anv_f3_value(rt, types, globals)"));
     assert!(!source.contains("impl "));
     assert!(!source.contains("trait "));
 }
@@ -8337,16 +9110,16 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains("struct AnvTypes<'cx>"));
-    assert!(source.contains("fn register(heap: &mut anvyx_runtime::Heap<'cx>) -> Self"));
-    assert!(source.contains("struct AnvCtx<'cx, 'rt>"));
-    assert!(source.contains("fn runtime(&mut self) -> &mut anvyx_runtime::Ctx<'cx, 'rt>"));
+    assert!(source.contains("fn register(_heap: &mut anvyx_runtime::Heap<'cx>) -> Self"));
+    assert!(source.contains("struct AnvGlobals<'cx>"));
+    assert!(source.contains("struct AnvGlobals<'cx>"));
     assert!(source.contains("let types = AnvTypes::register(heap);"));
-    assert!(source.contains("let rt = anvyx_runtime::Ctx::new(heap);"));
-    assert!(source.contains("let mut ctx = AnvCtx::new(rt, types);"));
-    assert!(source.contains("fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>)"));
-    assert!(source.contains(
-        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0.as_str())"
-    ));
+    assert!(source.contains("let mut rt = anvyx_runtime::Ctx::new(heap);"));
+    assert!(source.contains("let globals = AnvGlobals::new();"));
+    assert!(source.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>)"));
+    assert!(
+        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0.as_str())")
+    );
     assert!(!source.contains("type AnvCtx"));
     assert_eq!(source.matches("anvyx_runtime::Ctx::new").count(), 1);
     assert!(!source.contains("fn anv_extern__println"));
@@ -8400,9 +9173,9 @@ fn emit_uses_underscored_context_only_for_leaf_bodies() {
 
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anv_f0_leaf<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>) -> i64"));
-    assert!(source.contains("fn anv_f1_caller<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> i64"));
-    assert!(source.contains("anv_f0_leaf(ctx)"));
+    assert!(source.contains("fn anv_f0_leaf<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> i64"));
+    assert!(source.contains("fn anv_f1_caller<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>) -> i64"));
+    assert!(source.contains("anv_f0_leaf(rt, types, globals)"));
 }
 
 #[test]
@@ -8418,7 +9191,7 @@ fn emit_uses_underscored_context_for_primitive_struct_stringify_helper() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains(
-        "fn anvstringify_t3_point<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, value: &anvT3_Point)"
+        "fn anvstringify_t3_point<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, value: &anvT3_Point)"
     ));
 }
 
@@ -8493,12 +9266,12 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
     let source = emit::emit(&verified).into_string();
 
     assert!(
-        source.contains("fn stringify_inner<'cx, 'rt>(_ctx: &mut AnvCtx<'cx, 'rt>, value: &Inner)")
+        source.contains("fn stringify_inner<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, value: &Inner)")
     );
     assert!(
-        source.contains("fn stringify_outer<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>, value: &Outer)")
+        source.contains("fn stringify_outer<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, value: &Outer)")
     );
-    assert!(source.contains("stringify_inner(ctx, &value.inner)"));
+    assert!(source.contains("stringify_inner(rt, types, &value.inner)"));
 }
 
 #[test]
@@ -8529,7 +9302,7 @@ fn emit_wraps_native_string_returns() {
         emit::emit(&rir::verify(&native_string_return_program()).expect("RIR verify failed"))
             .into_string();
 
-    assert!(source.contains("anvyx_runtime::AnvString::from(host::string(ctx.runtime()))"));
+    assert!(source.contains("anvyx_runtime::AnvString::from(host::string(rt))"));
 }
 
 #[test]
@@ -8559,11 +9332,11 @@ fn emit_wraps_native_option_string_returns() {
                     ty: option,
                 },
             }],
-            term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: option,
-            }))),
+            term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                option,
+            )))),
         },
     });
 
@@ -8571,7 +9344,7 @@ fn emit_wraps_native_option_string_returns() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
-    assert!(text.contains("match host::substring(ctx.runtime())"));
+    assert!(text.contains("match host::substring(rt)"));
     assert!(text.contains("Some(value) => Some(anvyx_runtime::AnvString::from(value))"));
 
     let source = emit::RustSource::new(format!(
@@ -8588,11 +9361,11 @@ fn emit_propagates_fallible_native_calls() {
     let source = plan_source(fallible_call_program(false, false)).into_string();
 
     assert!(source.contains(
-        "fn anv_f0_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
-    assert!(source.contains("host::fallible(ctx.runtime(), 41)?;"));
+    assert!(source.contains("host::fallible(rt, 41)?;"));
     assert!(source.contains("fn main() -> Result<(), anvyx_runtime::RuntimeError>"));
-    assert!(source.contains("let _ = anv_f0_main(&mut ctx)?;"));
+    assert!(source.contains("let _ = anv_f0_main(&mut rt, &types, &globals)?;"));
     assert!(!source.contains(".unwrap()"));
 }
 
@@ -8601,12 +9374,12 @@ fn emit_propagates_generated_fallibility_transitively() {
     let source = plan_source(fallible_call_program(true, false)).into_string();
 
     assert!(source.contains(
-        "fn anv_f0_leaf<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f0_leaf<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
     assert!(source.contains(
-        "fn anv_f1_main<'cx, 'rt>(ctx: &mut AnvCtx<'cx, 'rt>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f1_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
-    assert!(source.contains("anv_f0_leaf(ctx)?;"));
+    assert!(source.contains("anv_f0_leaf(rt, types, globals)?;"));
 }
 
 #[test]
@@ -8621,9 +9394,7 @@ fn source_job_compiles_fallible_non_void_entry() {
 fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
-    assert!(source.contains(
-        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), \"ready\");"
-    ));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, \"ready\");"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -8633,26 +9404,18 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
     let source = plan_source(shared_string_forward_program()).into_string();
 
     assert!(source.contains(": &str"));
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0);"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, &v0);"));
     assert!(
-        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0);")
+        !source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0.as_str());")
     );
-    assert!(
-        !source
-            .contains("anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), &v0);")
-    );
-    assert!(!source.contains(
-        "anvyx_core2::__anvyx_native::core_runtime::_println(ctx.runtime(), v0.as_str());"
-    ));
 }
 
 #[test]
 fn emit_borrows_string_constant_for_native_string_param() {
     let source = plan_source(native_str_len_const_program()).into_string();
 
-    assert!(
-        source
-            .contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), \"abc\")")
-    );
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, \"abc\")"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -8661,14 +9424,8 @@ fn emit_borrows_string_constant_for_native_string_param() {
 fn emit_borrows_string_local_for_native_string_param() {
     let source = plan_source(native_str_len_local_program()).into_string();
 
-    assert!(
-        source.contains(
-            "anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), v0.as_str())"
-        )
-    );
-    assert!(
-        !source.contains("anvyx_core2::__anvyx_native::core_string::str_len(ctx.runtime(), &v0)")
-    );
+    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, v0.as_str())"));
+    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, &v0)"));
 }
 
 #[test]
@@ -8704,11 +9461,11 @@ fn rir_verify_rejects_return_from_uninitialized_local() {
         initialized: false,
         payload_ref: false,
     });
-    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace {
-        local: RirLocalId::from_index(0),
-        projections: vec![],
-        ty: RirTypeId::from_index(0),
-    })));
+    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+        RirLocalId::from_index(0),
+        vec![],
+        RirTypeId::from_index(0),
+    ))));
 
     let errors = rir::verify(&program).expect_err("verified uninitialized local");
     assert!(
@@ -8945,11 +9702,11 @@ fn rir_verify_rejects_bad_call_arg_mode() {
         }],
         body: RirStructuredBlock {
             stmts: vec![],
-            term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: int,
-            }))),
+            term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                int,
+            )))),
         },
     });
     program.functions[0]
@@ -8957,11 +9714,11 @@ fn rir_verify_rejects_bad_call_arg_mode() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
-            args: vec![RirCallArg::SharedBorrow(RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: int,
-            })],
+            args: vec![RirCallArg::SharedBorrow(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                int,
+            ))],
             ty: int,
         }));
 
@@ -9135,16 +9892,16 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
             "impl<'cx> {} for anvP0_Node_value_place<'cx>",
             target::dataref_place_ops_ty("i64")
         ),
-        target::ctx_heap_try_with_erased(
-            "ctx",
+        target::rt_heap_try_with_erased(
+            "rt",
             "object",
             &heap_type,
             "storage",
             "NodeStorage<'cx>",
             "f(&storage.value)",
         ),
-        target::ctx_heap_try_with_erased_mut(
-            "ctx",
+        target::rt_heap_try_with_erased_mut(
+            "rt",
             "object",
             &heap_type,
             "storage",
@@ -9153,14 +9910,14 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
         ),
         format!(
             "let __anv_dataref_place_object_0 = {};",
-            target::ctx_heap_erase("ctx", "&node")
+            target::rt_heap_erase("rt", "&node")
         ),
         format!(
-            "let __anv_dataref_place_ops_0 = anvP0_Node_value_place {{ {}: ctx._types.NodeHeapType }};",
+            "let __anv_dataref_place_ops_0 = anvP0_Node_value_place {{ {}: types.NodeHeapType }};",
             target::dataref_place_heap_type_field()
         ),
         format!(
-            "sink(ctx, {})",
+            "sink(rt, types, globals, {})",
             target::mut_place_dataref("__anv_dataref_place_object_0", "&__anv_dataref_place_ops_0")
         ),
     ] {
@@ -10049,11 +10806,7 @@ fn valid_heap_env_lambda_rir() -> RirProgram {
                         value: RirRValue::Lambda {
                             lambda,
                             captures: vec![RirLambdaCaptureArg::Readonly {
-                                value: RirOperand::Place(RirPlace {
-                                    local: source,
-                                    projections: vec![],
-                                    ty: int,
-                                }),
+                                value: RirOperand::Place(RirPlace::local(source, vec![], int)),
                             }],
                             ty: lambda_ty,
                         },
@@ -10463,22 +11216,14 @@ fn read_compute_write_cell_rir(cell: RirCellDecl) -> RirProgram {
             local: next,
             value: RirRValue::Binary {
                 op: BinaryOp::Add,
-                lhs: RirOperand::Place(RirPlace {
-                    local: tmp,
-                    projections: vec![],
-                    ty: int,
-                }),
+                lhs: RirOperand::Place(RirPlace::local(tmp, vec![], int)),
                 rhs: RirOperand::Const(one),
                 ty: int,
             },
         },
         RirStmt::CellSet {
             cell: RirCellRef::Owner(RirCellId::from_index(0)),
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                local: next,
-                projections: vec![],
-                ty: int,
-            })),
+            value: RirRValue::Use(RirOperand::Place(RirPlace::local(next, vec![], int))),
         },
     ];
     program
@@ -11062,11 +11807,7 @@ fn mut_borrow_lambda_rir() -> RirProgram {
         int,
         true,
         RirLambdaCaptureArg::Scoped {
-            place: RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: int,
-            },
+            place: RirPlace::local(RirLocalId::from_index(0), vec![], int),
         },
     )
 }
@@ -11084,6 +11825,68 @@ fn assert_rir_type_error(program: RirProgram) {
             .any(|error| matches!(error.kind, RirVerifyErrorKind::TypeMismatch { .. })),
         "missing expected type mismatch: {errors:?}"
     );
+}
+
+fn valid_global_rir(edit: impl FnOnce(&mut RirProgram)) -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let void = RirTypeId::from_index(1);
+    let value = RirConstId::from_index(0);
+    let global = RirGlobalId::from_index(0);
+    let init = RirFunctionId::from_index(0);
+    let main = RirFunctionId::from_index(1);
+    let mut program = RirProgram {
+        globals: vec![RirGlobal {
+            id: global,
+            air_id: air::GlobalId::from_index(0),
+            module: air::ModuleId::from_index(0),
+            name: RirSymbol::new("game.score"),
+            slot_symbol: RirSymbol::new("g0_score"),
+            ty: int,
+            mutable: true,
+            init,
+        }],
+        types: vec![RirType::Int, RirType::Void],
+        consts: vec![RirConst {
+            id: value,
+            ty: int,
+            value: RirConstValue::Int(7),
+        }],
+        functions: vec![
+            RirFunction {
+                id: init,
+                air_id: None,
+                symbol: RirSymbol::new("ginit0"),
+                params: vec![],
+                ret: RirReturn { ty: int },
+                locals: vec![],
+                body: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(value))),
+                },
+            },
+            RirFunction {
+                id: main,
+                air_id: None,
+                symbol: RirSymbol::new("main"),
+                params: vec![],
+                ret: RirReturn { ty: void },
+                locals: vec![],
+                body: RirStructuredBlock {
+                    stmts: vec![
+                        RirStmt::GlobalEnsure { global },
+                        RirStmt::GlobalSetRoot {
+                            global,
+                            value: RirRValue::Use(RirOperand::Const(value)),
+                        },
+                    ],
+                    term: RirTerm::Return(None),
+                },
+            },
+        ],
+        ..RirProgram::default()
+    };
+    edit(&mut program);
+    program
 }
 
 fn tracked_struct_tuple_payload_program() -> Program {
@@ -11470,11 +12273,11 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
 }
 
 fn dataref_access_place(local: usize, ty: usize) -> RirPlace {
-    RirPlace {
-        local: RirLocalId::from_index(local),
-        projections: vec![],
-        ty: RirTypeId::from_index(ty),
-    }
+    RirPlace::local(
+        RirLocalId::from_index(local),
+        vec![],
+        RirTypeId::from_index(ty),
+    )
 }
 
 fn enum_match_rir(
@@ -11521,11 +12324,7 @@ fn enum_match_rir(
     });
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::EnumMatch(RirEnumMatch {
-            discr: RirPlace {
-                local: RirLocalId::from_index(0),
-                projections: vec![],
-                ty: RirTypeId::from_index(0),
-            },
+            discr: RirPlace::local(RirLocalId::from_index(0), vec![], RirTypeId::from_index(0)),
             arms,
             else_block,
         })],
@@ -11660,11 +12459,11 @@ fn rir_local(id: RirLocalId, ty: RirTypeId, mutable: bool, symbol: &str) -> RirL
 }
 
 fn rir_place(local: RirLocalId, ty: RirTypeId) -> RirPlace {
-    RirPlace {
-        local,
-        projections: vec![],
-        ty,
-    }
+    RirPlace::local(local, vec![], ty)
+}
+
+fn rir_global_place(ty: RirTypeId) -> RirPlace {
+    RirPlace::global(RirGlobalId::from_index(0), vec![], ty)
 }
 
 fn mut_place_call_rir(
@@ -13609,11 +14408,7 @@ fn rir_optional_some_accepts_shareable_slice_descriptor() {
     program.functions[0].locals[1].initialized = true;
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::Eval(RirRValue::OptionalSome {
-            value: RirOperand::Place(RirPlace {
-                local: RirLocalId::from_index(1),
-                projections: vec![],
-                ty: slice,
-            }),
+            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(1), vec![], slice)),
             ty: option,
         })],
         term: RirTerm::Unreachable,
@@ -13799,11 +14594,9 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     nested_scoped_ref_used_after_block.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(1),
-            projections: vec![],
-            ty: RirTypeId::from_index(0),
-        }))));
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+            RirPlace::local(RirLocalId::from_index(1), vec![], RirTypeId::from_index(0)),
+        ))));
     let errors = rir::verify(&nested_scoped_ref_used_after_block)
         .expect_err("payload_ref from nested block must not escape block scope");
     assert!(errors.iter().any(|error| {
@@ -13824,11 +14617,9 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     scoped_ref_used_after_match.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(RirPlace {
-            local: RirLocalId::from_index(1),
-            projections: vec![],
-            ty: RirTypeId::from_index(0),
-        }))));
+        .push(RirStmt::Eval(RirRValue::Use(RirOperand::Place(
+            RirPlace::local(RirLocalId::from_index(1), vec![], RirTypeId::from_index(0)),
+        ))));
     let errors = rir::verify(&scoped_ref_used_after_match)
         .expect_err("non-escaping payload_ref must not outlive match arm");
     assert!(errors.iter().any(|error| {
@@ -13881,21 +14672,17 @@ fn option_match_rir() -> RirProgram {
             ],
             body: RirStructuredBlock {
                 stmts: vec![RirStmt::OptionMatch(RirOptionMatch {
-                    discr: RirPlace {
-                        local: opt,
-                        projections: vec![],
-                        ty: option,
-                    },
+                    discr: RirPlace::local(opt, vec![], option),
                     payload: Some(payload),
                     payload_ref: false,
                     payload_escapes: false,
                     some_block: RirStructuredBlock {
                         stmts: vec![],
-                        term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
-                            local: payload,
-                            projections: vec![],
-                            ty: int,
-                        }))),
+                        term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                            payload,
+                            vec![],
+                            int,
+                        )))),
                     },
                     none_block: RirStructuredBlock {
                         stmts: vec![],
@@ -14398,11 +15185,11 @@ mod arrays {
             ],
             body: RirStructuredBlock {
                 stmts: vec![],
-                term: RirTerm::Return(Some(RirOperand::Place(RirPlace {
-                    local: RirLocalId::from_index(0),
-                    projections: vec![RirProjection::Index(RirLocalId::from_index(1))],
-                    ty: int,
-                }))),
+                term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                    RirLocalId::from_index(0),
+                    vec![RirProjection::Index(RirLocalId::from_index(1))],
+                    int,
+                )))),
             },
         });
 
@@ -15156,11 +15943,7 @@ fn rir_verifies_raw_enum_metadata_and_cast() {
         }],
         body: RirStructuredBlock {
             stmts: vec![RirStmt::Eval(RirRValue::Cast {
-                value: RirOperand::Place(RirPlace {
-                    local: RirLocalId::from_index(0),
-                    projections: vec![],
-                    ty: state,
-                }),
+                value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], state)),
                 target: int,
             })],
             term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
@@ -15610,11 +16393,11 @@ fn native_string_return_program() -> RirProgram {
         params: vec![],
         ret: RirTypeId::from_index(0),
     });
-    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace {
-        local: RirLocalId::from_index(0),
-        projections: vec![],
-        ty: RirTypeId::from_index(0),
-    })));
+    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+        RirLocalId::from_index(0),
+        vec![],
+        RirTypeId::from_index(0),
+    ))));
     program.functions[0].locals.push(RirLocal {
         id: RirLocalId::from_index(0),
         ty: RirTypeId::from_index(0),

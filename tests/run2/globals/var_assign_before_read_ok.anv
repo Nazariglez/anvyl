@@ -1,0 +1,16 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 5
+
+fn make_score() -> int {
+    println("init");
+    7
+}
+
+lazy var score = make_score();
+
+fn main() {
+    score = 5;
+    println(score);
+}

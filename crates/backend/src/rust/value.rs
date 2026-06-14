@@ -3,12 +3,13 @@ use super::{
     rep_policy::{RustBorrowView, RustRepPolicy},
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
-        RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace, RirProgram,
-        RirScopedPlaceCellRef, RirType, RirTypeId, RirVariant, RirVariantKind,
+        RirGlobalId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace,
+        RirPlaceRoot, RirProgram, RirScopedPlaceCellRef, RirType, RirTypeId, RirVariant,
+        RirVariantKind,
     },
     syntax::{
-        comma, field_init, match_expr, rust_string, struct_lit, struct_variant, tuple_variant,
-        variant_path,
+        block_expr, comma, field_init, match_expr, rust_string, struct_lit, struct_variant,
+        tuple_variant, variant_path,
     },
     target,
 };
@@ -80,11 +81,7 @@ impl<'a> RustValues<'a> {
         match root {
             RirMutPlaceRoot::Local { local, ty } => Some((
                 *ty,
-                target::mut_place_local(&self.place(&RirPlace {
-                    local: *local,
-                    projections: vec![],
-                    ty: *ty,
-                })),
+                target::mut_place_local(&self.place(&RirPlace::local(*local, vec![], *ty))),
             )),
             RirMutPlaceRoot::Param { local, ty } => Some((
                 *ty,
@@ -150,6 +147,9 @@ impl<'a> RustValues<'a> {
         let RirOperand::Place(place) = operand else {
             return self.operand(operand);
         };
+        if let Some(value) = self.global_value_operand(place) {
+            return value;
+        }
         if self.places.mut_place_root_param(place) {
             return self.mut_place_value_operand(place);
         }
@@ -190,6 +190,9 @@ impl<'a> RustValues<'a> {
                 self.mut_place_projected_value_operand(place)
             }
             RirOperand::Place(place) => {
+                if let Some(value) = self.global_value_operand(place) {
+                    return value;
+                }
                 if let Some(value) = self.map_slot_value_operand(place) {
                     return value;
                 }
@@ -219,6 +222,31 @@ impl<'a> RustValues<'a> {
         self.place_value_from_access(place.ty, &self.place(place))
     }
 
+    fn global_value_operand(&self, place: &RirPlace) -> Option<String> {
+        let RirPlaceRoot::Global(global) = place.root else {
+            return None;
+        };
+        if !place.projections.is_empty() {
+            unreachable!("profile rejects projected global reads")
+        }
+        Some(self.global_read(global))
+    }
+
+    fn global_read(&self, global: RirGlobalId) -> String {
+        let global = &self.program.globals[global.index()];
+        let slot =
+            target::global_slot_field(target::globals_param_name(), global.slot_symbol.as_str());
+        let init = target::generated_call(
+            self.program.functions[global.init.index()].symbol.as_str(),
+            [],
+        );
+        let read = target::global_read(&slot, &init);
+        block_expr(
+            [format!("let __global = {read};")],
+            Some("*__global".to_string()),
+        )
+    }
+
     fn map_slot_value_operand(&self, place: &RirPlace) -> Option<String> {
         let access = self.places.map_slot_access(place)?;
         let value = self.value_from_ref(access.value_ty, "value");
@@ -233,11 +261,11 @@ impl<'a> RustValues<'a> {
         let set = if self.collection_replace_ty(place.ty) {
             target::mut_place_replace_collection(
                 "__anv_place",
-                &target::ctx_runtime("ctx"),
+                target::runtime_param_name(),
                 "__anv_value",
             )
         } else {
-            target::mut_place_set("__anv_place", &target::ctx_runtime("ctx"), "__anv_value")
+            target::mut_place_set("__anv_place", target::runtime_param_name(), "__anv_value")
         };
         Some(self.mut_place_projected_region(
             &projection,
@@ -459,15 +487,15 @@ impl<'a> RustValues<'a> {
     }
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
-        let runtime = target::ctx_runtime("ctx");
+        let runtime = target::runtime_param_name();
         if self.policy.cow_value(ty) {
-            return target::mut_place_access(expr, &runtime, "Ok(value.share())");
+            return target::mut_place_access(expr, runtime, "Ok(value.share())");
         }
         if !self.policy.copyable(ty) && self.policy.shareable_value(ty) {
             let value = self.value_from_ref(ty, "value");
-            return target::mut_place_access(expr, &runtime, &format!("Ok({value})"));
+            return target::mut_place_access(expr, runtime, &format!("Ok({value})"));
         }
-        target::mut_place_get_copy(expr, &runtime)
+        target::mut_place_get_copy(expr, runtime)
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {

@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 9
+
+lazy let source = 9;
+lazy var target = 0;
+
+fn main() {
+    target = source;
+    println(target);
+}

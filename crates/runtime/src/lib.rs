@@ -4,6 +4,7 @@ pub mod collection;
 pub mod ctx;
 pub mod cycle_collector;
 pub mod error;
+mod global_slot;
 mod lambda_cell;
 pub mod managed_rc;
 mod mutable_place;
@@ -25,6 +26,7 @@ pub use collection::{CollectionLoanState, ShapeLoanGuard};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::RuntimeError;
+pub use global_slot::{GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState};
 pub use inventory;
 pub use lambda_cell::{LambdaCell, StackLambdaCell};
 pub use managed_rc::{

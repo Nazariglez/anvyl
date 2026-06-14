@@ -1,0 +1,417 @@
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    rc::Rc,
+};
+
+use crate::RuntimeError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalSlotState {
+    Uninit,
+    Initializing,
+    Ready,
+    Failed,
+}
+
+pub struct GlobalRef<'a, T>(Ref<'a, T>);
+
+impl<T> Deref for GlobalRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct GlobalRefMut<'a, T>(RefMut<'a, T>);
+
+impl<T> Deref for GlobalRefMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for GlobalRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+enum LazyState<T> {
+    Uninit,
+    Initializing,
+    Ready(T),
+    Failed(RuntimeError),
+}
+
+pub struct GlobalSlot<T> {
+    name: &'static str,
+    state: RefCell<LazyState<T>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl<T> std::fmt::Debug for GlobalSlot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalSlot")
+            .field("name", &self.name)
+            .field("state", &self.state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> GlobalSlot<T> {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            state: RefCell::new(LazyState::Uninit),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    pub fn state(&self) -> GlobalSlotState {
+        let Ok(state) = self.state.try_borrow() else {
+            return GlobalSlotState::Ready;
+        };
+        match &*state {
+            LazyState::Uninit => GlobalSlotState::Uninit,
+            LazyState::Initializing => GlobalSlotState::Initializing,
+            LazyState::Ready(_) => GlobalSlotState::Ready,
+            LazyState::Failed(_) => GlobalSlotState::Failed,
+        }
+    }
+
+    pub fn ensure(
+        &self,
+        init: impl FnOnce() -> Result<T, RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        {
+            let state = self
+                .state
+                .try_borrow()
+                .map_err(|_| self.borrow_conflict())?;
+            match &*state {
+                LazyState::Ready(_) => return Ok(()),
+                LazyState::Failed(error) => return Err(error.clone()),
+                LazyState::Initializing => return Err(self.cycle_error()),
+                LazyState::Uninit => {}
+            }
+        }
+
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| self.borrow_conflict())?;
+        match &*state {
+            LazyState::Ready(_) => return Ok(()),
+            LazyState::Failed(error) => return Err(error.clone()),
+            LazyState::Initializing => return Err(self.cycle_error()),
+            LazyState::Uninit => *state = LazyState::Initializing,
+        }
+        drop(state);
+
+        let result = init();
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| self.borrow_conflict())?;
+        match result {
+            Ok(value) => {
+                *state = LazyState::Ready(value);
+                Ok(())
+            }
+            Err(error) => {
+                let error = self.poisoned_error(&error);
+                *state = LazyState::Failed(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn read(
+        &self,
+        init: impl FnOnce() -> Result<T, RuntimeError>,
+    ) -> Result<GlobalRef<'_, T>, RuntimeError> {
+        self.ensure(init)?;
+        let state = self
+            .state
+            .try_borrow()
+            .map_err(|_| self.borrow_conflict())?;
+        Ref::filter_map(state, |state| match state {
+            LazyState::Ready(value) => Some(value),
+            LazyState::Uninit | LazyState::Initializing | LazyState::Failed(_) => None,
+        })
+        .map(GlobalRef)
+        .map_err(|_| self.internal_error("successful global read found no ready value"))
+    }
+
+    pub fn write(
+        &self,
+        init: impl FnOnce() -> Result<T, RuntimeError>,
+    ) -> Result<GlobalRefMut<'_, T>, RuntimeError> {
+        self.ensure(init)?;
+        let state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| self.borrow_conflict())?;
+        RefMut::filter_map(state, |state| match state {
+            LazyState::Ready(value) => Some(value),
+            LazyState::Uninit | LazyState::Initializing | LazyState::Failed(_) => None,
+        })
+        .map(GlobalRefMut)
+        .map_err(|_| self.internal_error("successful global write found no ready value"))
+    }
+
+    pub fn set_without_init(&self, value: T) -> Result<(), RuntimeError> {
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| self.borrow_conflict())?;
+        match &*state {
+            LazyState::Initializing => Err(self.initializing_assignment_error()),
+            LazyState::Uninit | LazyState::Ready(_) | LazyState::Failed(_) => {
+                *state = LazyState::Ready(value);
+                Ok(())
+            }
+        }
+    }
+
+    fn cycle_error(&self) -> RuntimeError {
+        RuntimeError::new(format!(
+            "lazy global '{}' is already initializing",
+            self.name
+        ))
+    }
+
+    fn borrow_conflict(&self) -> RuntimeError {
+        RuntimeError::new(format!("lazy global '{}' has an active borrow", self.name))
+    }
+
+    fn poisoned_error(&self, error: &RuntimeError) -> RuntimeError {
+        RuntimeError::new(format!("poisoned lazy global '{}': {error}", self.name))
+    }
+
+    fn initializing_assignment_error(&self) -> RuntimeError {
+        RuntimeError::new(format!(
+            "cannot assign lazy global '{}' while it is initializing",
+            self.name
+        ))
+    }
+
+    fn internal_error(&self, message: &'static str) -> RuntimeError {
+        RuntimeError::new(format!(
+            "internal lazy global '{}' error: {message}",
+            self.name
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::LazyState;
+    use crate::{GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState};
+
+    #[test]
+    fn new_slot_starts_uninit() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        assert_eq!(slot.state(), GlobalSlotState::Uninit);
+        assert_eq!(slot.name, "score");
+    }
+
+    #[test]
+    fn state_reports_all_internal_states() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        *slot.state.borrow_mut() = LazyState::Initializing;
+        assert_eq!(slot.state(), GlobalSlotState::Initializing);
+
+        *slot.state.borrow_mut() = LazyState::Ready(1);
+        assert_eq!(slot.state(), GlobalSlotState::Ready);
+
+        *slot.state.borrow_mut() = LazyState::Failed(crate::RuntimeError::new("failed"));
+        assert_eq!(slot.state(), GlobalSlotState::Failed);
+    }
+
+    #[test]
+    fn ensure_initializes_once() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let mut calls = 0;
+
+        slot.ensure(|| {
+            calls += 1;
+            Ok(7)
+        })
+        .unwrap();
+        slot.ensure(|| {
+            calls += 1;
+            Ok(9)
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(slot.state(), GlobalSlotState::Ready);
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 7);
+    }
+
+    #[test]
+    fn read_initializes_and_returns_ready_value() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        let value = slot.read(|| Ok(7)).unwrap();
+
+        assert_eq!(*value, 7);
+        assert_eq!(slot.state(), GlobalSlotState::Ready);
+    }
+
+    #[test]
+    fn failed_initializer_is_poisoned() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let first = slot
+            .ensure(|| Err(crate::RuntimeError::new("boom")))
+            .unwrap_err();
+        let second = slot.ensure(|| Ok(7)).unwrap_err();
+
+        assert_eq!(first.message(), "poisoned lazy global 'score': boom");
+        assert_eq!(second.message(), "poisoned lazy global 'score': boom");
+        assert_eq!(slot.state(), GlobalSlotState::Failed);
+    }
+
+    #[test]
+    fn initializing_cycle_returns_error_instead_of_borrow_panic() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let error = slot
+            .ensure(|| {
+                let cycle = slot.ensure(|| Ok(1)).unwrap_err();
+                Err(cycle)
+            })
+            .unwrap_err();
+
+        assert!(error.message().contains("score"));
+        assert!(error.message().contains("initializing"));
+        assert_eq!(slot.state(), GlobalSlotState::Failed);
+    }
+
+    #[test]
+    fn write_initializes_and_mutates_ready_value() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        *slot.write(|| Ok(7)).unwrap() = 9;
+
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 9);
+    }
+
+    #[test]
+    fn set_without_init_replaces_uninit_ready_and_failed() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        slot.set_without_init(1).unwrap();
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 1);
+
+        slot.set_without_init(2).unwrap();
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 2);
+
+        *slot.state.borrow_mut() = LazyState::Failed(crate::RuntimeError::new("boom"));
+        slot.set_without_init(3).unwrap();
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
+    }
+
+    #[test]
+    fn set_without_init_rejects_initializing() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let error = slot
+            .ensure(|| {
+                let error = slot.set_without_init(1).unwrap_err();
+                Err(error)
+            })
+            .unwrap_err();
+
+        assert!(error.message().contains("score"));
+        assert!(error.message().contains("initializing"));
+    }
+
+    #[test]
+    fn multiple_shared_reads_can_coexist() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        let first = slot.read(|| Ok(7)).unwrap();
+        let second = slot.read(|| unreachable!()).unwrap();
+
+        assert_eq!(*first, 7);
+        assert_eq!(*second, 7);
+    }
+
+    #[test]
+    fn active_read_blocks_write_and_root_replacement() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let read = slot.read(|| Ok(7)).unwrap();
+
+        let write = slot.write(|| unreachable!()).err().unwrap();
+        let set = slot.set_without_init(9).unwrap_err();
+
+        assert_eq!(*read, 7);
+        assert!(write.message().contains("active borrow"));
+        assert!(set.message().contains("active borrow"));
+    }
+
+    #[test]
+    fn active_write_blocks_reads_writes_and_root_replacement() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let mut write = slot.write(|| Ok(7)).unwrap();
+        *write = 8;
+
+        let read_error = slot.read(|| unreachable!()).err().unwrap();
+        let write_error = slot.write(|| unreachable!()).err().unwrap();
+        let set_error = slot.set_without_init(9).unwrap_err();
+
+        assert_eq!(*write, 8);
+        assert_eq!(slot.state(), GlobalSlotState::Ready);
+        assert!(read_error.message().contains("active borrow"));
+        assert!(write_error.message().contains("active borrow"));
+        assert!(set_error.message().contains("active borrow"));
+    }
+
+    #[test]
+    fn replacement_drops_ready_payload_once() {
+        #[derive(Debug)]
+        struct CountDrop(Rc<Cell<usize>>);
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let slot = GlobalSlot::new("score");
+        slot.set_without_init(CountDrop(drops.clone())).unwrap();
+        assert_eq!(drops.get(), 0);
+
+        slot.set_without_init(CountDrop(drops.clone())).unwrap();
+        assert_eq!(drops.get(), 1);
+
+        *slot.state.borrow_mut() = LazyState::Failed(crate::RuntimeError::new("boom"));
+        assert_eq!(drops.get(), 2);
+
+        slot.set_without_init(CountDrop(drops.clone())).unwrap();
+        assert_eq!(drops.get(), 2);
+
+        drop(slot);
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn exports_are_visible() {
+        fn assert_exported<T>(_: T) {}
+
+        assert_exported::<GlobalSlot<i64>>(GlobalSlot::new("score"));
+        assert_eq!(GlobalSlotState::Uninit, GlobalSlotState::Uninit);
+        let _: Option<GlobalRef<'_, i64>> = None;
+        let _: Option<GlobalRefMut<'_, i64>> = None;
+    }
+}

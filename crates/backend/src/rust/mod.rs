@@ -24,8 +24,8 @@ use std::{
 
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, LocalId,
-        LocalKind, Mutability, Operand, ParamEscape, ParamMode, Place, Projection, RValue,
+        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, GlobalId,
+        LocalId, LocalKind, Mutability, Operand, ParamEscape, ParamMode, Place, Projection, RValue,
         TypeData, TypeId, TypePassClasses, VerifiedProgram,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
@@ -42,17 +42,18 @@ use self::{
         RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId,
         RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind,
         RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign,
-        RirFormatSpec, RirFunction, RirFunctionId, RirIf, RirLambda, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirFormatSpec, RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand,
+        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
 };
 
@@ -146,7 +147,7 @@ pub enum RustTargetGapSite {
     Type(TypeId),
     Const(ConstId),
     Module(usize),
-    Global(air::GlobalId),
+    Global(GlobalId),
     Function(FunctionId),
     Extern(ExternId),
     Local(FunctionId, LocalId),
@@ -179,7 +180,13 @@ pub enum RustTargetGapKind {
     UnsupportedLambdaCapture,
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
-    UnsupportedGlobal,
+    UnsupportedGlobalType,
+    UnsupportedGlobalAccess,
+    UnsupportedGlobalBorrow,
+    UnsupportedGlobalProjection,
+    UnsupportedGlobalInitializer,
+    UnsupportedGlobalValueRead,
+    UnsupportedGlobalRooting,
     NonCopyValueRequired,
     UnsupportedStructuralStringify,
     UnsupportedContextBorrowAcrossCall,
@@ -254,7 +261,25 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedLambdaExternBoundary => {
                     RustTargetGapKind::UnsupportedLambdaExternBoundary
                 }
-                ProfileErrorKind::UnsupportedGlobal => RustTargetGapKind::UnsupportedGlobal,
+                ProfileErrorKind::UnsupportedGlobalType => RustTargetGapKind::UnsupportedGlobalType,
+                ProfileErrorKind::UnsupportedGlobalAccess => {
+                    RustTargetGapKind::UnsupportedGlobalAccess
+                }
+                ProfileErrorKind::UnsupportedGlobalBorrow => {
+                    RustTargetGapKind::UnsupportedGlobalBorrow
+                }
+                ProfileErrorKind::UnsupportedGlobalProjection => {
+                    RustTargetGapKind::UnsupportedGlobalProjection
+                }
+                ProfileErrorKind::UnsupportedGlobalInitializer => {
+                    RustTargetGapKind::UnsupportedGlobalInitializer
+                }
+                ProfileErrorKind::UnsupportedGlobalValueRead => {
+                    RustTargetGapKind::UnsupportedGlobalValueRead
+                }
+                ProfileErrorKind::UnsupportedGlobalRooting => {
+                    RustTargetGapKind::UnsupportedGlobalRooting
+                }
                 ProfileErrorKind::UnsupportedMutablePlace => {
                     RustTargetGapKind::UnsupportedMutablePlace
                 }
@@ -285,6 +310,7 @@ struct PlanCx<'a> {
     lambda_sig_map: HashMap<TypeId, RirLambdaSigId>,
     const_map: HashMap<ConstId, RirConstId>,
     function_map: HashMap<FunctionId, RirFunctionId>,
+    global_map: HashMap<GlobalId, RirGlobalId>,
     function_lambda_map: HashMap<FunctionId, RirLambdaId>,
     lambda_map: HashMap<air::LambdaId, RirLambdaId>,
     function_type_copyable: HashMap<TypeId, bool>,
@@ -383,6 +409,7 @@ impl<'a> PlanCx<'a> {
             lambda_sig_map: HashMap::new(),
             const_map: HashMap::new(),
             function_map: HashMap::new(),
+            global_map: HashMap::new(),
             function_lambda_map: HashMap::new(),
             lambda_map: HashMap::new(),
             function_type_copyable: HashMap::new(),
@@ -417,6 +444,7 @@ impl<'a> PlanCx<'a> {
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
+        self.plan_globals(&mut program)?;
         self.plan_function_type_capture_policy(&mut program);
         self.plan_cells(&mut program);
         self.plan_scoped_place_cells(&mut program);
@@ -1178,6 +1206,38 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn plan_globals(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        for index in 0..self.air.globals.len() {
+            let air_id = GlobalId::from_index(index);
+            let decl = &self.air.globals[index];
+            let id = RirGlobalId::from_index(program.globals.len());
+            let Some(&ty) = self.type_map.get(&decl.ty) else {
+                return Err(Self::gap(
+                    RustTargetGapSite::Global(air_id),
+                    RustTargetGapKind::UnsupportedGlobalType,
+                ));
+            };
+            let Some(&init) = self.function_map.get(&decl.init) else {
+                return Err(Self::gap(
+                    RustTargetGapSite::Global(air_id),
+                    RustTargetGapKind::UnsupportedGlobalInitializer,
+                ));
+            };
+            self.global_map.insert(air_id, id);
+            program.globals.push(RirGlobal {
+                id,
+                air_id,
+                module: decl.module,
+                name: global_display(self.air, decl),
+                slot_symbol: global_slot_symbol(id, decl),
+                ty,
+                mutable: decl.mutability == Mutability::Mutable,
+                init,
+            });
+        }
+        Ok(())
+    }
+
     fn plan_cells(&mut self, program: &mut RirProgram) {
         for (index, cell) in self.air.capture_cells.iter().enumerate() {
             let air_id = air::CaptureCellId::from_index(index);
@@ -1711,9 +1771,10 @@ impl<'a> PlanCx<'a> {
         in_loop: bool,
     ) -> Result<RirStructuredBlock, RustPlanError> {
         let mut stmts = vec![];
-        for stmt in &block.stmts {
+        for (index, stmt) in block.stmts.iter().enumerate() {
             stmts.extend(self.plan_air_stmt(
                 function,
+                index,
                 stmt,
                 locals,
                 lambda_values,
@@ -1730,6 +1791,7 @@ impl<'a> PlanCx<'a> {
     fn plan_air_stmt(
         &self,
         function: FunctionId,
+        index: usize,
         stmt: &air::AirStmt,
         locals: &mut Vec<RirLocal>,
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
@@ -1777,8 +1839,34 @@ impl<'a> PlanCx<'a> {
                 stmts.push(RirStmt::Eval(planned.value));
                 Ok(stmts)
             }
-            air::AirStmt::GlobalEnsure { .. } | air::AirStmt::GlobalSetRoot { .. } => {
-                unreachable!("AIR globals are rejected by the Rust backend profile")
+            air::AirStmt::GlobalEnsure { global } => Ok(vec![RirStmt::GlobalEnsure {
+                global: self.global_map[global],
+            }]),
+            air::AirStmt::GlobalSetRoot {
+                global,
+                value,
+                init,
+            } => {
+                if *init != air::GlobalInitEffect::StoreWithoutInit {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Statement(function, index),
+                        RustTargetGapKind::UnsupportedGlobalRooting,
+                    ));
+                }
+                let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let mut stmts = planned.stmts;
+                let value = RirRValue::Use(self.rvalue_short_region_operand(
+                    function,
+                    planned.value,
+                    self.air.globals[global.index()].ty,
+                    locals,
+                    &mut stmts,
+                ));
+                stmts.push(RirStmt::GlobalSetRoot {
+                    global: self.global_map[global],
+                    value,
+                });
+                Ok(stmts)
             }
             air::AirStmt::If(branch) => {
                 let cond = self.plan_operand_read(function, &branch.cond, locals);
@@ -2868,11 +2956,7 @@ impl<'a> PlanCx<'a> {
             RirCallArg::MutPlace(arg) => match &arg.root {
                 RirMutPlaceRoot::Local { local, ty } => Self::place_is_collection_slot(
                     scope,
-                    &RirPlace {
-                        local: *local,
-                        projections: arg.projections.clone(),
-                        ty: *ty,
-                    },
+                    &RirPlace::local(*local, arg.projections.clone(), *ty),
                 ),
                 _ => false,
             },
@@ -2881,10 +2965,13 @@ impl<'a> PlanCx<'a> {
     }
 
     fn place_is_collection_slot(scope: &air::AirCollectionSlotScope, place: &RirPlace) -> bool {
+        let RirPlaceRoot::Local(local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
         scope
             .slots
             .iter()
-            .any(|slot| RirLocalId::from_index(slot.local.index()) == place.local)
+            .any(|slot| RirLocalId::from_index(slot.local.index()) == local)
     }
 
     fn collection_slot_reads(
@@ -2903,11 +2990,7 @@ impl<'a> PlanCx<'a> {
                     RirStmt::Init { local, value }
                 } else {
                     RirStmt::Assign {
-                        dst: RirPlace {
-                            local,
-                            projections: vec![],
-                            ty: self.type_map[&slot.ty],
-                        },
+                        dst: RirPlace::local(local, vec![], self.type_map[&slot.ty]),
                         value,
                     }
                 }
@@ -2953,11 +3036,7 @@ impl<'a> PlanCx<'a> {
         slot: &air::AirCollectionSlot,
     ) -> RirStmt {
         let local = RirLocalId::from_index(slot.local.index());
-        let value = RirOperand::Place(RirPlace {
-            local,
-            projections: vec![],
-            ty: self.type_map[&slot.ty],
-        });
+        let value = RirOperand::Place(RirPlace::local(local, vec![], self.type_map[&slot.ty]));
         match slot.kind {
             air::AirCollectionSlotKind::SequenceElement => RirStmt::Assign {
                 dst: self.collection_slot_place(function, scope, slot),
@@ -3055,11 +3134,11 @@ impl<'a> PlanCx<'a> {
                             local,
                             value: known.rvalue(),
                         }],
-                        arg: RirCallArg::Value(RirOperand::Place(RirPlace {
+                        arg: RirCallArg::Value(RirOperand::Place(RirPlace::local(
                             local,
-                            projections: vec![],
-                            ty: known.ty,
-                        })),
+                            vec![],
+                            known.ty,
+                        ))),
                     });
                 }
                 if self.moves_bound_noncopy_lambda(function, operand) {
@@ -3143,6 +3222,18 @@ impl<'a> PlanCx<'a> {
         locals: &mut Vec<RirLocal>,
     ) -> PlannedOperand {
         let crosses_dataref = self.place_crosses_dataref(function, place);
+        if matches!(place.root, air::PlaceRoot::Global(_)) {
+            let mut stmts = vec![];
+            let operand = self.rvalue_temp(
+                RirRValue::Use(RirOperand::Place(
+                    self.plan_place_in_function(function, place),
+                )),
+                place.ty,
+                locals,
+                &mut stmts,
+            );
+            return PlannedOperand { stmts, operand };
+        }
         if let Some(cell) = self.place_capture_cell(function, place) {
             if place.projection.is_empty() {
                 let mut stmts = vec![];
@@ -3169,13 +3260,16 @@ impl<'a> PlanCx<'a> {
                     locals,
                     &mut stmts,
                 );
+                let RirPlaceRoot::Local(root_local) = root.root else {
+                    unreachable!("global RIR places are not supported here")
+                };
                 return PlannedOperand {
                     stmts,
-                    operand: RirOperand::Place(RirPlace {
-                        local: root.local,
-                        projections: place.projection.iter().map(Self::rir_projection).collect(),
-                        ty: self.type_map[&place.ty],
-                    }),
+                    operand: RirOperand::Place(RirPlace::local(
+                        root_local,
+                        place.projection.iter().map(Self::rir_projection).collect(),
+                        self.type_map[&place.ty],
+                    )),
                 };
             }
         }
@@ -3205,13 +3299,16 @@ impl<'a> PlanCx<'a> {
                     locals,
                     &mut stmts,
                 );
+                let RirPlaceRoot::Local(root_local) = root.root else {
+                    unreachable!("global RIR places are not supported here")
+                };
                 return PlannedOperand {
                     stmts,
-                    operand: RirOperand::Place(RirPlace {
-                        local: root.local,
-                        projections: place.projection.iter().map(Self::rir_projection).collect(),
-                        ty: self.type_map[&place.ty],
-                    }),
+                    operand: RirOperand::Place(RirPlace::local(
+                        root_local,
+                        place.projection.iter().map(Self::rir_projection).collect(),
+                        self.type_map[&place.ty],
+                    )),
                 };
             }
         }
@@ -3416,11 +3513,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn rir_root_place(&self, local: RirLocalId, ty: TypeId) -> RirPlace {
-        RirPlace {
-            local,
-            projections: vec![],
-            ty: self.type_map[&ty],
-        }
+        RirPlace::local(local, vec![], self.type_map[&ty])
     }
 
     fn next_dataref_segment(
@@ -3490,10 +3583,18 @@ impl<'a> PlanCx<'a> {
     }
 
     fn operand_uses_ctx(&self, function: FunctionId, operand: &RirOperand) -> bool {
-        matches!(operand, RirOperand::Place(place) if self.rir_place_is_source_mut_place_param(function, place))
+        matches!(
+            operand,
+            RirOperand::Place(place)
+                if matches!(place.root, RirPlaceRoot::Global(_))
+                    || self.rir_place_is_source_mut_place_param(function, place)
+        )
     }
 
     fn rir_place_is_source_mut_place_param(&self, function: FunctionId, place: &RirPlace) -> bool {
+        let RirPlaceRoot::Local(local) = place.root else {
+            return false;
+        };
         place.projections.is_empty()
             && self
                 .air
@@ -3502,8 +3603,7 @@ impl<'a> PlanCx<'a> {
                 .params
                 .iter()
                 .any(|param| {
-                    param.mode == ParamMode::MutBorrow
-                        && param.local_id.index() == place.local.index()
+                    param.mode == ParamMode::MutBorrow && param.local_id.index() == local.index()
                 })
     }
 
@@ -3734,9 +3834,18 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_place_in_function(&self, function: FunctionId, place: &Place) -> RirPlace {
-        let (_, root) = self.current_place_root(function, place);
+        let root = match place.root {
+            air::PlaceRoot::Global(global) => RirPlaceRoot::Global(self.global_map[&global]),
+            air::PlaceRoot::Local(_)
+            | air::PlaceRoot::LambdaCapture(_)
+            | air::PlaceRoot::ScopedBorrow(_)
+            | air::PlaceRoot::CaptureCell(_) => {
+                let (_, local) = self.current_place_root(function, place);
+                RirPlaceRoot::Local(local)
+            }
+        };
         RirPlace {
-            local: root,
+            root,
             projections: place.projection.iter().map(Self::rir_projection).collect(),
             ty: self.type_map[&place.ty],
         }
@@ -3827,6 +3936,21 @@ fn native_path(path: &RustPath) -> Vec<String> {
     let mut out = vec![path.crate_name.clone()];
     out.extend(path.segments.clone());
     out
+}
+
+fn global_display(air: &air::Program, decl: &air::GlobalDecl) -> RirSymbol {
+    let mut path = air.modules[decl.module.index()]
+        .path
+        .iter()
+        .map(Ident::as_str)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    path.push(decl.name.as_str());
+    RirSymbol::new(path.join("."))
+}
+
+fn global_slot_symbol(id: RirGlobalId, decl: &air::GlobalDecl) -> RirSymbol {
+    RirSymbol::new(format!("g{}_{}", id.index(), sanitize(decl.name.as_str())))
 }
 
 fn function_symbol(

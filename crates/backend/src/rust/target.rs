@@ -1,4 +1,4 @@
-use super::syntax;
+use super::{rir::RirCtxPlan, syntax};
 
 const RT: &str = "anvyx_runtime";
 
@@ -83,7 +83,7 @@ impl DataRefPlaceOp {
 
     pub(super) fn heap_access(
         &self,
-        ctx: &str,
+        rt: &str,
         object: &str,
         heap_type: &str,
         storage: &str,
@@ -92,10 +92,10 @@ impl DataRefPlaceOp {
     ) -> String {
         match self {
             Self::Access => {
-                ctx_heap_try_with_erased(ctx, object, heap_type, storage, storage_ty, body)
+                rt_heap_try_with_erased(rt, object, heap_type, storage, storage_ty, body)
             }
             Self::Mutate => {
-                ctx_heap_try_with_erased_mut(ctx, object, heap_type, storage, storage_ty, body)
+                rt_heap_try_with_erased_mut(rt, object, heap_type, storage, storage_ty, body)
             }
         }
     }
@@ -148,12 +148,101 @@ pub(super) fn result_ty(ret: &str) -> String {
     format!("Result<{ret}, {}>", runtime_error_ty())
 }
 
+pub(super) fn generated_types_symbol(ctx: &RirCtxPlan) -> &str {
+    ctx.types_symbol.as_str()
+}
+
+pub(super) fn generated_globals_symbol(ctx: &RirCtxPlan) -> &str {
+    ctx.globals_symbol.as_str()
+}
+
+pub(super) fn runtime_param_name() -> &'static str {
+    "rt"
+}
+
+pub(super) fn types_param_name() -> &'static str {
+    "types"
+}
+
+pub(super) fn globals_param_name() -> &'static str {
+    "globals"
+}
+
+pub(super) fn runtime_param(used: bool) -> &'static str {
+    if used { "rt" } else { "_rt" }
+}
+
+pub(super) fn types_param(used: bool) -> &'static str {
+    if used { "types" } else { "_types" }
+}
+
+pub(super) fn globals_param(used: bool) -> &'static str {
+    if used { "globals" } else { "_globals" }
+}
+
 pub(super) fn runtime_ctx_ty() -> String {
     runtime_ctx_ty_with("'rt")
 }
 
+pub(super) fn runtime_ctx_ref_ty() -> String {
+    format!("&mut {}", runtime_ctx_ty())
+}
+
 pub(super) fn runtime_ctx_ty_with(rt_lifetime: &str) -> String {
     format!("{}<'cx, {rt_lifetime}>", rt_path("Ctx"))
+}
+
+pub(super) fn types_ref_ty(symbol: &str) -> String {
+    format!("&{symbol}<'cx>")
+}
+
+pub(super) fn globals_ref_ty(symbol: &str) -> String {
+    format!("&{symbol}<'cx>")
+}
+
+pub(super) fn global_slot_ty(payload: &str) -> String {
+    format!("{}<{payload}>", rt_path("GlobalSlot"))
+}
+
+pub(super) fn global_slot_new(name: &str) -> String {
+    format!("{}::new({name:?})", rt_path("GlobalSlot"))
+}
+
+pub(super) fn global_slot_field(globals: &str, field: &str) -> String {
+    format!("{globals}.{field}")
+}
+
+pub(super) fn global_ensure(slot: &str, init: &str) -> String {
+    format!("{slot}.ensure(|| {init})?")
+}
+
+pub(super) fn global_read(slot: &str, init: &str) -> String {
+    format!("{slot}.read(|| {init})?")
+}
+
+pub(super) fn global_set_without_init(slot: &str, value: &str) -> String {
+    format!("{slot}.set_without_init({value})?")
+}
+
+pub(super) fn generated_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    [
+        runtime_param_name().to_string(),
+        types_param_name().to_string(),
+        globals_param_name().to_string(),
+    ]
+    .into_iter()
+    .chain(args)
+    .collect()
+}
+
+pub(super) fn generated_call(symbol: &str, args: impl IntoIterator<Item = String>) -> String {
+    format!("{symbol}({})", syntax::comma(generated_call_args(args)))
+}
+
+pub(super) fn native_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    std::iter::once(runtime_param_name().to_string())
+        .chain(args)
+        .collect()
 }
 
 pub(super) fn heap_ty() -> String {
@@ -380,16 +469,16 @@ pub(super) fn heap_register(tracked: bool) -> &'static str {
     }
 }
 
-pub(super) fn ctx_heap_alloc(ctx: &str, heap_type: &str, storage: &str) -> String {
-    format!("{ctx}.heap().alloc({heap_type}, {storage})")
+pub(super) fn rt_heap_alloc(rt: &str, heap_type: &str, storage: &str) -> String {
+    format!("{rt}.heap().alloc({heap_type}, {storage})")
 }
 
-pub(super) fn ctx_heap_with(ctx: &str, object: &str, storage: &str, body: &str) -> String {
-    format!("{ctx}.heap().with({object}, |{storage}| {body})")
+pub(super) fn rt_heap_with(rt: &str, object: &str, storage: &str, body: &str) -> String {
+    format!("{rt}.heap().with({object}, |{storage}| {body})")
 }
 
-pub(super) fn ctx_heap_with_mut(ctx: &str, object: &str, storage: &str, body: &str) -> String {
-    format!("{ctx}.heap().with_mut({object}, |{storage}| {{ {body} }})")
+pub(super) fn rt_heap_with_mut(rt: &str, object: &str, storage: &str, body: &str) -> String {
+    format!("{rt}.heap().with_mut({object}, |{storage}| {{ {body} }})")
 }
 
 pub(super) fn heap_access_error() -> String {
@@ -400,34 +489,34 @@ pub(super) fn map_heap_access_error(expr: &str) -> String {
     format!("{expr}.map_err({})?", heap_access_error())
 }
 
-pub(super) fn ctx_heap_erase(ctx: &str, object: &str) -> String {
-    map_heap_access_error(&format!("{ctx}.heap().erase({object})"))
+pub(super) fn rt_heap_erase(rt: &str, object: &str) -> String {
+    map_heap_access_error(&format!("{rt}.heap().erase({object})"))
 }
 
-pub(super) fn ctx_heap_try_with_erased(
-    ctx: &str,
+pub(super) fn rt_heap_try_with_erased(
+    rt: &str,
     object: &str,
     heap_type: &str,
     storage: &str,
     storage_ty: &str,
     body: &str,
 ) -> String {
-    ctx_heap_try_with_erased_op(ctx, object, heap_type, storage, storage_ty, body, false)
+    rt_heap_try_with_erased_op(rt, object, heap_type, storage, storage_ty, body, false)
 }
 
-pub(super) fn ctx_heap_try_with_erased_mut(
-    ctx: &str,
+pub(super) fn rt_heap_try_with_erased_mut(
+    rt: &str,
     object: &str,
     heap_type: &str,
     storage: &str,
     storage_ty: &str,
     body: &str,
 ) -> String {
-    ctx_heap_try_with_erased_op(ctx, object, heap_type, storage, storage_ty, body, true)
+    rt_heap_try_with_erased_op(rt, object, heap_type, storage, storage_ty, body, true)
 }
 
-fn ctx_heap_try_with_erased_op(
-    ctx: &str,
+fn rt_heap_try_with_erased_op(
+    rt: &str,
     object: &str,
     heap_type: &str,
     storage: &str,
@@ -442,12 +531,12 @@ fn ctx_heap_try_with_erased_op(
     };
     let storage_ref = if mutable { "&mut " } else { "&" };
     map_heap_access_error(&format!(
-        "{ctx}.heap().{method}({object}, {heap_type}, |{storage}: {storage_ref}{storage_ty}| {body})"
+        "{rt}.heap().{method}({object}, {heap_type}, |{storage}: {storage_ref}{storage_ty}| {body})"
     ))
 }
 
-pub(super) fn ctx_runtime(ctx: &str) -> String {
-    format!("{ctx}.runtime()")
+pub(super) fn heap_type_access(types: &str, heap_type: &str) -> String {
+    format!("{types}.{heap_type}")
 }
 
 pub(super) fn mut_place_local(slot: &str) -> String {
@@ -554,16 +643,17 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
-        checked_range, ctx_heap_alloc, ctx_heap_erase, ctx_heap_try_with_erased,
-        ctx_heap_try_with_erased_mut, ctx_heap_with, ctx_heap_with_mut, ctx_runtime,
-        dataref_place_heap_type_access, dataref_place_heap_type_field, dataref_place_ops_ty,
-        erased_handle_ty, heap_access_error, heap_register, heap_scope, lambda_cell_ctor,
-        map_heap_access_error, mut_place_access, mut_place_dataref, mut_place_get_copy,
-        mut_place_heap_cell, mut_place_local, mut_place_mutate, mut_place_projected,
-        mut_place_reborrow, mut_place_replace_collection, mut_place_scoped_cell, mut_place_set,
-        mut_place_stack_cell, mut_place_ty, projection_ops_ty, result_ty, runtime_ctx_new,
-        runtime_ctx_ty_with, scoped_mut_place_cell_new, scoped_mut_place_cell_ty,
-        stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
+        checked_range, dataref_place_heap_type_access, dataref_place_heap_type_field,
+        dataref_place_ops_ty, erased_handle_ty, generated_call, heap_access_error, heap_register,
+        heap_scope, heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
+        mut_place_dataref, mut_place_get_copy, mut_place_heap_cell, mut_place_local,
+        mut_place_mutate, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
+        projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
+        rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
+        runtime_ctx_ty_with, runtime_param_name, scoped_mut_place_cell_new,
+        scoped_mut_place_cell_ty, stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr,
+        trace_derive, visitor_ty,
     };
 
     #[test]
@@ -633,6 +723,10 @@ mod tests {
         );
         assert_eq!(visitor_ty("D"), "anvyx_runtime::Visitor<'cx, '_, D>");
         assert_eq!(
+            generated_call("f", ["x".to_string()]),
+            "f(rt, types, globals, x)"
+        );
+        assert_eq!(
             checked_index("i", "xs.len()"),
             "anvyx_runtime::checked_index(i, xs.len())"
         );
@@ -647,49 +741,50 @@ mod tests {
         assert_eq!(heap_register(true), "register_tracked");
         assert_eq!(heap_register(false), "register_untracked");
         assert_eq!(
-            ctx_heap_alloc("ctx", "heap_type", "Storage { value: 1 }"),
-            "ctx.heap().alloc(heap_type, Storage { value: 1 })"
+            rt_heap_alloc("rt", "heap_type", "Storage { value: 1 }"),
+            "rt.heap().alloc(heap_type, Storage { value: 1 })"
         );
         assert_eq!(
-            ctx_heap_with("cx", "&v0", "item", "item.value"),
-            "cx.heap().with(&v0, |item| item.value)"
+            rt_heap_with("rt", "&v0", "item", "item.value"),
+            "rt.heap().with(&v0, |item| item.value)"
         );
         assert_eq!(
-            ctx_heap_with_mut("cx", "&v0", "item", "item.value = 1;"),
-            "cx.heap().with_mut(&v0, |item| { item.value = 1; })"
+            rt_heap_with_mut("rt", "&v0", "item", "item.value = 1;"),
+            "rt.heap().with_mut(&v0, |item| { item.value = 1; })"
         );
         assert_eq!(heap_access_error(), "anvyx_runtime::heap_access_error");
         assert_eq!(
-            map_heap_access_error("ctx.heap().erase(&v0)"),
-            "ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
+            map_heap_access_error("rt.heap().erase(&v0)"),
+            "rt.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
         );
         assert_eq!(
-            ctx_heap_erase("ctx", "&v0"),
-            "ctx.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
+            rt_heap_erase("rt", "&v0"),
+            "rt.heap().erase(&v0).map_err(anvyx_runtime::heap_access_error)?"
         );
         assert_eq!(
-            ctx_heap_try_with_erased(
-                "ctx",
+            rt_heap_try_with_erased(
+                "rt",
                 "object",
                 "self.heap_type",
                 "storage",
                 "Node",
                 "f(&storage.value)"
             ),
-            "ctx.heap().try_with_erased(object, self.heap_type, |storage: &Node| f(&storage.value)).map_err(anvyx_runtime::heap_access_error)?"
+            "rt.heap().try_with_erased(object, self.heap_type, |storage: &Node| f(&storage.value)).map_err(anvyx_runtime::heap_access_error)?"
         );
         assert_eq!(
-            ctx_heap_try_with_erased_mut(
-                "ctx",
+            rt_heap_try_with_erased_mut(
+                "rt",
                 "object",
                 "self.heap_type",
                 "storage",
                 "Node",
                 "f(&mut storage.value)"
             ),
-            "ctx.heap().try_with_erased_mut(object, self.heap_type, |storage: &mut Node| f(&mut storage.value)).map_err(anvyx_runtime::heap_access_error)?"
+            "rt.heap().try_with_erased_mut(object, self.heap_type, |storage: &mut Node| f(&mut storage.value)).map_err(anvyx_runtime::heap_access_error)?"
         );
-        assert_eq!(ctx_runtime("ctx"), "ctx.runtime()");
+        assert_eq!(runtime_param_name(), "rt");
+        assert_eq!(heap_type_access("types", "node"), "types.node");
         assert_eq!(
             mut_place_local("slot"),
             "anvyx_runtime::MutPlace::local(&mut slot)"
@@ -718,25 +813,22 @@ mod tests {
         assert_eq!(dataref_place_heap_type_field(), "heap_type");
         assert_eq!(dataref_place_heap_type_access("self"), "self.heap_type");
         assert_eq!(
-            mut_place_set("place", "ctx.runtime()", "value"),
-            "place.set(ctx.runtime(), value)?"
+            mut_place_set("place", "rt", "value"),
+            "place.set(rt, value)?"
         );
         assert_eq!(
-            mut_place_access("place", "ctx.runtime()", "Ok(value.share())"),
-            "place.access(ctx.runtime(), |value| Ok(value.share()))?"
+            mut_place_access("place", "rt", "Ok(value.share())"),
+            "place.access(rt, |value| Ok(value.share()))?"
         );
         assert_eq!(
-            mut_place_mutate("place", "ctx.runtime()", "value.replace_with(next)"),
-            "place.mutate(ctx.runtime(), |value| value.replace_with(next))?"
+            mut_place_mutate("place", "rt", "value.replace_with(next)"),
+            "place.mutate(rt, |value| value.replace_with(next))?"
         );
         assert_eq!(
-            mut_place_replace_collection("place", "ctx.runtime()", "next"),
-            "place.mutate(ctx.runtime(), |slot| slot.replace_with(next))?"
+            mut_place_replace_collection("place", "rt", "next"),
+            "place.mutate(rt, |slot| slot.replace_with(next))?"
         );
-        assert_eq!(
-            mut_place_get_copy("place", "ctx.runtime()"),
-            "place.get_copy(ctx.runtime())?"
-        );
+        assert_eq!(mut_place_get_copy("place", "rt"), "place.get_copy(rt)?");
         assert_eq!(heap_scope(), "anvyx_runtime::Heap::scope");
         assert_eq!(runtime_ctx_new("heap"), "anvyx_runtime::Ctx::new(heap)");
     }

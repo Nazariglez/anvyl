@@ -2,8 +2,8 @@ use super::{
     dataref_place::storage_path as dataref_storage_path,
     rep_policy::RustRepPolicy,
     rir::{
-        RirDataRefId, RirField, RirFunction, RirLocalId, RirParamAbi, RirPlace, RirProgram,
-        RirProjection, RirType, RirTypeId,
+        RirDataRefId, RirField, RirFunction, RirLocalId, RirParamAbi, RirPlace, RirPlaceRoot,
+        RirProgram, RirProjection, RirType, RirTypeId,
     },
     syntax::comma,
     target,
@@ -73,7 +73,10 @@ impl<'a> RustPlaces<'a> {
     }
 
     fn local_place_with_ty(&self, place: &RirPlace) -> RenderedPlace {
-        let local = &self.function.locals[place.local.index()];
+        let RirPlaceRoot::Local(root) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
+        let local = &self.function.locals[root.index()];
         let mut rendered = RenderedPlace {
             expr: if self.root_needs_deref(place) {
                 format!("(*{})", local.symbol.as_str())
@@ -107,19 +110,28 @@ impl<'a> RustPlaces<'a> {
     }
 
     pub(super) fn shared_borrow_root_param(&self, place: &RirPlace) -> bool {
+        let RirPlaceRoot::Local(local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
         place.projections.is_empty()
-            && self.param_abi_for_local(place.local) == Some(RirParamAbi::SharedBorrow)
+            && self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
     }
 
     pub(super) fn mut_place_root_param(&self, place: &RirPlace) -> bool {
-        place.projections.is_empty() && self.local_is_mut_place_param(place.local)
+        let RirPlaceRoot::Local(local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
+        place.projections.is_empty() && self.local_is_mut_place_param(local)
     }
 
     pub(super) fn mut_place_projection(&self, place: &RirPlace) -> Option<MutPlaceProjection> {
-        if place.projections.is_empty() || !self.local_is_mut_place_param(place.local) {
+        let RirPlaceRoot::Local(root) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
+        if place.projections.is_empty() || !self.local_is_mut_place_param(root) {
             return None;
         }
-        let local = &self.function.locals[place.local.index()];
+        let local = &self.function.locals[root.index()];
         self.projected_place(
             local.ty,
             local.symbol.as_str(),
@@ -193,7 +205,7 @@ impl<'a> RustPlaces<'a> {
                             fields.push(format!("{version}: u64"));
                             inits.push((
                                 version.clone(),
-                                target::mut_place_access(root, &target::ctx_runtime("ctx"), &body),
+                                target::mut_place_access(root, target::runtime_param_name(), &body),
                             ));
                             steps.push(MutPlaceProjectionStep::ListIndex {
                                 index: field,
@@ -258,7 +270,10 @@ impl<'a> RustPlaces<'a> {
         let RirProjection::MapIndex(index) = last else {
             return None;
         };
-        let local = &self.function.locals[place.local.index()];
+        let RirPlaceRoot::Local(root_local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
+        let local = &self.function.locals[root_local.index()];
         let root = local.symbol.as_str().to_string();
         let mut rendered = RenderedPlace {
             expr: if self.root_needs_deref(place) {
@@ -288,11 +303,11 @@ impl<'a> RustPlaces<'a> {
         let RirProjection::Index(index) = last else {
             return None;
         };
-        let mut base = RirPlace {
-            local: place.local,
-            projections: prefix.to_vec(),
-            ty: self.function.locals[place.local.index()].ty,
+        let RirPlaceRoot::Local(root) = place.root else {
+            unreachable!("global RIR places are not supported here")
         };
+        let mut base =
+            RirPlace::local(root, prefix.to_vec(), self.function.locals[root.index()].ty);
         for projection in prefix {
             base.ty = match (self.program.types[base.ty.index()], projection) {
                 (RirType::Struct(id), RirProjection::Field(field)) => {
@@ -324,8 +339,11 @@ impl<'a> RustPlaces<'a> {
     }
 
     fn root_needs_deref(&self, place: &RirPlace) -> bool {
-        self.function.locals[place.local.index()].payload_ref
-            || self.param_abi_for_local(place.local) == Some(RirParamAbi::MutBorrow)
+        let RirPlaceRoot::Local(local) = place.root else {
+            unreachable!("global RIR places are not supported here")
+        };
+        self.function.locals[local.index()].payload_ref
+            || self.param_abi_for_local(local) == Some(RirParamAbi::MutBorrow)
     }
 
     fn captured_local_value(&self, local: RirLocalId, ty: RirTypeId) -> String {
