@@ -264,7 +264,7 @@ fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
                     Some(Subject::Error)
                 }
                 super::ResolvedIdentSubject::Named(module, value_name, value) => Some(
-                    named_value_subject(tc, module, value_name, &value, expr.span),
+                    named_value_subject(tc, module, value_name, &value, expr.node.id, expr.span),
                 ),
                 super::ResolvedIdentSubject::Module(scope) => Some(Subject::Module(scope)),
                 super::ResolvedIdentSubject::Type(ty) => Some(Subject::Type(ty)),
@@ -555,8 +555,12 @@ fn value_subject_checked(checked: CheckedType) -> Subject {
     Subject::Value(PlaceValue::not_place(checked))
 }
 
-fn global_subject(sig: &super::GlobalSig, tc: &TypeChecker) -> Subject {
-    Subject::Value(place::global_value(sig, tc.global_checked(sig)))
+fn global_subject(sig: &super::GlobalSig, root_expr_id: ExprId, tc: &TypeChecker) -> Subject {
+    Subject::Value(place::global_value(
+        sig,
+        root_expr_id,
+        tc.global_checked(sig),
+    ))
 }
 
 fn subject_contains_extern_any(subject: &Subject) -> bool {
@@ -590,7 +594,9 @@ fn apply_field(
             kind,
             tc,
         ),
-        Subject::Module(scope) => apply_module_field(scope, field.node.field, field.span, kind, tc),
+        Subject::Module(scope) => {
+            apply_module_field(scope, field.node.field, field_id, field.span, kind, tc)
+        }
         Subject::Type(ty) => apply_type_field(ty, field.node.field, field.span, kind, expected, tc),
         Subject::Callable { .. }
         | Subject::EnumVariant { .. }
@@ -716,6 +722,7 @@ fn named_value_subject(
     module: ModuleScope,
     name: Ident,
     value: &ValueDecl,
+    root_expr_id: ExprId,
     span: Span,
 ) -> Subject {
     tc.warn_named_value_deprecated(value, name, span);
@@ -730,7 +737,7 @@ fn named_value_subject(
     .flatten()
     .map(|info| tc.solver.local_type_to_type(info.type_id));
     if let ValueDecl::Global(sig) = value {
-        return global_subject(sig, tc);
+        return global_subject(sig, root_expr_id, tc);
     }
     match tc.decls.callable_for_value(&resolved) {
         Some(mut callee) => {
@@ -1142,6 +1149,7 @@ fn push_extend_method_error(tc: &mut TypeChecker, error: member::ExtendMethodErr
 fn apply_module_field(
     scope: &ModuleScope,
     name: Ident,
+    field_id: ExprId,
     span: Span,
     kind: MemberAccessKind,
     tc: &mut TypeChecker,
@@ -1155,7 +1163,7 @@ fn apply_module_field(
     match tc.decls.module_value(scope, name) {
         ModuleMemberLookup::Found(value) => {
             let (module, value_name, decl) = TypeChecker::resolved_value(value);
-            return named_value_subject(tc, module, value_name, &decl, span);
+            return named_value_subject(tc, module, value_name, &decl, field_id, span);
         }
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}

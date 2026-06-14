@@ -14,9 +14,23 @@ pub struct AirBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AirStmt {
-    Init { local: LocalId, value: RValue },
-    Assign { dst: Place, value: RValue },
+    Init {
+        local: LocalId,
+        value: RValue,
+    },
+    Assign {
+        dst: Place,
+        value: RValue,
+    },
     Eval(RValue),
+    GlobalEnsure {
+        global: GlobalId,
+    },
+    GlobalSetRoot {
+        global: GlobalId,
+        value: RValue,
+        init: GlobalInitEffect,
+    },
     If(AirIf),
     Loop(AirLoop),
     CollectionLoan(AirCollectionLoan),
@@ -33,6 +47,12 @@ pub enum AirTail {
     Break(AirLoopId),
     Continue(AirLoopId),
     Unreachable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalInitEffect {
+    InitializeFirst,
+    StoreWithoutInit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -417,7 +437,11 @@ impl AirBlock {
 impl AirStmt {
     pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
         match self {
-            Self::Init { value, .. } | Self::Assign { value, .. } | Self::Eval(value) => f(value),
+            Self::Init { value, .. }
+            | Self::Assign { value, .. }
+            | Self::Eval(value)
+            | Self::GlobalSetRoot { value, .. } => f(value),
+            Self::GlobalEnsure { .. } => {}
             Self::If(branch) => {
                 branch.then_block.for_each_rvalue(f);
                 if let Some(block) = &branch.else_block {

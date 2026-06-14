@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+lazy let scale = 2;
+
+fn make() -> fn(int) -> int {
+    |x| x * scale
+}

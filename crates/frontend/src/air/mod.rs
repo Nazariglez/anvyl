@@ -120,6 +120,28 @@ impl Program {
         id
     }
 
+    pub fn alloc_global_with_init(
+        &mut self,
+        build: impl FnOnce(GlobalId, FunctionId) -> (GlobalDecl, Function),
+    ) -> (GlobalId, FunctionId) {
+        let global = GlobalId::from_index(self.globals.len());
+        let init = FunctionId::from_index(self.functions.len());
+        let (decl, function) = build(global, init);
+        debug_assert_eq!(decl.init, init);
+        debug_assert_eq!(function.module, decl.module);
+        debug_assert_eq!(function.kind, FunctionKind::GlobalInit(global));
+
+        let module = decl.module;
+        let allocated_global = self.alloc_global(decl);
+        debug_assert_eq!(allocated_global, global);
+        self.module_mut(module).globals.push(global);
+
+        let allocated_init = self.alloc_function(function);
+        debug_assert_eq!(allocated_init, init);
+        self.module_mut(module).functions.push(init);
+        (global, init)
+    }
+
     pub fn function(&self, id: FunctionId) -> &Function {
         &self.functions[id.index()]
     }

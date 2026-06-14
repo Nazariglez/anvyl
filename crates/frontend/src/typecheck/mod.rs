@@ -1547,7 +1547,7 @@ impl TypeChecker {
     fn can_record_local_facts(&self) -> bool {
         let body = self.current_body();
         match body {
-            BodyInstanceKey::Lambda(_) => true,
+            BodyInstanceKey::Lambda(_) | BodyInstanceKey::Global(_) => true,
             BodyInstanceKey::Callable(key) => {
                 key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
                     || matches!(
@@ -2568,15 +2568,18 @@ impl TypeChecker {
         }
     }
 
-    fn enter_global_initializer(&mut self) {
+    fn with_global_initializer_body<R>(
+        &mut self,
+        key: GlobalKey,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.global_initializer_depth += 1;
-    }
-
-    fn exit_global_initializer(&mut self) {
+        let ret = self.with_body_instance(BodyInstanceKey::Global(key), f);
         self.global_initializer_depth = self
             .global_initializer_depth
             .checked_sub(1)
             .expect("global initializer depth underflow");
+        ret
     }
 
     fn in_global_initializer(&self) -> bool {
@@ -4164,7 +4167,7 @@ fn check_expr_checked_with_hint(
                     tc.warn_named_value_deprecated(value.as_ref(), value_name, expr.span);
                     if let ValueDecl::Global(sig) = value.as_ref() {
                         let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
-                        let value = place::global_value(sig, checked);
+                        let value = place::global_value(sig, expr.node.id, checked);
                         tc.record_expr_place(expr.node.id, &value);
                         place::record_value_read(expr.node.id, &value, tc);
                         tc.record_function_value_expr(

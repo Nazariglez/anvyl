@@ -6,7 +6,7 @@ use verify::{
 
 use super::{super::verify::verify_structured_body, *};
 use crate::{
-    air::{ExternBindingDecl, ExternTypeId, FunctionSpecialization},
+    air::{ExternBindingDecl, ExternTypeId, FunctionSpecialization, GlobalInitEffect},
     ast::Ident,
 };
 
@@ -1386,11 +1386,12 @@ fn invalid_unused_root_decls_are_rejected() {
         source_local: LocalId::from_index(0),
         ty: invalid_ty,
     });
-    let global = builder.alloc_global(GlobalDecl {
+    let global = builder.alloc_global_raw(GlobalDecl {
         name: Ident::new("g"),
         module: invalid_module,
         ty: invalid_ty,
         mutability: Mutability::Immutable,
+        init: FunctionId::from_index(99),
     });
 
     let errors = verify(&builder.finish()).unwrap_err();
@@ -4279,6 +4280,20 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
+    let missing_global = builder.alloc_global_raw(GlobalDecl {
+        name: Ident::new("missing_global"),
+        module: m0,
+        ty: void_ty,
+        mutability: Mutability::Immutable,
+        init: FunctionId::from_index(99),
+    });
+    let wrong_global = builder.alloc_global_raw(GlobalDecl {
+        name: Ident::new("wrong_global"),
+        module: m1,
+        ty: void_ty,
+        mutability: Mutability::Immutable,
+        init: FunctionId::from_index(99),
+    });
 
     let mut fb = FunctionBuilder::new("wrong", m1, FunctionKind::Normal, void_ty);
     fb.push_block(term_return_void());
@@ -4286,6 +4301,8 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
     let module = builder.module_mut(m0);
     module.functions.push(wrong);
     module.functions.push(wrong);
+    module.globals.push(wrong_global);
+    module.globals.push(wrong_global);
 
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Function(id))) if id == missing)));
@@ -4293,8 +4310,235 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Enum(id))) if id == missing_enum)));
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::ExternType(id))) if id == missing_ext_ty)));
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Extern(id))) if id == missing_ext)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::MissingItem(ModuleItem::Global(id))) if id == missing_global)));
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::ItemWrongModule { item: ModuleItem::Function(id), expected, found }) if id == wrong && expected == m0 && found == m1)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::ItemWrongModule { item: ModuleItem::Global(id), expected, found }) if id == wrong_global && expected == m0 && found == m1)));
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::DuplicateItem(ModuleItem::Function(id))) if id == wrong)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadModule(BadModule::DuplicateItem(ModuleItem::Global(id))) if id == wrong_global)));
+}
+
+#[test]
+fn malformed_globals_are_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let (global, init) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Mutable);
+    let mut program = builder.finish();
+    program.functions[init.index()]
+        .signature
+        .params
+        .push(Param {
+            name: Some(Ident::new("x")),
+            ty: int_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
+            role: ParamRole::Normal,
+            local_id: LocalId::from_index(0),
+        });
+    program.functions[init.index()].signature.return_mode = ReturnMode::Value(bool_ty);
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::GlobalInitSignatureMismatch { global: id, init: found }) if id == global && found == init)));
+}
+
+#[test]
+fn global_initializer_place_return_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (global, init) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Immutable);
+    let mut program = builder.finish();
+    program.functions[init.index()].signature.return_mode = ReturnMode::Place(int_ty);
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::GlobalInitSignatureMismatch { global: id, init: found }) if id == global && found == init)));
+}
+
+#[test]
+fn global_initializer_backlink_mismatch_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (first, first_init) =
+        builder.alloc_global_with_init(module, "first", int_ty, Mutability::Immutable);
+    let (second, second_init) =
+        builder.alloc_global_with_init(module, "second", int_ty, Mutability::Immutable);
+    let mut program = builder.finish();
+    program.functions[first_init.index()].kind = FunctionKind::GlobalInit(second);
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::GlobalInitKindMismatch { global, init }) if global == first && init == first_init)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::GlobalInitFunctionMismatch { global, init }) if global == second && init == second_init)));
+}
+
+#[test]
+fn global_initializer_module_mismatch_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let other = builder.alloc_module(empty_module("other"));
+    let (global, init) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Immutable);
+    let mut program = builder.finish();
+    program.functions[init.index()].module = other;
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadFunction(BadFunction::GlobalInitModuleMismatch { global: id, expected, found }) if id == global && expected == module && found == other)));
+}
+
+#[test]
+fn global_root_set_invariants_are_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let module = test_module(&mut builder);
+    let (mutable_global, _) =
+        builder.alloc_global_with_init(module, "v", int_ty, Mutability::Mutable);
+    let (immutable_global, _) =
+        builder.alloc_global_with_init(module, "c", int_ty, Mutability::Immutable);
+    let value = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let void_ty = builder.void_ty();
+    let errors = verify_void_entry(builder, "main", module, void_ty, |fb, bb0| {
+        fb.add_statement(
+            bb0,
+            AirStmt::GlobalEnsure {
+                global: GlobalId::from_index(99),
+            },
+        );
+        fb.add_statement(
+            bb0,
+            AirStmt::GlobalSetRoot {
+                global: mutable_global,
+                value: RValue::Use(op_const(value)),
+                init: GlobalInitEffect::InitializeFirst,
+            },
+        );
+        fb.add_statement(
+            bb0,
+            AirStmt::GlobalSetRoot {
+                global: immutable_global,
+                value: RValue::Use(op_const(value)),
+                init: GlobalInitEffect::StoreWithoutInit,
+            },
+        );
+        fb.add_statement(
+            bb0,
+            stmt_assign(
+                Place {
+                    root: PlaceRoot::Global(mutable_global),
+                    projection: vec![],
+                    ty: int_ty,
+                },
+                RValue::Use(op_const(value)),
+            ),
+        );
+    });
+
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadReference(BadReference::InvalidGlobal(id)) if id == GlobalId::from_index(99)
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::GlobalSetRootInitMustStoreWithoutInit)
+    )));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::GlobalSetRootTypeMismatch { expected, found }) if expected == int_ty && found == bool_ty)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadPlace(BadPlace::ImmutableRoot(PlaceRoot::Global(id))) if id == immutable_global)));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadStatement(BadStatement::AssignGlobalRoot(id)) if id == mutable_global)));
+}
+
+#[test]
+fn global_initializer_function_cannot_be_entry() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (_global, init) =
+        builder.alloc_global_with_init(module, "g", int_ty, Mutability::Immutable);
+    builder.set_entry(init);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(
+        |e| matches!(e.kind, EK::BadFunction(BadFunction::EntryMustBeNamed(id)) if id == init)
+    ));
+}
+
+#[test]
+fn global_initializer_functions_are_not_source_callable() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (_global, init) =
+        builder.alloc_global_with_init(module, "g", int_ty, Mutability::Immutable);
+    let void_ty = builder.void_ty();
+    let errors = verify_void_entry(builder, "main", module, void_ty, |fb, bb0| {
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::FunctionRef {
+                function: init,
+                ty: int_ty,
+            }),
+        );
+        fb.add_statement(
+            bb0,
+            stmt_eval(RValue::Call {
+                callee: Callee::Function(init),
+                args: vec![],
+            }),
+        );
+    });
+
+    assert!(errors.iter().any(
+        |e| matches!(e.kind, EK::BadRValue(BadRValue::FunctionRefMustBeNamed(id)) if id == init)
+    ));
+    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadCall(BadCall::FunctionCalleeMustBeSourceCallable(id)) if id == init)));
+}
+
+#[test]
+fn collection_loan_rejects_global_root_set() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let list_ty = builder.alloc_type(TypeData::List(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (global, _) = builder.alloc_global_with_init(module, "xs", list_ty, Mutability::Mutable);
+    let mut fb = FunctionBuilder::new("loan", module, FunctionKind::Normal, void_ty);
+    let source = fb.push_param("source", list_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::CollectionLoan(AirCollectionLoan {
+                root: Place {
+                    root: PlaceRoot::Global(global),
+                    projection: vec![],
+                    ty: list_ty,
+                },
+                root_kind: AirCollectionRootKind::List,
+                mode: AirCollectionLoanMode::ReadonlySequence,
+                body: AirBlock {
+                    stmts: vec![AirStmt::GlobalSetRoot {
+                        global,
+                        value: RValue::Use(op_place(source, list_ty)),
+                        init: GlobalInitEffect::StoreWithoutInit,
+                    }],
+                    tail: AirTail::None,
+                },
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::CollectionLoanRootRebindConflict {
+            mode: AirCollectionLoanMode::ReadonlySequence,
+        })
+    )));
 }
 
 #[test]

@@ -38,6 +38,7 @@ impl TypeChecker {
     pub(super) fn record_global_access(
         &mut self,
         expr_id: ExprId,
+        root_expr_id: ExprId,
         key: &GlobalKey,
         root: bool,
         mode: GlobalAccessMode,
@@ -51,6 +52,7 @@ impl TypeChecker {
             self.current_body(),
             GlobalAccessFact {
                 expr_id,
+                root_expr_id,
                 key: key.clone(),
                 mode,
                 init_effect,
@@ -127,17 +129,19 @@ fn check_global_initializer(module: &ModuleScope, global: &GlobalDeclNode, tc: &
     };
     let expected = tc.global_handle(&key);
 
-    tc.enter_global_initializer();
-    let value = check_value_expr_checked_with_hint(&global.node.value, Some(expected.clone()), tc);
-    tc.reject_extern_any_escape(&value, global.node.value.span);
-    tc.expect_assignable_expr(
-        global.node.value.span,
-        global.node.value.node.id,
-        value.handle,
-        expected.clone(),
-    );
-    tc.solve_constraints();
-    tc.exit_global_initializer();
+    tc.with_global_initializer_body(key, |tc| {
+        let value =
+            check_value_expr_checked_with_hint(&global.node.value, Some(expected.clone()), tc);
+        tc.record_escaping_use(&global.node.value);
+        tc.reject_extern_any_escape(&value, global.node.value.span);
+        tc.expect_assignable_expr(
+            global.node.value.span,
+            global.node.value.node.id,
+            value.handle,
+            expected.clone(),
+        );
+        tc.solve_constraints();
+    });
 
     let ty = tc.handle_type(&expected);
     tc.reject_user_any_type(&ty, global.span);

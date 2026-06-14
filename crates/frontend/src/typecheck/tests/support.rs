@@ -1,4 +1,4 @@
-use std::collections::hash_map::Values;
+use std::collections::hash_map::{Iter, Values};
 
 use crate::{
     ast::{ContractRef, ExprId, Ident, NominalKind, Type, TypeVisitor},
@@ -58,6 +58,10 @@ impl TypecheckTestResult {
 
     pub(crate) fn bodies(&self) -> Values<'_, BodyInstanceKey, SemanticBodyFacts> {
         self.program.facts.bodies.values()
+    }
+
+    pub(crate) fn body_entries(&self) -> Iter<'_, BodyInstanceKey, SemanticBodyFacts> {
+        self.program.facts.bodies.iter()
     }
 
     pub(crate) fn calls(&self) -> &CallMap {

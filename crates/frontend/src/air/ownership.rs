@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     AggregateKind, AirBlock, AirCollectionLoanMode, AirStmt, AirTail, CallArg, Callee, ConstId,
-    Function, FunctionId, LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal,
-    PlaceRoot, Program, RValue, TypeData, TypeId, VariantShape, typing,
+    Function, FunctionId, GlobalId, GlobalInitEffect, LambdaCaptureArg, LocalId, Operand,
+    ParamMode, Place, PlaceReadLocal, PlaceRoot, Program, RValue, TypeData, TypeId, VariantShape,
+    typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -348,12 +349,15 @@ impl ParamUseAnalyzer<'_> {
 
     fn observe_air_stmt(&mut self, stmt: &AirStmt) {
         match stmt {
-            AirStmt::Init { value, .. } => self.observe_rvalue(value, ValueContext::Store),
+            AirStmt::Init { value, .. } | AirStmt::GlobalSetRoot { value, .. } => {
+                self.observe_rvalue(value, ValueContext::Store);
+            }
             AirStmt::Assign { dst, value } => {
                 self.observe_place(dst, ParamUse::ReborrowMut);
                 self.observe_rvalue(value, ValueContext::Store);
             }
             AirStmt::Eval(value) => self.observe_rvalue(value, ValueContext::Read),
+            AirStmt::GlobalEnsure { .. } => {}
             AirStmt::If(branch) => {
                 self.observe_operand(&branch.cond, ValueContext::Read);
                 self.observe_air_block(&branch.then_block);
@@ -892,6 +896,25 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
             }
+            AirStmt::GlobalEnsure { global } => {
+                block.stmts.push(AirStmt::GlobalEnsure { global });
+            }
+            AirStmt::GlobalSetRoot {
+                global,
+                value,
+                init,
+            } => {
+                rewrite_air_value_stmt(
+                    &mut block.stmts,
+                    AirStmtValue::GlobalSetRoot { global, init },
+                    value,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+            }
             AirStmt::If(mut branch) => {
                 rewrite_air_block_call_args(
                     &mut branch.then_block,
@@ -996,6 +1019,10 @@ enum AirStmtValue {
     Init(LocalId),
     Assign(Place),
     Eval,
+    GlobalSetRoot {
+        global: GlobalId,
+        init: GlobalInitEffect,
+    },
 }
 
 fn rewrite_air_value_stmt(
@@ -1021,6 +1048,11 @@ fn rewrite_air_value_stmt(
         AirStmtValue::Init(local) => AirStmt::Init { local, value },
         AirStmtValue::Assign(dst) => AirStmt::Assign { dst, value },
         AirStmtValue::Eval => AirStmt::Eval(value),
+        AirStmtValue::GlobalSetRoot { global, init } => AirStmt::GlobalSetRoot {
+            global,
+            value,
+            init,
+        },
     });
 }
 
@@ -1170,11 +1202,7 @@ mod tests {
     fn module(program: &mut Program) -> ModuleId {
         program.alloc_module(Module {
             path: vec![Ident::new("test")],
-            functions: vec![],
-            aggregates: vec![],
-            enums: vec![],
-            extern_types: vec![],
-            externs: vec![],
+            ..Module::default()
         })
     }
 

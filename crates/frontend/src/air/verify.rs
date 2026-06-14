@@ -12,8 +12,8 @@ use super::{
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
-        AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, LambdaCaptureArg, MapWriteKind,
-        Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
+        AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, GlobalInitEffect, LambdaCaptureArg,
+        MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
     },
     ids::*,
     typing::{self, PrimitiveTypes},
@@ -136,6 +136,7 @@ pub enum BadModule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleItem {
     Function(FunctionId),
+    Global(GlobalId),
     Aggregate(AggregateId),
     Enum(EnumId),
     ExternType(ExternTypeId),
@@ -269,6 +270,9 @@ pub enum BadStatement {
     InitParamLocal(LocalId),
     InitTypeMismatch { expected: TypeId, found: TypeId },
     AssignTypeMismatch { expected: TypeId, found: TypeId },
+    AssignGlobalRoot(GlobalId),
+    GlobalSetRootInitMustStoreWithoutInit,
+    GlobalSetRootTypeMismatch { expected: TypeId, found: TypeId },
     ReadUninitializedLocal(LocalId),
     ReadUninitializedCaptureCell(CaptureCellId),
     AssignUninitializedLocal(LocalId),
@@ -305,6 +309,24 @@ pub enum BadReference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadFunction {
+    GlobalVoidType(GlobalId),
+    GlobalInitKindMismatch {
+        global: GlobalId,
+        init: FunctionId,
+    },
+    GlobalInitFunctionMismatch {
+        global: GlobalId,
+        init: FunctionId,
+    },
+    GlobalInitSignatureMismatch {
+        global: GlobalId,
+        init: FunctionId,
+    },
+    GlobalInitModuleMismatch {
+        global: GlobalId,
+        expected: ModuleId,
+        found: ModuleId,
+    },
     ParamLocalOutOfRange {
         param: usize,
         total_locals: usize,
@@ -639,6 +661,7 @@ pub enum BadPlace {
 pub enum BadCall {
     LambdaCalleeMustBeFunction,
     FunctionCalleeMustBeNamed(FunctionId),
+    FunctionCalleeMustBeSourceCallable(FunctionId),
     ArityMismatch {
         expected: usize,
         found: usize,
@@ -1013,10 +1036,17 @@ fn join_escape(
 fn collect_errors(cx: &mut VerifyCx<'_>) {
     if let Some(entry) = cx.program.entry {
         match cx.program.functions.get(entry.index()) {
-            Some(function) if matches!(function.kind, FunctionKind::Lambda(_)) => cx.push(
-                VerifySite::Program,
-                VerifyErrorKind::BadFunction(BadFunction::EntryMustBeNamed(entry)),
-            ),
+            Some(function)
+                if matches!(
+                    function.kind,
+                    FunctionKind::Lambda(_) | FunctionKind::GlobalInit(_)
+                ) =>
+            {
+                cx.push(
+                    VerifySite::Program,
+                    VerifyErrorKind::BadFunction(BadFunction::EntryMustBeNamed(entry)),
+                );
+            }
             Some(_) => {}
             None => cx.push(
                 VerifySite::Program,
@@ -1086,6 +1116,9 @@ fn verify_module(cx: &mut VerifyCx<'_>, id: ModuleId) {
             .functions
             .get(item.index())
             .map(|decl| decl.module)
+    });
+    verify_module_items(cx, &site, id, &module.globals, |cx, item| {
+        cx.program.globals.get(item.index()).map(|decl| decl.module)
     });
     verify_module_items(cx, &site, id, &module.aggregates, |cx, item| {
         cx.program
@@ -1159,6 +1192,7 @@ macro_rules! impl_module_ref {
 }
 
 impl_module_ref!(FunctionId, InvalidFunction, Function);
+impl_module_ref!(GlobalId, InvalidGlobal, Global);
 impl_module_ref!(AggregateId, InvalidAggregate, Aggregate);
 impl_module_ref!(EnumId, InvalidEnum, Enum);
 impl_module_ref!(ExternTypeId, InvalidExternType, ExternType);
@@ -1806,8 +1840,52 @@ fn verify_capture_cell_uniqueness(cx: &mut VerifyCx<'_>) {
 
 fn verify_global(cx: &mut VerifyCx<'_>, id: GlobalId) {
     let decl = &cx.program.globals[id.index()];
-    cx.verify_module_ref(VerifySite::Global(id), decl.module);
-    cx.verify_type_ref(VerifySite::Global(id), decl.ty);
+    let site = VerifySite::Global(id);
+    cx.verify_module_ref(site.clone(), decl.module);
+    verify_decl_listed_once(cx, site.clone(), decl.module, id, |m| &m.globals);
+    cx.verify_type_ref(site.clone(), decl.ty);
+    if cx.primitives.void() == Some(decl.ty) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::GlobalVoidType(id)),
+        );
+    }
+    match cx.program.functions.get(decl.init.index()) {
+        Some(function) if function.kind == FunctionKind::GlobalInit(id) => {
+            if function.module != decl.module {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::GlobalInitModuleMismatch {
+                        global: id,
+                        expected: decl.module,
+                        found: function.module,
+                    }),
+                );
+            }
+            if !function.signature.params.is_empty()
+                || function.signature.return_mode != ReturnMode::Value(decl.ty)
+            {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadFunction(BadFunction::GlobalInitSignatureMismatch {
+                        global: id,
+                        init: decl.init,
+                    }),
+                );
+            }
+        }
+        Some(_) => cx.push(
+            site,
+            VerifyErrorKind::BadFunction(BadFunction::GlobalInitKindMismatch {
+                global: id,
+                init: decl.init,
+            }),
+        ),
+        None => cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.init)),
+        ),
+    }
 }
 
 fn verify_const(cx: &mut VerifyCx<'_>, id: ConstId) {
@@ -2448,8 +2526,8 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
     let site = VerifySite::Function(id);
     cx.verify_module_ref(site.clone(), func.module);
     verify_decl_listed_once(cx, site.clone(), func.module, id, |m| &m.functions);
-    if let FunctionKind::Lambda(lambda) = func.kind {
-        match cx.program.lambdas.get(lambda.index()) {
+    match func.kind {
+        FunctionKind::Lambda(lambda) => match cx.program.lambdas.get(lambda.index()) {
             Some(decl) if decl.body == id => {}
             Some(decl) => cx.push(
                 site.clone(),
@@ -2462,7 +2540,25 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
                 site.clone(),
                 VerifyErrorKind::BadReference(BadReference::InvalidLambda(lambda)),
             ),
-        }
+        },
+        FunctionKind::GlobalInit(global) => match cx.program.globals.get(global.index()) {
+            Some(decl) if decl.init == id => {}
+            Some(decl) => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::GlobalInitFunctionMismatch {
+                    global,
+                    init: decl.init,
+                }),
+            ),
+            None => cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidGlobal(global)),
+            ),
+        },
+        FunctionKind::Normal
+        | FunctionKind::Method
+        | FunctionKind::ExtendMethod
+        | FunctionKind::Helper => {}
     }
 
     let mut seen_locals = std::collections::HashSet::new();
@@ -2660,6 +2756,24 @@ fn verify_air_stmt(
         AirStmt::Eval(value) => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_rvalue(cx, function_id, block_id, Some(index), value);
+            Some(state.clone())
+        }
+        AirStmt::GlobalEnsure { global } => {
+            if !cx.has_global(*global) {
+                cx.push(
+                    VerifyCx::stmt_site(function_id, block_id, index),
+                    VerifyErrorKind::BadReference(BadReference::InvalidGlobal(*global)),
+                );
+            }
+            Some(state.clone())
+        }
+        AirStmt::GlobalSetRoot {
+            global,
+            value,
+            init,
+        } => {
+            verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_global_set_root_stmt(cx, function_id, block_id, index, *global, value, *init);
             Some(state.clone())
         }
         AirStmt::If(branch) => verify_air_if(cx, function_id, index, branch, state, loops),
@@ -2984,7 +3098,11 @@ fn collect_collection_loan_slot_locals(
                 collect_collection_loan_slot_locals(&match_.some_block, slot_locals);
                 collect_collection_loan_slot_locals(&match_.none_block, slot_locals);
             }
-            AirStmt::Init { .. } | AirStmt::Assign { .. } | AirStmt::Eval(_) => {}
+            AirStmt::Init { .. }
+            | AirStmt::Assign { .. }
+            | AirStmt::Eval(_)
+            | AirStmt::GlobalEnsure { .. }
+            | AirStmt::GlobalSetRoot { .. } => {}
         }
     }
 }
@@ -3035,6 +3153,29 @@ fn verify_collection_loan_contract_stmt(
                 active_loans,
             );
         }
+        AirStmt::GlobalSetRoot { global, value, .. } => {
+            if let Some(decl) = cx.program.globals.get(global.index()) {
+                verify_collection_loan_root_rebind(
+                    cx,
+                    function_id,
+                    active_loans,
+                    &Place {
+                        root: PlaceRoot::Global(*global),
+                        projection: vec![],
+                        ty: decl.ty,
+                    },
+                );
+            }
+            verify_collection_loan_contract_rvalue(
+                cx,
+                function_id,
+                value,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
+        AirStmt::GlobalEnsure { .. } => {}
         AirStmt::Assign { dst, value } => {
             verify_collection_loan_contract_place(
                 cx,
@@ -4336,6 +4477,14 @@ fn verify_assign_stmt(
 ) {
     let site = VerifyCx::stmt_site(function_id, block_id, index);
     let dst_ty = verify_place(cx, function_id, block_id, Some(index), dst);
+    if let PlaceRoot::Global(global) = dst.root
+        && dst.projection.is_empty()
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::AssignGlobalRoot(global)),
+        );
+    }
     verify_mutable_place(cx, function_id, &site, dst);
     verify_rvalue(cx, function_id, block_id, Some(index), value);
     if let (Some(expected), Some(found)) =
@@ -4345,6 +4494,50 @@ fn verify_assign_stmt(
         cx.push(
             site,
             VerifyErrorKind::BadStatement(BadStatement::AssignTypeMismatch { expected, found }),
+        );
+    }
+}
+
+fn verify_global_set_root_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    global: GlobalId,
+    value: &RValue,
+    init: GlobalInitEffect,
+) {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    if init != GlobalInitEffect::StoreWithoutInit {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::GlobalSetRootInitMustStoreWithoutInit),
+        );
+    }
+    let Some(decl) = cx.program.globals.get(global.index()) else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidGlobal(global)),
+        );
+        verify_rvalue(cx, function_id, block_id, Some(index), value);
+        return;
+    };
+    if decl.mutability == Mutability::Immutable {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadPlace(BadPlace::ImmutableRoot(PlaceRoot::Global(global))),
+        );
+    }
+    verify_rvalue(cx, function_id, block_id, Some(index), value);
+    if let Some(found) = typing::rvalue_ty(cx.program, &cx.primitives, value)
+        && !same_type(cx, decl.ty, found)
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadStatement(BadStatement::GlobalSetRootTypeMismatch {
+                expected: decl.ty,
+                found,
+            }),
         );
     }
 }
@@ -4781,7 +4974,12 @@ fn verify_rvalue(
         }
         RValue::FunctionRef { function, ty } => {
             match cx.program.functions.get(function.index()) {
-                Some(function_decl) if matches!(function_decl.kind, FunctionKind::Lambda(_)) => {
+                Some(function_decl)
+                    if matches!(
+                        function_decl.kind,
+                        FunctionKind::Lambda(_) | FunctionKind::GlobalInit(_)
+                    ) =>
+                {
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadRValue(BadRValue::FunctionRefMustBeNamed(*function)),
@@ -6158,6 +6356,13 @@ fn verify_call(
                 cx.push(
                     site,
                     VerifyErrorKind::BadCall(BadCall::FunctionCalleeMustBeNamed(*id)),
+                );
+                return;
+            }
+            Some(function) if matches!(function.kind, FunctionKind::GlobalInit(_)) => {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadCall(BadCall::FunctionCalleeMustBeSourceCallable(*id)),
                 );
                 return;
             }

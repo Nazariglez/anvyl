@@ -531,6 +531,7 @@ pub(super) struct PlaceValue {
 #[derive(Clone)]
 pub(super) struct GlobalPlace {
     pub(super) key: GlobalKey,
+    pub(super) root_expr_id: ExprId,
     pub(super) root: bool,
 }
 
@@ -538,12 +539,17 @@ impl GlobalPlace {
     pub(super) fn projected(&self) -> Self {
         Self {
             key: self.key.clone(),
+            root_expr_id: self.root_expr_id,
             root: false,
         }
     }
 }
 
-pub(super) fn global_value(sig: &GlobalSig, checked: CheckedType) -> PlaceValue {
+pub(super) fn global_value(
+    sig: &GlobalSig,
+    root_expr_id: ExprId,
+    checked: CheckedType,
+) -> PlaceValue {
     let access = match sig.mutability {
         Mutability::Mutable => PlaceAccess::Mutable,
         Mutability::Immutable => PlaceAccess::Immutable,
@@ -553,6 +559,7 @@ pub(super) fn global_value(sig: &GlobalSig, checked: CheckedType) -> PlaceValue 
     value.root_name = Some(sig.key.name);
     value.global = Some(GlobalPlace {
         key: sig.key.clone(),
+        root_expr_id,
         root: true,
     });
     value
@@ -825,7 +832,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
                         expr.span,
                     );
                     let checked = super::checked_from_handle(expr, tc.global_handle(&sig.key), tc);
-                    let value = global_value(&sig, checked);
+                    let value = global_value(&sig, expr.node.id, checked);
                     return CheckedPlace {
                         accepts_extern_any: value.checked.contains_extern_any,
                         value,
@@ -1106,7 +1113,7 @@ fn record_place_global_access(
     let Some(global) = &value.global else {
         return;
     };
-    tc.record_global_access(expr_id, &global.key, global.root, mode);
+    tc.record_global_access(expr_id, global.root_expr_id, &global.key, global.root, mode);
 }
 
 pub(super) fn record_facts_read(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {

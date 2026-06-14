@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+lazy let base = 1;
+lazy let value = {
+    let local = base + 1;
+    local
+};
+
+fn main() -> int {
+    value
+}

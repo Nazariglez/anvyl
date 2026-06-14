@@ -31,12 +31,35 @@ fn local_root_reads_verify() {
 }
 
 #[test]
+fn global_with_initializer_verifies() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let (global, init) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Mutable);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::Global(global),
+        projection: vec![],
+        ty: int_ty,
+    })));
+    let main = builder.alloc_function(fb.finish());
+    builder.set_entry(main);
+
+    let program = builder.finish();
+    assert!(matches!(
+        program.functions[init.index()].kind,
+        FunctionKind::GlobalInit(id) if id == global
+    ));
+    expect_verified(&program);
+}
+
+#[test]
 fn non_local_roots_verify_with_declarations() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
     let scoped = builder.alloc_scoped_borrow(scoped_mut_param_borrow(
-        FunctionId::from_index(0),
+        FunctionId::from_index(1),
         BindingId::from_index(1),
         LocalId::from_index(0),
         int_ty,
@@ -44,16 +67,11 @@ fn non_local_roots_verify_with_declarations() {
     ));
     let cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(0),
-        owner: FunctionId::from_index(0),
+        owner: FunctionId::from_index(1),
         source_local: LocalId::from_index(1),
         ty: int_ty,
     });
-    let global = builder.alloc_global(GlobalDecl {
-        name: Ident::new("g"),
-        module,
-        ty: int_ty,
-        mutability: Mutability::Mutable,
-    });
+    let (global, _) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Mutable);
 
     let mut fb = FunctionBuilder::new("roots", module, FunctionKind::Normal, int_ty);
     let param = fb.push_param_with_mode("p", int_ty, ParamMode::MutBorrow, ParamRole::Normal);

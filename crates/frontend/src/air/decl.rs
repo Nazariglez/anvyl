@@ -10,10 +10,11 @@ use super::{
 };
 use crate::ast::{ExprId, Ident};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Module {
     pub path: Vec<Ident>,
     pub functions: Vec<FunctionId>,
+    pub globals: Vec<GlobalId>,
     pub aggregates: Vec<AggregateId>,
     pub enums: Vec<EnumId>,
     pub extern_types: Vec<ExternTypeId>,
@@ -50,6 +51,7 @@ pub enum FunctionKind {
     ExtendMethod,
     Lambda(LambdaId),
     Helper,
+    GlobalInit(GlobalId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +240,7 @@ pub struct GlobalDecl {
     pub module: ModuleId,
     pub ty: TypeId,
     pub mutability: Mutability,
+    pub init: FunctionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

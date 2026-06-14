@@ -175,8 +175,31 @@ impl ProgramBuilder {
         self.program.alloc_capture_cell(decl)
     }
 
-    pub fn alloc_global(&mut self, decl: GlobalDecl) -> GlobalId {
+    pub fn alloc_global_raw(&mut self, decl: GlobalDecl) -> GlobalId {
         self.program.alloc_global(decl)
+    }
+
+    pub fn alloc_global_with_init(
+        &mut self,
+        module: ModuleId,
+        name: &str,
+        ty: TypeId,
+        mutability: Mutability,
+    ) -> (GlobalId, FunctionId) {
+        self.program.alloc_global_with_init(|global, init| {
+            let mut fb = FunctionBuilder::new(name, module, FunctionKind::GlobalInit(global), ty);
+            fb.push_block(AirTail::Unreachable);
+            (
+                GlobalDecl {
+                    name: Ident::new(name),
+                    module,
+                    ty,
+                    mutability,
+                    init,
+                },
+                fb.finish(),
+            )
+        })
     }
 
     pub fn alloc_function(&mut self, func: Function) -> FunctionId {
@@ -321,11 +344,7 @@ pub fn body_from_block(block: AirBlock) -> AirBody {
 pub fn empty_module(path: &str) -> Module {
     Module {
         path: vec![Ident::new(path)],
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
+        ..Module::default()
     }
 }
 

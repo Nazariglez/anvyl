@@ -12,12 +12,12 @@ use super::{
     ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
-    FunctionSpecialization, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
-    LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
-    Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
-    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
-    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
-    VerifyError, ownership,
+    FunctionSpecialization, GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg,
+    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
+    LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
+    ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue,
+    ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType,
+    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -36,7 +36,8 @@ use crate::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
         CallableParent, CaptureStorage, CaptureStorageOrigin, ConstTerm, DeclarationIndex,
         DefaultArgFact, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueKind,
-        GenericArgs, LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind,
+        GenericArgs, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect,
+        GlobalKey, GlobalSig, LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind,
         LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind, MethodMode,
         MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
         SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
@@ -91,6 +92,15 @@ pub(crate) enum LowerError {
     MissingFunctionFact {
         id: Box<CallableId>,
         args: Box<GenericArgs>,
+    },
+    MissingGlobalSig {
+        key: Box<GlobalKey>,
+    },
+    MissingSourceGlobal {
+        key: Box<GlobalKey>,
+    },
+    MissingLoweredGlobal {
+        key: Box<GlobalKey>,
     },
     MissingSpecializedBodyFacts {
         body: Box<BodyInstanceKey>,
@@ -757,11 +767,7 @@ fn ensure_module(
     }
     let id = program.alloc_module(Module {
         path: module_path(scope),
-        functions: vec![],
-        aggregates: vec![],
-        enums: vec![],
-        extern_types: vec![],
-        externs: vec![],
+        ..Module::default()
     });
     modules.insert(scope.clone(), id);
     id
@@ -795,6 +801,7 @@ struct LoweringMaps {
     bodies: HashMap<BodyInstanceKey, FunctionId>,
     locals: HashMap<BodyInstanceKey, HashMap<SemanticLocalId, LocalId>>,
     lambdas: HashMap<LambdaBodyKey, LambdaId>,
+    globals: HashMap<GlobalKey, GlobalId>,
     externs: HashMap<ExternUseTarget, ExternId>,
 }
 
@@ -977,6 +984,22 @@ impl LowerCx<'_> {
         function
     }
 
+    fn alloc_global_in_module(
+        &mut self,
+        scope: &ModuleScope,
+        key: GlobalKey,
+        body: BodyInstanceKey,
+        build: impl FnOnce(ModuleId, GlobalId, FunctionId) -> (GlobalDecl, Function),
+    ) -> FunctionId {
+        let module = self.ensure_module(scope);
+        let (global, init) = self
+            .program
+            .alloc_global_with_init(|global, init| build(module, global, init));
+        self.maps.globals.insert(key, global);
+        self.register_body_function(body, HashMap::new(), init);
+        init
+    }
+
     fn register_body_function(
         &mut self,
         body: BodyInstanceKey,
@@ -1028,7 +1051,7 @@ impl LowerCx<'_> {
 
     fn lower_extern_declarations(
         &mut self,
-        functions: &ReachableCallables<'_>,
+        functions: &ReachableItems<'_>,
         semantic: &SemanticProgram,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
@@ -1297,7 +1320,7 @@ impl LowerCx<'_> {
     fn lower_function_shells(
         &mut self,
         modules: &SourceModules<'_>,
-        functions: &ReachableCallables<'_>,
+        functions: &ReachableItems<'_>,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
             match &source.source {
@@ -1386,6 +1409,39 @@ impl LowerCx<'_> {
                         },
                     );
                 }
+                ReachableSource::Global { global, sig } => {
+                    let module_scope = &modules.items[global.module].scope;
+                    let ty = self.lower_ty(&sig.ty)?;
+                    let mutability = lower_global_mutability(sig.mutability);
+                    self.alloc_global_in_module(
+                        module_scope,
+                        sig.key.clone(),
+                        source.body.clone(),
+                        |module, global_id, init| {
+                            (
+                                GlobalDecl {
+                                    name: sig.key.name,
+                                    module,
+                                    ty,
+                                    mutability,
+                                    init,
+                                },
+                                Function {
+                                    name: sig.key.name,
+                                    module,
+                                    kind: FunctionKind::GlobalInit(global_id),
+                                    owner: None,
+                                    specialization: None,
+                                    signature: Signature::new(vec![], ty),
+                                    locals: vec![],
+                                    body: AirBody {
+                                        block: AirBlock::default(),
+                                    },
+                                },
+                            )
+                        },
+                    );
+                }
             }
         }
         Ok(())
@@ -1393,7 +1449,7 @@ impl LowerCx<'_> {
 
     fn lower_callable_params(
         &mut self,
-        source: &ReachableCallable<'_>,
+        source: &ReachableItem<'_>,
         callable: SourceCallable<'_>,
         fact: &SemanticFunctionInstanceFact,
     ) -> Result<ParamLowerResult, LowerError> {
@@ -1419,7 +1475,7 @@ impl LowerCx<'_> {
 
     fn lower_lambda_params(
         &mut self,
-        source: &ReachableCallable<'_>,
+        source: &ReachableItem<'_>,
         lambda: &ast::LambdaNode,
         source_params: &[ast::FuncParam],
     ) -> Result<ParamLowerResult, LowerError> {
@@ -1448,7 +1504,7 @@ impl LowerCx<'_> {
 
     fn lower_params<'a>(
         &mut self,
-        source: &ReachableCallable<'_>,
+        source: &ReachableItem<'_>,
         specs: impl IntoIterator<Item = ParamLowerSpec<'a>>,
     ) -> Result<ParamLowerResult, LowerError> {
         let body_facts = source.body_facts.as_facts();
@@ -1547,7 +1603,7 @@ impl LowerCx<'_> {
         }))
     }
 
-    fn attach_stringify_overrides(&mut self, functions: &ReachableCallables<'_>) {
+    fn attach_stringify_overrides(&mut self, functions: &ReachableItems<'_>) {
         for source in &functions.items {
             let ReachableSource::Callable { fact, .. } = &source.source else {
                 continue;
@@ -1567,10 +1623,7 @@ impl LowerCx<'_> {
         }
     }
 
-    fn lower_function_bodies(
-        &mut self,
-        functions: &ReachableCallables<'_>,
-    ) -> Result<(), LowerError> {
+    fn lower_function_bodies(&mut self, functions: &ReachableItems<'_>) -> Result<(), LowerError> {
         let mut lowered = std::collections::HashSet::new();
         for source in &functions.items {
             if let ReachableSource::Lambda { owner, .. } = &source.source
@@ -1601,7 +1654,10 @@ impl LowerCx<'_> {
                     lowerer.lower_body(callable.body())?;
                 }
                 ReachableSource::Lambda { lambda, .. } => {
-                    lowerer.lower_lambda_body(&lambda.node.body)?;
+                    lowerer.lower_expr_body(&lambda.node.body)?;
+                }
+                ReachableSource::Global { global, .. } => {
+                    lowerer.lower_expr_body(&global.node.node.value)?;
                 }
             }
             lowered.insert(source.body.clone());
@@ -1663,7 +1719,7 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
 impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn new(
         cx: &'cx mut LowerCx<'tc>,
-        functions: &'facts ReachableCallables<'facts>,
+        functions: &'facts ReachableItems<'facts>,
         body: &BodyInstanceKey,
         facts: &'facts SemanticBodyFacts,
         function_id: FunctionId,
@@ -1766,7 +1822,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match &self.body {
             BodyInstanceKey::Callable(key) => key.args.clone(),
             BodyInstanceKey::Lambda(key) => key.specialization.clone(),
-            BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
+            BodyInstanceKey::Module(_)
+            | BodyInstanceKey::Global(_)
+            | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
         }
     }
 
@@ -1790,7 +1848,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.finish_body()
     }
 
-    fn lower_lambda_body(&mut self, body: &ExprNode) -> Result<(), LowerError> {
+    fn lower_expr_body(&mut self, body: &ExprNode) -> Result<(), LowerError> {
         if self.returns_void() {
             self.lower_effect(body)?;
             if !self.terminated {
@@ -3084,6 +3142,25 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         requires_mut: bool,
         allow_promoted_root: bool,
     ) -> Result<Place, LowerError> {
+        if let Some(fact) = self.global_access(expr.node.id).cloned() {
+            let valid = if requires_mut {
+                matches!(
+                    fact.mode,
+                    GlobalAccessMode::VarArgument
+                        | GlobalAccessMode::MutableBorrow
+                        | GlobalAccessMode::MutReceiver
+                )
+            } else {
+                matches!(
+                    fact.mode,
+                    GlobalAccessMode::ImmutableBorrow | GlobalAccessMode::Read
+                )
+            };
+            if !valid {
+                return Err(unsupported_expr(expr));
+            }
+            return self.lower_global_projected_place(expr, &fact);
+        }
         let fact = if requires_mut {
             match self
                 .local_use(expr, LocalUseMode::VarArgument)
@@ -3231,6 +3308,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             return self.lower_projected_place(expr, self.binding_place(&fact)?);
         }
+        if let Some(fact) = self.global_access(expr.node.id).cloned() {
+            return self.lower_global_projected_place(expr, &fact);
+        }
         if matches!(&root.node.kind, ExprKind::Ident(name) if name.as_str() == "self") {
             return self.lower_projected_place(expr, self.self_place(expr)?);
         }
@@ -3238,6 +3318,48 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             body: Box::new(self.body.clone()),
             expr_id: root.node.id,
         })
+    }
+
+    fn global_access(&self, expr_id: ExprId) -> Option<&GlobalAccessFact> {
+        self.facts.global_accesses.get(&expr_id)
+    }
+
+    fn lowered_global(&self, key: &GlobalKey) -> Result<GlobalId, LowerError> {
+        self.cx
+            .maps
+            .globals
+            .get(key)
+            .copied()
+            .ok_or_else(|| LowerError::MissingLoweredGlobal {
+                key: Box::new(key.clone()),
+            })
+    }
+
+    fn global_root_place(&self, fact: &GlobalAccessFact) -> Result<Place, LowerError> {
+        let global = self.lowered_global(&fact.key)?;
+        let ty = self.cx.program.globals[global.index()].ty;
+        Ok(Place {
+            root: PlaceRoot::Global(global),
+            projection: vec![],
+            ty,
+        })
+    }
+
+    fn lower_global_projected_place(
+        &mut self,
+        expr: &ExprNode,
+        fact: &GlobalAccessFact,
+    ) -> Result<Place, LowerError> {
+        self.emit_global_ensure_for_place(fact)?;
+        let root = self.global_root_place(fact)?;
+        self.lower_projected_place_from(expr, Some(fact.root_expr_id), root)
+    }
+
+    fn emit_global_ensure_for_place(&mut self, fact: &GlobalAccessFact) -> Result<(), LowerError> {
+        if fact.init_effect == TcGlobalInitEffect::InitializeFirst {
+            self.emit_global_ensure(self.lowered_global(&fact.key)?)?;
+        }
+        Ok(())
     }
 
     fn self_place(&self, expr: &ExprNode) -> Result<Place, LowerError> {
@@ -3325,24 +3447,37 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
+        self.lower_projected_place_from(expr, None, root)
+    }
+
+    fn lower_projected_place_from(
+        &mut self,
+        expr: &ExprNode,
+        root_expr: Option<ExprId>,
+        root: Place,
+    ) -> Result<Place, LowerError> {
+        if root_expr == Some(expr.node.id) {
+            return Ok(root);
+        }
         match &expr.node.kind {
             ExprKind::Ident(_) => Ok(root),
             ExprKind::Field(field) => {
                 if field.node.safe {
                     return Err(unsupported_expr(expr));
                 }
-                let place = self.lower_projected_place(&field.node.target, root)?;
+                let place = self.lower_projected_place_from(&field.node.target, root_expr, root)?;
                 self.project_field(expr, place, field.node.field)
             }
             ExprKind::TupleIndex(tuple) => {
-                let place = self.lower_projected_place(&tuple.node.target, root)?;
+                let place = self.lower_projected_place_from(&tuple.node.target, root_expr, root)?;
                 self.project_tuple_index(expr, place, tuple.node.index)
             }
             ExprKind::Index(index) => {
                 if index.node.safe {
                     return Err(unsupported_expr(expr));
                 }
-                let mut place = self.lower_projected_place(&index.node.target, root)?;
+                let mut place =
+                    self.lower_projected_place_from(&index.node.target, root_expr, root)?;
                 if self.place_is_capture_cell(&place) || self.place_is_scoped_borrow(&place) {
                     match self.cx.program.type_data(place.ty) {
                         TypeData::List(_) | TypeData::Slice(_) | TypeData::Map { .. } => {
@@ -3712,16 +3847,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Some(value) = self.lower_function_value(expr)? {
             return Ok(value);
         }
+        if let Some(value) = self.lower_safe_field_chain(expr)? {
+            return Ok(value);
+        }
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.lower_lit(expr, lit),
             ExprKind::Ident(_) | ExprKind::Field(_) => {
-                if let Some(value) = self.lower_safe_field_chain(expr)? {
-                    return Ok(value);
-                }
                 if !self.facts.locals.uses.contains_key(&expr.node.id)
                     && let Some(value) = self.lower_qualified_unit_enum(expr)?
                 {
                     return Ok(value);
+                }
+                if let Some(fact) = self.global_access(expr.node.id).cloned()
+                    && fact.mode == GlobalAccessMode::Read
+                {
+                    return self
+                        .lower_global_projected_place(expr, &fact)
+                        .map(Operand::Place);
                 }
                 match self.local_use(expr, LocalUseMode::Read) {
                     Ok(fact) => {
@@ -3735,18 +3877,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
             }
             ExprKind::TupleIndex(tuple) => {
-                if let Some(value) = self.lower_safe_field_chain(expr)? {
-                    return Ok(value);
-                }
                 let value = self.lower_value(&tuple.node.target)?;
                 self.project_tuple_index_operand(value, expr, tuple.node.index)
             }
-            ExprKind::Index(index) => {
-                if let Some(value) = self.lower_safe_field_chain(expr)? {
-                    return Ok(value);
-                }
-                self.lower_index_value(expr, index)
-            }
+            ExprKind::Index(index) => self.lower_index_value(expr, index),
             ExprKind::Block(block) => self.lower_block_value(expr, block),
             ExprKind::If(if_expr) => self.lower_if_value(expr, if_expr),
             ExprKind::IfLet(if_let) => self.lower_if_let_value(expr, if_let),
@@ -3812,12 +3946,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     ty,
                 })
             }
-            ExprKind::Call(call) => {
-                if let Some(value) = self.lower_safe_field_chain(expr)? {
-                    return Ok(value);
-                }
-                self.lower_call_value(expr, call)
-            }
+            ExprKind::Call(call) => self.lower_call_value(expr, call),
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
             ExprKind::StructLiteral(literal) => self.lower_struct_literal(expr, literal),
@@ -6498,6 +6627,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         {
             return Ok(());
         }
+        if let PlaceRoot::Global(global) = place.root
+            && self.cx.program.globals[global.index()].mutability == AirMutability::Mutable
+        {
+            return Ok(());
+        }
         Err(unsupported_expr(expr))
     }
 
@@ -6753,6 +6887,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     )?;
                     return self.emit_eval(value);
                 }
+                if let Some(fact) = self.global_access(assign.node.target.node.id).cloned() {
+                    let dst = self.lower_global_projected_place(&assign.node.target, &fact)?;
+                    let value =
+                        self.lower_value_to(&assign.node.value, dst.ty, &assign.node.value)?;
+                    return match fact.mode {
+                        GlobalAccessMode::RootAssign
+                            if fact.init_effect == TcGlobalInitEffect::StoreWithoutInit =>
+                        {
+                            let global = self.lowered_global(&fact.key)?;
+                            self.emit_global_set_root(global, RValue::Use(value))
+                        }
+                        GlobalAccessMode::ProjectedAssign => {
+                            self.emit_assign(dst, RValue::Use(value))
+                        }
+                        _ => Err(unsupported_expr(&assign.node.target)),
+                    };
+                }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
                 let value = self.lower_value_to(&assign.node.value, dst.ty, &assign.node.value)?;
@@ -6760,18 +6911,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             op => {
                 let binary = assign_op_to_binary(op);
-                let fact = self.local_use(&assign.node.target, LocalUseMode::CompoundAssign)?;
-                let dst = self.lower_place(&assign.node.target, &fact)?;
+                let dst = if let Some(fact) =
+                    self.global_access(assign.node.target.node.id).cloned()
+                {
+                    if fact.mode != GlobalAccessMode::CompoundAssign {
+                        return Err(unsupported_expr(&assign.node.target));
+                    }
+                    self.lower_global_projected_place(&assign.node.target, &fact)?
+                } else {
+                    let fact = self.local_use(&assign.node.target, LocalUseMode::CompoundAssign)?;
+                    self.lower_place(&assign.node.target, &fact)?
+                };
+                if matches!(dst.root, PlaceRoot::Global(_)) && dst.projection.is_empty() {
+                    return Err(unsupported_expr(&assign.node.target));
+                }
                 let result_ty = self.air_type(dst.ty);
                 if binary == BinaryOp::Add && result_ty == Type::String {
                     let lhs = Operand::Place(dst.clone());
                     let rhs = self.lower_string_part(&assign.node.value)?;
-                    self.emit_assign(
-                        dst,
-                        RValue::StringConcat {
-                            parts: vec![lhs, rhs],
-                        },
-                    )?;
+                    let value = RValue::StringConcat {
+                        parts: vec![lhs, rhs],
+                    };
+                    self.emit_assign(dst, value)?;
                     return Ok(());
                 }
                 self.require_builtin_scalar(expr)?;
@@ -6820,7 +6981,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             || self.facts.dyn_weakenings.contains_key(&id)
             || self.facts.dyn_calls.contains_key(&id)
             || self.facts.dyn_downcasts.contains_key(&id)
-            || self.facts.global_accesses.contains_key(&id)
     }
 
     fn returns_void(&self) -> bool {
@@ -6994,6 +7154,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn emit_eval(&mut self, value: RValue) -> Result<(), LowerError> {
         self.ensure_open()?;
         self.block.stmts.push(AirStmt::Eval(value));
+        Ok(())
+    }
+
+    fn emit_global_ensure(&mut self, global: GlobalId) -> Result<(), LowerError> {
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::GlobalEnsure { global });
+        Ok(())
+    }
+
+    fn emit_global_set_root(&mut self, global: GlobalId, value: RValue) -> Result<(), LowerError> {
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::GlobalSetRoot {
+            global,
+            value,
+            init: GlobalInitEffect::StoreWithoutInit,
+        });
         Ok(())
     }
 
@@ -7447,7 +7623,7 @@ pub(crate) fn lower_with_modules(
     let entry = roots.entry.clone();
     let roots = roots.normalized();
     validate_roots(&roots, &callable_facts)?;
-    let functions = ReachableCallables::new(&index, semantic, &callable_facts, roots)?;
+    let functions = ReachableItems::new(&index, semantic, &callable_facts, roots)?;
     let mut cx = LowerCx {
         decls: Some(semantic.declarations.clone()),
         externs: Some(semantic.externs.clone()),
@@ -7604,6 +7780,13 @@ fn const_term_is_concrete(term: &ConstTerm) -> bool {
     matches!(term, ConstTerm::Value(_))
 }
 
+fn lower_global_mutability(mutability: AstMutability) -> AirMutability {
+    match mutability {
+        AstMutability::Immutable => AirMutability::Immutable,
+        AstMutability::Mutable => AirMutability::Mutable,
+    }
+}
+
 fn reject_any_types(program: &Program) -> Result<(), LowerError> {
     for (index, ty) in program.type_arena.iter().enumerate() {
         if matches!(ty, TypeData::Any) {
@@ -7643,6 +7826,7 @@ impl<'a> SourceModules<'a> {
 struct SourceProgramIndex<'a> {
     modules: SourceModules<'a>,
     callables: HashMap<CallableId, SourceCallable<'a>>,
+    globals: HashMap<GlobalKey, SourceGlobal<'a>>,
     lambdas: HashMap<ExprId, &'a ast::LambdaNode>,
     default_exprs: HashMap<(CallableId, SourceId, ExprId), &'a ExprNode>,
 }
@@ -7654,6 +7838,13 @@ fn lower_const_specialization_value(value: &ast::ConstValue) -> ConstValue {
         ast::ConstValue::Bool(value) => ConstValue::Bool(*value),
         ast::ConstValue::String(value) => ConstValue::String(value.clone().into_boxed_str()),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceGlobal<'a> {
+    module: usize,
+    source: SourceId,
+    node: &'a ast::GlobalDeclNode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7733,6 +7924,7 @@ fn collect_stmt_lambdas<'a>(
             ast::DeferBody::Expr(expr) => collect_expr_lambdas(expr, lambdas),
             ast::DeferBody::Block(block) => collect_block_lambdas(block, lambdas),
         },
+        Stmt::Global(global) => collect_expr_lambdas(&global.node.value, lambdas),
         Stmt::Import(_)
         | Stmt::Func(_)
         | Stmt::ExternFunc(_)
@@ -7741,7 +7933,6 @@ fn collect_stmt_lambdas<'a>(
         | Stmt::Enum(_)
         | Stmt::Extend(_)
         | Stmt::Const(_)
-        | Stmt::Global(_)
         | Stmt::TypeAlias(_)
         | Stmt::Contract(_)
         | Stmt::Break
@@ -7947,13 +8138,13 @@ impl<'a> SourceCallable<'a> {
 }
 
 #[derive(Debug)]
-struct ReachableCallables<'a> {
+struct ReachableItems<'a> {
     index: &'a SourceProgramIndex<'a>,
-    items: Vec<ReachableCallable<'a>>,
+    items: Vec<ReachableItem<'a>>,
 }
 
 #[derive(Debug)]
-struct ReachableCallable<'a> {
+struct ReachableItem<'a> {
     source: ReachableSource<'a>,
     body: BodyInstanceKey,
     body_facts: ReachableBodyFacts<'a>,
@@ -7970,6 +8161,10 @@ enum ReachableSource<'a> {
         owner: BodyInstanceKey,
         lambda: &'a ast::LambdaNode,
         ty: &'a Type,
+    },
+    Global {
+        global: SourceGlobal<'a>,
+        sig: GlobalSig,
     },
 }
 
@@ -8268,7 +8463,7 @@ fn exact_capture_source(
 
 fn owned_reachable_lambdas(
     cx: &LowerCx<'_>,
-    functions: &ReachableCallables<'_>,
+    functions: &ReachableItems<'_>,
     body: &BodyInstanceKey,
 ) -> Vec<(ExprId, LambdaId)> {
     functions
@@ -8504,6 +8699,7 @@ impl<'a> SourceProgramIndex<'a> {
     fn new(root: &'a ast::Program, resolved: &'a ResolveResult) -> Self {
         let modules = SourceModules::new(root, resolved);
         let mut callables = HashMap::new();
+        let mut globals = HashMap::new();
         let mut lambdas = HashMap::new();
         let mut default_exprs = HashMap::new();
 
@@ -8564,6 +8760,20 @@ impl<'a> SourceProgramIndex<'a> {
                             );
                         }
                     }
+                    Stmt::Global(global) => {
+                        collect_expr_lambdas(&global.node.value, &mut lambdas);
+                        globals.insert(
+                            GlobalKey {
+                                module: module.scope.clone(),
+                                name: global.node.name,
+                            },
+                            SourceGlobal {
+                                module: module_index,
+                                source: module.source,
+                                node: global,
+                            },
+                        );
+                    }
                     Stmt::Extend(extend_node) => {
                         let extend_id = ExtendId {
                             module: module.scope.clone(),
@@ -8606,13 +8816,14 @@ impl<'a> SourceProgramIndex<'a> {
         Self {
             modules,
             callables,
+            globals,
             lambdas,
             default_exprs,
         }
     }
 }
 
-impl<'a> ReachableCallables<'a> {
+impl<'a> ReachableItems<'a> {
     fn new(
         index: &'a SourceProgramIndex<'a>,
         semantic: &'a SemanticProgram,
@@ -8636,6 +8847,7 @@ impl<'a> ReachableCallables<'a> {
                 ReachableKey::Lambda { owner, key, source } => {
                     reachable_lambda(index, semantic, *owner, &key, source)?
                 }
+                ReachableKey::Global(key) => reachable_global(index, semantic, &key)?,
             };
             enqueue_body_references(
                 index,
@@ -8656,6 +8868,7 @@ impl<'a> ReachableCallables<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReachableKey {
     Callable(CallableInstanceKey),
+    Global(GlobalKey),
     Lambda {
         owner: Box<BodyInstanceKey>,
         key: LambdaBodyKey,
@@ -8668,7 +8881,7 @@ fn reachable_callable<'a>(
     semantic: &'a SemanticProgram,
     semantic_functions: &SemanticCallableFacts<'a>,
     key: &CallableInstanceKey,
-) -> Result<ReachableCallable<'a>, LowerError> {
+) -> Result<ReachableItem<'a>, LowerError> {
     let Some(source) = index.callables.get(&key.target).copied() else {
         return Err(LowerError::UnsupportedCallableInstance {
             id: Box::new(key.target.clone()),
@@ -8696,7 +8909,7 @@ fn reachable_callable<'a>(
             });
         }
     };
-    Ok(ReachableCallable {
+    Ok(ReachableItem {
         source: ReachableSource::Callable {
             callable: source,
             fact,
@@ -8707,13 +8920,48 @@ fn reachable_callable<'a>(
     })
 }
 
+fn reachable_global<'a>(
+    index: &'a SourceProgramIndex<'a>,
+    semantic: &'a SemanticProgram,
+    key: &GlobalKey,
+) -> Result<ReachableItem<'a>, LowerError> {
+    let global =
+        index
+            .globals
+            .get(key)
+            .copied()
+            .ok_or_else(|| LowerError::MissingSourceGlobal {
+                key: Box::new(key.clone()),
+            })?;
+    let sig = semantic
+        .declarations
+        .global(key)
+        .ok_or_else(|| LowerError::MissingGlobalSig {
+            key: Box::new(key.clone()),
+        })?;
+    let body = BodyInstanceKey::Global(key.clone());
+    let facts =
+        semantic
+            .facts
+            .body(&body)
+            .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+                body: Box::new(body.clone()),
+            })?;
+    Ok(ReachableItem {
+        source: ReachableSource::Global { global, sig },
+        body,
+        body_facts: ReachableBodyFacts::Facts(facts),
+        source_id: global.source,
+    })
+}
+
 fn reachable_lambda<'a>(
     index: &'a SourceProgramIndex<'a>,
     semantic: &'a SemanticProgram,
     owner: BodyInstanceKey,
     key: &LambdaBodyKey,
     source_id: SourceId,
-) -> Result<ReachableCallable<'a>, LowerError> {
+) -> Result<ReachableItem<'a>, LowerError> {
     let body = BodyInstanceKey::Lambda(key.clone());
     let facts =
         semantic
@@ -8738,7 +8986,7 @@ fn reachable_lambda<'a>(
             expr_id: key.expr,
             kind: "Lambda",
         })?;
-    Ok(ReachableCallable {
+    Ok(ReachableItem {
         source: ReachableSource::Lambda {
             owner,
             lambda,
@@ -8783,9 +9031,22 @@ fn enqueue_body_references(
             }),
         );
     }
+    enqueue_global_accesses(body_facts, queued, worklist);
     enqueue_function_values(index, body_facts, body, source_id, queued, worklist)?;
     enqueue_stringify_overrides(index, semantic, body_facts, queued, worklist);
     Ok(())
+}
+
+fn enqueue_global_accesses(
+    body_facts: &SemanticBodyFacts,
+    queued: &mut std::collections::HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) {
+    let mut accesses = body_facts.global_accesses.values().collect::<Vec<_>>();
+    accesses.sort_by_key(|fact| fact.expr_id.0);
+    for fact in accesses {
+        queue_reachable(queued, worklist, ReachableKey::Global(fact.key.clone()));
+    }
 }
 
 fn sequence_filter_remove_matches(
@@ -8861,9 +9122,9 @@ fn enqueue_function_values(
                             specialization: match owner {
                                 BodyInstanceKey::Callable(key) => key.args.clone(),
                                 BodyInstanceKey::Lambda(key) => key.specialization.clone(),
-                                BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => {
-                                    GenericArgs::default()
-                                }
+                                BodyInstanceKey::Module(_)
+                                | BodyInstanceKey::Global(_)
+                                | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
                             },
                         },
                         source,
@@ -9789,20 +10050,670 @@ mod tests {
         .expect("lower failed");
 
         assert_eq!(function_names(&air), vec!["main"]);
+        assert!(air.globals.is_empty());
         assert!(air.externs.is_empty());
         assert!(air.aggregates.is_empty());
         assert!(air.enums.is_empty());
     }
 
     #[test]
-    fn reached_lazy_global_access_is_explicitly_unsupported() {
-        let err = lower_root(
+    fn reached_lazy_global_access_lowers_to_global_root() {
+        let air = lower_root(
             "lazy let Value: int = 1; fn main() -> int { Value }",
             "main",
         )
-        .expect_err("expected unsupported global access");
+        .expect("lower failed");
 
-        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
+        assert_eq!(air.globals.len(), 1);
+        let global = GlobalId::from_index(0);
+        assert!(matches!(
+            air.functions[air.globals[0].init.index()].kind,
+            FunctionKind::GlobalInit(id) if id == global
+        ));
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+        assert!(matches!(
+            main.body.block.stmts.as_slice(),
+            [AirStmt::GlobalEnsure { global: id }] if *id == global
+        ));
+        assert!(matches!(
+            main.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(id),
+                projection: ref fields,
+                ..
+            }))) if id == global && fields.is_empty()
+        ));
+    }
+
+    #[test]
+    fn repeated_global_reads_reuse_one_global() {
+        let air = lower_root(
+            "lazy let Value: int = 1; fn main() -> int { Value + Value }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.globals.len(), 1);
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        let ensures = statements
+            .iter()
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::GlobalEnsure {
+                        global: GlobalId(0)
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ensures, 2);
+        let reads = statements
+            .iter()
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::Init {
+                        value: RValue::Binary {
+                            lhs: Operand::Place(Place {
+                                root: PlaceRoot::Global(GlobalId(0)),
+                                ..
+                            }),
+                            rhs: Operand::Place(Place {
+                                root: PlaceRoot::Global(GlobalId(0)),
+                                ..
+                            }),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn global_root_assignment_lowers_to_global_set_root() {
+        let air = lower_root("lazy var Value: int = 1; fn main() { Value = 2; }", "main")
+            .expect("lower failed");
+
+        assert_eq!(air.globals.len(), 1);
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        assert!(!statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalSetRoot {
+                global: GlobalId(0),
+                init: GlobalInitEffect::StoreWithoutInit,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn global_root_assignment_evaluates_rhs_before_store() {
+        let air = lower_root(
+            "lazy let Source: int = 1; lazy var Target: int = 0; fn main() { Target = Source + 1; }",
+            "main",
+        )
+        .expect("lower failed");
+
+        let source = global_id(&air, "Source");
+        let target = global_id(&air, "Target");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+        let statements = function_statements(main).collect::<Vec<_>>();
+        let ensure_source = statements
+            .iter()
+            .position(|statement| {
+                matches!(statement, AirStmt::GlobalEnsure { global } if *global == source)
+            })
+            .expect("missing source ensure");
+        let rhs = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::Init {
+                        value: RValue::Binary {
+                            lhs: Operand::Place(Place {
+                                root: PlaceRoot::Global(global),
+                                ..
+                            }),
+                            ..
+                        },
+                        ..
+                    } if *global == source
+                )
+            })
+            .expect("missing rhs temp");
+        let set_target = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::GlobalSetRoot {
+                        global,
+                        init: GlobalInitEffect::StoreWithoutInit,
+                        ..
+                    } if *global == target
+                )
+            })
+            .expect("missing target set");
+
+        assert!(ensure_source < rhs && rhs < set_target);
+        assert!(!statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure { global } if *global == target
+        )));
+    }
+
+    #[test]
+    fn global_root_compound_assignment_is_not_air_represented() {
+        assert!(lower_root("lazy var Value: int = 1; fn main() { Value += 2; }", "main").is_err());
+    }
+
+    #[test]
+    fn projected_global_assignment_emits_ensure_then_assign() {
+        let air = lower_root(
+            "struct Box { value: int } lazy var State: Box = Box { value: 0 }; fn main() { State.value = 3; }",
+            "main",
+        )
+        .expect("lower failed");
+
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        let ensure = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::GlobalEnsure {
+                        global: GlobalId(0)
+                    }
+                )
+            })
+            .expect("missing ensure");
+        let assign = statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    AirStmt::Assign {
+                        dst: Place {
+                            root: PlaceRoot::Global(GlobalId(0)),
+                            projection,
+                            ..
+                        },
+                        ..
+                    } if !projection.is_empty()
+                )
+            })
+            .expect("missing projected assign");
+        assert!(ensure < assign);
+    }
+
+    #[test]
+    fn global_safe_chain_ensures_global_base() {
+        let air = lower_root(
+            "struct Config { title: int } lazy let maybe_config: Config? = Config { title: 1 }; fn main() -> int? { maybe_config?.title }",
+            "main",
+        )
+        .expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(main.body.block.stmts.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(main.body.block.stmts.iter().any(|statement| matches!(
+            statement,
+            AirStmt::OptionalMatch(AirOptionalMatch {
+                discr: Place {
+                    root: PlaceRoot::Global(GlobalId(0)),
+                    ..
+                },
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn global_var_argument_emits_ensure_and_mut_borrow_arg() {
+        let air = lower_root(
+            "lazy var Value: int = 1; fn set(var x: int) { x = 2; } fn main() { set(Value); }",
+            "main",
+        )
+        .expect("lower failed");
+
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Eval(RValue::Call { args, .. })
+                if matches!(args.as_slice(), [CallArg::MutBorrow(Place { root: PlaceRoot::Global(GlobalId(0)), .. })])
+        )));
+    }
+
+    #[test]
+    fn global_extern_shared_borrow_emits_ensure_and_borrow_arg() {
+        let air = lower_global_extern_arg(ParamFlow::Borrow, "lazy let Value: int = 1;");
+        let statements = program_statements(&air).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Eval(RValue::Call { args, .. })
+                if matches!(args.as_slice(), [CallArg::SharedBorrow(Place { root: PlaceRoot::Global(GlobalId(0)), .. })])
+        )));
+    }
+
+    #[test]
+    fn global_extern_mut_borrow_emits_ensure_and_borrow_arg() {
+        let air = lower_global_extern_arg(ParamFlow::MutBorrow, "lazy var Value: int = 1;");
+        let statements = program_statements(&air).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Eval(RValue::Call { args, .. })
+                if matches!(args.as_slice(), [CallArg::MutBorrow(Place { root: PlaceRoot::Global(GlobalId(0)), .. })])
+        )));
+    }
+
+    #[test]
+    fn global_mut_receiver_emits_ensure_and_mut_borrow_receiver() {
+        let air = lower_root(
+            "struct Box { value: int } extend Box { fn reset(var self) { self.value = 0; } } lazy var State: Box = Box { value: 1 }; fn main() { State.reset(); }",
+            "main",
+        )
+        .expect("lower failed");
+
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure {
+                global: GlobalId(0)
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Eval(RValue::Call { args, .. })
+                if matches!(args.as_slice(), [CallArg::MutBorrow(Place { root: PlaceRoot::Global(GlobalId(0)), .. })])
+        )));
+    }
+
+    #[test]
+    fn global_initializer_read_extends_reachability() {
+        let air = lower_root(
+            "lazy let Dep: int = 1; lazy let Value: int = Dep + 1; fn main() -> int { Value }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.globals.len(), 2);
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| matches!(statement, AirStmt::GlobalEnsure { .. }))
+        );
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::Binary {
+                    lhs: Operand::Place(Place {
+                        root: PlaceRoot::Global(_),
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn global_initializer_block_lowers_locals_and_reads() {
+        let air = lower_root(
+            "lazy let base: int = 1; lazy let value: int = { let local = base + 1; local }; fn main() -> int { value }",
+            "main",
+        )
+        .expect("lower failed");
+        let base = global_id(&air, "base");
+        let value = global_id(&air, "value");
+        let init = air
+            .functions
+            .iter()
+            .find(|function| function.kind == FunctionKind::GlobalInit(value))
+            .expect("missing value init");
+        let statements = function_statements(init).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalEnsure { global } if *global == base
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::Binary {
+                    lhs: Operand::Place(Place {
+                        root: PlaceRoot::Global(global),
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            } if *global == base
+        )));
+        assert!(matches!(
+            init.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Local(_),
+                ..
+            })))
+        ));
+    }
+
+    #[test]
+    fn global_initializer_lambda_reads_global_as_global_root() {
+        let air = lower_root(
+            "lazy let base: int = 1; lazy let make: fn() -> int = || base; fn main() { let f: fn() -> int = make; }",
+            "main",
+        )
+        .expect("lower failed");
+        let base = global_id(&air, "base");
+        let make = global_id(&air, "make");
+        let init = air
+            .functions
+            .iter()
+            .find(|function| function.kind == FunctionKind::GlobalInit(make))
+            .expect("missing make init");
+
+        assert!(function_statements(init).any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::MakeLambda { .. },
+                ..
+            }
+        )));
+        assert!(air.lambdas.iter().all(|lambda| lambda.captures.is_empty()));
+        assert!(air.functions.iter().any(|function| {
+            matches!(function.kind, FunctionKind::Lambda(_))
+                && matches!(
+                    function.body.block.stmts.as_slice(),
+                    [AirStmt::GlobalEnsure { global }] if *global == base
+                )
+                && matches!(
+                    function.body.block.tail,
+                    AirTail::Return(Some(Operand::Place(Place {
+                        root: PlaceRoot::Global(global),
+                        ..
+                    }))) if global == base
+                )
+        }));
+    }
+
+    #[test]
+    fn global_initializer_cycle_lowers_without_static_rejection() {
+        let air = lower_root(
+            "lazy let A: int = B; lazy let B: int = A; fn main() -> int { A }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.globals.len(), 2);
+    }
+
+    #[test]
+    fn lambda_reads_global_as_global_root() {
+        let air = lower_root(
+            "lazy let Value: int = 1; fn make() -> fn() -> int { || Value } fn main() -> int { make()() }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert_eq!(air.globals.len(), 1);
+        assert!(air.lambdas.iter().all(|lambda| lambda.captures.is_empty()));
+        assert!(air.functions.iter().any(|function| {
+            matches!(function.kind, FunctionKind::Lambda(_))
+                && matches!(
+                    function.body.block.stmts.as_slice(),
+                    [AirStmt::GlobalEnsure {
+                        global: GlobalId(0)
+                    }]
+                )
+                && matches!(
+                    function.body.block.tail,
+                    AirTail::Return(Some(Operand::Place(Place {
+                        root: PlaceRoot::Global(GlobalId(0)),
+                        ..
+                    })))
+                )
+        }));
+    }
+
+    #[test]
+    fn qualified_global_root_read_lowers_without_value_projection() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import dep; fn main() -> int { dep.count }",
+            &[("dep", "pub lazy let count: int = 1;")],
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(matches!(
+            main.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(GlobalId(0)),
+                projection: ref fields,
+                ..
+            }))) if fields.is_empty()
+        ));
+    }
+
+    #[test]
+    fn qualified_global_root_assignment_lowers_to_root_set() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import dep; fn main() { dep.count = 2; }",
+            &[("dep", "pub lazy var count: int = 1;")],
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
+        let statements = program_statements(&air).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::GlobalSetRoot {
+                global: GlobalId(0),
+                ..
+            }
+        )));
+        assert!(!statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Assign {
+                dst: Place {
+                    root: PlaceRoot::Global(GlobalId(0)),
+                    projection,
+                    ..
+                },
+                ..
+            } if projection.is_empty()
+        )));
+    }
+
+    #[test]
+    fn tuple_global_read_lowers_from_final_fact() {
+        let air = lower_root(
+            "lazy let pair: (int, int) = (1, 2); fn main() -> int { pair.0 }",
+            "main",
+        )
+        .expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(matches!(
+            main.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(GlobalId(0)),
+                projection: ref fields,
+                ..
+            }))) if matches!(fields.as_slice(), [crate::air::Projection::TupleField(0)])
+        ));
+    }
+
+    #[test]
+    fn indexed_global_read_lowers_from_final_fact() {
+        let air = lower_root(
+            "lazy let xs: [int; 2] = [1, 2]; fn main() -> int { xs[0] }",
+            "main",
+        )
+        .expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(matches!(
+            main.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(GlobalId(0)),
+                projection: ref fields,
+                ..
+            }))) if matches!(fields.as_slice(), [crate::air::Projection::Index(_)])
+        ));
+    }
+
+    #[test]
+    fn map_global_read_lowers_to_map_get() {
+        let air = lower_root(
+            "lazy let counts: [string: int] = [\"a\": 1]; fn main() -> int? { counts[\"a\"] }",
+            "main",
+        )
+        .expect("lower failed");
+        let statements = program_statements(&air).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::MapGet {
+                    map: Place {
+                        root: PlaceRoot::Global(GlobalId(0)),
+                        ..
+                    },
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn qualified_global_projected_read_lowers_only_value_suffix() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import dep; fn main() -> int { dep.state.value }",
+            &[(
+                "dep",
+                "pub struct Box { value: int } pub lazy var state: Box = Box { value: 1 };",
+            )],
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(matches!(
+            main.body.block.tail,
+            AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Global(GlobalId(0)),
+                projection: ref fields,
+                ..
+            }))) if fields.len() == 1
+        ));
+    }
+
+    #[test]
+    fn dependency_function_reaches_own_global() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import dep { value }; fn main() -> int { value() }",
+            &[(
+                "dep",
+                "lazy let Count: int = 1; pub fn value() -> int { Count }",
+            )],
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
+
+        assert_eq!(air.globals.len(), 1);
+        let global = &air.globals[0];
+        assert_eq!(
+            air.modules[global.module.index()].path,
+            vec![Ident::new("dep")]
+        );
+    }
+
+    #[test]
+    fn reexported_global_uses_one_declaring_identity() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import prelude { atlas }; fn main() -> int { atlas + atlas }",
+            &[
+                ("assets", "pub lazy let atlas: int = 1;"),
+                ("prelude", "pub import assets { atlas } ;"),
+            ],
+        );
+        let air =
+            lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed");
+
+        assert_eq!(air.globals.len(), 1);
+        let global = &air.globals[0];
+        assert_eq!(
+            air.modules[global.module.index()].path,
+            vec![Ident::new("assets")]
+        );
     }
 
     #[test]
@@ -12844,10 +13755,7 @@ fn main() {}
     }
 
     fn program_statements(program: &Program) -> impl Iterator<Item = AirStmt> + '_ {
-        program
-            .functions
-            .iter()
-            .flat_map(|function| function_statements(function).collect::<Vec<_>>())
+        program.functions.iter().flat_map(function_statements)
     }
 
     fn test_operand_ty(program: &Program, operand: &Operand) -> TypeId {
@@ -12858,6 +13766,15 @@ fn main() {}
         let mut statements = vec![];
         collect_block_statements(&function.body.block, &mut statements);
         statements.into_iter()
+    }
+
+    fn global_id(program: &Program, name: &str) -> GlobalId {
+        let index = program
+            .globals
+            .iter()
+            .position(|global| global.name == Ident::new(name))
+            .unwrap_or_else(|| panic!("missing global {name}"));
+        GlobalId::from_index(index)
     }
 
     fn collect_block_statements(block: &AirBlock, statements: &mut Vec<AirStmt>) {
@@ -12872,6 +13789,18 @@ fn main() {}
                     value: value.clone(),
                 }),
                 AirStmt::Eval(value) => statements.push(AirStmt::Eval(value.clone())),
+                AirStmt::GlobalEnsure { global } => {
+                    statements.push(AirStmt::GlobalEnsure { global: *global });
+                }
+                AirStmt::GlobalSetRoot {
+                    global,
+                    value,
+                    init,
+                } => statements.push(AirStmt::GlobalSetRoot {
+                    global: *global,
+                    value: value.clone(),
+                    init: *init,
+                }),
                 AirStmt::If(branch) => {
                     collect_block_statements(&branch.then_block, statements);
                     if let Some(block) = &branch.else_block {
@@ -12976,30 +13905,34 @@ fn main() {}
         }));
     }
 
-    fn test_reachable_callable<'a>(item: &ReachableCallable<'a>) -> SourceCallable<'a> {
+    fn test_reachable_callable<'a>(item: &ReachableItem<'a>) -> SourceCallable<'a> {
         match item.source {
             ReachableSource::Callable { callable, .. } => callable,
-            ReachableSource::Lambda { .. } => panic!("expected callable item"),
+            ReachableSource::Lambda { .. } | ReachableSource::Global { .. } => {
+                panic!("expected callable item")
+            }
         }
     }
 
-    fn test_reachable_fact<'a>(item: &ReachableCallable<'a>) -> &'a SemanticFunctionInstanceFact {
+    fn test_reachable_fact<'a>(item: &ReachableItem<'a>) -> &'a SemanticFunctionInstanceFact {
         match item.source {
             ReachableSource::Callable { fact, .. } => fact,
-            ReachableSource::Lambda { .. } => panic!("expected callable item"),
+            ReachableSource::Lambda { .. } | ReachableSource::Global { .. } => {
+                panic!("expected callable item")
+            }
         }
     }
 
     fn with_source_functions<R>(
         source: &str,
         names: &[&str],
-        f: impl FnOnce(&SourceModules<'_>, &ReachableCallables<'_>, &SemanticProgram) -> R,
+        f: impl FnOnce(&SourceModules<'_>, &ReachableItems<'_>, &SemanticProgram) -> R,
     ) -> R {
         let (root, resolved, semantic) = checked(source);
         let index = SourceProgramIndex::new(&root, &resolved);
         let facts = SemanticCallableFacts::new(&semantic.program);
         let roots = names.iter().map(|name| root_function(name)).collect();
-        let functions = ReachableCallables::new(&index, &semantic.program, &facts, roots)
+        let functions = ReachableItems::new(&index, &semantic.program, &facts, roots)
             .expect("source functions failed");
         f(&index.modules, &functions, &semantic.program)
     }
@@ -13031,6 +13964,37 @@ fn main() {}
         provider: ProviderDescriptor,
     ) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
         checked_with_providers(source, vec![provider])
+    }
+
+    fn lower_global_extern_arg(flow: ParamFlow, global: &str) -> Program {
+        let provider = ProviderDescriptor {
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: anvyx_externs::ModulePath {
+                    segments: vec!["host".to_string()],
+                },
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "touch".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![ExternParam {
+                            name: Some("value".to_string()),
+                            ty: ExternTypeExpr::Int,
+                            flow,
+                            escape: CallbackEscape::NonEscaping,
+                        }],
+                        ret: ExternTypeExpr::Void,
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+        let source = format!("import ext:host {{ touch }}; {global} fn main() {{ touch(Value); }}");
+        let (root, resolved, semantic) = checked_with_provider(&source, provider);
+        lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed")
     }
 
     fn checked_with_providers(

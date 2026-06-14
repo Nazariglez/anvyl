@@ -168,6 +168,7 @@ impl SemanticDeclarations {
                 }
                 BodyInstanceKey::Module(_)
                 | BodyInstanceKey::Lambda(_)
+                | BodyInstanceKey::Global(_)
                 | BodyInstanceKey::CastFrom(_) => {
                     debug_assert!(false, "semantic function fact has non-callable body");
                 }
@@ -272,6 +273,7 @@ pub(crate) enum BodyInstanceKey {
     Module(ModuleScope),
     Callable(CallableInstanceKey),
     Lambda(LambdaBodyKey),
+    Global(GlobalKey),
     CastFrom(CastFromInstanceKey),
 }
 
@@ -965,6 +967,7 @@ pub(crate) enum GlobalInitEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalAccessFact {
     pub(crate) expr_id: ExprId,
+    pub(crate) root_expr_id: ExprId,
     pub(crate) key: GlobalKey,
     pub(crate) mode: GlobalAccessMode,
     pub(crate) init_effect: GlobalInitEffect,
