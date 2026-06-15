@@ -349,7 +349,9 @@ impl ParamUseAnalyzer<'_> {
 
     fn observe_air_stmt(&mut self, stmt: &AirStmt) {
         match stmt {
-            AirStmt::Init { value, .. } | AirStmt::GlobalSetRoot { value, .. } => {
+            AirStmt::Init { value, .. }
+            | AirStmt::GlobalSetRoot { value, .. }
+            | AirStmt::GlobalUpdateRoot { value, .. } => {
                 self.observe_rvalue(value, ValueContext::Store);
             }
             AirStmt::Assign { dst, value } => {
@@ -915,6 +917,18 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
             }
+            AirStmt::GlobalUpdateRoot { global, value } => {
+                rewrite_air_value_stmt(
+                    &mut block.stmts,
+                    AirStmtValue::GlobalUpdateRoot { global },
+                    value,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+            }
             AirStmt::If(mut branch) => {
                 rewrite_air_block_call_args(
                     &mut branch.then_block,
@@ -1023,6 +1037,9 @@ enum AirStmtValue {
         global: GlobalId,
         init: GlobalInitEffect,
     },
+    GlobalUpdateRoot {
+        global: GlobalId,
+    },
 }
 
 fn rewrite_air_value_stmt(
@@ -1053,6 +1070,7 @@ fn rewrite_air_value_stmt(
             value,
             init,
         },
+        AirStmtValue::GlobalUpdateRoot { global } => AirStmt::GlobalUpdateRoot { global, value },
     });
 }
 

@@ -31,6 +31,10 @@ pub enum AirStmt {
         value: RValue,
         init: GlobalInitEffect,
     },
+    GlobalUpdateRoot {
+        global: GlobalId,
+        value: RValue,
+    },
     If(AirIf),
     Loop(AirLoop),
     CollectionLoan(AirCollectionLoan),
@@ -440,7 +444,8 @@ impl AirStmt {
             Self::Init { value, .. }
             | Self::Assign { value, .. }
             | Self::Eval(value)
-            | Self::GlobalSetRoot { value, .. } => f(value),
+            | Self::GlobalSetRoot { value, .. }
+            | Self::GlobalUpdateRoot { value, .. } => f(value),
             Self::GlobalEnsure { .. } => {}
             Self::If(branch) => {
                 branch.then_block.for_each_rvalue(f);

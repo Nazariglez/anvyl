@@ -6922,9 +6922,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     let fact = self.local_use(&assign.node.target, LocalUseMode::CompoundAssign)?;
                     self.lower_place(&assign.node.target, &fact)?
                 };
-                if matches!(dst.root, PlaceRoot::Global(_)) && dst.projection.is_empty() {
-                    return Err(unsupported_expr(&assign.node.target));
-                }
+                let is_global_root =
+                    matches!(dst.root, PlaceRoot::Global(_)) && dst.projection.is_empty();
                 let result_ty = self.air_type(dst.ty);
                 if binary == BinaryOp::Add && result_ty == Type::String {
                     let lhs = Operand::Place(dst.clone());
@@ -6932,7 +6931,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     let value = RValue::StringConcat {
                         parts: vec![lhs, rhs],
                     };
-                    self.emit_assign(dst, value)?;
+                    if is_global_root {
+                        let PlaceRoot::Global(global) = dst.root else {
+                            unreachable!("checked global root")
+                        };
+                        self.emit_global_update_root(global, value)?;
+                    } else {
+                        self.emit_assign(dst, value)?;
+                    }
                     return Ok(());
                 }
                 self.require_builtin_scalar(expr)?;
@@ -6956,7 +6962,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     rhs,
                     ty: dst.ty,
                 })?;
-                self.emit_assign(dst, RValue::Use(tmp))
+                if is_global_root {
+                    let PlaceRoot::Global(global) = dst.root else {
+                        unreachable!("checked global root")
+                    };
+                    self.emit_global_update_root(global, RValue::Use(tmp))
+                } else {
+                    self.emit_assign(dst, RValue::Use(tmp))
+                }
             }
         }
     }
@@ -7170,6 +7183,18 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             value,
             init: GlobalInitEffect::StoreWithoutInit,
         });
+        Ok(())
+    }
+
+    fn emit_global_update_root(
+        &mut self,
+        global: GlobalId,
+        value: RValue,
+    ) -> Result<(), LowerError> {
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::GlobalUpdateRoot { global, value });
         Ok(())
     }
 
@@ -10221,8 +10246,61 @@ mod tests {
     }
 
     #[test]
-    fn global_root_compound_assignment_is_not_air_represented() {
-        assert!(lower_root("lazy var Value: int = 1; fn main() { Value += 2; }", "main").is_err());
+    fn global_root_compound_assignment_lowers_to_update_after_ensure() {
+        let air = lower_root("lazy var Value: int = 1; fn main() { Value += 2; }", "main")
+            .expect("lower failed");
+        let statements = program_statements(&air).collect::<Vec<_>>();
+        let ensure = statements
+            .iter()
+            .position(|statement| {
+                matches!(statement, AirStmt::GlobalEnsure { global } if *global == GlobalId(0))
+            })
+            .expect("missing ensure");
+        let update = statements
+            .iter()
+            .position(|statement| {
+                matches!(statement, AirStmt::GlobalUpdateRoot { global, .. } if *global == GlobalId(0))
+            })
+            .expect("missing root update");
+
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| {
+                    matches!(statement, AirStmt::GlobalEnsure { global } if *global == GlobalId(0))
+                })
+                .count(),
+            1
+        );
+        assert!(ensure < update);
+        assert!(
+            !statements
+                .iter()
+                .any(|statement| matches!(statement, AirStmt::GlobalSetRoot { .. }))
+        );
+    }
+
+    #[test]
+    fn global_root_update_requires_prior_ensure() {
+        let mut program = lower_root("lazy var Value: int = 1; fn main() { Value += 2; }", "main")
+            .expect("lower failed");
+        let main = program
+            .functions
+            .iter_mut()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+        main.body.block.stmts.retain(|statement| {
+            !matches!(statement, AirStmt::GlobalEnsure { global } if *global == GlobalId(0))
+        });
+
+        let errors =
+            crate::air::verify(&program).expect_err("root update without ensure should fail");
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            crate::air::VerifyErrorKind::BadStatement(
+                crate::air::BadStatement::GlobalUpdateRootWithoutEnsure(GlobalId(0))
+            )
+        )));
     }
 
     #[test]
@@ -13801,6 +13879,12 @@ fn main() {}
                     value: value.clone(),
                     init: *init,
                 }),
+                AirStmt::GlobalUpdateRoot { global, value } => {
+                    statements.push(AirStmt::GlobalUpdateRoot {
+                        global: *global,
+                        value: value.clone(),
+                    });
+                }
                 AirStmt::If(branch) => {
                     collect_block_statements(&branch.then_block, statements);
                     if let Some(block) = &branch.else_block {

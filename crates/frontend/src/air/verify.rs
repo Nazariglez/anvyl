@@ -273,6 +273,8 @@ pub enum BadStatement {
     AssignGlobalRoot(GlobalId),
     GlobalSetRootInitMustStoreWithoutInit,
     GlobalSetRootTypeMismatch { expected: TypeId, found: TypeId },
+    GlobalUpdateRootTypeMismatch { expected: TypeId, found: TypeId },
+    GlobalUpdateRootWithoutEnsure(GlobalId),
     ReadUninitializedLocal(LocalId),
     ReadUninitializedCaptureCell(CaptureCellId),
     AssignUninitializedLocal(LocalId),
@@ -892,6 +894,7 @@ struct LocalInit {
     possible: Vec<bool>,
     local_escape: Vec<FunctionValueCapability>,
     cell_definite: Vec<bool>,
+    global_definite: Vec<bool>,
 }
 
 impl LocalInit {
@@ -914,6 +917,7 @@ impl LocalInit {
                 })
                 .collect(),
             cell_definite: vec![false; program.capture_cells.len()],
+            global_definite: vec![false; program.globals.len()],
         };
         for param in &function.signature.params {
             if param.local_id.index() < function.locals.len() {
@@ -983,6 +987,19 @@ impl LocalInit {
             .unwrap_or(false)
     }
 
+    fn ensure_global(&mut self, global: GlobalId) {
+        if global.index() < self.global_definite.len() {
+            self.global_definite[global.index()] = true;
+        }
+    }
+
+    fn global_is_definite(&self, global: GlobalId) -> bool {
+        self.global_definite
+            .get(global.index())
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn clear(&mut self, local: LocalId) {
         if local.index() < self.definite.len() {
             self.definite[local.index()] = false;
@@ -1004,6 +1021,9 @@ impl LocalInit {
                 *left = join_escape(*left, right);
             }
             for (left, right) in joined.cell_definite.iter_mut().zip(state.cell_definite) {
+                *left &= right;
+            }
+            for (left, right) in joined.global_definite.iter_mut().zip(state.global_definite) {
                 *left &= right;
             }
         }
@@ -2765,7 +2785,9 @@ fn verify_air_stmt(
                     VerifyErrorKind::BadReference(BadReference::InvalidGlobal(*global)),
                 );
             }
-            Some(state.clone())
+            let mut next = state.clone();
+            next.ensure_global(*global);
+            Some(next)
         }
         AirStmt::GlobalSetRoot {
             global,
@@ -2774,6 +2796,11 @@ fn verify_air_stmt(
         } => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_global_set_root_stmt(cx, function_id, block_id, index, *global, value, *init);
+            Some(state.clone())
+        }
+        AirStmt::GlobalUpdateRoot { global, value } => {
+            verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_global_update_root_stmt(cx, function_id, block_id, index, *global, value, state);
             Some(state.clone())
         }
         AirStmt::If(branch) => verify_air_if(cx, function_id, index, branch, state, loops),
@@ -3102,7 +3129,8 @@ fn collect_collection_loan_slot_locals(
             | AirStmt::Assign { .. }
             | AirStmt::Eval(_)
             | AirStmt::GlobalEnsure { .. }
-            | AirStmt::GlobalSetRoot { .. } => {}
+            | AirStmt::GlobalSetRoot { .. }
+            | AirStmt::GlobalUpdateRoot { .. } => {}
         }
     }
 }
@@ -3153,7 +3181,8 @@ fn verify_collection_loan_contract_stmt(
                 active_loans,
             );
         }
-        AirStmt::GlobalSetRoot { global, value, .. } => {
+        AirStmt::GlobalSetRoot { global, value, .. }
+        | AirStmt::GlobalUpdateRoot { global, value } => {
             if let Some(decl) = cx.program.globals.get(global.index()) {
                 verify_collection_loan_root_rebind(
                     cx,
@@ -4514,6 +4543,56 @@ fn verify_global_set_root_stmt(
             VerifyErrorKind::BadStatement(BadStatement::GlobalSetRootInitMustStoreWithoutInit),
         );
     }
+    verify_global_root_store_stmt(
+        cx,
+        function_id,
+        block_id,
+        index,
+        site,
+        global,
+        value,
+        |expected, found| BadStatement::GlobalSetRootTypeMismatch { expected, found },
+    );
+}
+
+fn verify_global_update_root_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    global: GlobalId,
+    value: &RValue,
+    state: &LocalInit,
+) {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    if !state.global_is_definite(global) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::GlobalUpdateRootWithoutEnsure(global)),
+        );
+    }
+    verify_global_root_store_stmt(
+        cx,
+        function_id,
+        block_id,
+        index,
+        site,
+        global,
+        value,
+        |expected, found| BadStatement::GlobalUpdateRootTypeMismatch { expected, found },
+    );
+}
+
+fn verify_global_root_store_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    site: VerifySite,
+    global: GlobalId,
+    value: &RValue,
+    mismatch: impl Fn(TypeId, TypeId) -> BadStatement,
+) {
     let Some(decl) = cx.program.globals.get(global.index()) else {
         cx.push(
             site.clone(),
@@ -4534,10 +4613,7 @@ fn verify_global_set_root_stmt(
     {
         cx.push(
             site,
-            VerifyErrorKind::BadStatement(BadStatement::GlobalSetRootTypeMismatch {
-                expected: decl.ty,
-                found,
-            }),
+            VerifyErrorKind::BadStatement(mismatch(decl.ty, found)),
         );
     }
 }
