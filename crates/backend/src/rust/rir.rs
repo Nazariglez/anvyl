@@ -47,6 +47,7 @@ rir_id!(RirStringifyReqId);
 rir_id!(RirLambdaSigId);
 rir_id!(RirLambdaId);
 rir_id!(RirLambdaEnvId);
+rir_id!(RirCollectionStorageId);
 rir_id!(RirCellId);
 rir_id!(RirScopedPlaceCellId);
 
@@ -77,6 +78,7 @@ pub struct RirProgram {
     pub lambda_sigs: Vec<RirLambdaSig>,
     pub lambdas: Vec<RirLambda>,
     pub lambda_envs: Vec<RirLambdaEnvLayout>,
+    pub collection_storages: Vec<RirCollectionStorage>,
     pub cells: Vec<RirCellDecl>,
     pub scoped_place_cells: Vec<RirScopedPlaceCellDecl>,
     pub stringify_reqs: Vec<RirStringifyReq>,
@@ -88,6 +90,26 @@ pub struct RirProgram {
 impl RirProgram {
     pub fn lambdas_for_sig(&self, sig: RirLambdaSigId) -> impl Iterator<Item = &RirLambda> {
         self.lambdas.iter().filter(move |lambda| lambda.sig == sig)
+    }
+
+    pub fn collection_storage_for(&self, value_ty: RirTypeId) -> Option<&RirCollectionStorage> {
+        self.collection_storages
+            .iter()
+            .find(|storage| storage.value_ty == value_ty)
+    }
+
+    pub fn option_ty(&self, inner: RirTypeId) -> Option<RirTypeId> {
+        self.types
+            .iter()
+            .position(|ty| matches!(ty, RirType::Option(found) if *found == inner))
+            .map(RirTypeId::from_index)
+    }
+
+    pub fn collection_replace_ty(&self, ty: RirTypeId) -> bool {
+        matches!(
+            self.types[ty.index()],
+            RirType::List(_) | RirType::Map { .. }
+        )
     }
 }
 
@@ -281,6 +303,25 @@ pub struct RirLambdaEnvLayout {
     pub lambda: RirLambdaId,
     pub symbol: RirSymbol,
     pub fields: Vec<RirLambdaEnvField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirCollectionStorage {
+    pub id: RirCollectionStorageId,
+    pub value_ty: RirTypeId,
+    pub kind: RirCollectionStorageKind,
+    pub symbol: RirSymbol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirCollectionStorageKind {
+    List {
+        elem_ty: RirTypeId,
+    },
+    Map {
+        key_ty: RirTypeId,
+        value_ty: RirTypeId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1305,7 +1346,9 @@ fn native_return_abi_ok(
 ) -> bool {
     match abi {
         RustReturnAbi::Void => Some(ret) == void,
-        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, ret, ty),
+        RustReturnAbi::Value(ty) => {
+            !extern_type_contains_collection(ty) && rir_type_matches_extern(program, ret, ty)
+        }
         RustReturnAbi::Option(inner) => rir_type_matches_option(program, ret, inner),
         RustReturnAbi::List(_) => false,
     }
@@ -1345,8 +1388,31 @@ fn rir_type_matches_option(program: &RirProgram, id: RirTypeId, inner: &RustRetu
         return false;
     };
     match inner {
-        RustReturnAbi::Value(ty) => rir_type_matches_extern(program, *payload, ty),
+        RustReturnAbi::Value(ty) => {
+            !extern_type_contains_collection(ty) && rir_type_matches_extern(program, *payload, ty)
+        }
         RustReturnAbi::Void | RustReturnAbi::Option(_) | RustReturnAbi::List(_) => false,
+    }
+}
+
+fn extern_type_contains_collection(ty: &ExternTypeExpr) -> bool {
+    match ty {
+        ExternTypeExpr::List(_) | ExternTypeExpr::Map(_, _) => true,
+        ExternTypeExpr::Option(inner) => extern_type_contains_collection(inner),
+        ExternTypeExpr::Callback(callback) => {
+            callback
+                .params
+                .iter()
+                .any(|param| extern_type_contains_collection(&param.ty))
+                || extern_type_contains_collection(&callback.ret)
+        }
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::String
+        | ExternTypeExpr::Any
+        | ExternTypeExpr::Named { .. } => false,
     }
 }
 
@@ -1390,6 +1456,7 @@ impl VerifyCx<'_> {
         self.check_lambda_sigs();
         self.check_lambdas();
         self.check_lambda_envs();
+        self.check_collection_storages();
         self.check_cells();
         self.check_scoped_place_cells();
         self.check_cell_symbol_uniqueness();
@@ -1803,6 +1870,44 @@ impl VerifyCx<'_> {
         match storage {
             RirCellStorage::StackScoped => (RirParamSemantic::StackCell, RirParamAbi::StackCell),
             RirCellStorage::Heap => (RirParamSemantic::HeapCell, RirParamAbi::HeapCell),
+        }
+    }
+
+    fn check_collection_storages(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        for (index, storage) in self.program.collection_storages.iter().enumerate() {
+            if storage.id != RirCollectionStorageId::from_index(index) {
+                self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
+            }
+            if !seen.insert(storage.value_ty) {
+                self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
+            }
+            self.check_type_id(RirVerifySite::Program, storage.value_ty);
+            match storage.kind {
+                RirCollectionStorageKind::List { elem_ty } => {
+                    self.check_type_id(RirVerifySite::Program, elem_ty);
+                    match self.ty(storage.value_ty) {
+                        Some(RirType::List(elem)) if elem == elem_ty => {}
+                        _ => self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId),
+                    }
+                }
+                RirCollectionStorageKind::Map { key_ty, value_ty } => {
+                    self.check_type_id(RirVerifySite::Program, key_ty);
+                    self.check_type_id(RirVerifySite::Program, value_ty);
+                    match self.ty(storage.value_ty) {
+                        Some(RirType::Map { key, value }) if key == key_ty && value == value_ty => {
+                        }
+                        _ => self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId),
+                    }
+                }
+            }
+        }
+        for (index, ty) in self.program.types.iter().enumerate() {
+            if matches!(ty, RirType::List(_) | RirType::Map { .. })
+                && !seen.contains(&RirTypeId::from_index(index))
+            {
+                self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
+            }
         }
     }
 
@@ -4422,7 +4527,7 @@ impl VerifyCx<'_> {
                         return None;
                     };
                     self.check_map_index_local(site, function, *local, key)?;
-                    let Some(slot) = self.option_ty(value) else {
+                    let Some(slot) = self.program.option_ty(value) else {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                         return None;
                     };
@@ -5235,17 +5340,11 @@ impl VerifyCx<'_> {
                 RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem),
                 RirProjection::Index(_),
             ) => Some(elem),
-            (RirType::Map { value, .. }, RirProjection::MapIndex(_)) => self.option_ty(value),
+            (RirType::Map { value, .. }, RirProjection::MapIndex(_)) => {
+                self.program.option_ty(value)
+            }
             _ => None,
         }
-    }
-
-    fn option_ty(&self, inner: RirTypeId) -> Option<RirTypeId> {
-        self.program
-            .types
-            .iter()
-            .position(|ty| matches!(ty, RirType::Option(found) if *found == inner))
-            .map(RirTypeId::from_index)
     }
 
     fn function_local_param_abi(function: &RirFunction, local: RirLocalId) -> Option<RirParamAbi> {

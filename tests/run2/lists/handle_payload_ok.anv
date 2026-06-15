@@ -1,0 +1,24 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 3
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn value(node: Node) -> int { node.value }
+
+fn main() {
+    var a: [Node] = [Node { value: 1 }, Node { value: 2 }];
+    var b = a;
+    a.push(Node { value: 3 });
+
+    println(value(b[0]));
+    println(value(b[1]));
+    println(value(a[2]));
+}

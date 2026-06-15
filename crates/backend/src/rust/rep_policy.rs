@@ -7,10 +7,10 @@ use anvyx_frontend::air::{
 
 use super::{
     rir::{
-        RirCellDecl, RirCellStorage, RirDataRef, RirEnum, RirEnumId, RirField, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaSigId, RirLambdaStorage, RirParamAbi,
-        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirTuple, RirTupleId, RirType,
-        RirTypeId,
+        RirCellDecl, RirCellStorage, RirCollectionStorageKind, RirDataRef, RirEnum, RirEnumId,
+        RirField, RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaSigId,
+        RirLambdaStorage, RirParamAbi, RirParamSemantic, RirProgram, RirStruct, RirStructId,
+        RirTuple, RirTupleId, RirType, RirTypeId,
     },
     target,
 };
@@ -107,7 +107,9 @@ impl<'a> AirRustRepPolicy<'a> {
     pub fn dataref_payload_supported(self, ty: TypeId) -> bool {
         match self.program.type_arena.data(ty) {
             TypeData::DataRef(_) => true,
-            TypeData::Optional(inner) => self.dataref_payload_supported(*inner),
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.dataref_payload_supported(*inner)
+            }
             TypeData::Tuple(elems) => elems
                 .iter()
                 .all(|elem| self.dataref_payload_supported(*elem)),
@@ -120,12 +122,11 @@ impl<'a> AirRustRepPolicy<'a> {
             TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().all(|variant| {
                 Self::variant_field_tys(variant).all(|ty| self.dataref_payload_supported(ty))
             }),
+            TypeData::List(_) => self.list_supported(ty),
+            TypeData::Map { .. } => self.map_supported(ty),
             TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
             TypeData::Void
             | TypeData::Any
-            | TypeData::Array { .. }
-            | TypeData::List(_)
-            | TypeData::Map { .. }
             | TypeData::Slice(_)
             | TypeData::Extern(_)
             | TypeData::Function(_)
@@ -213,14 +214,37 @@ impl<'a> AirRustRepPolicy<'a> {
         let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
             return false;
         };
-        self.map_slot_supported(*key) && self.map_slot_supported(*value)
+        self.map_key_supported(*key) && self.map_value_supported(*value)
     }
 
-    fn map_slot_supported(self, ty: TypeId) -> bool {
+    pub fn map_key_supported(self, ty: TypeId) -> bool {
         matches!(
             self.program.type_arena.data(ty),
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
+            TypeData::Int | TypeData::Bool | TypeData::String
         )
+    }
+
+    pub fn map_value_supported(self, ty: TypeId) -> bool {
+        match self.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::DataRef(_)
+            | TypeData::List(_)
+            | TypeData::Map { .. } => self.value_place_shareable(ty),
+            TypeData::Optional(inner) => self.map_value_supported(*inner),
+            TypeData::Tuple(elems) => elems.iter().all(|elem| self.map_value_supported(*elem)),
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Array { .. }
+            | TypeData::Aggregate(_)
+            | TypeData::Enum(_)
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => false,
+        }
     }
 
     pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
@@ -752,15 +776,21 @@ impl<'a> RustRepPolicy<'a> {
         })
     }
 
+    pub fn list_storage_tracked(self, elem: RirTypeId) -> bool {
+        self.type_owns_heap_edges(elem)
+    }
+
+    pub fn map_storage_tracked(self, key: RirTypeId, value: RirTypeId) -> bool {
+        self.type_owns_heap_edges(key) || self.type_owns_heap_edges(value)
+    }
+
     pub fn type_owns_heap_edges(self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
-            RirType::DataRef(_) => true,
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } | RirType::List(inner) => {
+            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) => true,
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
                 self.type_owns_heap_edges(inner)
             }
-            RirType::Map { key, value } => {
-                self.type_owns_heap_edges(key) || self.type_owns_heap_edges(value)
-            }
+            RirType::Map { .. } => true,
             RirType::Lambda(sig) => self.lambda_sig_owns_heap_edges(sig),
             RirType::Struct(id) => self.program.structs[id.index()]
                 .fields
@@ -779,12 +809,9 @@ impl<'a> RustRepPolicy<'a> {
                         .iter()
                         .any(|field| self.type_owns_heap_edges(field.ty))
                 }),
-            RirType::Int
-            | RirType::Float
-            | RirType::Bool
-            | RirType::String
-            | RirType::Void
-            | RirType::Slice(_) => false,
+            RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void => {
+                false
+            }
         }
     }
 
@@ -800,13 +827,11 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
-            RirType::DataRef(_) => true,
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } | RirType::List(inner) => {
+            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) => true,
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
                 self.type_cx_dependent(inner)
             }
-            RirType::Map { key, value } => {
-                self.type_cx_dependent(key) || self.type_cx_dependent(value)
-            }
+            RirType::Map { .. } => true,
             RirType::Lambda(sig) => self.lambda_sig_needs_ctx_lifetime(sig),
             RirType::Struct(id) => self.program.structs[id.index()]
                 .fields
@@ -984,6 +1009,22 @@ impl RustTracePlan {
                 }
             }
         }
+        for storage in &program.collection_storages {
+            match storage.kind {
+                RirCollectionStorageKind::List { elem_ty }
+                    if policy.list_storage_tracked(elem_ty) =>
+                {
+                    plan.mark_type(program, elem_ty);
+                }
+                RirCollectionStorageKind::Map { key_ty, value_ty }
+                    if policy.map_storage_tracked(key_ty, value_ty) =>
+                {
+                    plan.mark_type(program, key_ty);
+                    plan.mark_type(program, value_ty);
+                }
+                _ => {}
+            }
+        }
         plan
     }
 
@@ -1105,6 +1146,28 @@ mod tests {
         assert!(policy.supports_param_mode(list, ParamMode::MutBorrow));
         assert!(policy.copyable(function));
         assert!(policy.value_from_ref_supported(function));
+    }
+
+    #[test]
+    fn air_policy_splits_map_key_and_value_support() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let float = program.alloc_type(TypeData::Float);
+        let float_key = program.alloc_type(TypeData::Map {
+            key: float,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
+        let float_value = program.alloc_type(TypeData::Map {
+            key: int,
+            value: float,
+            order: air::MapOrder::Insertion,
+        });
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert!(!policy.map_supported(float_key));
+        assert!(policy.map_supported(float_value));
     }
 
     #[test]

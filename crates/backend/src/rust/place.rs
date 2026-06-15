@@ -132,7 +132,7 @@ impl<'a> RustPlaces<'a> {
             return None;
         }
         let local = &self.function.locals[root.index()];
-        self.projected_place(
+        self.projected_mut_place(
             local.ty,
             local.symbol.as_str(),
             place.ty,
@@ -146,6 +146,27 @@ impl<'a> RustPlaces<'a> {
         root: &str,
         slot_ty: RirTypeId,
         projections: &[RirProjection],
+    ) -> Option<MutPlaceProjection> {
+        self.projected_place_impl(root_ty, root, slot_ty, projections, false)
+    }
+
+    pub(super) fn projected_mut_place(
+        &self,
+        root_ty: RirTypeId,
+        root: &str,
+        slot_ty: RirTypeId,
+        projections: &[RirProjection],
+    ) -> Option<MutPlaceProjection> {
+        self.projected_place_impl(root_ty, root, slot_ty, projections, true)
+    }
+
+    fn projected_place_impl(
+        &self,
+        root_ty: RirTypeId,
+        root: &str,
+        slot_ty: RirTypeId,
+        projections: &[RirProjection],
+        root_is_mut_place: bool,
     ) -> Option<MutPlaceProjection> {
         let mut ty = root_ty;
         let mut fields = vec![];
@@ -187,7 +208,7 @@ impl<'a> RustPlaces<'a> {
                         key: field,
                         value_ty: value,
                     });
-                    ty = self.option_ty(value)?;
+                    ty = self.program.option_ty(value)?;
                 }
                 RirProjection::Index(index) => {
                     let local = self.function.locals[index.index()].symbol.as_str();
@@ -201,12 +222,17 @@ impl<'a> RustPlaces<'a> {
                         }
                         RirType::List(elem) => {
                             let version = format!("__v{}", fields.len());
-                            let body = self.projection_version_body(&steps)?;
+                            let body = if root_is_mut_place {
+                                target::mut_place_access(
+                                    root,
+                                    target::runtime_param_name(),
+                                    &self.projection_version_body(&steps)?,
+                                )
+                            } else {
+                                format!("{}?", Self::projection_version_body_from(root, &steps)?)
+                            };
                             fields.push(format!("{version}: u64"));
-                            inits.push((
-                                version.clone(),
-                                target::mut_place_access(root, target::runtime_param_name(), &body),
-                            ));
+                            inits.push((version.clone(), body));
                             steps.push(MutPlaceProjectionStep::ListIndex {
                                 index: field,
                                 version,
@@ -256,7 +282,7 @@ impl<'a> RustPlaces<'a> {
                 let checked = target::checked_index_result(index, &format!("{expr}.len()"), "list");
                 let body = Self::projection_version_body_from("value", rest)?;
                 Some(format!(
-                    "{{ let index = {checked}; let value = &{expr}.as_slice()[index]; {body} }}"
+                    "{{ let index = {checked}; {expr}.with_elem_shared_short(rt, index, {expr}.structural_version(), |value| {{ {body} }}) }}"
                 ))
             }
             MutPlaceProjectionStep::SliceIndex { .. } | MutPlaceProjectionStep::MapIndex { .. } => {
@@ -358,14 +384,6 @@ impl<'a> RustPlaces<'a> {
         }
     }
 
-    fn option_ty(&self, inner: RirTypeId) -> Option<RirTypeId> {
-        self.program
-            .types
-            .iter()
-            .position(|ty| matches!(ty, RirType::Option(found) if *found == inner))
-            .map(RirTypeId::from_index)
-    }
-
     fn local_is_mut_place_param(&self, local: RirLocalId) -> bool {
         self.param_abi_for_local(local) == Some(RirParamAbi::MutPlace)
     }
@@ -419,15 +437,23 @@ impl<'a> RustPlaces<'a> {
                             rendered.ty = elem;
                         }
                         RirType::List(elem) if allow_list_index => {
-                            let len = format!("{}.len()", rendered.expr);
-                            rendered.expr.push('[');
-                            rendered.expr.push_str(&target::checked_index(index, &len));
-                            rendered.expr.push(']');
+                            let list = rendered.expr.clone();
+                            let checked = target::checked_index(index, &format!("{list}.len()"));
+                            rendered.expr = format!(
+                                "{list}.elem_at_shared({}, {checked}, {list}.structural_version())?",
+                                target::runtime_param_name()
+                            );
                             rendered.ty = elem;
                         }
                         RirType::Slice(elem) => {
-                            rendered.expr =
-                                format!("{}?", target::slice_elem_at_shared(&rendered.expr, index));
+                            rendered.expr = format!(
+                                "{}?",
+                                target::slice_elem_at_shared(
+                                    &rendered.expr,
+                                    target::runtime_param_name(),
+                                    index,
+                                )
+                            );
                             rendered.ty = elem;
                         }
                         _ => unreachable!("verified index projection"),

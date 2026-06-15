@@ -11,15 +11,23 @@ pub(super) fn anv_string_ty() -> String {
 }
 
 pub(super) fn anv_list_ty(elem: String) -> String {
-    format!("{}<{elem}>", rt_path("AnvList"))
+    format!("{}<'cx, {elem}>", rt_path("AnvList"))
+}
+
+pub(super) fn list_storage_ty(elem: String) -> String {
+    format!("{}<'cx, {elem}>", rt_path("ListStorage"))
 }
 
 pub(super) fn anv_slice_ty(elem: String) -> String {
-    format!("{}<{elem}>", rt_path("AnvSlice"))
+    format!("{}<'cx, {elem}>", rt_path("AnvSlice"))
 }
 
 pub(super) fn anv_map_ty(key: String, value: String) -> String {
-    format!("{}<{key}, {value}>", rt_path("AnvMap"))
+    format!("{}<'cx, {key}, {value}>", rt_path("AnvMap"))
+}
+
+pub(super) fn map_storage_ty(key: String, value: String) -> String {
+    format!("{}<'cx, {key}, {value}>", rt_path("MapStorage"))
 }
 
 pub(super) fn stack_lambda_cell_ty(payload: &str) -> String {
@@ -294,12 +302,18 @@ pub(super) fn anv_string_format(fmt: &str, arg: &str) -> String {
     anv_string_from(&format!("format!({fmt}, {arg})"))
 }
 
-pub(super) fn anv_list_from_elems(elems: &str) -> String {
-    format!("{}::from_elems([{elems}])", rt_path("AnvList"))
+pub(super) fn anv_list_from_elems(rt: &str, storage_ty: &str, elems: &str) -> String {
+    format!(
+        "{}::from_elems({rt}, {storage_ty}, [{elems}])",
+        rt_path("AnvList")
+    )
 }
 
-pub(super) fn anv_list_from_iter(iter: &str) -> String {
-    format!("{}::from_elems({iter})", rt_path("AnvList"))
+pub(super) fn anv_list_from_iter(rt: &str, storage_ty: &str, iter: &str) -> String {
+    format!(
+        "{}::from_elems({rt}, {storage_ty}, {iter})",
+        rt_path("AnvList")
+    )
 }
 
 pub(super) fn anv_slice_from_raw_parts(
@@ -326,16 +340,16 @@ pub(super) fn anv_slice_from_raw_parts_mut(
     )
 }
 
-pub(super) fn anv_slice_from_list(root: &str, start: &str, len: &str, guard: &str) -> String {
+pub(super) fn anv_slice_from_list(root: &str, start: &str, len: &str) -> String {
     format!(
-        "unsafe {{ {}::from_list({root}, {start}, {len}, {guard}) }}",
+        "{}::from_list({root}, {start}, {len})?",
         rt_path("AnvSlice")
     )
 }
 
-pub(super) fn anv_slice_from_list_mut(root: &str, start: &str, len: &str, guard: &str) -> String {
+pub(super) fn anv_slice_from_list_mut(rt: &str, root: &str, start: &str, len: &str) -> String {
     format!(
-        "unsafe {{ {}::from_list_mut({root}, {start}, {len}, {guard}) }}",
+        "{}::from_list_mut({rt}, {root}, {start}, {len})?",
         rt_path("AnvSlice")
     )
 }
@@ -346,59 +360,70 @@ pub(super) fn anv_slice_slice(source: &str, start: &str, len: &str) -> String {
 
 pub(super) fn anv_slice_copy_range_with(
     source: &str,
+    rt: &str,
+    storage_ty: &str,
     range: &str,
     item: &str,
     body: &str,
 ) -> String {
-    format!("unsafe {{ {source}.copy_range_with({range}, |{item}| {body}) }}")
+    format!("unsafe {{ {source}.copy_range_with({rt}, {storage_ty}, {range}, |{item}| {body}) }}")
 }
 
 pub(super) fn mut_place_slice_view(
     place: &str,
+    rt: &str,
     start: &str,
     end: &str,
     inclusive: bool,
     mutable: bool,
+    raw: bool,
 ) -> String {
-    let method = if mutable {
-        "slice_view_mut"
+    let view = if mutable {
+        format!("{place}.slice_view_mut({rt}, {start}, {end}, {inclusive})")
     } else {
-        "slice_view"
+        format!("{place}.slice_view({start}, {end}, {inclusive})")
     };
-    format!("{place}.{method}({start}, {end}, {inclusive})?")
+    if raw {
+        format!("unsafe {{ {view} }}?")
+    } else {
+        format!("{view}?")
+    }
 }
 
-pub(super) fn anv_map_from_entries(entries: &str) -> String {
-    format!("{}::from_entries([{entries}])", rt_path("AnvMap"))
+pub(super) fn anv_map_from_entries(rt: &str, storage_ty: &str, entries: &str) -> String {
+    format!(
+        "{}::from_entries({rt}, {storage_ty}, [{entries}])",
+        rt_path("AnvMap")
+    )
 }
 
-pub(super) fn list_push(list: &str, value: &str) -> String {
-    format!("{list}.push({value})?")
+pub(super) fn list_push(list: &str, rt: &str, value: &str) -> String {
+    format!("{list}.push({rt}, {value})?")
 }
 
-pub(super) fn list_push_region(value: &str) -> String {
-    format!("{{ value.push({value})?; Ok(()) }}")
+pub(super) fn list_push_ctx_region(value: &str) -> String {
+    format!("{{ value.push(rt, {value})?; Ok(()) }}")
 }
 
-pub(super) fn map_insert(map: &str, key: &str, value: &str) -> String {
-    format!("{map}.insert({key}, {value})?")
+pub(super) fn map_insert(map: &str, rt: &str, key: &str, value: &str) -> String {
+    format!("{map}.insert({rt}, {key}, {value})?")
 }
 
 pub(super) fn map_insert_region(key: &str, inserted: &str) -> String {
-    format!("{{ value.insert({key}, {inserted})?; Ok(()) }}")
+    format!("{{ value.insert(rt, {key}, {inserted})?; Ok(()) }}")
 }
 
-pub(super) fn map_remove(map: &str, key: &str) -> String {
-    format!("{map}.remove(&{key})?")
+pub(super) fn map_remove(map: &str, rt: &str, key: &str) -> String {
+    format!("{map}.remove({rt}, &{key})?")
 }
 
 pub(super) fn map_remove_region(key: &str) -> String {
-    format!("value.remove(&{key})")
+    format!("value.remove(rt, &{key})")
 }
 
-pub(super) fn map_optional_slot_set(map: &str, key: &str, slot: &str) -> String {
+pub(super) fn map_optional_slot_set(map: &str, rt: &str, key: &str, slot: &str) -> String {
     format!(
-        "match {slot} {{ Some(slot) => {{ {map}.insert({key}.clone(), slot)?; Ok(()) }} None => {{ {map}.remove(&{key})?; Ok(()) }} }}"
+        "match {slot} {{ Some(slot) => {{ {map}.insert({rt}, {key}.clone(), slot)?; Ok(()) }} None => {{ {map}.remove({rt}, &{key})?; Ok(()) }} }}"
     )
 }
 
@@ -408,45 +433,57 @@ pub(super) fn collection_structural_version(collection: &str) -> String {
 
 pub(super) fn list_with_elem_shared_short(
     list: &str,
+    rt: &str,
     index: &str,
     version: &str,
     body: &str,
 ) -> String {
-    format!("{list}.with_elem_shared_short({index}, {version}, |value| {{ {body} }})")
+    format!("{list}.with_elem_shared_short({rt}, {index}, {version}, |value| {{ {body} }})")
 }
 
-pub(super) fn list_with_elem_mut_short(
+pub(super) fn list_with_elem_owned_mut_short(
     list: &str,
+    rt: &str,
     index: &str,
     version: &str,
     body: &str,
 ) -> String {
-    format!("{list}.with_elem_mut_short({index}, {version}, |value| {{ {body} }})")
+    format!(
+        "{list}.with_elem_owned_mut_ctx_short({rt}, {index}, {version}, |rt, value| {{ {body} }})"
+    )
 }
 
-pub(super) fn slice_elem_at_shared(slice: &str, index: &str) -> String {
-    format!("{slice}.elem_at_shared({index})")
+pub(super) fn slice_elem_at_shared(slice: &str, rt: &str, index: &str) -> String {
+    format!("{slice}.elem_at_shared({rt}, {index})")
 }
 
-pub(super) fn slice_with_elem_mut_short(slice: &str, index: &str, body: &str) -> String {
-    format!("{slice}.with_elem_mut_short({index}, |value| {{ {body} }})")
+pub(super) fn slice_with_elem_owned_mut_short(
+    slice: &str,
+    rt: &str,
+    index: &str,
+    body: &str,
+) -> String {
+    format!("{slice}.with_elem_owned_mut_ctx_short({rt}, {index}, |rt, value| {{ {body} }})")
 }
 
-pub(super) fn map_key_at_shared(map: &str, index: &str, version: &str) -> String {
-    format!("{map}.key_at_shared({index}, {version})?")
+pub(super) fn map_key_at_shared(map: &str, rt: &str, index: &str, version: &str) -> String {
+    format!("{map}.key_at_shared({rt}, {index}, {version})?")
 }
 
-pub(super) fn map_value_at_shared(map: &str, index: &str, version: &str) -> String {
-    format!("{map}.value_at_shared({index}, {version})?")
+pub(super) fn map_value_at_shared(map: &str, rt: &str, index: &str, version: &str) -> String {
+    format!("{map}.value_at_shared({rt}, {index}, {version})?")
 }
 
 pub(super) fn map_with_value_mut_short(
     map: &str,
+    rt: &str,
     index: &str,
     version: &str,
     body: &str,
 ) -> String {
-    format!("{map}.with_value_mut_short({index}, {version}, |value| {{ {body} }})")
+    format!(
+        "unsafe {{ {map}.with_value_mut_short({rt}, {index}, {version}, |value| {{ {body} }}) }}"
+    )
 }
 
 pub(super) fn begin_shape_loan(root: &str) -> String {
@@ -601,8 +638,12 @@ pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String
     mut_place_region(place, "access", runtime, "value", body)
 }
 
-pub(super) fn mut_place_mutate(place: &str, runtime: &str, body: &str) -> String {
-    mut_place_region(place, "mutate", runtime, "value", body)
+pub(super) fn mut_place_access_ctx(place: &str, runtime: &str, body: &str) -> String {
+    format!("{place}.access_with_ctx({runtime}, |rt, value| {body})?")
+}
+
+pub(super) fn mut_place_mutate_ctx(place: &str, runtime: &str, body: &str) -> String {
+    format!("{place}.mutate_with_ctx({runtime}, |rt, value| {body})?")
 }
 
 pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {
@@ -647,7 +688,7 @@ mod tests {
         dataref_place_ops_ty, erased_handle_ty, generated_call, heap_access_error, heap_register,
         heap_scope, heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
         mut_place_dataref, mut_place_get_copy, mut_place_heap_cell, mut_place_local,
-        mut_place_mutate, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
         mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
         projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
         rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
@@ -660,11 +701,11 @@ mod tests {
     fn renders_runtime_types() {
         assert_eq!(
             anv_list_ty("i64".to_string()),
-            "anvyx_runtime::AnvList<i64>"
+            "anvyx_runtime::AnvList<'cx, i64>"
         );
         assert_eq!(
             anv_map_ty("i64".to_string(), "bool".to_string()),
-            "anvyx_runtime::AnvMap<i64, bool>"
+            "anvyx_runtime::AnvMap<'cx, i64, bool>"
         );
         assert_eq!(
             stack_lambda_cell_ty("i64"),
@@ -718,8 +759,8 @@ mod tests {
             "anvyx_runtime::AnvString::from(out)"
         );
         assert_eq!(
-            anv_map_from_entries("(k, v)"),
-            "anvyx_runtime::AnvMap::from_entries([(k, v)])"
+            anv_map_from_entries("rt", "types.map_storage1", "(k, v)"),
+            "anvyx_runtime::AnvMap::from_entries(rt, types.map_storage1, [(k, v)])"
         );
         assert_eq!(visitor_ty("D"), "anvyx_runtime::Visitor<'cx, '_, D>");
         assert_eq!(
@@ -819,10 +860,6 @@ mod tests {
         assert_eq!(
             mut_place_access("place", "rt", "Ok(value.share())"),
             "place.access(rt, |value| Ok(value.share()))?"
-        );
-        assert_eq!(
-            mut_place_mutate("place", "rt", "value.replace_with(next)"),
-            "place.mutate(rt, |value| value.replace_with(next))?"
         );
         assert_eq!(
             mut_place_replace_collection("place", "rt", "next"),

@@ -1,0 +1,29 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 10
+// 3
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn main() {
+    var a: [string: Node] = ["a": Node { value: 1 }, "b": Node { value: 2 }];
+    var b = a;
+    a["a"] = Option.Some(Node { value: 10 });
+    a.insert("c", Node { value: 3 });
+
+    if let node? = b["a"] {
+        println(node.value);
+    }
+    if let node? = a["a"] {
+        println(node.value);
+    }
+    if let node? = a["c"] {
+        println(node.value);
+    }
+}

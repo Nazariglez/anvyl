@@ -106,6 +106,8 @@ pub enum ProfileErrorKind {
     UnsupportedMutablePlaceProjection,
     UnsupportedMutablePlaceDataRef,
     UnsupportedMutablePlaceNativeBoundary,
+    UnsupportedMapKey,
+    UnsupportedMapValue,
     NonCopyValueRequired,
 }
 
@@ -1673,7 +1675,7 @@ impl ProfileCx<'_> {
                 } else {
                     self.check_type_ref(site, *key);
                     self.check_type_ref(site, *value);
-                    self.policy().map_supported(ty)
+                    self.check_map_shape(site, *key, *value)
                 }
             }
             TypeData::Optional(inner) => {
@@ -1710,6 +1712,18 @@ impl ProfileCx<'_> {
         if !ok {
             self.push(site, ProfileErrorKind::UnsupportedType);
         }
+    }
+
+    fn check_map_shape(&mut self, site: ProfileSite, key: TypeId, value: TypeId) -> bool {
+        let key_ok = self.policy().map_key_supported(key);
+        let value_ok = self.policy().map_value_supported(value);
+        if !key_ok {
+            self.push(site, ProfileErrorKind::UnsupportedMapKey);
+        }
+        if !value_ok {
+            self.push(site, ProfileErrorKind::UnsupportedMapValue);
+        }
+        key_ok && value_ok
     }
 
     fn reject_function_container(&mut self, site: ProfileSite, ty: TypeId) -> bool {

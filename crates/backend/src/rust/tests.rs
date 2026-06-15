@@ -21,8 +21,9 @@ use super::{
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
         self, RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage,
-        RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirConst, RirConstId,
-        RirConstValue, RirCoreEnumKind, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
+        RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
+        RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
+        RirCoreEnumKind, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
         RirEnumMatchArm, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField,
         RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal,
         RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
@@ -673,7 +674,7 @@ fn profile_accepts_supported_format_rvalues() {
 }
 
 #[test]
-fn profile_rejects_dataref_list_payload_as_explicit_target_gap() {
+fn profile_accepts_dataref_list_payload() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let list = program.alloc_type(TypeData::List(int));
@@ -693,7 +694,7 @@ fn profile_rejects_dataref_list_payload_as_explicit_target_gap() {
     });
     program.module_mut(module).aggregates.push(aggregate);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedModuleItem);
+    check(program);
 }
 
 #[test]
@@ -773,8 +774,8 @@ fn plan_marks_tuple_with_dataref_field_noncopy() {
 fn profile_rejects_dataref_tuple_payload_with_unsupported_element() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
-    let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
-    let tuple = program.alloc_type(TypeData::Tuple(vec![array, int]));
+    let slice = program.alloc_type(TypeData::Slice(int));
+    let tuple = program.alloc_type(TypeData::Tuple(vec![slice, int]));
     let module = program.alloc_module(root_module());
     let aggregate = program.alloc_aggregate(air::AggregateDecl {
         name: Ident::new("Node"),
@@ -1775,6 +1776,35 @@ fn plan_maps_profile_global_value_read_to_target_gap() {
         rust_plan_config(),
         RustTargetGapKind::UnsupportedGlobalValueRead,
     );
+}
+
+#[test]
+fn profile_rejects_nonprimitive_map_keys_by_named_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let map = program.alloc_type(TypeData::Map {
+        key: tuple,
+        value: int,
+        order: air::MapOrder::Insertion,
+    });
+    let module = program.alloc_module(root_module());
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(map, LocalKind::Temp)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    expect_reject(program, ProfileErrorKind::UnsupportedMapKey);
 }
 
 #[test]
@@ -2961,6 +2991,78 @@ fn emit_derives_trace_for_generated_payloads_from_tracked_storage() {
 
     assert!(source.contains(
         "#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct Payload"
+    ));
+}
+
+#[test]
+fn trace_plan_marks_struct_with_primitive_list_field() {
+    let int = RirTypeId::from_index(0);
+    let list = RirTypeId::from_index(1);
+    let program = RirProgram {
+        types: vec![
+            RirType::Int,
+            RirType::List(int),
+            RirType::Struct(RirStructId::from_index(0)),
+        ],
+        collection_storages: vec![rir_list_storage(list, int)],
+        structs: vec![RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Payload"),
+            display: RirSymbol::new("Payload"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("items"),
+                ty: list,
+            }],
+        }],
+        ..RirProgram::default()
+    };
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(RustTracePlan::build(&program).needs_struct_trace(RirStructId::from_index(0)));
+    assert!(source.contains(
+        "#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct Payload<'cx>"
+    ));
+    assert!(source.contains(
+        "list_storage1: heap.register_untracked::<anvyx_runtime::ListStorage<'cx, i64>>()"
+    ));
+}
+
+#[test]
+fn collection_storage_tracking_follows_payload_edges() {
+    let mut program = dataref_metadata_rir();
+    let int = RirTypeId::from_index(0);
+    let node = RirTypeId::from_index(1);
+    let primitive_list = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::List(int));
+    let ref_list = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::List(node));
+    let map = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::Map {
+        key: int,
+        value: node,
+    });
+    program.collection_storages = vec![
+        rir_list_storage_id(0, primitive_list, int),
+        rir_list_storage_id(1, ref_list, node),
+        rir_map_storage(2, map, int, node),
+    ];
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains(
+        "list_storage2: heap.register_untracked::<anvyx_runtime::ListStorage<'cx, i64>>()"
+    ));
+    assert!(source.contains(
+        "list_storage3: heap.register_tracked::<anvyx_runtime::ListStorage<'cx, Node<'cx>>>()"
+    ));
+    assert!(source.contains(
+        "map_storage4: heap.register_tracked::<anvyx_runtime::MapStorage<'cx, i64, Node<'cx>>>()"
     ));
 }
 
@@ -5745,6 +5847,7 @@ fn rir_rejects_dynamic_projected_cell_mut_place_arg() {
     let index = RirLocalId::from_index(1);
     let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         cells: vec![RirCellDecl {
             payload_ty: list,
             ..valid_stack_cell_decl()
@@ -5797,6 +5900,7 @@ fn rir_accepts_single_dynamic_projected_param_mut_place_arg() {
     let index = RirLocalId::from_index(1);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![
             rir_function(
                 RirFunctionId::from_index(0),
@@ -5847,6 +5951,10 @@ fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
             RirType::Int,
             RirType::List(int),
             RirType::List(list),
+        ],
+        collection_storages: vec![
+            rir_list_storage_id(0, list, int),
+            rir_list_storage_id(1, nested, list),
         ],
         functions: vec![
             rir_function(
@@ -5899,6 +6007,7 @@ fn rir_accepts_map_slot_projected_param_mut_place_arg() {
                 value: int,
             },
         ],
+        collection_storages: vec![rir_map_storage(0, map, string, int)],
         functions: vec![
             rir_function(
                 RirFunctionId::from_index(0),
@@ -5956,6 +6065,10 @@ fn rir_accepts_nested_dynamic_map_slot_projection() {
                 value: int,
             },
             RirType::List(map),
+        ],
+        collection_storages: vec![
+            rir_map_storage(0, map, string, int),
+            rir_list_storage_id(1, list, map),
         ],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
@@ -6039,6 +6152,7 @@ fn rir_accepts_collection_loan_scope_around_loop() {
     let loop_id = RirLoopId::from_index(0);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6076,6 +6190,7 @@ fn rir_rejects_collection_loan_mode_root_mismatch() {
     let xs = RirLocalId::from_index(0);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6107,6 +6222,7 @@ fn rir_rejects_mutable_collection_loan_on_immutable_root() {
     let xs = RirLocalId::from_index(0);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6139,6 +6255,7 @@ fn rir_rejects_active_collection_root_assignment() {
     let ys = RirLocalId::from_index(1);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6174,6 +6291,7 @@ fn emit_collection_loan_scope_uses_lexical_raii_guard() {
     let xs = RirLocalId::from_index(0);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6211,6 +6329,7 @@ fn emit_collection_loan_scope_uses_short_mut_place_access() {
     let xs = RirLocalId::from_index(0);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -6293,7 +6412,7 @@ fn slice_type_uses_runtime_descriptor_not_raw_slice() {
 
     assert_eq!(
         RustRepPolicy::new(&program).rust_ty(slice),
-        "anvyx_runtime::AnvSlice<i64>"
+        "anvyx_runtime::AnvSlice<'cx, i64>"
     );
 }
 
@@ -6306,6 +6425,7 @@ fn rir_rejects_mut_place_operand_inside_short_region() {
     let value = RirLocalId::from_index(1);
     let program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
@@ -12121,6 +12241,10 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
             RirType::Option(int),
             RirType::Enum(RirEnumId::from_index(0)),
         ],
+        collection_storages: vec![
+            rir_list_storage(list, int),
+            rir_map_storage(1, map, int, int),
+        ],
         structs: vec![RirStruct {
             id: RirStructId::from_index(0),
             air_id: None,
@@ -12462,6 +12586,36 @@ fn rir_place(local: RirLocalId, ty: RirTypeId) -> RirPlace {
     RirPlace::local(local, vec![], ty)
 }
 
+fn rir_list_storage(value_ty: RirTypeId, elem_ty: RirTypeId) -> RirCollectionStorage {
+    rir_list_storage_id(0, value_ty, elem_ty)
+}
+
+fn rir_list_storage_id(id: usize, value_ty: RirTypeId, elem_ty: RirTypeId) -> RirCollectionStorage {
+    RirCollectionStorage {
+        id: RirCollectionStorageId::from_index(id),
+        value_ty,
+        kind: RirCollectionStorageKind::List { elem_ty },
+        symbol: RirSymbol::new(format!("list_storage{}", value_ty.index())),
+    }
+}
+
+fn rir_map_storage(
+    id: usize,
+    value_ty: RirTypeId,
+    key_ty: RirTypeId,
+    value_elem_ty: RirTypeId,
+) -> RirCollectionStorage {
+    RirCollectionStorage {
+        id: RirCollectionStorageId::from_index(id),
+        value_ty,
+        kind: RirCollectionStorageKind::Map {
+            key_ty,
+            value_ty: value_elem_ty,
+        },
+        symbol: RirSymbol::new(format!("map_storage{}", value_ty.index())),
+    }
+}
+
 fn rir_global_place(ty: RirTypeId) -> RirPlace {
     RirPlace::global(RirGlobalId::from_index(0), vec![], ty)
 }
@@ -12572,7 +12726,7 @@ fn struct_decl_program(dataref: bool) -> Program {
 fn unsupported_dataref_payload_program() -> Program {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
-    let list = program.alloc_type(TypeData::List(int));
+    let list = program.alloc_type(TypeData::Slice(int));
     let module = program.alloc_module(root_module());
     let aggregate = program.alloc_aggregate(air::AggregateDecl {
         name: Ident::new("Bad"),
@@ -15271,12 +15425,12 @@ mod lists {
 
         let source = plan_source(program);
         let text = source.as_str();
-        assert!(text.contains("anvyx_runtime::AnvList::from_elems([1])"));
+        assert!(text.contains("anvyx_runtime::AnvList::from_elems(rt, types.list_storage"));
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
         assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
-        assert!(text.contains(".push(2)?"));
-        assert!(text.contains("v0[anvyx_runtime::checked_index(v1, v0.len())]"));
+        assert!(text.contains(".push(rt, 2)?"));
+        assert!(text.contains(".elem_at_shared(rt, anvyx_runtime::checked_index(v1, v0.len()), v0.structural_version())?"));
         assert!(!text.contains("negative index"));
         assert!(!text.contains("index out of bounds"));
         assert!(text.contains(".len() as i64"));
@@ -15338,8 +15492,8 @@ mod lists {
         let source = plan_source(program);
         let text = source.as_str();
         assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
-        assert!(text.contains(".insert(1, 2)?;"));
-        assert!(text.contains(".remove(&1)?;"));
+        assert!(text.contains(".insert(rt, 1, 2)?;"));
+        assert!(text.contains(".remove(rt, &1)?;"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
@@ -15403,7 +15557,11 @@ mod lists {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("&anvyx_runtime::AnvList<i64>"));
+        assert!(
+            source
+                .as_str()
+                .contains("&anvyx_runtime::AnvList<'cx, i64>")
+        );
     }
 
     #[test]
@@ -15752,7 +15910,12 @@ mod slices {
     #[test]
     fn slice_range_list_copy_uses_runtime_helper_and_fallible_result() {
         let source = plan_source(range_copy_len_program(RangeCopySource::SliceParam)).into_string();
-        assert!(source.contains("unsafe { v0.copy_range_with(anvyx_runtime::checked_range(v1, v2, false, v0.len()), |item| *(item)) }?"));
+        assert!(source.contains("unsafe { v0.copy_range_with(rt, types.list_storage"));
+        assert!(
+            source.contains(
+                "anvyx_runtime::checked_range(v1, v2, false, v0.len()), |item| *(item)) }?"
+            )
+        );
         assert!(source.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
     }
 
@@ -16568,9 +16731,8 @@ fn native_scoped_lambda_air_with(kind: NativeLambdaArgKind) -> Program {
             captures,
         }))
     };
-    program.function_mut(lambda_body).kind = lambda
-        .map(FunctionKind::Lambda)
-        .unwrap_or(FunctionKind::Normal);
+    program.function_mut(lambda_body).kind =
+        lambda.map_or(FunctionKind::Normal, FunctionKind::Lambda);
 
     let mut locals = vec![
         Local {

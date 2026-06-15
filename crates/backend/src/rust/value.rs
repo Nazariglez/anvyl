@@ -4,8 +4,8 @@ use super::{
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
         RirGlobalId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirScopedPlaceCellRef, RirType, RirTypeId, RirVariant,
-        RirVariantKind,
+        RirPlaceRoot, RirProgram, RirProjection, RirScopedPlaceCellRef, RirType, RirTypeId,
+        RirVariant, RirVariantKind,
     },
     syntax::{
         block_expr, comma, field_init, match_expr, rust_string, struct_lit, struct_variant,
@@ -249,28 +249,58 @@ impl<'a> RustValues<'a> {
 
     fn map_slot_value_operand(&self, place: &RirPlace) -> Option<String> {
         let access = self.places.map_slot_access(place)?;
-        let value = self.value_from_ref(access.value_ty, "value");
+        let value = self.value_from_place(access.value_ty, "value");
         Some(format!(
-            "{}.get(&{}).map(|value| {value})",
-            access.map, access.key
+            "{}.get({}, &{})?.map(|value| {value})",
+            access.map,
+            target::runtime_param_name(),
+            access.key
         ))
+    }
+
+    fn projection_needs_projected_set(projection: &MutPlaceProjection) -> bool {
+        matches!(
+            projection.steps.last(),
+            Some(MutPlaceProjectionStep::MapIndex { .. })
+        ) && projection.steps[..projection.steps.len() - 1]
+            .iter()
+            .any(|step| {
+                matches!(
+                    step,
+                    MutPlaceProjectionStep::ListIndex { .. }
+                        | MutPlaceProjectionStep::SliceIndex { .. }
+                        | MutPlaceProjectionStep::MapIndex { .. }
+                )
+            })
     }
 
     pub(super) fn mut_place_projected_set(&self, place: &RirPlace, value: &str) -> Option<String> {
         let projection = self.places.mut_place_projection(place)?;
-        let set = if self.collection_replace_ty(place.ty) {
-            target::mut_place_replace_collection(
-                "__anv_place",
-                target::runtime_param_name(),
-                "__anv_value",
-            )
-        } else {
-            target::mut_place_set("__anv_place", target::runtime_param_name(), "__anv_value")
-        };
-        Some(self.mut_place_projected_region(
+        Some(self.projected_set_region(
             &projection,
-            &format!("let __anv_value = {value};"),
-            &set,
+            &target::mut_place_reborrow(&projection.root),
+            value,
+        ))
+    }
+
+    pub(super) fn local_projected_set(&self, place: &RirPlace, value: &str) -> Option<String> {
+        let RirPlaceRoot::Local(root) = place.root else {
+            return None;
+        };
+        let local = &self.function.locals[root.index()];
+        let projection = self.places.projected_place(
+            local.ty,
+            local.symbol.as_str(),
+            place.ty,
+            &place.projections,
+        )?;
+        if !Self::projection_needs_projected_set(&projection) {
+            return None;
+        }
+        Some(self.projected_set_region(
+            &projection,
+            &target::mut_place_local(&projection.root),
+            value,
         ))
     }
 
@@ -281,21 +311,39 @@ impl<'a> RustValues<'a> {
             .expect("checked mut-place projection");
         self.mut_place_projected_region(
             &projection,
+            &target::mut_place_reborrow(&projection.root),
             "",
             &self.place_value_from_access(place.ty, "__anv_place"),
         )
     }
 
-    fn collection_replace_ty(&self, ty: RirTypeId) -> bool {
-        matches!(
-            self.program.types[ty.index()],
-            RirType::List(_) | RirType::Map { .. }
+    fn projected_set_region(
+        &self,
+        projection: &MutPlaceProjection,
+        root_place: &str,
+        value: &str,
+    ) -> String {
+        let set = if self.program.collection_replace_ty(projection.slot_ty) {
+            target::mut_place_replace_collection(
+                "__anv_place",
+                target::runtime_param_name(),
+                "__anv_value",
+            )
+        } else {
+            target::mut_place_set("__anv_place", target::runtime_param_name(), "__anv_value")
+        };
+        self.mut_place_projected_region(
+            projection,
+            root_place,
+            &format!("let __anv_value = {value};"),
+            &set,
         )
     }
 
     fn mut_place_projected_region(
         &self,
         projection: &MutPlaceProjection,
+        root_place: &str,
         before_place: &str,
         body: &str,
     ) -> String {
@@ -305,10 +353,7 @@ impl<'a> RustValues<'a> {
             descriptor.struct_decl,
             descriptor.impl_decl,
             descriptor.ctor,
-            target::mut_place_projected(
-                &target::mut_place_reborrow(&projection.root),
-                "&__anv_ops"
-            ),
+            target::mut_place_projected(root_place, "&__anv_ops"),
         )
     }
 
@@ -318,11 +363,11 @@ impl<'a> RustValues<'a> {
         root_ty: RirTypeId,
         root: &str,
         slot_ty: RirTypeId,
-        projections: &[super::rir::RirProjection],
+        projections: &[RirProjection],
     ) -> ProjectedPlaceDescriptor {
         let projection = self
             .places
-            .projected_place(root_ty, root, slot_ty, projections)
+            .projected_mut_place(root_ty, root, slot_ty, projections)
             .expect("verified projected place descriptor");
         self.mut_place_projection_descriptor(ops, &projection)
     }
@@ -364,7 +409,7 @@ impl<'a> RustValues<'a> {
         let access = self.projected_access("root", true, steps);
         let mutate = self.projected_mutate("root", true, steps);
         format!(
-            "impl<'cx> {} for {ops} {{ fn access(&self, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
+            "impl<'cx> {} for {ops} {{ fn access(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
             target::projection_ops_ty(root_ty, slot_ty),
             target::result_ty("()"),
             target::result_ty("()"),
@@ -408,6 +453,7 @@ impl<'a> RustValues<'a> {
                 let body = self.projected_access("value", true, rest);
                 let access = target::list_with_elem_shared_short(
                     expr,
+                    "rt",
                     "index",
                     &format!("self.{version}"),
                     &body,
@@ -416,12 +462,14 @@ impl<'a> RustValues<'a> {
             }
             MutPlaceProjectionStep::SliceIndex { index } => {
                 let body = self.projected_access("value", false, rest);
-                format!("{{ let value = {expr}.elem_at_shared(self.{index})?; {body} }}")
+                format!("{{ let value = {expr}.elem_at_shared(rt, self.{index})?; {body} }}")
             }
             MutPlaceProjectionStep::MapIndex { key, value_ty } => {
                 debug_assert!(rest.is_empty());
-                let value = self.value_from_ref(*value_ty, "value");
-                format!("{{ let value = {expr}.get(&self.{key}).map(|value| {value}); f(&value) }}")
+                let value = self.value_from_place(*value_ty, "value");
+                format!(
+                    "{{ let value = {expr}.get(rt, &self.{key})?.map(|value| {value}); f(&value) }}"
+                )
             }
         }
     }
@@ -459,20 +507,25 @@ impl<'a> RustValues<'a> {
                     "list",
                 );
                 let body = self.projected_mutate("value", true, rest);
-                format!(
-                    "{{ let index = {checked}; {expr}.with_elem_mut_short(index, self.{version}, |value| {{ {body} }}) }}"
-                )
+                let access = target::list_with_elem_owned_mut_short(
+                    expr,
+                    "rt",
+                    "index",
+                    &format!("self.{version}"),
+                    &body,
+                );
+                format!("{{ let index = {checked}; {access} }}")
             }
             MutPlaceProjectionStep::SliceIndex { index } => {
                 let body = self.projected_mutate("value", true, rest);
-                format!("{expr}.with_elem_mut_short(self.{index}, |value| {{ {body} }})")
+                target::slice_with_elem_owned_mut_short(expr, "rt", &format!("self.{index}"), &body)
             }
             MutPlaceProjectionStep::MapIndex { key, value_ty } => {
                 debug_assert!(rest.is_empty());
-                let value = self.value_from_ref(*value_ty, "value");
-                let set = target::map_optional_slot_set(expr, &format!("self.{key}"), "slot");
+                let value = self.value_from_place(*value_ty, "value");
+                let set = target::map_optional_slot_set(expr, "rt", &format!("self.{key}"), "slot");
                 format!(
-                    "{{ let mut slot = {expr}.get(&self.{key}).map(|value| {value}); f(&mut slot)?; {set} }}"
+                    "{{ let mut slot = {expr}.get(rt, &self.{key})?.map(|value| {value}); f(&mut slot)?; {set} }}"
                 )
             }
         }

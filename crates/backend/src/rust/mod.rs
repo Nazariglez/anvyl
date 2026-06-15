@@ -38,22 +38,22 @@ use self::{
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellRef, RirCellStorage,
-        RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirConst, RirConstId,
-        RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId,
-        RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind,
-        RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign,
-        RirFormatSpec, RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand,
-        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn,
-        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
+        RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
+        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
+        RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam,
+        RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
+        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -197,6 +197,8 @@ pub enum RustTargetGapKind {
     UnsupportedMutablePlaceProjection,
     UnsupportedMutablePlaceDataRef,
     UnsupportedMutablePlaceNativeBoundary,
+    UnsupportedMapKey,
+    UnsupportedMapValue,
 }
 
 impl fmt::Display for RustTargetGap {
@@ -295,6 +297,8 @@ impl From<RustBackendProfileError> for RustTargetGap {
                 ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary => {
                     RustTargetGapKind::UnsupportedMutablePlaceNativeBoundary
                 }
+                ProfileErrorKind::UnsupportedMapKey => RustTargetGapKind::UnsupportedMapKey,
+                ProfileErrorKind::UnsupportedMapValue => RustTargetGapKind::UnsupportedMapValue,
                 ProfileErrorKind::NonCopyValueRequired => RustTargetGapKind::NonCopyValueRequired,
             },
         }
@@ -441,6 +445,7 @@ impl<'a> PlanCx<'a> {
             ..RirProgram::default()
         };
         self.plan_types(&mut program)?;
+        self.plan_collection_storages(&mut program);
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
@@ -460,6 +465,31 @@ impl<'a> PlanCx<'a> {
         }
         program.entry = self.air.entry().map(|entry| self.function_map[&entry]);
         Ok(program)
+    }
+
+    fn plan_collection_storages(&self, program: &mut RirProgram) {
+        for (index, ty) in program.types.iter().enumerate() {
+            let (kind, prefix) = match ty {
+                RirType::List(elem_ty) => {
+                    (RirCollectionStorageKind::List { elem_ty: *elem_ty }, "list")
+                }
+                RirType::Map { key, value } => (
+                    RirCollectionStorageKind::Map {
+                        key_ty: *key,
+                        value_ty: *value,
+                    },
+                    "map",
+                ),
+                _ => continue,
+            };
+            let id = RirCollectionStorageId::from_index(program.collection_storages.len());
+            program.collection_storages.push(RirCollectionStorage {
+                id,
+                value_ty: RirTypeId::from_index(index),
+                kind,
+                symbol: RirSymbol::new(format!("{prefix}_storage{index}")),
+            });
+        }
     }
 
     fn plan_types(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
