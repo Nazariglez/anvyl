@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: not keyable
+
+enum Box<T> {
+    Item(T),
+}
+
+fn main() {
+    let key = Box.Item(Box.Item(1.0));
+    let m = [key: 1];
+}

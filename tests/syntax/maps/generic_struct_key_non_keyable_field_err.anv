@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: not keyable
+// @contains: field 'value'
+
+struct Box<T> {
+    value: T,
+}
+
+fn main() {
+    let key = Box { value: Box { value: 1.0 } };
+    let m = [key: 1];
+}

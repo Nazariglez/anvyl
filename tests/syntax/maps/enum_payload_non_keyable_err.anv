@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: not keyable
+
+enum BadKey {
+    Weight(float),
+}
+
+fn main() {
+    let k = BadKey.Weight(1.5);
+    let m = [k: "bad"];
+}

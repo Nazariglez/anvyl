@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cannot be used as map key
+
+dataref Node {
+    value: int,
+}
+
+fn main() {
+    let n = Node { value: 1 };
+    let m = [n: "node"];
+}

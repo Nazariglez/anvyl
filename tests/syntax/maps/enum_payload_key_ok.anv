@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+enum Token {
+    Int(int),
+    Name(string),
+    Pair((int, bool)),
+}
+
+fn main() {
+    let a = Token.Int(1);
+    let b = Token.Name("x");
+    let m = [a: 10, b: 20];
+}

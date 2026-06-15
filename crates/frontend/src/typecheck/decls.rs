@@ -3998,11 +3998,7 @@ impl DeclarationIndex {
         self.map_key_error_inner(ty, &mut HashSet::new())
     }
 
-    fn map_key_error_inner(
-        &self,
-        ty: &Type,
-        seen: &mut HashSet<NominalKey>,
-    ) -> Option<MapKeyError> {
+    fn map_key_error_inner(&self, ty: &Type, seen: &mut HashSet<Type>) -> Option<MapKeyError> {
         if self.semantic_option_inner(ty).is_some() {
             return Some(MapKeyError {
                 ty: ty.clone(),
@@ -4039,37 +4035,70 @@ impl DeclarationIndex {
         }
     }
 
-    fn nominal_map_key_error(
-        &self,
-        ty: &Type,
-        seen: &mut HashSet<NominalKey>,
-    ) -> Option<MapKeyError> {
+    fn nominal_map_key_error(&self, ty: &Type, seen: &mut HashSet<Type>) -> Option<MapKeyError> {
         let key = self.key_for_type(ty)?;
-        match key.kind {
-            NominalKind::Enum => None,
-            NominalKind::Extern => Some(MapKeyError {
+        if !seen.insert(ty.clone()) {
+            return None;
+        }
+        let err = match key.kind {
+            NominalKind::Struct => self.struct_map_key_error(ty, &key, seen),
+            NominalKind::Enum => self.enum_map_key_error(ty, &key, seen),
+            NominalKind::DataRef | NominalKind::Extern => Some(MapKeyError {
                 ty: ty.clone(),
                 field: None,
             }),
-            NominalKind::Struct | NominalKind::DataRef => {
-                if !seen.insert(key.clone()) {
-                    return None;
-                }
-                let agg = self.aggregate(&key)?;
-                for (name, field) in agg.fields.iter() {
-                    let field_ty = substitute_aggregate_member(ty, &agg.generics, &field.ty);
-                    if let Some(err) = self.map_key_error_inner(&field_ty, seen) {
-                        seen.remove(&key);
-                        return Some(MapKeyError {
-                            ty: err.ty,
-                            field: Some(name),
-                        });
-                    }
-                }
-                seen.remove(&key);
-                None
-            }
+        };
+        seen.remove(ty);
+        err
+    }
+
+    fn struct_map_key_error(
+        &self,
+        ty: &Type,
+        key: &NominalKey,
+        seen: &mut HashSet<Type>,
+    ) -> Option<MapKeyError> {
+        let agg = self.aggregate(key)?;
+        agg.fields.iter().find_map(|(name, field)| {
+            self.member_map_key_error(ty, &agg.generics, &field.ty, Some(name), seen)
+        })
+    }
+
+    fn enum_map_key_error(
+        &self,
+        ty: &Type,
+        key: &NominalKey,
+        seen: &mut HashSet<Type>,
+    ) -> Option<MapKeyError> {
+        let schema = self.enum_schema(key)?;
+        schema
+            .variants
+            .values()
+            .find_map(|variant| match &variant.payload {
+                VariantPayload::Unit => None,
+                VariantPayload::Tuple(fields) => fields.iter().find_map(|field_ty| {
+                    self.member_map_key_error(ty, &schema.generics, field_ty, None, seen)
+                }),
+                VariantPayload::Struct(fields) => fields.iter().find_map(|(name, field)| {
+                    self.member_map_key_error(ty, &schema.generics, &field.ty, Some(name), seen)
+                }),
+            })
+    }
+
+    fn member_map_key_error(
+        &self,
+        owner: &Type,
+        generics: &GenericParams,
+        ty: &Type,
+        field: Option<Ident>,
+        seen: &mut HashSet<Type>,
+    ) -> Option<MapKeyError> {
+        let ty = substitute_aggregate_member(owner, generics, ty);
+        let mut err = self.map_key_error_inner(&ty, seen)?;
+        if field.is_some() {
+            err.field = field;
         }
+        Some(err)
     }
 
     pub(crate) fn core_option_key(&self) -> Option<NominalKey> {
