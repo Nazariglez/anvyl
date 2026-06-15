@@ -1,0 +1,20 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// 3
+// @match-end
+
+fn make_pair() -> (int, bool) {
+    println("init");
+    (1, true)
+}
+
+lazy var state = make_pair();
+
+fn main() {
+    state.0 = 3;
+    let local = state;
+    println(local.0);
+}

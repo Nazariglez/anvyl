@@ -47,13 +47,14 @@ use self::{
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceRoot, RirNativeExtern, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
-        RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLoop, RirLoopId, RirMutPlaceArg, RirMutPlaceRoot, RirNativeExtern, RirOperand,
+        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
 };
 
@@ -1818,6 +1819,26 @@ impl<'a> PlanCx<'a> {
         Ok(RirStructuredBlock { stmts, term })
     }
 
+    fn plan_global_root_value(
+        &self,
+        function: FunctionId,
+        global: GlobalId,
+        value: &RValue,
+        locals: &mut Vec<RirLocal>,
+        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+    ) -> Result<(Vec<RirStmt>, RirRValue), RustPlanError> {
+        let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+        let mut stmts = planned.stmts;
+        let value = RirRValue::Use(self.rvalue_short_region_operand(
+            function,
+            planned.value,
+            self.air.globals[global.index()].ty,
+            locals,
+            &mut stmts,
+        ));
+        Ok((stmts, value))
+    }
+
     fn plan_air_stmt(
         &self,
         function: FunctionId,
@@ -1883,16 +1904,18 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedGlobalRooting,
                     ));
                 }
-                let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
-                let mut stmts = planned.stmts;
-                let value = RirRValue::Use(self.rvalue_short_region_operand(
-                    function,
-                    planned.value,
-                    self.air.globals[global.index()].ty,
-                    locals,
-                    &mut stmts,
-                ));
+                let (mut stmts, value) =
+                    self.plan_global_root_value(function, *global, value, locals, lambda_values)?;
                 stmts.push(RirStmt::GlobalSetRoot {
+                    global: self.global_map[global],
+                    value,
+                });
+                Ok(stmts)
+            }
+            air::AirStmt::GlobalUpdateRoot { global, value } => {
+                let (mut stmts, value) =
+                    self.plan_global_root_value(function, *global, value, locals, lambda_values)?;
+                stmts.push(RirStmt::GlobalUpdateRoot {
                     global: self.global_map[global],
                     value,
                 });
@@ -2658,6 +2681,11 @@ impl<'a> PlanCx<'a> {
                 ));
             }
         }
+        if matches!(place.root, air::PlaceRoot::Global(_)) && place.projection.is_empty() {
+            return Ok(PlannedRValue::from_value(RirRValue::Use(
+                self.plan_operand(function, operand),
+            )));
+        }
         let TypeData::Aggregate(aggregate) = self.air.type_arena.data(place.ty) else {
             return Ok(PlannedRValue::from_value(RirRValue::Use(
                 self.plan_operand(function, operand),
@@ -3183,6 +3211,11 @@ impl<'a> PlanCx<'a> {
                     arg: RirCallArg::Value(planned.operand),
                 })
             }
+            CallArg::SharedBorrow(place) if matches!(place.root, air::PlaceRoot::Global(_)) => {
+                Ok(PlannedCallArg::from_arg(RirCallArg::SharedBorrow(
+                    self.plan_place_in_function(function, place),
+                )))
+            }
             CallArg::SharedBorrow(place) => {
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(place) = planned.operand else {
@@ -3446,10 +3479,27 @@ impl<'a> PlanCx<'a> {
             } else {
                 value
             };
-            stmts.push(RirStmt::Assign {
-                dst: self.plan_place_in_function(function, place),
-                value,
-            });
+            if let air::PlaceRoot::Global(global) = place.root
+                && !place.projection.is_empty()
+            {
+                let global_decl = &self.air.globals[global.index()];
+                stmts.push(RirStmt::MutPlaceSet {
+                    place: RirMutPlaceArg::projected(
+                        RirMutPlaceRoot::Global {
+                            global: self.global_map[&global],
+                            ty: self.type_map[&global_decl.ty],
+                        },
+                        place.projection.iter().map(Self::rir_projection).collect(),
+                        self.type_map[&place.ty],
+                    ),
+                    value,
+                });
+            } else {
+                stmts.push(RirStmt::Assign {
+                    dst: self.plan_place_in_function(function, place),
+                    value,
+                });
+            }
             return Ok(());
         }
         let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);

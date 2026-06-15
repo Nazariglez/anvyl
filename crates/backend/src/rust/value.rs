@@ -1,6 +1,6 @@
 use super::{
     place::{MutPlaceProjection, MutPlaceProjectionStep, RustPlaces, projected_ops_ctor},
-    rep_policy::{RustBorrowView, RustRepPolicy},
+    rep_policy::{RustBorrowView, RustMaterialization, RustRepPolicy},
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
         RirGlobalId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace,
@@ -55,14 +55,39 @@ impl<'a> RustValues<'a> {
 
     pub(super) fn borrow_arg(&self, place: &RirPlace) -> String {
         let place_expr = self.places.local_place(place);
-        let borrowed_root = self.places.shared_borrow_root_param(place);
-        match self.policy.borrow_view(place.ty) {
-            RustBorrowView::Ref if borrowed_root => place_expr,
-            RustBorrowView::Ref => format!("&{place_expr}"),
-            RustBorrowView::Str | RustBorrowView::Slice if borrowed_root => place_expr,
-            RustBorrowView::Str => format!("{place_expr}.as_str()"),
-            RustBorrowView::Slice => format!("&{place_expr}"),
-            RustBorrowView::TargetGap => place_expr,
+        self.borrow_expr(
+            place.ty,
+            &place_expr,
+            self.places.shared_borrow_root_param(place),
+        )
+    }
+
+    pub(super) fn global_slot_expr(program: &RirProgram, global: RirGlobalId) -> String {
+        let global = &program.globals[global.index()];
+        target::global_slot_field(target::globals_param_name(), global.slot_symbol.as_str())
+    }
+
+    pub(super) fn global_init_call(program: &RirProgram, global: RirGlobalId) -> String {
+        let global = &program.globals[global.index()];
+        target::generated_call(program.functions[global.init.index()].symbol.as_str(), [])
+    }
+
+    pub(super) fn global_value_binding(&self, global: RirGlobalId, tmp: &str) -> String {
+        format!("let {tmp} = {};", self.global_read(global))
+    }
+
+    pub(super) fn borrow_temp_arg(&self, ty: RirTypeId, tmp: &str) -> String {
+        self.borrow_expr(ty, tmp, false)
+    }
+
+    fn borrow_expr(&self, ty: RirTypeId, expr: &str, borrowed_root: bool) -> String {
+        match self.policy.borrow_view(ty) {
+            RustBorrowView::Ref if borrowed_root => expr.to_string(),
+            RustBorrowView::Ref => format!("&{expr}"),
+            RustBorrowView::Str | RustBorrowView::Slice if borrowed_root => expr.to_string(),
+            RustBorrowView::Str => format!("{expr}.as_str()"),
+            RustBorrowView::Slice => format!("&{expr}"),
+            RustBorrowView::TargetGap => expr.to_string(),
         }
     }
 
@@ -102,6 +127,13 @@ impl<'a> RustValues<'a> {
                 };
                 Some((*ty, target::mut_place_scoped_cell(&cell)))
             }
+            RirMutPlaceRoot::Global { global, ty } => Some((
+                *ty,
+                target::mut_place_global(
+                    &Self::global_slot_expr(self.program, *global),
+                    &Self::global_init_call(self.program, *global),
+                ),
+            )),
             RirMutPlaceRoot::DataRef { .. } => None,
         }
     }
@@ -160,18 +192,20 @@ impl<'a> RustValues<'a> {
             return value;
         }
         let place_expr = self.place(place);
-        if self.policy.cow_value(place.ty) {
-            if self.places.shared_borrow_root_param(place)
-                && matches!(self.program.types[place.ty.index()], RirType::String)
+        match self.policy.materialization(place.ty) {
+            RustMaterialization::Copy => self.operand(operand),
+            RustMaterialization::Share
+                if self.places.shared_borrow_root_param(place)
+                    && matches!(self.program.types[place.ty.index()], RirType::String) =>
             {
-                return target::anv_string_from(&place_expr);
+                target::anv_string_from(&place_expr)
             }
-            return format!("{place_expr}.share()");
+            RustMaterialization::Share
+            | RustMaterialization::CloneHandle
+            | RustMaterialization::CloneLambda
+            | RustMaterialization::BorrowGuard => self.value_from_place(place.ty, &place_expr),
+            RustMaterialization::Gap => unreachable!("verified materializable value operand"),
         }
-        if !self.policy.copyable(place.ty) && self.policy.shareable_value(place.ty) {
-            return self.value_from_place(place.ty, &place_expr);
-        }
-        self.operand(operand)
     }
 
     pub(super) fn operand_ty(&self, operand: &RirOperand) -> RirTypeId {
@@ -210,7 +244,7 @@ impl<'a> RustValues<'a> {
                     _ => self.place(place),
                 }
             }
-            RirOperand::Const(id) => self.const_value(&self.program.consts[id.index()]),
+            RirOperand::Const(id) => Self::const_value(&self.program.consts[id.index()]),
         }
     }
 
@@ -233,17 +267,13 @@ impl<'a> RustValues<'a> {
     }
 
     fn global_read(&self, global: RirGlobalId) -> String {
-        let global = &self.program.globals[global.index()];
-        let slot =
-            target::global_slot_field(target::globals_param_name(), global.slot_symbol.as_str());
-        let init = target::generated_call(
-            self.program.functions[global.init.index()].symbol.as_str(),
-            [],
+        let read = target::global_read(
+            &Self::global_slot_expr(self.program, global),
+            &Self::global_init_call(self.program, global),
         );
-        let read = target::global_read(&slot, &init);
         block_expr(
             [format!("let __global = {read};")],
-            Some("*__global".to_string()),
+            Some(self.value_from_ref(self.program.globals[global.index()].ty, "&*__global")),
         )
     }
 
@@ -541,34 +571,101 @@ impl<'a> RustValues<'a> {
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
         let runtime = target::runtime_param_name();
-        if self.policy.cow_value(ty) {
-            return target::mut_place_access(expr, runtime, "Ok(value.share())");
+        match self.policy.materialization(ty) {
+            RustMaterialization::Copy => target::mut_place_get_copy(expr, runtime),
+            RustMaterialization::Share
+            | RustMaterialization::CloneHandle
+            | RustMaterialization::CloneLambda
+            | RustMaterialization::BorrowGuard => {
+                let value = self.value_from_ref(ty, "value");
+                target::mut_place_access(expr, runtime, &format!("Ok({value})"))
+            }
+            RustMaterialization::Gap => {
+                unreachable!("verified materializable mutable-place access")
+            }
         }
-        if !self.policy.copyable(ty) && self.policy.shareable_value(ty) {
-            let value = self.value_from_ref(ty, "value");
-            return target::mut_place_access(expr, runtime, &format!("Ok({value})"));
-        }
-        target::mut_place_get_copy(expr, runtime)
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
-        self.copy_from_ref(ty, expr)
+        match self.policy.materialization(ty) {
+            RustMaterialization::Copy => self.copy_from_ref(ty, expr),
+            RustMaterialization::Share => self.share_from_ref(ty, expr),
+            RustMaterialization::CloneHandle => format!("(*({expr})).clone()"),
+            RustMaterialization::CloneLambda => format!("({expr}).clone()"),
+            RustMaterialization::BorrowGuard => self.borrow_guard_from_ref(ty, expr),
+            RustMaterialization::Gap => unreachable!("verified materializable value"),
+        }
     }
 
     pub(super) fn value_from_place(&self, ty: RirTypeId, expr: &str) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
-            RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
-            RirType::DataRef(_) => format!("{expr}.clone()"),
-            RirType::Slice(_) => format!("{expr}.readonly()"),
-            RirType::Lambda(sig) if !self.policy.lambda_sig_copyable(sig) => {
+        match self.policy.materialization(ty) {
+            RustMaterialization::Copy => match self.program.types[ty.index()] {
+                RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
+                _ => self.copy_from_ref(ty, &format!("&{expr}")),
+            },
+            RustMaterialization::Share => self.share_from_place(ty, expr),
+            RustMaterialization::CloneHandle | RustMaterialization::CloneLambda => {
                 format!("{expr}.clone()")
             }
-            RirType::Struct(_) | RirType::Tuple(_) | RirType::Array { .. } | RirType::Enum(_) => {
-                self.copy_from_ref(ty, &format!("&{expr}"))
+            RustMaterialization::BorrowGuard => self.borrow_guard_from_place(ty, expr),
+            RustMaterialization::Gap => unreachable!("verified materializable value"),
+        }
+    }
+
+    fn share_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::String | RirType::List(_) | RirType::Map { .. } => {
+                format!("(*({expr})).share()")
             }
-            RirType::Option(_) => self.copy_from_ref(ty, &format!("&{expr}")),
-            RirType::Lambda(_) | RirType::Void => unreachable!("verified dataref field value"),
+            RirType::Option(inner) => format!(
+                "({expr}).as_ref().map(|value| {})",
+                self.value_from_ref(inner, "value")
+            ),
+            RirType::Array { elem, len } => {
+                let elems = comma(
+                    (0..len).map(|index| self.value_from_ref(elem, &format!("&({expr})[{index}]"))),
+                );
+                format!("[{elems}]")
+            }
+            RirType::Struct(id) => {
+                let strukt = &self.program.structs[id.index()];
+                self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)
+            }
+            RirType::Tuple(id) => {
+                let tuple = &self.program.tuples[id.index()];
+                self.copy_record_from_ref(tuple.symbol.as_str(), &tuple.fields, expr)
+            }
+            RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
+                format!("match *({expr}) {{}}")
+            }
+            RirType::Enum(_) => self.copy_enum_ref_expr(expr, ty),
+            _ => unreachable!("verified shareable value"),
+        }
+    }
+
+    fn share_from_place(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::String | RirType::List(_) | RirType::Map { .. } => format!("{expr}.share()"),
+            RirType::Option(_)
+            | RirType::Array { .. }
+            | RirType::Struct(_)
+            | RirType::Tuple(_)
+            | RirType::Enum(_) => self.share_from_ref(ty, &format!("&{expr}")),
+            _ => unreachable!("verified shareable value"),
+        }
+    }
+
+    fn borrow_guard_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::Slice(_) => format!("(*({expr})).readonly()"),
+            _ => unreachable!("verified borrow-guard materialization"),
+        }
+    }
+
+    fn borrow_guard_from_place(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::Slice(_) => format!("{expr}.readonly()"),
+            _ => unreachable!("verified borrow-guard materialization"),
         }
     }
 
@@ -579,7 +676,7 @@ impl<'a> RustValues<'a> {
         call: String,
     ) -> String {
         match abi {
-            anvyx_runtime::RustReturnAbi::Value(ty) => self.native_value_return(ty, &call),
+            anvyx_runtime::RustReturnAbi::Value(ty) => Self::native_value_return(ty, &call),
             anvyx_runtime::RustReturnAbi::Option(inner) => {
                 self.option_return_call(ret, inner, call)
             }
@@ -611,7 +708,7 @@ impl<'a> RustValues<'a> {
                 let konst = &self.program.consts[id.index()];
                 match &konst.value {
                     RirConstValue::String(value) => rust_string(value),
-                    _ => format!("{}.as_str()", self.const_value(konst)),
+                    _ => format!("{}.as_str()", Self::const_value(konst)),
                 }
             }
             RirOperand::Place(place) => self.borrow_arg(place),
@@ -626,7 +723,7 @@ impl<'a> RustValues<'a> {
         }
     }
 
-    pub(super) fn const_value(&self, konst: &RirConst) -> String {
+    pub(super) fn const_value(konst: &RirConst) -> String {
         match &konst.value {
             RirConstValue::Int(value) => value.to_string(),
             RirConstValue::Float(value) => {
@@ -653,7 +750,7 @@ impl<'a> RustValues<'a> {
             unreachable!("verified native option return type")
         };
         let value = match inner {
-            anvyx_runtime::RustReturnAbi::Value(ty) => self.native_value_return(ty, "value"),
+            anvyx_runtime::RustReturnAbi::Value(ty) => Self::native_value_return(ty, "value"),
             _ => unreachable!("verified native option return inner"),
         };
         match_expr(
@@ -665,7 +762,7 @@ impl<'a> RustValues<'a> {
         )
     }
 
-    fn native_value_return(&self, ty: &anvyx_runtime::ExternTypeExpr, expr: &str) -> String {
+    fn native_value_return(ty: &anvyx_runtime::ExternTypeExpr, expr: &str) -> String {
         match ty {
             anvyx_runtime::ExternTypeExpr::String => target::anv_string_from(expr),
             _ => expr.to_string(),
@@ -771,10 +868,7 @@ impl<'a> RustValues<'a> {
         match self.program.types[ty.index()] {
             RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
             RirType::Lambda(sig) if self.policy.lambda_sig_copyable(sig) => format!("*({expr})"),
-            RirType::Lambda(sig) if self.policy.lambda_sig_cloneable(sig) => {
-                format!("({expr}).clone()")
-            }
-            RirType::Lambda(_) => unreachable!("verified cloneable lambda value"),
+            RirType::Lambda(_) => unreachable!("verified copyable lambda value"),
             RirType::Struct(id) => {
                 let strukt = &self.program.structs[id.index()];
                 self.copy_record_from_ref(strukt.symbol.as_str(), &strukt.fields, expr)
@@ -797,12 +891,12 @@ impl<'a> RustValues<'a> {
                 "({expr}).as_ref().map(|value| {})",
                 self.value_from_ref(inner, "value")
             ),
-            RirType::DataRef(_) => format!("(*({expr})).clone()"),
-            RirType::String | RirType::List(_) | RirType::Map { .. } => {
-                format!("(*({expr})).share()")
-            }
-            RirType::Slice(_) => format!("(*({expr})).readonly()"),
-            RirType::Void => unreachable!("verified copy enum payload"),
+            RirType::DataRef(_)
+            | RirType::String
+            | RirType::List(_)
+            | RirType::Map { .. }
+            | RirType::Slice(_)
+            | RirType::Void => unreachable!("verified copyable value"),
         }
     }
 
@@ -815,5 +909,131 @@ impl<'a> RustValues<'a> {
             )
         });
         struct_lit(symbol, fields)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rust::rir::{
+        RirFieldId, RirFunctionId, RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaSig,
+        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirReturn, RirStruct, RirStructId,
+        RirSymbol, RirTuple, RirTupleId,
+    };
+
+    fn field(id: usize, symbol: &str, ty: RirTypeId) -> RirField {
+        RirField {
+            id: RirFieldId::from_index(id),
+            symbol: RirSymbol::new(symbol),
+            ty,
+        }
+    }
+
+    #[test]
+    fn materializes_values_through_policy_classes() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Int);
+        let string = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::String);
+        let list = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::List(int));
+        let map = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Map {
+            key: int,
+            value: string,
+        });
+        let node = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::DataRef(
+            crate::rust::rir::RirDataRefId::from_index(0),
+        ));
+        program.datarefs.push(crate::rust::rir::RirDataRef {
+            id: crate::rust::rir::RirDataRefId::from_index(0),
+            air_id: anvyx_frontend::air::AggregateId::from_index(0),
+            symbol: RirSymbol::new("Node"),
+            display: RirSymbol::new("Node"),
+            cycle_capable: true,
+            fields: vec![field(0, "value", int)],
+        });
+        let label = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Struct(RirStructId::from_index(0)));
+        program.structs.push(RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Label"),
+            display: RirSymbol::new("Label"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![field(0, "text", string)],
+        });
+        let pair = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Tuple(RirTupleId::from_index(0)));
+        program.tuples.push(RirTuple {
+            id: RirTupleId::from_index(0),
+            symbol: RirSymbol::new("Pair"),
+            display: RirSymbol::new("Pair"),
+            fields: vec![field(0, "a", int), field(1, "b", int)],
+            copyable: true,
+        });
+        let maybe_node = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Option(node));
+        let slice = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Slice(int));
+        let lambda_sig = RirLambdaSigId::from_index(0);
+        let lambda = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Lambda(lambda_sig));
+        program.lambda_sigs.push(RirLambdaSig {
+            id: lambda_sig,
+            params: vec![],
+            ret: int,
+        });
+        program.lambdas.push(crate::rust::rir::RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Function(anvyx_frontend::air::FunctionId::from_index(0)),
+            function: RirFunctionId::from_index(0),
+            sig: lambda_sig,
+            escape: RirLambdaEscape::Escaping,
+            storage: RirLambdaStorage::HeapEnv {
+                env: RirLambdaEnvId::from_index(0),
+            },
+            captures: vec![],
+        });
+        let function = RirFunction {
+            id: RirFunctionId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("f"),
+            params: vec![],
+            ret: RirReturn { ty: int },
+            locals: vec![],
+            body: crate::rust::rir::RirStructuredBlock::default(),
+        };
+        let values = RustValues::new(&program, &function);
+
+        assert_eq!(values.value_from_ref(int, "x"), "*(x)");
+        assert_eq!(values.value_from_place(int, "x"), "x");
+        assert_eq!(values.value_from_ref(string, "x"), "(*(x)).share()");
+        assert_eq!(values.value_from_place(string, "x"), "x.share()");
+        assert_eq!(values.value_from_ref(list, "x"), "(*(x)).share()");
+        assert_eq!(values.value_from_place(map, "x"), "x.share()");
+        assert_eq!(values.value_from_ref(node, "x"), "(*(x)).clone()");
+        assert_eq!(values.value_from_place(node, "x"), "x.clone()");
+        assert!(
+            values
+                .value_from_ref(label, "x")
+                .contains("text: (*(&(x).text)).share()")
+        );
+        assert_eq!(
+            values.value_from_ref(maybe_node, "x"),
+            "(x).as_ref().map(|value| (*(value)).clone())"
+        );
+        assert!(values.value_from_ref(pair, "x").contains("a: *(&(x).a)"));
+        assert_eq!(values.value_from_ref(slice, "x"), "(*(x)).readonly()");
+        assert_eq!(values.value_from_place(slice, "x"), "x.readonly()");
+        assert_eq!(values.value_from_ref(lambda, "x"), "(x).clone()");
     }
 }

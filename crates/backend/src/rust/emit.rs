@@ -7,11 +7,11 @@ use super::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirCollectionLoanScope,
         RirCollectionRootKind, RirCollectionStorageKind, RirEnum, RirEnumMatch, RirEnumRepr,
         RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirGlobal, RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
-        RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot,
-        RirOperand, RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
+        RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
+        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMutPlaceRoot, RirOperand,
+        RirOptionMatch, RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
         RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
         VerifiedRirProgram,
     },
@@ -1062,7 +1062,13 @@ impl EmitCx<'_> {
         }
     }
 
-    fn emit_stmt_mode(&mut self, function: &RirFunction, stmt: &RirStmt, predeclared: bool) {
+    fn emit_stmt_mode(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        stmt: &RirStmt,
+        predeclared: bool,
+    ) {
         match stmt {
             RirStmt::Init { local, value } => {
                 let local_data = &function.locals[local.index()];
@@ -1085,22 +1091,52 @@ impl EmitCx<'_> {
                 }
             }
             RirStmt::GlobalEnsure { global } => {
-                let global = &self.program.globals[global.index()];
                 self.w.line(format_args!(
                     "{};",
                     target::global_ensure(
-                        &self.global_slot_expr(global),
-                        &self.global_init_call(global.init),
+                        &RustValues::global_slot_expr(self.program, *global),
+                        &RustValues::global_init_call(self.program, *global),
                     )
                 ));
             }
-            RirStmt::GlobalSetRoot { global, value } => {
-                let global = &self.program.globals[global.index()];
+            RirStmt::GlobalSetRoot { global, value }
+            | RirStmt::GlobalUpdateRoot { global, value } => {
                 let value = self.rvalue(function, value);
                 self.w.line(format_args!(
                     "{};",
-                    target::global_set_without_init(&self.global_slot_expr(global), &value)
+                    target::global_set_without_init(
+                        &RustValues::global_slot_expr(self.program, *global),
+                        &value,
+                    )
                 ));
+            }
+            RirStmt::MutPlaceSet { place, value } => {
+                let values = RustValues::new(self.program, function);
+                let (root_ty, root) = values
+                    .mut_place_root_arg(&place.root)
+                    .expect("verified mutable-place set root");
+                let slot_ty = place.ty;
+                let value_tmp = format!("__anv_value_{index}");
+                let value = self.rvalue(function, value);
+                self.w.line(format_args!("let {value_tmp} = {value};"));
+                let (mut prelude, place) = if place.projections.is_empty() {
+                    (vec![], root)
+                } else {
+                    self.prepared_projected_call_arg(function, index, place, root_ty, &root)
+                };
+                for line in prelude.drain(..) {
+                    self.w.line(format_args!("{line}"));
+                }
+                let set = if self.program.collection_replace_ty(slot_ty) {
+                    target::mut_place_replace_collection(
+                        &place,
+                        target::runtime_param_name(),
+                        &value_tmp,
+                    )
+                } else {
+                    target::mut_place_set(&place, target::runtime_param_name(), &value_tmp)
+                };
+                self.w.line(format_args!("{set};"));
             }
             RirStmt::Assign { dst, value } => {
                 let places = RustPlaces::new(self.program, function);
@@ -1193,14 +1229,6 @@ impl EmitCx<'_> {
                 self.emit_option_match(function, match_, predeclared);
             }
         }
-    }
-
-    fn global_slot_expr(&self, global: &RirGlobal) -> String {
-        target::global_slot_field(target::globals_param_name(), global.slot_symbol.as_str())
-    }
-
-    fn global_init_call(&self, init: super::rir::RirFunctionId) -> String {
-        target::generated_call(self.program.functions[init.index()].symbol.as_str(), [])
     }
 
     fn emit_loop(&mut self, function: &RirFunction, loop_: &RirLoop, predeclared: bool) {
@@ -1394,7 +1422,7 @@ impl EmitCx<'_> {
         predeclared: bool,
     ) {
         for (index, stmt) in block.stmts.iter().enumerate() {
-            self.emit_stmt_mode(function, stmt, predeclared);
+            self.emit_stmt_mode(function, index, stmt, predeclared);
             for local in self.slice_call_arg_drops(&block.stmts, index) {
                 self.w.line(format_args!(
                     "drop({});",
@@ -2113,6 +2141,15 @@ impl EmitCx<'_> {
                 tmp,
             );
         }
+        if let RirCallArg::SharedBorrow(place) = arg
+            && let RirPlaceRoot::Global(global) = place.root
+        {
+            let tmp = format!("__anv_global_borrow_{index}");
+            return (
+                vec![values.global_value_binding(global, &tmp)],
+                values.borrow_temp_arg(place.ty, &tmp),
+            );
+        }
         let RirCallArg::MutPlace(mut_place) = arg else {
             return (vec![], values.call_arg(arg));
         };
@@ -2713,6 +2750,8 @@ fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
         RirStmt::Init { value, .. }
         | RirStmt::Assign { value, .. }
         | RirStmt::GlobalSetRoot { value, .. }
+        | RirStmt::GlobalUpdateRoot { value, .. }
+        | RirStmt::MutPlaceSet { value, .. }
         | RirStmt::CellInit { value, .. }
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }

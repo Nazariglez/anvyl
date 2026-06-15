@@ -1,0 +1,8 @@
+// @helper
+
+fn make_names() -> [string] {
+    println("init");
+    ["initial"]
+}
+
+pub lazy var names = make_names();

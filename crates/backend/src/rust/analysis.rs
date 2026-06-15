@@ -52,7 +52,9 @@ fn stmt_calls_fallible(
             rvalue_calls_fallible(program, fallible, function, value)
         }
         RirStmt::GlobalEnsure { .. } => true,
-        RirStmt::GlobalSetRoot { .. } => true,
+        RirStmt::GlobalSetRoot { .. }
+        | RirStmt::GlobalUpdateRoot { .. }
+        | RirStmt::MutPlaceSet { .. } => true,
         RirStmt::Assign { dst, value } => {
             place_is_mut_place_param(function, dst)
                 || place_has_indexed_collection_write(program, function, dst)
@@ -422,8 +424,11 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             rvalue_context_use(program, function, value)
         }
         RirStmt::GlobalEnsure { .. } => ContextUse::generated_call(),
-        RirStmt::GlobalSetRoot { value, .. } => {
+        RirStmt::GlobalSetRoot { value, .. } | RirStmt::GlobalUpdateRoot { value, .. } => {
             ContextUse::globals().union(rvalue_context_use(program, function, value))
+        }
+        RirStmt::MutPlaceSet { value, .. } => {
+            ContextUse::generated_call().union(rvalue_context_use(program, function, value))
         }
         RirStmt::CellInit { cell, value } | RirStmt::CellSet { cell, value } => {
             cell_context_use(program, *cell).union(rvalue_context_use(program, function, value))
@@ -745,6 +750,8 @@ fn stmt_child_blocks_any(
         RirStmt::Init { .. }
         | RirStmt::GlobalEnsure { .. }
         | RirStmt::GlobalSetRoot { .. }
+        | RirStmt::GlobalUpdateRoot { .. }
+        | RirStmt::MutPlaceSet { .. }
         | RirStmt::Assign { .. }
         | RirStmt::CellInit { .. }
         | RirStmt::CellSet { .. }

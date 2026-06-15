@@ -592,6 +592,10 @@ pub(super) fn mut_place_heap_cell(cell: &str) -> String {
     format!("{}::heap_cell({cell}.clone())", mut_place_ty())
 }
 
+pub(super) fn mut_place_global(slot: &str, init: &str) -> String {
+    format!("{}::global(&{slot}, &|rt| {init})", mut_place_ty())
+}
+
 pub(super) fn mut_place_scoped_cell(cell: &str) -> String {
     format!("{}::scoped_cell({cell})", mut_place_ty())
 }
@@ -687,8 +691,8 @@ mod tests {
         checked_range, dataref_place_heap_type_access, dataref_place_heap_type_field,
         dataref_place_ops_ty, erased_handle_ty, generated_call, heap_access_error, heap_register,
         heap_scope, heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
-        mut_place_dataref, mut_place_get_copy, mut_place_heap_cell, mut_place_local,
-        mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        mut_place_dataref, mut_place_get_copy, mut_place_global, mut_place_heap_cell,
+        mut_place_local, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
         mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
         projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
         rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
@@ -838,6 +842,10 @@ mod tests {
         assert_eq!(
             mut_place_heap_cell("cell"),
             "anvyx_runtime::MutPlace::heap_cell(cell.clone())"
+        );
+        assert_eq!(
+            mut_place_global("globals.g", "ginit(rt, types, globals)"),
+            "anvyx_runtime::MutPlace::global(&globals.g, &|rt| ginit(rt, types, globals))"
         );
         assert_eq!(
             mut_place_scoped_cell("&cell"),

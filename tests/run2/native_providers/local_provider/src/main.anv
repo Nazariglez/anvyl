@@ -5,6 +5,7 @@
 // @match-begin
 // 12
 // 5
+// 6
 // 42
 // 10
 // 101
@@ -21,6 +22,8 @@
 import pkg:host.host { host_add, host_len, host_bump, host_apply, host_call0, host_each };
 
 struct Box { value: int }
+
+lazy let title = "global";
 
 fn forward(var value: int) {
     host_bump(value);
@@ -45,6 +48,7 @@ fn make_counter() -> fn(int) -> int {
 fn main() {
     println(host_add(5, 7));
     println(host_len("hello"));
+    println(host_len(title));
     var n = 41;
     host_bump(n);
     println(n);

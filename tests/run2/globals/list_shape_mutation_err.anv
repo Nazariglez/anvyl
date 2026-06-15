@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @stderr-contains: UnsupportedGlobalRooting
+
+lazy var values: [int] = [1];
+
+fn main() {
+    values.push(2);
+}

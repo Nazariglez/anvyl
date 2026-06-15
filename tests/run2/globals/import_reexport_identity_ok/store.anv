@@ -1,0 +1,12 @@
+// @helper
+
+fn make_title() -> string {
+    println("init");
+    "ready"
+}
+
+pub lazy let title = make_title();
+
+pub fn get_title() -> string {
+    title
+}

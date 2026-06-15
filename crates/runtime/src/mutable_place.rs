@@ -1,16 +1,25 @@
 use std::{cell::UnsafeCell, marker::PhantomData, rc::Rc};
 
 use crate::{
-    AnvList, AnvSlice, Ctx, ErasedHandle, Handle, LambdaCell, RuntimeError, StackLambdaCell,
-    heap_access_error, lambda_cell::CellBorrowFlag,
+    AnvList, AnvSlice, Ctx, ErasedHandle, GlobalSlot, Handle, LambdaCell, RuntimeError,
+    StackLambdaCell, heap_access_error, lambda_cell::CellBorrowFlag,
 };
 
 pub enum MutPlace<'place, 'cx, T> {
     Local(&'place mut T, PhantomData<&'cx ()>),
     StackCell(&'place StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
+    Global(GlobalPlace<'place, 'cx, T>),
     Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'place>),
     ScopedCell(&'place ScopedMutPlaceCell<'place, 'cx, T>),
+}
+
+type GlobalInit<'place, 'cx, T> =
+    dyn for<'rt> Fn(&mut Ctx<'cx, 'rt>) -> Result<T, RuntimeError> + 'place;
+
+pub struct GlobalPlace<'place, 'cx, T> {
+    slot: &'place GlobalSlot<T>,
+    init: &'place GlobalInit<'place, 'cx, T>,
 }
 
 pub struct DataRefPlace<'ops, 'cx, T> {
@@ -83,6 +92,7 @@ enum ScopedMutPlaceRoot<'source, 'cx, T> {
     Local(*mut T, PhantomData<&'source mut T>, PhantomData<&'cx ()>),
     StackCell(&'source StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
+    Global(GlobalPlace<'source, 'cx, T>),
     Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'source>),
     ScopedCell(&'source ScopedMutPlaceCell<'source, 'cx, T>),
 }
@@ -203,9 +213,11 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
                 let range = crate::checked_range(start, end, inclusive, list.len());
                 AnvSlice::from_list(list, range.start, range.len())
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
-                Err(non_local_slice_view_error())
-            }
+            Self::StackCell(..)
+            | Self::HeapCell(_)
+            | Self::Global(_)
+            | Self::Projected(_)
+            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
 
@@ -224,9 +236,11 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
                 let range = crate::checked_range(start, end, inclusive, list.len());
                 AnvSlice::from_list_mut(ctx, list, range.start, range.len())
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
-                Err(non_local_slice_view_error())
-            }
+            Self::StackCell(..)
+            | Self::HeapCell(_)
+            | Self::Global(_)
+            | Self::Projected(_)
+            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
 }
@@ -251,9 +265,11 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
                     },
                 )
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
-                Err(non_local_slice_view_error())
-            }
+            Self::StackCell(..)
+            | Self::HeapCell(_)
+            | Self::Global(_)
+            | Self::Projected(_)
+            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
 
@@ -275,15 +291,63 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
                     AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
                 })
             }
-            Self::StackCell(..) | Self::HeapCell(_) | Self::Projected(_) | Self::ScopedCell(_) => {
-                Err(non_local_slice_view_error())
-            }
+            Self::StackCell(..)
+            | Self::HeapCell(_)
+            | Self::Global(_)
+            | Self::Projected(_)
+            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
 }
 
 fn non_local_slice_view_error() -> RuntimeError {
     RuntimeError::new("slice view over non-local mutable collection parameter is unsupported")
+}
+
+impl<T> Copy for GlobalPlace<'_, '_, T> {}
+
+impl<T> Clone for GlobalPlace<'_, '_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'cx, T: 'cx> GlobalPlace<'_, 'cx, T> {
+    fn access<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let value = self.slot.read(|| (self.init)(ctx))?;
+        f(&value)
+    }
+
+    fn mutate<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let mut value = self.slot.write(|| (self.init)(ctx))?;
+        f(&mut value)
+    }
+
+    fn access_with_ctx<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
+        self.access(ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
+    }
+
+    fn mutate_with_ctx<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
+        self.mutate(ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
+    }
 }
 
 impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
@@ -297,6 +361,10 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
 
     pub fn heap_cell(cell: Handle<'cx, LambdaCell<T>>) -> Self {
         Self::HeapCell(cell)
+    }
+
+    pub fn global(slot: &'place GlobalSlot<T>, init: &'place GlobalInit<'place, 'cx, T>) -> Self {
+        Self::Global(GlobalPlace { slot, init })
     }
 
     pub fn dataref(object: ErasedHandle<'cx>, ops: &'place dyn DataRefPlaceOps<'cx, T>) -> Self {
@@ -319,6 +387,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => MutPlace::local(&mut **value),
             Self::StackCell(cell, _) => MutPlace::stack_cell(cell),
             Self::HeapCell(cell) => MutPlace::heap_cell(cell.clone()),
+            Self::Global(global) => MutPlace::Global(*global),
             Self::Projected(place) => MutPlace::Projected(place.reborrow()),
             Self::ScopedCell(cell) => MutPlace::scoped_cell(cell),
         }
@@ -333,6 +402,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(value),
             Self::StackCell(cell, _) => cell.access(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.access(f)),
+            Self::Global(global) => global.access(ctx, f),
             Self::Projected(place) => projected_access(&**place, ctx, f),
             Self::ScopedCell(cell) => cell.access(ctx, f),
         }
@@ -347,6 +417,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::Local(value, _) => f(*value),
             Self::StackCell(cell, _) => cell.mutate(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
+            Self::Global(global) => global.mutate(ctx, f),
             Self::Projected(place) => projected_mutate(&**place, ctx, f),
             Self::ScopedCell(cell) => cell.mutate(ctx, f),
         }
@@ -364,6 +435,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
                 cell.access(|value| f(unsafe { &mut *ctx_ptr }, value))
             }),
+            Self::Global(global) => global.access_with_ctx(ctx, f),
             Self::Projected(place) => {
                 projected_access(&**place, ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
             }
@@ -383,6 +455,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
                 cell.mutate(|value| f(unsafe { &mut *ctx_ptr }, value))
             }),
+            Self::Global(global) => global.mutate_with_ctx(ctx, f),
             Self::Projected(place) => {
                 projected_mutate(&**place, ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
             }
@@ -438,6 +511,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &*value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.access(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.access(f)),
+            ScopedMutPlaceRoot::Global(global) => global.access(ctx, f),
             ScopedMutPlaceRoot::Projected(ref place) => projected_access(&**place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.access(ctx, f),
         }
@@ -453,6 +527,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &mut *value }),
             ScopedMutPlaceRoot::StackCell(cell, _) => cell.mutate(f),
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
+            ScopedMutPlaceRoot::Global(global) => global.mutate(ctx, f),
             ScopedMutPlaceRoot::Projected(ref place) => projected_mutate(&**place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.mutate(ctx, f),
         }
@@ -476,6 +551,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceRoot<'source, 'cx, T> {
             MutPlace::Local(value, _) => Self::Local(value, PhantomData, PhantomData),
             MutPlace::StackCell(cell, _) => Self::StackCell(cell, PhantomData),
             MutPlace::HeapCell(cell) => Self::HeapCell(cell),
+            MutPlace::Global(global) => Self::Global(global),
             MutPlace::Projected(place) => Self::Projected(place),
             MutPlace::ScopedCell(cell) => Self::ScopedCell(cell),
         }
@@ -493,8 +569,8 @@ mod tests {
     use std::{cell::Cell, mem::ManuallyDrop};
 
     use crate::{
-        AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, HeapType, LambdaCell, ListStorage,
-        MutPlace, ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell,
+        AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType, LambdaCell,
+        ListStorage, MutPlace, ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell,
         heap_access_error,
     };
 
@@ -505,6 +581,44 @@ mod tests {
                 $($body)*
             })
         };
+    }
+
+    #[test]
+    fn global_place_initializes_and_reopens_short_guards() {
+        with_ctx!(ctx;
+            let calls = Cell::new(0);
+            let slot = GlobalSlot::new("score");
+            let init = |_: &mut Ctx<'_, '_>| {
+                calls.set(calls.get() + 1);
+                Ok(7)
+            };
+            let mut place = MutPlace::global(&slot, &init);
+
+            assert_eq!(place.access(&mut ctx, |value| Ok(*value)).unwrap(), 7);
+            place.mutate(&mut ctx, |value| {
+                *value += 1;
+                Ok(())
+            }).unwrap();
+            assert_eq!(place.access(&mut ctx, |value| Ok(*value)).unwrap(), 8);
+            assert_eq!(calls.get(), 1);
+        );
+    }
+
+    #[test]
+    fn global_place_reports_active_borrow_conflict() {
+        with_ctx!(ctx;
+            let slot = GlobalSlot::new("score");
+            let init = |_: &mut Ctx<'_, '_>| Ok(7);
+            let mut place = MutPlace::global(&slot, &init);
+            let guard = slot.read(|| Ok(1)).unwrap();
+
+            let err = place.mutate(&mut ctx, |value| {
+                *value = 2;
+                Ok(())
+            }).expect_err("active read guard should block mutation");
+            assert!(err.to_string().contains("active borrow"));
+            drop(guard);
+        );
     }
 
     fn list_storage_ty<'cx>(ctx: &mut Ctx<'cx, '_>) -> HeapType<'cx, ListStorage<'cx, i64>> {

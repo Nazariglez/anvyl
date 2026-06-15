@@ -2,12 +2,12 @@ use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
-        CaptureCellDecl, CaptureLocalSource, ConstData, ConstValue, EnumDecl, ExternBindingDecl,
-        ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
-        FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl, LambdaEscape, Local,
-        LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot,
-        Program, Projection, RValue, RawEnumValue, Signature, TypeData, VariantDecl, VariantId,
-        VariantShape,
+        CaptureCellDecl, CaptureLocalSource, ConstData, ConstValue, DynContractData, EnumDecl,
+        ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl, ExternRep, ExternTypeDecl,
+        FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl,
+        LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode,
+        ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature,
+        TypeData, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -1040,6 +1040,47 @@ fn rir_rejects_global_init_params() {
 }
 
 #[test]
+fn rir_rejects_invalid_global_references() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].body.stmts = vec![RirStmt::GlobalEnsure {
+                global: RirGlobalId::from_index(99),
+            }];
+        }),
+        RirVerifyErrorKind::BadId,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].body.stmts = vec![RirStmt::GlobalSetRoot {
+                global: RirGlobalId::from_index(99),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }];
+        }),
+        RirVerifyErrorKind::BadId,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].ret.ty = RirTypeId::from_index(0);
+            program.functions[1].body.term =
+                RirTerm::Return(Some(RirOperand::Place(RirPlace::global(
+                    RirGlobalId::from_index(99),
+                    vec![],
+                    RirTypeId::from_index(0),
+                ))));
+        }),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
+fn rir_rejects_invalid_global_payload_type_without_panicking() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].ty = RirTypeId::from_index(99)),
+        RirVerifyErrorKind::BadId,
+    );
+}
+
+#[test]
 fn rir_rejects_empty_global_symbols() {
     assert_rir_error(
         valid_global_rir(|program| program.globals[0].slot_symbol = RirSymbol::new("")),
@@ -1073,6 +1114,164 @@ fn rir_rejects_immutable_global_root_set() {
 }
 
 #[test]
+fn rir_accepts_global_root_update_for_supported_payloads() {
+    rir::verify(&valid_global_rir(|program| {
+        program.functions[1].body.stmts = vec![
+            RirStmt::GlobalEnsure {
+                global: RirGlobalId::from_index(0),
+            },
+            RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            },
+        ];
+    }))
+    .expect("scalar update should verify");
+
+    rir::verify(&valid_global_rir(|program| {
+        let (_, value) = set_global_string_payload(program);
+        program.functions[1].body.stmts = vec![
+            RirStmt::GlobalEnsure {
+                global: RirGlobalId::from_index(0),
+            },
+            RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(value)),
+            },
+        ];
+    }))
+    .expect("string update should verify");
+}
+
+#[test]
+fn rir_rejects_malformed_global_root_update() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].body.stmts = vec![RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }];
+        }),
+        RirVerifyErrorKind::UninitializedGlobal(RirGlobalId::from_index(0)),
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.functions[1].body.stmts = vec![RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(99),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }];
+        }),
+        RirVerifyErrorKind::BadId,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.globals[0].mutable = false;
+            program.functions[1].body.stmts = vec![RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }];
+        }),
+        RirVerifyErrorKind::ImmutableAssign,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            program.globals[0].ty = RirTypeId::from_index(1);
+            program.functions[1].body.stmts = vec![RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            }];
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let bool_ty = RirTypeId::from_index(2);
+            let bool_const = RirConstId::from_index(1);
+            program.types.push(RirType::Bool);
+            program.consts.push(RirConst {
+                id: bool_const,
+                ty: bool_ty,
+                value: RirConstValue::Bool(true),
+            });
+            program.functions[1].body.stmts = vec![RirStmt::GlobalUpdateRoot {
+                global: RirGlobalId::from_index(0),
+                value: RirRValue::Use(RirOperand::Const(bool_const)),
+            }];
+        }),
+        RirVerifyErrorKind::TypeMismatch {
+            expected: RirTypeId::from_index(0),
+            found: RirTypeId::from_index(2),
+        },
+    );
+}
+
+#[test]
+fn rir_accepts_global_mut_place_root() {
+    rir::verify(&valid_global_rir(|program| {
+        let callee = add_global_mut_place_callee(program);
+        program.functions[1].body.stmts = vec![
+            RirStmt::GlobalEnsure {
+                global: RirGlobalId::from_index(0),
+            },
+            global_mut_place_call(callee, RirGlobalId::from_index(0), RirTypeId::from_index(0)),
+        ];
+    }))
+    .expect("global mut place root should verify");
+}
+
+#[test]
+fn rir_rejects_malformed_global_mut_place_root() {
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let callee = add_global_mut_place_callee(program);
+            program.functions[1].body.stmts = vec![global_mut_place_call(
+                callee,
+                RirGlobalId::from_index(0),
+                RirTypeId::from_index(0),
+            )];
+        }),
+        RirVerifyErrorKind::UninitializedGlobal(RirGlobalId::from_index(0)),
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let callee = add_global_mut_place_callee(program);
+            program.globals[0].mutable = false;
+            program.functions[1].body.stmts = vec![global_mut_place_call(
+                callee,
+                RirGlobalId::from_index(0),
+                RirTypeId::from_index(0),
+            )];
+        }),
+        RirVerifyErrorKind::ImmutableAssign,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let callee = add_global_mut_place_callee(program);
+            program.functions[1].body.stmts = vec![global_mut_place_call(
+                callee,
+                RirGlobalId::from_index(99),
+                RirTypeId::from_index(0),
+            )];
+        }),
+        RirVerifyErrorKind::BadId,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let callee = add_global_mut_place_callee(program);
+            program.functions[1].body.stmts = vec![global_mut_place_call(
+                callee,
+                RirGlobalId::from_index(0),
+                RirTypeId::from_index(1),
+            )];
+        }),
+        RirVerifyErrorKind::TypeMismatch {
+            expected: RirTypeId::from_index(0),
+            found: RirTypeId::from_index(1),
+        },
+    );
+}
+
+#[test]
 fn rir_rejects_duplicate_global_slot_symbol() {
     assert_rir_error(
         valid_global_rir(|program| {
@@ -1101,42 +1300,33 @@ fn rir_rejects_global_projection() {
 }
 
 #[test]
-fn rir_rejects_global_borrow_call_arg() {
+fn rir_accepts_global_borrow_call_arg_after_ensure() {
+    rir::verify(&valid_global_rir(|program| {
+        let (string, callee) = add_string_global_borrow_callee(program);
+        program.functions[1]
+            .body
+            .stmts
+            .push(RirStmt::Eval(RirRValue::Call {
+                callee: RirCallTarget::Function(callee),
+                args: vec![RirCallArg::SharedBorrow(rir_global_place(string))],
+                ty: RirTypeId::from_index(1),
+            }));
+    }))
+    .expect("global borrow call arg should verify after ensure");
+}
+
+#[test]
+fn rir_rejects_global_borrow_call_arg_without_ensure() {
     assert_rir_error(
         valid_global_rir(|program| {
-            let local = RirLocalId::from_index(0);
-            let callee = RirFunctionId::from_index(2);
-            program.functions.push(RirFunction {
-                id: callee,
-                air_id: None,
-                symbol: RirSymbol::new("borrow"),
-                params: vec![rir_param(
-                    local,
-                    RirTypeId::from_index(0),
-                    RirParamSemantic::SharedBorrow,
-                    RirParamAbi::SharedBorrow,
-                )],
-                ret: RirReturn {
-                    ty: RirTypeId::from_index(1),
-                },
-                locals: vec![rir_local(local, RirTypeId::from_index(0), false, "x")],
-                body: RirStructuredBlock {
-                    stmts: vec![],
-                    term: RirTerm::Return(None),
-                },
-            });
-            program.functions[1]
-                .body
-                .stmts
-                .push(RirStmt::Eval(RirRValue::Call {
-                    callee: RirCallTarget::Function(callee),
-                    args: vec![RirCallArg::SharedBorrow(rir_global_place(
-                        RirTypeId::from_index(0),
-                    ))],
-                    ty: RirTypeId::from_index(1),
-                }));
+            let (string, callee) = add_string_global_borrow_callee(program);
+            program.functions[1].body.stmts = vec![RirStmt::Eval(RirRValue::Call {
+                callee: RirCallTarget::Function(callee),
+                args: vec![RirCallArg::SharedBorrow(rir_global_place(string))],
+                ty: RirTypeId::from_index(1),
+            })];
         }),
-        RirVerifyErrorKind::UnsupportedRValueType,
+        RirVerifyErrorKind::UninitializedGlobal(RirGlobalId::from_index(0)),
     );
 }
 
@@ -1159,12 +1349,66 @@ fn rir_rejects_void_global_payload() {
 }
 
 #[test]
-fn rir_rejects_non_scalar_global_payload() {
+fn rir_accepts_exact_root_non_scalar_global_payload() {
+    rir::verify(&valid_global_rir(|program| {
+        let (string, _) = set_global_string_payload(program);
+        program.functions[1].body.term =
+            RirTerm::Return(Some(RirOperand::Place(rir_global_place(string))));
+        program.functions[1].ret.ty = string;
+    }))
+    .expect("verified exact-root non-scalar global RIR");
+}
+
+#[test]
+fn rir_rejects_unsupported_global_payloads() {
+    assert_rir_error(
+        valid_global_rir(|program| program.globals[0].ty = RirTypeId::from_index(1)),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
     assert_rir_error(
         valid_global_rir(|program| {
-            let string = RirTypeId::from_index(program.types.len());
-            program.types.push(RirType::String);
-            program.globals[0].ty = string;
+            let slice = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::Slice(RirTypeId::from_index(0)));
+            program.globals[0].ty = slice;
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let sig = RirLambdaSigId::from_index(0);
+            let lambda = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::Lambda(sig));
+            program.lambda_sigs.push(RirLambdaSig {
+                id: sig,
+                params: vec![],
+                ret: RirTypeId::from_index(0),
+            });
+            program.globals[0].ty = lambda;
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let tuple = RirTypeId::from_index(program.types.len());
+            program
+                .types
+                .push(RirType::Tuple(RirTupleId::from_index(0)));
+            let map = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::Map {
+                key: tuple,
+                value: RirTypeId::from_index(0),
+            });
+            program.globals[0].ty = map;
+        }),
+        RirVerifyErrorKind::UnsupportedRValueType,
+    );
+    assert_rir_error(
+        valid_global_rir(|program| {
+            let slice = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::Slice(RirTypeId::from_index(0)));
+            let maybe_slice = RirTypeId::from_index(program.types.len());
+            program.types.push(RirType::Option(slice));
+            program.globals[0].ty = maybe_slice;
         }),
         RirVerifyErrorKind::UnsupportedRValueType,
     );
@@ -1265,7 +1509,7 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
     let text = source.as_str();
 
     assert!(text.contains(
-        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, types, globals))?; *__global }; host::sink(rt, __anv_arg_0)"
+        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, types, globals))?; *(&*__global) }; host::sink(rt, __anv_arg_0)"
     ), "{text}");
 
     let source = emit::RustSource::new(format!(
@@ -1330,22 +1574,221 @@ fn rir_rejects_global_option_match_discriminant() {
 #[test]
 fn profile_rejects_unsupported_global_declaration_and_initializer_by_named_gaps() {
     let mut program = Program::default();
-    let string = program.alloc_type(TypeData::String);
+    let int = program.alloc_type(TypeData::Int);
+    let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(int),
+    )));
     let module = program.alloc_module(root_module());
-    let global = global_with_init(&mut program, module, "g", string, Mutability::Mutable);
+    let global = global_with_init(&mut program, module, "g", function, Mutability::Mutable);
     let init = program.globals[global.index()].init;
 
     let errors = profile_errors(program);
     assert_profile_error(
         &errors,
         ProfileSite::Global(global),
-        ProfileErrorKind::UnsupportedGlobalRooting,
+        ProfileErrorKind::UnsupportedGlobalType,
     );
     assert_profile_error(
         &errors,
         ProfileSite::Function(init),
         ProfileErrorKind::UnsupportedGlobalInitializer,
     );
+}
+
+#[test]
+fn profile_accepts_exact_root_global_payloads() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let string = program.alloc_type(TypeData::String);
+    let list = program.alloc_type(TypeData::List(string));
+    let map = program.alloc_type(TypeData::Map {
+        key: string,
+        value: list,
+        order: air::MapOrder::Insertion,
+    });
+    let module = program.alloc_module(root_module());
+    let node_id = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Node"),
+        module,
+        kind: air::AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("value"),
+            ty: int,
+        }],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    let label_id = program.alloc_aggregate(air::AggregateDecl {
+        name: Ident::new("Label"),
+        module,
+        kind: air::AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![FieldDecl {
+            name: Ident::new("text"),
+            ty: string,
+        }],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    program
+        .module_mut(module)
+        .aggregates
+        .extend([node_id, label_id]);
+    let node = program.alloc_type(TypeData::DataRef(node_id));
+    let label = program.alloc_type(TypeData::Aggregate(label_id));
+    let tuple = program.alloc_type(TypeData::Tuple(vec![label, node]));
+    let maybe_node = program.alloc_type(TypeData::Optional(node));
+    let labels = program.alloc_type(TypeData::Array {
+        elem: label,
+        len: 2,
+    });
+    let label_list = program.alloc_type(TypeData::List(label));
+    let label_map = program.alloc_type(TypeData::Map {
+        key: string,
+        value: label,
+        order: air::MapOrder::Insertion,
+    });
+    let array_map = program.alloc_type(TypeData::Map {
+        key: string,
+        value: labels,
+        order: air::MapOrder::Insertion,
+    });
+
+    for (name, ty) in [
+        ("int", int),
+        ("string", string),
+        ("list", list),
+        ("map", map),
+        ("node", node),
+        ("label", label),
+        ("tuple", tuple),
+        ("maybe_node", maybe_node),
+        ("labels", labels),
+        ("label_list", label_list),
+        ("label_map", label_map),
+        ("array_map", array_map),
+    ] {
+        global_with_init(&mut program, module, name, ty, Mutability::Mutable);
+    }
+
+    check(program);
+}
+
+#[test]
+fn profile_rejects_unsupported_exact_root_global_payloads() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let slice = program.alloc_type(TypeData::Slice(int));
+    let any = program.alloc_type(TypeData::Any);
+    let dyn_ty = program.alloc_type(TypeData::Dyn(DynContractData {
+        display_name: "Drawable".into(),
+        method_table_key: "Drawable".into(),
+        concrete_printer: None,
+    }));
+    let module = program.alloc_module(root_module());
+    let ext_id = program.alloc_extern_type(ExternTypeDecl {
+        name: Ident::new("HostValue"),
+        module,
+        binding: None,
+        type_args: vec![],
+        const_args: vec![],
+        rep: ExternRep::Inline,
+        has_init: false,
+        init_fields: vec![],
+        fields: vec![],
+        methods: vec![],
+        statics: vec![],
+        operators: vec![],
+    });
+    program.module_mut(module).extern_types.push(ext_id);
+    let ext = program.alloc_type(TypeData::Extern(ext_id));
+    let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(int),
+    )));
+    let list_slice = program.alloc_type(TypeData::List(slice));
+    let list_function = program.alloc_type(TypeData::List(function));
+    let map_slice = program.alloc_type(TypeData::Map {
+        key: int,
+        value: slice,
+        order: air::MapOrder::Insertion,
+    });
+
+    let globals = [
+        ("slice", slice, ProfileErrorKind::UnsupportedGlobalRooting),
+        ("extern", ext, ProfileErrorKind::UnsupportedGlobalRooting),
+        ("any", any, ProfileErrorKind::UnsupportedGlobalType),
+        ("dyn", dyn_ty, ProfileErrorKind::UnsupportedGlobalType),
+        (
+            "function",
+            function,
+            ProfileErrorKind::UnsupportedGlobalType,
+        ),
+        (
+            "list_slice",
+            list_slice,
+            ProfileErrorKind::UnsupportedGlobalRooting,
+        ),
+        (
+            "list_function",
+            list_function,
+            ProfileErrorKind::UnsupportedGlobalRooting,
+        ),
+        (
+            "map_slice",
+            map_slice,
+            ProfileErrorKind::UnsupportedGlobalRooting,
+        ),
+    ];
+    for (name, ty, _) in globals {
+        global_with_init(&mut program, module, name, ty, Mutability::Mutable);
+    }
+
+    let errors = profile_errors(program);
+    for (index, (_, _, kind)) in globals.into_iter().enumerate() {
+        assert_profile_error(
+            &errors,
+            ProfileSite::Global(air::GlobalId::from_index(index)),
+            kind,
+        );
+    }
+}
+
+#[test]
+fn profile_accepts_non_scalar_direct_root_assignment() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let value = program.alloc_const(ConstData {
+        ty: string,
+        value: ConstValue::String("ready".into()),
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", string, Mutability::Mutable);
+    let function = program.alloc_function(Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::GlobalSetRoot {
+                global,
+                value: RValue::Use(Operand::Const(value)),
+                init: air::GlobalInitEffect::StoreWithoutInit,
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    check(program);
 }
 
 #[test]
@@ -1668,6 +2111,132 @@ fn plan_lowers_scalar_global_root_read_and_statements() {
 }
 
 #[test]
+fn plan_lowers_projected_global_assignment() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(2),
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", tuple, Mutability::Mutable);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::Assign {
+                    dst: Place {
+                        root: PlaceRoot::Global(global),
+                        projection: vec![Projection::TupleField(0)],
+                        ty: int,
+                    },
+                    value: RValue::Use(Operand::Const(value)),
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), main);
+
+    assert!(matches!(
+        function.body.stmts.as_slice(),
+        [
+            RirStmt::GlobalEnsure { .. },
+            RirStmt::MutPlaceSet {
+                place: RirMutPlaceArg {
+                    root: RirMutPlaceRoot::Global { .. },
+                    projections,
+                    ..
+                },
+                ..
+            }
+        ] if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
+    ));
+}
+
+#[test]
+fn plan_lowers_projected_global_var_arg_to_mut_place() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "g", tuple, Mutability::Mutable);
+    let param_local = air::LocalId::from_index(0);
+    let callee = program.alloc_function(Function {
+        name: Ident::new("bump"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("x", int, ParamMode::MutBorrow, param_local)],
+            void,
+        ),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(callee);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::Eval(RValue::Call {
+                    callee: Callee::Function(callee),
+                    args: vec![CallArg::MutBorrow(Place {
+                        root: PlaceRoot::Global(global),
+                        projection: vec![Projection::TupleField(0)],
+                        ty: int,
+                    })],
+                }),
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), main);
+
+    assert!(matches!(
+        function.body.stmts.as_slice(),
+        [
+            RirStmt::GlobalEnsure { .. },
+            RirStmt::Eval(RirRValue::Call {
+                args,
+                ..
+            })
+        ] if matches!(
+            args.as_slice(),
+            [RirCallArg::MutPlace(RirMutPlaceArg {
+                root: RirMutPlaceRoot::Global { .. },
+                projections,
+                ..
+            })] if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
+        )
+    ));
+}
+
+#[test]
 fn emit_scalar_global_slots_and_operations() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -1717,6 +2286,245 @@ fn emit_scalar_global_slots_and_operations() {
 }
 
 #[test]
+fn emit_global_root_update_initializes_then_replaces_root() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let two = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(2),
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "score", int, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+    program.function_mut(init).body =
+        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one))));
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![
+                Statement::GlobalEnsure { global },
+                Statement::GlobalUpdateRoot {
+                    global,
+                    value: RValue::Use(Operand::Const(two)),
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let source = plan_source(program).into_string();
+    let ensure = source
+        .find("globals.g0_score.ensure(||")
+        .expect("missing ensure");
+    let set = source
+        .find("globals.g0_score.set_without_init(2)")
+        .expect("missing root update set");
+
+    assert!(ensure < set);
+}
+
+#[test]
+fn emit_non_scalar_global_read_and_root_set_materializes_owned_values() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let value = program.alloc_const(ConstData {
+        ty: string,
+        value: ConstValue::String("ready".into()),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "title", string, Mutability::Mutable);
+    let init = program.globals[global.index()].init;
+    program.function_mut(init).body =
+        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], string),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::GlobalSetRoot {
+                global,
+                value: RValue::Use(Operand::Const(value)),
+                init: air::GlobalInitEffect::StoreWithoutInit,
+            }],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                string,
+            )))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let source = plan_source(program).into_string();
+
+    assert!(source.contains("g0_title: anvyx_runtime::GlobalSlot<anvyx_runtime::AnvString>"));
+    assert!(source.contains(
+        "globals.g0_title.set_without_init(anvyx_runtime::AnvString::from(\"ready\"))?;"
+    ));
+    assert!(source.contains("globals.g0_title.read(||"));
+    assert!(source.contains("(*(&*__global)).share()"));
+    assert!(!source.contains("static "));
+    assert!(!source.contains("OnceLock"));
+}
+
+#[test]
+fn emit_enum_global_read_materializes_from_deref_guard_ref() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let enum_id = program.alloc_enum(EnumDecl {
+        name: Ident::new("Event"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        core: None,
+        repr: air::EnumRepr::Adt,
+        raw_type: None,
+        variants: vec![VariantDecl {
+            name: Ident::new("Hit"),
+            shape: VariantShape::Tuple(vec![int]),
+            raw_value: None,
+        }],
+    });
+    program.module_mut(module).enums.push(enum_id);
+    let event = program.alloc_type(TypeData::Enum(enum_id));
+    let one = int_const(&mut program, int, 1);
+    let global = global_with_init(&mut program, module, "event", event, Mutability::Immutable);
+    let init = program.globals[global.index()].init;
+    let tmp = air::LocalId::from_index(0);
+    program.function_mut(init).locals = vec![local(event, LocalKind::Temp)];
+    program.function_mut(init).body = structured_body(
+        vec![Statement::Init {
+            local: tmp,
+            value: RValue::Aggregate {
+                kind: AggregateCtor::EnumVariant {
+                    enum_id,
+                    variant: VariantId::from_index(0),
+                },
+                fields: vec![Operand::Const(one)],
+                ty: event,
+            },
+        }],
+        air::AirTail::Return(Some(Operand::Place(place(tmp, event)))),
+    );
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], event),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::GlobalEnsure { global }],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                event,
+            )))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let source = plan_source(program);
+
+    assert!(source.as_str().contains("match &*__global"));
+    assert!(!source.as_str().contains("match __global"));
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn emit_collection_global_reads_share_from_short_guard() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let list = program.alloc_type(TypeData::List(string));
+    let map = program.alloc_type(TypeData::Map {
+        key: string,
+        value: list,
+        order: air::MapOrder::Insertion,
+    });
+    let key = program.alloc_const(ConstData {
+        ty: string,
+        value: ConstValue::String("k".into()),
+    });
+    let value = program.alloc_const(ConstData {
+        ty: string,
+        value: ConstValue::String("v".into()),
+    });
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(&mut program, module, "table", map, Mutability::Immutable);
+    let init = program.globals[global.index()].init;
+    let xs = air::LocalId::from_index(0);
+    let tmp = air::LocalId::from_index(1);
+    program.function_mut(init).locals =
+        vec![local(list, LocalKind::Temp), local(map, LocalKind::Temp)];
+    program.function_mut(init).body = structured_body(
+        vec![
+            Statement::Init {
+                local: xs,
+                value: RValue::Aggregate {
+                    kind: AggregateCtor::List,
+                    fields: vec![Operand::Const(value)],
+                    ty: list,
+                },
+            },
+            Statement::Init {
+                local: tmp,
+                value: RValue::Aggregate {
+                    kind: AggregateCtor::Map,
+                    fields: vec![Operand::Const(key), Operand::Place(place(xs, list))],
+                    ty: map,
+                },
+            },
+        ],
+        air::AirTail::Return(Some(Operand::Place(place(tmp, map)))),
+    );
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], map),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::GlobalEnsure { global }],
+            air::AirTail::Return(Some(Operand::Place(root_place(
+                PlaceRoot::Global(global),
+                map,
+            )))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let source = plan_source(program);
+
+    assert!(
+        source
+            .as_str()
+            .contains("let __global = globals.g0_table.read")
+    );
+    assert!(source.as_str().contains("(*(&*__global)).share()"));
+    let output = run_source(source);
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
 fn profile_accepts_scalar_global_root_value_reads() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -1746,7 +2554,7 @@ fn profile_accepts_scalar_global_root_value_reads() {
 }
 
 #[test]
-fn plan_maps_profile_global_value_read_to_target_gap() {
+fn profile_accepts_non_scalar_global_root_value_reads() {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
     let module = program.alloc_module(root_module());
@@ -1771,11 +2579,7 @@ fn plan_maps_profile_global_value_read_to_target_gap() {
     program.module_mut(module).functions.push(id);
     program.set_entry(id);
 
-    assert_plan_gap(
-        program,
-        rust_plan_config(),
-        RustTargetGapKind::UnsupportedGlobalValueRead,
-    );
+    check(program);
 }
 
 #[test]
@@ -1808,12 +2612,66 @@ fn profile_rejects_nonprimitive_map_keys_by_named_gap() {
 }
 
 #[test]
-fn profile_rejects_global_projection_by_named_gap() {
+fn profile_accepts_supported_projected_global_assignment() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
+    let value = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
     let global = global_with_init(&mut program, module, "g", tuple, Mutability::Mutable);
+    let function = Function {
+        name: Ident::new("f"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![Statement::Assign {
+                dst: Place {
+                    root: PlaceRoot::Global(global),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: int,
+                },
+                value: RValue::Use(Operand::Const(value)),
+            }],
+            air::AirTail::Return(None),
+        ),
+    };
+    let id = program.alloc_function(function);
+    program.module_mut(module).functions.push(id);
+    program.set_entry(id);
+
+    check(program);
+}
+
+#[test]
+fn profile_rejects_unsupported_global_projection_by_named_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let enum_id = program.alloc_enum(EnumDecl {
+        name: Ident::new("Slot"),
+        module,
+        type_args: vec![],
+        const_args: vec![],
+        core: None,
+        repr: air::EnumRepr::Adt,
+        raw_type: None,
+        variants: vec![VariantDecl {
+            name: Ident::new("Item"),
+            shape: VariantShape::Tuple(vec![int]),
+            raw_value: None,
+        }],
+    });
+    program.module_mut(module).enums.push(enum_id);
+    let slot = program.alloc_type(TypeData::Enum(enum_id));
+    let global = global_with_init(&mut program, module, "g", slot, Mutability::Mutable);
     let function = Function {
         name: Ident::new("f"),
         module,
@@ -1826,7 +2684,11 @@ fn profile_rejects_global_projection_by_named_gap() {
             vec![],
             air::AirTail::Return(Some(Operand::Place(Place {
                 root: PlaceRoot::Global(global),
-                projection: vec![Projection::TupleField(0)],
+                projection: vec![Projection::VariantField {
+                    enum_id,
+                    variant: VariantId::from_index(0),
+                    field: 0,
+                }],
                 ty: int,
             }))),
         ),
@@ -1881,24 +2743,24 @@ fn profile_accepts_scalar_global_statements() {
 }
 
 #[test]
-fn profile_rejects_global_borrow_by_named_gap() {
+fn profile_accepts_exact_root_global_borrow() {
     let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
+    let string = program.alloc_type(TypeData::String);
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let global = global_with_init(&mut program, module, "g", int, Mutability::Mutable);
+    let global = global_with_init(&mut program, module, "g", string, Mutability::Mutable);
     let param_local = air::LocalId::from_index(0);
     let callee = program.alloc_function(Function {
-        name: Ident::new("mutate"),
+        name: Ident::new("borrow"),
         module,
         kind: FunctionKind::Normal,
         owner: None,
         specialization: None,
         signature: Signature::new(
-            vec![param("x", int, ParamMode::MutBorrow, param_local)],
+            vec![param("x", string, ParamMode::SharedBorrow, param_local)],
             void,
         ),
-        locals: vec![mut_local(int, LocalKind::Arg)],
+        locals: vec![local(string, LocalKind::Arg)],
         body: structured_body(vec![], air::AirTail::Return(None)),
     });
     let caller = program.alloc_function(Function {
@@ -1912,10 +2774,10 @@ fn profile_rejects_global_borrow_by_named_gap() {
         body: structured_body(
             vec![Statement::Eval(RValue::Call {
                 callee: Callee::Function(callee),
-                args: vec![CallArg::MutBorrow(Place {
+                args: vec![CallArg::SharedBorrow(Place {
                     root: PlaceRoot::Global(global),
                     projection: vec![],
-                    ty: int,
+                    ty: string,
                 })],
             })],
             air::AirTail::Return(None),
@@ -1927,12 +2789,7 @@ fn profile_rejects_global_borrow_by_named_gap() {
         .extend([callee, caller]);
     program.set_entry(caller);
 
-    let errors = profile_errors(program);
-    assert_profile_error(
-        &errors,
-        ProfileSite::Statement(caller, 0),
-        ProfileErrorKind::UnsupportedGlobalBorrow,
-    );
+    check(program);
 }
 
 #[test]
@@ -11934,7 +12791,10 @@ fn mut_borrow_lambda_rir() -> RirProgram {
 
 fn assert_rir_error(program: RirProgram, kind: RirVerifyErrorKind) {
     let errors = rir::verify(&program).expect_err("verified invalid RIR");
-    assert!(errors.iter().any(|error| error.kind == kind));
+    assert!(
+        errors.iter().any(|error| error.kind == kind),
+        "missing {kind:?}: {errors:?}"
+    );
 }
 
 fn assert_rir_type_error(program: RirProgram) {
@@ -11945,6 +12805,92 @@ fn assert_rir_type_error(program: RirProgram) {
             .any(|error| matches!(error.kind, RirVerifyErrorKind::TypeMismatch { .. })),
         "missing expected type mismatch: {errors:?}"
     );
+}
+
+fn add_global_mut_place_callee(program: &mut RirProgram) -> RirFunctionId {
+    let callee = RirFunctionId::from_index(2);
+    program.functions.push(RirFunction {
+        id: callee,
+        air_id: None,
+        symbol: RirSymbol::new("bump"),
+        params: vec![rir_param(
+            RirLocalId::from_index(0),
+            RirTypeId::from_index(0),
+            RirParamSemantic::MutPlace,
+            RirParamAbi::MutPlace,
+        )],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(1),
+        },
+        locals: vec![rir_local(
+            RirLocalId::from_index(0),
+            RirTypeId::from_index(0),
+            true,
+            "x",
+        )],
+        body: RirStructuredBlock {
+            stmts: vec![],
+            term: RirTerm::Return(None),
+        },
+    });
+    callee
+}
+
+fn global_mut_place_call(callee: RirFunctionId, global: RirGlobalId, ty: RirTypeId) -> RirStmt {
+    RirStmt::Eval(RirRValue::Call {
+        callee: RirCallTarget::Function(callee),
+        args: vec![RirCallArg::MutPlace(RirMutPlaceArg::global(global, ty))],
+        ty: RirTypeId::from_index(1),
+    })
+}
+
+fn set_global_string_payload(program: &mut RirProgram) -> (RirTypeId, RirConstId) {
+    let string = RirTypeId::from_index(2);
+    let value = RirConstId::from_index(1);
+    program.types.push(RirType::String);
+    program.consts.push(RirConst {
+        id: value,
+        ty: string,
+        value: RirConstValue::String("ready".into()),
+    });
+    program.globals[0].ty = string;
+    program.functions[0].ret.ty = string;
+    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Const(value)));
+    for stmt in &mut program.functions[1].body.stmts {
+        if let RirStmt::GlobalSetRoot {
+            value: root_value, ..
+        } = stmt
+        {
+            *root_value = RirRValue::Use(RirOperand::Const(value));
+        }
+    }
+    (string, value)
+}
+
+fn add_string_global_borrow_callee(program: &mut RirProgram) -> (RirTypeId, RirFunctionId) {
+    let (string, _) = set_global_string_payload(program);
+    let local = RirLocalId::from_index(0);
+    let callee = RirFunctionId::from_index(2);
+    program.functions.push(RirFunction {
+        id: callee,
+        air_id: None,
+        symbol: RirSymbol::new("borrow"),
+        params: vec![rir_param(
+            local,
+            string,
+            RirParamSemantic::SharedBorrow,
+            RirParamAbi::SharedBorrow,
+        )],
+        ret: RirReturn {
+            ty: RirTypeId::from_index(1),
+        },
+        locals: vec![rir_local(local, string, false, "x")],
+        body: RirStructuredBlock {
+            stmts: vec![],
+            term: RirTerm::Return(None),
+        },
+    });
+    (string, callee)
 }
 
 fn valid_global_rir(edit: impl FnOnce(&mut RirProgram)) -> RirProgram {

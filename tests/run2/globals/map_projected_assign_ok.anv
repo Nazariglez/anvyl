@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// 5
+// @match-end
+
+fn make_values() -> [string: int] {
+    println("init");
+    ["a": 1]
+}
+
+lazy var values = make_values();
+
+fn main() {
+    values["a"] = 5;
+    let local = values;
+    match local["a"] {
+        value? => println(value),
+        nil => println(0),
+    };
+}

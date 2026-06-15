@@ -9,7 +9,7 @@ use anvyx_runtime::{
     RustParamAbi, RustReturnAbi,
 };
 
-use super::rep_policy::RustRepPolicy;
+use super::rep_policy::{RustMaterialization, RustRepPolicy};
 
 macro_rules! rir_id {
     ($name:ident) => {
@@ -487,6 +487,14 @@ pub enum RirStmt {
         global: RirGlobalId,
         value: RirRValue,
     },
+    GlobalUpdateRoot {
+        global: RirGlobalId,
+        value: RirRValue,
+    },
+    MutPlaceSet {
+        place: RirMutPlaceArg,
+        value: RirRValue,
+    },
     Assign {
         dst: RirPlace,
         value: RirRValue,
@@ -839,6 +847,10 @@ pub enum RirMutPlaceRoot {
         cell: RirScopedPlaceCellRef,
         ty: RirTypeId,
     },
+    Global {
+        global: RirGlobalId,
+        ty: RirTypeId,
+    },
     DataRef {
         object: RirOperand,
         dataref: RirDataRefId,
@@ -852,7 +864,8 @@ impl RirMutPlaceRoot {
             | Self::Param { ty, .. }
             | Self::StackCell { ty, .. }
             | Self::HeapCell { ty, .. }
-            | Self::ScopedPlaceCell { ty, .. } => Some(*ty),
+            | Self::ScopedPlaceCell { ty, .. }
+            | Self::Global { ty, .. } => Some(*ty),
             Self::DataRef { .. } => None,
         }
     }
@@ -912,6 +925,14 @@ impl RirMutPlaceArg {
     pub fn scoped_place_cell(cell: RirScopedPlaceCellRef, ty: RirTypeId) -> Self {
         Self {
             root: RirMutPlaceRoot::ScopedPlaceCell { cell, ty },
+            projections: vec![],
+            ty,
+        }
+    }
+
+    pub fn global(global: RirGlobalId, ty: RirTypeId) -> Self {
+        Self {
+            root: RirMutPlaceRoot::Global { global, ty },
             projections: vec![],
             ty,
         }
@@ -1070,6 +1091,7 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         lambda_escapes: vec![],
         initialized_cells: vec![],
         possibly_initialized_cells: vec![],
+        global_initialized: vec![],
         loops: vec![],
         collection_loans: vec![],
     };
@@ -1129,6 +1151,7 @@ pub enum RirVerifyErrorKind {
     ParamLocalNotInitialized,
     InitParamLocal,
     UninitializedLocal(RirLocalId),
+    UninitializedGlobal(RirGlobalId),
     UninitializedCell(RirCellId),
     InitCellTwice(RirCellId),
     UnsupportedAbi,
@@ -1193,6 +1216,7 @@ type RirBlockState = (
     Vec<Option<RirLambdaEscape>>,
     Vec<bool>,
     Vec<bool>,
+    Vec<bool>,
 );
 
 struct VerifyCx<'a> {
@@ -1204,6 +1228,7 @@ struct VerifyCx<'a> {
     lambda_escapes: Vec<Option<RirLambdaEscape>>,
     initialized_cells: Vec<bool>,
     possibly_initialized_cells: Vec<bool>,
+    global_initialized: Vec<bool>,
     loops: Vec<RirLoopId>,
     collection_loans: Vec<ActiveRirCollectionLoan>,
 }
@@ -1497,10 +1522,7 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
             self.check_type_id(site, global.ty);
-            if !matches!(
-                self.ty(global.ty),
-                Some(RirType::Int | RirType::Float | RirType::Bool)
-            ) {
+            if !self.global_payload_supported(global.ty) {
                 self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             }
             self.check_function_id(site, global.init);
@@ -1531,6 +1553,15 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::DuplicateSymbol);
             }
         }
+    }
+
+    fn global_payload_supported(&self, ty: RirTypeId) -> bool {
+        matches!(
+            RustRepPolicy::new(self.program).exact_root_global_materialization(ty),
+            RustMaterialization::Copy
+                | RustMaterialization::Share
+                | RustMaterialization::CloneHandle
+        )
     }
 
     fn check_lambda_container_type(&mut self, site: RirVerifySite, ty: RirTypeId) {
@@ -2602,6 +2633,7 @@ impl VerifyCx<'_> {
         let previous_lambda_escapes = std::mem::take(&mut self.lambda_escapes);
         let previous_initialized_cells = std::mem::take(&mut self.initialized_cells);
         let previous_possible_cells = std::mem::take(&mut self.possibly_initialized_cells);
+        let previous_global_initialized = std::mem::take(&mut self.global_initialized);
         self.initialized = function
             .locals
             .iter()
@@ -2612,6 +2644,7 @@ impl VerifyCx<'_> {
         self.lambda_escapes = vec![None; function.locals.len()];
         self.initialized_cells = vec![false; self.program.cells.len()];
         self.possibly_initialized_cells = vec![false; self.program.cells.len()];
+        self.global_initialized = vec![false; self.program.globals.len()];
         for lambda in self
             .program
             .lambdas
@@ -2671,6 +2704,7 @@ impl VerifyCx<'_> {
         self.lambda_escapes = previous_lambda_escapes;
         self.initialized_cells = previous_initialized_cells;
         self.possibly_initialized_cells = previous_possible_cells;
+        self.global_initialized = previous_global_initialized;
     }
 
     fn check_stmt(
@@ -2715,17 +2749,42 @@ impl VerifyCx<'_> {
                 }
             }
             RirStmt::GlobalEnsure { global } => {
-                self.check_global_id(site, *global);
+                if self.check_global_id(site, *global).is_some()
+                    && let Some(slot) = self.global_initialized.get_mut(global.index())
+                {
+                    *slot = true;
+                }
             }
-            RirStmt::GlobalSetRoot { global, value } => {
+            RirStmt::GlobalSetRoot { global, value }
+            | RirStmt::GlobalUpdateRoot { global, value } => {
                 let Some(global_decl) = self.check_global_id(site, *global).cloned() else {
                     self.check_rvalue(function_id, function, index, value, None);
                     return;
                 };
+                let requires_init = matches!(stmt, RirStmt::GlobalUpdateRoot { .. });
+                if requires_init
+                    && !self
+                        .global_initialized
+                        .get(global.index())
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    self.push(site, RirVerifyErrorKind::UninitializedGlobal(*global));
+                }
                 if !global_decl.mutable {
                     self.push(site, RirVerifyErrorKind::ImmutableAssign);
                 }
+                if !self.global_payload_supported(global_decl.ty) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
                 self.check_rvalue(function_id, function, index, value, Some(global_decl.ty));
+                if let Some(slot) = self.global_initialized.get_mut(global.index()) {
+                    *slot = true;
+                }
+            }
+            RirStmt::MutPlaceSet { place, value } => {
+                let ty = self.check_mut_place_arg(site, function_id, function, place);
+                self.check_rvalue(function_id, function, index, value, Some(ty));
             }
             RirStmt::Assign { dst, value } => {
                 self.check_place(site, function, dst);
@@ -2851,6 +2910,7 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_globals = self.global_initialized.clone();
                 let then_state = self.check_structured_block(
                     function_id,
                     function,
@@ -2858,6 +2918,7 @@ impl VerifyCx<'_> {
                     entry_definite.clone(),
                     entry_possible.clone(),
                     entry_lambda_escapes.clone(),
+                    entry_globals.clone(),
                     None,
                 );
                 let else_state = branch.else_block.as_ref().map_or(
@@ -2867,6 +2928,7 @@ impl VerifyCx<'_> {
                         entry_lambda_escapes.clone(),
                         self.initialized_cells.clone(),
                         self.possibly_initialized_cells.clone(),
+                        entry_globals.clone(),
                     )),
                     |else_block| {
                         self.check_structured_block(
@@ -2876,6 +2938,7 @@ impl VerifyCx<'_> {
                             entry_definite.clone(),
                             entry_possible.clone(),
                             entry_lambda_escapes.clone(),
+                            entry_globals.clone(),
                             None,
                         )
                     },
@@ -2891,6 +2954,7 @@ impl VerifyCx<'_> {
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
                     self.lambda_escapes.clone(),
+                    self.global_initialized.clone(),
                     None,
                 );
                 self.loops.pop();
@@ -2906,6 +2970,7 @@ impl VerifyCx<'_> {
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
                     self.lambda_escapes.clone(),
+                    self.global_initialized.clone(),
                     None,
                 );
                 self.merge_structured_states([state]);
@@ -2926,6 +2991,7 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_globals = self.global_initialized.clone();
                 let mut states = vec![];
                 for arm in &match_.arms {
                     if variant_count.is_none_or(|len| arm.variant.index() >= len) {
@@ -2942,6 +3008,7 @@ impl VerifyCx<'_> {
                         entry_definite.clone(),
                         entry_possible.clone(),
                         entry_lambda_escapes.clone(),
+                        entry_globals.clone(),
                         None,
                     ));
                 }
@@ -2953,6 +3020,7 @@ impl VerifyCx<'_> {
                         entry_definite.clone(),
                         entry_possible.clone(),
                         entry_lambda_escapes.clone(),
+                        entry_globals.clone(),
                         None,
                     ));
                 } else if variant_count.is_some_and(|len| seen.len() < len) {
@@ -2973,6 +3041,7 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_globals = self.global_initialized.clone();
                 let mut some_definite = entry_definite.clone();
                 let mut some_possible = entry_possible.clone();
                 let mut some_lambda_escapes = entry_lambda_escapes.clone();
@@ -3055,11 +3124,12 @@ impl VerifyCx<'_> {
                     some_definite,
                     some_possible,
                     some_lambda_escapes,
+                    entry_globals.clone(),
                     escaping_payload,
                 );
                 if match_.payload_ref
                     && !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible, _, _, _))) =
+                    && let (Some(payload), Some((definite, possible, _, _, _, _))) =
                         (match_.payload, &mut some_state)
                 {
                     if let Some(slot) = definite.get_mut(payload.index()) {
@@ -3076,6 +3146,7 @@ impl VerifyCx<'_> {
                     entry_definite,
                     entry_possible,
                     entry_lambda_escapes,
+                    entry_globals,
                     None,
                 );
                 if match_.payload_escapes && none_state.is_some() {
@@ -3193,6 +3264,7 @@ impl VerifyCx<'_> {
             self.initialized.clone(),
             self.possibly_initialized.clone(),
             self.lambda_escapes.clone(),
+            self.global_initialized.clone(),
             None,
         );
         self.collection_loans.pop();
@@ -3262,11 +3334,13 @@ impl VerifyCx<'_> {
         definite: Vec<bool>,
         possible: Vec<bool>,
         lambda_escapes: Vec<Option<RirLambdaEscape>>,
+        global_initialized: Vec<bool>,
         preserved_payload_ref: Option<RirLocalId>,
     ) -> Option<RirBlockState> {
         let outer_definite = std::mem::replace(&mut self.initialized, definite);
         let outer_possible = std::mem::replace(&mut self.possibly_initialized, possible);
         let outer_lambda_escapes = std::mem::replace(&mut self.lambda_escapes, lambda_escapes);
+        let outer_globals = std::mem::replace(&mut self.global_initialized, global_initialized);
         let outer_cell_definite = self.initialized_cells.clone();
         let outer_cell_possible = self.possibly_initialized_cells.clone();
         for (index, stmt) in body.stmts.iter().enumerate() {
@@ -3280,6 +3354,7 @@ impl VerifyCx<'_> {
             let lambda_escapes = self.lambda_escapes.clone();
             let cell_definite = self.initialized_cells.clone();
             let cell_possible = self.possibly_initialized_cells.clone();
+            let globals = self.global_initialized.clone();
             for local in &function.locals {
                 if local.payload_ref && Some(local.id) != preserved_payload_ref {
                     if let Some(slot) = definite.get_mut(local.id.index()) {
@@ -3296,11 +3371,13 @@ impl VerifyCx<'_> {
                 lambda_escapes,
                 cell_definite,
                 cell_possible,
+                globals,
             )
         });
         self.initialized = outer_definite;
         self.possibly_initialized = outer_possible;
         self.lambda_escapes = outer_lambda_escapes;
+        self.global_initialized = outer_globals;
         self.initialized_cells = outer_cell_definite;
         self.possibly_initialized_cells = outer_cell_possible;
         result
@@ -3344,6 +3421,8 @@ impl VerifyCx<'_> {
             | RirStmt::Init { .. }
             | RirStmt::GlobalEnsure { .. }
             | RirStmt::GlobalSetRoot { .. }
+            | RirStmt::GlobalUpdateRoot { .. }
+            | RirStmt::MutPlaceSet { .. }
             | RirStmt::Assign { .. }
             | RirStmt::CellInit { .. }
             | RirStmt::CellSet { .. }
@@ -3379,6 +3458,7 @@ impl VerifyCx<'_> {
             mut lambda_escapes,
             mut cell_definite,
             mut cell_possible,
+            mut globals,
         )) = states.next()
         else {
             return;
@@ -3389,6 +3469,7 @@ impl VerifyCx<'_> {
             next_lambda_escapes,
             next_cell_definite,
             next_cell_possible,
+            next_globals,
         ) in states
         {
             definite = definite
@@ -3416,12 +3497,18 @@ impl VerifyCx<'_> {
                 .zip(&next_cell_possible)
                 .map(|(lhs, rhs)| *lhs || *rhs)
                 .collect();
+            globals = globals
+                .iter()
+                .zip(&next_globals)
+                .map(|(lhs, rhs)| *lhs && *rhs)
+                .collect();
         }
         self.initialized = definite;
         self.possibly_initialized = possible;
         self.lambda_escapes = lambda_escapes;
         self.initialized_cells = cell_definite;
         self.possibly_initialized_cells = cell_possible;
+        self.global_initialized = globals;
     }
 
     fn check_lambda_capture_args(
@@ -4196,14 +4283,26 @@ impl VerifyCx<'_> {
             let found = match arg {
                 RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
                 RirCallArg::SharedBorrow(place) => {
-                    let RirPlaceRoot::Local(local) = place.root else {
-                        self.check_place(site, function, place);
-                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                        return;
-                    };
                     self.check_place(site, function, place);
-                    if Self::function_local_is_mut_place_param(function, local) {
-                        self.push(site, RirVerifyErrorKind::CallArgMode);
+                    match place.root {
+                        RirPlaceRoot::Local(local) => {
+                            if Self::function_local_is_mut_place_param(function, local) {
+                                self.push(site, RirVerifyErrorKind::CallArgMode);
+                            }
+                        }
+                        RirPlaceRoot::Global(global) => {
+                            if !self.global_payload_supported(place.ty) {
+                                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                            }
+                            if !self
+                                .global_initialized
+                                .get(global.index())
+                                .copied()
+                                .unwrap_or(false)
+                            {
+                                self.push(site, RirVerifyErrorKind::UninitializedGlobal(global));
+                            }
+                        }
                     }
                     Some(place.ty)
                 }
@@ -4403,6 +4502,49 @@ impl VerifyCx<'_> {
                     &arg.projections,
                     arg.ty,
                 );
+                arg.ty
+            }
+            RirMutPlaceRoot::Global { global, ty } => {
+                let Some(decl) = self.check_global_id(site, *global).cloned() else {
+                    return arg.ty;
+                };
+                if !self
+                    .global_initialized
+                    .get(global.index())
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    self.push(site, RirVerifyErrorKind::UninitializedGlobal(*global));
+                }
+                if !decl.mutable {
+                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
+                }
+                if decl.ty != *ty {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: decl.ty,
+                            found: *ty,
+                        },
+                    );
+                }
+                let Some(found) =
+                    self.check_projection_chain(site, function, *ty, &arg.projections, true)
+                else {
+                    return arg.ty;
+                };
+                if found != arg.ty {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: found,
+                            found: arg.ty,
+                        },
+                    );
+                }
+                if !self.projected_mut_place_arg_supported(*ty, &arg.projections, true) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
                 arg.ty
             }
             RirMutPlaceRoot::DataRef { object, dataref } => {
@@ -5048,14 +5190,15 @@ impl VerifyCx<'_> {
                 current
             }
             RirPlaceRoot::Global(global) => {
-                let Some(global) = self.check_global_id(site, global) else {
+                let Some(global_ty) = self.check_global_id(site, global).map(|global| global.ty)
+                else {
                     return;
                 };
                 if !place.projections.is_empty() {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 }
-                global.ty
+                global_ty
             }
         };
         let Some(current) =

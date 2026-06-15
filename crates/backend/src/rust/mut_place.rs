@@ -94,7 +94,7 @@ impl PlanCx<'_> {
         }
 
         if !place.projection.is_empty() {
-            return self.plan_projected_local_mut_place_arg(function, place);
+            return self.plan_projected_mut_place_arg(function, place);
         }
 
         self.plan_root_mut_place_arg(function, place)
@@ -125,7 +125,7 @@ impl PlanCx<'_> {
         }
     }
 
-    fn plan_projected_local_mut_place_arg(
+    fn plan_projected_mut_place_arg(
         &self,
         function: FunctionId,
         place: &Place,
@@ -154,6 +154,13 @@ impl PlanCx<'_> {
                     },
                     false,
                 )
+            } else if let PlaceRoot::Global(global) = place.root {
+                let global_decl = &self.air.globals[global.index()];
+                let root = RirMutPlaceRoot::Global {
+                    global: self.global_map[&global],
+                    ty: self.type_map[&global_decl.ty],
+                };
+                (global_decl.ty, root, true)
             } else {
                 let Some(root) = place.root.local() else {
                     return Self::unsupported_mut_place(
@@ -210,6 +217,12 @@ impl PlanCx<'_> {
             let arg =
                 RirMutPlaceArg::scoped_place_cell(self.scoped_place_cell_ref(function, borrow), ty);
             return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(arg)));
+        }
+
+        if let PlaceRoot::Global(global) = place.root {
+            return Ok(PlannedCallArg::from_arg(RirCallArg::MutPlace(
+                RirMutPlaceArg::global(self.global_map[&global], ty),
+            )));
         }
 
         let Some(root) = place.root.local() else {

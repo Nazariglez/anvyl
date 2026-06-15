@@ -50,6 +50,8 @@ impl DataRefPlaceDescriptors {
             RirStmt::Init { value, .. }
             | RirStmt::Assign { value, .. }
             | RirStmt::GlobalSetRoot { value, .. }
+            | RirStmt::GlobalUpdateRoot { value, .. }
+            | RirStmt::MutPlaceSet { value, .. }
             | RirStmt::Eval(value)
             | RirStmt::CellInit { value, .. }
             | RirStmt::CellSet { value, .. }

@@ -1,0 +1,10 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @stderr-contains: UnsupportedGlobalRooting
+
+lazy var values: [string: int] = ["a": 1];
+
+fn main() {
+    values.insert("b", 2);
+}

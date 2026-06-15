@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 3
+
+struct Label {
+    value: int,
+}
+
+fn make_label() -> Label { Label { value: 3 } }
+
+lazy let label = make_label();
+
+fn main() {
+    let local = label;
+    println(local.value);
+}

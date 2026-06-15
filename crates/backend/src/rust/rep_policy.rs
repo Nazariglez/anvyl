@@ -38,6 +38,16 @@ pub enum RustBorrowView {
     TargetGap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMaterialization {
+    Copy,
+    Share,
+    CloneHandle,
+    CloneLambda,
+    BorrowGuard,
+    Gap,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AirRustRepPolicy<'a> {
     program: &'a AirProgram,
@@ -72,36 +82,144 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     pub fn value_from_ref_supported(self, ty: TypeId) -> bool {
+        !matches!(
+            self.materialization(ty),
+            RustMaterialization::BorrowGuard | RustMaterialization::Gap
+        )
+    }
+
+    pub fn materialization(self, ty: TypeId) -> RustMaterialization {
+        if matches!(self.program.type_arena.data(ty), TypeData::Void) {
+            return RustMaterialization::Gap;
+        }
+        if self.copyable(ty) {
+            return RustMaterialization::Copy;
+        }
         match self.program.type_arena.data(ty) {
+            TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
+                RustMaterialization::Share
+            }
+            TypeData::DataRef(_) => RustMaterialization::CloneHandle,
+            TypeData::Slice(_) => RustMaterialization::BorrowGuard,
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.composite_materialization([*inner])
+            }
+            TypeData::Tuple(elems) => self.composite_materialization(elems.iter().copied()),
+            TypeData::Aggregate(id) => self.composite_materialization(
+                self.program
+                    .aggregate(*id)
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            TypeData::Enum(id) => self.composite_materialization(
+                self.program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .flat_map(Self::variant_field_tys),
+            ),
+            TypeData::Extern(id) => self.composite_materialization(
+                self.program
+                    .extern_type(*id)
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Void
+            | TypeData::Any
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => RustMaterialization::Gap,
+        }
+    }
+
+    pub fn exact_root_global_materialization(self, ty: TypeId) -> RustMaterialization {
+        match self.program.type_arena.data(ty) {
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_) => RustMaterialization::Gap,
+            TypeData::List(elem) if !self.exact_root_global_field_supported(*elem) => {
+                RustMaterialization::Gap
+            }
+            TypeData::Map { key, value, .. }
+                if !self.map_key_supported(*key)
+                    || !self.exact_root_global_field_supported(*value) =>
+            {
+                RustMaterialization::Gap
+            }
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.composite_global_materialization([*inner])
+            }
+            TypeData::Tuple(elems) => self.composite_global_materialization(elems.iter().copied()),
+            TypeData::Aggregate(id) => self.composite_global_materialization(
+                self.program
+                    .aggregate(*id)
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            TypeData::Enum(id) => self.composite_global_materialization(
+                self.program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .flat_map(Self::variant_field_tys),
+            ),
             TypeData::Int
             | TypeData::Float
             | TypeData::Bool
             | TypeData::String
             | TypeData::DataRef(_)
             | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Function(_) => true,
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.value_from_ref_supported(*inner)
-            }
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.value_from_ref_supported(*elem)),
-            TypeData::Aggregate(id) => self
-                .program
-                .aggregate(*id)
-                .fields
-                .iter()
-                .all(|field| self.value_from_ref_supported(field.ty)),
-            TypeData::Enum(id) => self.enum_value_from_ref_supported(*id),
-            TypeData::Extern(id) => self
-                .program
-                .extern_type(*id)
-                .fields
-                .iter()
-                .all(|field| self.value_from_ref_supported(field.ty)),
-            TypeData::Void | TypeData::Any | TypeData::Slice(_) | TypeData::Dyn(_) => false,
+            | TypeData::Map { .. } => self.materialization(ty),
         }
+    }
+
+    fn composite_materialization(
+        self,
+        fields: impl IntoIterator<Item = TypeId>,
+    ) -> RustMaterialization {
+        if fields
+            .into_iter()
+            .all(|field| !matches!(self.materialization(field), RustMaterialization::Gap))
+        {
+            RustMaterialization::Share
+        } else {
+            RustMaterialization::Gap
+        }
+    }
+
+    fn composite_global_materialization(
+        self,
+        fields: impl IntoIterator<Item = TypeId>,
+    ) -> RustMaterialization {
+        if fields.into_iter().all(|field| {
+            !matches!(
+                self.exact_root_global_materialization(field),
+                RustMaterialization::BorrowGuard
+                    | RustMaterialization::CloneLambda
+                    | RustMaterialization::Gap
+            )
+        }) {
+            RustMaterialization::Share
+        } else {
+            RustMaterialization::Gap
+        }
+    }
+
+    fn exact_root_global_field_supported(self, ty: TypeId) -> bool {
+        !matches!(
+            self.exact_root_global_materialization(ty),
+            RustMaterialization::BorrowGuard
+                | RustMaterialization::CloneLambda
+                | RustMaterialization::Gap
+        )
     }
 
     pub fn dataref_payload_supported(self, ty: TypeId) -> bool {
@@ -138,7 +256,16 @@ impl<'a> AirRustRepPolicy<'a> {
         let TypeData::List(elem) = self.program.type_arena.data(ty) else {
             return false;
         };
-        self.value_place_shareable(*elem)
+        self.collection_value_supported(*elem)
+    }
+
+    fn collection_value_supported(self, ty: TypeId) -> bool {
+        matches!(
+            self.materialization(ty),
+            RustMaterialization::Copy
+                | RustMaterialization::Share
+                | RustMaterialization::CloneHandle
+        )
     }
 
     fn shareable_value(self, ty: TypeId) -> bool {
@@ -193,23 +320,6 @@ impl<'a> AirRustRepPolicy<'a> {
         })
     }
 
-    fn enum_value_from_ref_supported(self, id: air::EnumId) -> bool {
-        self.program.enum_decl(id).variants.iter().all(|variant| {
-            let fields: &[TypeId] = match &variant.shape {
-                VariantShape::Unit => &[],
-                VariantShape::Tuple(fields) => fields,
-                VariantShape::Struct(fields) => {
-                    return fields
-                        .iter()
-                        .all(|field| self.value_from_ref_supported(field.ty));
-                }
-            };
-            fields
-                .iter()
-                .all(|field| self.value_from_ref_supported(*field))
-        })
-    }
-
     pub fn map_supported(self, ty: TypeId) -> bool {
         let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
             return false;
@@ -225,26 +335,7 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     pub fn map_value_supported(self, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::String
-            | TypeData::DataRef(_)
-            | TypeData::List(_)
-            | TypeData::Map { .. } => self.value_place_shareable(ty),
-            TypeData::Optional(inner) => self.map_value_supported(*inner),
-            TypeData::Tuple(elems) => elems.iter().all(|elem| self.map_value_supported(*elem)),
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Array { .. }
-            | TypeData::Aggregate(_)
-            | TypeData::Enum(_)
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_)
-            | TypeData::Dyn(_) => false,
-        }
+        self.collection_value_supported(ty)
     }
 
     pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
@@ -410,36 +501,151 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
+        !matches!(
+            self.materialization(ty),
+            RustMaterialization::BorrowGuard | RustMaterialization::Gap
+        )
+    }
+
+    pub fn materialization(self, ty: RirTypeId) -> RustMaterialization {
+        if matches!(self.ty(ty), RirType::Void) {
+            return RustMaterialization::Gap;
+        }
+        if self.copyable(ty) {
+            return RustMaterialization::Copy;
+        }
         match self.ty(ty) {
+            RirType::String | RirType::List(_) | RirType::Map { .. } => RustMaterialization::Share,
+            RirType::DataRef(_) => RustMaterialization::CloneHandle,
+            RirType::Lambda(sig) if self.lambda_sig_cloneable(sig) => {
+                RustMaterialization::CloneLambda
+            }
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                self.composite_materialization([inner])
+            }
+            RirType::Struct(id) => self.composite_materialization(
+                self.program.structs[id.index()]
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            RirType::Tuple(id) => self.composite_materialization(
+                self.program.tuples[id.index()]
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            RirType::Enum(id) => self.composite_materialization(
+                self.program.enums[id.index()]
+                    .variants
+                    .iter()
+                    .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
+            ),
+            RirType::Slice(_) => RustMaterialization::BorrowGuard,
+            RirType::Int | RirType::Float | RirType::Bool | RirType::Void | RirType::Lambda(_) => {
+                RustMaterialization::Gap
+            }
+        }
+    }
+
+    pub fn exact_root_global_materialization(self, ty: RirTypeId) -> RustMaterialization {
+        let Some(data) = self.ty_opt(ty) else {
+            return RustMaterialization::Gap;
+        };
+        if matches!(data, RirType::Void | RirType::Slice(_) | RirType::Lambda(_)) {
+            return RustMaterialization::Gap;
+        }
+        if self.copyable(ty) {
+            return RustMaterialization::Copy;
+        }
+        match data {
+            RirType::String | RirType::DataRef(_) => self.materialization(ty),
+            RirType::List(elem) if self.exact_root_global_field_supported(elem) => {
+                self.materialization(ty)
+            }
+            RirType::Map { key, value }
+                if self.global_map_key_supported(key)
+                    && self.exact_root_global_field_supported(value) =>
+            {
+                self.materialization(ty)
+            }
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                self.composite_global_materialization([inner])
+            }
+            RirType::Struct(id) => {
+                let Some(strukt) = self.program.structs.get(id.index()) else {
+                    return RustMaterialization::Gap;
+                };
+                self.composite_global_materialization(strukt.fields.iter().map(|field| field.ty))
+            }
+            RirType::Tuple(id) => {
+                let Some(tuple) = self.program.tuples.get(id.index()) else {
+                    return RustMaterialization::Gap;
+                };
+                self.composite_global_materialization(tuple.fields.iter().map(|field| field.ty))
+            }
+            RirType::Enum(id) => {
+                let Some(enm) = self.program.enums.get(id.index()) else {
+                    return RustMaterialization::Gap;
+                };
+                self.composite_global_materialization(
+                    enm.variants
+                        .iter()
+                        .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
+                )
+            }
             RirType::Int
             | RirType::Float
             | RirType::Bool
-            | RirType::String
-            | RirType::DataRef(_)
+            | RirType::Void
             | RirType::List(_)
-            | RirType::Map { .. } => true,
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.value_from_ref_supported(inner)
-            }
-            RirType::Struct(id) => self.program.structs[id.index()]
-                .fields
-                .iter()
-                .all(|field| self.value_from_ref_supported(field.ty)),
-            RirType::Tuple(id) => self.program.tuples[id.index()]
-                .fields
-                .iter()
-                .all(|field| self.value_from_ref_supported(field.ty)),
-            RirType::Enum(id) => self.program.enums[id.index()]
-                .variants
-                .iter()
-                .all(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .all(|field| self.value_from_ref_supported(field.ty))
-                }),
-            RirType::Slice(_) | RirType::Void => false,
-            RirType::Lambda(_) => true,
+            | RirType::Map { .. }
+            | RirType::Slice(_)
+            | RirType::Lambda(_) => RustMaterialization::Gap,
+        }
+    }
+
+    fn composite_global_materialization(
+        self,
+        fields: impl IntoIterator<Item = RirTypeId>,
+    ) -> RustMaterialization {
+        if fields
+            .into_iter()
+            .all(|field| self.exact_root_global_field_supported(field))
+        {
+            RustMaterialization::Share
+        } else {
+            RustMaterialization::Gap
+        }
+    }
+
+    fn exact_root_global_field_supported(self, ty: RirTypeId) -> bool {
+        matches!(
+            self.exact_root_global_materialization(ty),
+            RustMaterialization::Copy
+                | RustMaterialization::Share
+                | RustMaterialization::CloneHandle
+        )
+    }
+
+    fn global_map_key_supported(self, ty: RirTypeId) -> bool {
+        matches!(
+            self.ty_opt(ty),
+            Some(RirType::Int | RirType::Bool | RirType::String)
+        )
+    }
+
+    fn composite_materialization(
+        self,
+        fields: impl IntoIterator<Item = RirTypeId>,
+    ) -> RustMaterialization {
+        if fields
+            .into_iter()
+            .all(|field| !matches!(self.materialization(field), RustMaterialization::Gap))
+        {
+            RustMaterialization::Share
+        } else {
+            RustMaterialization::Gap
         }
     }
 
@@ -698,18 +904,18 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Bool => "bool".into(),
             RirType::String => target::anv_string_ty(),
             RirType::Void => "()".into(),
-            RirType::Struct(id) => self.named_ty(
+            RirType::Struct(id) => Self::named_ty(
                 self.program.structs[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
             RirType::DataRef(id) => {
                 format!("{}<'cx>", self.program.datarefs[id.index()].symbol.as_str())
             }
-            RirType::Enum(id) => self.named_ty(
+            RirType::Enum(id) => Self::named_ty(
                 self.program.enums[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
-            RirType::Tuple(id) => self.named_ty(
+            RirType::Tuple(id) => Self::named_ty(
                 self.program.tuples[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
@@ -749,7 +955,7 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn lambda_env_storage_ty(self, env: &RirLambdaEnvLayout) -> String {
-        self.named_ty(env.symbol.as_str(), self.lambda_env_cx_dependent(env))
+        Self::named_ty(env.symbol.as_str(), self.lambda_env_cx_dependent(env))
     }
 
     pub fn lambda_env_cx_dependent(self, env: &RirLambdaEnvLayout) -> bool {
@@ -854,7 +1060,7 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
-    fn named_ty(self, symbol: &str, cx_dependent: bool) -> String {
+    fn named_ty(symbol: &str, cx_dependent: bool) -> String {
         if cx_dependent {
             format!("{symbol}<'cx>")
         } else {
@@ -1097,14 +1303,18 @@ impl RustTracePlan {
 #[cfg(test)]
 mod tests {
     use anvyx_frontend::{
-        air::{self, FieldDecl, ParamMode, Program, TypeData, TypePassClasses},
+        air::{self, FieldDecl, FunctionId, ParamMode, Program, TypeData, TypePassClasses},
         ast::Ident,
     };
 
-    use super::{AirRustRepPolicy, RustBorrowView, RustRepPolicy, RustValueRep};
+    use super::{
+        AirRustRepPolicy, RustBorrowView, RustMaterialization, RustRepPolicy, RustValueRep,
+    };
     use crate::rust::rir::{
-        RirDataRef, RirDataRefId, RirField, RirFieldId, RirProgram, RirStruct, RirStructId,
-        RirSymbol, RirType, RirTypeId,
+        RirDataRef, RirDataRefId, RirField, RirFieldId, RirLambda, RirLambdaEscape, RirLambdaId,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi,
+        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
+        RirType, RirTypeId,
     };
 
     #[test]
@@ -1238,14 +1448,142 @@ mod tests {
         assert_eq!(policy.value_rep(node), RustValueRep::HeapHandle);
         assert!(!policy.copyable(node));
         assert!(policy.shareable_value(node));
-        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::Value));
-        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::SharedBorrow));
-        assert!(policy.supports_param(node, crate::rust::rir::RirParamSemantic::MutBorrow));
+        assert!(policy.supports_param(node, RirParamSemantic::Value));
+        assert!(policy.supports_param(node, RirParamSemantic::SharedBorrow));
+        assert!(policy.supports_param(node, RirParamSemantic::MutBorrow));
         assert_eq!(policy.borrow_view(node), RustBorrowView::Ref);
         assert_eq!(policy.rust_ty(node), "Node<'cx>");
         assert!(!policy.cow_value(node));
         assert!(!policy.copyable(maybe_node));
         assert!(policy.shareable_value(maybe_node));
+    }
+
+    #[test]
+    fn policy_classifies_materialization() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Int);
+        let string = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::String);
+        let list = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::List(int));
+        let map = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Map {
+            key: int,
+            value: string,
+        });
+        let node = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::DataRef(RirDataRefId::from_index(0)));
+        program.datarefs.push(RirDataRef {
+            id: RirDataRefId::from_index(0),
+            air_id: air::AggregateId::from_index(0),
+            symbol: RirSymbol::new("Node"),
+            display: RirSymbol::new("Node"),
+            cycle_capable: true,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("value"),
+                ty: int,
+            }],
+        });
+        let tuple = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Tuple(RirTupleId::from_index(0)));
+        program.tuples.push(RirTuple {
+            id: RirTupleId::from_index(0),
+            symbol: RirSymbol::new("Tuple0"),
+            display: RirSymbol::new("Tuple0"),
+            fields: vec![
+                RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("_0"),
+                    ty: string,
+                },
+                RirField {
+                    id: RirFieldId::from_index(1),
+                    symbol: RirSymbol::new("_1"),
+                    ty: node,
+                },
+            ],
+            copyable: false,
+        });
+        let maybe_node = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Option(node));
+        let slice = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Slice(int));
+        let lambda_sig = RirLambdaSigId::from_index(0);
+        let lambda = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Lambda(lambda_sig));
+        program.lambda_sigs.push(RirLambdaSig {
+            id: lambda_sig,
+            params: vec![],
+            ret: int,
+        });
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Function(FunctionId::from_index(0)),
+            function: crate::rust::rir::RirFunctionId::from_index(0),
+            sig: lambda_sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ZeroEnv,
+            captures: vec![],
+        });
+        let policy = RustRepPolicy::new(&program);
+
+        assert_eq!(policy.materialization(int), RustMaterialization::Copy);
+        assert_eq!(policy.materialization(string), RustMaterialization::Share);
+        assert_eq!(policy.materialization(list), RustMaterialization::Share);
+        assert_eq!(policy.materialization(map), RustMaterialization::Share);
+        assert_eq!(
+            policy.materialization(node),
+            RustMaterialization::CloneHandle
+        );
+        assert_eq!(policy.materialization(tuple), RustMaterialization::Share);
+        assert_eq!(
+            policy.materialization(maybe_node),
+            RustMaterialization::Share
+        );
+        assert_eq!(
+            policy.materialization(slice),
+            RustMaterialization::BorrowGuard
+        );
+        assert_eq!(policy.materialization(lambda), RustMaterialization::Copy);
+    }
+
+    #[test]
+    fn policy_rejects_non_cloneable_lambda_materialization() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Int);
+        let lambda_sig = RirLambdaSigId::from_index(0);
+        let lambda = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Lambda(lambda_sig));
+        program.lambda_sigs.push(RirLambdaSig {
+            id: lambda_sig,
+            params: vec![],
+            ret: int,
+        });
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Function(FunctionId::from_index(0)),
+            function: crate::rust::rir::RirFunctionId::from_index(0),
+            sig: lambda_sig,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![crate::rust::rir::RirLambdaCapture {
+                ty: int,
+                semantic: RirParamSemantic::MutBorrow,
+                abi: RirParamAbi::MutBorrow,
+                kind: crate::rust::rir::RirLambdaCaptureKind::Param,
+            }],
+        });
+        let policy = RustRepPolicy::new(&program);
+
+        assert_eq!(policy.materialization(lambda), RustMaterialization::Gap);
+        assert!(!policy.value_from_ref_supported(lambda));
     }
 
     #[test]

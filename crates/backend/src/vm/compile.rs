@@ -162,7 +162,7 @@ impl CompileCx<'_> {
                 AirStmt::GlobalEnsure { .. } => {
                     self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
                 }
-                AirStmt::GlobalSetRoot { value, .. } => {
+                AirStmt::GlobalSetRoot { value, .. } | AirStmt::GlobalUpdateRoot { value, .. } => {
                     self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
                     self.check_rvalue(function, value);
                     if let Some(call) = self.compile_rvalue_call(function, value) {
