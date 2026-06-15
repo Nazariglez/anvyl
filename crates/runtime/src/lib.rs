@@ -1,5 +1,7 @@
 mod check;
 pub mod collection;
+mod collection_storage;
+pub mod cow_storage;
 
 pub mod ctx;
 pub mod cycle_collector;
@@ -23,9 +25,10 @@ pub use anvyx_heap::{
 pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
 pub use check::{checked_index, checked_index_result, checked_range};
 pub use collection::{CollectionLoanState, ShapeLoanGuard};
+pub use collection_storage::{ListStorage, MapStorage};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
-pub use error::RuntimeError;
+pub use error::{RuntimeError, heap_access_error};
 pub use global_slot::{GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState};
 pub use inventory;
 pub use lambda_cell::{LambdaCell, StackLambdaCell};
@@ -35,7 +38,6 @@ pub use managed_rc::{
 };
 pub use mutable_place::{
     DataRefPlace, DataRefPlaceOps, MutPlace, ProjectedPlace, ProjectionOps, ScopedMutPlaceCell,
-    heap_access_error,
 };
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,

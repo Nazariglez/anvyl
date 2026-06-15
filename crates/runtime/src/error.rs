@@ -1,5 +1,7 @@
 use std::fmt;
 
+use anvyx_heap::AccessError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
@@ -24,3 +26,11 @@ impl fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+pub fn heap_access_error(error: AccessError) -> RuntimeError {
+    let message = match error {
+        AccessError::WrongHeap => "heap object belongs to a different heap",
+        AccessError::DeadHandle => "heap object handle is no longer live",
+    };
+    RuntimeError::new(message)
+}

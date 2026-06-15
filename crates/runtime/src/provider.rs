@@ -753,6 +753,18 @@ fn validate_native_abi(
             "direct mutable collection ABI is unsupported",
         ));
     }
+    let direct_collection = abi.params.iter().any(direct_collection_abi)
+        || direct_collection_return_abi(&abi.ret)
+        || (abi.support == RustAbiSupport::Direct
+            && (abi.params.iter().any(collection_wrapper_param_abi)
+                || collection_wrapper_return_abi(&abi.ret)));
+    if direct_collection {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "direct collection ABI is unsupported",
+        ));
+    }
     Ok(())
 }
 
@@ -884,6 +896,45 @@ fn param_abi_contains_callback(abi: &RustParamAbi) -> bool {
 
 fn direct_mut_collection_abi(abi: &RustParamAbi) -> bool {
     matches!(abi, RustParamAbi::MutBorrow(ty) if type_contains_collection(ty))
+}
+
+fn direct_collection_abi(abi: &RustParamAbi) -> bool {
+    match abi {
+        RustParamAbi::Value(ty) | RustParamAbi::Borrow(ty) => type_contains_collection(ty),
+        RustParamAbi::Option(inner) => direct_collection_abi(inner),
+        RustParamAbi::MutBorrow(_)
+        | RustParamAbi::MutPlace(_)
+        | RustParamAbi::ScopedLambda(_)
+        | RustParamAbi::List(_) => false,
+    }
+}
+
+fn direct_collection_return_abi(abi: &RustReturnAbi) -> bool {
+    match abi {
+        RustReturnAbi::Value(ty) => type_contains_collection(ty),
+        RustReturnAbi::Option(inner) => direct_collection_return_abi(inner),
+        RustReturnAbi::Void | RustReturnAbi::List(_) => false,
+    }
+}
+
+fn collection_wrapper_param_abi(abi: &RustParamAbi) -> bool {
+    match abi {
+        RustParamAbi::Option(inner) => collection_wrapper_param_abi(inner),
+        RustParamAbi::List(_) => true,
+        RustParamAbi::Value(_)
+        | RustParamAbi::Borrow(_)
+        | RustParamAbi::MutBorrow(_)
+        | RustParamAbi::MutPlace(_)
+        | RustParamAbi::ScopedLambda(_) => false,
+    }
+}
+
+fn collection_wrapper_return_abi(abi: &RustReturnAbi) -> bool {
+    match abi {
+        RustReturnAbi::Option(inner) => collection_wrapper_return_abi(inner),
+        RustReturnAbi::List(_) => true,
+        RustReturnAbi::Void | RustReturnAbi::Value(_) => false,
+    }
 }
 
 fn param_contains_callback(param: &ExternParam) -> bool {
@@ -1099,6 +1150,110 @@ mod tests {
         assert_abi_ok(
             mutable_descriptor("filter_map", map.clone()),
             void_binding("filter_map", RustParamAbi::MutPlace(map)),
+        );
+    }
+
+    #[test]
+    fn rejects_direct_collection_value_and_return_abis() {
+        fn int_list() -> ExternTypeExpr {
+            ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
+        }
+
+        fn list_param_abi() -> RustParamAbi {
+            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)))
+        }
+
+        fn list_return_abi() -> RustReturnAbi {
+            RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)))
+        }
+
+        fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
+            binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
+            binding
+        }
+
+        for (descriptor, binding) in [
+            (
+                param_descriptor("take", int_list(), ParamFlow::Value, ExternTypeExpr::Void),
+                void_binding("take", RustParamAbi::Value(int_list())),
+            ),
+            (
+                param_descriptor(
+                    "borrow",
+                    int_list(),
+                    ParamFlow::Borrow,
+                    ExternTypeExpr::Void,
+                ),
+                void_binding("borrow", RustParamAbi::Borrow(int_list())),
+            ),
+            (
+                param_descriptor("make", ExternTypeExpr::Void, ParamFlow::Value, int_list()),
+                binding_with_abi(
+                    "make",
+                    RustParamAbi::Value(ExternTypeExpr::Void),
+                    RustReturnAbi::Value(int_list()),
+                ),
+            ),
+            (
+                param_descriptor(
+                    "take_list",
+                    int_list(),
+                    ParamFlow::Value,
+                    ExternTypeExpr::Void,
+                ),
+                void_binding("take_list", list_param_abi()),
+            ),
+            (
+                param_descriptor(
+                    "make_list",
+                    ExternTypeExpr::Void,
+                    ParamFlow::Value,
+                    int_list(),
+                ),
+                binding_with_abi(
+                    "make_list",
+                    RustParamAbi::Value(ExternTypeExpr::Void),
+                    list_return_abi(),
+                ),
+            ),
+            (
+                param_descriptor(
+                    "maybe_make",
+                    ExternTypeExpr::Void,
+                    ParamFlow::Value,
+                    ExternTypeExpr::Option(Box::new(int_list())),
+                ),
+                binding_with_abi(
+                    "maybe_make",
+                    RustParamAbi::Value(ExternTypeExpr::Void),
+                    RustReturnAbi::Option(Box::new(RustReturnAbi::Value(int_list()))),
+                ),
+            ),
+        ] {
+            assert_abi_error(descriptor, binding, "direct collection ABI is unsupported");
+        }
+
+        assert_abi_ok(
+            param_descriptor(
+                "take_list_wrapper",
+                int_list(),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            wrapper(void_binding("take_list_wrapper", list_param_abi())),
+        );
+        assert_abi_ok(
+            param_descriptor(
+                "make_list_wrapper",
+                ExternTypeExpr::Void,
+                ParamFlow::Value,
+                int_list(),
+            ),
+            wrapper(binding_with_abi(
+                "make_list_wrapper",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                list_return_abi(),
+            )),
         );
     }
 

@@ -234,6 +234,7 @@ dependencies = [
  "anvyx-heap",
  "anvyx-macros",
  "ecow",
+ "indexmap",
  "inventory",
  "serde",
  "trybuild",

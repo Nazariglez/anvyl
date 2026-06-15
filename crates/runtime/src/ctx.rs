@@ -12,4 +12,8 @@ impl<'cx, 'rt> Ctx<'cx, 'rt> {
     pub fn heap(&mut self) -> &mut Heap<'cx> {
         self.heap
     }
+
+    pub fn heap_ref(&self) -> &Heap<'cx> {
+        self.heap
+    }
 }

@@ -8,6 +8,7 @@ anvyx-externs = { path = "../externs" }
 anvyx-heap = { path = "../heap" }
 anvyx-macros = { path = "../macros" }
 ecow = "0.2.6"
+indexmap = "2"
 inventory = "0.3"
 serde = { version = "1", features = ["derive"] }
 

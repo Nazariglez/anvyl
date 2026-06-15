@@ -1,14 +1,13 @@
-use std::{
-    borrow::Borrow,
-    fmt,
-    marker::PhantomData,
-    ops::{Index, Range},
-    ptr::NonNull,
+use std::{borrow::Borrow, fmt, hash::Hash, marker::PhantomData, ops::Range, ptr::NonNull};
+
+use ecow::EcoString;
+
+use crate::{
+    CollectionLoanState, Ctx, HeapType, ListStorage, MapStorage, RuntimeError, ShapeLoanGuard,
+    Trace, TraceDriver, Visitor,
+    cow_storage::{CowStorageOwner, CowStorageView},
+    heap_access_error,
 };
-
-use ecow::{EcoString, EcoVec};
-
-use crate::{CollectionLoanState, RuntimeError, ShapeLoanGuard, Trace, TraceDriver, Visitor};
 
 #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnvString {
@@ -84,23 +83,31 @@ unsafe impl<'cx> Trace<'cx> for AnvString {
     fn trace<D: TraceDriver<'cx>>(&self, _visitor: &mut Visitor<'cx, '_, D>) {}
 }
 
-pub struct AnvList<T> {
-    elems: EcoVec<T>,
+pub struct AnvList<'cx, T> {
+    storage: CowStorageOwner<'cx, ListStorage<'cx, T>>,
+    storage_ty: HeapType<'cx, ListStorage<'cx, T>>,
     loan: CollectionLoanState,
+    len: usize,
 }
 
-impl<T> Default for AnvList<T> {
-    fn default() -> Self {
+impl<'cx, T: 'cx> AnvList<'cx, T> {
+    pub fn from_elems<'rt>(
+        ctx: &mut Ctx<'cx, 'rt>,
+        storage_ty: HeapType<'cx, ListStorage<'cx, T>>,
+        elems: impl IntoIterator<Item = T>,
+    ) -> Self {
+        let storage = ListStorage::from_elems(elems);
+        let len = storage.len();
         Self {
-            elems: EcoVec::new(),
+            storage: CowStorageOwner::alloc(ctx.heap(), storage_ty, storage),
+            storage_ty,
             loan: CollectionLoanState::default(),
+            len,
         }
     }
-}
 
-impl<T> AnvList<T> {
     pub fn len(&self) -> usize {
-        self.elems.len()
+        self.len
     }
 
     pub fn len_i64(&self) -> i64 {
@@ -108,19 +115,11 @@ impl<T> AnvList<T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.elems.is_empty()
+        self.len == 0
     }
 
-    pub fn get(&self, index: usize) -> Option<&T> {
-        self.elems.get(index)
-    }
-
-    pub fn checked_index(&self, index: i64) -> &T {
-        &self.elems[crate::check::checked_index(index, self.len())]
-    }
-
-    pub fn as_slice(&self) -> &[T] {
-        self.elems.as_slice()
+    fn storage_view(&self) -> CowStorageView<'cx, ListStorage<'cx, T>> {
+        self.storage.view()
     }
 
     pub fn begin_shape_loan(&self) -> Result<ShapeLoanGuard, RuntimeError> {
@@ -131,24 +130,105 @@ impl<T> AnvList<T> {
         self.loan.current_version()
     }
 
-    pub fn with_elem_shared_short<R>(
+    fn with_storage<'rt, R>(
         &self,
+        ctx: &Ctx<'cx, 'rt>,
+        f: impl FnOnce(&ListStorage<'cx, T>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        ctx.heap_ref()
+            .try_with(self.storage.handle(), f)
+            .map_err(heap_access_error)?
+    }
+
+    fn make_unique<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>) -> Result<(), RuntimeError>
+    where
+        T: Clone,
+    {
+        self.storage
+            .make_unique(ctx.heap(), self.storage_ty)
+            .map_err(heap_access_error)
+    }
+
+    fn with_storage_mut<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut ListStorage<'cx, T>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        ctx.heap()
+            .try_with_mut(self.storage.handle(), f)
+            .map_err(heap_access_error)?
+    }
+
+    fn structurally_mutate_storage<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut ListStorage<'cx, T>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError>
+    where
+        T: Clone,
+    {
+        let loan = self.loan.clone();
+        loan.structural_mutation_result(|| {
+            self.make_unique(ctx)?;
+            let (result, len) = ctx
+                .heap()
+                .try_with_mut(self.storage.handle(), |storage| {
+                    let result = f(storage)?;
+                    Ok((result, storage.len()))
+                })
+                .map_err(heap_access_error)??;
+            self.len = len;
+            Ok(result)
+        })
+    }
+
+    pub fn to_vec<'rt>(&self, ctx: &Ctx<'cx, 'rt>) -> Result<Vec<T>, RuntimeError>
+    where
+        T: Clone,
+    {
+        self.with_storage(ctx, |storage| Ok(storage.as_slice().to_vec()))
+    }
+
+    pub fn checked_index<'rt>(&self, ctx: &Ctx<'cx, 'rt>, index: i64) -> Result<T, RuntimeError>
+    where
+        T: Clone,
+    {
+        let index = crate::check::checked_index(index, self.len());
+        self.with_storage(ctx, |storage| {
+            storage.get(index).cloned().ok_or_else(|| {
+                RuntimeError::new(format!(
+                    "list index {index} out of bounds for len {}",
+                    self.len()
+                ))
+            })
+        })
+    }
+
+    pub fn with_elem_shared_short<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
         f: impl FnOnce(&T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         self.loan.check_stable(expected_version)?;
-        let Some(elem) = self.elems.get(index) else {
-            return Err(RuntimeError::new(format!(
-                "list index {index} out of bounds for len {}",
-                self.len()
-            )));
-        };
-        f(elem)
+        self.with_storage(ctx, |storage| {
+            let Some(elem) = storage.get(index) else {
+                return Err(RuntimeError::new(format!(
+                    "list index {index} out of bounds for len {}",
+                    self.len()
+                )));
+            };
+            f(elem)
+        })
     }
 
-    pub fn with_elem_mut_short<R>(
+    /// # Safety
+    ///
+    /// The callback must not access this list's storage while it receives the element reference.
+    pub unsafe fn with_elem_mut_short<'rt, R>(
         &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
@@ -157,110 +237,154 @@ impl<T> AnvList<T> {
         T: Clone,
     {
         self.loan.check_stable(expected_version)?;
+        self.check_elem_index(index)?;
+        self.make_unique(ctx)?;
+        self.with_storage_mut(ctx, |storage| {
+            let elem = storage
+                .get_mut(index)
+                .expect("list storage length drifted from list length");
+            f(elem)
+        })
+    }
+
+    pub fn with_elem_owned_mut_ctx_short<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError>
+    where
+        T: Clone,
+    {
+        self.loan.check_stable(expected_version)?;
+        self.check_elem_index(index)?;
+        self.make_unique(ctx)?;
+        let mut elem = self.with_storage(ctx, |storage| {
+            Ok(storage
+                .get(index)
+                .expect("list storage length drifted from list length")
+                .clone())
+        })?;
+        let result = f(ctx, &mut elem)?;
+        self.loan.check_stable(expected_version)?;
+        self.check_elem_index(index)?;
+        self.with_storage_mut(ctx, |storage| {
+            *storage
+                .get_mut(index)
+                .expect("list storage length drifted from list length") = elem;
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn check_elem_index(&self, index: usize) -> Result<(), RuntimeError> {
         let len = self.len();
-        let Some(elem) = self.elems.make_mut().get_mut(index) else {
-            return Err(RuntimeError::new(format!(
-                "list index {index} out of bounds for len {len}"
-            )));
-        };
-        f(elem)
-    }
-}
-
-impl<T: Clone> Clone for AnvList<T> {
-    fn clone(&self) -> Self {
-        Self {
-            elems: self.elems.clone(),
-            loan: CollectionLoanState::default(),
+        if index < len {
+            return Ok(());
         }
+        Err(RuntimeError::new(format!(
+            "list index {index} out of bounds for len {len}"
+        )))
     }
-}
 
-impl<T: PartialEq> PartialEq for AnvList<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.elems == other.elems
-    }
-}
-
-impl<T: Eq> Eq for AnvList<T> {}
-
-impl<T: Clone> AnvList<T> {
     #[must_use]
     pub fn share(&self) -> Self {
-        self.clone()
-    }
-
-    pub fn from_elems(elems: impl IntoIterator<Item = T>) -> Self {
         Self {
-            elems: elems.into_iter().collect(),
+            storage: self.storage.share(),
+            storage_ty: self.storage_ty,
             loan: CollectionLoanState::default(),
+            len: self.len,
         }
     }
 
-    pub fn elem_at_shared(&self, index: usize, expected_version: u64) -> Result<T, RuntimeError> {
-        self.with_elem_shared_short(index, expected_version, |elem| Ok(elem.clone()))
+    pub fn elem_at_shared<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+    ) -> Result<T, RuntimeError>
+    where
+        T: Clone,
+    {
+        self.with_elem_shared_short(ctx, index, expected_version, |elem| Ok(elem.clone()))
     }
 
-    pub fn push(&mut self, elem: T) -> Result<(), RuntimeError> {
-        let loan = self.loan.clone();
-        loan.structural_mutation(|| self.elems.push(elem))
+    pub fn push<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>, elem: T) -> Result<(), RuntimeError>
+    where
+        T: Clone,
+    {
+        self.structurally_mutate_storage(ctx, |storage| {
+            storage.push(elem);
+            Ok(())
+        })
     }
 
     pub fn replace_with(&mut self, other: Self) -> Result<(), RuntimeError> {
         let loan = self.loan.clone();
-        loan.structural_mutation(|| *self = other)
+        loan.structural_mutation_result(|| {
+            let Self {
+                storage,
+                storage_ty,
+                loan: _,
+                len,
+            } = other;
+            self.storage = storage;
+            self.storage_ty = storage_ty;
+            self.len = len;
+            Ok(())
+        })
     }
 }
 
-impl<T: Clone> FromIterator<T> for AnvList<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self::from_elems(iter)
+impl<'cx, T: 'cx> Clone for AnvList<'cx, T> {
+    fn clone(&self) -> Self {
+        self.share()
     }
 }
 
-impl<T> Index<usize> for AnvList<T> {
-    type Output = T;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        self.elems
-            .get(index)
-            .unwrap_or_else(|| panic!("list index {index} out of bounds for len {}", self.len()))
+impl<T: fmt::Debug> fmt::Debug for AnvList<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnvList").field("len", &self.len).finish()
     }
 }
 
-impl<T> Index<Range<usize>> for AnvList<T> {
-    type Output = [T];
-
-    fn index(&self, range: Range<usize>) -> &Self::Output {
-        &self.as_slice()[range]
+// SAFETY: logical list values trace only the heap-visible storage owner; storage traces elements.
+unsafe impl<'cx, T> Trace<'cx> for AnvList<'cx, T> {
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        self.storage.trace(visitor);
     }
 }
 
-pub struct AnvMap<K, V> {
-    entries: EcoVec<(K, V)>,
+pub struct AnvMap<'cx, K, V> {
+    storage: CowStorageOwner<'cx, MapStorage<'cx, K, V>>,
+    storage_ty: HeapType<'cx, MapStorage<'cx, K, V>>,
     loan: CollectionLoanState,
+    len: usize,
 }
 
-impl<K, V> Default for AnvMap<K, V> {
-    fn default() -> Self {
+impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
+    pub fn from_entries<'rt>(
+        ctx: &mut Ctx<'cx, 'rt>,
+        storage_ty: HeapType<'cx, MapStorage<'cx, K, V>>,
+        entries: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        let storage = MapStorage::from_entries(entries);
+        let len = storage.len();
         Self {
-            entries: EcoVec::new(),
+            storage: CowStorageOwner::alloc(ctx.heap(), storage_ty, storage),
+            storage_ty,
             loan: CollectionLoanState::default(),
+            len,
         }
     }
-}
 
-impl<K, V> AnvMap<K, V> {
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.entries.iter().map(|(key, value)| (key, value))
+        self.len == 0
     }
 
     pub fn begin_shape_loan(&self) -> Result<ShapeLoanGuard, RuntimeError> {
@@ -270,42 +394,95 @@ impl<K, V> AnvMap<K, V> {
     pub fn structural_version(&self) -> u64 {
         self.loan.current_version()
     }
-}
 
-impl<K: PartialEq, V> AnvMap<K, V> {
-    fn find_key(&self, key: &K) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|(entry_key, _)| entry_key == key)
+    fn with_storage<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        f: impl FnOnce(&MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        ctx.heap_ref()
+            .try_with(self.storage.handle(), f)
+            .map_err(heap_access_error)?
     }
 
-    fn entry_at_checked(
-        &self,
-        index: usize,
-        expected_version: u64,
-    ) -> Result<(&K, &V), RuntimeError> {
-        self.loan.check_stable(expected_version)?;
-        self.entry_at(index).ok_or_else(|| {
-            RuntimeError::new(format!(
-                "map entry index {index} out of bounds for len {}",
-                self.len()
-            ))
+    fn with_storage_mut<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        ctx.heap()
+            .try_with_mut(self.storage.handle(), f)
+            .map_err(heap_access_error)?
+    }
+
+    pub fn get<'rt>(&self, ctx: &Ctx<'cx, 'rt>, key: &K) -> Result<Option<V>, RuntimeError>
+    where
+        V: Clone,
+    {
+        self.with_storage(ctx, |storage| Ok(storage.get(key).cloned()))
+    }
+
+    fn make_unique<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>) -> Result<(), RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.storage
+            .make_unique(ctx.heap(), self.storage_ty)
+            .map_err(heap_access_error)
+    }
+
+    fn structurally_mutate_storage<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        let loan = self.loan.clone();
+        loan.structural_mutation_result(|| {
+            self.make_unique(ctx)?;
+            let (result, len) = self.with_storage_mut(ctx, |storage| {
+                let result = f(storage)?;
+                Ok((result, storage.len()))
+            })?;
+            self.len = len;
+            Ok(result)
         })
     }
 
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.entries
-            .iter()
-            .find(|(entry_key, _)| entry_key == key)
-            .map(|(_, value)| value)
+    fn entry_at_checked<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+    ) -> Result<(K, V), RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.loan.check_stable(expected_version)?;
+        self.with_storage(ctx, |storage| {
+            storage
+                .get_index(index)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .ok_or_else(|| {
+                    RuntimeError::new(format!(
+                        "map entry index {index} out of bounds for len {}",
+                        self.len()
+                    ))
+                })
+        })
     }
 
-    pub fn entry_at(&self, index: usize) -> Option<(&K, &V)> {
-        self.entries.get(index).map(|(key, value)| (key, value))
-    }
-
-    pub fn with_value_mut_short<R>(
+    /// # Safety
+    ///
+    /// The callback must not access this map's storage while it receives the value reference.
+    pub unsafe fn with_value_mut_short<'rt, R>(
         &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
         f: impl FnOnce(&mut V) -> Result<R, RuntimeError>,
@@ -316,121 +493,162 @@ impl<K: PartialEq, V> AnvMap<K, V> {
     {
         self.loan.check_stable(expected_version)?;
         let len = self.len();
-        let Some((_, value)) = self.entries.make_mut().get_mut(index) else {
+        if index >= len {
             return Err(RuntimeError::new(format!(
                 "map entry index {index} out of bounds for len {len}"
             )));
-        };
-        f(value)
-    }
-}
-
-impl<K: Clone, V: Clone> Clone for AnvMap<K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            entries: self.entries.clone(),
-            loan: CollectionLoanState::default(),
         }
+        self.make_unique(ctx)?;
+        self.with_storage_mut(ctx, |storage| {
+            let Some((_, value)) = storage.get_index_mut(index) else {
+                return Err(RuntimeError::new(format!(
+                    "map entry index {index} out of bounds for len {len}"
+                )));
+            };
+            f(value)
+        })
     }
-}
 
-impl<K: PartialEq, V: PartialEq> PartialEq for AnvMap<K, V> {
-    fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
-    }
-}
-
-impl<K: Eq, V: Eq> Eq for AnvMap<K, V> {}
-
-impl<K: Clone + PartialEq, V: Clone> AnvMap<K, V> {
     #[must_use]
     pub fn share(&self) -> Self {
-        self.clone()
-    }
-
-    pub fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let mut map = Self::default();
-        for (key, value) in entries {
-            map.insert_unchecked(key, value);
+        Self {
+            storage: self.storage.share(),
+            storage_ty: self.storage_ty,
+            loan: CollectionLoanState::default(),
+            len: self.len,
         }
-        map
     }
 
-    fn insert_unchecked(&mut self, key: K, value: V) -> Option<V> {
-        if let Some(index) = self.find_key(&key) {
-            return Some(std::mem::replace(
-                &mut self.entries.make_mut()[index].1,
-                value,
-            ));
+    pub fn key_at_shared<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+    ) -> Result<K, RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.entry_at_checked(ctx, index, expected_version)
+            .map(|(key, _)| key)
+    }
+
+    pub fn value_at_shared<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+    ) -> Result<V, RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.entry_at_checked(ctx, index, expected_version)
+            .map(|(_, value)| value)
+    }
+
+    pub fn insert<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        key: K,
+        value: V,
+    ) -> Result<Option<V>, RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        if self.with_storage(ctx, |storage| Ok(storage.get(&key).is_some()))? {
+            self.make_unique(ctx)?;
+            return self.with_storage_mut(ctx, |storage| Ok(storage.insert(key, value)));
         }
-        self.entries.push((key, value));
-        None
-    }
-
-    pub fn key_at_shared(&self, index: usize, expected_version: u64) -> Result<K, RuntimeError> {
-        self.entry_at_checked(index, expected_version)
-            .map(|(key, _)| key.clone())
-    }
-
-    pub fn value_at_shared(&self, index: usize, expected_version: u64) -> Result<V, RuntimeError> {
-        self.entry_at_checked(index, expected_version)
-            .map(|(_, value)| value.clone())
-    }
-
-    pub fn insert(&mut self, key: K, value: V) -> Result<Option<V>, RuntimeError> {
-        if let Some(index) = self.find_key(&key) {
-            return Ok(Some(std::mem::replace(
-                &mut self.entries.make_mut()[index].1,
-                value,
-            )));
-        }
-        let loan = self.loan.clone();
-        loan.structural_mutation(|| self.entries.push((key, value)))?;
+        let old =
+            self.structurally_mutate_storage(ctx, |storage| Ok(storage.insert(key, value)))?;
+        debug_assert!(old.is_none());
         Ok(None)
     }
 
-    pub fn remove(&mut self, key: &K) -> Result<Option<V>, RuntimeError> {
-        let Some(index) = self.find_key(key) else {
+    pub fn remove<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        key: &K,
+    ) -> Result<Option<V>, RuntimeError>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        if !self.with_storage(ctx, |storage| Ok(storage.get(key).is_some()))? {
             return Ok(None);
-        };
-        let loan = self.loan.clone();
-        loan.structural_mutation(|| self.entries.remove(index).1)
-            .map(Some)
+        }
+        self.structurally_mutate_storage(ctx, |storage| Ok(storage.shift_remove(key)))
     }
 
     pub fn replace_with(&mut self, other: Self) -> Result<(), RuntimeError> {
         let loan = self.loan.clone();
-        loan.structural_mutation(|| *self = other)
+        loan.structural_mutation_result(|| {
+            let Self {
+                storage,
+                storage_ty,
+                loan: _,
+                len,
+            } = other;
+            self.storage = storage;
+            self.storage_ty = storage_ty;
+            self.len = len;
+            Ok(())
+        })
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for AnvMap<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for AnvList<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.elems.fmt(f)
-    }
-}
-
-enum SliceRoot<T> {
-    Raw { ptr: NonNull<T>, len: usize },
-    List { list: NonNull<AnvList<T>> },
-}
-
-impl<T> Clone for SliceRoot<T> {
+impl<'cx, K: Eq + Hash + 'cx, V: 'cx> Clone for AnvMap<'cx, K, V> {
     fn clone(&self) -> Self {
-        *self
+        self.share()
     }
 }
 
-impl<T> Copy for SliceRoot<T> {}
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for AnvMap<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnvMap").field("len", &self.len).finish()
+    }
+}
 
-pub struct AnvSlice<T> {
-    root: SliceRoot<T>,
+// SAFETY: logical map values trace only the heap-visible storage owner; storage traces entries.
+unsafe impl<'cx, K, V> Trace<'cx> for AnvMap<'cx, K, V> {
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        self.storage.trace(visitor);
+    }
+}
+
+enum SliceRoot<'cx, T> {
+    Raw {
+        ptr: NonNull<T>,
+        len: usize,
+    },
+    List {
+        storage: CowStorageView<'cx, ListStorage<'cx, T>>,
+        storage_len: usize,
+    },
+}
+
+impl<T> Clone for SliceRoot<'_, T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Raw { ptr, len } => Self::Raw {
+                ptr: *ptr,
+                len: *len,
+            },
+            Self::List {
+                storage,
+                storage_len,
+            } => Self::List {
+                storage: storage.clone(),
+                storage_len: *storage_len,
+            },
+        }
+    }
+}
+
+pub struct AnvSlice<'cx, T> {
+    root: SliceRoot<'cx, T>,
     start: usize,
     len: usize,
     guard: Option<ShapeLoanGuard>,
@@ -438,10 +656,10 @@ pub struct AnvSlice<T> {
     _marker: PhantomData<T>,
 }
 
-impl<T> AnvSlice<T> {
+impl<'cx, T: 'cx> AnvSlice<'cx, T> {
     /// # Safety
     ///
-    /// `ptr` must point to `len` initialized contiguous elements that outlive the returned descriptor.
+    /// `ptr` must point to initialized contiguous elements that outlive the returned descriptor.
     pub unsafe fn from_raw_parts(ptr: *const T, len: usize, start: usize, len_view: usize) -> Self {
         let ptr = NonNull::new(ptr.cast_mut()).expect("slice root pointer cannot be null");
         Self::new(SliceRoot::Raw { ptr, len }, start, len_view, None, false)
@@ -449,7 +667,8 @@ impl<T> AnvSlice<T> {
 
     /// # Safety
     ///
-    /// `ptr` must point to `len` initialized contiguous elements, be uniquely mutable during short mutable accesses, and outlive the returned descriptor.
+    /// `ptr` must point to initialized contiguous elements, be uniquely mutable during short mutable
+    /// accesses, and outlive the returned descriptor.
     pub unsafe fn from_raw_parts_mut(
         ptr: *mut T,
         len: usize,
@@ -460,34 +679,49 @@ impl<T> AnvSlice<T> {
         Self::new(SliceRoot::Raw { ptr, len }, start, len_view, None, true)
     }
 
-    /// # Safety
-    ///
-    /// `list` must remain valid and must not be moved while the returned descriptor can be used.
-    pub unsafe fn from_list(
-        list: *const AnvList<T>,
+    pub fn from_list(
+        list: &AnvList<'cx, T>,
         start: usize,
         len: usize,
-        guard: ShapeLoanGuard,
-    ) -> Self {
-        let list = NonNull::new(list.cast_mut()).expect("slice root pointer cannot be null");
-        Self::new(SliceRoot::List { list }, start, len, Some(guard), false)
+    ) -> Result<Self, RuntimeError> {
+        let guard = list.begin_shape_loan()?;
+        Ok(Self::new(
+            SliceRoot::List {
+                storage: list.storage_view(),
+                storage_len: list.len(),
+            },
+            start,
+            len,
+            Some(guard),
+            false,
+        ))
     }
 
-    /// # Safety
-    ///
-    /// `list` must remain valid, must not be moved, and must be uniquely mutable during short mutable accesses while the descriptor can be used.
-    pub unsafe fn from_list_mut(
-        list: *mut AnvList<T>,
+    pub fn from_list_mut<'rt>(
+        ctx: &mut Ctx<'cx, 'rt>,
+        list: &mut AnvList<'cx, T>,
         start: usize,
         len: usize,
-        guard: ShapeLoanGuard,
-    ) -> Self {
-        let list = NonNull::new(list).expect("slice root pointer cannot be null");
-        Self::new(SliceRoot::List { list }, start, len, Some(guard), true)
+    ) -> Result<Self, RuntimeError>
+    where
+        T: Clone,
+    {
+        list.make_unique(ctx)?;
+        let guard = list.begin_shape_loan()?;
+        Ok(Self::new(
+            SliceRoot::List {
+                storage: list.storage_view(),
+                storage_len: list.len(),
+            },
+            start,
+            len,
+            Some(guard),
+            true,
+        ))
     }
 
     fn new(
-        root: SliceRoot<T>,
+        root: SliceRoot<'cx, T>,
         start: usize,
         len: usize,
         guard: Option<ShapeLoanGuard>,
@@ -510,13 +744,19 @@ impl<T> AnvSlice<T> {
 
     #[must_use]
     pub fn readonly(&self) -> Self {
-        Self::new(self.root, self.start, self.len, self.guard.clone(), false)
+        Self::new(
+            self.root.clone(),
+            self.start,
+            self.len,
+            self.guard.clone(),
+            false,
+        )
     }
 
     #[must_use]
     pub fn slice(&self, start: usize, len: usize) -> Self {
         Self::new(
-            self.root,
+            self.root.clone(),
             self.start + start,
             len,
             self.guard.clone(),
@@ -532,7 +772,7 @@ impl<T> AnvSlice<T> {
         self.len == 0
     }
 
-    pub fn elem_at_shared(&self, index: i64) -> Result<T, RuntimeError>
+    pub fn elem_at_shared<'rt>(&self, ctx: &Ctx<'cx, 'rt>, index: i64) -> Result<T, RuntimeError>
     where
         T: Clone,
     {
@@ -542,41 +782,65 @@ impl<T> AnvSlice<T> {
             SliceRoot::Raw { ptr, .. } => unsafe {
                 Ok(ptr.as_ptr().add(absolute).as_ref().unwrap().clone())
             },
-            SliceRoot::List { list } => unsafe {
-                let list = list.as_ref();
+            SliceRoot::List { ref storage, .. } => {
                 self.check_stable()?;
-                list.elem_at_shared(absolute, self.version())
-            },
+                ctx.heap_ref()
+                    .try_with(storage.handle(), |storage| {
+                        storage.get(absolute).cloned().ok_or_else(|| {
+                            RuntimeError::new(format!(
+                                "slice index {index} out of bounds for len {}",
+                                self.len
+                            ))
+                        })
+                    })
+                    .map_err(heap_access_error)?
+            }
         }
     }
 
     /// # Safety
     ///
-    /// `convert` must not access, mutate, move, or invalidate the slice root while it receives element references.
-    pub unsafe fn copy_range_with<U: Clone>(
+    ///  must not access, mutate, move, or invalidate the slice root while it receives element references.
+    pub unsafe fn copy_range_with<'rt, U: 'cx + Clone>(
         &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        storage_ty: HeapType<'cx, ListStorage<'cx, U>>,
         range: Range<usize>,
         mut convert: impl FnMut(&T) -> U,
-    ) -> Result<AnvList<U>, RuntimeError> {
+    ) -> Result<AnvList<'cx, U>, RuntimeError> {
         let absolute = self.check_view_range(range)?;
+        let mut elems = vec![];
         match self.root {
             SliceRoot::Raw { ptr, .. } => unsafe {
-                Ok(AnvList::from_elems(absolute.map(|index| {
-                    convert(ptr.as_ptr().add(index).as_ref().unwrap())
-                })))
+                for index in absolute {
+                    elems.push(convert(ptr.as_ptr().add(index).as_ref().unwrap()));
+                }
             },
-            SliceRoot::List { list } => unsafe {
-                let list = list.as_ref();
+            SliceRoot::List { ref storage, .. } => {
                 self.check_stable()?;
-                Ok(AnvList::from_elems(
-                    list.as_slice()[absolute].iter().map(convert),
-                ))
-            },
+                ctx.heap_ref()
+                    .try_with(storage.handle(), |storage| {
+                        for index in absolute {
+                            let Some(elem) = storage.get(index) else {
+                                return Err(RuntimeError::new("slice range out of bounds"));
+                            };
+                            elems.push(convert(elem));
+                        }
+                        Ok(())
+                    })
+                    .map_err(heap_access_error)??;
+            }
         }
+        Ok(AnvList::from_elems(ctx, storage_ty, elems))
     }
 
-    pub fn with_elem_mut_short<R>(
+    /// # Safety
+    ///
+    /// The callback must not access, mutate, move, or invalidate the slice root while it receives
+    /// the element reference.
+    pub unsafe fn with_elem_mut_short<'rt, R>(
         &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
         index: i64,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError>
@@ -592,12 +856,69 @@ impl<T> AnvSlice<T> {
             SliceRoot::Raw { ptr, .. } => unsafe {
                 f(ptr.as_ptr().add(absolute).as_mut().unwrap())
             },
-            SliceRoot::List { mut list } => unsafe {
-                let list = list.as_mut();
+            SliceRoot::List { ref storage, .. } => {
                 self.check_stable()?;
-                list.with_elem_mut_short(absolute, self.version(), f)
-            },
+                ctx.heap()
+                    .try_with_mut(storage.handle(), |storage| {
+                        let Some(elem) = storage.get_mut(absolute) else {
+                            return Err(RuntimeError::new("slice index out of bounds"));
+                        };
+                        f(elem)
+                    })
+                    .map_err(heap_access_error)?
+            }
         }
+    }
+
+    pub fn with_elem_owned_mut_ctx_short<'rt, R>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        index: i64,
+        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError>
+    where
+        T: Clone,
+    {
+        if !self.mutable {
+            return Err(RuntimeError::new("cannot mutate readonly slice"));
+        }
+        let index = self.check_view_index(index)?;
+        let absolute = self.start + index;
+        let mut elem = match self.root {
+            SliceRoot::Raw { ptr, .. } => unsafe {
+                ptr.as_ptr().add(absolute).as_ref().unwrap().clone()
+            },
+            SliceRoot::List { ref storage, .. } => {
+                self.check_stable()?;
+                ctx.heap_ref()
+                    .try_with(storage.handle(), |storage| {
+                        storage
+                            .get(absolute)
+                            .cloned()
+                            .ok_or_else(|| RuntimeError::new("slice index out of bounds"))
+                    })
+                    .map_err(heap_access_error)??
+            }
+        };
+        let result = f(ctx, &mut elem)?;
+        match self.root {
+            SliceRoot::Raw { ptr, .. } => unsafe {
+                *ptr.as_ptr().add(absolute) = elem;
+            },
+            SliceRoot::List { ref storage, .. } => {
+                self.check_stable()?;
+                ctx.heap()
+                    .try_with_mut(storage.handle(), |storage| {
+                        let Some(slot) = storage.get_mut(absolute) else {
+                            return Err(RuntimeError::new("slice index out of bounds"));
+                        };
+                        *slot = elem;
+                        Ok(())
+                    })
+                    .map_err(heap_access_error)??;
+            }
+        }
+        Ok(result)
     }
 
     fn check_stable(&self) -> Result<(), RuntimeError> {
@@ -607,20 +928,13 @@ impl<T> AnvSlice<T> {
         }
     }
 
-    fn version(&self) -> u64 {
-        self.guard
-            .as_ref()
-            .expect("list slice needs guard")
-            .version()
-    }
-
     fn check_view_range(&self, range: Range<usize>) -> Result<Range<usize>, RuntimeError> {
         let Some(view_end) = self.start.checked_add(self.len) else {
             return Err(RuntimeError::new("slice range out of bounds"));
         };
         let root_len = match self.root {
             SliceRoot::Raw { len, .. } => len,
-            SliceRoot::List { list } => unsafe { list.as_ref().len() },
+            SliceRoot::List { storage_len, .. } => storage_len,
         };
         if view_end > root_len || range.start > range.end || range.end > self.len {
             return Err(RuntimeError::new("slice range out of bounds"));
@@ -645,10 +959,31 @@ impl<T> AnvSlice<T> {
     }
 }
 
+// SAFETY: list-backed slices trace their storage view; raw slices only borrow non-heap array memory.
+unsafe impl<'cx, T> Trace<'cx> for AnvSlice<'cx, T> {
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        if let SliceRoot::List { storage, .. } = &self.root {
+            storage.trace(visitor);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::{AnvList, AnvMap, AnvSlice, AnvString};
-    use crate::{Heap, Trace, TraceDriver, Visitor};
+    use crate::{
+        Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, Trace, TraceDriver, Visitor,
+    };
+
+    fn list_ty<'cx, T: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, ListStorage<'cx, T>> {
+        heap.register_untracked::<ListStorage<'_, T>>()
+    }
+
+    fn map_ty<'cx, K: 'cx, V: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, MapStorage<'cx, K, V>> {
+        heap.register_untracked::<MapStorage<'_, K, V>>()
+    }
 
     #[test]
     fn anv_string_static_and_owned_construction() {
@@ -659,40 +994,6 @@ mod tests {
         assert!(!static_text.is_empty());
         assert_eq!(AnvString::from(String::from("owned")).as_str(), "owned");
         assert_eq!(AnvString::from("borrowed").as_str(), "borrowed");
-    }
-
-    #[test]
-    fn anv_string_concat_keeps_order() {
-        let text = AnvString::concat(["red", " ", "fox"]);
-        assert_eq!(text.as_str(), "red fox");
-    }
-
-    #[test]
-    fn anv_string_heap_clone_is_independent_after_mutation() {
-        let original = AnvString::from("this string is long enough to spill out of inline storage");
-        let mut changed = original.clone();
-
-        changed.text.push_str("+");
-
-        assert_eq!(
-            original.as_str(),
-            "this string is long enough to spill out of inline storage"
-        );
-        assert_eq!(
-            changed.as_str(),
-            "this string is long enough to spill out of inline storage+"
-        );
-    }
-
-    #[test]
-    fn anv_string_as_str_needs_no_runtime_context() {
-        fn accepts_str(text: &str) -> usize {
-            text.len()
-        }
-
-        let text = AnvString::from("ctx-free");
-
-        assert_eq!(accepts_str(text.as_str()), 8);
     }
 
     #[test]
@@ -725,315 +1026,416 @@ mod tests {
     }
 
     #[test]
-    fn anv_list_constructs_indexes_and_reports_len() {
-        let list = AnvList::from_elems([1_i64, 2, 3]);
+    fn list_constructs_in_heap_storage() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
 
-        assert_eq!(list.len(), 3);
-        assert_eq!(list.len_i64(), 3);
-        assert_eq!(list.get(1), Some(&2));
-        assert_eq!(*list.checked_index(2), 3);
-        assert_eq!(list.as_slice(), &[1, 2, 3]);
+            assert_eq!(list.len(), 3);
+            assert_eq!(list.len_i64(), 3);
+            assert_eq!(list.checked_index(&ctx, 2).unwrap(), 3);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "negative index")]
-    fn anv_list_rejects_negative_index() {
-        AnvList::from_elems([1_i64]).checked_index(-1);
+    fn list_push_updates_storage_and_version() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2]);
+
+            list.push(&mut ctx, 3).unwrap();
+
+            assert_eq!(list.structural_version(), 1);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
+        });
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn anv_list_rejects_out_of_bounds_index() {
-        AnvList::from_elems([1_i64]).checked_index(1);
+    fn list_share_detaches_on_structural_mutation() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
+            let mut shared = list.share();
+
+            shared.push(&mut ctx, 2).unwrap();
+
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1]);
+            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2]);
+            assert!(list.storage.is_unique());
+            assert!(shared.storage.is_unique());
+        });
     }
 
     #[test]
-    fn anv_list_clone_mutation_detaches() {
-        let original = AnvList::from_elems([1_i64, 2]);
-        let mut changed = original.clone();
+    fn list_storage_view_does_not_force_detach() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
+            let view = list.storage.view();
 
-        changed.push(3).unwrap();
+            list.push(&mut ctx, 2).unwrap();
 
-        assert_eq!(original.as_slice(), &[1, 2]);
-        assert_eq!(changed.as_slice(), &[1, 2, 3]);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2]);
+            assert_eq!(view.handle().strong_count(), 2);
+            assert!(list.storage.is_unique());
+        });
     }
 
     #[test]
-    fn anv_list_preserves_value_semantics_after_aliasing() {
-        let a = AnvList::from_elems([AnvString::from("a")]);
-        let mut b = a.clone();
+    fn list_active_loan_blocks_before_detach() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
+            let mut shared = list.share();
+            let _guard = shared.begin_shape_loan().unwrap();
 
-        b.push(AnvString::from("b")).unwrap();
+            assert!(shared.push(&mut ctx, 2).is_err());
 
-        assert_eq!(a.checked_index(0).as_str(), "a");
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.checked_index(1).as_str(), "b");
+            assert_eq!(list.storage.logical_owners(), 2);
+            assert_eq!(shared.storage.logical_owners(), 2);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1]);
+            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1]);
+        });
     }
 
     #[test]
-    fn anv_map_preserves_insertion_order_and_replaces() {
-        let mut map = AnvMap::from_entries([("a", 1_i64), ("b", 2)]);
+    fn list_element_mutation_uses_heap_storage() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2]);
+            let guard = list.begin_shape_loan().unwrap();
+            let version = guard.version();
 
-        assert_eq!(map.insert("a", 3).unwrap(), Some(1));
-        assert_eq!(map.get(&"a"), Some(&3));
-        assert_eq!(map.iter().collect::<Vec<_>>(), vec![(&"a", &3), (&"b", &2)]);
+            unsafe {
+                list.with_elem_mut_short(&mut ctx, 1, version, |elem| {
+                    *elem = 5;
+                    Ok(())
+                })
+            }
+            .unwrap();
+
+            assert_eq!(list.structural_version(), 0);
+            assert_eq!(list.elem_at_shared(&ctx, 1, version).unwrap(), 5);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 5]);
+        });
+    }
+
+    struct TraceChild {
+        traces: Rc<Cell<u32>>,
+    }
+
+    struct TraceRoot<'cx> {
+        list: AnvList<'cx, Handle<'cx, TraceChild>>,
+        self_ref: Option<Handle<'cx, TraceRoot<'cx>>>,
+        root_traces: Rc<Cell<u32>>,
+    }
+
+    struct TraceMapRoot<'cx> {
+        map: AnvMap<'cx, i64, Handle<'cx, TraceChild>>,
+        self_ref: Option<Handle<'cx, TraceMapRoot<'cx>>>,
+        root_traces: Rc<Cell<u32>>,
+    }
+
+    unsafe impl<'cx> Trace<'cx> for TraceChild {
+        fn trace<D: TraceDriver<'cx>>(&self, _visitor: &mut Visitor<'cx, '_, D>) {
+            self.traces.set(self.traces.get() + 1);
+        }
+    }
+
+    unsafe impl<'cx> Trace<'cx> for TraceRoot<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.root_traces.set(self.root_traces.get() + 1);
+            self.list.trace(visitor);
+            self.self_ref.trace(visitor);
+        }
+    }
+
+    unsafe impl<'cx> Trace<'cx> for TraceMapRoot<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.root_traces.set(self.root_traces.get() + 1);
+            self.map.trace(visitor);
+            self.self_ref.trace(visitor);
+        }
     }
 
     #[test]
-    fn anv_map_remove_and_alias_detach() {
-        let original = AnvMap::from_entries([(1_i64, AnvString::from("one"))]);
-        let mut changed = original.share();
+    fn list_traces_storage_handle_and_storage_traces_elements_once() {
+        Heap::scope(|heap| {
+            let child_traces = Rc::new(Cell::new(0));
+            let root_traces = Rc::new(Cell::new(0));
+            let child_ty = heap.register_tracked::<TraceChild>();
+            let list_ty = heap.register_tracked::<ListStorage<'_, Handle<'_, TraceChild>>>();
+            let root_ty = heap.register_tracked::<TraceRoot<'_>>();
+            let child = heap.alloc(
+                child_ty,
+                TraceChild {
+                    traces: Rc::clone(&child_traces),
+                },
+            );
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, list_ty, [child]);
+            let root = ctx.heap().alloc(
+                root_ty,
+                TraceRoot {
+                    list,
+                    self_ref: None,
+                    root_traces: Rc::clone(&root_traces),
+                },
+            );
+            ctx.heap()
+                .with_mut(&root, |root_data| root_data.self_ref = Some(root.clone()));
 
-        changed.insert(2, AnvString::from("two")).unwrap();
-        assert!(original.get(&2).is_none());
-        assert_eq!(
-            changed.remove(&1).unwrap().as_ref().map(AnvString::as_str),
-            Some("one")
-        );
-        assert!(changed.get(&1).is_none());
+            drop(root);
+            ctx.heap().reset_stats();
+            let outcome = ctx.heap().collect_all();
+
+            assert_eq!(outcome.collected, 3);
+            assert_eq!(root_traces.get(), 1);
+            assert_eq!(child_traces.get(), 1);
+            assert_eq!(ctx.heap().stats().edge_visits, 3);
+            assert_eq!(ctx.heap().stats().internal_edges, 3);
+        });
     }
 
     #[test]
-    fn list_structural_mutation_is_guarded() {
-        let mut list = AnvList::from_elems([1_i64, 2]);
-        let guard = list.begin_shape_loan().unwrap();
+    fn map_traces_storage_handle_and_storage_traces_entries_once() {
+        Heap::scope(|heap| {
+            let child_traces = Rc::new(Cell::new(0));
+            let root_traces = Rc::new(Cell::new(0));
+            let child_ty = heap.register_tracked::<TraceChild>();
+            let map_ty = heap.register_tracked::<MapStorage<'_, i64, Handle<'_, TraceChild>>>();
+            let root_ty = heap.register_tracked::<TraceMapRoot<'_>>();
+            let child = heap.alloc(
+                child_ty,
+                TraceChild {
+                    traces: Rc::clone(&child_traces),
+                },
+            );
+            let mut ctx = Ctx::new(heap);
+            let map = AnvMap::from_entries(&mut ctx, map_ty, [(1_i64, child)]);
+            let root = ctx.heap().alloc(
+                root_ty,
+                TraceMapRoot {
+                    map,
+                    self_ref: None,
+                    root_traces: Rc::clone(&root_traces),
+                },
+            );
+            ctx.heap()
+                .with_mut(&root, |root_data| root_data.self_ref = Some(root.clone()));
 
-        assert!(list.push(3).is_err());
-        assert_eq!(list.as_slice(), &[1, 2]);
-        drop(guard);
+            drop(root);
+            ctx.heap().reset_stats();
+            let outcome = ctx.heap().collect_all();
 
-        list.push(3).unwrap();
-        assert_eq!(list.structural_version(), 1);
-        assert_eq!(list.as_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn list_element_mutation_is_not_structural() {
-        let mut list = AnvList::from_elems([1_i64, 2]);
-        let guard = list.begin_shape_loan().unwrap();
-        let version = guard.version();
-
-        list.with_elem_mut_short(1, version, |elem| {
-            *elem = 5;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(list.structural_version(), 0);
-        assert_eq!(list.elem_at_shared(1, version).unwrap(), 5);
-        assert_eq!(list.as_slice(), &[1, 5]);
-    }
-
-    #[test]
-    fn list_replacement_is_guarded() {
-        let mut list = AnvList::from_elems([1_i64, 2]);
-        let guard = list.begin_shape_loan().unwrap();
-
-        assert!(list.replace_with(AnvList::from_elems([3])).is_err());
-        drop(guard);
-        list.replace_with(AnvList::from_elems([3])).unwrap();
-        assert_eq!(list.as_slice(), &[3]);
-    }
-
-    #[test]
-    fn copied_list_has_independent_loan_state() {
-        let original = AnvList::from_elems([1_i64]);
-        let _guard = original.begin_shape_loan().unwrap();
-        let mut copy = original.share();
-
-        copy.push(2).unwrap();
-
-        assert_eq!(original.as_slice(), &[1]);
-        assert_eq!(copy.as_slice(), &[1, 2]);
-    }
-
-    #[test]
-    fn stale_list_version_rejects_short_access() {
-        let mut list = AnvList::from_elems([1_i64]);
-        let version = list.structural_version();
-        list.push(2).unwrap();
-
-        assert!(list.elem_at_shared(0, version).is_err());
-        assert!(list.with_elem_mut_short(0, version, |_| Ok(())).is_err());
+            assert_eq!(outcome.collected, 3);
+            assert_eq!(root_traces.get(), 1);
+            assert_eq!(child_traces.get(), 1);
+            assert_eq!(ctx.heap().stats().edge_visits, 3);
+            assert_eq!(ctx.heap().stats().internal_edges, 3);
+        });
     }
 
     #[test]
     fn map_loan_allows_value_update_but_not_key_set_mutation() {
-        let mut map = AnvMap::from_entries([("a", 1_i64)]);
-        let guard = map.begin_shape_loan().unwrap();
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let guard = map.begin_shape_loan().unwrap();
 
-        assert_eq!(map.insert("a", 2).unwrap(), Some(1));
-        assert_eq!(map.get(&"a"), Some(&2));
-        assert_eq!(map.structural_version(), 0);
-        assert!(map.insert("b", 3).is_err());
-        assert!(map.remove(&"a").is_err());
-        assert_eq!(map.remove(&"missing").unwrap(), None);
-        assert!(map.replace_with(AnvMap::from_entries([("z", 9)])).is_err());
-        drop(guard);
+            assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
+            assert_eq!(map.structural_version(), 0);
+            assert!(map.insert(&mut ctx, "b", 3).is_err());
+            assert!(map.remove(&mut ctx, &"a").is_err());
+            assert_eq!(map.remove(&mut ctx, &"missing").unwrap(), None);
+            drop(guard);
 
-        assert_eq!(map.insert("b", 3).unwrap(), None);
-        assert_eq!(map.structural_version(), 1);
+            assert_eq!(map.insert(&mut ctx, "b", 3).unwrap(), None);
+            assert_eq!(map.structural_version(), 1);
+        });
     }
 
     #[test]
-    fn map_short_access_uses_stable_entry_index() {
-        let mut map = AnvMap::from_entries([("a", 1_i64), ("b", 2)]);
-        let guard = map.begin_shape_loan().unwrap();
-        let version = guard.version();
+    fn map_share_detaches_on_value_update() {
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let shared = map.share();
 
-        assert_eq!(map.key_at_shared(1, version).unwrap(), "b");
-        assert_eq!(map.value_at_shared(1, version).unwrap(), 2);
-        map.with_value_mut_short(1, version, |value| {
-            *value = 7;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(map.value_at_shared(1, version).unwrap(), 7);
-        assert_eq!(map.structural_version(), 0);
+            assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
+
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
+            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(map.structural_version(), 0);
+        });
     }
 
     #[test]
-    fn stale_map_version_rejects_short_access() {
-        let mut map = AnvMap::from_entries([("a", 1_i64)]);
-        let version = map.structural_version();
-        map.insert("b", 2).unwrap();
+    fn map_loan_blocks_structural_insert_before_detach() {
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let shared = map.share();
+            let guard = map.begin_shape_loan().unwrap();
 
-        assert!(map.key_at_shared(0, version).is_err());
-        assert!(map.value_at_shared(0, version).is_err());
-        assert!(map.with_value_mut_short(0, version, |_| Ok(())).is_err());
+            assert!(map.insert(&mut ctx, "b", 2).is_err());
+            drop(guard);
+
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(map.insert(&mut ctx, "b", 2).unwrap(), None);
+            assert_eq!(map.structural_version(), 1);
+        });
     }
 
     #[test]
-    fn copied_map_has_independent_loan_state() {
-        let original = AnvMap::from_entries([("a", 1_i64)]);
-        let _guard = original.begin_shape_loan().unwrap();
-        let mut copy = original.share();
+    fn map_value_mutation_detaches_without_structural_version_change() {
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let shared = map.share();
+            let version = map.structural_version();
 
-        copy.insert("b", 2).unwrap();
-        copy.remove(&"a").unwrap();
-
-        assert_eq!(original.iter().collect::<Vec<_>>(), vec![(&"a", &1)]);
-        assert_eq!(copy.iter().collect::<Vec<_>>(), vec![(&"b", &2)]);
-    }
-
-    #[test]
-    fn slice_descriptor_reads_array_without_borrowing_for_lifetime() {
-        let values = [1_i64, 2, 3];
-        let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 2) };
-
-        assert_eq!(slice.len(), 2);
-        assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
-        assert_eq!(slice.elem_at_shared(1).unwrap(), 3);
-        assert!(slice.elem_at_shared(2).is_err());
-    }
-
-    #[test]
-    fn mutable_slice_descriptor_uses_short_array_access() {
-        let mut values = [1_i64, 2, 3];
-        let mut slice =
-            unsafe { AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 1, 2) };
-
-        slice
-            .with_elem_mut_short(0, |value| {
-                *value = 5;
-                Ok(())
-            })
+            unsafe {
+                map.with_value_mut_short(&mut ctx, 0, version, |value| {
+                    *value = 3;
+                    Ok(())
+                })
+            }
             .unwrap();
 
-        assert_eq!(values, [1, 5, 3]);
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
+            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(map.structural_version(), 0);
+        });
     }
 
     #[test]
-    fn shared_mutable_slice_descriptor_is_readonly() {
-        let mut values = [1_i64];
-        let slice =
-            unsafe { AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 0, 1) };
-        let mut shared = slice.share();
+    fn raw_slice_descriptor_uses_short_access() {
+        Heap::scope(|heap| {
+            let mut ctx = Ctx::new(heap);
+            let mut values = [1_i64, 2, 3];
+            let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 2) };
+            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
 
-        assert!(shared.with_elem_mut_short(0, |_| Ok(())).is_err());
-        assert_eq!(values, [1]);
-    }
-
-    #[test]
-    fn list_slice_descriptor_owns_shape_loan() {
-        let mut list = AnvList::from_elems([1_i64, 2, 3]);
-        let guard = list.begin_shape_loan().unwrap();
-        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 1, 2, guard) };
-        assert_eq!(slice.elem_at_shared(0).unwrap(), 2);
-
-        assert!(list.push(4).is_err());
-        drop(slice);
-        list.push(4).unwrap();
-    }
-
-    #[test]
-    fn shared_list_slice_descriptor_extends_shape_loan() {
-        let mut list = AnvList::from_elems([1_i64, 2, 3]);
-        let guard = list.begin_shape_loan().unwrap();
-        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 0, 2, guard) };
-        let shared = slice.share();
-
-        drop(slice);
-        assert!(list.push(4).is_err());
-        drop(shared);
-        list.push(4).unwrap();
-    }
-
-    #[test]
-    fn mutable_list_slice_descriptor_uses_short_list_access() {
-        let mut list = AnvList::from_elems([1_i64, 2, 3]);
-        let guard = list.begin_shape_loan().unwrap();
-        let mut slice =
-            unsafe { AnvSlice::from_list_mut(std::ptr::from_mut(&mut list), 1, 2, guard) };
-
-        slice
-            .with_elem_mut_short(1, |value| {
-                *value = 8;
-                Ok(())
-            })
+            let mut slice =
+                unsafe { AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 1, 2) };
+            unsafe {
+                slice.with_elem_mut_short(&mut ctx, 0, |value| {
+                    *value = 5;
+                    Ok(())
+                })
+            }
             .unwrap();
 
-        assert_eq!(list.as_slice(), &[1, 2, 8]);
+            assert_eq!(values, [1, 5, 3]);
+        });
     }
 
     #[test]
-    fn slice_copy_range_copies_views() {
-        let values = [1_i64, 2, 3, 4];
-        let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
-        let copy = unsafe { slice.copy_range_with(1..3, |value| *value * 10) }.unwrap();
-        assert_eq!(copy.as_slice(), &[30, 40]);
+    fn list_slice_keeps_storage_alive_after_owner_drops() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
+            let slice = AnvSlice::from_list(&list, 1, 2).unwrap();
+            drop(list);
 
-        let list = AnvList::from_elems(values);
-        let guard = list.begin_shape_loan().unwrap();
-        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 1, 3, guard) };
-        let copy = unsafe { slice.copy_range_with(0..2, |value| *value) }.unwrap();
-        assert_eq!(copy.as_slice(), &[2, 3]);
-
-        let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
-        let copy = unsafe { slice.slice(1, 2).copy_range_with(0..2, |value| *value) }.unwrap();
-        assert_eq!(copy.as_slice(), &[3, 4]);
+            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
+            assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 3);
+        });
     }
 
     #[test]
-    fn slice_copy_range_result_has_independent_loan_state() {
-        let mut list = AnvList::from_elems([1_i64, 2, 3]);
-        let guard = list.begin_shape_loan().unwrap();
-        let slice = unsafe { AnvSlice::from_list(std::ptr::from_ref(&list), 0, 3, guard) };
-        let mut copy = unsafe { slice.copy_range_with(0..2, |value| *value) }.unwrap();
+    fn list_slice_keeps_old_storage_after_owner_detaches() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2]);
+            let shared = list.share();
+            let version = list.structural_version();
+            let slice = AnvSlice::from_list(&list, 0, 2).unwrap();
 
-        drop(slice);
-        list.push(4).unwrap();
-        copy.push(9).unwrap();
+            unsafe {
+                list.with_elem_mut_short(&mut ctx, 0, version, |value| {
+                    *value = 10;
+                    Ok(())
+                })
+            }
+            .unwrap();
 
-        assert_eq!(list.as_slice(), &[1, 2, 3, 4]);
-        assert_eq!(copy.as_slice(), &[1, 2, 9]);
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![10, 2]);
+            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2]);
+            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 1);
+        });
     }
 
     #[test]
-    fn anv_list_default_is_empty() {
-        let list = AnvList::<i64>::default();
+    fn mutable_list_slice_writes_through_unique_storage() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
+            let mut slice = AnvSlice::from_list_mut(&mut ctx, &mut list, 1, 2).unwrap();
 
-        assert!(list.is_empty());
-        assert_eq!(list.len_i64(), 0);
+            slice
+                .with_elem_owned_mut_ctx_short(&mut ctx, 0, |_, value| {
+                    *value = 20;
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 20, 3]);
+        });
+    }
+
+    #[test]
+    fn mutable_list_slice_detaches_shared_storage() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
+            let shared = list.share();
+            let mut slice = AnvSlice::from_list_mut(&mut ctx, &mut list, 1, 2).unwrap();
+
+            slice
+                .with_elem_owned_mut_ctx_short(&mut ctx, 0, |_, value| {
+                    *value = 20;
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 20, 3]);
+            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
+        });
+    }
+
+    #[test]
+    fn raw_slice_copy_range_creates_heap_visible_list() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let values = [1_i64, 2, 3, 4];
+            let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
+            let copy = unsafe {
+                slice
+                    .copy_range_with(&mut ctx, ty, 1..3, |value| *value * 10)
+                    .unwrap()
+            };
+
+            assert_eq!(copy.to_vec(&ctx).unwrap(), vec![30, 40]);
+        });
     }
 }

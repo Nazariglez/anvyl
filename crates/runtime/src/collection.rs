@@ -87,9 +87,12 @@ impl CollectionLoanState {
         self.inner.structural_version.set(next);
     }
 
-    pub fn structural_mutation<R>(&self, mutate: impl FnOnce() -> R) -> Result<R, RuntimeError> {
+    pub fn structural_mutation_result<R>(
+        &self,
+        mutate: impl FnOnce() -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
         self.before_structural_mutation()?;
-        let result = mutate();
+        let result = mutate()?;
         self.finish_structural_mutation();
         Ok(result)
     }
