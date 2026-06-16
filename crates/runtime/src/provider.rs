@@ -895,7 +895,7 @@ fn param_abi_contains_callback(abi: &RustParamAbi) -> bool {
 }
 
 fn direct_mut_collection_abi(abi: &RustParamAbi) -> bool {
-    matches!(abi, RustParamAbi::MutBorrow(ty) if type_contains_collection(ty))
+    matches!(abi, RustParamAbi::MutBorrow(ty) | RustParamAbi::MutPlace(ty) if type_contains_collection(ty))
 }
 
 fn direct_collection_abi(abi: &RustParamAbi) -> bool {
@@ -1127,30 +1127,31 @@ mod tests {
 
     #[test]
     fn validates_mutable_collection_abis() {
-        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
-        assert_abi_error(
-            mutable_descriptor("filter", list.clone()),
-            void_binding("filter", RustParamAbi::MutBorrow(list.clone())),
-            "direct mutable collection ABI is unsupported",
-        );
-        assert_abi_ok(
-            mutable_descriptor("filter", list.clone()),
-            void_binding("filter", RustParamAbi::MutPlace(list)),
-        );
-
-        let map = ExternTypeExpr::Map(
-            Box::new(ExternTypeExpr::String),
-            Box::new(ExternTypeExpr::Int),
-        );
-        assert_abi_error(
-            mutable_descriptor("filter_map", map.clone()),
-            void_binding("filter_map", RustParamAbi::MutBorrow(map.clone())),
-            "direct mutable collection ABI is unsupported",
-        );
-        assert_abi_ok(
-            mutable_descriptor("filter_map", map.clone()),
-            void_binding("filter_map", RustParamAbi::MutPlace(map)),
-        );
+        let cases = [
+            (
+                "filter",
+                ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
+            ),
+            (
+                "filter_map",
+                ExternTypeExpr::Map(
+                    Box::new(ExternTypeExpr::String),
+                    Box::new(ExternTypeExpr::Int),
+                ),
+            ),
+        ];
+        for (name, ty) in cases {
+            for abi in [
+                RustParamAbi::MutBorrow(ty.clone()),
+                RustParamAbi::MutPlace(ty.clone()),
+            ] {
+                assert_abi_error(
+                    mutable_descriptor(name, ty.clone()),
+                    void_binding(name, abi),
+                    "direct mutable collection ABI is unsupported",
+                );
+            }
+        }
     }
 
     #[test]
@@ -1739,7 +1740,7 @@ mod tests {
 
     fn assert_abi_error(descriptor: ProviderDescriptor, binding: RustExternBinding, message: &str) {
         let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
-        assert!(error.contains(message));
+        assert!(error.contains(message), "expected {message:?} in {error:?}");
     }
 
     fn void_binding(name: &str, abi: RustParamAbi) -> RustExternBinding {

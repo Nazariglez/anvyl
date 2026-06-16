@@ -1131,15 +1131,9 @@ mod tests {
         traces: Rc<Cell<u32>>,
     }
 
-    struct TraceRoot<'cx> {
-        list: AnvList<'cx, Handle<'cx, TraceChild>>,
-        self_ref: Option<Handle<'cx, TraceRoot<'cx>>>,
-        root_traces: Rc<Cell<u32>>,
-    }
-
-    struct TraceMapRoot<'cx> {
-        map: AnvMap<'cx, i64, Handle<'cx, TraceChild>>,
-        self_ref: Option<Handle<'cx, TraceMapRoot<'cx>>>,
+    struct TraceRoot<'cx, T> {
+        payload: T,
+        self_ref: Option<Handle<'cx, TraceRoot<'cx, T>>>,
         root_traces: Rc<Cell<u32>>,
     }
 
@@ -1149,20 +1143,31 @@ mod tests {
         }
     }
 
-    unsafe impl<'cx> Trace<'cx> for TraceRoot<'cx> {
+    unsafe impl<'cx, T: Trace<'cx>> Trace<'cx> for TraceRoot<'cx, T> {
         fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
             self.root_traces.set(self.root_traces.get() + 1);
-            self.list.trace(visitor);
+            self.payload.trace(visitor);
             self.self_ref.trace(visitor);
         }
     }
 
-    unsafe impl<'cx> Trace<'cx> for TraceMapRoot<'cx> {
-        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
-            self.root_traces.set(self.root_traces.get() + 1);
-            self.map.trace(visitor);
-            self.self_ref.trace(visitor);
-        }
+    fn cyclic_trace_root<'cx, 'rt, T: 'cx>(
+        ctx: &mut Ctx<'cx, 'rt>,
+        ty: HeapType<'cx, TraceRoot<'cx, T>>,
+        payload: T,
+        root_traces: Rc<Cell<u32>>,
+    ) -> Handle<'cx, TraceRoot<'cx, T>> {
+        let root = ctx.heap().alloc(
+            ty,
+            TraceRoot {
+                payload,
+                self_ref: None,
+                root_traces,
+            },
+        );
+        ctx.heap()
+            .with_mut(&root, |root_data| root_data.self_ref = Some(root.clone()));
+        root
     }
 
     #[test]
@@ -1172,7 +1177,8 @@ mod tests {
             let root_traces = Rc::new(Cell::new(0));
             let child_ty = heap.register_tracked::<TraceChild>();
             let list_ty = heap.register_tracked::<ListStorage<'_, Handle<'_, TraceChild>>>();
-            let root_ty = heap.register_tracked::<TraceRoot<'_>>();
+            let root_ty =
+                heap.register_tracked::<TraceRoot<'_, AnvList<'_, Handle<'_, TraceChild>>>>();
             let child = heap.alloc(
                 child_ty,
                 TraceChild {
@@ -1181,16 +1187,7 @@ mod tests {
             );
             let mut ctx = Ctx::new(heap);
             let list = AnvList::from_elems(&mut ctx, list_ty, [child]);
-            let root = ctx.heap().alloc(
-                root_ty,
-                TraceRoot {
-                    list,
-                    self_ref: None,
-                    root_traces: Rc::clone(&root_traces),
-                },
-            );
-            ctx.heap()
-                .with_mut(&root, |root_data| root_data.self_ref = Some(root.clone()));
+            let root = cyclic_trace_root(&mut ctx, root_ty, list, Rc::clone(&root_traces));
 
             drop(root);
             ctx.heap().reset_stats();
@@ -1211,7 +1208,8 @@ mod tests {
             let root_traces = Rc::new(Cell::new(0));
             let child_ty = heap.register_tracked::<TraceChild>();
             let map_ty = heap.register_tracked::<MapStorage<'_, i64, Handle<'_, TraceChild>>>();
-            let root_ty = heap.register_tracked::<TraceMapRoot<'_>>();
+            let root_ty =
+                heap.register_tracked::<TraceRoot<'_, AnvMap<'_, i64, Handle<'_, TraceChild>>>>();
             let child = heap.alloc(
                 child_ty,
                 TraceChild {
@@ -1220,16 +1218,7 @@ mod tests {
             );
             let mut ctx = Ctx::new(heap);
             let map = AnvMap::from_entries(&mut ctx, map_ty, [(1_i64, child)]);
-            let root = ctx.heap().alloc(
-                root_ty,
-                TraceMapRoot {
-                    map,
-                    self_ref: None,
-                    root_traces: Rc::clone(&root_traces),
-                },
-            );
-            ctx.heap()
-                .with_mut(&root, |root_data| root_data.self_ref = Some(root.clone()));
+            let root = cyclic_trace_root(&mut ctx, root_ty, map, Rc::clone(&root_traces));
 
             drop(root);
             ctx.heap().reset_stats();
@@ -1240,6 +1229,146 @@ mod tests {
             assert_eq!(child_traces.get(), 1);
             assert_eq!(ctx.heap().stats().edge_visits, 3);
             assert_eq!(ctx.heap().stats().internal_edges, 3);
+        });
+    }
+
+    #[test]
+    fn nested_list_traces_outer_and_inner_storage_once() {
+        Heap::scope(|heap| {
+            let child_traces = Rc::new(Cell::new(0));
+            let root_traces = Rc::new(Cell::new(0));
+            let child_ty = heap.register_tracked::<TraceChild>();
+            let inner_ty = heap.register_tracked::<ListStorage<'_, Handle<'_, TraceChild>>>();
+            let outer_ty =
+                heap.register_tracked::<ListStorage<'_, AnvList<'_, Handle<'_, TraceChild>>>>();
+            let root_ty = heap
+                .register_tracked::<TraceRoot<'_, AnvList<'_, AnvList<'_, Handle<'_, TraceChild>>>>>();
+            let child = heap.alloc(
+                child_ty,
+                TraceChild {
+                    traces: Rc::clone(&child_traces),
+                },
+            );
+            let mut ctx = Ctx::new(heap);
+            let inner = AnvList::from_elems(&mut ctx, inner_ty, [child]);
+            let list = AnvList::from_elems(&mut ctx, outer_ty, [inner]);
+            let root = cyclic_trace_root(&mut ctx, root_ty, list, Rc::clone(&root_traces));
+
+            drop(root);
+            ctx.heap().reset_stats();
+            let outcome = ctx.heap().collect_all();
+
+            assert_eq!(outcome.collected, 4);
+            assert_eq!(root_traces.get(), 1);
+            assert_eq!(child_traces.get(), 1);
+            assert_eq!(ctx.heap().stats().edge_visits, 4);
+            assert_eq!(ctx.heap().stats().internal_edges, 4);
+        });
+    }
+
+    #[test]
+    fn map_list_values_trace_outer_and_inner_storage_once() {
+        Heap::scope(|heap| {
+            let child_traces = Rc::new(Cell::new(0));
+            let root_traces = Rc::new(Cell::new(0));
+            let child_ty = heap.register_tracked::<TraceChild>();
+            let list_ty = heap.register_tracked::<ListStorage<'_, Handle<'_, TraceChild>>>();
+            let map_ty =
+                heap.register_tracked::<MapStorage<'_, i64, AnvList<'_, Handle<'_, TraceChild>>>>();
+            let root_ty = heap.register_tracked::<TraceRoot<
+                '_,
+                AnvMap<'_, i64, AnvList<'_, Handle<'_, TraceChild>>>,
+            >>();
+            let child = heap.alloc(
+                child_ty,
+                TraceChild {
+                    traces: Rc::clone(&child_traces),
+                },
+            );
+            let mut ctx = Ctx::new(heap);
+            let inner = AnvList::from_elems(&mut ctx, list_ty, [child]);
+            let map = AnvMap::from_entries(&mut ctx, map_ty, [(1_i64, inner)]);
+            let root = cyclic_trace_root(&mut ctx, root_ty, map, Rc::clone(&root_traces));
+
+            drop(root);
+            ctx.heap().reset_stats();
+            let outcome = ctx.heap().collect_all();
+
+            assert_eq!(outcome.collected, 4);
+            assert_eq!(root_traces.get(), 1);
+            assert_eq!(child_traces.get(), 1);
+            assert_eq!(ctx.heap().stats().edge_visits, 4);
+            assert_eq!(ctx.heap().stats().internal_edges, 4);
+        });
+    }
+
+    #[test]
+    fn detaching_outer_list_shares_inner_storage() {
+        Heap::scope(|heap| {
+            let int_list_ty = list_ty::<i64>(heap);
+            let nested_ty = heap.register_tracked::<ListStorage<'_, AnvList<'_, i64>>>();
+            let mut ctx = Ctx::new(heap);
+            let inner = AnvList::from_elems(&mut ctx, int_list_ty, [1_i64]);
+            let list = AnvList::from_elems(&mut ctx, nested_ty, [inner]);
+            let mut shared = list.share();
+            let replacement = AnvList::from_elems(&mut ctx, int_list_ty, [2_i64]);
+
+            shared.push(&mut ctx, replacement).unwrap();
+
+            let original_inner_owners = list
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(0).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+            let shared_inner_owners = shared
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(0).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+            let replacement_owners = shared
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(1).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+
+            assert_eq!(original_inner_owners, 2);
+            assert_eq!(shared_inner_owners, 2);
+            assert_eq!(replacement_owners, 1);
+        });
+    }
+
+    #[test]
+    fn detaching_map_with_list_values_shares_inner_storage() {
+        Heap::scope(|heap| {
+            let list_ty = list_ty::<i64>(heap);
+            let map_ty = heap.register_tracked::<MapStorage<'_, i64, AnvList<'_, i64>>>();
+            let mut ctx = Ctx::new(heap);
+            let inner = AnvList::from_elems(&mut ctx, list_ty, [1_i64]);
+            let map = AnvMap::from_entries(&mut ctx, map_ty, [(1_i64, inner)]);
+            let mut shared = map.share();
+            let replacement = AnvList::from_elems(&mut ctx, list_ty, [2_i64]);
+
+            shared.insert(&mut ctx, 2, replacement).unwrap();
+
+            let original_inner_owners = map
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(&1).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+            let shared_inner_owners = shared
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(&1).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+            let replacement_owners = shared
+                .with_storage(&ctx, |storage| {
+                    Ok(storage.get(&2).unwrap().storage.logical_owners())
+                })
+                .unwrap();
+
+            assert_eq!(original_inner_owners, 2);
+            assert_eq!(shared_inner_owners, 2);
+            assert_eq!(replacement_owners, 1);
         });
     }
 
