@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 2
+// 3
+// @match-end
+
+struct Bag {
+    xs: [int],
+}
+
+fn read(bag: Bag) -> int {
+    bag.xs[1]
+}
+
+fn main() {
+    var bag = Bag { xs: [1, 2] };
+    let copy = bag;
+    bag.xs.push(3);
+    println(read(copy));
+    println(bag.xs[2]);
+}

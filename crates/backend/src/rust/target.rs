@@ -634,8 +634,12 @@ pub(super) fn mut_place_replace_collection(
     )
 }
 
+pub(super) fn replace_collection_result(place: &str, value: &str) -> String {
+    format!("{place}.replace_with({value})")
+}
+
 pub(super) fn replace_collection(place: &str, value: &str) -> String {
-    format!("{place}.replace_with({value})?")
+    format!("{}?", replace_collection_result(place, value))
 }
 
 pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String {

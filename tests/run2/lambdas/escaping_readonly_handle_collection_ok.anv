@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match-begin
+// 2
+// 3
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn make(nodes: [Node]) -> fn() -> Node {
+    || nodes[1]
+}
+
+fn main() {
+    var nodes: [Node] = [Node { value: 1 }, Node { value: 2 }];
+    let f = make(nodes);
+    nodes.push(Node { value: 3 });
+    let captured = f();
+    println(captured.value);
+    let added = nodes[2];
+    println(added.value);
+}

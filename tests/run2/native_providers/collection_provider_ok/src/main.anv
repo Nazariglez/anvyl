@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @skip: provider collection wrapper conversion is not implemented yet
+// @match-begin
+// 3
+// 7
+// @match-end
+
+import pkg:host.host { host_first, host_make };
+
+fn main() {
+    println(host_first([3, 4]));
+    let xs = host_make();
+    println(xs[1]);
+}

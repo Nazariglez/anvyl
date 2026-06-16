@@ -1,0 +1,21 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 2
+// 4
+// @match-end
+
+fn main() {
+    var groups: [string: [int]] = ["a": [1, 2]];
+    var snapshot = groups;
+    let replacement: [int] = [3, 4];
+    groups["a"] = replacement;
+
+    if let xs? = snapshot["a"] {
+        println(xs[1]);
+    }
+    if let xs? = groups["a"] {
+        println(xs[1]);
+    }
+}

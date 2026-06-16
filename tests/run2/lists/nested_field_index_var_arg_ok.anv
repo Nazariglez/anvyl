@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: collection fields inside aggregates are not executable yet
 // @match: 8
 
 struct Bag { xs: [int] }

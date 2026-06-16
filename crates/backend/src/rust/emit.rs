@@ -2587,7 +2587,7 @@ impl EmitCx<'_> {
                 "rt",
                 &object,
                 "storage",
-                &target::replace_collection(&path, &value),
+                &target::replace_collection_result(&path, &value),
             ) + "?"
         } else {
             target::rt_heap_with_mut("rt", &object, "storage", &format!("{path} = {value};"))

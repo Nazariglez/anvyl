@@ -48,6 +48,13 @@ pub enum RustMaterialization {
     Gap,
 }
 
+fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
+    matches!(
+        materialization,
+        RustMaterialization::Copy | RustMaterialization::Share | RustMaterialization::CloneHandle
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AirRustRepPolicy<'a> {
     program: &'a AirProgram,
@@ -187,7 +194,7 @@ impl<'a> AirRustRepPolicy<'a> {
     ) -> RustMaterialization {
         if fields
             .into_iter()
-            .all(|field| !matches!(self.materialization(field), RustMaterialization::Gap))
+            .all(|field| self.stored_payload_supported(field))
         {
             RustMaterialization::Share
         } else {
@@ -199,14 +206,10 @@ impl<'a> AirRustRepPolicy<'a> {
         self,
         fields: impl IntoIterator<Item = TypeId>,
     ) -> RustMaterialization {
-        if fields.into_iter().all(|field| {
-            !matches!(
-                self.exact_root_global_materialization(field),
-                RustMaterialization::BorrowGuard
-                    | RustMaterialization::CloneLambda
-                    | RustMaterialization::Gap
-            )
-        }) {
+        if fields
+            .into_iter()
+            .all(|field| self.exact_root_global_field_supported(field))
+        {
             RustMaterialization::Share
         } else {
             RustMaterialization::Gap
@@ -214,58 +217,60 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     fn exact_root_global_field_supported(self, ty: TypeId) -> bool {
-        !matches!(
-            self.exact_root_global_materialization(ty),
-            RustMaterialization::BorrowGuard
-                | RustMaterialization::CloneLambda
-                | RustMaterialization::Gap
-        )
+        materialization_is_owned_payload(self.exact_root_global_materialization(ty))
     }
 
-    pub fn dataref_payload_supported(self, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::DataRef(_) => true,
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.dataref_payload_supported(*inner)
-            }
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.dataref_payload_supported(*elem)),
-            TypeData::Aggregate(aggregate) => self
-                .program
-                .aggregate(*aggregate)
-                .fields
-                .iter()
-                .all(|field| self.dataref_payload_supported(field.ty)),
-            TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().all(|variant| {
-                Self::variant_field_tys(variant).all(|ty| self.dataref_payload_supported(ty))
-            }),
-            TypeData::List(_) => self.list_supported(ty),
-            TypeData::Map { .. } => self.map_supported(ty),
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_)
-            | TypeData::Dyn(_) => false,
+    pub fn stored_payload_supported(self, ty: TypeId) -> bool {
+        self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
+    }
+
+    fn stored_payload_supported_inner(
+        self,
+        ty: TypeId,
+        cycle_broken: bool,
+        active: &mut BTreeSet<TypeId>,
+    ) -> bool {
+        if !active.insert(ty) {
+            return cycle_broken;
         }
+        let supported =
+            match self.program.type_arena.data(ty) {
+                TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
+                TypeData::DataRef(_) => true,
+                TypeData::List(elem) => self.stored_payload_supported_inner(*elem, true, active),
+                TypeData::Map { key, value, .. } => {
+                    self.map_key_supported(*key)
+                        && self.stored_payload_supported_inner(*value, true, active)
+                }
+                TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                    self.stored_payload_supported_inner(*inner, cycle_broken, active)
+                }
+                TypeData::Tuple(elems) => elems
+                    .iter()
+                    .all(|elem| self.stored_payload_supported_inner(*elem, cycle_broken, active)),
+                TypeData::Aggregate(id) => self.program.aggregate(*id).fields.iter().all(|field| {
+                    self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+                }),
+                TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
+                    Self::variant_field_tys(variant)
+                        .all(|ty| self.stored_payload_supported_inner(ty, cycle_broken, active))
+                }),
+                TypeData::Void
+                | TypeData::Any
+                | TypeData::Slice(_)
+                | TypeData::Extern(_)
+                | TypeData::Function(_)
+                | TypeData::Dyn(_) => false,
+            };
+        active.remove(&ty);
+        supported
     }
 
     pub fn list_supported(self, ty: TypeId) -> bool {
         let TypeData::List(elem) = self.program.type_arena.data(ty) else {
             return false;
         };
-        self.collection_value_supported(*elem)
-    }
-
-    fn collection_value_supported(self, ty: TypeId) -> bool {
-        matches!(
-            self.materialization(ty),
-            RustMaterialization::Copy
-                | RustMaterialization::Share
-                | RustMaterialization::CloneHandle
-        )
+        self.stored_payload_supported(*elem)
     }
 
     fn shareable_value(self, ty: TypeId) -> bool {
@@ -335,7 +340,7 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     pub fn map_value_supported(self, ty: TypeId) -> bool {
-        self.collection_value_supported(ty)
+        self.stored_payload_supported(ty)
     }
 
     pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
@@ -564,8 +569,7 @@ impl<'a> RustRepPolicy<'a> {
                 self.materialization(ty)
             }
             RirType::Map { key, value }
-                if self.global_map_key_supported(key)
-                    && self.exact_root_global_field_supported(value) =>
+                if self.map_key_supported(key) && self.exact_root_global_field_supported(value) =>
             {
                 self.materialization(ty)
             }
@@ -620,15 +624,10 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     fn exact_root_global_field_supported(self, ty: RirTypeId) -> bool {
-        matches!(
-            self.exact_root_global_materialization(ty),
-            RustMaterialization::Copy
-                | RustMaterialization::Share
-                | RustMaterialization::CloneHandle
-        )
+        materialization_is_owned_payload(self.exact_root_global_materialization(ty))
     }
 
-    fn global_map_key_supported(self, ty: RirTypeId) -> bool {
+    fn map_key_supported(self, ty: RirTypeId) -> bool {
         matches!(
             self.ty_opt(ty),
             Some(RirType::Int | RirType::Bool | RirType::String)
@@ -641,12 +640,61 @@ impl<'a> RustRepPolicy<'a> {
     ) -> RustMaterialization {
         if fields
             .into_iter()
-            .all(|field| !matches!(self.materialization(field), RustMaterialization::Gap))
+            .all(|field| self.stored_payload_supported(field))
         {
             RustMaterialization::Share
         } else {
             RustMaterialization::Gap
         }
+    }
+
+    pub fn stored_payload_supported(self, ty: RirTypeId) -> bool {
+        self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
+    }
+
+    fn stored_payload_supported_inner(
+        self,
+        ty: RirTypeId,
+        cycle_broken: bool,
+        active: &mut BTreeSet<RirTypeId>,
+    ) -> bool {
+        if !active.insert(ty) {
+            return cycle_broken;
+        }
+        let supported = match self.ty_opt(ty) {
+            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::String) => true,
+            Some(RirType::DataRef(_)) => true,
+            Some(RirType::List(elem)) => self.stored_payload_supported_inner(elem, true, active),
+            Some(RirType::Map { key, value }) => {
+                self.map_key_supported(key)
+                    && self.stored_payload_supported_inner(value, true, active)
+            }
+            Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
+                self.stored_payload_supported_inner(inner, cycle_broken, active)
+            }
+            Some(RirType::Struct(id)) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt.fields.iter().all(|field| {
+                        self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+                    })
+                })
+            }
+            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
+                tuple.fields.iter().all(|field| {
+                    self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+                })
+            }),
+            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
+                enm.variants.iter().all(|variant| {
+                    variant.fields.iter().all(|field| {
+                        self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+                    })
+                })
+            }),
+            Some(RirType::Void | RirType::Slice(_) | RirType::Lambda(_)) | None => false,
+        };
+        active.remove(&ty);
+        supported
     }
 
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
@@ -991,34 +1039,7 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn type_owns_heap_edges(self, ty: RirTypeId) -> bool {
-        match self.ty(ty) {
-            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) => true,
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.type_owns_heap_edges(inner)
-            }
-            RirType::Map { .. } => true,
-            RirType::Lambda(sig) => self.lambda_sig_owns_heap_edges(sig),
-            RirType::Struct(id) => self.program.structs[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.type_owns_heap_edges(field.ty)),
-            RirType::Tuple(id) => self.program.tuples[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.type_owns_heap_edges(field.ty)),
-            RirType::Enum(id) => self.program.enums[id.index()]
-                .variants
-                .iter()
-                .any(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .any(|field| self.type_owns_heap_edges(field.ty))
-                }),
-            RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void => {
-                false
-            }
-        }
+        self.type_has_heap_shape(ty, Self::lambda_sig_owns_heap_edges)
     }
 
     fn lambda_sig_owns_heap_edges(self, id: RirLambdaSigId) -> bool {
@@ -1032,32 +1053,56 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
-        match self.ty(ty) {
-            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) => true,
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.type_cx_dependent(inner)
+        self.type_has_heap_shape(ty, Self::lambda_sig_needs_ctx_lifetime)
+    }
+
+    fn type_has_heap_shape(
+        self,
+        ty: RirTypeId,
+        lambda_has_shape: fn(Self, RirLambdaSigId) -> bool,
+    ) -> bool {
+        self.type_has_heap_shape_inner(ty, lambda_has_shape, &mut BTreeSet::new())
+    }
+
+    fn type_has_heap_shape_inner(
+        self,
+        ty: RirTypeId,
+        lambda_has_shape: fn(Self, RirLambdaSigId) -> bool,
+        active: &mut BTreeSet<RirTypeId>,
+    ) -> bool {
+        if !active.insert(ty) {
+            return false;
+        }
+        let has_shape = match self.ty(ty) {
+            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) | RirType::Map { .. } => {
+                true
             }
-            RirType::Map { .. } => true,
-            RirType::Lambda(sig) => self.lambda_sig_needs_ctx_lifetime(sig),
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                self.type_has_heap_shape_inner(inner, lambda_has_shape, active)
+            }
+            RirType::Lambda(sig) => lambda_has_shape(self, sig),
             RirType::Struct(id) => self.program.structs[id.index()]
                 .fields
                 .iter()
-                .any(|field| self.type_cx_dependent(field.ty)),
+                .any(|field| self.type_has_heap_shape_inner(field.ty, lambda_has_shape, active)),
             RirType::Tuple(id) => self.program.tuples[id.index()]
                 .fields
                 .iter()
-                .any(|field| self.type_cx_dependent(field.ty)),
+                .any(|field| self.type_has_heap_shape_inner(field.ty, lambda_has_shape, active)),
             RirType::Enum(id) => self.program.enums[id.index()]
                 .variants
                 .iter()
                 .any(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .any(|field| self.type_cx_dependent(field.ty))
+                    variant.fields.iter().any(|field| {
+                        self.type_has_heap_shape_inner(field.ty, lambda_has_shape, active)
+                    })
                 }),
-            _ => false,
-        }
+            RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void => {
+                false
+            }
+        };
+        active.remove(&ty);
+        has_shape
     }
 
     fn named_ty(symbol: &str, cx_dependent: bool) -> String {
@@ -1308,7 +1353,8 @@ mod tests {
     };
 
     use super::{
-        AirRustRepPolicy, RustBorrowView, RustMaterialization, RustRepPolicy, RustValueRep,
+        AirRustRepPolicy, RustBorrowView, RustMaterialization, RustRepPolicy, RustTracePlan,
+        RustValueRep,
     };
     use crate::rust::rir::{
         RirDataRef, RirDataRefId, RirField, RirFieldId, RirLambda, RirLambdaEscape, RirLambdaId,
@@ -1378,6 +1424,46 @@ mod tests {
 
         assert!(!policy.map_supported(float_key));
         assert!(policy.map_supported(float_value));
+    }
+
+    #[test]
+    fn air_policy_names_stored_payload_boundaries() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let string = program.alloc_type(TypeData::String);
+        let list = program.alloc_type(TypeData::List(int));
+        let slice = program.alloc_type(TypeData::Slice(int));
+        let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+            vec![],
+            air::ReturnMode::Value(int),
+        )));
+        let module = program.alloc_module(air::Module::default());
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Payload"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("xs"),
+                ty: list,
+            }],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let aggregate = program.alloc_type(TypeData::Aggregate(aggregate));
+        let slice_tuple = program.alloc_type(TypeData::Tuple(vec![slice]));
+        let function_tuple = program.alloc_type(TypeData::Tuple(vec![function]));
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert!(policy.stored_payload_supported(string));
+        assert!(policy.stored_payload_supported(list));
+        assert!(policy.stored_payload_supported(aggregate));
+        assert!(!policy.stored_payload_supported(slice));
+        assert!(!policy.stored_payload_supported(function));
+        assert!(!policy.stored_payload_supported(slice_tuple));
+        assert!(!policy.stored_payload_supported(function_tuple));
     }
 
     #[test]
@@ -1531,6 +1617,36 @@ mod tests {
             storage: RirLambdaStorage::ZeroEnv,
             captures: vec![],
         });
+        let slice_tuple = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Tuple(RirTupleId::from_index(1)));
+        program.tuples.push(RirTuple {
+            id: RirTupleId::from_index(1),
+            symbol: RirSymbol::new("Tuple1"),
+            display: RirSymbol::new("Tuple1"),
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("_0"),
+                ty: slice,
+            }],
+            copyable: false,
+        });
+        let lambda_tuple = RirTypeId::from_index(program.types.len());
+        program
+            .types
+            .push(RirType::Tuple(RirTupleId::from_index(2)));
+        program.tuples.push(RirTuple {
+            id: RirTupleId::from_index(2),
+            symbol: RirSymbol::new("Tuple2"),
+            display: RirSymbol::new("Tuple2"),
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("_0"),
+                ty: lambda,
+            }],
+            copyable: false,
+        });
         let policy = RustRepPolicy::new(&program);
 
         assert_eq!(policy.materialization(int), RustMaterialization::Copy);
@@ -1551,6 +1667,19 @@ mod tests {
             RustMaterialization::BorrowGuard
         );
         assert_eq!(policy.materialization(lambda), RustMaterialization::Copy);
+        assert_eq!(
+            policy.materialization(slice_tuple),
+            RustMaterialization::Gap
+        );
+        assert_eq!(
+            policy.materialization(lambda_tuple),
+            RustMaterialization::Gap
+        );
+        assert!(policy.stored_payload_supported(list));
+        assert!(policy.stored_payload_supported(map));
+        assert!(policy.stored_payload_supported(node));
+        assert!(!policy.stored_payload_supported(slice));
+        assert!(!policy.stored_payload_supported(lambda));
     }
 
     #[test]
@@ -1610,6 +1739,99 @@ mod tests {
 
         assert!(!policy.copyable(label));
         assert!(policy.value_place_shareable(label));
+    }
+
+    #[test]
+    fn air_policy_allows_collection_broken_payload_cycles() {
+        let mut program = Program::default();
+        let module = program.alloc_module(air::Module::default());
+        let a = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("A"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let b = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("B"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let a_ty = program.alloc_type(TypeData::Aggregate(a));
+        let b_ty = program.alloc_type(TypeData::Aggregate(b));
+        let list_b = program.alloc_type(TypeData::List(b_ty));
+        let maybe_a = program.alloc_type(TypeData::Optional(a_ty));
+        program.aggregate_mut(a).fields.push(FieldDecl {
+            name: Ident::new("bs"),
+            ty: list_b,
+        });
+        program.aggregate_mut(b).fields.push(FieldDecl {
+            name: Ident::new("a"),
+            ty: maybe_a,
+        });
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert!(policy.stored_payload_supported(a_ty));
+        assert_eq!(policy.materialization(a_ty), RustMaterialization::Share);
+    }
+
+    #[test]
+    fn rir_policy_allows_collection_broken_payload_cycles() {
+        let mut program = RirProgram {
+            types: vec![
+                RirType::Int,
+                RirType::Struct(RirStructId::from_index(0)),
+                RirType::Struct(RirStructId::from_index(1)),
+                RirType::List(RirTypeId::from_index(2)),
+                RirType::Option(RirTypeId::from_index(1)),
+            ],
+            ..RirProgram::default()
+        };
+        program.structs.push(RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("A"),
+            display: RirSymbol::new("A"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("bs"),
+                ty: RirTypeId::from_index(3),
+            }],
+        });
+        program.structs.push(RirStruct {
+            id: RirStructId::from_index(1),
+            air_id: None,
+            symbol: RirSymbol::new("B"),
+            display: RirSymbol::new("B"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("a"),
+                ty: RirTypeId::from_index(4),
+            }],
+        });
+        let policy = RustRepPolicy::new(&program);
+        let a = RirTypeId::from_index(1);
+
+        assert!(policy.stored_payload_supported(a));
+        assert!(policy.type_owns_heap_edges(a));
+        assert!(policy.type_cx_dependent(a));
+        assert_eq!(policy.materialization(a), RustMaterialization::Share);
+        assert!(RustTracePlan::build(&program).needs_struct_trace(RirStructId::from_index(0)));
     }
 
     #[test]

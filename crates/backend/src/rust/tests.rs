@@ -3924,6 +3924,63 @@ fn collection_storage_tracking_follows_payload_edges() {
 }
 
 #[test]
+fn rir_verify_rejects_list_storage_slice_payload() {
+    let int = RirTypeId::from_index(1);
+    let slice = RirTypeId::from_index(2);
+    let list = RirTypeId::from_index(3);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Slice(int),
+            RirType::List(slice),
+        ],
+        collection_storages: vec![rir_list_storage(list, slice)],
+        ..empty_rir_function(RirType::Void)
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_map_storage_nonprimitive_key() {
+    let int = RirTypeId::from_index(1);
+    let key = RirTypeId::from_index(2);
+    let map = RirTypeId::from_index(3);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Struct(RirStructId::from_index(0)),
+            RirType::Map { key, value: int },
+        ],
+        structs: vec![rir_struct(0, "Key", vec![])],
+        collection_storages: vec![rir_map_storage(0, map, key, int)],
+        ..empty_rir_function(RirType::Void)
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_unsupported_stored_field_payload() {
+    let int = RirTypeId::from_index(1);
+    let slice = RirTypeId::from_index(2);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Slice(int),
+            RirType::Struct(RirStructId::from_index(0)),
+        ],
+        structs: vec![rir_struct(0, "Payload", vec![rir_field(0, "items", slice)])],
+        ..empty_rir_function(RirType::Void)
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
 fn emit_renders_plain_struct_declarations_without_impls() {
     let program = struct_decl_program(false);
     let source = plan_source(program).into_string();
@@ -11520,6 +11577,63 @@ fn rir_verify_rejects_direct_scoped_lambda_provider_abi() {
 }
 
 #[test]
+fn rir_verify_rejects_direct_native_collection_abis() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let int_list =
+        anvyx_runtime::ExternTypeExpr::List(Box::new(anvyx_runtime::ExternTypeExpr::Int));
+    let direct = |params, ret| anvyx_runtime::RustExternAbi {
+        params,
+        ret,
+        fallible: false,
+        support: anvyx_runtime::RustAbiSupport::Direct,
+        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+    };
+    let cases = [
+        (
+            "take",
+            vec![RirExternParam {
+                ty: list,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            void,
+            direct(
+                vec![anvyx_runtime::RustParamAbi::Value(int_list.clone())],
+                anvyx_runtime::RustReturnAbi::Void,
+            ),
+        ),
+        (
+            "make",
+            vec![],
+            list,
+            direct(vec![], anvyx_runtime::RustReturnAbi::Value(int_list)),
+        ),
+    ];
+
+    for (symbol, params, ret, abi) in cases {
+        let program = RirProgram {
+            types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+            collection_storages: vec![rir_list_storage(list, int)],
+            externs: vec![RirExtern {
+                id: RirExternId::from_index(0),
+                symbol: RirSymbol::new(symbol),
+                kind: RirExternKind::Native(rir::RirNativeExtern {
+                    path: vec!["host".to_string(), symbol.to_string()],
+                    abi,
+                }),
+                params,
+                ret,
+            }],
+            ..empty_rir_function(RirType::Void)
+        };
+        assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+    }
+}
+
+#[test]
 fn rir_verify_rejects_scoped_lambda_source_param_abi() {
     let mut program = native_scoped_lambda_rir();
     let lambda_ty = RirTypeId::from_index(2);
@@ -13514,6 +13628,27 @@ fn rir_param(
         semantic,
         abi,
         escape: RirParamEscape::NonEscaping,
+    }
+}
+
+fn rir_field(id: usize, symbol: &str, ty: RirTypeId) -> RirField {
+    RirField {
+        id: RirFieldId::from_index(id),
+        symbol: RirSymbol::new(symbol),
+        ty,
+    }
+}
+
+fn rir_struct(id: usize, symbol: &str, fields: Vec<RirField>) -> RirStruct {
+    RirStruct {
+        id: RirStructId::from_index(id),
+        air_id: None,
+        symbol: RirSymbol::new(symbol),
+        display: RirSymbol::new(symbol),
+        native_path: None,
+        native_key: None,
+        copyable: false,
+        fields,
     }
 }
 

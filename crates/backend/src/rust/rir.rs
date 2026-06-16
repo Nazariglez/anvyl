@@ -1288,8 +1288,10 @@ pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
                         RustParamAbi::Borrow(_)
                             | RustParamAbi::MutBorrow(_)
                             | RustParamAbi::MutPlace(_)
+                            | RustParamAbi::List(_)
                     )
                 })
+                && !matches!(abi.ret, RustReturnAbi::List(_))
         }
         anvyx_runtime::RustAbiSupport::Unsupported => false,
     }
@@ -1326,7 +1328,10 @@ fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExter
             RustParamAbi::Value(ty)
             | RustParamAbi::Borrow(ty)
             | RustParamAbi::MutBorrow(ty)
-            | RustParamAbi::MutPlace(ty) => rir_type_matches_extern(program, param.ty, ty),
+            | RustParamAbi::MutPlace(ty) => {
+                !extern_type_contains_collection(ty)
+                    && rir_type_matches_extern(program, param.ty, ty)
+            }
             RustParamAbi::ScopedLambda(callback) => {
                 rir_type_matches_callback(program, param.ty, callback)
             }
@@ -1564,6 +1569,21 @@ impl VerifyCx<'_> {
         )
     }
 
+    fn stored_payload_supported(&self, ty: RirTypeId) -> bool {
+        RustRepPolicy::new(self.program).stored_payload_supported(ty)
+    }
+
+    fn value_from_ref_supported(&self, ty: RirTypeId) -> bool {
+        RustRepPolicy::new(self.program).value_from_ref_supported(ty)
+    }
+
+    fn check_stored_payload(&mut self, site: RirVerifySite, ty: RirTypeId) {
+        self.check_type_id(site, ty);
+        if self.ty(ty).is_some() && !self.stored_payload_supported(ty) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
+    }
+
     fn check_lambda_container_type(&mut self, site: RirVerifySite, ty: RirTypeId) {
         if self.type_contains_lambda(ty) {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -1734,6 +1754,12 @@ impl VerifyCx<'_> {
             }
             for (index, field) in env.fields.iter().enumerate() {
                 self.check_type_id(site, field.ty);
+                if self.ty(field.ty).is_some()
+                    && matches!(field.kind, RirLambdaEnvFieldKind::Value)
+                    && !self.value_from_ref_supported(field.ty)
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                }
                 if field.symbol.as_str().is_empty() {
                     self.push(site, RirVerifyErrorKind::BadId);
                 }
@@ -1800,6 +1826,8 @@ impl VerifyCx<'_> {
                     if heap_env {
                         if capture.semantic != RirParamSemantic::Value
                             || capture.abi != RirParamAbi::Value
+                            || (self.ty(capture.ty).is_some()
+                                && !self.value_from_ref_supported(capture.ty))
                         {
                             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                         }
@@ -1931,6 +1959,14 @@ impl VerifyCx<'_> {
                         _ => self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId),
                     }
                 }
+            }
+            if self.ty(storage.value_ty).is_some()
+                && !self.stored_payload_supported(storage.value_ty)
+            {
+                self.push(
+                    RirVerifySite::Program,
+                    RirVerifyErrorKind::UnsupportedRValueType,
+                );
             }
         }
         for (index, ty) in self.program.types.iter().enumerate() {
@@ -2199,7 +2235,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_type_id(site, field.ty);
+                self.check_stored_payload(site, field.ty);
                 self.check_lambda_container_type(site, field.ty);
                 if strukt.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
@@ -2242,11 +2278,8 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_type_id(site, field.ty);
+                self.check_stored_payload(site, field.ty);
                 self.check_lambda_container_type(site, field.ty);
-                if matches!(self.ty(field.ty), Some(RirType::Void | RirType::Slice(_))) {
-                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                }
             }
         }
     }
@@ -2298,11 +2331,8 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                     }
                     field_symbols.push(field.symbol.clone());
-                    self.check_type_id(site, field.ty);
+                    self.check_stored_payload(site, field.ty);
                     self.check_lambda_container_type(site, field.ty);
-                    if matches!(self.ty(field.ty), Some(RirType::Void)) {
-                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                    }
                     if enm.copyable && !self.copyable_type(field.ty) {
                         self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                     }
@@ -2339,7 +2369,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_type_id(site, field.ty);
+                self.check_stored_payload(site, field.ty);
                 self.check_lambda_container_type(site, field.ty);
                 if tuple.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);

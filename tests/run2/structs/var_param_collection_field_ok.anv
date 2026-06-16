@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: replacing collection fields through var parameters is not executable yet
 // @match: 3
 
 struct Box {

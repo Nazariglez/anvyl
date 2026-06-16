@@ -264,7 +264,7 @@ impl ProfileCx<'_> {
             && decl
                 .fields
                 .iter()
-                .all(|field| self.inline_payload_supported(field.ty))
+                .all(|field| self.policy().stored_payload_supported(field.ty))
     }
 
     fn dataref_decl_supported(&self, aggregate: AggregateId) -> bool {
@@ -273,57 +273,13 @@ impl ProfileCx<'_> {
             && decl
                 .fields
                 .iter()
-                .all(|field| self.dataref_payload_supported(field.ty))
-    }
-
-    fn inline_payload_supported(&self, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::String
-            | TypeData::DataRef(_) => true,
-            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
-            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.inline_payload_supported(*inner)
-            }
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.inline_payload_supported(*elem)),
-            _ => false,
-        }
-    }
-
-    fn dataref_payload_supported(&self, ty: TypeId) -> bool {
-        self.policy().dataref_payload_supported(ty)
+                .all(|field| self.policy().stored_payload_supported(field.ty))
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
-        let decl = self.program.enum_decl(enm);
-        decl.variants.iter().all(|variant| {
-            variant_field_tys(variant).all(|ty| self.enum_field_supported(decl.core, ty))
+        self.program.enum_decl(enm).variants.iter().all(|variant| {
+            variant_field_tys(variant).all(|ty| self.policy().stored_payload_supported(ty))
         })
-    }
-
-    fn enum_field_supported(&self, core: Option<air::CoreEnumKind>, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::Aggregate(aggregate) => self.aggregate_decl_supported(*aggregate),
-            TypeData::Enum(_) if core == Some(air::CoreEnumKind::Option) => true,
-            TypeData::Enum(enm) => self.enum_decl_supported(*enm),
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.inline_payload_supported(*inner)
-            }
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.enum_field_supported(core, *elem)),
-            TypeData::DataRef(_)
-            | TypeData::Int
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::String => true,
-            _ => false,
-        }
     }
 
     fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {
