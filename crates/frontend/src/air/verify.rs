@@ -16,6 +16,7 @@ use super::{
         MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
     },
     ids::*,
+    place_model,
     typing::{self, PrimitiveTypes},
 };
 use crate::{
@@ -5391,7 +5392,7 @@ fn verify_mutable_place(
     site: &VerifySite,
     place: &Place,
 ) {
-    if place_crosses_dataref(cx.program, function_id, place) {
+    if place_model::place_crosses_dataref(cx.program, function_id, place) {
         return;
     }
     if place_mutability(cx.program, function_id, place.root) == Some(Mutability::Immutable) {
@@ -5757,77 +5758,7 @@ fn place_mutability(
     function_id: FunctionId,
     root: PlaceRoot,
 ) -> Option<Mutability> {
-    if program.capture_cell_root(function_id, root).is_some() {
-        return Some(Mutability::Mutable);
-    }
-    match root {
-        PlaceRoot::Local(local) => program
-            .function(function_id)
-            .locals
-            .get(local.index())
-            .map(|decl| decl.mutability),
-        PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
-            .and_then(|lambda| program.lambdas.get(lambda.index()))
-            .and_then(|decl| decl.captures.get(slot.index()))
-            .map(LambdaCaptureDecl::mutability),
-        PlaceRoot::ScopedBorrow(id) => program
-            .scoped_borrows
-            .get(id.index())
-            .map(|decl| decl.mutability),
-        PlaceRoot::CaptureCell(_) => Some(Mutability::Mutable),
-        PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.mutability),
-    }
-}
-
-fn place_crosses_dataref(program: &Program, function_id: FunctionId, place: &Place) -> bool {
-    let Some(mut ty) = place_root_ty(program, function_id, place.root) else {
-        return false;
-    };
-    for projection in &place.projection {
-        let Some(data) = program.type_arena.get(ty) else {
-            return false;
-        };
-        if matches!(data, TypeData::DataRef(_)) {
-            return true;
-        }
-        let Some(next) = projection_ty(program, ty, projection) else {
-            return false;
-        };
-        ty = next;
-    }
-    false
-}
-
-fn place_root_ty(program: &Program, function_id: FunctionId, root: PlaceRoot) -> Option<TypeId> {
-    match root {
-        PlaceRoot::Local(local) => program
-            .function(function_id)
-            .locals
-            .get(local.index())
-            .map(|decl| decl.ty),
-        PlaceRoot::LambdaCapture(slot) => lambda_function(program, function_id)
-            .and_then(|lambda| program.lambdas.get(lambda.index()))
-            .and_then(|decl| decl.captures.get(slot.index()))
-            .map(LambdaCaptureDecl::ty),
-        PlaceRoot::ScopedBorrow(id) => program.scoped_borrows.get(id.index()).map(|decl| decl.ty),
-        PlaceRoot::CaptureCell(id) => program.capture_cells.get(id.index()).map(|decl| decl.ty),
-        PlaceRoot::Global(id) => program.globals.get(id.index()).map(|decl| decl.ty),
-    }
-}
-
-fn projection_ty(program: &Program, ty: TypeId, projection: &Projection) -> Option<TypeId> {
-    match projection {
-        Projection::Field(field) => typing::field_by_id(program, ty, *field),
-        Projection::TupleField(index) => match program.type_arena.get(ty) {
-            Some(TypeData::Tuple(elems)) => elems.get(*index as usize).copied(),
-            _ => None,
-        },
-        Projection::VariantField { variant, field, .. } => {
-            typing::enum_variant_field(program, ty, *variant, *field)
-        }
-        Projection::Index(_) => typing::index_elem(program, ty),
-        Projection::MapIndex(_) => typing::map_slot(program, ty).map(|(_, slot)| slot),
-    }
+    place_model::root_info(program, function_id, root).map(|root| root.mutability)
 }
 
 fn verify_place(
@@ -5856,6 +5787,10 @@ fn verify_place(
         return None;
     }
     for proj in &place.projection {
+        if let Some(step) = place_model::project_step(cx.program, function_id, current_ty, proj) {
+            current_ty = step.ty();
+            continue;
+        }
         let Some(data) = cx.type_data(current_ty) else {
             cx.push(
                 site.clone(),

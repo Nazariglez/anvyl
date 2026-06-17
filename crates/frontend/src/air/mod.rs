@@ -2,6 +2,7 @@ pub mod body;
 pub mod decl;
 pub mod ids;
 pub mod ownership;
+pub mod place_model;
 pub mod types;
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use super::{
     LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
     ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue,
     ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType,
-    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -2205,6 +2205,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     ) -> Result<(), LowerError> {
         if self.is_optional_expr(&match_expr.node.scrutinee)? {
             return self.lower_optional_match_effect(expr, match_expr);
+        }
+        if match_expr.node.head == ast::PatternHead::Var {
+            return Err(LowerError::UnsupportedExpr {
+                expr_id: expr.node.id,
+                kind: "UnsupportedPayloadAlias",
+            });
         }
         let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
         let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
@@ -5061,6 +5067,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let result = self.temp(result_ty);
             return self.lower_optional_match_value(expr, match_expr, result, result_ty);
         }
+        if match_expr.node.head == ast::PatternHead::Var {
+            return Err(LowerError::UnsupportedExpr {
+                expr_id: expr.node.id,
+                kind: "UnsupportedPayloadAlias",
+            });
+        }
         let result_ty = match self.lower_expr_ty(expr.node.id)? {
             ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => self.cx.lower_ty(&ty)?,
             _ => return Err(unsupported_expr(expr)),
@@ -5620,7 +5632,17 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if place.projection.is_empty() {
             return Ok(place);
         }
-        let Some(root_ty) = self.place_root_ty(place.root) else {
+        let root_ty = match place.root {
+            PlaceRoot::Local(local) => self
+                .function
+                .locals
+                .get(local.index())
+                .map(|local| local.ty),
+            root => {
+                place_model::root_info(&self.cx.program, self.function_id, root).map(|root| root.ty)
+            }
+        };
+        let Some(root_ty) = root_ty else {
             return Ok(place);
         };
         if !matches!(self.cx.program.type_data(root_ty), TypeData::DataRef(_)) {
@@ -5641,40 +5663,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             projection: place.projection,
             ty: place.ty,
         })
-    }
-
-    fn place_root_ty(&self, root: PlaceRoot) -> Option<TypeId> {
-        match root {
-            PlaceRoot::Local(local) => self
-                .function
-                .locals
-                .get(local.index())
-                .map(|local| local.ty),
-            PlaceRoot::LambdaCapture(slot) => match self.function.kind {
-                FunctionKind::Lambda(lambda) => self
-                    .cx
-                    .program
-                    .lambdas
-                    .get(lambda.index())?
-                    .captures
-                    .get(slot.index())
-                    .map(LambdaCaptureDecl::ty),
-                _ => None,
-            },
-            PlaceRoot::ScopedBorrow(id) => self
-                .cx
-                .program
-                .scoped_borrows
-                .get(id.index())
-                .map(|decl| decl.ty),
-            PlaceRoot::CaptureCell(id) => self
-                .cx
-                .program
-                .capture_cells
-                .get(id.index())
-                .map(|decl| decl.ty),
-            PlaceRoot::Global(id) => self.cx.program.globals.get(id.index()).map(|decl| decl.ty),
-        }
     }
 
     fn lower_call_value(
@@ -6020,6 +6008,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             else {
                 return Ok(false);
             };
+            if matches!(root.root, PlaceRoot::Global(_)) {
+                return Err(LowerError::UnsupportedExpr {
+                    expr_id: expr.node.id,
+                    kind: "UnsupportedCollectionLoan",
+                });
+            }
             self.lower_list_filter_effect(&root, elem, &call.node.args[0], remove_matches)?;
             return Ok(true);
         }
@@ -6031,6 +6025,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         else {
             return Ok(false);
         };
+        if matches!(root.root, PlaceRoot::Global(_)) {
+            return Err(LowerError::UnsupportedExpr {
+                expr_id: expr.node.id,
+                kind: "UnsupportedCollectionLoan",
+            });
+        }
         self.lower_map_filter_effect(&root, key, value, &call.node.args[0], remove_matches)?;
         Ok(true)
     }
@@ -7159,6 +7159,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn emit_assign(&mut self, dst: Place, value: RValue) -> Result<(), LowerError> {
+        if let PlaceRoot::Global(global) = dst.root
+            && dst.projection.is_empty()
+        {
+            return self.emit_global_update_root(global, value);
+        }
         self.ensure_open()?;
         self.block.stmts.push(AirStmt::Assign { dst, value });
         Ok(())

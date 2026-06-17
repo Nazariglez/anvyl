@@ -964,6 +964,21 @@ pub(crate) enum GlobalInitEffect {
     StoreWithoutInit,
 }
 
+impl GlobalAccessMode {
+    pub(crate) fn init_effect(self) -> GlobalInitEffect {
+        match self {
+            Self::RootAssign => GlobalInitEffect::StoreWithoutInit,
+            Self::Read
+            | Self::ProjectedAssign
+            | Self::CompoundAssign
+            | Self::ImmutableBorrow
+            | Self::MutableBorrow
+            | Self::VarArgument
+            | Self::MutReceiver => GlobalInitEffect::InitializeFirst,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalAccessFact {
     pub(crate) expr_id: ExprId,

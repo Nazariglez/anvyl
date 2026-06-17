@@ -977,53 +977,71 @@ pub(super) enum PlaceUseKind {
 }
 
 impl PlaceUseKind {
-    fn closure_effect(self) -> ClosurePlaceEffect {
-        match self {
-            Self::Read | Self::ImmutableBorrow => ClosurePlaceEffect::Read,
-            Self::Assign
-            | Self::CompoundAssign
-            | Self::VarArgument
-            | Self::MutReceiver
-            | Self::MutableBorrow => ClosurePlaceEffect::Mutable,
+    fn record(self, value: &PlaceValue) -> RecordedPlaceUse {
+        let global = value.global.as_ref();
+        let (closure, local, global_mode, extern_effect) = match self {
+            Self::Read => (
+                ClosurePlaceEffect::Read,
+                Some(LocalUseMode::Read),
+                Some(GlobalAccessMode::Read),
+                ExternPlaceEffect::Read,
+            ),
+            Self::Assign => (
+                ClosurePlaceEffect::Mutable,
+                Some(LocalUseMode::Assign),
+                Some(if global.is_some_and(|global| global.root) {
+                    GlobalAccessMode::RootAssign
+                } else {
+                    GlobalAccessMode::ProjectedAssign
+                }),
+                ExternPlaceEffect::Write,
+            ),
+            Self::CompoundAssign => (
+                ClosurePlaceEffect::Mutable,
+                Some(LocalUseMode::CompoundAssign),
+                Some(GlobalAccessMode::CompoundAssign),
+                ExternPlaceEffect::ReadWrite,
+            ),
+            Self::VarArgument => (
+                ClosurePlaceEffect::Mutable,
+                Some(LocalUseMode::VarArgument),
+                Some(GlobalAccessMode::VarArgument),
+                ExternPlaceEffect::Write,
+            ),
+            Self::MutReceiver => (
+                ClosurePlaceEffect::Mutable,
+                None,
+                Some(GlobalAccessMode::MutReceiver),
+                ExternPlaceEffect::Write,
+            ),
+            Self::ImmutableBorrow => (
+                ClosurePlaceEffect::Read,
+                Some(LocalUseMode::Borrow),
+                Some(GlobalAccessMode::ImmutableBorrow),
+                ExternPlaceEffect::Read,
+            ),
+            Self::MutableBorrow => (
+                ClosurePlaceEffect::Mutable,
+                Some(LocalUseMode::MutBorrow),
+                Some(GlobalAccessMode::MutableBorrow),
+                ExternPlaceEffect::Write,
+            ),
+        };
+        RecordedPlaceUse {
+            closure,
+            local,
+            global: global.and(global_mode),
+            extern_effect,
         }
     }
+}
 
-    fn local_mode(self) -> Option<LocalUseMode> {
-        match self {
-            Self::Read => Some(LocalUseMode::Read),
-            Self::Assign => Some(LocalUseMode::Assign),
-            Self::CompoundAssign => Some(LocalUseMode::CompoundAssign),
-            Self::VarArgument => Some(LocalUseMode::VarArgument),
-            Self::MutReceiver => None,
-            Self::ImmutableBorrow => Some(LocalUseMode::Borrow),
-            Self::MutableBorrow => Some(LocalUseMode::MutBorrow),
-        }
-    }
-
-    fn global_mode(self, value: &PlaceValue) -> GlobalAccessMode {
-        match self {
-            Self::Read => GlobalAccessMode::Read,
-            Self::Assign if value.global.as_ref().is_some_and(|global| global.root) => {
-                GlobalAccessMode::RootAssign
-            }
-            Self::Assign => GlobalAccessMode::ProjectedAssign,
-            Self::CompoundAssign => GlobalAccessMode::CompoundAssign,
-            Self::VarArgument => GlobalAccessMode::VarArgument,
-            Self::MutReceiver => GlobalAccessMode::MutReceiver,
-            Self::ImmutableBorrow => GlobalAccessMode::ImmutableBorrow,
-            Self::MutableBorrow => GlobalAccessMode::MutableBorrow,
-        }
-    }
-
-    fn extern_effect(self) -> ExternPlaceEffect {
-        match self {
-            Self::Read | Self::ImmutableBorrow => ExternPlaceEffect::Read,
-            Self::Assign | Self::VarArgument | Self::MutReceiver | Self::MutableBorrow => {
-                ExternPlaceEffect::Write
-            }
-            Self::CompoundAssign => ExternPlaceEffect::ReadWrite,
-        }
-    }
+#[derive(Clone, Copy)]
+struct RecordedPlaceUse {
+    closure: ClosurePlaceEffect,
+    local: Option<LocalUseMode>,
+    global: Option<GlobalAccessMode>,
+    extern_effect: ExternPlaceEffect,
 }
 
 #[derive(Clone, Copy)]
@@ -1057,15 +1075,16 @@ pub(super) fn record_place_use(
     kind: PlaceUseKind,
     tc: &mut TypeChecker,
 ) {
-    match kind.closure_effect() {
+    let use_ = kind.record(value);
+    match use_.closure {
         ClosurePlaceEffect::Read => tc.closure.read_place(expr_id),
         ClosurePlaceEffect::Mutable => tc.closure.mutably_use_place(expr_id),
     }
-    record_place_global_access(expr_id, value, kind.global_mode(value), tc);
-    if let Some(mode) = kind.local_mode() {
+    record_place_global_access(expr_id, value, use_.global, tc);
+    if let Some(mode) = use_.local {
         record_direct_use(expr_id, value, mode, tc);
     }
-    match kind.extern_effect() {
+    match use_.extern_effect {
         ExternPlaceEffect::Read => record_facts_read(expr_id, &value.facts, tc),
         ExternPlaceEffect::Write => record_facts_write(expr_id, &value.facts, tc),
         ExternPlaceEffect::ReadWrite => {
@@ -1107,13 +1126,13 @@ pub(super) fn record_mut_borrow(expr_id: ExprId, value: &PlaceValue, tc: &mut Ty
 fn record_place_global_access(
     expr_id: ExprId,
     value: &PlaceValue,
-    mode: GlobalAccessMode,
+    mode: Option<GlobalAccessMode>,
     tc: &mut TypeChecker,
 ) {
-    let Some(global) = &value.global else {
+    let (Some(global), Some(mode)) = (&value.global, mode) else {
         return;
     };
-    tc.record_global_access(expr_id, global.root_expr_id, &global.key, global.root, mode);
+    tc.record_global_access(expr_id, global.root_expr_id, &global.key, mode);
 }
 
 pub(super) fn record_facts_read(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {

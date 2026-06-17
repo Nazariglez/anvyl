@@ -1,6 +1,6 @@
 use super::{
-    CheckedType, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect, GlobalKey, GlobalSig, Type,
-    TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint, push_type_closure_error,
+    CheckedType, GlobalAccessFact, GlobalAccessMode, GlobalKey, GlobalSig, Type, TypeChecker,
+    TypeError, ValueDecl, check_value_expr_checked_with_hint, push_type_closure_error,
     register_declarations, type_closure_facts,
 };
 use crate::{
@@ -40,14 +40,8 @@ impl TypeChecker {
         expr_id: ExprId,
         root_expr_id: ExprId,
         key: &GlobalKey,
-        root: bool,
         mode: GlobalAccessMode,
     ) {
-        let init_effect = if root && mode == GlobalAccessMode::RootAssign {
-            GlobalInitEffect::StoreWithoutInit
-        } else {
-            GlobalInitEffect::InitializeFirst
-        };
         self.semantic_facts.record_global_access(
             self.current_body(),
             GlobalAccessFact {
@@ -55,7 +49,7 @@ impl TypeChecker {
                 root_expr_id,
                 key: key.clone(),
                 mode,
-                init_effect,
+                init_effect: mode.init_effect(),
             },
         );
     }
