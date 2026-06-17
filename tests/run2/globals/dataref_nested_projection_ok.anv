@@ -1,0 +1,35 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// 5
+// 10
+// @match-end
+
+dataref Node {
+    value: int,
+    name: string,
+}
+
+struct Holder {
+    node: Node,
+}
+
+fn make_holder() -> Holder {
+    println("init");
+    Holder { node: Node { value: 4, name: "ready" } }
+}
+
+fn bump(var value: int) {
+    value += 5;
+}
+
+lazy var holder = make_holder();
+
+fn main() {
+    println(holder.node.name.len());
+    bump(holder.node.value);
+    holder.node.value = holder.node.value + 1;
+    println(holder.node.value);
+}

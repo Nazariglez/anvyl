@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: nested dataref-handle mutable-place projections are future work
 // @match: 2
 
 dataref Node {

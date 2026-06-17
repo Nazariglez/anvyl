@@ -1,0 +1,25 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// ready
+// @match-end
+
+struct Box { title: string }
+
+fn make_box() -> Box {
+    println("init");
+    Box { title: "ready" }
+}
+
+fn show(title: string) {
+    state = Box { title: "ready" };
+    println(title);
+}
+
+lazy var state = make_box();
+
+fn main() {
+    show(state.title);
+}

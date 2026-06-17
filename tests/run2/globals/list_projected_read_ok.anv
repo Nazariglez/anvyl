@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// 5
+// @match-end
+
+fn make_values() -> [int] {
+    println("init");
+    [4, 5]
+}
+
+lazy var values = make_values();
+
+fn main() {
+    let index = 1;
+    println(values[index]);
+}

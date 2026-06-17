@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// a
+// 1
+// b
+// 2
+// @match-end
+
+lazy var values: [string: int] = ["a": 1];
+
+fn main() {
+    values.insert("b", 2);
+    for key, value in values {
+        println(key);
+        println(value);
+    }
+}

@@ -1,11 +1,16 @@
 use super::{
-    place::{MutPlaceProjection, MutPlaceProjectionStep, RustPlaces, projected_ops_ctor},
-    rep_policy::{RustBorrowView, RustMaterialization, RustRepPolicy},
+    place::{
+        DynamicPlaceAccess, MutPlaceProjection, MutPlaceProjectionStep, RustPlaces,
+        projected_ops_ctor,
+    },
+    rep_policy::{
+        RustBorrowView, RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy,
+    },
     rir::{
         RirCallArg, RirCellRef, RirConst, RirConstValue, RirEnum, RirField, RirFunction,
-        RirGlobalId, RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirScopedPlaceCellRef, RirType, RirTypeId,
-        RirVariant, RirVariantKind,
+        RirGlobalId, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
+        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirScopedPlaceCellRef,
+        RirType, RirTypeId, RirVariant, RirVariantKind,
     },
     syntax::{
         block_expr, comma, field_init, match_expr, rust_string, struct_lit, struct_variant,
@@ -82,11 +87,11 @@ impl<'a> RustValues<'a> {
 
     fn borrow_expr(&self, ty: RirTypeId, expr: &str, borrowed_root: bool) -> String {
         match self.policy.borrow_view(ty) {
-            RustBorrowView::Ref if borrowed_root => expr.to_string(),
-            RustBorrowView::Ref => format!("&{expr}"),
-            RustBorrowView::Str | RustBorrowView::Slice if borrowed_root => expr.to_string(),
+            RustBorrowView::Ref | RustBorrowView::Slice | RustBorrowView::Str if borrowed_root => {
+                expr.to_string()
+            }
+            RustBorrowView::Ref | RustBorrowView::Slice => format!("&{expr}"),
             RustBorrowView::Str => format!("{expr}.as_str()"),
-            RustBorrowView::Slice => format!("&{expr}"),
             RustBorrowView::TargetGap => expr.to_string(),
         }
     }
@@ -97,44 +102,53 @@ impl<'a> RustValues<'a> {
 
     pub(super) fn mut_place_arg(&self, arg: &RirMutPlaceArg) -> String {
         debug_assert!(arg.projections.is_empty());
-        self.mut_place_root_arg(&arg.root)
+        self.mut_place_access_arg(&arg.access)
             .expect("dataref mut-place args must be prepared before rendering")
             .1
     }
 
-    pub(super) fn mut_place_root_arg(&self, root: &RirMutPlaceRoot) -> Option<(RirTypeId, String)> {
+    pub(super) fn mut_place_access_arg(
+        &self,
+        access: &RirMutPlaceAccess,
+    ) -> Option<(RirTypeId, String)> {
+        match access {
+            RirMutPlaceAccess::Handle(handle) => Some(self.mut_place_handle_arg(handle)),
+            RirMutPlaceAccess::DataRef { .. } => None,
+        }
+    }
+
+    fn mut_place_handle_arg(&self, root: &RirMutPlaceHandle) -> (RirTypeId, String) {
         match root {
-            RirMutPlaceRoot::Local { local, ty } => Some((
+            RirMutPlaceHandle::Local { local, ty } => (
                 *ty,
                 target::mut_place_local(&self.place(&RirPlace::local(*local, vec![], *ty))),
-            )),
-            RirMutPlaceRoot::Param { local, ty } => Some((
+            ),
+            RirMutPlaceHandle::Param { local, ty } => (
                 *ty,
                 target::mut_place_reborrow(self.function.locals[local.index()].symbol.as_str()),
-            )),
-            RirMutPlaceRoot::StackCell { cell, ty } => {
-                Some((*ty, target::mut_place_stack_cell(&self.cell_ref(*cell))))
+            ),
+            RirMutPlaceHandle::StackCell { cell, ty } => {
+                (*ty, target::mut_place_stack_cell(&self.cell_ref(*cell)))
             }
-            RirMutPlaceRoot::HeapCell { cell, ty } => {
-                Some((*ty, target::mut_place_heap_cell(&self.cell_ref(*cell))))
+            RirMutPlaceHandle::HeapCell { cell, ty } => {
+                (*ty, target::mut_place_heap_cell(&self.cell_ref(*cell)))
             }
-            RirMutPlaceRoot::ScopedPlaceCell { cell, ty } => {
+            RirMutPlaceHandle::ScopedPlaceCell { cell, ty } => {
                 let cell = match cell {
                     RirScopedPlaceCellRef::Owner(_) => {
                         format!("&{}", self.scoped_place_cell_ref(*cell))
                     }
                     RirScopedPlaceCellRef::Capture { .. } => self.scoped_place_cell_ref(*cell),
                 };
-                Some((*ty, target::mut_place_scoped_cell(&cell)))
+                (*ty, target::mut_place_scoped_cell(&cell))
             }
-            RirMutPlaceRoot::Global { global, ty } => Some((
+            RirMutPlaceHandle::Global { global, ty } => (
                 *ty,
                 target::mut_place_global(
                     &Self::global_slot_expr(self.program, *global),
                     &Self::global_init_call(self.program, *global),
                 ),
-            )),
-            RirMutPlaceRoot::DataRef { .. } => None,
+            ),
         }
     }
 
@@ -192,7 +206,11 @@ impl<'a> RustValues<'a> {
             return value;
         }
         let place_expr = self.place(place);
-        match self.policy.materialization(place.ty) {
+        match self.policy.materialization_for(
+            place.ty,
+            RustMaterialSource::Value,
+            RustMaterialIntent::Read,
+        ) {
             RustMaterialization::Copy => self.operand(operand),
             RustMaterialization::Share
                 if self.places.shared_borrow_root_param(place)
@@ -260,10 +278,28 @@ impl<'a> RustValues<'a> {
         let RirPlaceRoot::Global(global) = place.root else {
             return None;
         };
-        if !place.projections.is_empty() {
-            unreachable!("profile rejects projected global reads")
+        if place.projections.is_empty() {
+            return Some(self.global_read(global));
         }
-        Some(self.global_read(global))
+        let root_ty = self.program.globals[global.index()].ty;
+        let guard = "__anv_global";
+        let root = format!("(&*{guard})");
+        let value = if let Some(access) =
+            self.places
+                .map_slot_access_from(root_ty, &root, &place.projections)
+        {
+            self.map_slot_value_expr(&access)
+        } else {
+            let expr = self
+                .places
+                .projected_expr(root_ty, &root, place.ty, &place.projections)?;
+            self.value_from_place(place.ty, &expr)
+        };
+        let read = target::global_read(
+            &Self::global_slot_expr(self.program, global),
+            &Self::global_init_call(self.program, global),
+        );
+        Some(block_expr([format!("let {guard} = {read};")], Some(value)))
     }
 
     fn global_read(&self, global: RirGlobalId) -> String {
@@ -273,38 +309,127 @@ impl<'a> RustValues<'a> {
         );
         block_expr(
             [format!("let __global = {read};")],
-            Some(self.value_from_ref(self.program.globals[global.index()].ty, "&*__global")),
+            Some(self.value_from_ref_with_source(
+                self.program.globals[global.index()].ty,
+                "&*__global",
+                RustMaterialSource::ExactGlobalRoot,
+            )),
+        )
+    }
+
+    pub(super) fn assign(&self, dst: &RirPlace, value: &str) -> String {
+        if let Some(set) = self.projected_mut_place_assign(dst, value) {
+            return set;
+        }
+        if let Some(set) = self.dynamic_local_assign(dst, value) {
+            return set;
+        }
+        if let Some(access) = self.places.dynamic_place_access(dst) {
+            return Self::dynamic_place_assign(access, value);
+        }
+        let dst_expr = self.places.local_place(dst);
+        if self.places.mut_place_root_param(dst) {
+            self.mut_place_set(dst.ty, &dst_expr, value)
+        } else if self.program.collection_replace_ty(dst.ty) {
+            target::replace_collection(&dst_expr, value)
+        } else {
+            format!("{dst_expr} = {value}")
+        }
+    }
+
+    fn dynamic_place_assign(access: DynamicPlaceAccess, value: &str) -> String {
+        match access {
+            DynamicPlaceAccess::MapSlot(access) => Self::assign_map_slot(&access, value),
+            DynamicPlaceAccess::SliceIndex(access) => Self::assign_slice_index(&access, value),
+        }
+    }
+
+    fn mut_place_set(&self, ty: RirTypeId, place: &str, value: &str) -> String {
+        if self.program.collection_replace_ty(ty) {
+            target::mut_place_replace_collection(place, target::runtime_param_name(), value)
+        } else {
+            target::mut_place_set(place, target::runtime_param_name(), value)
+        }
+    }
+
+    fn assign_slice_index(access: &super::place::SliceIndexAccess, value: &str) -> String {
+        if access.list_root {
+            let checked = target::checked_index_result(
+                &access.index,
+                &format!("{}.len()", access.slice),
+                "list",
+            );
+            let version = target::collection_structural_version(&access.slice);
+            let update = target::list_with_elem_owned_mut_short(
+                &access.slice,
+                target::runtime_param_name(),
+                "index",
+                "version",
+                "*value = __anv_slice_value; Ok(())",
+            );
+            format!(
+                "{{ let index = {checked}; let version = {version}; let __anv_slice_value = {value}; {update}?; }}"
+            )
+        } else {
+            format!(
+                "{{ let __anv_slice_value = {value}; {}?; }}",
+                target::slice_with_elem_owned_mut_short(
+                    &access.slice,
+                    target::runtime_param_name(),
+                    &access.index,
+                    "*value = __anv_slice_value; Ok(())",
+                )
+            )
+        }
+    }
+
+    fn assign_map_slot(access: &super::place::MapSlotAccess, value: &str) -> String {
+        let set = target::map_optional_slot_set(
+            "value",
+            target::runtime_param_name(),
+            "__anv_map_key",
+            "__anv_map_slot",
+        );
+        format!(
+            "{{ let __anv_map_key = {}; let __anv_map_slot = {value}; let value = &mut {}; {set}?; }}",
+            access.key_value, access.map
         )
     }
 
     fn map_slot_value_operand(&self, place: &RirPlace) -> Option<String> {
-        let access = self.places.map_slot_access(place)?;
+        let DynamicPlaceAccess::MapSlot(access) = self.places.dynamic_place_access(place)? else {
+            return None;
+        };
+        Some(self.map_slot_value_expr(&access))
+    }
+
+    fn map_slot_value_expr(&self, access: &super::place::MapSlotAccess) -> String {
         let value = self.value_from_place(access.value_ty, "value");
-        Some(format!(
+        format!(
             "{}.get({}, &{})?.map(|value| {value})",
             access.map,
             target::runtime_param_name(),
             access.key
-        ))
+        )
     }
 
-    fn projection_needs_projected_set(projection: &MutPlaceProjection) -> bool {
+    fn needs_dynamic_set_region(projection: &MutPlaceProjection) -> bool {
+        projection
+            .steps
+            .split_last()
+            .is_some_and(|(_, prefix)| prefix.iter().any(Self::dynamic_projection_step))
+    }
+
+    fn dynamic_projection_step(step: &MutPlaceProjectionStep) -> bool {
         matches!(
-            projection.steps.last(),
-            Some(MutPlaceProjectionStep::MapIndex { .. })
-        ) && projection.steps[..projection.steps.len() - 1]
-            .iter()
-            .any(|step| {
-                matches!(
-                    step,
-                    MutPlaceProjectionStep::ListIndex { .. }
-                        | MutPlaceProjectionStep::SliceIndex { .. }
-                        | MutPlaceProjectionStep::MapIndex { .. }
-                )
-            })
+            step,
+            MutPlaceProjectionStep::ListIndex { .. }
+                | MutPlaceProjectionStep::SliceIndex { .. }
+                | MutPlaceProjectionStep::MapIndex { .. }
+        )
     }
 
-    pub(super) fn mut_place_projected_set(&self, place: &RirPlace, value: &str) -> Option<String> {
+    fn projected_mut_place_assign(&self, place: &RirPlace, value: &str) -> Option<String> {
         let projection = self.places.mut_place_projection(place)?;
         Some(self.projected_set_region(
             &projection,
@@ -313,7 +438,7 @@ impl<'a> RustValues<'a> {
         ))
     }
 
-    pub(super) fn local_projected_set(&self, place: &RirPlace, value: &str) -> Option<String> {
+    fn dynamic_local_assign(&self, place: &RirPlace, value: &str) -> Option<String> {
         let RirPlaceRoot::Local(root) = place.root else {
             return None;
         };
@@ -324,7 +449,7 @@ impl<'a> RustValues<'a> {
             place.ty,
             &place.projections,
         )?;
-        if !Self::projection_needs_projected_set(&projection) {
+        if !Self::needs_dynamic_set_region(&projection) {
             return None;
         }
         Some(self.projected_set_region(
@@ -379,7 +504,7 @@ impl<'a> RustValues<'a> {
     ) -> String {
         let descriptor = self.mut_place_projection_descriptor("__AnvProjectedPlaceOps", projection);
         format!(
-            "{{ {before_place} {} {} let __anv_ops = {}; let mut __anv_place = {}; {body} }}",
+            "{{ {} {} let __anv_ops = {}; {before_place} let mut __anv_place = {}; {body} }}",
             descriptor.struct_decl,
             descriptor.impl_decl,
             descriptor.ctor,
@@ -571,7 +696,11 @@ impl<'a> RustValues<'a> {
 
     fn place_value_from_access(&self, ty: RirTypeId, expr: &str) -> String {
         let runtime = target::runtime_param_name();
-        match self.policy.materialization(ty) {
+        match self.policy.materialization_for(
+            ty,
+            RustMaterialSource::Value,
+            RustMaterialIntent::Read,
+        ) {
             RustMaterialization::Copy => target::mut_place_get_copy(expr, runtime),
             RustMaterialization::Share
             | RustMaterialization::CloneHandle
@@ -587,7 +716,19 @@ impl<'a> RustValues<'a> {
     }
 
     pub(super) fn value_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
-        match self.policy.materialization(ty) {
+        self.value_from_ref_with_source(ty, expr, RustMaterialSource::Value)
+    }
+
+    fn value_from_ref_with_source(
+        &self,
+        ty: RirTypeId,
+        expr: &str,
+        source: RustMaterialSource,
+    ) -> String {
+        match self
+            .policy
+            .materialization_for(ty, source, RustMaterialIntent::Read)
+        {
             RustMaterialization::Copy => self.copy_from_ref(ty, expr),
             RustMaterialization::Share => self.share_from_ref(ty, expr),
             RustMaterialization::CloneHandle => format!("(*({expr})).clone()"),
@@ -598,7 +739,11 @@ impl<'a> RustValues<'a> {
     }
 
     pub(super) fn value_from_place(&self, ty: RirTypeId, expr: &str) -> String {
-        match self.policy.materialization(ty) {
+        match self.policy.materialization_for(
+            ty,
+            RustMaterialSource::Value,
+            RustMaterialIntent::Read,
+        ) {
             RustMaterialization::Copy => match self.program.types[ty.index()] {
                 RirType::Int | RirType::Float | RirType::Bool => expr.to_string(),
                 _ => self.copy_from_ref(ty, &format!("&{expr}")),
@@ -678,7 +823,7 @@ impl<'a> RustValues<'a> {
         match abi {
             anvyx_runtime::RustReturnAbi::Value(ty) => Self::native_value_return(ty, &call),
             anvyx_runtime::RustReturnAbi::Option(inner) => {
-                self.option_return_call(ret, inner, call)
+                self.option_return_call(ret, inner, &call)
             }
             _ => call,
         }
@@ -744,7 +889,7 @@ impl<'a> RustValues<'a> {
         &self,
         ret: RirTypeId,
         inner: &anvyx_runtime::RustReturnAbi,
-        call: String,
+        call: &str,
     ) -> String {
         let RirType::Option(_) = self.program.types[ret.index()] else {
             unreachable!("verified native option return type")
@@ -754,7 +899,7 @@ impl<'a> RustValues<'a> {
             _ => unreachable!("verified native option return inner"),
         };
         match_expr(
-            &call,
+            call,
             [
                 format!("Some(value) => Some({value})"),
                 "None => None".to_string(),

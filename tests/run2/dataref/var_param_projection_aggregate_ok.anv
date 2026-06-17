@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: aggregate dataref mutable-place projections are future work
 // @match: 2
 
 struct Stats {

@@ -7,16 +7,17 @@ use anvyx_frontend::{
         FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl,
         LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode,
         ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature,
-        TypeData, VariantDecl, VariantId, VariantShape,
+        TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
 
 use super::{
     RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
-    dataref_mut_place::{DataRefMutPlaceSupport, classify as classify_dataref_mut_place},
     dataref_place::DataRefPlaceDescriptors,
-    emit, plan,
+    emit,
+    place_access::{PlaceAccessCx, PlaceAccessIntent},
+    plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
@@ -30,13 +31,13 @@ use super::{
         RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
         RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
         RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMutPlaceArg, RirMutPlaceRoot, RirOperand, RirOptionMatch, RirParam, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
-        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind, RirVerifySite,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
     target,
@@ -2156,7 +2157,7 @@ fn plan_lowers_projected_global_assignment() {
             RirStmt::GlobalEnsure { .. },
             RirStmt::MutPlaceSet {
                 place: RirMutPlaceArg {
-                    root: RirMutPlaceRoot::Global { .. },
+                    access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }),
                     projections,
                     ..
                 },
@@ -2228,7 +2229,7 @@ fn plan_lowers_projected_global_var_arg_to_mut_place() {
         ] if matches!(
             args.as_slice(),
             [RirCallArg::MutPlace(RirMutPlaceArg {
-                root: RirMutPlaceRoot::Global { .. },
+                access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }),
                 projections,
                 ..
             })] if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
@@ -6619,7 +6620,7 @@ fn rir_accepts_projected_local_field_mut_place_arg() {
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Local { local, ty: pair_ty },
+                        RirMutPlaceHandle::Local { local, ty: pair_ty },
                         vec![RirProjection::TupleField(field)],
                         int,
                     ))],
@@ -6669,7 +6670,7 @@ fn rir_accepts_projected_param_mut_place_arg() {
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Param { local, ty: pair_ty },
+                        RirMutPlaceHandle::Param { local, ty: pair_ty },
                         vec![RirProjection::TupleField(field)],
                         int,
                     ))],
@@ -6686,7 +6687,7 @@ fn rir_accepts_projected_param_mut_place_arg() {
 
 #[test]
 fn rir_accepts_projected_stack_cell_mut_place_arg() {
-    let program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::StackCell {
+    let program = projected_cell_mut_place_arg_program(RirMutPlaceHandle::StackCell {
         cell: RirCellRef::Owner(RirCellId::from_index(0)),
         ty: RirTypeId::from_index(2),
     });
@@ -6696,7 +6697,7 @@ fn rir_accepts_projected_stack_cell_mut_place_arg() {
 
 #[test]
 fn rir_accepts_projected_heap_cell_mut_place_arg() {
-    let program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::HeapCell {
+    let program = projected_cell_mut_place_arg_program(RirMutPlaceHandle::HeapCell {
         cell: RirCellRef::Owner(RirCellId::from_index(0)),
         ty: RirTypeId::from_index(2),
     });
@@ -6734,7 +6735,7 @@ fn rir_rejects_projected_cell_bad_index_local() {
             vec![RirStmt::Eval(RirRValue::Call {
                 callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                 args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                    RirMutPlaceRoot::StackCell {
+                    RirMutPlaceHandle::StackCell {
                         cell: RirCellRef::Owner(RirCellId::from_index(0)),
                         ty: array,
                     },
@@ -6785,7 +6786,7 @@ fn rir_rejects_dynamic_projected_cell_mut_place_arg() {
                 RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::StackCell {
+                        RirMutPlaceHandle::StackCell {
                             cell: RirCellRef::Owner(RirCellId::from_index(0)),
                             ty: list,
                         },
@@ -6832,7 +6833,7 @@ fn rir_accepts_single_dynamic_projected_param_mut_place_arg() {
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Param {
+                        RirMutPlaceHandle::Param {
                             local: xs,
                             ty: list,
                         },
@@ -6883,7 +6884,7 @@ fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Local {
+                        RirMutPlaceHandle::Local {
                             local: xs,
                             ty: nested,
                         },
@@ -6939,7 +6940,7 @@ fn rir_accepts_map_slot_projected_param_mut_place_arg() {
                 vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Param {
+                        RirMutPlaceHandle::Param {
                             local: counts,
                             ty: map,
                         },
@@ -9186,8 +9187,9 @@ fn profile_rejects_scoped_borrowed_param_to_native_mut_borrow() {
 }
 
 #[test]
-fn classifier_accepts_direct_scalar_dataref_source_var_arg() {
+fn access_plan_accepts_direct_scalar_dataref_source_var_arg() {
     let program = projected_mut_call_arg_program();
+    let classes = TypePassClasses::analyze(&program);
     let function = FunctionId::from_index(1);
     let Statement::Eval(RValue::Call { args, .. }) =
         &program.function(function).body.block.stmts[0]
@@ -9197,13 +9199,11 @@ fn classifier_accepts_direct_scalar_dataref_source_var_arg() {
     let CallArg::MutBorrow(place) = &args[0] else {
         unreachable!();
     };
-    let root = place.root.local().unwrap();
-    let root_ty = program.function(function).locals[root.index()].ty;
+    let plan = PlaceAccessCx::new(&program, &classes)
+        .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+        .unwrap();
 
-    assert!(matches!(
-        classify_dataref_mut_place(&program, root_ty, place),
-        DataRefMutPlaceSupport::Supported(_)
-    ));
+    assert!(plan.crosses_dataref);
 }
 
 #[test]
@@ -9286,7 +9286,7 @@ fn plan_lowers_owner_heap_capture_cell_source_var_arg_to_heap_cell() {
     assert!(matches!(
         arg,
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::HeapCell { cell: RirCellRef::Owner(id), .. },
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::HeapCell { cell: RirCellRef::Owner(id), .. }),
             ..
         }) if *id == RirCellId::from_index(0)
     ));
@@ -9303,7 +9303,7 @@ fn plan_lowers_lambda_heap_capture_cell_source_var_arg_to_heap_cell() {
     assert!(matches!(
         arg,
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::HeapCell { cell: RirCellRef::Capture { cell, .. }, .. },
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::HeapCell { cell: RirCellRef::Capture { cell, .. }, .. }),
             ..
         }) if *cell == RirCellId::from_index(0)
     ));
@@ -9320,7 +9320,7 @@ fn plan_lowers_owner_capture_cell_source_var_arg_to_stack_cell() {
     assert!(matches!(
         arg,
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::StackCell { cell: RirCellRef::Owner(id), .. },
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::StackCell { cell: RirCellRef::Owner(id), .. }),
             ..
         }) if *id == RirCellId::from_index(0)
     ));
@@ -9337,7 +9337,7 @@ fn plan_lowers_lambda_capture_cell_source_var_arg_to_stack_cell() {
     assert!(matches!(
         arg,
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::StackCell { cell: RirCellRef::Capture { cell, .. }, .. },
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::StackCell { cell: RirCellRef::Capture { cell, .. }, .. }),
             ..
         }) if *cell == RirCellId::from_index(0)
     ));
@@ -9431,13 +9431,13 @@ fn plan_lowers_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
     assert!(matches!(
         arg,
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::ScopedPlaceCell {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell {
                 cell: RirScopedPlaceCellRef::Capture {
                     cell: RirScopedPlaceCellId(0),
                     ..
                 },
                 ..
-            },
+            }),
             ..
         })
     ));
@@ -9470,13 +9470,13 @@ fn plan_lowers_nested_scoped_borrow_recapture_to_same_cell() {
     assert!(matches!(
         only_call_arg(inner_body),
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::ScopedPlaceCell {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell {
                 cell: RirScopedPlaceCellRef::Capture {
                     cell: RirScopedPlaceCellId(0),
                     local: RirLocalId(0),
                 },
                 ..
-            },
+            }),
             ..
         })
     ));
@@ -9593,10 +9593,10 @@ fn plan_lowers_owner_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
     assert!(matches!(
         only_call_arg(owner),
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::ScopedPlaceCell {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell {
                 cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
                 ..
-            },
+            }),
             ..
         })
     ));
@@ -9828,7 +9828,7 @@ fn plan_lowers_projected_local_to_native_mut_place() {
     assert!(matches!(
         only_call_arg(caller),
         RirCallArg::MutPlace(RirMutPlaceArg {
-            root: RirMutPlaceRoot::Local { .. },
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { .. }),
             projections,
             ..
         }) if matches!(projections.as_slice(), [RirProjection::TupleField(_)])
@@ -10893,7 +10893,7 @@ fn dataref_place_descriptor_inventory_finds_call_arg_descriptor() {
     let RirCallArg::MutPlace(arg) = &args[0] else {
         unreachable!();
     };
-    let RirMutPlaceRoot::DataRef { dataref, .. } = arg.root else {
+    let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access else {
         unreachable!();
     };
 
@@ -11057,19 +11057,20 @@ fn rir_verify_rejects_index_dataref_projection_mut_place_arg() {
 }
 
 #[test]
-fn rir_verify_rejects_nested_dataref_handle_projection_mut_place_arg() {
+fn rir_verify_accepts_nested_dataref_handle_projection_mut_place_arg() {
+    let ty = RirTypeId::from_index(1);
     let arg = dataref_projection_mut_place_arg(
         vec![
             RirProjection::Field(RirFieldId::from_index(0)),
             RirProjection::Field(RirFieldId::from_index(1)),
         ],
-        RirTypeId::from_index(1),
+        ty,
     );
+    let mut program = dataref_projection_mut_place_call_rir(arg);
+    program.functions[1].params[0].ty = ty;
+    program.functions[1].locals[0].ty = ty;
 
-    assert_rir_error(
-        dataref_projection_mut_place_call_rir(arg),
-        RirVerifyErrorKind::UnsupportedRValueType,
-    );
+    rir::verify(&program).expect("RIR rejected nested dataref handle mut-place arg");
 }
 
 #[test]
@@ -11086,9 +11087,21 @@ fn rir_verify_accepts_dataref_handle_projection_mut_place_arg() {
 }
 
 #[test]
-fn rir_verify_rejects_aggregate_dataref_projection_mut_place_arg_payloads() {
+fn rir_verify_accepts_aggregate_dataref_projection_mut_place_arg_payload() {
+    let ty = RirTypeId::from_index(2);
+    let arg =
+        dataref_projection_mut_place_arg(vec![RirProjection::Field(RirFieldId::from_index(0))], ty);
+    let mut program = dataref_projection_mut_place_call_rir(arg);
+    program.functions[1].params[0].ty = ty;
+    program.functions[1].locals[0].ty = ty;
+
+    rir::verify(&program).expect("RIR rejected aggregate dataref mut-place arg");
+}
+
+#[test]
+fn rir_verify_rejects_container_optional_enum_dataref_projection_mut_place_arg_payloads() {
     for (field, ty) in [
-        (RirFieldId::from_index(0), RirTypeId::from_index(2)),
+        (RirFieldId::from_index(1), RirTypeId::from_index(3)),
         (RirFieldId::from_index(4), RirTypeId::from_index(3)),
         (RirFieldId::from_index(5), RirTypeId::from_index(6)),
         (RirFieldId::from_index(6), RirTypeId::from_index(7)),
@@ -11166,6 +11179,16 @@ fn rir_verify_accepts_dataref_get_set_projection_ops() {
     ]);
 
     rir::verify(&program).expect("dataref access ops should verify");
+}
+
+#[test]
+fn rir_verify_rejects_dataref_mut_place_set() {
+    let program = dataref_access_rir(vec![RirStmt::MutPlaceSet {
+        place: valid_dataref_projection_mut_place_arg(),
+        value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+    }]);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -12128,14 +12151,14 @@ fn stack_cell_rir(cell: RirCellDecl) -> RirProgram {
     }
 }
 
-fn projected_cell_mut_place_arg_program(root: RirMutPlaceRoot) -> RirProgram {
+fn projected_cell_mut_place_arg_program(handle: RirMutPlaceHandle) -> RirProgram {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
     let tuple_ty = RirTypeId::from_index(2);
     let tuple = RirTupleId::from_index(0);
     let field = RirFieldId::from_index(0);
-    let storage = match root {
-        RirMutPlaceRoot::HeapCell { .. } => RirCellStorage::Heap,
+    let storage = match handle {
+        RirMutPlaceHandle::HeapCell { .. } => RirCellStorage::Heap,
         _ => RirCellStorage::StackScoped,
     };
     let mut program = RirProgram {
@@ -12177,7 +12200,7 @@ fn projected_cell_mut_place_arg_program(root: RirMutPlaceRoot) -> RirProgram {
                 RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
                     args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        root,
+                        handle,
                         vec![RirProjection::TupleField(field)],
                         int,
                     ))],
@@ -12199,7 +12222,7 @@ fn projected_cell_mut_place_arg_program(root: RirMutPlaceRoot) -> RirProgram {
 }
 
 fn projected_scoped_place_cell_mut_place_arg_program() -> RirProgram {
-    let mut program = projected_cell_mut_place_arg_program(RirMutPlaceRoot::ScopedPlaceCell {
+    let mut program = projected_cell_mut_place_arg_program(RirMutPlaceHandle::ScopedPlaceCell {
         cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
         ty: RirTypeId::from_index(2),
     });
@@ -13233,7 +13256,7 @@ fn edit_dataref_projection_mut_place_arg(
     edit: impl FnOnce(&mut RirOperand, &mut RirDataRefId, &mut Vec<RirProjection>, &mut RirTypeId),
 ) -> RirMutPlaceArg {
     let mut arg = valid_dataref_projection_mut_place_arg();
-    let RirMutPlaceRoot::DataRef { object, dataref } = &mut arg.root else {
+    let RirMutPlaceAccess::DataRef { object, dataref } = &mut arg.access else {
         unreachable!();
     };
     edit(object, dataref, &mut arg.projections, &mut arg.ty);

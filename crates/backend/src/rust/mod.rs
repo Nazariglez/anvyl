@@ -1,11 +1,11 @@
 mod analysis;
 pub mod cargo_job;
-mod dataref_mut_place;
 mod dataref_place;
 pub mod emit;
 mod mut_place;
 mod native;
 mod place;
+mod place_access;
 pub mod profile;
 pub mod rep_policy;
 pub mod rir;
@@ -33,7 +33,10 @@ use anvyx_frontend::{
 use anvyx_runtime::{RustPath, RustProviderSupport};
 
 use self::{
-    dataref_mut_place::projected_ty as air_projected_ty,
+    place_access::{
+        PlaceAccessCx, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot, PlaceProjection,
+        PlaceProjectionKind,
+    },
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
@@ -47,9 +50,9 @@ use self::{
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceArg, RirMutPlaceRoot, RirNativeExtern, RirOperand,
-        RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn,
+        RirLoop, RirLoopId, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern,
+        RirOperand, RirOptionMatch, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
+        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn,
         RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
         RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
         RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
@@ -353,6 +356,7 @@ struct PlannedLambdaCaptures {
 struct PlannedRValue {
     stmts: Vec<RirStmt>,
     value: RirRValue,
+    post_stmts: Vec<RirStmt>,
 }
 
 impl PlannedRValue {
@@ -360,6 +364,7 @@ impl PlannedRValue {
         Self {
             stmts: vec![],
             value,
+            post_stmts: vec![],
         }
     }
 }
@@ -383,6 +388,12 @@ struct PlannedOperands {
     operands: Vec<RirOperand>,
 }
 
+struct PlannedPlace {
+    stmts: Vec<RirStmt>,
+    place: RirPlace,
+    post_stmts: Vec<RirStmt>,
+}
+
 struct PlannedCallArg {
     stmts: Vec<RirStmt>,
     arg: RirCallArg,
@@ -394,6 +405,14 @@ struct DataRefSegment {
     projections: Vec<RirProjection>,
     ty: TypeId,
     next_index: usize,
+}
+
+enum AssignTarget {
+    CaptureCell(air::CaptureCellId),
+    ScopedPlaceCell(air::ScopedBorrowId),
+    ProjectedGlobal(GlobalId),
+    DataRef,
+    Assign { source_mut_param: bool },
 }
 
 impl PlannedCallArg {
@@ -446,7 +465,7 @@ impl<'a> PlanCx<'a> {
             ..RirProgram::default()
         };
         self.plan_types(&mut program)?;
-        self.plan_collection_storages(&mut program);
+        Self::plan_collection_storages(&mut program);
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
@@ -468,7 +487,7 @@ impl<'a> PlanCx<'a> {
         Ok(program)
     }
 
-    fn plan_collection_storages(&self, program: &mut RirProgram) {
+    fn plan_collection_storages(program: &mut RirProgram) {
         for (index, ty) in program.types.iter().enumerate() {
             let (kind, prefix) = match ty {
                 RirType::List(elem_ty) => {
@@ -1864,6 +1883,7 @@ impl<'a> PlanCx<'a> {
                     local: RirLocalId::from_index(local.index()),
                     value: planned.value,
                 });
+                stmts.extend(planned.post_stmts);
                 Self::set_known_lambda(lambda_values, RirLocalId::from_index(local.index()), known);
                 Ok(stmts)
             }
@@ -1881,6 +1901,7 @@ impl<'a> PlanCx<'a> {
                     possible_cells,
                     in_loop,
                 )?;
+                stmts.extend(planned.post_stmts);
                 Self::set_place_known_lambda(lambda_values, dst, known);
                 Ok(stmts)
             }
@@ -1888,6 +1909,7 @@ impl<'a> PlanCx<'a> {
                 let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Eval(planned.value));
+                stmts.extend(planned.post_stmts);
                 Ok(stmts)
             }
             air::AirStmt::GlobalEnsure { global } => Ok(vec![RirStmt::GlobalEnsure {
@@ -1915,10 +1937,24 @@ impl<'a> PlanCx<'a> {
             air::AirStmt::GlobalUpdateRoot { global, value } => {
                 let (mut stmts, value) =
                     self.plan_global_root_value(function, *global, value, locals, lambda_values)?;
-                stmts.push(RirStmt::GlobalUpdateRoot {
-                    global: self.global_map[global],
-                    value,
-                });
+                let global_decl = &self.air.globals[global.index()];
+                if matches!(
+                    self.air.type_arena.data(global_decl.ty),
+                    TypeData::List(_) | TypeData::Map { .. }
+                ) {
+                    stmts.push(RirStmt::MutPlaceSet {
+                        place: RirMutPlaceArg::global(
+                            self.global_map[global],
+                            self.type_map[&global_decl.ty],
+                        ),
+                        value,
+                    });
+                } else {
+                    stmts.push(RirStmt::GlobalUpdateRoot {
+                        global: self.global_map[global],
+                        value,
+                    });
+                }
                 Ok(stmts)
             }
             air::AirStmt::If(branch) => {
@@ -2021,6 +2057,7 @@ impl<'a> PlanCx<'a> {
                 })])
             }
             air::AirStmt::CollectionLoan(loan) => {
+                let root = self.lower_collection_loan_root(function, &loan.root);
                 let body = self.plan_air_block(
                     function,
                     &loan.body,
@@ -2030,12 +2067,14 @@ impl<'a> PlanCx<'a> {
                     possible_cells,
                     in_loop,
                 )?;
-                Ok(vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                    root: self.plan_place_in_function(function, &loan.root),
+                let mut stmts = root.stmts;
+                stmts.push(RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                    root: root.place,
                     root_kind: rir_collection_root_kind(loan.root_kind),
                     mode: rir_collection_loan_mode(loan.mode),
                     body,
-                })])
+                }));
+                Ok(stmts)
             }
             air::AirStmt::CollectionSlotScope(scope) => self.plan_collection_slot_scope(
                 function,
@@ -2277,6 +2316,7 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::Binary { op, lhs, rhs, ty } => {
@@ -2292,6 +2332,7 @@ impl<'a> PlanCx<'a> {
                         rhs: rhs.operand,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::SharedRefEq { lhs, rhs, negated } => {
@@ -2306,6 +2347,7 @@ impl<'a> PlanCx<'a> {
                         rhs: rhs.operand,
                         negated: *negated,
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::Cast { value, target } => {
@@ -2316,6 +2358,7 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         target: self.type_map[target],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::OptionalSome { value, ty } => {
@@ -2326,6 +2369,7 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::Call { callee, args } => {
@@ -2339,6 +2383,7 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         source_ty: self.type_map[source_ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::StringConcat { parts } => {
@@ -2348,6 +2393,7 @@ impl<'a> PlanCx<'a> {
                     value: RirRValue::StringConcat {
                         parts: parts.operands,
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::Format { value, spec } => {
@@ -2360,6 +2406,7 @@ impl<'a> PlanCx<'a> {
                         source_ty,
                         spec: rir_format_spec(*spec),
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::Aggregate { kind, fields, ty } => {
@@ -2375,22 +2422,21 @@ impl<'a> PlanCx<'a> {
                     value: RirRValue::Len {
                         source: source_place,
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::ListPush { list, value } => {
-                if self.place_crosses_dataref(function, list) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedPlaceProjection,
-                    ));
-                }
                 let value = self.plan_operand_read(function, value, locals);
+                let list = self.lower_structural_mutation_place(function, list, locals);
+                let mut stmts = value.stmts;
+                stmts.extend(list.stmts);
                 PlannedRValue {
-                    stmts: value.stmts,
+                    stmts,
                     value: RirRValue::ListPush {
-                        list: self.plan_place_in_function(function, list),
+                        list: list.place,
                         value: value.operand,
                     },
+                    post_stmts: list.post_stmts,
                 }
             }
             RValue::SliceView {
@@ -2427,6 +2473,7 @@ impl<'a> PlanCx<'a> {
                         inclusive: *inclusive,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::MapGet { map, key, ty } => {
@@ -2444,6 +2491,7 @@ impl<'a> PlanCx<'a> {
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: vec![],
                 }
             }
             RValue::MapInsert {
@@ -2452,40 +2500,35 @@ impl<'a> PlanCx<'a> {
                 value,
                 kind: _,
             } => {
-                if self.place_crosses_dataref(function, map) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedPlaceProjection,
-                    ));
-                }
                 let key = self.plan_operand_read(function, key, locals);
                 let value = self.plan_operand_read(function, value, locals);
+                let map = self.lower_structural_mutation_place(function, map, locals);
                 let mut stmts = key.stmts;
                 stmts.extend(value.stmts);
+                stmts.extend(map.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::MapInsert {
-                        map: self.plan_place_in_function(function, map),
+                        map: map.place,
                         key: key.operand,
                         value: value.operand,
                     },
+                    post_stmts: map.post_stmts,
                 }
             }
             RValue::MapRemove { map, key, ty } => {
-                if self.place_crosses_dataref(function, map) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedPlaceProjection,
-                    ));
-                }
                 let key = self.plan_operand_read(function, key, locals);
+                let map = self.lower_structural_mutation_place(function, map, locals);
+                let mut stmts = key.stmts;
+                stmts.extend(map.stmts);
                 PlannedRValue {
-                    stmts: key.stmts,
+                    stmts,
                     value: RirRValue::MapRemove {
-                        map: self.plan_place_in_function(function, map),
+                        map: map.place,
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
+                    post_stmts: map.post_stmts,
                 }
             }
             RValue::FunctionRef {
@@ -2509,11 +2552,19 @@ impl<'a> PlanCx<'a> {
                 })
             }
             RValue::MapEntryAt { map, index, ty } => {
-                PlannedRValue::from_value(RirRValue::MapEntryAt {
-                    map: self.plan_place_in_function(function, map),
-                    index: RirLocalId::from_index(index.index()),
-                    ty: self.type_map[ty],
-                })
+                let map = self.lower_place_read(function, map, locals);
+                let RirOperand::Place(map_place) = map.operand else {
+                    unreachable!("place read returns a place operand")
+                };
+                PlannedRValue {
+                    stmts: map.stmts,
+                    value: RirRValue::MapEntryAt {
+                        map: map_place,
+                        index: RirLocalId::from_index(index.index()),
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
             }
             RValue::ListPop { .. } => {
                 return Err(Self::gap(
@@ -2639,35 +2690,31 @@ impl<'a> PlanCx<'a> {
                 self.plan_operand(function, operand),
             )));
         };
-        if let Some(cell) = self.place_capture_cell(function, place) {
-            if !place.projection.is_empty() {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedPlaceProjection,
-                ));
+        if place.projection.is_empty() {
+            if let Some(cell) = self.place_capture_cell(function, place) {
+                return Ok(PlannedRValue::from_value(RirRValue::CellGetCopy {
+                    cell: self.capture_cell_ref(function, cell),
+                    ty: self.type_map[&place.ty],
+                }));
             }
-            return Ok(PlannedRValue::from_value(RirRValue::CellGetCopy {
-                cell: self.capture_cell_ref(function, cell),
-                ty: self.type_map[&place.ty],
-            }));
-        }
-        if let Some(borrow) = self.place_scoped_borrow(function, place) {
-            if !place.projection.is_empty() {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedMutablePlaceProjection,
-                ));
+            if let Some(borrow) = self.place_scoped_borrow(function, place) {
+                return Ok(PlannedRValue::from_value(RirRValue::ScopedPlaceCellGet {
+                    cell: self.scoped_place_cell_ref(function, borrow),
+                    ty: self.type_map[&place.ty],
+                }));
             }
-            return Ok(PlannedRValue::from_value(RirRValue::ScopedPlaceCellGet {
-                cell: self.scoped_place_cell_ref(function, borrow),
-                ty: self.type_map[&place.ty],
-            }));
         }
-        if self.place_crosses_dataref(function, place) {
+        if self
+            .access()
+            .plan(function, PlaceAccessIntent::ReadValue, place)
+            .expect("profile verifies readable places")
+            .crosses_dataref
+        {
             let planned = self.lower_place_read(function, place, locals);
             return Ok(PlannedRValue {
                 stmts: planned.stmts,
                 value: RirRValue::Use(planned.operand),
+                post_stmts: vec![],
             });
         }
         if !self.air_place_value_readable(place.ty) {
@@ -2763,6 +2810,7 @@ impl<'a> PlanCx<'a> {
         Ok(PlannedRValue {
             stmts: fields.stmts,
             value,
+            post_stmts: vec![],
         })
     }
 
@@ -2844,6 +2892,7 @@ impl<'a> PlanCx<'a> {
                 args: planned_args,
                 ty,
             },
+            post_stmts: vec![],
         })
     }
 
@@ -3011,11 +3060,13 @@ impl<'a> PlanCx<'a> {
     ) -> bool {
         match arg {
             RirCallArg::MutBorrow(place) => Self::place_is_collection_slot(scope, place),
-            RirCallArg::MutPlace(arg) => match &arg.root {
-                RirMutPlaceRoot::Local { local, ty } => Self::place_is_collection_slot(
-                    scope,
-                    &RirPlace::local(*local, arg.projections.clone(), *ty),
-                ),
+            RirCallArg::MutPlace(arg) => match &arg.access {
+                RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) => {
+                    Self::place_is_collection_slot(
+                        scope,
+                        &RirPlace::local(*local, arg.projections.clone(), *ty),
+                    )
+                }
                 _ => false,
             },
             _ => false,
@@ -3024,7 +3075,7 @@ impl<'a> PlanCx<'a> {
 
     fn place_is_collection_slot(scope: &air::AirCollectionSlotScope, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         scope
             .slots
@@ -3129,18 +3180,6 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn place_is_source_mut_place_param(&self, function: FunctionId, place: &Place) -> bool {
-        let Some(local) = place.root.local() else {
-            return false;
-        };
-        self.air
-            .function(function)
-            .signature
-            .params
-            .iter()
-            .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
-    }
-
     fn moves_bound_noncopy_lambda(&self, function: FunctionId, operand: &Operand) -> bool {
         let Operand::Place(place) = operand else {
             return false;
@@ -3211,11 +3250,6 @@ impl<'a> PlanCx<'a> {
                     arg: RirCallArg::Value(planned.operand),
                 })
             }
-            CallArg::SharedBorrow(place) if matches!(place.root, air::PlaceRoot::Global(_)) => {
-                Ok(PlannedCallArg::from_arg(RirCallArg::SharedBorrow(
-                    self.plan_place_in_function(function, place),
-                )))
-            }
             CallArg::SharedBorrow(place) => {
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(place) = planned.operand else {
@@ -3284,8 +3318,11 @@ impl<'a> PlanCx<'a> {
         place: &Place,
         locals: &mut Vec<RirLocal>,
     ) -> PlannedOperand {
-        let crosses_dataref = self.place_crosses_dataref(function, place);
-        if matches!(place.root, air::PlaceRoot::Global(_)) {
+        let plan = self
+            .access()
+            .plan(function, PlaceAccessIntent::ReadValue, place)
+            .expect("profile verifies readable places");
+        if matches!(plan.root, PlaceAccessRoot::Global(_)) && !plan.crosses_dataref {
             let mut stmts = vec![];
             let operand = self.rvalue_temp(
                 RirRValue::Use(RirOperand::Place(
@@ -3297,108 +3334,66 @@ impl<'a> PlanCx<'a> {
             );
             return PlannedOperand { stmts, operand };
         }
-        if let Some(cell) = self.place_capture_cell(function, place) {
-            if place.projection.is_empty() {
-                let mut stmts = vec![];
-                let operand = self.rvalue_temp(
-                    RirRValue::CellGetCopy {
-                        cell: self.capture_cell_ref(function, cell),
-                        ty: self.type_map[&place.ty],
-                    },
-                    place.ty,
-                    locals,
-                    &mut stmts,
-                );
-                return PlannedOperand { stmts, operand };
-            }
-            if !crosses_dataref {
-                let root_ty = self.air.capture_cells[cell.index()].ty;
-                let mut stmts = vec![];
-                let root = self.rvalue_temp_place(
-                    RirRValue::CellGetCopy {
-                        cell: self.capture_cell_ref(function, cell),
-                        ty: self.type_map[&root_ty],
-                    },
-                    root_ty,
-                    locals,
-                    &mut stmts,
-                );
-                let RirPlaceRoot::Local(root_local) = root.root else {
-                    unreachable!("global RIR places are not supported here")
-                };
-                return PlannedOperand {
-                    stmts,
-                    operand: RirOperand::Place(RirPlace::local(
-                        root_local,
-                        place.projection.iter().map(Self::rir_projection).collect(),
-                        self.type_map[&place.ty],
-                    )),
-                };
-            }
-        }
-        if let Some(borrow) = self.place_scoped_borrow(function, place) {
-            if place.projection.is_empty() {
-                let mut stmts = vec![];
-                let operand = self.rvalue_temp(
-                    RirRValue::ScopedPlaceCellGet {
-                        cell: self.scoped_place_cell_ref(function, borrow),
-                        ty: self.type_map[&place.ty],
-                    },
-                    place.ty,
-                    locals,
-                    &mut stmts,
-                );
-                return PlannedOperand { stmts, operand };
-            }
-            if !crosses_dataref {
-                let root_ty = self.air.scoped_borrows[borrow.index()].ty;
-                let mut stmts = vec![];
-                let root = self.rvalue_temp_place(
-                    RirRValue::ScopedPlaceCellGet {
-                        cell: self.scoped_place_cell_ref(function, borrow),
-                        ty: self.type_map[&root_ty],
-                    },
-                    root_ty,
-                    locals,
-                    &mut stmts,
-                );
-                let RirPlaceRoot::Local(root_local) = root.root else {
-                    unreachable!("global RIR places are not supported here")
-                };
-                return PlannedOperand {
-                    stmts,
-                    operand: RirOperand::Place(RirPlace::local(
-                        root_local,
-                        place.projection.iter().map(Self::rir_projection).collect(),
-                        self.type_map[&place.ty],
-                    )),
-                };
-            }
-        }
-        if !crosses_dataref {
-            if self.place_is_source_mut_place_param(function, place) {
-                let mut stmts = vec![];
-                let operand = self.rvalue_temp(
-                    RirRValue::Use(RirOperand::Place(
+        if !plan.crosses_dataref {
+            match plan.root {
+                PlaceAccessRoot::CaptureCell(cell) => {
+                    let root_ty = self.air.capture_cells[cell.index()].ty;
+                    return self.lower_temp_root_read(
+                        RirRValue::CellGetCopy {
+                            cell: self.capture_cell_ref(function, cell),
+                            ty: self.type_map[&root_ty],
+                        },
+                        root_ty,
+                        place,
+                        locals,
+                    );
+                }
+                PlaceAccessRoot::ScopedPlaceCell(borrow) => {
+                    let root_ty = self.air.scoped_borrows[borrow.index()].ty;
+                    return self.lower_temp_root_read(
+                        RirRValue::ScopedPlaceCellGet {
+                            cell: self.scoped_place_cell_ref(function, borrow),
+                            ty: self.type_map[&root_ty],
+                        },
+                        root_ty,
+                        place,
+                        locals,
+                    );
+                }
+                PlaceAccessRoot::Local {
+                    source_mut_param: true,
+                    ..
+                } => {
+                    let mut stmts = vec![];
+                    let operand = self.rvalue_temp(
+                        RirRValue::Use(RirOperand::Place(
+                            self.plan_place_in_function(function, place),
+                        )),
+                        place.ty,
+                        locals,
+                        &mut stmts,
+                    );
+                    return PlannedOperand { stmts, operand };
+                }
+                PlaceAccessRoot::Local { .. } | PlaceAccessRoot::LambdaCapture(_) => {
+                    return PlannedOperand::from_operand(RirOperand::Place(
                         self.plan_place_in_function(function, place),
-                    )),
-                    place.ty,
-                    locals,
-                    &mut stmts,
-                );
-                return PlannedOperand { stmts, operand };
+                    ));
+                }
+                PlaceAccessRoot::Global(_) => unreachable!("global roots returned above"),
             }
-            return PlannedOperand::from_operand(RirOperand::Place(
-                self.plan_place_in_function(function, place),
-            ));
         }
         let mut stmts = vec![];
+        let root_ty = Self::place_plan_root_ty(&plan);
         let (mut current_ty, mut current_place) =
-            self.dataref_root_place(function, place, locals, &mut stmts);
+            self.dataref_runtime_root_place(function, plan.root, root_ty, locals, &mut stmts);
         let mut index = 0;
-        while let Some(segment) =
-            self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
-        {
+        while let Some(segment) = self.next_dataref_plan_segment(
+            &plan.projection,
+            &mut index,
+            &mut current_ty,
+            &mut current_place,
+        ) {
             index = segment.next_index;
             current_ty = segment.ty;
             current_place = self.read_dataref_segment(segment, locals, &mut stmts);
@@ -3406,6 +3401,131 @@ impl<'a> PlanCx<'a> {
         PlannedOperand {
             stmts,
             operand: RirOperand::Place(current_place),
+        }
+    }
+
+    fn lower_temp_root_read(
+        &self,
+        value: RirRValue,
+        root_ty: TypeId,
+        place: &Place,
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedOperand {
+        let mut stmts = vec![];
+        if place.projection.is_empty() {
+            let operand = self.rvalue_temp(value, place.ty, locals, &mut stmts);
+            return PlannedOperand { stmts, operand };
+        }
+        let root = self.rvalue_temp_place(value, root_ty, locals, &mut stmts);
+        let RirPlaceRoot::Local(root_local) = root.root else {
+            unreachable!("temporary roots are local")
+        };
+        PlannedOperand {
+            stmts,
+            operand: RirOperand::Place(RirPlace::local(
+                root_local,
+                place.projection.iter().map(Self::rir_projection).collect(),
+                self.type_map[&place.ty],
+            )),
+        }
+    }
+
+    fn lower_structural_mutation_place(
+        &self,
+        function: FunctionId,
+        place: &Place,
+        locals: &mut Vec<RirLocal>,
+    ) -> PlannedPlace {
+        let plan = self
+            .access()
+            .plan(function, PlaceAccessIntent::StructuralMutation, place)
+            .expect("profile verifies structural mutations");
+        if let PlaceAccessRoot::Global(global) = plan.root {
+            let global_decl = &self.air.globals[global.index()];
+            if !place.projection.is_empty() {
+                return PlannedPlace {
+                    stmts: vec![],
+                    place: self.plan_place_in_function(function, place),
+                    post_stmts: vec![],
+                };
+            }
+            let mut stmts = vec![];
+            let root = self.rvalue_temp_place(
+                RirRValue::Use(RirOperand::Place(RirPlace::global(
+                    self.global_map[&global],
+                    vec![],
+                    self.type_map[&global_decl.ty],
+                ))),
+                global_decl.ty,
+                locals,
+                &mut stmts,
+            );
+            Self::mark_place_root_mutable(&root, locals);
+            return PlannedPlace {
+                stmts,
+                place: root.clone(),
+                post_stmts: vec![RirStmt::MutPlaceSet {
+                    place: RirMutPlaceArg::global(
+                        self.global_map[&global],
+                        self.type_map[&global_decl.ty],
+                    ),
+                    value: RirRValue::Use(RirOperand::Place(root)),
+                }],
+            };
+        }
+        PlannedPlace {
+            stmts: vec![],
+            place: self.plan_place_in_function(function, place),
+            post_stmts: vec![],
+        }
+    }
+
+    fn lower_collection_loan_root(&self, function: FunctionId, root: &Place) -> PlannedPlace {
+        self.access()
+            .plan(function, PlaceAccessIntent::CollectionLoan, root)
+            .expect("profile verifies collection loan roots");
+        PlannedPlace {
+            stmts: vec![],
+            place: self.plan_place_in_function(function, root),
+            post_stmts: vec![],
+        }
+    }
+
+    fn mark_place_root_mutable(place: &RirPlace, locals: &mut [RirLocal]) {
+        let RirPlaceRoot::Local(local) = place.root else {
+            return;
+        };
+        locals[local.index()].mutable = true;
+    }
+
+    fn assign_target(plan: &PlaceAccessPlan, place: &Place) -> AssignTarget {
+        if plan.crosses_dataref {
+            return AssignTarget::DataRef;
+        }
+        match plan.root {
+            PlaceAccessRoot::CaptureCell(cell) if place.projection.is_empty() => {
+                AssignTarget::CaptureCell(cell)
+            }
+            PlaceAccessRoot::CaptureCell(_) => {
+                unreachable!("profile rejects projected capture-cell places")
+            }
+            PlaceAccessRoot::ScopedPlaceCell(borrow) if place.projection.is_empty() => {
+                AssignTarget::ScopedPlaceCell(borrow)
+            }
+            PlaceAccessRoot::ScopedPlaceCell(_) => {
+                unreachable!("profile rejects projected scoped-borrow places")
+            }
+            PlaceAccessRoot::Global(global) if !place.projection.is_empty() => {
+                AssignTarget::ProjectedGlobal(global)
+            }
+            PlaceAccessRoot::Local {
+                source_mut_param, ..
+            } => AssignTarget::Assign { source_mut_param },
+            PlaceAccessRoot::Global(_) | PlaceAccessRoot::LambdaCapture(_) => {
+                AssignTarget::Assign {
+                    source_mut_param: false,
+                }
+            }
         }
     }
 
@@ -3420,72 +3540,36 @@ impl<'a> PlanCx<'a> {
         possible_cells: &mut [bool],
         in_loop: bool,
     ) -> Result<(), RustPlanError> {
-        let crosses_dataref = self.place_crosses_dataref(function, place);
-        if let Some(cell) = self.place_capture_cell(function, place) {
-            if place.projection.is_empty() {
-                let cell_ref = self.capture_cell_ref(function, cell);
-                if initialized_cells
-                    .get(cell.index())
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    let value =
-                        self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
-                    stmts.push(RirStmt::CellSet {
-                        cell: cell_ref,
-                        value: RirRValue::Use(value),
-                    });
-                } else if in_loop || possible_cells.get(cell.index()).copied().unwrap_or(false) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::UnsupportedLambdaCell,
-                    ));
-                } else {
-                    stmts.push(RirStmt::CellInit {
-                        cell: cell_ref,
-                        value,
-                    });
-                    if let Some(slot) = initialized_cells.get_mut(cell.index()) {
-                        *slot = true;
-                    }
-                    if let Some(slot) = possible_cells.get_mut(cell.index()) {
-                        *slot = true;
-                    }
-                }
-                return Ok(());
+        let plan = self
+            .access()
+            .plan(function, PlaceAccessIntent::Assign, place)
+            .expect("profile verifies assignable places");
+        match Self::assign_target(&plan, place) {
+            AssignTarget::CaptureCell(cell) => {
+                self.lower_capture_cell_write(
+                    function,
+                    cell,
+                    place,
+                    value,
+                    locals,
+                    stmts,
+                    initialized_cells,
+                    possible_cells,
+                    in_loop,
+                )?;
             }
-            if !crosses_dataref {
-                unreachable!("Rust backend profile rejects projected capture-cell places")
-            }
-        }
-        if let Some(borrow) = self.place_scoped_borrow(function, place) {
-            if place.projection.is_empty() {
+            AssignTarget::ScopedPlaceCell(borrow) => {
                 let value = self.rvalue_temp(value, place.ty, locals, stmts);
                 stmts.push(RirStmt::ScopedPlaceCellSet {
                     cell: self.scoped_place_cell_ref(function, borrow),
                     value: RirRValue::Use(value),
                 });
-                return Ok(());
             }
-            if !crosses_dataref {
-                unreachable!("Rust backend profile rejects projected scoped-borrow places")
-            }
-        }
-        if !crosses_dataref {
-            let value = if self.place_is_source_mut_place_param(function, place) {
-                RirRValue::Use(
-                    self.rvalue_short_region_operand(function, value, place.ty, locals, stmts),
-                )
-            } else {
-                value
-            };
-            if let air::PlaceRoot::Global(global) = place.root
-                && !place.projection.is_empty()
-            {
+            AssignTarget::ProjectedGlobal(global) => {
                 let global_decl = &self.air.globals[global.index()];
                 stmts.push(RirStmt::MutPlaceSet {
                     place: RirMutPlaceArg::projected(
-                        RirMutPlaceRoot::Global {
+                        RirMutPlaceHandle::Global {
                             global: self.global_map[&global],
                             ty: self.type_map[&global_decl.ty],
                         },
@@ -3494,40 +3578,87 @@ impl<'a> PlanCx<'a> {
                     ),
                     value,
                 });
-            } else {
+            }
+            AssignTarget::Assign { source_mut_param } => {
+                let value = if source_mut_param {
+                    RirRValue::Use(
+                        self.rvalue_short_region_operand(function, value, place.ty, locals, stmts),
+                    )
+                } else {
+                    value
+                };
                 stmts.push(RirStmt::Assign {
                     dst: self.plan_place_in_function(function, place),
                     value,
                 });
             }
-            return Ok(());
-        }
-        let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
-        let (mut current_ty, mut current_place) =
-            self.dataref_root_place(function, place, locals, stmts);
-        let mut index = 0;
-        while let Some(segment) =
-            self.next_dataref_segment(place, &mut index, &mut current_ty, &mut current_place)
-        {
-            if segment.next_index == place.projection.len() {
-                stmts.push(RirStmt::DataRefSet {
-                    object: segment.object,
-                    dataref: segment.dataref,
-                    projections: segment.projections,
-                    value,
-                });
-                return Ok(());
+            AssignTarget::DataRef => {
+                self.lower_dataref_write(function, &plan, place, value, locals, stmts);
             }
-            index = segment.next_index;
-            current_ty = segment.ty;
-            current_place = self.read_dataref_segment(segment, locals, stmts);
         }
-        unreachable!("dataref-crossing write has a dataref segment")
+        Ok(())
     }
 
-    fn root_place(&self, function: FunctionId, place: &Place) -> (TypeId, RirPlace) {
-        let (ty, local) = self.current_place_root(function, place);
-        (ty, self.rir_root_place(local, ty))
+    fn lower_capture_cell_write(
+        &self,
+        function: FunctionId,
+        cell: air::CaptureCellId,
+        place: &Place,
+        value: RirRValue,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
+    ) -> Result<(), RustPlanError> {
+        let cell_ref = self.capture_cell_ref(function, cell);
+        if initialized_cells
+            .get(cell.index())
+            .copied()
+            .unwrap_or(false)
+        {
+            let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
+            stmts.push(RirStmt::CellSet {
+                cell: cell_ref,
+                value: RirRValue::Use(value),
+            });
+        } else if in_loop || possible_cells.get(cell.index()).copied().unwrap_or(false) {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function),
+                RustTargetGapKind::UnsupportedLambdaCell,
+            ));
+        } else {
+            stmts.push(RirStmt::CellInit {
+                cell: cell_ref,
+                value,
+            });
+            if let Some(slot) = initialized_cells.get_mut(cell.index()) {
+                *slot = true;
+            }
+            if let Some(slot) = possible_cells.get_mut(cell.index()) {
+                *slot = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_dataref_write(
+        &self,
+        function: FunctionId,
+        plan: &PlaceAccessPlan,
+        place: &Place,
+        value: RirRValue,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) {
+        let segment = self.final_dataref_segment(function, plan, locals, stmts);
+        let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
+        stmts.push(RirStmt::DataRefSet {
+            object: segment.object,
+            dataref: segment.dataref,
+            projections: segment.projections,
+            value,
+        });
     }
 
     fn plan_slice_view_source(
@@ -3535,12 +3666,10 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         place: &Place,
     ) -> Result<RirPlace, RustPlanError> {
-        if matches!(
-            place.root,
-            air::PlaceRoot::CaptureCell(_)
-                | air::PlaceRoot::ScopedBorrow(_)
-                | air::PlaceRoot::Global(_)
-        ) || self.place_crosses_dataref(function, place)
+        if self
+            .access()
+            .plan(function, PlaceAccessIntent::SliceView, place)
+            .is_err()
         {
             return Err(Self::gap(
                 RustTargetGapSite::Function(function),
@@ -3550,63 +3679,144 @@ impl<'a> PlanCx<'a> {
         Ok(self.plan_place_in_function(function, place))
     }
 
-    fn dataref_root_place(
+    fn dataref_runtime_root_place(
         &self,
         function: FunctionId,
-        place: &Place,
+        root: PlaceAccessRoot,
+        ty: TypeId,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
     ) -> (TypeId, RirPlace) {
-        if let Some(cell) = self.place_capture_cell(function, place) {
-            let ty = self.air.capture_cells[cell.index()].ty;
-            let root = self.rvalue_temp_place(
-                RirRValue::CellGetCopy {
-                    cell: self.capture_cell_ref(function, cell),
-                    ty: self.type_map[&ty],
-                },
-                ty,
-                locals,
-                stmts,
-            );
-            return (ty, root);
+        match root {
+            PlaceAccessRoot::CaptureCell(cell) => {
+                let root = self.rvalue_temp_place(
+                    RirRValue::CellGetCopy {
+                        cell: self.capture_cell_ref(function, cell),
+                        ty: self.type_map[&ty],
+                    },
+                    ty,
+                    locals,
+                    stmts,
+                );
+                (ty, root)
+            }
+            PlaceAccessRoot::ScopedPlaceCell(borrow) => {
+                let root = self.rvalue_temp_place(
+                    RirRValue::ScopedPlaceCellGet {
+                        cell: self.scoped_place_cell_ref(function, borrow),
+                        ty: self.type_map[&ty],
+                    },
+                    ty,
+                    locals,
+                    stmts,
+                );
+                (ty, root)
+            }
+            PlaceAccessRoot::Local {
+                local,
+                source_mut_param,
+                ..
+            } => {
+                let root = self.rir_root_place(RirLocalId::from_index(local.index()), ty);
+                if source_mut_param {
+                    let root = self.rvalue_temp_place(
+                        RirRValue::Use(RirOperand::Place(root)),
+                        ty,
+                        locals,
+                        stmts,
+                    );
+                    (ty, root)
+                } else {
+                    (ty, root)
+                }
+            }
+            PlaceAccessRoot::LambdaCapture(slot) => {
+                let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+                    unreachable!("AIR verifier rejects capture roots outside lambdas")
+                };
+                let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
+                (
+                    ty,
+                    self.rir_root_place(
+                        RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
+                        ty,
+                    ),
+                )
+            }
+            PlaceAccessRoot::Global(global) => {
+                let root = self.rvalue_temp_place(
+                    RirRValue::Use(RirOperand::Place(RirPlace::global(
+                        self.global_map[&global],
+                        vec![],
+                        self.type_map[&ty],
+                    ))),
+                    ty,
+                    locals,
+                    stmts,
+                );
+                (ty, root)
+            }
         }
-        if let Some(borrow) = self.place_scoped_borrow(function, place) {
-            let ty = self.air.scoped_borrows[borrow.index()].ty;
-            let root = self.rvalue_temp_place(
-                RirRValue::ScopedPlaceCellGet {
-                    cell: self.scoped_place_cell_ref(function, borrow),
-                    ty: self.type_map[&ty],
-                },
-                ty,
-                locals,
-                stmts,
-            );
-            return (ty, root);
-        }
-        let (ty, root) = self.root_place(function, place);
-        if !self.place_is_source_mut_place_param(function, place) {
-            return (ty, root);
-        }
-        let root =
-            self.rvalue_temp_place(RirRValue::Use(RirOperand::Place(root)), ty, locals, stmts);
-        (ty, root)
     }
 
     fn rir_root_place(&self, local: RirLocalId, ty: TypeId) -> RirPlace {
         RirPlace::local(local, vec![], self.type_map[&ty])
     }
 
-    fn next_dataref_segment(
+    fn dataref_mut_place_segment(
         &self,
-        place: &Place,
+        function: FunctionId,
+        plan: &PlaceAccessPlan,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> DataRefSegment {
+        self.final_dataref_segment(function, plan, locals, stmts)
+    }
+
+    fn final_dataref_segment(
+        &self,
+        function: FunctionId,
+        plan: &PlaceAccessPlan,
+        locals: &mut Vec<RirLocal>,
+        stmts: &mut Vec<RirStmt>,
+    ) -> DataRefSegment {
+        let root_ty = Self::place_plan_root_ty(plan);
+        let (mut current_ty, mut current_place) =
+            self.dataref_runtime_root_place(function, plan.root, root_ty, locals, stmts);
+        let mut index = 0;
+        while let Some(segment) = self.next_dataref_plan_segment(
+            &plan.projection,
+            &mut index,
+            &mut current_ty,
+            &mut current_place,
+        ) {
+            if segment.next_index == plan.projection.len() {
+                return segment;
+            }
+            index = segment.next_index;
+            current_ty = segment.ty;
+            current_place = self.read_dataref_segment(segment, locals, stmts);
+        }
+        unreachable!("dataref place has a final dataref segment")
+    }
+
+    fn place_plan_root_ty(plan: &PlaceAccessPlan) -> TypeId {
+        plan.projection
+            .first()
+            .map_or(plan.ty, |projection| projection.source_ty)
+    }
+
+    fn next_dataref_plan_segment(
+        &self,
+        projections: &[PlaceProjection],
         index: &mut usize,
         current_ty: &mut TypeId,
         current_place: &mut RirPlace,
     ) -> Option<DataRefSegment> {
-        while *index < place.projection.len() {
+        while *index < projections.len() {
             if let TypeData::DataRef(aggregate) = self.air.type_arena.data(*current_ty) {
                 let (projections, ty, next_index) =
-                    self.dataref_projection_segment(*current_ty, &place.projection, *index);
+                    self.dataref_plan_projection_segment(projections, *index);
                 return Some(DataRefSegment {
                     object: RirOperand::Place(current_place.clone()),
                     dataref: self.dataref_map[aggregate],
@@ -3615,11 +3825,11 @@ impl<'a> PlanCx<'a> {
                     next_index,
                 });
             }
-            let projection = &place.projection[*index];
-            *current_ty = air_projected_ty(self.air, *current_ty, projection)?;
+            let projection = &projections[*index];
+            *current_ty = projection.ty;
             current_place
                 .projections
-                .push(Self::rir_projection(projection));
+                .push(Self::rir_plan_projection(projection));
             current_place.ty = self.type_map[&*current_ty];
             *index += 1;
         }
@@ -3709,49 +3919,28 @@ impl<'a> PlanCx<'a> {
         self.rir_root_place(local, ty)
     }
 
-    fn dataref_projection_segment(
+    fn dataref_plan_projection_segment(
         &self,
-        dataref_ty: TypeId,
-        projections: &[Projection],
+        projections: &[PlaceProjection],
         start: usize,
     ) -> (Vec<RirProjection>, TypeId, usize) {
-        let mut current_ty = dataref_ty;
         let mut index = start;
         let mut segment = vec![];
         while index < projections.len() {
             let projection = &projections[index];
-            segment.push(Self::rir_projection(projection));
-            current_ty = air_projected_ty(self.air, current_ty, projection)
-                .expect("verified dataref projection");
+            segment.push(Self::rir_plan_projection(projection));
+            let current_ty = projection.ty;
             index += 1;
             if matches!(self.air.type_arena.data(current_ty), TypeData::DataRef(_))
                 && index < projections.len()
             {
-                break;
+                return (segment, current_ty, index);
+            }
+            if index == projections.len() {
+                return (segment, current_ty, index);
             }
         }
-        (segment, current_ty, index)
-    }
-
-    fn place_crosses_dataref(&self, function: FunctionId, place: &Place) -> bool {
-        let mut ty = match place.root {
-            air::PlaceRoot::CaptureCell(cell) => self.air.capture_cells[cell.index()].ty,
-            air::PlaceRoot::ScopedBorrow(borrow) => self.air.scoped_borrows[borrow.index()].ty,
-            air::PlaceRoot::Global(_) => return false,
-            air::PlaceRoot::Local(_) | air::PlaceRoot::LambdaCapture(_) => {
-                self.current_place_root(function, place).0
-            }
-        };
-        for projection in &place.projection {
-            if matches!(self.air.type_arena.data(ty), TypeData::DataRef(_)) {
-                return true;
-            }
-            let Some(next_ty) = air_projected_ty(self.air, ty, projection) else {
-                return false;
-            };
-            ty = next_ty;
-        }
-        false
+        unreachable!("dataref segment starts at an existing projection")
     }
 
     fn place_capture_cell(
@@ -3865,6 +4054,28 @@ impl<'a> PlanCx<'a> {
         id
     }
 
+    fn rir_plan_projection(projection: &PlaceProjection) -> RirProjection {
+        match projection.kind {
+            PlaceProjectionKind::Field(field) | PlaceProjectionKind::DataRefField(field) => {
+                RirProjection::Field(RirFieldId::from_index(field.index()))
+            }
+            PlaceProjectionKind::TupleField(index) => {
+                RirProjection::TupleField(RirFieldId::from_index(index as usize))
+            }
+            PlaceProjectionKind::ArrayIndex(local)
+            | PlaceProjectionKind::ListIndex(local)
+            | PlaceProjectionKind::SliceIndex(local) => {
+                RirProjection::Index(RirLocalId::from_index(local.index()))
+            }
+            PlaceProjectionKind::MapIndex(local) => {
+                RirProjection::MapIndex(RirLocalId::from_index(local.index()))
+            }
+            PlaceProjectionKind::ExternField | PlaceProjectionKind::VariantField => {
+                unreachable!("profile rejects unsupported projection")
+            }
+        }
+    }
+
     fn rir_projection(projection: &Projection) -> RirProjection {
         match projection {
             Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
@@ -3907,6 +4118,10 @@ impl<'a> PlanCx<'a> {
                 .unwrap_or_else(|| self.rust_copyable_air_type(ty));
         }
         self.air_policy().value_place_shareable(ty)
+    }
+
+    fn access(&self) -> PlaceAccessCx<'_> {
+        PlaceAccessCx::new(self.air, &self.classes)
     }
 
     fn air_policy(&self) -> AirRustRepPolicy<'_> {

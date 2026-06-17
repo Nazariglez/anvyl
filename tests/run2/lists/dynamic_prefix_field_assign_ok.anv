@@ -1,0 +1,13 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 9
+
+struct Box { value: int }
+
+fn main() {
+    var xs: [Box] = [Box { value: 1 }, Box { value: 2 }];
+    let i = 0;
+    xs[i].value = 9;
+    println(xs[0].value);
+}

@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+
+struct Point { x: int, y: int }
+
+lazy var point = Point { x: 1, y: 2 };
+
+fn inc(var value: int) {
+    value = value + 1;
+}
+
+fn main() {
+    inc(point.x);
+}

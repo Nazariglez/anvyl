@@ -1,0 +1,19 @@
+// @helper
+
+lazy var _manager = { Manager.new() };
+
+pub dataref Manager {
+    _count: int,
+
+    fn new() -> Self {
+        Manager { _count: 0 }
+    }
+
+    fn add() {
+        _manager._count += 1;
+    }
+
+    fn count() -> int {
+        _manager._count
+    }
+}

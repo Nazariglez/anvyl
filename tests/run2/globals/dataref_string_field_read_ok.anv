@@ -1,0 +1,25 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// init
+// ready
+// 5
+// @match-end
+
+dataref Node {
+    name: string,
+}
+
+fn make_node() -> Node {
+    println("init");
+    Node { name: "ready" }
+}
+
+lazy var root = make_node();
+
+fn main() {
+    let name = root.name;
+    println(name);
+    println(root.name.len());
+}

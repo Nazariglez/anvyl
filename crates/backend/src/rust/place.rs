@@ -1,9 +1,9 @@
 use super::{
-    dataref_place::storage_path as dataref_storage_path,
+    dataref_place::{self as dataref_paths},
     rep_policy::RustRepPolicy,
     rir::{
-        RirDataRefId, RirField, RirFunction, RirLocalId, RirParamAbi, RirPlace, RirPlaceRoot,
-        RirProgram, RirProjection, RirType, RirTypeId,
+        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirParamAbi, RirPlace,
+        RirPlaceModel, RirPlaceRoot, RirProgram, RirProjection, RirType, RirTypeId,
     },
     syntax::comma,
     target,
@@ -44,6 +44,51 @@ pub(super) struct MapSlotAccess {
     pub value_ty: RirTypeId,
 }
 
+pub(super) enum DynamicPlaceAccess {
+    MapSlot(MapSlotAccess),
+    SliceIndex(SliceIndexAccess),
+}
+
+pub(super) struct ProjectionFacts {
+    pub(super) fallible_projection: bool,
+    pub(super) indexed_collection_write: bool,
+}
+
+pub(super) fn place_dynamic_facts(
+    program: &RirProgram,
+    function: &RirFunction,
+    place: &RirPlace,
+) -> Option<ProjectionFacts> {
+    let RirPlaceRoot::Local(local) = place.root else {
+        return None;
+    };
+    dynamic_facts_from(
+        program,
+        function.locals.get(local.index())?.ty,
+        &place.projections,
+    )
+}
+
+pub(super) fn mut_place_dynamic_facts(
+    program: &RirProgram,
+    arg: &RirMutPlaceArg,
+) -> Option<ProjectionFacts> {
+    dynamic_facts_from(program, arg.access.ty()?, &arg.projections)
+}
+
+fn dynamic_facts_from(
+    program: &RirProgram,
+    ty: RirTypeId,
+    projections: &[RirProjection],
+) -> Option<ProjectionFacts> {
+    let (fallible_projection, indexed_collection_write) =
+        RirPlaceModel::new(program).projection_dynamic_facts(ty, projections)?;
+    Some(ProjectionFacts {
+        fallible_projection,
+        indexed_collection_write,
+    })
+}
+
 pub(super) fn projected_ops_ctor(ops: &str, inits: &[(String, String)]) -> String {
     if inits.is_empty() {
         return ops.to_string();
@@ -74,7 +119,7 @@ impl<'a> RustPlaces<'a> {
 
     fn local_place_with_ty(&self, place: &RirPlace) -> RenderedPlace {
         let RirPlaceRoot::Local(root) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         let local = &self.function.locals[root.index()];
         let mut rendered = RenderedPlace {
@@ -94,7 +139,51 @@ impl<'a> RustPlaces<'a> {
         dataref: RirDataRefId,
         projections: &[RirProjection],
     ) -> String {
-        dataref_storage_path(self.program, dataref, projections)
+        dataref_paths::storage_path(self.program, dataref, projections)
+    }
+
+    pub(super) fn projected_expr(
+        &self,
+        root_ty: RirTypeId,
+        root: &str,
+        slot_ty: RirTypeId,
+        projections: &[RirProjection],
+    ) -> Option<String> {
+        let mut rendered = RenderedPlace {
+            expr: root.to_string(),
+            ty: root_ty,
+        };
+        self.apply_projections(&mut rendered, projections, true);
+        (rendered.ty == slot_ty).then_some(rendered.expr)
+    }
+
+    pub(super) fn map_slot_access_from(
+        &self,
+        root_ty: RirTypeId,
+        root: &str,
+        projections: &[RirProjection],
+    ) -> Option<MapSlotAccess> {
+        let (last, prefix) = projections.split_last()?;
+        let RirProjection::MapIndex(index) = last else {
+            return None;
+        };
+        let mut rendered = RenderedPlace {
+            expr: root.to_string(),
+            ty: root_ty,
+        };
+        self.apply_projections(&mut rendered, prefix, true);
+        let RirType::Map { key, value } = self.program.types[rendered.ty.index()] else {
+            return None;
+        };
+        Some(MapSlotAccess {
+            map: rendered.expr,
+            key: self.function.locals[index.index()]
+                .symbol
+                .as_str()
+                .to_string(),
+            key_value: self.captured_local_value(*index, key),
+            value_ty: value,
+        })
     }
 
     pub(super) fn record_field_place(&self, place: &RirPlace, field: &RirField) -> RirPlace {
@@ -111,7 +200,7 @@ impl<'a> RustPlaces<'a> {
 
     pub(super) fn shared_borrow_root_param(&self, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         place.projections.is_empty()
             && self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
@@ -119,14 +208,14 @@ impl<'a> RustPlaces<'a> {
 
     pub(super) fn mut_place_root_param(&self, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         place.projections.is_empty() && self.local_is_mut_place_param(local)
     }
 
     pub(super) fn mut_place_projection(&self, place: &RirPlace) -> Option<MutPlaceProjection> {
         let RirPlaceRoot::Local(root) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         if place.projections.is_empty() || !self.local_is_mut_place_param(root) {
             return None;
@@ -168,6 +257,10 @@ impl<'a> RustPlaces<'a> {
         projections: &[RirProjection],
         root_is_mut_place: bool,
     ) -> Option<MutPlaceProjection> {
+        let path = RirPlaceModel::new(self.program).projection_path(root_ty, projections)?;
+        if path.ty() != slot_ty {
+            return None;
+        }
         let mut ty = root_ty;
         let mut fields = vec![];
         let mut inits = vec![];
@@ -226,7 +319,7 @@ impl<'a> RustPlaces<'a> {
                                 target::mut_place_access(
                                     root,
                                     target::runtime_param_name(),
-                                    &self.projection_version_body(&steps)?,
+                                    &Self::projection_version_body(&steps)?,
                                 )
                             } else {
                                 format!("{}?", Self::projection_version_body_from(root, &steps)?)
@@ -248,7 +341,7 @@ impl<'a> RustPlaces<'a> {
                 }
             }
         }
-        (ty == slot_ty).then(|| MutPlaceProjection {
+        Some(MutPlaceProjection {
             root: root.to_string(),
             root_ty,
             slot_ty,
@@ -258,7 +351,7 @@ impl<'a> RustPlaces<'a> {
         })
     }
 
-    fn projection_version_body(&self, steps: &[MutPlaceProjectionStep]) -> Option<String> {
+    fn projection_version_body(steps: &[MutPlaceProjectionStep]) -> Option<String> {
         Self::projection_version_body_from("value", steps)
     }
 
@@ -291,13 +384,21 @@ impl<'a> RustPlaces<'a> {
         }
     }
 
-    pub(super) fn map_slot_access(&self, place: &RirPlace) -> Option<MapSlotAccess> {
+    pub(super) fn dynamic_place_access(&self, place: &RirPlace) -> Option<DynamicPlaceAccess> {
+        if let Some(access) = self.map_slot_dynamic_access(place) {
+            return Some(DynamicPlaceAccess::MapSlot(access));
+        }
+        self.slice_index_dynamic_access(place)
+            .map(DynamicPlaceAccess::SliceIndex)
+    }
+
+    fn map_slot_dynamic_access(&self, place: &RirPlace) -> Option<MapSlotAccess> {
         let (last, prefix) = place.projections.split_last()?;
         let RirProjection::MapIndex(index) = last else {
             return None;
         };
         let RirPlaceRoot::Local(root_local) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         let local = &self.function.locals[root_local.index()];
         let root = local.symbol.as_str().to_string();
@@ -324,13 +425,13 @@ impl<'a> RustPlaces<'a> {
         })
     }
 
-    pub(super) fn slice_index_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
+    fn slice_index_dynamic_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
         let (last, prefix) = place.projections.split_last()?;
         let RirProjection::Index(index) = last else {
             return None;
         };
         let RirPlaceRoot::Local(root) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         let mut base =
             RirPlace::local(root, prefix.to_vec(), self.function.locals[root.index()].ty);
@@ -366,7 +467,7 @@ impl<'a> RustPlaces<'a> {
 
     fn root_needs_deref(&self, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
-            unreachable!("global RIR places are not supported here")
+            unreachable!("expected a local RIR place")
         };
         self.function.locals[local.index()].payload_ref
             || self.param_abi_for_local(local) == Some(RirParamAbi::MutBorrow)

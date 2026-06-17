@@ -48,6 +48,33 @@ pub enum RustMaterialization {
     Gap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMaterialGap {
+    UnsupportedType,
+    UnsupportedRooting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustMaterialPlan {
+    pub materialization: RustMaterialization,
+    pub gap: Option<RustMaterialGap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMaterialSource {
+    Value,
+    ExactGlobalRoot,
+    StoredPayload,
+    DataRefMutPlace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustMaterialIntent {
+    Read,
+    Store,
+    MutPlacePayload,
+}
+
 fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
     matches!(
         materialization,
@@ -90,12 +117,120 @@ impl<'a> AirRustRepPolicy<'a> {
 
     pub fn value_from_ref_supported(self, ty: TypeId) -> bool {
         !matches!(
-            self.materialization(ty),
+            self.materialization_for(ty, RustMaterialSource::Value, RustMaterialIntent::Read),
             RustMaterialization::BorrowGuard | RustMaterialization::Gap
         )
     }
 
-    pub fn materialization(self, ty: TypeId) -> RustMaterialization {
+    pub fn materialization_for(
+        self,
+        ty: TypeId,
+        source: RustMaterialSource,
+        intent: RustMaterialIntent,
+    ) -> RustMaterialization {
+        self.materialization_plan_for(ty, source, intent)
+            .materialization
+    }
+
+    pub fn materialization_plan_for(
+        self,
+        ty: TypeId,
+        source: RustMaterialSource,
+        intent: RustMaterialIntent,
+    ) -> RustMaterialPlan {
+        let materialization = match (source, intent) {
+            (RustMaterialSource::Value, RustMaterialIntent::Read) => self.materialization(ty),
+            (
+                RustMaterialSource::ExactGlobalRoot,
+                RustMaterialIntent::Read | RustMaterialIntent::Store,
+            ) => self.exact_root_global_materialization(ty),
+            (RustMaterialSource::StoredPayload, RustMaterialIntent::Store) => {
+                if self.stored_payload_supported(ty) {
+                    self.materialization(ty)
+                } else {
+                    RustMaterialization::Gap
+                }
+            }
+            (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
+                match self.program.type_arena.data(ty) {
+                    TypeData::Int | TypeData::Float | TypeData::Bool => RustMaterialization::Copy,
+                    TypeData::DataRef(_) => RustMaterialization::CloneHandle,
+                    TypeData::Aggregate(_) | TypeData::Tuple(_) => self.materialization(ty),
+                    _ => RustMaterialization::Gap,
+                }
+            }
+            _ => RustMaterialization::Gap,
+        };
+        RustMaterialPlan {
+            materialization,
+            gap: matches!(materialization, RustMaterialization::Gap)
+                .then(|| self.material_gap(ty, source)),
+        }
+    }
+
+    fn material_gap(self, ty: TypeId, source: RustMaterialSource) -> RustMaterialGap {
+        match source {
+            RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
+            _ => RustMaterialGap::UnsupportedType,
+        }
+    }
+
+    fn global_material_gap(self, ty: TypeId) -> RustMaterialGap {
+        match self.program.type_arena.data(ty) {
+            TypeData::Void | TypeData::Any | TypeData::Function(_) | TypeData::Dyn(_) => {
+                RustMaterialGap::UnsupportedType
+            }
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.global_material_gap(*inner)
+            }
+            TypeData::Tuple(elems) => self.first_global_material_gap(elems.iter().copied()),
+            TypeData::Aggregate(id) => self.first_global_material_gap(
+                self.program
+                    .aggregate(*id)
+                    .fields
+                    .iter()
+                    .map(|field| field.ty),
+            ),
+            TypeData::Enum(id) => self.first_global_material_gap(
+                self.program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .flat_map(Self::variant_field_tys),
+            ),
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::Slice(_)
+            | TypeData::DataRef(_)
+            | TypeData::Extern(_) => RustMaterialGap::UnsupportedRooting,
+        }
+    }
+
+    fn first_global_material_gap(
+        self,
+        fields: impl IntoIterator<Item = TypeId>,
+    ) -> RustMaterialGap {
+        fields
+            .into_iter()
+            .find_map(|field| {
+                matches!(
+                    self.materialization_for(
+                        field,
+                        RustMaterialSource::ExactGlobalRoot,
+                        RustMaterialIntent::Read,
+                    ),
+                    RustMaterialization::Gap
+                )
+                .then(|| self.global_material_gap(field))
+            })
+            .unwrap_or(RustMaterialGap::UnsupportedRooting)
+    }
+
+    fn materialization(self, ty: TypeId) -> RustMaterialization {
         if matches!(self.program.type_arena.data(ty), TypeData::Void) {
             return RustMaterialization::Gap;
         }
@@ -143,7 +278,7 @@ impl<'a> AirRustRepPolicy<'a> {
         }
     }
 
-    pub fn exact_root_global_materialization(self, ty: TypeId) -> RustMaterialization {
+    fn exact_root_global_materialization(self, ty: TypeId) -> RustMaterialization {
         match self.program.type_arena.data(ty) {
             TypeData::Void
             | TypeData::Any
@@ -217,10 +352,14 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     fn exact_root_global_field_supported(self, ty: TypeId) -> bool {
-        materialization_is_owned_payload(self.exact_root_global_materialization(ty))
+        materialization_is_owned_payload(self.materialization_for(
+            ty,
+            RustMaterialSource::ExactGlobalRoot,
+            RustMaterialIntent::Read,
+        ))
     }
 
-    pub fn stored_payload_supported(self, ty: TypeId) -> bool {
+    fn stored_payload_supported(self, ty: TypeId) -> bool {
         self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
     }
 
@@ -235,8 +374,11 @@ impl<'a> AirRustRepPolicy<'a> {
         }
         let supported =
             match self.program.type_arena.data(ty) {
-                TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => true,
-                TypeData::DataRef(_) => true,
+                TypeData::Int
+                | TypeData::Float
+                | TypeData::Bool
+                | TypeData::String
+                | TypeData::DataRef(_) => true,
                 TypeData::List(elem) => self.stored_payload_supported_inner(*elem, true, active),
                 TypeData::Map { key, value, .. } => {
                     self.map_key_supported(*key)
@@ -362,14 +504,14 @@ impl<'a> AirRustRepPolicy<'a> {
                 | TypeData::Array { .. }
                 | TypeData::List(_)
                 | TypeData::Map { .. }
-                | TypeData::Slice(_) => true,
-                TypeData::Function(_) => true,
+                | TypeData::Slice(_)
+                | TypeData::Function(_) => true,
                 TypeData::Any | TypeData::Dyn(_) => false,
             },
             ParamMode::SharedBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
-                TypeData::Tuple(_) => true,
-                TypeData::String
+                TypeData::Tuple(_)
+                | TypeData::String
                 | TypeData::Aggregate(_)
                 | TypeData::DataRef(_)
                 | TypeData::Enum(_)
@@ -388,8 +530,8 @@ impl<'a> AirRustRepPolicy<'a> {
             },
             ParamMode::MutBorrow => match self.program.type_arena.data(ty) {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
-                TypeData::Tuple(_) => true,
-                TypeData::Int
+                TypeData::Tuple(_)
+                | TypeData::Int
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::String
@@ -426,10 +568,9 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Array { .. } => RustValueRep::InlineArray,
             RirType::List(_) => RustValueRep::CowList,
             RirType::Map { .. } => RustValueRep::CowMap,
-            RirType::Option(_) => RustValueRep::InlineEnum,
             RirType::Slice(_) => RustValueRep::Opaque,
             RirType::Lambda(sig) if self.lambda_sig_copyable(sig) => RustValueRep::InlineCopy,
-            RirType::Lambda(_) => RustValueRep::InlineEnum,
+            RirType::Option(_) | RirType::Lambda(_) => RustValueRep::InlineEnum,
             RirType::Struct(_) | RirType::Tuple(_) => RustValueRep::InlineStruct,
             RirType::DataRef(_) => RustValueRep::HeapHandle,
             RirType::Enum(id) => self.enum_rep(id),
@@ -507,12 +648,132 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
         !matches!(
-            self.materialization(ty),
+            self.materialization_for(ty, RustMaterialSource::Value, RustMaterialIntent::Read),
             RustMaterialization::BorrowGuard | RustMaterialization::Gap
         )
     }
 
-    pub fn materialization(self, ty: RirTypeId) -> RustMaterialization {
+    pub fn materialization_for(
+        self,
+        ty: RirTypeId,
+        source: RustMaterialSource,
+        intent: RustMaterialIntent,
+    ) -> RustMaterialization {
+        self.materialization_plan_for(ty, source, intent)
+            .materialization
+    }
+
+    pub fn materialization_plan_for(
+        self,
+        ty: RirTypeId,
+        source: RustMaterialSource,
+        intent: RustMaterialIntent,
+    ) -> RustMaterialPlan {
+        let materialization = match (source, intent) {
+            (RustMaterialSource::Value, RustMaterialIntent::Read) => self.materialization(ty),
+            (
+                RustMaterialSource::ExactGlobalRoot,
+                RustMaterialIntent::Read | RustMaterialIntent::Store,
+            ) => self.exact_root_global_materialization(ty),
+            (RustMaterialSource::StoredPayload, RustMaterialIntent::Store) => {
+                if self.stored_payload_supported(ty) {
+                    self.materialization(ty)
+                } else {
+                    RustMaterialization::Gap
+                }
+            }
+            (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
+                match self.ty_opt(ty) {
+                    Some(RirType::Int | RirType::Float | RirType::Bool) => {
+                        RustMaterialization::Copy
+                    }
+                    Some(RirType::DataRef(_)) => RustMaterialization::CloneHandle,
+                    Some(RirType::Struct(_) | RirType::Tuple(_)) => self.materialization(ty),
+                    _ => RustMaterialization::Gap,
+                }
+            }
+            _ => RustMaterialization::Gap,
+        };
+        RustMaterialPlan {
+            materialization,
+            gap: matches!(materialization, RustMaterialization::Gap)
+                .then(|| self.material_gap(ty, source)),
+        }
+    }
+
+    fn material_gap(self, ty: RirTypeId, source: RustMaterialSource) -> RustMaterialGap {
+        match source {
+            RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
+            _ => RustMaterialGap::UnsupportedType,
+        }
+    }
+
+    fn global_material_gap(self, ty: RirTypeId) -> RustMaterialGap {
+        match self.ty_opt(ty) {
+            Some(RirType::Void | RirType::Lambda(_)) | None => RustMaterialGap::UnsupportedType,
+            Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
+                self.global_material_gap(inner)
+            }
+            Some(RirType::Struct(id)) => self
+                .program
+                .structs
+                .get(id.index())
+                .map_or(RustMaterialGap::UnsupportedType, |strukt| {
+                    self.first_global_material_gap(strukt.fields.iter().map(|field| field.ty))
+                }),
+            Some(RirType::Tuple(id)) => self
+                .program
+                .tuples
+                .get(id.index())
+                .map_or(RustMaterialGap::UnsupportedType, |tuple| {
+                    self.first_global_material_gap(tuple.fields.iter().map(|field| field.ty))
+                }),
+            Some(RirType::Enum(id)) => {
+                self.program
+                    .enums
+                    .get(id.index())
+                    .map_or(RustMaterialGap::UnsupportedType, |enm| {
+                        self.first_global_material_gap(
+                            enm.variants
+                                .iter()
+                                .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
+                        )
+                    })
+            }
+            Some(
+                RirType::Int
+                | RirType::Float
+                | RirType::Bool
+                | RirType::String
+                | RirType::DataRef(_)
+                | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Slice(_),
+            ) => RustMaterialGap::UnsupportedRooting,
+        }
+    }
+
+    fn first_global_material_gap(
+        self,
+        fields: impl IntoIterator<Item = RirTypeId>,
+    ) -> RustMaterialGap {
+        fields
+            .into_iter()
+            .find_map(|field| {
+                matches!(
+                    self.materialization_for(
+                        field,
+                        RustMaterialSource::ExactGlobalRoot,
+                        RustMaterialIntent::Read,
+                    ),
+                    RustMaterialization::Gap
+                )
+                .then(|| self.global_material_gap(field))
+            })
+            .unwrap_or(RustMaterialGap::UnsupportedRooting)
+    }
+
+    fn materialization(self, ty: RirTypeId) -> RustMaterialization {
         if matches!(self.ty(ty), RirType::Void) {
             return RustMaterialization::Gap;
         }
@@ -553,7 +814,7 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
-    pub fn exact_root_global_materialization(self, ty: RirTypeId) -> RustMaterialization {
+    fn exact_root_global_materialization(self, ty: RirTypeId) -> RustMaterialization {
         let Some(data) = self.ty_opt(ty) else {
             return RustMaterialization::Gap;
         };
@@ -624,7 +885,11 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     fn exact_root_global_field_supported(self, ty: RirTypeId) -> bool {
-        materialization_is_owned_payload(self.exact_root_global_materialization(ty))
+        materialization_is_owned_payload(self.materialization_for(
+            ty,
+            RustMaterialSource::ExactGlobalRoot,
+            RustMaterialIntent::Read,
+        ))
     }
 
     fn map_key_supported(self, ty: RirTypeId) -> bool {
@@ -648,7 +913,7 @@ impl<'a> RustRepPolicy<'a> {
         }
     }
 
-    pub fn stored_payload_supported(self, ty: RirTypeId) -> bool {
+    fn stored_payload_supported(self, ty: RirTypeId) -> bool {
         self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
     }
 
@@ -662,8 +927,13 @@ impl<'a> RustRepPolicy<'a> {
             return cycle_broken;
         }
         let supported = match self.ty_opt(ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::String) => true,
-            Some(RirType::DataRef(_)) => true,
+            Some(
+                RirType::Int
+                | RirType::Float
+                | RirType::Bool
+                | RirType::String
+                | RirType::DataRef(_),
+            ) => true,
             Some(RirType::List(elem)) => self.stored_payload_supported_inner(elem, true, active),
             Some(RirType::Map { key, value }) => {
                 self.map_key_supported(key)
@@ -700,7 +970,6 @@ impl<'a> RustRepPolicy<'a> {
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
         match self.ty(ty) {
             RirType::String => RustBorrowView::Str,
-            RirType::Slice(_) => RustBorrowView::Ref,
             RirType::Void => RustBorrowView::TargetGap,
             _ => RustBorrowView::Ref,
         }

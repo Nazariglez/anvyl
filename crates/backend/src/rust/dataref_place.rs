@@ -1,6 +1,6 @@
 use super::rir::{
-    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceRoot, RirOptionMatch, RirProgram,
-    RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
+    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceAccess, RirOptionMatch, RirProgram,
+    RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -93,7 +93,7 @@ impl DataRefPlaceDescriptors {
         };
         for arg in args {
             if let RirCallArg::MutPlace(arg) = arg
-                && let RirMutPlaceRoot::DataRef { dataref, .. } = arg.root
+                && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
             {
                 self.intern(program, dataref, &arg.projections, arg.ty);
             }
@@ -222,8 +222,8 @@ enum RirPlaceContainer {
 
 fn container_for(program: &RirProgram, ty: RirTypeId) -> Option<RirPlaceContainer> {
     match program.types[ty.index()] {
-        super::rir::RirType::Struct(id) => Some(RirPlaceContainer::Struct(id)),
-        super::rir::RirType::Tuple(id) => Some(RirPlaceContainer::Tuple(id)),
+        RirType::Struct(id) => Some(RirPlaceContainer::Struct(id)),
+        RirType::Tuple(id) => Some(RirPlaceContainer::Tuple(id)),
         _ => None,
     }
 }

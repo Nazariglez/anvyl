@@ -1,0 +1,26 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 7
+// 2
+// bee
+// @match-end
+
+struct Config {
+    count: int,
+    pair: (int, int),
+}
+
+pub dataref Node {
+    name: string,
+}
+
+lazy let config = Config { count: 7, pair: (1, 2) };
+lazy let node = Node { name: "bee" };
+
+fn main() {
+    println(config.count);
+    println(config.pair.1);
+    println(node.name);
+}

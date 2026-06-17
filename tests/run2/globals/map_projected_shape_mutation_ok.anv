@@ -1,0 +1,23 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// a
+// 1
+// b
+// 2
+// @match-end
+
+struct State {
+    values: [string: int],
+}
+
+lazy var state = State { values: ["a": 1] };
+
+fn main() {
+    state.values.insert("b", 2);
+    for key, value in state.values {
+        println(key);
+        println(value);
+    }
+}
