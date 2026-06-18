@@ -4,8 +4,9 @@
 // @match: 2
 
 fn touch(var opt: int?) {
-    var value? = opt else return;
-    value = 2;
+    if var value? = opt {
+        value = 2;
+    }
 }
 
 fn main() {

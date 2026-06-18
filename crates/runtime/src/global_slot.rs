@@ -1,11 +1,11 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     rc::Rc,
 };
 
-use crate::RuntimeError;
+use crate::{RuntimeError, collection::ACTIVE_COLLECTION_LOAN_ERROR};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalSlotState {
@@ -26,6 +26,18 @@ impl<T> Deref for GlobalRef<'_, T> {
 }
 
 pub struct GlobalRefMut<'a, T>(RefMut<'a, T>);
+
+pub struct GlobalProjectedLoanGuard<'a, T> {
+    slot: &'a GlobalSlot<T>,
+}
+
+impl<T> Drop for GlobalProjectedLoanGuard<'_, T> {
+    fn drop(&mut self) {
+        let active = self.slot.projected_loans.get();
+        debug_assert!(active > 0);
+        self.slot.projected_loans.set(active.saturating_sub(1));
+    }
+}
 
 impl<T> Deref for GlobalRefMut<'_, T> {
     type Target = T;
@@ -51,6 +63,7 @@ enum LazyState<T> {
 pub struct GlobalSlot<T> {
     name: &'static str,
     state: RefCell<LazyState<T>>,
+    projected_loans: Cell<usize>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -68,6 +81,7 @@ impl<T> GlobalSlot<T> {
         Self {
             name,
             state: RefCell::new(LazyState::Uninit),
+            projected_loans: Cell::new(0),
             _not_send_sync: PhantomData,
         }
     }
@@ -153,6 +167,7 @@ impl<T> GlobalSlot<T> {
         init: impl FnOnce() -> Result<T, RuntimeError>,
     ) -> Result<GlobalRefMut<'_, T>, RuntimeError> {
         self.ensure(init)?;
+        self.check_projected_loan_assignment()?;
         let state = self
             .state
             .try_borrow_mut()
@@ -165,14 +180,32 @@ impl<T> GlobalSlot<T> {
         .map_err(|_| self.internal_error("successful global write found no ready value"))
     }
 
+    pub fn begin_projected_loan(&self) -> GlobalProjectedLoanGuard<'_, T> {
+        self.projected_loans.set(self.projected_loans.get() + 1);
+        GlobalProjectedLoanGuard { slot: self }
+    }
+
     pub fn set_without_init(&self, value: T) -> Result<(), RuntimeError> {
+        self.set_without_init_or_replace(value, |slot, value| {
+            *slot = value;
+            Ok(())
+        })
+    }
+
+    pub fn set_without_init_or_replace(
+        &self,
+        value: T,
+        replace: impl FnOnce(&mut T, T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        self.check_projected_loan_assignment()?;
         let mut state = self
             .state
             .try_borrow_mut()
             .map_err(|_| self.borrow_conflict())?;
-        match &*state {
+        match &mut *state {
             LazyState::Initializing => Err(self.initializing_assignment_error()),
-            LazyState::Uninit | LazyState::Ready(_) | LazyState::Failed(_) => {
+            LazyState::Ready(slot) => replace(slot, value),
+            LazyState::Uninit | LazyState::Failed(_) => {
                 *state = LazyState::Ready(value);
                 Ok(())
             }
@@ -194,10 +227,25 @@ impl<T> GlobalSlot<T> {
         RuntimeError::new(format!("poisoned lazy global '{}': {error}", self.name))
     }
 
+    fn check_projected_loan_assignment(&self) -> Result<(), RuntimeError> {
+        if self.projected_loans.get() == 0 {
+            Ok(())
+        } else {
+            Err(self.projected_loan_assignment_error())
+        }
+    }
+
     fn initializing_assignment_error(&self) -> RuntimeError {
         RuntimeError::new(format!(
             "cannot assign lazy global '{}' while it is initializing",
             self.name
+        ))
+    }
+
+    fn projected_loan_assignment_error(&self) -> RuntimeError {
+        RuntimeError::new(format!(
+            "cannot assign lazy global '{}' because {}",
+            self.name, ACTIVE_COLLECTION_LOAN_ERROR
         ))
     }
 
@@ -214,7 +262,10 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use super::LazyState;
-    use crate::{GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState};
+    use crate::{
+        GlobalProjectedLoanGuard, GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState,
+        collection::ACTIVE_COLLECTION_LOAN_ERROR,
+    };
 
     #[test]
     fn new_slot_starts_uninit() {
@@ -322,6 +373,30 @@ mod tests {
     }
 
     #[test]
+    fn set_without_init_or_replace_uses_ready_replacer() {
+        let slot = GlobalSlot::<i64>::new("score");
+        slot.set_without_init(1).unwrap();
+
+        slot.set_without_init_or_replace(2, |slot, value| {
+            *slot += value;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
+    }
+
+    #[test]
+    fn set_without_init_or_replace_sets_uninit_without_replacer() {
+        let slot = GlobalSlot::<i64>::new("score");
+
+        slot.set_without_init_or_replace(2, |_, _| unreachable!())
+            .unwrap();
+
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 2);
+    }
+
+    #[test]
     fn set_without_init_rejects_initializing() {
         let slot = GlobalSlot::<i64>::new("score");
         let error = slot
@@ -406,6 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn projected_loan_blocks_writes_and_replacement() {
+        let slot = GlobalSlot::<i64>::new("state");
+        slot.set_without_init(1).unwrap();
+        let loan = slot.begin_projected_loan();
+
+        let write = slot.write(|| unreachable!()).err().unwrap();
+        let set = slot.set_without_init(2).unwrap_err();
+
+        assert!(write.message().contains(ACTIVE_COLLECTION_LOAN_ERROR));
+        assert!(set.message().contains(ACTIVE_COLLECTION_LOAN_ERROR));
+        drop(loan);
+        slot.set_without_init(3).unwrap();
+        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
+    }
+
+    #[test]
     fn exports_are_visible() {
         fn assert_exported<T>(_: T) {}
 
@@ -413,5 +504,6 @@ mod tests {
         assert_eq!(GlobalSlotState::Uninit, GlobalSlotState::Uninit);
         let _: Option<GlobalRef<'_, i64>> = None;
         let _: Option<GlobalRefMut<'_, i64>> = None;
+        let _: Option<GlobalProjectedLoanGuard<'_, i64>> = None;
     }
 }

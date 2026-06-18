@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: callback reentry through active map iteration is not executable yet
+// @skip: blocked by UnsupportedMutablePlaceProjection before runtime collection-loan reentry guard
 // @contains: cannot structurally mutate collection during active iteration or slice view
 
 fn apply(cb: fn()) {

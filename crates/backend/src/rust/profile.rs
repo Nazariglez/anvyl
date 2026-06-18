@@ -14,7 +14,7 @@ use anvyx_runtime::RustProviderSupport;
 
 use super::{
     native,
-    place_access::{PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent},
+    place_access::{PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan},
     rep_policy::{AirRustRepPolicy, RustMaterialIntent, RustMaterialSource, RustMaterialization},
     rir,
 };
@@ -95,7 +95,6 @@ pub enum ProfileErrorKind {
     UnsupportedGlobalValueRead,
     UnsupportedGlobalRooting,
     UnsupportedMutablePlace,
-    UnsupportedCollectionLoan,
     UnsupportedMutablePlaceProjection,
     UnsupportedMutablePlaceDataRef,
     UnsupportedMutablePlaceNativeBoundary,
@@ -410,7 +409,9 @@ impl ProfileCx<'_> {
                 air::AirStmt::OptionalMatch(match_) => {
                     self.check_place(site, &match_.discr);
                     if match_.payload_ref
-                        && !self.optional_payload_ref_discr_supported(site, &match_.discr)
+                        && self
+                            .optional_payload_ref_discr_plan(site, &match_.discr)
+                            .is_none()
                     {
                         self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
                     }
@@ -427,10 +428,7 @@ impl ProfileCx<'_> {
                 }
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
                 air::AirStmt::CollectionLoan(loan) => {
-                    if let Err(gap) =
-                        self.access()
-                            .plan(function, PlaceAccessIntent::CollectionLoan, &loan.root)
-                    {
+                    if let Err(gap) = self.access().collection_loan_plan(function, loan) {
                         self.push(site, profile_gap_kind(gap));
                     }
                     self.check_place(site, &loan.root);
@@ -918,13 +916,15 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn optional_payload_ref_discr_supported(&self, site: ProfileSite, place: &Place) -> bool {
-        let Some(function) = Self::current_function_id(site) else {
-            return false;
-        };
+    fn optional_payload_ref_discr_plan(
+        &self,
+        site: ProfileSite,
+        place: &Place,
+    ) -> Option<PlaceAccessPlan> {
+        let function = Self::current_function_id(site)?;
         self.access()
             .plan(function, PlaceAccessIntent::PayloadAlias, place)
-            .is_ok()
+            .ok()
     }
 
     fn check_range_locals(

@@ -2,8 +2,9 @@ use super::{
     dataref_place::{self as dataref_paths},
     rep_policy::RustRepPolicy,
     rir::{
-        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirParamAbi, RirPlace,
-        RirPlaceModel, RirPlaceRoot, RirProgram, RirProjection, RirType, RirTypeId,
+        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirOptionSubject,
+        RirParamAbi, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram, RirProjection, RirStmt,
+        RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
     },
     syntax::comma,
     target,
@@ -210,7 +211,8 @@ impl<'a> RustPlaces<'a> {
         let RirPlaceRoot::Local(local) = place.root else {
             unreachable!("expected a local RIR place")
         };
-        place.projections.is_empty() && self.local_is_mut_place_param(local)
+        place.projections.is_empty()
+            && (self.local_is_mut_place_param(local) || self.payload_ref_cell_local(local))
     }
 
     pub(super) fn mut_place_projection(&self, place: &RirPlace) -> Option<MutPlaceProjection> {
@@ -469,7 +471,7 @@ impl<'a> RustPlaces<'a> {
         let RirPlaceRoot::Local(local) = place.root else {
             unreachable!("expected a local RIR place")
         };
-        self.function.locals[local.index()].payload_ref
+        self.function.locals[local.index()].payload_ref && !self.payload_ref_cell_local(local)
             || self.param_abi_for_local(local) == Some(RirParamAbi::MutBorrow)
     }
 
@@ -487,6 +489,11 @@ impl<'a> RustPlaces<'a> {
 
     fn local_is_mut_place_param(&self, local: RirLocalId) -> bool {
         self.param_abi_for_local(local) == Some(RirParamAbi::MutPlace)
+    }
+
+    pub(super) fn payload_ref_cell_local(&self, local: RirLocalId) -> bool {
+        self.function.locals[local.index()].payload_ref
+            && block_has_mut_place_payload(&self.function.body, local)
     }
 
     fn param_abi_for_local(&self, local: RirLocalId) -> Option<RirParamAbi> {
@@ -563,4 +570,20 @@ impl<'a> RustPlaces<'a> {
             }
         }
     }
+}
+
+fn block_has_mut_place_payload(block: &RirStructuredBlock, local: RirLocalId) -> bool {
+    block.stmts.iter().any(|stmt| {
+        stmt_has_mut_place_payload(stmt, local)
+            || stmt_child_blocks_any(stmt, |block| block_has_mut_place_payload(block, local))
+    })
+}
+
+fn stmt_has_mut_place_payload(stmt: &RirStmt, local: RirLocalId) -> bool {
+    let RirStmt::OptionMatch(match_) = stmt else {
+        return false;
+    };
+    match_.payload == Some(local)
+        && match_.payload_ref
+        && matches!(match_.subject, RirOptionSubject::MutPlace(_))
 }

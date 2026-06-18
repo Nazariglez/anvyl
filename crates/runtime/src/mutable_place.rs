@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub enum MutPlace<'place, 'cx, T> {
-    Local(&'place mut T, PhantomData<&'cx ()>),
+    Local(*mut T, PhantomData<(&'place mut T, &'cx ())>),
     StackCell(&'place StackLambdaCell<T>, PhantomData<&'cx ()>),
     HeapCell(Handle<'cx, LambdaCell<T>>),
     Global(GlobalPlace<'place, 'cx, T>),
@@ -65,6 +65,9 @@ pub trait ProjectionOps<'cx, R, T> {
         f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError>;
 }
+
+#[derive(Default)]
+pub struct OptionalPayloadOps<T>(PhantomData<T>);
 
 pub trait DataRefPlaceOps<'cx, T> {
     fn access(
@@ -169,6 +172,32 @@ fn projected_mutate<'cx, T: 'cx, R>(
     Ok(out.expect("projected place mutation did not invoke callback"))
 }
 
+impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
+    fn access(
+        &self,
+        _ctx: &mut Ctx<'cx, '_>,
+        root: &Option<T>,
+        f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let Some(payload) = root.as_ref() else {
+            return Err(RuntimeError::new("optional payload is nil"));
+        };
+        f(payload)
+    }
+
+    fn mutate(
+        &self,
+        _ctx: &mut Ctx<'cx, '_>,
+        root: &mut Option<T>,
+        f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let Some(payload) = root.as_mut() else {
+            return Err(RuntimeError::new("optional payload is nil"));
+        };
+        f(payload)
+    }
+}
+
 impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
     pub fn new(object: ErasedHandle<'cx>, ops: &'ops dyn DataRefPlaceOps<'cx, T>) -> Self {
         Self {
@@ -210,6 +239,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
         match self {
             Self::Local(list, _) => {
+                let list = unsafe { &**list };
                 let range = crate::checked_range(start, end, inclusive, list.len());
                 AnvSlice::from_list(list, range.start, range.len())
             }
@@ -233,6 +263,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
     {
         match self {
             Self::Local(list, _) => {
+                let list = unsafe { &mut **list };
                 let range = crate::checked_range(start, end, inclusive, list.len());
                 AnvSlice::from_list_mut(ctx, list, range.start, range.len())
             }
@@ -258,6 +289,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
         match self {
             Self::Local(array, _) => {
+                let array = unsafe { &**array };
                 let range = crate::checked_range(start, end, inclusive, N);
                 Ok(
                     unsafe {
@@ -286,6 +318,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
         match self {
             Self::Local(array, _) => {
+                let array = unsafe { &mut **array };
                 let range = crate::checked_range(start, end, inclusive, N);
                 Ok(unsafe {
                     AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
@@ -352,6 +385,14 @@ impl<'cx, T: 'cx> GlobalPlace<'_, 'cx, T> {
 
 impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
     pub fn local(value: &'place mut T) -> Self {
+        Self::Local(std::ptr::from_mut(value), PhantomData)
+    }
+
+    /// # Safety
+    ///
+    /// `value` must stay valid for the returned place's lifetime, and all access to it through
+    /// this place must obey Rust's aliasing rules at runtime.
+    pub unsafe fn local_raw(value: *mut T) -> Self {
         Self::Local(value, PhantomData)
     }
 
@@ -384,7 +425,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
 
     pub fn reborrow(&mut self) -> MutPlace<'_, 'cx, T> {
         match self {
-            Self::Local(value, _) => MutPlace::local(&mut **value),
+            Self::Local(value, _) => MutPlace::Local(*value, PhantomData),
             Self::StackCell(cell, _) => MutPlace::stack_cell(cell),
             Self::HeapCell(cell) => MutPlace::heap_cell(cell.clone()),
             Self::Global(global) => MutPlace::Global(*global),
@@ -399,7 +440,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
         f: impl FnOnce(&T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         match self {
-            Self::Local(value, _) => f(value),
+            Self::Local(value, _) => f(unsafe { &**value }),
             Self::StackCell(cell, _) => cell.access(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.access(f)),
             Self::Global(global) => global.access(ctx, f),
@@ -414,7 +455,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         match self {
-            Self::Local(value, _) => f(*value),
+            Self::Local(value, _) => f(unsafe { &mut **value }),
             Self::StackCell(cell, _) => cell.mutate(f),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
             Self::Global(global) => global.mutate(ctx, f),
@@ -430,7 +471,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
     ) -> Result<R, RuntimeError> {
         let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
         match self {
-            Self::Local(value, _) => f(ctx, value),
+            Self::Local(value, _) => f(ctx, unsafe { &**value }),
             Self::StackCell(cell, _) => cell.access(|value| f(ctx, value)),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
                 cell.access(|value| f(unsafe { &mut *ctx_ptr }, value))
@@ -450,7 +491,7 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
     ) -> Result<R, RuntimeError> {
         let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
         match self {
-            Self::Local(value, _) => f(ctx, *value),
+            Self::Local(value, _) => f(ctx, unsafe { &mut **value }),
             Self::StackCell(cell, _) => cell.mutate(|value| f(ctx, value)),
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
                 cell.mutate(|value| f(unsafe { &mut *ctx_ptr }, value))
@@ -570,8 +611,8 @@ mod tests {
 
     use crate::{
         AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType, LambdaCell,
-        ListStorage, MutPlace, ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell,
-        heap_access_error,
+        ListStorage, MutPlace, OptionalPayloadOps, ProjectionOps, RuntimeError, ScopedMutPlaceCell,
+        StackLambdaCell, heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -581,6 +622,33 @@ mod tests {
                 $($body)*
             })
         };
+    }
+
+    #[test]
+    fn optional_payload_ops_project_some_payload() {
+        with_ctx!(ctx;
+        let mut source = Some(1);
+        let ops = OptionalPayloadOps::<i64>::default();
+        let mut place = MutPlace::projected(MutPlace::local(&mut source), &ops);
+
+        place.update_copy(&mut ctx, |value| value + 1).unwrap();
+        drop(place);
+
+        assert_eq!(source, Some(2));
+            );
+    }
+
+    #[test]
+    fn optional_payload_ops_reject_nil_payload() {
+        with_ctx!(ctx;
+        let mut source: Option<i64> = None;
+        let ops = OptionalPayloadOps::<i64>::default();
+        let place = MutPlace::projected(MutPlace::local(&mut source), &ops);
+
+        let err = place.get_copy(&mut ctx).unwrap_err();
+
+        assert_eq!(err.message(), "optional payload is nil");
+            );
     }
 
     #[test]

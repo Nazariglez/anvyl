@@ -5,8 +5,7 @@
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    {
-        var value? = counts["a"] else return;
+    if var value? = counts["a"] {
         value = 2;
     }
     if let value? = counts["a"] {

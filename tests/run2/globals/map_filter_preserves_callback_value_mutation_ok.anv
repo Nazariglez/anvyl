@@ -3,14 +3,24 @@
 // @expect: success
 // @match-begin
 // a
-// 1
+// 9
+// b
+// 2
 // @match-end
 
 lazy var values: [string: int] = ["a": 1, "b": 2];
-lazy var removed = 2;
+
+fn rewrite_a() {
+    values["a"] = 9;
+}
 
 fn main() {
-    values.remove_where(|key, value| value == removed);
+    values.remove_where(|_, value| {
+        if value == 1 {
+            rewrite_a();
+        }
+        false
+    });
     for key, value in values {
         println(key);
         println(value);

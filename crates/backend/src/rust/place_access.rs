@@ -30,7 +30,161 @@ pub struct PlaceAccessPlan {
     pub root: PlaceAccessRoot,
     pub ty: TypeId,
     pub projection: Vec<PlaceProjection>,
-    pub crosses_dataref: bool,
+    dataref: Option<DataRefProjectionPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionLoanPlan {
+    pub place: PlaceAccessPlan,
+    pub root_kind: air::AirCollectionRootKind,
+    pub mode: air::AirCollectionLoanMode,
+}
+
+impl PlaceAccessPlan {
+    pub fn dataref_plan(&self) -> Option<&DataRefProjectionPlan> {
+        self.dataref.as_ref()
+    }
+
+    pub fn payload_alias_direct_place(&self) -> bool {
+        matches!(
+            self.root,
+            PlaceAccessRoot::Local {
+                source_mut_param: false,
+                ..
+            }
+        ) && self.dataref.is_none()
+            && self.projection.iter().all(|projection| {
+                matches!(
+                    projection.kind,
+                    PlaceProjectionKind::Field(_)
+                        | PlaceProjectionKind::TupleField(_)
+                        | PlaceProjectionKind::ArrayIndex(_)
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataRefProjectionPlan {
+    pub(super) root_ty: TypeId,
+    pub(super) object_prefix: Vec<PlaceProjection>,
+    pub(super) object_prefix_can_fail: bool,
+    pub(super) segments: Vec<DataRefSegmentPlan>,
+    pub(super) remaining: Vec<PlaceProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataRefSegmentPlan {
+    pub(super) dataref_ty: TypeId,
+    pub(super) dataref: air::AggregateId,
+    pub(super) storage: Vec<PlaceProjection>,
+    pub(super) storage_ty: TypeId,
+}
+
+impl DataRefProjectionPlan {
+    fn build(
+        program: &Program,
+        classes: &TypePassClasses,
+        path: &air_place::PlacePath,
+        intent: PlaceAccessIntent,
+    ) -> Result<Option<Self>, PlaceAccessGapKind> {
+        if !path.crosses_dataref() {
+            return Ok(None);
+        }
+
+        let mut object_prefix = vec![];
+        let mut object_prefix_can_fail = false;
+        let mut segments = vec![];
+        let mut current = None;
+        let mut remaining = vec![];
+        let mut materialized = false;
+
+        for step in path.steps() {
+            let projection = convert_projection(step);
+            if materialized {
+                if dataref_remaining_projection_supported(step.kind()) {
+                    remaining.push(projection);
+                    continue;
+                }
+                return Err(Self::projection_gap(intent));
+            }
+            match program.type_arena.data(step.source_ty()) {
+                TypeData::DataRef(dataref) => {
+                    let mut segment = DataRefSegmentPlan {
+                        dataref_ty: step.source_ty(),
+                        dataref: *dataref,
+                        storage: vec![],
+                        storage_ty: step.source_ty(),
+                    };
+                    if matches!(step.kind(), air_place::ProjectionKind::DataRefField(_)) {
+                        segment.storage_ty = projection.ty;
+                        segment.storage.push(projection);
+                        if let Some(segment) = current.replace(segment) {
+                            segments.push(segment);
+                        }
+                    } else {
+                        return Err(Self::projection_gap(intent));
+                    }
+                }
+                TypeData::Aggregate(_) if current.is_some() => {
+                    if matches!(step.kind(), air_place::ProjectionKind::Field(_)) {
+                        let segment = current.as_mut().expect("checked above");
+                        segment.storage_ty = projection.ty;
+                        segment.storage.push(projection);
+                    } else {
+                        return Err(Self::projection_gap(intent));
+                    }
+                }
+                TypeData::Tuple(_) if current.is_some() => {
+                    if matches!(step.kind(), air_place::ProjectionKind::TupleField(_)) {
+                        let segment = current.as_mut().expect("checked above");
+                        segment.storage_ty = projection.ty;
+                        segment.storage.push(projection);
+                    } else {
+                        return Err(Self::projection_gap(intent));
+                    }
+                }
+                _ if current.is_some()
+                    && intent == PlaceAccessIntent::ReadValue
+                    && dataref_remaining_projection_supported(step.kind()) =>
+                {
+                    segments.push(current.take().expect("checked above"));
+                    remaining.push(projection);
+                    materialized = true;
+                }
+                _ if current.is_some() => return Err(Self::projection_gap(intent)),
+                _ if ordinary_projection_supported(step.kind()) => {
+                    object_prefix_can_fail |= projection_is_dynamic(projection.kind);
+                    object_prefix.push(projection);
+                }
+                _ => return Err(Self::projection_gap(intent)),
+            }
+        }
+        if let Some(segment) = current {
+            segments.push(segment);
+        }
+
+        if matches!(intent, PlaceAccessIntent::MutPlaceArg)
+            && !dataref_mut_place_payload_supported(program, classes, path.ty())
+        {
+            return Err(PlaceAccessGapKind::MutablePlaceDataRef);
+        }
+
+        Ok(Some(Self {
+            root_ty: path.root().ty,
+            object_prefix,
+            object_prefix_can_fail,
+            segments,
+            remaining,
+        }))
+    }
+
+    fn projection_gap(intent: PlaceAccessIntent) -> PlaceAccessGapKind {
+        match intent {
+            PlaceAccessIntent::MutPlaceArg => PlaceAccessGapKind::MutablePlaceDataRef,
+            _ => PlaceAccessGapKind::PlaceProjection,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +236,38 @@ pub enum PlaceAccessGapKind {
     ReturnPlace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CollectionLoanBase {
+    Aggregate,
+    Tuple,
+    Array,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CollectionLoanProjection {
+    Field,
+    TupleField,
+    Index,
+    Other,
+}
+
+pub(super) fn collection_loan_step_supported(
+    base: CollectionLoanBase,
+    projection: CollectionLoanProjection,
+) -> bool {
+    matches!(
+        (base, projection),
+        (
+            CollectionLoanBase::Aggregate,
+            CollectionLoanProjection::Field
+        ) | (
+            CollectionLoanBase::Tuple,
+            CollectionLoanProjection::TupleField
+        ) | (CollectionLoanBase::Array, CollectionLoanProjection::Index)
+    )
+}
+
 pub struct PlaceAccessCx<'a> {
     program: &'a Program,
     classes: &'a TypePassClasses,
@@ -116,13 +302,14 @@ impl<'a> PlaceAccessCx<'a> {
         if intent == PlaceAccessIntent::PayloadAlias {
             self.check_payload_alias(function, &path)?;
         }
+        let dataref = DataRefProjectionPlan::build(self.program, self.classes, &path, intent)?;
         let root = self.root(function, path.root());
-        self.check_root_support(function, intent, place, &path)?;
+        self.check_root_support(function, intent, place, &path, dataref.as_ref())?;
         Ok(PlaceAccessPlan {
             root,
             ty: path.ty(),
             projection: path.steps().iter().map(convert_projection).collect(),
-            crosses_dataref: path.crosses_dataref(),
+            dataref,
         })
     }
 
@@ -163,6 +350,91 @@ impl<'a> PlaceAccessCx<'a> {
             })
     }
 
+    pub fn collection_loan_plan(
+        &self,
+        function: FunctionId,
+        loan: &air::AirCollectionLoan,
+    ) -> Result<CollectionLoanPlan, PlaceAccessGapKind> {
+        let place = self.plan(function, PlaceAccessIntent::CollectionLoan, &loan.root)?;
+        self.check_collection_loan_kind(loan.root.ty, loan.root_kind, loan.mode)?;
+        self.check_collection_loan_mutability(function, &loan.root, loan.mode)?;
+        Ok(CollectionLoanPlan {
+            place,
+            root_kind: loan.root_kind,
+            mode: loan.mode,
+        })
+    }
+
+    fn check_collection_loan_kind(
+        &self,
+        ty: TypeId,
+        root_kind: air::AirCollectionRootKind,
+        mode: air::AirCollectionLoanMode,
+    ) -> Result<(), PlaceAccessGapKind> {
+        let root_matches = matches!(
+            (root_kind, self.program.type_arena.data(ty)),
+            (air::AirCollectionRootKind::List, TypeData::List(_))
+                | (
+                    air::AirCollectionRootKind::FixedArray,
+                    TypeData::Array { .. }
+                )
+                | (air::AirCollectionRootKind::Slice, TypeData::Slice(_))
+                | (air::AirCollectionRootKind::Map, TypeData::Map { .. })
+        );
+        let mode_matches = matches!(
+            (root_kind, mode),
+            (
+                air::AirCollectionRootKind::List
+                    | air::AirCollectionRootKind::FixedArray
+                    | air::AirCollectionRootKind::Slice,
+                air::AirCollectionLoanMode::ReadonlySequence
+                    | air::AirCollectionLoanMode::MutableSequenceElement,
+            ) | (
+                air::AirCollectionRootKind::Map,
+                air::AirCollectionLoanMode::ReadonlyMap
+                    | air::AirCollectionLoanMode::MutableMapValue,
+            )
+        );
+        if root_matches && mode_matches {
+            Ok(())
+        } else {
+            Err(PlaceAccessGapKind::PlaceProjection)
+        }
+    }
+
+    fn check_collection_loan_mutability(
+        &self,
+        function: FunctionId,
+        root: &Place,
+        mode: air::AirCollectionLoanMode,
+    ) -> Result<(), PlaceAccessGapKind> {
+        if !matches!(
+            mode,
+            air::AirCollectionLoanMode::MutableSequenceElement
+                | air::AirCollectionLoanMode::MutableMapValue
+        ) {
+            return Ok(());
+        }
+        match root.root {
+            PlaceRoot::Local(local) => self
+                .program
+                .functions
+                .get(function.index())
+                .and_then(|function| function.locals.get(local.index()))
+                .is_some_and(|local| local.mutability == Mutability::Mutable)
+                .then_some(())
+                .ok_or(PlaceAccessGapKind::MutablePlace),
+            PlaceRoot::Global(global) => self
+                .program
+                .globals
+                .get(global.index())
+                .is_some_and(|global| global.mutability == Mutability::Mutable)
+                .then_some(())
+                .ok_or(PlaceAccessGapKind::GlobalRooting),
+            _ => Ok(()),
+        }
+    }
+
     fn root(&self, function: FunctionId, root: air_place::PlaceRootInfo) -> PlaceAccessRoot {
         match root.root {
             PlaceRoot::Local(local) => PlaceAccessRoot::Local {
@@ -195,10 +467,11 @@ impl<'a> PlaceAccessCx<'a> {
         intent: PlaceAccessIntent,
         place: &Place,
         path: &air_place::PlacePath,
+        dataref: Option<&DataRefProjectionPlan>,
     ) -> Result<(), PlaceAccessGapKind> {
         let root = path.root();
         if let Some(air_place::PlaceStorage::Global(global)) = root.storage {
-            return self.check_global(intent, global, place, path);
+            return self.check_global(intent, global, place, path, dataref);
         }
         if intent == PlaceAccessIntent::StructuralMutation && path.crosses_dataref() {
             return Err(PlaceAccessGapKind::PlaceProjection);
@@ -206,11 +479,21 @@ impl<'a> PlaceAccessCx<'a> {
         if intent == PlaceAccessIntent::MutPlaceArg && root.storage.is_none() {
             return Err(PlaceAccessGapKind::MutablePlace);
         }
+        if intent == PlaceAccessIntent::CollectionLoan {
+            if !collection_loan_projection_supported(self.program, path) {
+                return Err(PlaceAccessGapKind::PlaceProjection);
+            }
+            if !place.projection.is_empty()
+                && matches!(root.storage, Some(air_place::PlaceStorage::Local(local)) if self.local_is_source_mut_place_param(function, local))
+            {
+                return Err(PlaceAccessGapKind::MutablePlaceProjection);
+            }
+        }
         if matches!(
             intent,
             PlaceAccessIntent::ReadValue | PlaceAccessIntent::SharedBorrow
         ) && path.crosses_dataref()
-            && !dataref_projection_supported(self.program, path)
+            && dataref.is_none()
         {
             return Err(PlaceAccessGapKind::PlaceProjection);
         }
@@ -258,27 +541,17 @@ impl<'a> PlaceAccessCx<'a> {
 
     fn check_payload_alias(
         &self,
-        function: FunctionId,
+        _function: FunctionId,
         path: &air_place::PlacePath,
     ) -> Result<(), PlaceAccessGapKind> {
-        let PlaceRoot::Local(local) = path.root().root else {
+        let PlaceRoot::Local(_) = path.root().root else {
             return Err(PlaceAccessGapKind::PlaceProjection);
         };
-        if self.local_is_source_mut_place_param(function, local) || path.crosses_dataref() {
+        if path.crosses_dataref() {
             return Err(PlaceAccessGapKind::PlaceProjection);
         }
-        if path.steps().iter().all(|step| {
-            matches!(
-                step.kind(),
-                air_place::ProjectionKind::Field(_)
-                    | air_place::ProjectionKind::TupleField(_)
-                    | air_place::ProjectionKind::ArrayIndex(_)
-            )
-        }) {
-            Ok(())
-        } else {
-            Err(PlaceAccessGapKind::PlaceProjection)
-        }
+        self.check_projected_mut_place(path, true)
+            .map_err(|_| PlaceAccessGapKind::PlaceProjection)
     }
 
     fn check_global(
@@ -287,6 +560,7 @@ impl<'a> PlaceAccessCx<'a> {
         global: GlobalId,
         place: &Place,
         path: &air_place::PlacePath,
+        dataref: Option<&DataRefProjectionPlan>,
     ) -> Result<(), PlaceAccessGapKind> {
         let Some(decl) = self.program.globals.get(global.index()) else {
             return Err(PlaceAccessGapKind::GlobalAccess);
@@ -305,7 +579,7 @@ impl<'a> PlaceAccessCx<'a> {
                     return Err(PlaceAccessGapKind::GlobalRooting);
                 }
                 if place.projection.is_empty()
-                    || (global_structural_mutation_projection_supported(path)
+                    || (global_structural_mutation_projection_supported(self.program, path)
                         && self.value_read_supported(path.ty()))
                 {
                     Ok(())
@@ -318,7 +592,7 @@ impl<'a> PlaceAccessCx<'a> {
                     return Err(PlaceAccessGapKind::GlobalValueRead);
                 }
                 if place.projection.is_empty()
-                    || (global_structural_mutation_projection_supported(path)
+                    || (collection_loan_projection_supported(self.program, path)
                         && self.value_read_supported(path.ty()))
                 {
                     Ok(())
@@ -327,9 +601,7 @@ impl<'a> PlaceAccessCx<'a> {
                 }
             }
             PlaceAccessIntent::ReadValue if !place.projection.is_empty() => {
-                if !(global_read_projection_supported(path)
-                    || dataref_projection_supported(self.program, path))
-                {
+                if !(global_read_projection_supported(path) || dataref.is_some()) {
                     return Err(PlaceAccessGapKind::GlobalProjection);
                 }
                 if payload_gap.is_none() && self.value_read_supported(path.ty()) {
@@ -339,8 +611,7 @@ impl<'a> PlaceAccessCx<'a> {
                 }
             }
             PlaceAccessIntent::SharedBorrow if !place.projection.is_empty() => {
-                if (global_read_projection_supported(path)
-                    || dataref_projection_supported(self.program, path))
+                if (global_read_projection_supported(path) || dataref.is_some())
                     && self.value_read_supported(path.ty())
                 {
                     Ok(())
@@ -361,7 +632,7 @@ impl<'a> PlaceAccessCx<'a> {
                 if !place.projection.is_empty()
                     && decl.mutability == Mutability::Mutable
                     && payload_gap.is_none()
-                    && (dataref_projection_supported(self.program, path)
+                    && (dataref.is_some()
                         || self.check_projected_mut_place(path, true).is_ok()) =>
             {
                 Ok(())
@@ -431,34 +702,6 @@ impl<'a> PlaceAccessCx<'a> {
     }
 }
 
-fn dataref_projection_supported(program: &Program, path: &air_place::PlacePath) -> bool {
-    let mut crosses_dataref = false;
-    for step in path.steps() {
-        match program.type_arena.data(step.source_ty()) {
-            TypeData::DataRef(_) => {
-                if !matches!(step.kind(), air_place::ProjectionKind::DataRefField(_)) {
-                    return false;
-                }
-                crosses_dataref = true;
-            }
-            TypeData::Aggregate(_) if crosses_dataref => {
-                if !matches!(step.kind(), air_place::ProjectionKind::Field(_)) {
-                    return false;
-                }
-            }
-            TypeData::Tuple(_) if crosses_dataref => {
-                if !matches!(step.kind(), air_place::ProjectionKind::TupleField(_)) {
-                    return false;
-                }
-            }
-            _ if crosses_dataref => return false,
-            _ if !ordinary_projection_supported(step.kind()) => return false,
-            _ => {}
-        }
-    }
-    crosses_dataref
-}
-
 fn ordinary_projection_supported(kind: air_place::ProjectionKind) -> bool {
     matches!(
         kind,
@@ -471,21 +714,84 @@ fn ordinary_projection_supported(kind: air_place::ProjectionKind) -> bool {
     )
 }
 
+fn projection_is_dynamic(kind: PlaceProjectionKind) -> bool {
+    matches!(
+        kind,
+        PlaceProjectionKind::ArrayIndex(_)
+            | PlaceProjectionKind::ListIndex(_)
+            | PlaceProjectionKind::SliceIndex(_)
+            | PlaceProjectionKind::MapIndex(_)
+    )
+}
+
+fn dataref_remaining_projection_supported(kind: air_place::ProjectionKind) -> bool {
+    matches!(
+        kind,
+        air_place::ProjectionKind::Field(_)
+            | air_place::ProjectionKind::TupleField(_)
+            | air_place::ProjectionKind::ListIndex(_)
+    )
+}
+
 fn global_read_projection_supported(path: &air_place::PlacePath) -> bool {
     path.steps()
         .iter()
         .all(|step| ordinary_projection_supported(step.kind()))
 }
 
-fn global_structural_mutation_projection_supported(path: &air_place::PlacePath) -> bool {
+fn collection_loan_projection_supported(program: &Program, path: &air_place::PlacePath) -> bool {
     path.steps().iter().all(|step| {
-        matches!(
-            step.kind(),
-            air_place::ProjectionKind::Field(_)
-                | air_place::ProjectionKind::TupleField(_)
-                | air_place::ProjectionKind::ArrayIndex(_)
+        collection_loan_step_supported(
+            collection_loan_base(program.type_arena.data(step.source_ty())),
+            collection_loan_projection(step.kind()),
         )
     })
+}
+
+fn collection_loan_base(data: &TypeData) -> CollectionLoanBase {
+    match data {
+        TypeData::Aggregate(_) => CollectionLoanBase::Aggregate,
+        TypeData::Tuple(_) => CollectionLoanBase::Tuple,
+        TypeData::Array { .. } => CollectionLoanBase::Array,
+        _ => CollectionLoanBase::Other,
+    }
+}
+
+fn collection_loan_projection(kind: air_place::ProjectionKind) -> CollectionLoanProjection {
+    match kind {
+        air_place::ProjectionKind::Field(_) => CollectionLoanProjection::Field,
+        air_place::ProjectionKind::TupleField(_) => CollectionLoanProjection::TupleField,
+        air_place::ProjectionKind::ArrayIndex(_) => CollectionLoanProjection::Index,
+        _ => CollectionLoanProjection::Other,
+    }
+}
+
+fn global_structural_mutation_projection_supported(
+    program: &Program,
+    path: &air_place::PlacePath,
+) -> bool {
+    let mut ty = path.root().ty;
+    for step in path.steps() {
+        let supported = matches!(
+            (program.type_arena.data(ty), step.kind()),
+            (
+                TypeData::Aggregate(_) | TypeData::Tuple(_),
+                air_place::ProjectionKind::Field(_) | air_place::ProjectionKind::TupleField(_),
+            ) | (
+                TypeData::Array { .. },
+                air_place::ProjectionKind::ArrayIndex(_),
+            ) | (TypeData::List(_), air_place::ProjectionKind::ListIndex(_))
+                | (
+                    TypeData::Map { .. },
+                    air_place::ProjectionKind::MapIndex { .. }
+                )
+        );
+        if !supported {
+            return false;
+        }
+        ty = step.ty();
+    }
+    true
 }
 
 fn dataref_mut_place_supported(
@@ -496,14 +802,8 @@ fn dataref_mut_place_supported(
     if !path.crosses_dataref() {
         return Ok(false);
     }
-    if !dataref_projection_supported(program, path) {
-        return Err(PlaceAccessGapKind::MutablePlaceDataRef);
-    }
-    if dataref_mut_place_payload_supported(program, classes, path.ty()) {
-        Ok(true)
-    } else {
-        Err(PlaceAccessGapKind::MutablePlaceDataRef)
-    }
+    DataRefProjectionPlan::build(program, classes, path, PlaceAccessIntent::MutPlaceArg)
+        .map(|plan| plan.is_some())
 }
 
 fn dataref_mut_place_payload_supported(
@@ -589,7 +889,8 @@ mod tests {
     use anvyx_frontend::{
         air::{
             AggregateDecl, AggregateKind, AirBody, FieldDecl, Function, FunctionKind, GlobalDecl,
-            Local, LocalKind, Mutability, Signature, TypeData, TypePassClasses,
+            Local, LocalKind, Mutability, Param, ParamEscape, ParamRole, Signature, TypeData,
+            TypePassClasses,
         },
         ast::Ident,
     };
@@ -678,17 +979,8 @@ mod tests {
 
     #[test]
     fn accepts_global_structural_mutation() {
-        let mut program = Program::default();
-        let int = program.type_arena.alloc(TypeData::Int);
-        let list = program.type_arena.alloc(TypeData::List(int));
-        let global = push_global(&mut program, list);
-        program.functions.push(function(vec![]));
+        let (program, global, place) = global_list_place();
         let cx = cx(&program);
-        let place = Place {
-            root: PlaceRoot::Global(global),
-            projection: vec![],
-            ty: list,
-        };
 
         let plan = cx
             .plan(
@@ -701,12 +993,318 @@ mod tests {
         assert_eq!(plan.root, PlaceAccessRoot::Global(global));
     }
 
+    #[test]
+    fn accepts_dynamic_global_structural_mutation() {
+        let (program, place) = dynamic_global_list_place();
+        let cx = cx(&program);
+
+        let plan = cx
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::StructuralMutation,
+                &place,
+            )
+            .expect("dynamic global prefixes use live structural targets");
+
+        assert_eq!(plan.root, PlaceAccessRoot::Global(GlobalId::from_index(0)));
+    }
+
+    #[test]
+    fn accepts_exact_global_collection_loan() {
+        let (program, global, place) = global_list_place();
+        let cx = cx(&program);
+
+        let plan = cx
+            .collection_loan_plan(
+                FunctionId::from_index(0),
+                &collection_loan(place, air::AirCollectionLoanMode::MutableSequenceElement),
+            )
+            .expect("global collection loans are centrally accepted");
+
+        assert_eq!(plan.place.root, PlaceAccessRoot::Global(global));
+    }
+
+    #[test]
+    fn rejects_dynamic_global_collection_loan() {
+        let (program, place) = dynamic_global_list_place();
+        let cx = cx(&program);
+
+        let gap = cx
+            .collection_loan_plan(
+                FunctionId::from_index(0),
+                &collection_loan(place, air::AirCollectionLoanMode::MutableSequenceElement),
+            )
+            .expect_err("dynamic global loans await live descriptors");
+
+        assert_eq!(gap, PlaceAccessGapKind::GlobalProjection);
+    }
+
+    #[test]
+    fn accepts_payload_alias_over_direct_local() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let option = program.type_arena.alloc(TypeData::Optional(int));
+        program.functions.push(function(vec![local(option, true)]));
+        let cx = cx(&program);
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![],
+            ty: option,
+        };
+
+        let plan = cx
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::PayloadAlias,
+                &place,
+            )
+            .expect("direct local payload aliases are supported");
+
+        assert_eq!(
+            plan.root,
+            PlaceAccessRoot::Local {
+                local: LocalId::from_index(0),
+                source_mut_param: false,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_payload_alias_over_source_param() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let option = program.type_arena.alloc(TypeData::Optional(int));
+        program.functions.push(source_param_function(option));
+        let cx = cx(&program);
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![],
+            ty: option,
+        };
+
+        let plan = cx
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::PayloadAlias,
+                &place,
+            )
+            .expect("source-param payload aliases use mutable-place subjects");
+
+        assert!(!plan.payload_alias_direct_place());
+    }
+
+    #[test]
+    fn accepts_scalar_dataref_field_read() {
+        let (program, place) = dataref_field_program(TypeData::Int, true);
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::ReadValue,
+                &place,
+            )
+            .expect("scalar dataref field reads are supported");
+
+        assert!(plan.dataref_plan().is_some());
+    }
+
+    #[test]
+    fn accepts_nested_inline_dataref_field_read() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let point = air::AggregateId::from_index(0);
+        let point_ty = program.type_arena.alloc(TypeData::Aggregate(point));
+        let dataref = air::AggregateId::from_index(1);
+        let dataref_ty = program.type_arena.alloc(TypeData::DataRef(dataref));
+        program.aggregates.push(aggregate_decl(int));
+        program.aggregates.push(dataref_decl(point_ty));
+        program
+            .functions
+            .push(function(vec![local(dataref_ty, false)]));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![
+                air::Projection::Field(air::FieldId::from_index(0)),
+                air::Projection::Field(air::FieldId::from_index(0)),
+            ],
+            ty: int,
+        };
+
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::ReadValue,
+                &place,
+            )
+            .expect("nested inline dataref reads are supported");
+
+        let dataref = plan.dataref_plan().expect("dataref plan");
+        assert_eq!(dataref.segments.len(), 1);
+        assert_eq!(dataref.segments[0].storage.len(), 2);
+    }
+
+    #[test]
+    fn splits_nested_dataref_handle_reads_into_segments() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let inner = air::AggregateId::from_index(0);
+        let inner_ty = program.type_arena.alloc(TypeData::DataRef(inner));
+        let outer = air::AggregateId::from_index(1);
+        let outer_ty = program.type_arena.alloc(TypeData::DataRef(outer));
+        program.aggregates.push(dataref_decl(int));
+        program.aggregates.push(dataref_decl(inner_ty));
+        program
+            .functions
+            .push(function(vec![local(outer_ty, false)]));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![
+                air::Projection::Field(air::FieldId::from_index(0)),
+                air::Projection::Field(air::FieldId::from_index(0)),
+            ],
+            ty: int,
+        };
+
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::ReadValue,
+                &place,
+            )
+            .expect("nested dataref handle reads are supported");
+        let dataref = plan.dataref_plan().expect("dataref plan");
+
+        assert_eq!(dataref.segments.len(), 2);
+        assert_eq!(dataref.segments[0].storage_ty, inner_ty);
+        assert_eq!(dataref.segments[1].storage_ty, int);
+    }
+
+    #[test]
+    fn accepts_collection_value_projection_after_dataref_crossing() {
+        let (program, place) = aggregate_collection_dataref_projection_program();
+
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::ReadValue,
+                &place,
+            )
+            .expect("collection value projections after dataref crossings are supported");
+        let dataref = plan.dataref_plan().expect("dataref plan");
+
+        assert_eq!(dataref.segments.len(), 1);
+        assert_eq!(dataref.remaining.len(), 1);
+    }
+
+    #[test]
+    fn rejects_collection_mut_place_projection_after_dataref_crossing() {
+        let (program, place) = aggregate_collection_dataref_projection_program();
+
+        let gap = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::MutPlaceArg,
+                &place,
+            )
+            .expect_err(
+                "collection mut-place projections after dataref crossings remain unsupported",
+            );
+
+        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceDataRef);
+    }
+
+    #[test]
+    fn records_dynamic_dataref_object_prefix() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let dataref = air::AggregateId::from_index(0);
+        let dataref_ty = program.type_arena.alloc(TypeData::DataRef(dataref));
+        let list = program.type_arena.alloc(TypeData::List(dataref_ty));
+        program.aggregates.push(dataref_decl(int));
+        program
+            .functions
+            .push(function(vec![local(list, false), local(int, false)]));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![
+                air::Projection::Index(LocalId::from_index(1)),
+                air::Projection::Field(air::FieldId::from_index(0)),
+            ],
+            ty: int,
+        };
+
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::ReadValue,
+                &place,
+            )
+            .expect("dynamic object prefix dataref reads keep current support");
+        let dataref = plan.dataref_plan().expect("dataref plan");
+
+        assert!(dataref.object_prefix_can_fail);
+        assert_eq!(dataref.object_prefix.len(), 1);
+        assert_eq!(dataref.segments.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unsupported_dataref_mut_place_payload() {
+        let (program, place) = dataref_field_program(TypeData::String, true);
+
+        let gap = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::MutPlaceArg,
+                &place,
+            )
+            .expect_err("string dataref mut-place payloads stay unsupported");
+
+        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceDataRef);
+    }
+
     fn global_program(data: TypeData) -> (Program, GlobalId, TypeId) {
         let mut program = Program::default();
         let ty = program.type_arena.alloc(data);
         let global = push_global(&mut program, ty);
         program.functions.push(function(vec![]));
         (program, global, ty)
+    }
+
+    fn global_list_place() -> (Program, GlobalId, Place) {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let list = program.type_arena.alloc(TypeData::List(int));
+        let global = push_global(&mut program, list);
+        program.functions.push(function(vec![]));
+        let place = Place {
+            root: PlaceRoot::Global(global),
+            projection: vec![],
+            ty: list,
+        };
+        (program, global, place)
+    }
+
+    fn dynamic_global_list_place() -> (Program, Place) {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let row = program.type_arena.alloc(TypeData::List(int));
+        let rows = program.type_arena.alloc(TypeData::List(row));
+        let global = push_global(&mut program, rows);
+        program.functions.push(function(vec![local(int, false)]));
+        let place = Place {
+            root: PlaceRoot::Global(global),
+            projection: vec![air::Projection::Index(LocalId::from_index(0))],
+            ty: row,
+        };
+        (program, place)
+    }
+
+    fn collection_loan(root: Place, mode: air::AirCollectionLoanMode) -> air::AirCollectionLoan {
+        air::AirCollectionLoan {
+            root,
+            root_kind: air::AirCollectionRootKind::List,
+            mode,
+            body: air::AirBlock::default(),
+        }
     }
 
     fn push_global(program: &mut Program, ty: TypeId) -> GlobalId {
@@ -722,10 +1320,18 @@ mod tests {
     }
 
     fn aggregate_decl(field_ty: TypeId) -> AggregateDecl {
+        aggregate_decl_with_kind(field_ty, AggregateKind::Struct)
+    }
+
+    fn dataref_decl(field_ty: TypeId) -> AggregateDecl {
+        aggregate_decl_with_kind(field_ty, AggregateKind::DataRef)
+    }
+
+    fn aggregate_decl_with_kind(field_ty: TypeId, kind: AggregateKind) -> AggregateDecl {
         AggregateDecl {
             name: Ident::new("Box"),
             module: air::ModuleId::from_index(0),
-            kind: AggregateKind::Struct,
+            kind,
             type_args: vec![],
             const_args: vec![],
             fields: vec![FieldDecl {
@@ -737,6 +1343,48 @@ mod tests {
         }
     }
 
+    fn dataref_field_program(field_data: TypeData, mutable: bool) -> (Program, Place) {
+        let mut program = Program::default();
+        let field_ty = program.type_arena.alloc(field_data);
+        let dataref = air::AggregateId::from_index(0);
+        let dataref_ty = program.type_arena.alloc(TypeData::DataRef(dataref));
+        program.aggregates.push(dataref_decl(field_ty));
+        program
+            .functions
+            .push(function(vec![local(dataref_ty, mutable)]));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![air::Projection::Field(air::FieldId::from_index(0))],
+            ty: field_ty,
+        };
+        (program, place)
+    }
+
+    fn aggregate_collection_dataref_projection_program() -> (Program, Place) {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let list = program.type_arena.alloc(TypeData::List(int));
+        let payload = air::AggregateId::from_index(0);
+        let payload_ty = program.type_arena.alloc(TypeData::Aggregate(payload));
+        let dataref = air::AggregateId::from_index(1);
+        let dataref_ty = program.type_arena.alloc(TypeData::DataRef(dataref));
+        program.aggregates.push(aggregate_decl(list));
+        program.aggregates.push(dataref_decl(payload_ty));
+        program
+            .functions
+            .push(function(vec![local(dataref_ty, false), local(int, false)]));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![
+                air::Projection::Field(air::FieldId::from_index(0)),
+                air::Projection::Field(air::FieldId::from_index(0)),
+                air::Projection::Index(LocalId::from_index(1)),
+            ],
+            ty: int,
+        };
+        (program, place)
+    }
+
     fn function(locals: Vec<Local>) -> Function {
         Function {
             name: Ident::new("main"),
@@ -746,6 +1394,35 @@ mod tests {
             specialization: None,
             signature: Signature::new(vec![], TypeId::from_index(0)),
             locals,
+            body: AirBody {
+                block: air::AirBlock::default(),
+            },
+        }
+    }
+
+    fn source_param_function(ty: TypeId) -> Function {
+        let local_id = LocalId::from_index(0);
+        Function {
+            name: Ident::new("touch"),
+            module: air::ModuleId::from_index(0),
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(
+                vec![Param {
+                    name: None,
+                    ty,
+                    mode: ParamMode::MutBorrow,
+                    escape: ParamEscape::NonEscaping,
+                    role: ParamRole::Normal,
+                    local_id,
+                }],
+                TypeId::from_index(0),
+            ),
+            locals: vec![Local {
+                kind: LocalKind::Arg,
+                ..local(ty, true)
+            }],
             body: AirBody {
                 block: air::AirBlock::default(),
             },

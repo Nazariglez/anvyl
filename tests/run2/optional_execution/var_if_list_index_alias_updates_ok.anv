@@ -4,12 +4,11 @@
 // @match: 2
 
 fn main() {
-    var counts: [string: int] = ["a": 1];
-    {
-        var value? = counts["a"] else return;
+    var xs: [int?] = [1];
+    if var value? = xs[0] {
         value = 2;
     }
-    if let value? = counts["a"] {
+    if let value? = xs[0] {
         println(value);
     }
 }

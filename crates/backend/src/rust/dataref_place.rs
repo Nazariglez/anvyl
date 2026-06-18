@@ -1,6 +1,6 @@
 use super::rir::{
-    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceAccess, RirOptionMatch, RirProgram,
-    RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
+    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceAccess, RirOptionMatch, RirOptionSubject,
+    RirPlaceModel, RirProgram, RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -83,6 +83,11 @@ impl DataRefPlaceDescriptors {
     }
 
     fn collect_option_match(&mut self, program: &RirProgram, match_: &RirOptionMatch) {
+        if let RirOptionSubject::MutPlace(arg) = &match_.subject
+            && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
+        {
+            self.intern(program, dataref, &arg.projections, arg.ty);
+        }
         self.collect_block(program, &match_.some_block);
         self.collect_block(program, &match_.none_block);
     }
@@ -138,41 +143,16 @@ pub(super) fn storage_path(
     dataref: RirDataRefId,
     projections: &[RirProjection],
 ) -> String {
-    let Some((first, rest)) = projections.split_first() else {
-        unreachable!("verified dataref place descriptor projection")
-    };
-    let RirProjection::Field(field_id) = first else {
-        unreachable!("verified dataref field projection")
-    };
-    let field = &program.datarefs[dataref.index()].fields[field_id.index()];
-    let mut path = format!("storage.{}", field.symbol.as_str());
-    let mut ty = container_for(program, field.ty);
-    for projection in rest {
-        match projection {
-            RirProjection::Field(field_id) => {
-                let Some(RirPlaceContainer::Struct(struct_id)) = ty else {
-                    unreachable!("verified field projection")
-                };
-                let field = &program.structs[struct_id.index()].fields[field_id.index()];
-                path.push('.');
-                path.push_str(field.symbol.as_str());
-                ty = container_for(program, field.ty);
-            }
-            RirProjection::TupleField(field_id) => {
-                let Some(RirPlaceContainer::Tuple(tuple_id)) = ty else {
-                    unreachable!("verified tuple projection")
-                };
-                let field = &program.tuples[tuple_id.index()].fields[field_id.index()];
-                path.push('.');
-                path.push_str(field.symbol.as_str());
-                ty = container_for(program, field.ty);
-            }
-            RirProjection::Index(_) | RirProjection::MapIndex(_) => {
-                unreachable!("verified dataref place descriptor projection")
-            }
-        }
-    }
-    path
+    let path = RirPlaceModel::new(program)
+        .dataref_storage_path(dataref, projections)
+        .expect("verified dataref place descriptor projection");
+    let fields = path
+        .steps()
+        .iter()
+        .map(|step| step.symbol.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("storage.{fields}")
 }
 
 fn descriptor_symbol(
@@ -182,29 +162,14 @@ fn descriptor_symbol(
     projections: &[RirProjection],
 ) -> String {
     let dataref_name = program.datarefs[dataref.index()].symbol.as_str();
+    let path = RirPlaceModel::new(program)
+        .dataref_storage_path(dataref, projections)
+        .expect("verified dataref place descriptor projection");
     let mut parts = vec![format!("anvP{index}"), dataref_name.to_string()];
-    let mut ty = None;
-    for projection in projections {
-        match projection {
-            RirProjection::Field(field_id) => {
-                let field = match ty {
-                    None => &program.datarefs[dataref.index()].fields[field_id.index()],
-                    Some(RirPlaceContainer::Struct(struct_id)) => {
-                        &program.structs[struct_id.index()].fields[field_id.index()]
-                    }
-                    Some(RirPlaceContainer::Tuple(_)) => unreachable!("verified field projection"),
-                };
-                parts.push(field.symbol.as_str().to_string());
-                ty = container_for(program, field.ty);
-            }
-            RirProjection::TupleField(field_id) => {
-                let Some(RirPlaceContainer::Tuple(tuple_id)) = ty else {
-                    unreachable!("verified tuple projection")
-                };
-                let field = &program.tuples[tuple_id.index()].fields[field_id.index()];
-                parts.push(tuple_field_part(*field_id));
-                ty = container_for(program, field.ty);
-            }
+    for step in path.steps() {
+        match step.projection {
+            RirProjection::Field(_) => parts.push(step.symbol.as_str().to_string()),
+            RirProjection::TupleField(field) => parts.push(tuple_field_part(field)),
             RirProjection::Index(_) | RirProjection::MapIndex(_) => {
                 unreachable!("verified dataref place descriptor projection")
             }
@@ -214,20 +179,64 @@ fn descriptor_symbol(
     parts.join("_")
 }
 
-#[derive(Clone, Copy)]
-enum RirPlaceContainer {
-    Struct(super::rir::RirStructId),
-    Tuple(super::rir::RirTupleId),
-}
-
-fn container_for(program: &RirProgram, ty: RirTypeId) -> Option<RirPlaceContainer> {
-    match program.types[ty.index()] {
-        RirType::Struct(id) => Some(RirPlaceContainer::Struct(id)),
-        RirType::Tuple(id) => Some(RirPlaceContainer::Tuple(id)),
-        _ => None,
-    }
-}
-
 fn tuple_field_part(field: RirFieldId) -> String {
     format!("field{}", field.index())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rust::rir::{RirDataRef, RirField, RirStruct, RirStructId, RirSymbol, RirType};
+
+    fn ty(index: usize) -> RirTypeId {
+        RirTypeId::from_index(index)
+    }
+
+    fn field(index: usize, name: &str, ty: RirTypeId) -> RirField {
+        RirField {
+            id: RirFieldId::from_index(index),
+            symbol: RirSymbol::new(name),
+            ty,
+        }
+    }
+
+    #[test]
+    fn descriptor_paths_use_rir_storage_resolver() {
+        let dataref = RirDataRefId::from_index(0);
+        let program = RirProgram {
+            types: vec![RirType::Int, RirType::Struct(RirStructId::from_index(0))],
+            structs: vec![RirStruct {
+                id: RirStructId::from_index(0),
+                air_id: None,
+                symbol: RirSymbol::new("Payload"),
+                display: RirSymbol::new("Payload"),
+                native_path: None,
+                native_key: None,
+                copyable: true,
+                fields: vec![field(0, "inner", ty(0))],
+            }],
+            datarefs: vec![RirDataRef {
+                id: dataref,
+                air_id: anvyx_frontend::air::AggregateId::from_index(0),
+                symbol: RirSymbol::new("Box"),
+                display: RirSymbol::new("Box"),
+                cycle_capable: false,
+                fields: vec![field(0, "payload", ty(1))],
+            }],
+            ..RirProgram::default()
+        };
+        let projections = [
+            RirProjection::Field(RirFieldId::from_index(0)),
+            RirProjection::Field(RirFieldId::from_index(0)),
+        ];
+
+        assert_eq!(
+            storage_path(&program, dataref, &projections),
+            "storage.payload.inner"
+        );
+        assert_eq!(
+            descriptor_symbol(&program, 0, dataref, &projections),
+            "anvP0_Box_payload_inner_place"
+        );
+    }
 }

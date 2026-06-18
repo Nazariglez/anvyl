@@ -9,8 +9,9 @@ use anvyx_runtime::{
     RustParamAbi, RustReturnAbi,
 };
 
-use super::rep_policy::{
-    RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy,
+use super::{
+    place_access::{CollectionLoanBase, CollectionLoanProjection, collection_loan_step_supported},
+    rep_policy::{RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy},
 };
 
 macro_rules! rir_id {
@@ -533,6 +534,40 @@ pub enum RirStmt {
     OptionMatch(RirOptionMatch),
 }
 
+pub(super) fn stmt_child_blocks_any(
+    stmt: &RirStmt,
+    mut block_matches: impl FnMut(&RirStructuredBlock) -> bool,
+) -> bool {
+    match stmt {
+        RirStmt::If(branch) => {
+            block_matches(&branch.then_block)
+                || branch.else_block.as_ref().is_some_and(block_matches)
+        }
+        RirStmt::Loop(loop_) => block_matches(&loop_.body),
+        RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
+        RirStmt::CollectionSlotScope(block) => block_matches(block),
+        RirStmt::OptionMatch(match_) => {
+            block_matches(&match_.some_block) || block_matches(&match_.none_block)
+        }
+        RirStmt::EnumMatch(match_) => {
+            match_.arms.iter().any(|arm| block_matches(&arm.block))
+                || match_.else_block.as_ref().is_some_and(block_matches)
+        }
+        RirStmt::Init { .. }
+        | RirStmt::GlobalEnsure { .. }
+        | RirStmt::GlobalSetRoot { .. }
+        | RirStmt::GlobalUpdateRoot { .. }
+        | RirStmt::MutPlaceSet { .. }
+        | RirStmt::Assign { .. }
+        | RirStmt::CellInit { .. }
+        | RirStmt::CellSet { .. }
+        | RirStmt::ScopedPlaceCellSet { .. }
+        | RirStmt::Eval(_)
+        | RirStmt::DataRefSet { .. }
+        | RirStmt::MapValueSet { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirCollectionLoanScope {
     pub root: RirPlace,
@@ -547,6 +582,26 @@ pub enum RirCollectionRootKind {
     FixedArray,
     Slice,
     Map,
+}
+
+impl RirCollectionRootKind {
+    pub(super) fn tracks_shape_loan(self) -> bool {
+        matches!(self, Self::List | Self::Map)
+    }
+
+    fn accepts_mode(self, mode: RirCollectionLoanMode) -> bool {
+        matches!(
+            (self, mode),
+            (
+                Self::List | Self::FixedArray | Self::Slice,
+                RirCollectionLoanMode::ReadonlySequence
+                    | RirCollectionLoanMode::MutableSequenceElement,
+            ) | (
+                Self::Map,
+                RirCollectionLoanMode::ReadonlyMap | RirCollectionLoanMode::MutableMapValue,
+            )
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,12 +646,18 @@ pub struct RirEnumMatchArm {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirOptionMatch {
-    pub discr: RirPlace,
+    pub subject: RirOptionSubject,
     pub payload: Option<RirLocalId>,
     pub payload_ref: bool,
     pub payload_escapes: bool,
     pub some_block: RirStructuredBlock,
     pub none_block: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RirOptionSubject {
+    Place(RirPlace),
+    MutPlace(RirMutPlaceArg),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -897,7 +958,7 @@ impl RirMutPlaceAccess {
 }
 
 impl RirMutPlaceArg {
-    pub fn projected(
+    pub fn from_handle(
         handle: RirMutPlaceHandle,
         projections: Vec<RirProjection>,
         ty: RirTypeId,
@@ -907,6 +968,14 @@ impl RirMutPlaceArg {
             projections,
             ty,
         }
+    }
+
+    pub fn projected(
+        handle: RirMutPlaceHandle,
+        projections: Vec<RirProjection>,
+        ty: RirTypeId,
+    ) -> Self {
+        Self::from_handle(handle, projections, ty)
     }
 
     pub fn local(place: RirPlace) -> Self {
@@ -1160,7 +1229,7 @@ enum StorageProjectionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RirPlaceError {
+pub(super) enum RirPlaceError {
     BadId,
     Unsupported,
 }
@@ -1168,6 +1237,19 @@ enum RirPlaceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RirProjectionPath {
     ty: RirTypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RirDataRefStoragePath {
+    ty: RirTypeId,
+    steps: Vec<RirDataRefStorageStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RirDataRefStorageStep {
+    pub(super) projection: RirProjection,
+    pub(super) symbol: RirSymbol,
+    pub(super) ty: RirTypeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1194,16 +1276,26 @@ impl RirProjectionPath {
     }
 }
 
+impl RirDataRefStoragePath {
+    pub(super) fn ty(&self) -> RirTypeId {
+        self.ty
+    }
+
+    pub(super) fn steps(&self) -> &[RirDataRefStorageStep] {
+        &self.steps
+    }
+}
+
 impl<'a> RirPlaceModel<'a> {
     pub(super) fn new(program: &'a RirProgram) -> Self {
         Self { program }
     }
 
-    fn walk_dataref_storage(
+    pub(super) fn dataref_storage_path(
         &self,
         dataref_id: RirDataRefId,
         projections: &[RirProjection],
-    ) -> Result<RirProjectionPath, RirPlaceError> {
+    ) -> Result<RirDataRefStoragePath, RirPlaceError> {
         let Some((first, rest)) = projections.split_first() else {
             return Err(RirPlaceError::Unsupported);
         };
@@ -1217,16 +1309,23 @@ impl<'a> RirPlaceModel<'a> {
             .and_then(|dataref| dataref.fields.get(field_id.index()))
             .ok_or(RirPlaceError::BadId)?;
         let mut ty = field.ty;
+        let mut steps = vec![RirDataRefStorageStep {
+            projection: *first,
+            symbol: field.symbol.clone(),
+            ty,
+        }];
         for (index, projection) in rest.iter().enumerate() {
             if matches!(self.ty(ty), Some(RirType::DataRef(_))) {
                 return Err(RirPlaceError::Unsupported);
             }
-            ty = self.storage_step(ty, *projection)?.ty;
+            let step = self.dataref_storage_step(ty, *projection)?;
+            ty = step.ty;
+            steps.push(step);
             if index + 1 < rest.len() && matches!(self.ty(ty), Some(RirType::DataRef(_))) {
                 return Err(RirPlaceError::Unsupported);
             }
         }
-        Ok(RirProjectionPath { ty })
+        Ok(RirDataRefStoragePath { ty, steps })
     }
 
     pub(super) fn projection_path(
@@ -1239,6 +1338,27 @@ impl<'a> RirPlaceModel<'a> {
             ty = self.step(ty, *projection, true).ok()?.ty;
         }
         Some(RirProjectionPath { ty })
+    }
+
+    pub(super) fn collection_loan_projection_supported(
+        &self,
+        root_ty: RirTypeId,
+        projections: &[RirProjection],
+    ) -> bool {
+        let mut ty = root_ty;
+        for projection in projections {
+            if !collection_loan_step_supported(
+                rir_collection_loan_base(self.ty(ty)),
+                rir_collection_loan_projection(*projection),
+            ) {
+                return false;
+            }
+            let Ok(step) = self.step(ty, *projection, true) else {
+                return false;
+            };
+            ty = step.ty;
+        }
+        true
     }
 
     pub(super) fn projection_dynamic_facts(
@@ -1315,16 +1435,42 @@ impl<'a> RirPlaceModel<'a> {
         )
     }
 
-    fn storage_step(
+    fn dataref_storage_step(
         &self,
         ty: RirTypeId,
         projection: RirProjection,
-    ) -> Result<RirProjectionStep, RirPlaceError> {
-        match projection {
-            RirProjection::Field(_) | RirProjection::TupleField(_) => {
-                self.step(ty, projection, false)
+    ) -> Result<RirDataRefStorageStep, RirPlaceError> {
+        match (self.ty(ty), projection) {
+            (Some(RirType::Struct(id)), RirProjection::Field(field)) => {
+                let field = self
+                    .program
+                    .structs
+                    .get(id.index())
+                    .and_then(|strukt| strukt.fields.get(field.index()))
+                    .ok_or(RirPlaceError::BadId)?;
+                Ok(RirDataRefStorageStep {
+                    projection,
+                    symbol: field.symbol.clone(),
+                    ty: field.ty,
+                })
             }
-            RirProjection::Index(_) | RirProjection::MapIndex(_) => Err(RirPlaceError::Unsupported),
+            (Some(RirType::Tuple(id)), RirProjection::TupleField(field)) => {
+                let field = self
+                    .program
+                    .tuples
+                    .get(id.index())
+                    .and_then(|tuple| tuple.fields.get(field.index()))
+                    .ok_or(RirPlaceError::BadId)?;
+                Ok(RirDataRefStorageStep {
+                    projection,
+                    symbol: field.symbol.clone(),
+                    ty: field.ty,
+                })
+            }
+            (_, RirProjection::Index(_) | RirProjection::MapIndex(_)) => {
+                Err(RirPlaceError::Unsupported)
+            }
+            _ => Err(RirPlaceError::Unsupported),
         }
     }
 
@@ -1381,6 +1527,24 @@ impl<'a> RirPlaceModel<'a> {
 
     fn ty(&self, id: RirTypeId) -> Option<RirType> {
         self.program.types.get(id.index()).copied()
+    }
+}
+
+fn rir_collection_loan_base(ty: Option<RirType>) -> CollectionLoanBase {
+    match ty {
+        Some(RirType::Struct(_)) => CollectionLoanBase::Aggregate,
+        Some(RirType::Tuple(_)) => CollectionLoanBase::Tuple,
+        Some(RirType::Array { .. }) => CollectionLoanBase::Array,
+        _ => CollectionLoanBase::Other,
+    }
+}
+
+fn rir_collection_loan_projection(projection: RirProjection) -> CollectionLoanProjection {
+    match projection {
+        RirProjection::Field(_) => CollectionLoanProjection::Field,
+        RirProjection::TupleField(_) => CollectionLoanProjection::TupleField,
+        RirProjection::Index(_) => CollectionLoanProjection::Index,
+        RirProjection::MapIndex(_) => CollectionLoanProjection::Other,
     }
 }
 
@@ -3068,6 +3232,9 @@ impl VerifyCx<'_> {
                 if !self.global_payload_supported(global_decl.ty) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
+                if self.global_replaces_active_collection_root(*global) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
                 self.check_rvalue(function_id, function, index, value, Some(global_decl.ty));
                 if let Some(slot) = self.global_initialized.get_mut(global.index()) {
                     *slot = true;
@@ -3075,6 +3242,9 @@ impl VerifyCx<'_> {
             }
             RirStmt::MutPlaceSet { place, value } => {
                 if matches!(place.access, RirMutPlaceAccess::DataRef { .. }) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                if self.mut_place_set_replaces_active_collection_root(place) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 let ty = self.check_mut_place_arg(site, function_id, function, place);
@@ -3323,9 +3493,24 @@ impl VerifyCx<'_> {
                 self.merge_structured_states(states);
             }
             RirStmt::OptionMatch(match_) => {
-                let discr_local = self.local_root(site, &match_.discr);
-                self.check_place(site, function, &match_.discr);
-                let inner = match self.ty(match_.discr.ty) {
+                let subject_ty = match &match_.subject {
+                    RirOptionSubject::Place(place) => {
+                        self.check_place(site, function, place);
+                        place.ty
+                    }
+                    RirOptionSubject::MutPlace(place) => {
+                        let ty = self.check_mut_place_arg(site, function_id, function, place);
+                        if !match_.payload_ref {
+                            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        }
+                        ty
+                    }
+                };
+                let discr_local = match &match_.subject {
+                    RirOptionSubject::Place(place) => self.local_root(site, place),
+                    RirOptionSubject::MutPlace(_) => None,
+                };
+                let inner = match self.ty(subject_ty) {
                     Some(RirType::Option(inner)) => Some(inner),
                     _ => {
                         self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
@@ -3513,7 +3698,7 @@ impl VerifyCx<'_> {
         scope: &RirCollectionLoanScope,
     ) {
         self.check_place(site, function, &scope.root);
-        self.check_collection_loan_root(site, &scope.root);
+        self.check_collection_loan_root(site, function, &scope.root);
         let root_ty = self.ty(scope.root.ty);
         let compatible_root = matches!(
             (scope.root_kind, root_ty),
@@ -3525,26 +3710,14 @@ impl VerifyCx<'_> {
                 | (RirCollectionRootKind::Slice, Some(RirType::Slice(_)))
                 | (RirCollectionRootKind::Map, Some(RirType::Map { .. }))
         );
-        let compatible_mode = matches!(
-            (scope.root_kind, scope.mode),
-            (
-                RirCollectionRootKind::List
-                    | RirCollectionRootKind::FixedArray
-                    | RirCollectionRootKind::Slice,
-                RirCollectionLoanMode::ReadonlySequence
-                    | RirCollectionLoanMode::MutableSequenceElement,
-            ) | (
-                RirCollectionRootKind::Map,
-                RirCollectionLoanMode::ReadonlyMap | RirCollectionLoanMode::MutableMapValue,
-            )
-        );
+        let compatible_mode = scope.root_kind.accepts_mode(scope.mode);
         if !compatible_root || !compatible_mode {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         if matches!(
             scope.mode,
             RirCollectionLoanMode::MutableSequenceElement | RirCollectionLoanMode::MutableMapValue
-        ) && !Self::place_is_mutable_root(function, &scope.root)
+        ) && !self.collection_loan_root_mutable(function, &scope.root)
         {
             self.push(site, RirVerifyErrorKind::ImmutableAssign);
         }
@@ -3565,15 +3738,38 @@ impl VerifyCx<'_> {
         self.merge_structured_states([state]);
     }
 
-    fn check_collection_loan_root(&mut self, site: RirVerifySite, root: &RirPlace) {
+    fn collection_loan_root_mutable(&self, function: &RirFunction, root: &RirPlace) -> bool {
         match root.root {
-            RirPlaceRoot::Local(_) => {
+            RirPlaceRoot::Local(_) => Self::place_is_mutable_root(function, root),
+            RirPlaceRoot::Global(global) => self
+                .program
+                .globals
+                .get(global.index())
+                .is_some_and(|global| global.mutable),
+        }
+    }
+
+    fn check_collection_loan_root(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        root: &RirPlace,
+    ) {
+        let root_ty = match root.root {
+            RirPlaceRoot::Local(local) => {
                 self.local_root(site, root);
+                if !root.projections.is_empty()
+                    && Self::function_local_is_mut_place_param(function, local)
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                function.locals.get(local.index()).map(|local| local.ty)
             }
             RirPlaceRoot::Global(global) => {
-                if self.check_global_id(site, global).is_none() {
+                let Some(root_ty) = self.check_global_id(site, global).map(|global| global.ty)
+                else {
                     return;
-                }
+                };
                 if !self.global_payload_supported(root.ty) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
@@ -3585,7 +3781,14 @@ impl VerifyCx<'_> {
                 {
                     self.push(site, RirVerifyErrorKind::UninitializedGlobal(global));
                 }
+                Some(root_ty)
             }
+        };
+        if let Some(root_ty) = root_ty
+            && !RirPlaceModel::new(self.program)
+                .collection_loan_projection_supported(root_ty, &root.projections)
+        {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
     }
 
@@ -3630,6 +3833,9 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         place: &RirPlace,
     ) {
+        if self.assignment_replaces_active_collection_root(place) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
         match place.root {
             RirPlaceRoot::Local(_) => {
                 let local = self.local_root(site, place);
@@ -3665,6 +3871,21 @@ impl VerifyCx<'_> {
             }
             RirPlaceRoot::Global(_) => false,
         }
+    }
+
+    fn global_replaces_active_collection_root(&self, global: RirGlobalId) -> bool {
+        self.collection_loans
+            .iter()
+            .any(|loan| loan.root.root == RirPlaceRoot::Global(global))
+    }
+
+    fn mut_place_set_replaces_active_collection_root(&self, place: &RirMutPlaceArg) -> bool {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. }) = &place.access
+        else {
+            return false;
+        };
+        let dst = RirPlace::global(*global, place.projections.clone(), place.ty);
+        self.assignment_replaces_active_collection_root(&dst)
     }
 
     fn assignment_replaces_active_collection_root(&self, dst: &RirPlace) -> bool {
@@ -5391,20 +5612,20 @@ impl VerifyCx<'_> {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
         self.check_dataref_id(site, dataref_id);
-        let path =
-            match RirPlaceModel::new(self.program).walk_dataref_storage(dataref_id, projections) {
-                Ok(path) => path,
-                Err(error) => {
-                    self.push_place_error(site, error);
-                    return None;
-                }
-            };
+        let model = RirPlaceModel::new(self.program);
+        let path = match model.dataref_storage_path(dataref_id, projections) {
+            Ok(path) => path,
+            Err(error) => {
+                self.push_place_error(site, error);
+                return None;
+            }
+        };
         if mode == StorageProjectionMode::MutPlace
-            && !RirPlaceModel::new(self.program).dataref_mut_place_payload_supported(path.ty)
+            && !model.dataref_mut_place_payload_supported(path.ty())
         {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
-        Some(path.ty)
+        Some(path.ty())
     }
 
     fn check_place(&mut self, site: RirVerifySite, function: &RirFunction, place: &RirPlace) {
@@ -6014,7 +6235,7 @@ mod tests {
         };
 
         assert_eq!(
-            RirPlaceModel::new(&program).walk_dataref_storage(
+            RirPlaceModel::new(&program).dataref_storage_path(
                 RirDataRefId::from_index(0),
                 &[RirProjection::Index(local(0))],
             ),

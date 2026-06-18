@@ -119,6 +119,17 @@ impl<'a> RustValues<'a> {
 
     fn mut_place_handle_arg(&self, root: &RirMutPlaceHandle) -> (RirTypeId, String) {
         match root {
+            RirMutPlaceHandle::Local { local, ty }
+                if self.places.payload_ref_cell_local(*local) =>
+            {
+                (
+                    *ty,
+                    target::mut_place_scoped_cell(&format!(
+                        "&{}",
+                        self.function.locals[local.index()].symbol.as_str()
+                    )),
+                )
+            }
             RirMutPlaceHandle::Local { local, ty } => (
                 *ty,
                 target::mut_place_local(&self.place(&RirPlace::local(*local, vec![], *ty))),

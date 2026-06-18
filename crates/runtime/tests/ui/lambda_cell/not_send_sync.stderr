@@ -453,6 +453,41 @@ note: required by a bound in `assert_send`
  3 | fn assert_send<T: Send>() {}
    |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `Cell<usize>` cannot be shared between threads safely
+  --> tests/ui/lambda_cell/not_send_sync.rs:11:19
+   |
+11 |     assert_send::<ScopedMutPlaceCell<'static, 'static, i32>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Cell<usize>` cannot be shared between threads safely
+   |
+   = help: within `GlobalSlot<i32>`, the trait `Sync` is not implemented for `Cell<usize>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicUsize` instead
+note: required because it appears within the type `GlobalSlot<i32>`
+  --> src/global_slot.rs
+   |
+   | pub struct GlobalSlot<T> {
+   |            ^^^^^^^^^^
+   = note: required for `&'static GlobalSlot<i32>` to implement `Send`
+note: required because it appears within the type `anvyx_runtime::mutable_place::GlobalPlace<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | pub struct GlobalPlace<'place, 'cx, T> {
+   |            ^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::mutable_place::ScopedMutPlaceRoot<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | enum ScopedMutPlaceRoot<'source, 'cx, T> {
+   |      ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ScopedMutPlaceCell<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | pub struct ScopedMutPlaceCell<'source, 'cx, T> {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+  --> tests/ui/lambda_cell/not_send_sync.rs:3:19
+   |
+ 3 | fn assert_send<T: Send>() {}
+   |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*mut i32` cannot be shared between threads safely
   --> tests/ui/lambda_cell/not_send_sync.rs:11:19
    |
@@ -964,6 +999,41 @@ error[E0277]: `RefCell<anvyx_runtime::global_slot::LazyState<i32>>` cannot be sh
    |
    = help: within `ScopedMutPlaceCell<'static, 'static, i32>`, the trait `Sync` is not implemented for `RefCell<anvyx_runtime::global_slot::LazyState<i32>>`
    = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead
+note: required because it appears within the type `GlobalSlot<i32>`
+  --> src/global_slot.rs
+   |
+   | pub struct GlobalSlot<T> {
+   |            ^^^^^^^^^^
+   = note: required because it appears within the type `&'static GlobalSlot<i32>`
+note: required because it appears within the type `anvyx_runtime::mutable_place::GlobalPlace<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | pub struct GlobalPlace<'place, 'cx, T> {
+   |            ^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::mutable_place::ScopedMutPlaceRoot<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | enum ScopedMutPlaceRoot<'source, 'cx, T> {
+   |      ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `ScopedMutPlaceCell<'static, 'static, i32>`
+  --> src/mutable_place.rs
+   |
+   | pub struct ScopedMutPlaceCell<'source, 'cx, T> {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/lambda_cell/not_send_sync.rs:4:19
+   |
+ 4 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `Cell<usize>` cannot be shared between threads safely
+  --> tests/ui/lambda_cell/not_send_sync.rs:12:19
+   |
+12 |     assert_sync::<ScopedMutPlaceCell<'static, 'static, i32>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Cell<usize>` cannot be shared between threads safely
+   |
+   = help: within `ScopedMutPlaceCell<'static, 'static, i32>`, the trait `Sync` is not implemented for `Cell<usize>`
+   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicUsize` instead
 note: required because it appears within the type `GlobalSlot<i32>`
   --> src/global_slot.rs
    |

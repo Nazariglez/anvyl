@@ -2,9 +2,10 @@ use super::{
     place::{mut_place_dynamic_facts, place_dynamic_facts},
     rir::{
         RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionLoanScope,
-        RirCollectionRootKind, RirExternKind, RirFunction, RirLambdaStorage, RirMutPlaceArg,
-        RirOperand, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirStmt,
-        RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
+        RirCollectionRootKind, RirExternKind, RirFunction, RirLambdaStorage, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionSubject, RirParamAbi, RirPlace,
+        RirPlaceRoot, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct,
+        RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
     },
 };
 
@@ -77,6 +78,13 @@ fn stmt_calls_fallible(
                 || operand_has_fallible_place(program, function, object)
                 || operand_has_fallible_place(program, function, value)
                 || operand_ty(program, value).is_some_and(|ty| program.collection_replace_ty(ty))
+        }
+        RirStmt::OptionMatch(match_) => {
+            match_.payload_ref
+                || option_subject_fallible(program, function, &match_.subject)
+                || stmt_child_blocks_any(stmt, |block| {
+                    block_calls_fallible(program, fallible, function, block)
+                })
         }
         _ => stmt_child_blocks_any(stmt, |block| {
             block_calls_fallible(program, fallible, function, block)
@@ -263,11 +271,12 @@ fn operand_ty(program: &RirProgram, operand: &RirOperand) -> Option<RirTypeId> {
 }
 
 fn loan_scope_is_fallible(program: &RirProgram, scope: &RirCollectionLoanScope) -> bool {
-    matches!(
-        (scope.root_kind, program.types[scope.root.ty.index()]),
-        (RirCollectionRootKind::List, RirType::List(_))
-            | (RirCollectionRootKind::Map, RirType::Map { .. })
-    )
+    scope.root_kind.tracks_shape_loan()
+        && matches!(
+            (scope.root_kind, program.types[scope.root.ty.index()]),
+            (RirCollectionRootKind::List, RirType::List(_))
+                | (RirCollectionRootKind::Map, RirType::Map { .. })
+        )
 }
 
 fn stringify_calls_fallible(program: &RirProgram, fallible: &[bool], ty: RirTypeId) -> bool {
@@ -382,15 +391,16 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             .union(operand_context_use(program, function, object))
             .union(operand_context_use(program, function, value)),
         RirStmt::MapValueSet { .. } => ContextUse::rt(),
-        RirStmt::CollectionLoanScope(scope) => {
-            let root = if place_is_mut_place_param(function, &scope.root) {
-                ContextUse::rt()
-            } else {
-                ContextUse::default()
-            };
-            root.union(block_context_use(program, function, &scope.body))
-        }
+        RirStmt::CollectionLoanScope(scope) => collection_loan_context_use(function, scope)
+            .union(block_context_use(program, function, &scope.body)),
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
+        RirStmt::OptionMatch(match_) => {
+            let subject = option_subject_context_use(program, function, &match_.subject);
+            let payload = match_.payload_ref.then(ContextUse::rt).unwrap_or_default();
+            subject
+                .union(payload)
+                .union(stmt_child_blocks_context_use(program, function, stmt))
+        }
         _ => stmt_child_blocks_context_use(program, function, stmt),
     }
 }
@@ -409,6 +419,19 @@ fn stmt_child_blocks_context_use(
         false
     });
     uses
+}
+
+fn collection_loan_context_use(
+    function: &RirFunction,
+    scope: &RirCollectionLoanScope,
+) -> ContextUse {
+    match scope.root.root {
+        RirPlaceRoot::Global(_) => ContextUse::generated_call(),
+        RirPlaceRoot::Local(_) if place_is_mut_place_param(function, &scope.root) => {
+            ContextUse::rt()
+        }
+        RirPlaceRoot::Local(_) => ContextUse::default(),
+    }
 }
 
 fn rvalue_context_use(
@@ -578,13 +601,41 @@ fn mut_place_context_use(
     _function: &RirFunction,
     arg: &RirMutPlaceArg,
 ) -> ContextUse {
+    let root = mut_place_root_context_use(&arg.access);
     let Some(facts) = mut_place_dynamic_facts(program, arg) else {
-        return ContextUse::rt_types();
+        return root.union(ContextUse::rt_types());
     };
     if facts.fallible_projection {
-        ContextUse::rt()
+        root.union(ContextUse::rt())
     } else {
-        ContextUse::default()
+        root
+    }
+}
+
+fn mut_place_root_context_use(access: &RirMutPlaceAccess) -> ContextUse {
+    match access {
+        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }) => ContextUse::generated_call(),
+        RirMutPlaceAccess::DataRef { .. } => ContextUse::rt_types(),
+        RirMutPlaceAccess::Handle(
+            RirMutPlaceHandle::Local { .. }
+            | RirMutPlaceHandle::Param { .. }
+            | RirMutPlaceHandle::StackCell { .. }
+            | RirMutPlaceHandle::HeapCell { .. }
+            | RirMutPlaceHandle::ScopedPlaceCell { .. },
+        ) => ContextUse::default(),
+    }
+}
+
+fn option_subject_context_use(
+    program: &RirProgram,
+    function: &RirFunction,
+    subject: &RirOptionSubject,
+) -> ContextUse {
+    match subject {
+        RirOptionSubject::Place(place) => place_context_use(program, function, place),
+        RirOptionSubject::MutPlace(place) => {
+            ContextUse::rt().union(mut_place_context_use(program, function, place))
+        }
     }
 }
 
@@ -633,45 +684,36 @@ fn cell_context_use(program: &RirProgram, cell: RirCellRef) -> ContextUse {
     }
 }
 
-fn stmt_child_blocks_any(
-    stmt: &RirStmt,
-    mut block_matches: impl FnMut(&RirStructuredBlock) -> bool,
-) -> bool {
-    match stmt {
-        RirStmt::If(branch) => {
-            block_matches(&branch.then_block)
-                || branch.else_block.as_ref().is_some_and(block_matches)
-        }
-        RirStmt::Loop(loop_) => block_matches(&loop_.body),
-        RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
-        RirStmt::CollectionSlotScope(block) => block_matches(block),
-        RirStmt::OptionMatch(match_) => {
-            block_matches(&match_.some_block) || block_matches(&match_.none_block)
-        }
-        RirStmt::EnumMatch(match_) => {
-            match_.arms.iter().any(|arm| block_matches(&arm.block))
-                || match_.else_block.as_ref().is_some_and(block_matches)
-        }
-        RirStmt::Init { .. }
-        | RirStmt::GlobalEnsure { .. }
-        | RirStmt::GlobalSetRoot { .. }
-        | RirStmt::GlobalUpdateRoot { .. }
-        | RirStmt::MutPlaceSet { .. }
-        | RirStmt::Assign { .. }
-        | RirStmt::CellInit { .. }
-        | RirStmt::CellSet { .. }
-        | RirStmt::ScopedPlaceCellSet { .. }
-        | RirStmt::Eval(_)
-        | RirStmt::DataRefSet { .. }
-        | RirStmt::MapValueSet { .. } => false,
-    }
-}
-
 fn call_arg_preparation_fallible(program: &RirProgram, arg: &RirCallArg) -> bool {
     let RirCallArg::MutPlace(arg) = arg else {
         return false;
     };
-    mut_place_dynamic_facts(program, arg).is_none_or(|facts| facts.fallible_projection)
+    mut_place_preparation_fallible(program, arg)
+}
+
+fn option_subject_fallible(
+    program: &RirProgram,
+    function: &RirFunction,
+    subject: &RirOptionSubject,
+) -> bool {
+    match subject {
+        RirOptionSubject::Place(place) => place_has_fallible_projection(program, function, place),
+        RirOptionSubject::MutPlace(_) => true,
+    }
+}
+
+fn mut_place_preparation_fallible(program: &RirProgram, arg: &RirMutPlaceArg) -> bool {
+    match arg.access {
+        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. })
+        | RirMutPlaceAccess::DataRef { .. } => true,
+        RirMutPlaceAccess::Handle(
+            RirMutPlaceHandle::Local { .. }
+            | RirMutPlaceHandle::Param { .. }
+            | RirMutPlaceHandle::StackCell { .. }
+            | RirMutPlaceHandle::HeapCell { .. }
+            | RirMutPlaceHandle::ScopedPlaceCell { .. },
+        ) => mut_place_dynamic_facts(program, arg).is_none_or(|facts| facts.fallible_projection),
+    }
 }
 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {

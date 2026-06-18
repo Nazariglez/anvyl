@@ -2,7 +2,7 @@ use std::{cell::Cell, rc::Rc};
 
 use crate::RuntimeError;
 
-const ERR_ACTIVE_LOAN: &str =
+pub(crate) const ACTIVE_COLLECTION_LOAN_ERROR: &str =
     "cannot structurally mutate collection during active iteration or slice view";
 const ERR_STALE_VIEW: &str = "collection view is stale after structural mutation";
 const ERR_LOAN_OVERFLOW: &str = "too many nested collection loans";
@@ -75,7 +75,7 @@ impl CollectionLoanState {
         if self.active_shape_loans() == 0 {
             Ok(())
         } else {
-            Err(RuntimeError::new(ERR_ACTIVE_LOAN))
+            Err(RuntimeError::new(ACTIVE_COLLECTION_LOAN_ERROR))
         }
     }
 

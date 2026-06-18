@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: dynamic-prefix global collection shape mutation needs projected global collection mutation
 
 struct State {
     rows: [[string: int]],

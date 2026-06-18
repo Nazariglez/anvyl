@@ -29,7 +29,9 @@ pub use collection_storage::{ListStorage, MapStorage};
 pub use ctx::Ctx;
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::{RuntimeError, heap_access_error};
-pub use global_slot::{GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState};
+pub use global_slot::{
+    GlobalProjectedLoanGuard, GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState,
+};
 pub use inventory;
 pub use lambda_cell::{LambdaCell, StackLambdaCell};
 pub use managed_rc::{
@@ -37,7 +39,8 @@ pub use managed_rc::{
     managed_alloc_details, typed_dropper,
 };
 pub use mutable_place::{
-    DataRefPlace, DataRefPlaceOps, MutPlace, ProjectedPlace, ProjectionOps, ScopedMutPlaceCell,
+    DataRefPlace, DataRefPlaceOps, MutPlace, OptionalPayloadOps, ProjectedPlace, ProjectionOps,
+    ScopedMutPlaceCell,
 };
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,

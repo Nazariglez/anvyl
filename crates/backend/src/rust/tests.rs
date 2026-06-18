@@ -31,13 +31,13 @@ use super::{
         RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
         RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
         RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
-        RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
+        RirOptionSubject, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
     target,
@@ -1554,7 +1554,7 @@ fn rir_rejects_global_option_match_discriminant() {
                 .body
                 .stmts
                 .push(RirStmt::OptionMatch(RirOptionMatch {
-                    discr: rir_global_place(RirTypeId::from_index(0)),
+                    subject: RirOptionSubject::Place(rir_global_place(RirTypeId::from_index(0))),
                     payload: None,
                     payload_ref: false,
                     payload_escapes: false,
@@ -7162,6 +7162,189 @@ fn rir_rejects_mutable_collection_loan_on_immutable_root() {
 }
 
 #[test]
+fn rir_accepts_mutable_global_collection_loan() {
+    let program = global_list_collection_loan_rir(
+        RirCollectionLoanMode::MutableSequenceElement,
+        vec![],
+        vec![],
+        RirStructuredBlock::default(),
+    );
+
+    rir::verify(&program).expect("mutable global collection loans should verify");
+}
+
+#[test]
+fn rir_rejects_global_collection_mutation_during_active_loan() {
+    let int = RirTypeId::from_index(0);
+    let list = RirTypeId::from_index(2);
+    let global = RirGlobalId::from_index(0);
+    let value = RirConstId::from_index(0);
+    let program = global_list_collection_loan_rir(
+        RirCollectionLoanMode::ReadonlySequence,
+        vec![],
+        vec![RirConst {
+            id: value,
+            ty: int,
+            value: RirConstValue::Int(1),
+        }],
+        RirStructuredBlock {
+            stmts: vec![RirStmt::Eval(RirRValue::ListPush {
+                list: RirPlace::global(global, vec![], list),
+                value: RirOperand::Const(value),
+            })],
+            term: RirTerm::None,
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_rejects_global_root_replacement_during_active_loan() {
+    let list = RirTypeId::from_index(2);
+    let global = RirGlobalId::from_index(0);
+    let replacement = RirLocalId::from_index(0);
+    let mut replacement_local = rir_local(replacement, list, true, "replacement");
+    replacement_local.initialized = false;
+    let program = global_list_collection_loan_rir(
+        RirCollectionLoanMode::ReadonlySequence,
+        vec![replacement_local],
+        vec![],
+        RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: replacement,
+                    value: RirRValue::List {
+                        ty: list,
+                        elems: vec![],
+                    },
+                },
+                RirStmt::GlobalSetRoot {
+                    global,
+                    value: RirRValue::Use(RirOperand::Place(rir_place(replacement, list))),
+                },
+            ],
+            term: RirTerm::None,
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_rejects_global_mut_place_set_during_active_loan() {
+    let list = RirTypeId::from_index(2);
+    let global = RirGlobalId::from_index(0);
+    let replacement = RirLocalId::from_index(0);
+    let mut replacement_local = rir_local(replacement, list, true, "replacement");
+    replacement_local.initialized = false;
+    let program = global_list_collection_loan_rir(
+        RirCollectionLoanMode::ReadonlySequence,
+        vec![replacement_local],
+        vec![],
+        RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: replacement,
+                    value: RirRValue::List {
+                        ty: list,
+                        elems: vec![],
+                    },
+                },
+                RirStmt::MutPlaceSet {
+                    place: RirMutPlaceArg::global(global, list),
+                    value: RirRValue::Use(RirOperand::Place(rir_place(replacement, list))),
+                },
+            ],
+            term: RirTerm::None,
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_rejects_dynamic_global_collection_loan() {
+    let int = RirTypeId::from_index(0);
+    let void = RirTypeId::from_index(1);
+    let row = RirTypeId::from_index(2);
+    let rows = RirTypeId::from_index(3);
+    let global = RirGlobalId::from_index(0);
+    let init = RirFunctionId::from_index(0);
+    let main = RirFunctionId::from_index(1);
+    let xs = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(0);
+    let zero = RirConstId::from_index(0);
+    let mut init_local = rir_local(xs, rows, true, "xs");
+    init_local.initialized = false;
+    let mut program = RirProgram {
+        types: vec![
+            RirType::Int,
+            RirType::Void,
+            RirType::List(int),
+            RirType::List(row),
+        ],
+        collection_storages: vec![
+            rir_list_storage(row, int),
+            rir_list_storage_id(1, rows, row),
+        ],
+        consts: vec![RirConst {
+            id: zero,
+            ty: int,
+            value: RirConstValue::Int(0),
+        }],
+        globals: vec![RirGlobal {
+            id: global,
+            air_id: air::GlobalId::from_index(0),
+            module: air::ModuleId::from_index(0),
+            name: RirSymbol::new("game.rows"),
+            slot_symbol: RirSymbol::new("g0_rows"),
+            ty: rows,
+            mutable: true,
+            init,
+        }],
+        functions: vec![
+            rir_function(
+                init,
+                rows,
+                vec![],
+                vec![init_local],
+                vec![RirStmt::Init {
+                    local: xs,
+                    value: RirRValue::List {
+                        ty: rows,
+                        elems: vec![],
+                    },
+                }],
+            ),
+            rir_function(
+                main,
+                void,
+                vec![],
+                vec![rir_local(index, int, false, "i")],
+                vec![
+                    RirStmt::GlobalEnsure { global },
+                    RirStmt::Init {
+                        local: index,
+                        value: RirRValue::Use(RirOperand::Const(zero)),
+                    },
+                    RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                        root: RirPlace::global(global, vec![RirProjection::Index(index)], row),
+                        root_kind: RirCollectionRootKind::List,
+                        mode: RirCollectionLoanMode::ReadonlySequence,
+                        body: RirStructuredBlock::default(),
+                    }),
+                ],
+            ),
+        ],
+        ..RirProgram::default()
+    };
+    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(rir_place(xs, rows))));
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
 fn rir_rejects_active_collection_root_assignment() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
@@ -9203,7 +9386,7 @@ fn access_plan_accepts_direct_scalar_dataref_source_var_arg() {
         .plan(function, PlaceAccessIntent::MutPlaceArg, place)
         .unwrap();
 
-    assert!(plan.crosses_dataref);
+    assert!(plan.dataref_plan().is_some());
 }
 
 #[test]
@@ -13030,6 +13213,72 @@ fn add_string_global_borrow_callee(program: &mut RirProgram) -> (RirTypeId, RirF
     (string, callee)
 }
 
+fn global_list_collection_loan_rir(
+    mode: RirCollectionLoanMode,
+    main_locals: Vec<RirLocal>,
+    consts: Vec<RirConst>,
+    body: RirStructuredBlock,
+) -> RirProgram {
+    let int = RirTypeId::from_index(0);
+    let void = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let global = RirGlobalId::from_index(0);
+    let init = RirFunctionId::from_index(0);
+    let main = RirFunctionId::from_index(1);
+    let xs = RirLocalId::from_index(0);
+    let mut init_local = rir_local(xs, list, true, "xs");
+    init_local.initialized = false;
+
+    let mut program = RirProgram {
+        types: vec![RirType::Int, RirType::Void, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
+        consts,
+        globals: vec![RirGlobal {
+            id: global,
+            air_id: air::GlobalId::from_index(0),
+            module: air::ModuleId::from_index(0),
+            name: RirSymbol::new("game.xs"),
+            slot_symbol: RirSymbol::new("g0_xs"),
+            ty: list,
+            mutable: true,
+            init,
+        }],
+        functions: vec![
+            rir_function(
+                init,
+                list,
+                vec![],
+                vec![init_local],
+                vec![RirStmt::Init {
+                    local: xs,
+                    value: RirRValue::List {
+                        ty: list,
+                        elems: vec![],
+                    },
+                }],
+            ),
+            rir_function(
+                main,
+                void,
+                vec![],
+                main_locals,
+                vec![
+                    RirStmt::GlobalEnsure { global },
+                    RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                        root: RirPlace::global(global, vec![], list),
+                        root_kind: RirCollectionRootKind::List,
+                        mode,
+                        body,
+                    }),
+                ],
+            ),
+        ],
+        ..RirProgram::default()
+    };
+    program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(rir_place(xs, list))));
+    program
+}
+
 fn valid_global_rir(edit: impl FnOnce(&mut RirProgram)) -> RirProgram {
     let int = RirTypeId::from_index(0);
     let void = RirTypeId::from_index(1);
@@ -15616,11 +15865,76 @@ fn rir_option_match_verifies_and_emits_match_by_ref() {
 }
 
 #[test]
+fn rir_option_match_accepts_non_escaping_mut_place_subject() {
+    let mut program = option_match_rir();
+    let option = RirTypeId::from_index(1);
+    let opt = RirLocalId::from_index(0);
+    let payload = RirLocalId::from_index(1);
+    program.functions[0].locals[0].mutable = true;
+    program.functions[0].locals[1].mutable = true;
+    program.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] {
+        match_.subject =
+            RirOptionSubject::MutPlace(RirMutPlaceArg::local(RirPlace::local(opt, vec![], option)));
+        match_.payload = Some(payload);
+        match_.payload_ref = true;
+        match_.some_block.term = RirTerm::None;
+        match_.none_block.term = RirTerm::None;
+    }
+
+    rir::verify(&program).expect("non-escaping mutable-place option subjects are supported");
+}
+
+#[test]
+fn rir_option_match_accepts_escaping_mut_place_subject() {
+    let mut program = option_match_rir();
+    let option = RirTypeId::from_index(1);
+    let opt = RirLocalId::from_index(0);
+    let payload = RirLocalId::from_index(1);
+    program.functions[0].locals[0].mutable = true;
+    program.functions[0].locals[1].mutable = true;
+    program.functions[0].locals[1].payload_ref = true;
+    if let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] {
+        match_.subject =
+            RirOptionSubject::MutPlace(RirMutPlaceArg::local(RirPlace::local(opt, vec![], option)));
+        match_.payload = Some(payload);
+        match_.payload_ref = true;
+        match_.payload_escapes = true;
+        match_.some_block.term = RirTerm::None;
+        match_.none_block.term = RirTerm::Unreachable;
+    }
+
+    rir::verify(&program).expect("escaping mutable-place option subjects use live alias locals");
+}
+
+#[test]
+fn rir_option_match_rejects_bad_mut_place_subject_type() {
+    let mut program = option_match_rir();
+    let int = RirTypeId::from_index(0);
+    let opt = RirLocalId::from_index(0);
+    program.functions[0].locals[0].ty = int;
+    program.functions[0].locals[0].mutable = true;
+    if let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] {
+        match_.subject =
+            RirOptionSubject::MutPlace(RirMutPlaceArg::local(RirPlace::local(opt, vec![], int)));
+    }
+
+    let errors = rir::verify(&program).expect_err("option subject must have option type");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::UnsupportedRValueType)
+    );
+}
+
+#[test]
 fn rir_option_match_rejects_bad_discriminant_payload_type_and_mutable_payload() {
     let mut bad_discr = option_match_rir();
     let int = RirTypeId::from_index(0);
-    if let RirStmt::OptionMatch(match_) = &mut bad_discr.functions[0].body.stmts[0] {
-        match_.discr.ty = int;
+    if let RirStmt::OptionMatch(match_) = &mut bad_discr.functions[0].body.stmts[0]
+        && let RirOptionSubject::Place(subject) = &mut match_.subject
+    {
+        subject.ty = int;
     }
     let errors = rir::verify(&bad_discr).expect_err("bad option discr should fail");
     assert!(
@@ -15633,8 +15947,10 @@ fn rir_option_match_rejects_bad_discriminant_payload_type_and_mutable_payload() 
     let option = RirTypeId::from_index(1);
     bad_payload.types.push(RirType::Bool);
     bad_payload.functions[0].locals[1].ty = RirTypeId::from_index(2);
-    if let RirStmt::OptionMatch(match_) = &mut bad_payload.functions[0].body.stmts[0] {
-        match_.discr.ty = option;
+    if let RirStmt::OptionMatch(match_) = &mut bad_payload.functions[0].body.stmts[0]
+        && let RirOptionSubject::Place(subject) = &mut match_.subject
+    {
+        subject.ty = option;
     }
     let errors = rir::verify(&bad_payload).expect_err("bad payload should fail");
     assert!(errors.iter().any(|error| matches!(
@@ -15687,7 +16003,9 @@ fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
     slice_payload.functions[0].locals[0].ty = RirTypeId::from_index(1);
     slice_payload.functions[0].locals[1].ty = slice;
     if let RirStmt::OptionMatch(match_) = &mut slice_payload.functions[0].body.stmts[0] {
-        match_.discr.ty = RirTypeId::from_index(1);
+        if let RirOptionSubject::Place(subject) = &mut match_.subject {
+            subject.ty = RirTypeId::from_index(1);
+        }
         match_.some_block.term = RirTerm::Unreachable;
         match_.none_block.term = RirTerm::Unreachable;
     }
@@ -15706,7 +16024,9 @@ fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
     void_payload.functions[0].locals[0].ty = RirTypeId::from_index(1);
     void_payload.functions[0].locals[1].ty = void;
     if let RirStmt::OptionMatch(match_) = &mut void_payload.functions[0].body.stmts[0] {
-        match_.discr.ty = RirTypeId::from_index(1);
+        if let RirOptionSubject::Place(subject) = &mut match_.subject {
+            subject.ty = RirTypeId::from_index(1);
+        }
         match_.some_block.term = RirTerm::Unreachable;
         match_.none_block.term = RirTerm::Unreachable;
     }
@@ -15930,7 +16250,7 @@ fn option_match_rir() -> RirProgram {
             ],
             body: RirStructuredBlock {
                 stmts: vec![RirStmt::OptionMatch(RirOptionMatch {
-                    discr: RirPlace::local(opt, vec![], option),
+                    subject: RirOptionSubject::Place(RirPlace::local(opt, vec![], option)),
                     payload: Some(payload),
                     payload_ref: false,
                     payload_escapes: false,

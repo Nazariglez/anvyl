@@ -117,6 +117,14 @@ pub(super) fn projection_ops_ty(root: &str, payload: &str) -> String {
     format!("{}<'cx, {root}, {payload}>", rt_path("ProjectionOps"))
 }
 
+pub(super) fn optional_payload_ops_ty(payload: &str) -> String {
+    format!("{}<{payload}>", rt_path("OptionalPayloadOps"))
+}
+
+pub(super) fn optional_payload_ops_ctor(payload: &str) -> String {
+    format!("{}::<{payload}>::default()", rt_path("OptionalPayloadOps"))
+}
+
 pub(super) fn erased_handle_ty() -> String {
     format!("{}<'cx>", rt_path("ErasedHandle"))
 }
@@ -230,6 +238,14 @@ pub(super) fn global_read(slot: &str, init: &str) -> String {
 
 pub(super) fn global_set_without_init(slot: &str, value: &str) -> String {
     format!("{slot}.set_without_init({value})?")
+}
+
+pub(super) fn global_set_or_replace_collection(slot: &str, value: &str) -> String {
+    format!("{slot}.set_without_init_or_replace({value}, |slot, value| slot.replace_with(value))?")
+}
+
+pub(super) fn global_begin_projected_loan(slot: &str) -> String {
+    format!("{slot}.begin_projected_loan()")
 }
 
 pub(super) fn generated_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -580,6 +596,13 @@ pub(super) fn mut_place_local(slot: &str) -> String {
     format!("{}::local(&mut {slot})", mut_place_ty())
 }
 
+pub(super) fn mut_place_local_raw(slot: &str) -> String {
+    format!(
+        "unsafe {{ {}::local_raw(&raw mut {slot}) }}",
+        mut_place_ty()
+    )
+}
+
 pub(super) fn mut_place_reborrow(place: &str) -> String {
     format!("{place}.reborrow()")
 }
@@ -693,12 +716,14 @@ mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
         checked_range, dataref_place_heap_type_access, dataref_place_heap_type_field,
-        dataref_place_ops_ty, erased_handle_ty, generated_call, heap_access_error, heap_register,
-        heap_scope, heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
+        dataref_place_ops_ty, erased_handle_ty, generated_call, global_begin_projected_loan,
+        global_set_or_replace_collection, heap_access_error, heap_register, heap_scope,
+        heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
         mut_place_dataref, mut_place_get_copy, mut_place_global, mut_place_heap_cell,
-        mut_place_local, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
-        mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
-        projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
+        mut_place_local, mut_place_local_raw, mut_place_projected, mut_place_reborrow,
+        mut_place_replace_collection, mut_place_scoped_cell, mut_place_set, mut_place_stack_cell,
+        mut_place_ty, optional_payload_ops_ctor, optional_payload_ops_ty, projection_ops_ty,
+        result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
         rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
         runtime_ctx_ty_with, runtime_param_name, scoped_mut_place_cell_new,
         scoped_mut_place_cell_ty, stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr,
@@ -728,6 +753,10 @@ mod tests {
             projection_ops_ty("Point", "i64"),
             "anvyx_runtime::ProjectionOps<'cx, Point, i64>"
         );
+        assert_eq!(
+            optional_payload_ops_ty("i64"),
+            "anvyx_runtime::OptionalPayloadOps<i64>"
+        );
         assert_eq!(erased_handle_ty(), "anvyx_runtime::ErasedHandle<'cx>");
         assert_eq!(
             scoped_mut_place_cell_ty("'env", "i64"),
@@ -742,6 +771,10 @@ mod tests {
         assert_eq!(
             scoped_mut_place_cell_new("v0"),
             "anvyx_runtime::ScopedMutPlaceCell::new(v0)"
+        );
+        assert_eq!(
+            optional_payload_ops_ctor("i64"),
+            "anvyx_runtime::OptionalPayloadOps::<i64>::default()"
         );
         assert_eq!(result_ty("i64"), "Result<i64, anvyx_runtime::RuntimeError>");
         assert_eq!(result_ty("()"), "Result<(), anvyx_runtime::RuntimeError>");
@@ -774,6 +807,10 @@ mod tests {
         assert_eq!(
             generated_call("f", ["x".to_string()]),
             "f(rt, types, globals, x)"
+        );
+        assert_eq!(
+            global_set_or_replace_collection("globals.xs", "next"),
+            "globals.xs.set_without_init_or_replace(next, |slot, value| slot.replace_with(value))?"
         );
         assert_eq!(
             checked_index("i", "xs.len()"),
@@ -838,6 +875,10 @@ mod tests {
             mut_place_local("slot"),
             "anvyx_runtime::MutPlace::local(&mut slot)"
         );
+        assert_eq!(
+            mut_place_local_raw("slot"),
+            "unsafe { anvyx_runtime::MutPlace::local_raw(&raw mut slot) }"
+        );
         assert_eq!(mut_place_reborrow("place"), "place.reborrow()");
         assert_eq!(
             mut_place_stack_cell("cell"),
@@ -872,6 +913,10 @@ mod tests {
         assert_eq!(
             mut_place_access("place", "rt", "Ok(value.share())"),
             "place.access(rt, |value| Ok(value.share()))?"
+        );
+        assert_eq!(
+            global_begin_projected_loan("globals.state"),
+            "globals.state.begin_projected_loan()"
         );
         assert_eq!(
             mut_place_replace_collection("place", "rt", "next"),

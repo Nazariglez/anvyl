@@ -184,6 +184,12 @@ impl AirRoots {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FilterCollection {
+    List { elem: TypeId },
+    Map { key: TypeId, value: TypeId },
+}
+
 struct SemanticCallableFacts<'a> {
     functions: HashMap<CallableInstanceKey, &'a SemanticFunctionInstanceFact>,
 }
@@ -5999,65 +6005,81 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !is_lowered_collection_stub(&target.id) {
             return Ok(false);
         }
+        let sequence_filter = collection_effect::classify_sequence_method(field.node.field)
+            .and_then(sequence_filter_remove_matches);
+        let map_filter = collection_effect::classify_map_method(field.node.field)
+            .and_then(map_filter_remove_matches);
+        if sequence_filter.is_none() && map_filter.is_none() {
+            return Ok(false);
+        }
         let root = self.lower_method_target(&field.node.target)?;
         self.require_mutable_place(expr, &root)?;
         if let Some(elem) = typing::list_elem(&self.cx.program, root.ty) {
-            let Some(remove_matches) =
-                collection_effect::classify_sequence_method(field.node.field)
-                    .and_then(sequence_filter_remove_matches)
-            else {
+            let Some(remove_matches) = sequence_filter else {
                 return Ok(false);
             };
-            if matches!(root.root, PlaceRoot::Global(_)) {
-                return Err(LowerError::UnsupportedExpr {
-                    expr_id: expr.node.id,
-                    kind: "UnsupportedCollectionLoan",
-                });
-            }
-            self.lower_list_filter_effect(&root, elem, &call.node.args[0], remove_matches)?;
+            self.lower_filter_effect(
+                &root,
+                &call.node.args[0],
+                remove_matches,
+                FilterCollection::List { elem },
+            )?;
             return Ok(true);
         }
         let Some((key, value)) = typing::map_kv(&self.cx.program, root.ty) else {
             return Ok(false);
         };
-        let Some(remove_matches) = collection_effect::classify_map_method(field.node.field)
-            .and_then(map_filter_remove_matches)
-        else {
+        let Some(remove_matches) = map_filter else {
             return Ok(false);
         };
-        if matches!(root.root, PlaceRoot::Global(_)) {
-            return Err(LowerError::UnsupportedExpr {
-                expr_id: expr.node.id,
-                kind: "UnsupportedCollectionLoan",
-            });
-        }
-        self.lower_map_filter_effect(&root, key, value, &call.node.args[0], remove_matches)?;
+        self.lower_filter_effect(
+            &root,
+            &call.node.args[0],
+            remove_matches,
+            FilterCollection::Map { key, value },
+        )?;
         Ok(true)
     }
 
-    fn lower_list_filter_effect(
+    fn lower_filter_effect(
         &mut self,
         root: &Place,
-        elem: TypeId,
         predicate: &ExprNode,
         remove_matches: bool,
+        collection: FilterCollection,
     ) -> Result<(), LowerError> {
         let bool_ty = self.cx.lower_ty(&Type::Bool)?;
         let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let flags_ty = self.cx.program.alloc_type(TypeData::List(bool_ty));
         let len = self.for_len_local()?;
         let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let flags = self.push_local(
+            None,
+            None,
+            flags_ty,
+            AirMutability::Mutable,
+            LocalKind::Temp,
+        );
         let kept = self.push_local(None, None, root.ty, AirMutability::Mutable, LocalKind::Temp);
+        let entry_ty = match collection {
+            FilterCollection::List { .. } => None,
+            FilterCollection::Map { key, value } => Some(
+                self.cx
+                    .program
+                    .alloc_type(TypeData::Tuple(vec![key, value])),
+            ),
+        };
         let one = self.int_const(1)?;
         let step = self.emit_typed_temp(int_ty, RValue::Use(one))?;
         let id = self.alloc_loop();
         let callback = self.lower_filter_callback(predicate)?;
         let body = self.with_nested_block(|this| {
             this.emit_init(
-                kept,
+                flags,
                 RValue::Aggregate {
                     kind: AggregateCtor::List,
                     fields: vec![],
-                    ty: root.ty,
+                    ty: flags_ty,
                 },
             )?;
             this.emit_init(
@@ -6066,235 +6088,229 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     source: root.clone(),
                 },
             )?;
-            let zero = this.int_const(0)?;
-            this.emit_init(
-                index,
-                RValue::Binary {
-                    op: BinaryOp::Sub,
-                    lhs: zero,
-                    rhs: step.clone(),
-                    ty: int_ty,
-                },
-            )?;
-            let loop_body = this.with_nested_block(|this| {
-                this.emit_assign(
-                    this.local_place(index),
-                    RValue::Binary {
-                        op: BinaryOp::Add,
-                        lhs: Operand::Place(this.local_place(index)),
-                        rhs: step.clone(),
-                        ty: int_ty,
-                    },
-                )?;
-                let cond = this.emit_typed_temp(
-                    bool_ty,
-                    RValue::Binary {
-                        op: BinaryOp::LessThan,
-                        lhs: Operand::Place(this.local_place(index)),
-                        rhs: Operand::Place(this.local_place(len)),
-                        ty: bool_ty,
-                    },
-                )?;
-                let then_block = this.with_nested_block(|this| {
-                    let elem_value = this.emit_typed_temp(
-                        elem,
-                        RValue::Use(Operand::Place(Self::sequence_element_place(
-                            root, index, elem,
-                        ))),
-                    )?;
-                    let keep = this.lower_filter_keep(
-                        predicate,
-                        &callback,
-                        vec![elem_value.clone()],
-                        remove_matches,
-                    )?;
-                    let keep_block = this.with_nested_block(|this| {
-                        this.emit_eval(RValue::ListPush {
-                            list: this.local_place(kept),
-                            value: elem_value,
-                        })?;
-                        this.terminate(AirTail::Continue(id))
-                    })?;
-                    let discard_block = AirBlock {
-                        stmts: vec![],
-                        tail: AirTail::Continue(id),
-                    };
-                    this.ensure_open()?;
-                    this.block.stmts.push(AirStmt::If(AirIf {
-                        cond: keep,
-                        then_block: keep_block,
-                        else_block: Some(discard_block),
-                    }));
-                    Ok(())
+            this.reset_filter_index(index, int_ty, &step, true)?;
+            this.emit_filter_loop(id, len, index, int_ty, bool_ty, &step, |this| {
+                let args = this.filter_callback_args(root, index, collection, entry_ty)?;
+                let keep = this.lower_filter_keep(predicate, &callback, args, remove_matches)?;
+                this.emit_eval(RValue::ListPush {
+                    list: this.local_place(flags),
+                    value: keep,
                 })?;
-                let else_block = AirBlock {
-                    stmts: vec![],
-                    tail: AirTail::Break(id),
-                };
-                this.ensure_open()?;
-                this.block.stmts.push(AirStmt::If(AirIf {
-                    cond,
-                    then_block,
-                    else_block: Some(else_block),
-                }));
-                Ok(())
-            })?;
-            this.ensure_open()?;
-            this.block.stmts.push(AirStmt::Loop(AirLoop {
-                id,
-                body: loop_body,
-            }));
-            Ok(())
+                this.terminate(AirTail::Continue(id))
+            })
         })?;
         self.ensure_open()?;
         self.block
             .stmts
             .push(AirStmt::CollectionLoan(AirCollectionLoan {
                 root: root.clone(),
-                root_kind: AirCollectionRootKind::List,
-                mode: AirCollectionLoanMode::ReadonlySequence,
+                root_kind: match collection {
+                    FilterCollection::List { .. } => AirCollectionRootKind::List,
+                    FilterCollection::Map { .. } => AirCollectionRootKind::Map,
+                },
+                mode: match collection {
+                    FilterCollection::List { .. } => AirCollectionLoanMode::ReadonlySequence,
+                    FilterCollection::Map { .. } => AirCollectionLoanMode::ReadonlyMap,
+                },
                 body,
             }));
+        self.rebuild_filtered_collection(
+            root, len, index, kept, flags, &step, collection, entry_ty,
+        )?;
         self.emit_assign(
             root.clone(),
             RValue::Use(Operand::Place(self.local_place(kept))),
         )
     }
 
-    fn lower_map_filter_effect(
+    fn rebuild_filtered_collection(
         &mut self,
         root: &Place,
-        key: TypeId,
-        value: TypeId,
-        predicate: &ExprNode,
-        remove_matches: bool,
+        len: LocalId,
+        index: LocalId,
+        kept: LocalId,
+        flags: LocalId,
+        step: &Operand,
+        collection: FilterCollection,
+        entry_ty: Option<TypeId>,
     ) -> Result<(), LowerError> {
         let bool_ty = self.cx.lower_ty(&Type::Bool)?;
         let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let len = self.for_len_local()?;
-        let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
-        let kept = self.push_local(None, None, root.ty, AirMutability::Mutable, LocalKind::Temp);
-        let entry_ty = self
-            .cx
-            .program
-            .alloc_type(TypeData::Tuple(vec![key, value]));
-        let one = self.int_const(1)?;
-        let step = self.emit_typed_temp(int_ty, RValue::Use(one))?;
+        self.emit_init(
+            kept,
+            RValue::Aggregate {
+                kind: match collection {
+                    FilterCollection::List { .. } => AggregateCtor::List,
+                    FilterCollection::Map { .. } => AggregateCtor::Map,
+                },
+                fields: vec![],
+                ty: root.ty,
+            },
+        )?;
+        self.reset_filter_index(index, int_ty, step, false)?;
         let id = self.alloc_loop();
-        let callback = self.lower_filter_callback(predicate)?;
-        let body = self.with_nested_block(|this| {
-            this.emit_init(
-                kept,
-                RValue::Aggregate {
-                    kind: AggregateCtor::Map,
-                    fields: vec![],
-                    ty: root.ty,
-                },
-            )?;
-            this.emit_init(
-                len,
-                RValue::Len {
-                    source: root.clone(),
-                },
-            )?;
-            let zero = this.int_const(0)?;
-            this.emit_init(
+        self.emit_filter_loop(id, len, index, int_ty, bool_ty, step, |this| {
+            let keep = Operand::Place(Self::sequence_element_place(
+                &this.local_place(flags),
                 index,
+                bool_ty,
+            ));
+            let keep_block = this.with_nested_block(|this| {
+                this.emit_kept_filter_entry(root, index, kept, collection, entry_ty)?;
+                this.terminate(AirTail::Continue(id))
+            })?;
+            this.ensure_open()?;
+            this.block.stmts.push(AirStmt::If(AirIf {
+                cond: keep,
+                then_block: keep_block,
+                else_block: Some(AirBlock {
+                    stmts: vec![],
+                    tail: AirTail::Continue(id),
+                }),
+            }));
+            Ok(())
+        })
+    }
+
+    fn reset_filter_index(
+        &mut self,
+        index: LocalId,
+        int_ty: TypeId,
+        step: &Operand,
+        init: bool,
+    ) -> Result<(), LowerError> {
+        let zero = self.int_const(0)?;
+        let value = RValue::Binary {
+            op: BinaryOp::Sub,
+            lhs: zero,
+            rhs: step.clone(),
+            ty: int_ty,
+        };
+        if init {
+            self.emit_init(index, value)
+        } else {
+            self.emit_assign(self.local_place(index), value)
+        }
+    }
+
+    fn emit_filter_loop(
+        &mut self,
+        id: AirLoopId,
+        len: LocalId,
+        index: LocalId,
+        int_ty: TypeId,
+        bool_ty: TypeId,
+        step: &Operand,
+        mut emit_then: impl FnMut(&mut Self) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        let body = self.with_nested_block(|this| {
+            this.emit_assign(
+                this.local_place(index),
                 RValue::Binary {
-                    op: BinaryOp::Sub,
-                    lhs: zero,
+                    op: BinaryOp::Add,
+                    lhs: Operand::Place(this.local_place(index)),
                     rhs: step.clone(),
                     ty: int_ty,
                 },
             )?;
-            let loop_body = this.with_nested_block(|this| {
-                this.emit_assign(
-                    this.local_place(index),
-                    RValue::Binary {
-                        op: BinaryOp::Add,
-                        lhs: Operand::Place(this.local_place(index)),
-                        rhs: step.clone(),
-                        ty: int_ty,
-                    },
-                )?;
-                let cond = this.emit_typed_temp(
-                    bool_ty,
-                    RValue::Binary {
-                        op: BinaryOp::LessThan,
-                        lhs: Operand::Place(this.local_place(index)),
-                        rhs: Operand::Place(this.local_place(len)),
-                        ty: bool_ty,
-                    },
-                )?;
-                let then_block = this.with_nested_block(|this| {
-                    let entry = this.emit_typed_temp(
-                        entry_ty,
-                        RValue::MapEntryAt {
-                            map: root.clone(),
-                            index,
-                            ty: entry_ty,
-                        },
-                    )?;
-                    let key_arg = Self::tuple_field_operand(entry.clone(), 0, key);
-                    let value_arg = Self::tuple_field_operand(entry.clone(), 1, value);
-                    let keep = this.lower_filter_keep(
-                        predicate,
-                        &callback,
-                        vec![key_arg.clone(), value_arg.clone()],
-                        remove_matches,
-                    )?;
-                    let keep_block = this.with_nested_block(|this| {
-                        this.emit_eval(RValue::MapInsert {
-                            map: this.local_place(kept),
-                            key: key_arg,
-                            value: value_arg,
-                            kind: MapWriteKind::StructuralInsert,
-                        })?;
-                        this.terminate(AirTail::Continue(id))
-                    })?;
-                    let discard_block = AirBlock {
-                        stmts: vec![],
-                        tail: AirTail::Continue(id),
-                    };
-                    this.ensure_open()?;
-                    this.block.stmts.push(AirStmt::If(AirIf {
-                        cond: keep,
-                        then_block: keep_block,
-                        else_block: Some(discard_block),
-                    }));
-                    Ok(())
-                })?;
-                let else_block = AirBlock {
+            let cond = this.emit_typed_temp(
+                bool_ty,
+                RValue::Binary {
+                    op: BinaryOp::LessThan,
+                    lhs: Operand::Place(this.local_place(index)),
+                    rhs: Operand::Place(this.local_place(len)),
+                    ty: bool_ty,
+                },
+            )?;
+            let then_block = this.with_nested_block(|this| emit_then(this))?;
+            this.ensure_open()?;
+            this.block.stmts.push(AirStmt::If(AirIf {
+                cond,
+                then_block,
+                else_block: Some(AirBlock {
                     stmts: vec![],
                     tail: AirTail::Break(id),
-                };
-                this.ensure_open()?;
-                this.block.stmts.push(AirStmt::If(AirIf {
-                    cond,
-                    then_block,
-                    else_block: Some(else_block),
-                }));
-                Ok(())
-            })?;
-            this.ensure_open()?;
-            this.block.stmts.push(AirStmt::Loop(AirLoop {
-                id,
-                body: loop_body,
+                }),
             }));
             Ok(())
         })?;
         self.ensure_open()?;
-        self.block
-            .stmts
-            .push(AirStmt::CollectionLoan(AirCollectionLoan {
-                root: root.clone(),
-                root_kind: AirCollectionRootKind::Map,
-                mode: AirCollectionLoanMode::ReadonlyMap,
-                body,
-            }));
-        self.emit_assign(
-            root.clone(),
-            RValue::Use(Operand::Place(self.local_place(kept))),
+        self.block.stmts.push(AirStmt::Loop(AirLoop { id, body }));
+        Ok(())
+    }
+
+    fn filter_callback_args(
+        &mut self,
+        root: &Place,
+        index: LocalId,
+        collection: FilterCollection,
+        entry_ty: Option<TypeId>,
+    ) -> Result<Vec<Operand>, LowerError> {
+        match collection {
+            FilterCollection::List { elem } => Ok(vec![self.emit_typed_temp(
+                elem,
+                RValue::Use(Operand::Place(Self::sequence_element_place(
+                    root, index, elem,
+                ))),
+            )?]),
+            FilterCollection::Map { key, value } => {
+                let entry =
+                    self.map_filter_entry(root, index, entry_ty.expect("map entry type"))?;
+                Ok(vec![
+                    Self::tuple_field_operand(entry.clone(), 0, key),
+                    Self::tuple_field_operand(entry, 1, value),
+                ])
+            }
+        }
+    }
+
+    fn emit_kept_filter_entry(
+        &mut self,
+        root: &Place,
+        index: LocalId,
+        kept: LocalId,
+        collection: FilterCollection,
+        entry_ty: Option<TypeId>,
+    ) -> Result<(), LowerError> {
+        match collection {
+            FilterCollection::List { elem } => {
+                let elem_value = self.emit_typed_temp(
+                    elem,
+                    RValue::Use(Operand::Place(Self::sequence_element_place(
+                        root, index, elem,
+                    ))),
+                )?;
+                self.emit_eval(RValue::ListPush {
+                    list: self.local_place(kept),
+                    value: elem_value,
+                })
+            }
+            FilterCollection::Map { key, value } => {
+                let entry =
+                    self.map_filter_entry(root, index, entry_ty.expect("map entry type"))?;
+                self.emit_eval(RValue::MapInsert {
+                    map: self.local_place(kept),
+                    key: Self::tuple_field_operand(entry.clone(), 0, key),
+                    value: Self::tuple_field_operand(entry, 1, value),
+                    kind: MapWriteKind::StructuralInsert,
+                })
+            }
+        }
+    }
+
+    fn map_filter_entry(
+        &mut self,
+        root: &Place,
+        index: LocalId,
+        entry_ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        self.emit_typed_temp(
+            entry_ty,
+            RValue::MapEntryAt {
+                map: root.clone(),
+                index,
+                ty: entry_ty,
+            },
         )
     }
 
@@ -9928,7 +9944,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, LowerError::UnsupportedExternSignature { .. }));
+        assert!(matches!(err, LowerError::UnsupportedExternSignature));
     }
 
     #[test]
@@ -10298,8 +10314,7 @@ mod tests {
             !matches!(statement, AirStmt::GlobalEnsure { global } if *global == GlobalId(0))
         });
 
-        let errors =
-            crate::air::verify(&program).expect_err("root update without ensure should fail");
+        let errors = verify(&program).expect_err("root update without ensure should fail");
         assert!(errors.iter().any(|error| matches!(
             error.kind,
             crate::air::VerifyErrorKind::BadStatement(
