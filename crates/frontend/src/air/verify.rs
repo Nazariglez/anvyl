@@ -4774,7 +4774,12 @@ fn verify_rvalue(
                     (Some(lhs), Some(rhs), Some(result)) => {
                         op.scalar_result(lhs, rhs) == Some(result)
                     }
-                    _ => false,
+                    _ => {
+                        matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+                            && lhs_ty == rhs_ty
+                            && Some(*ty) == cx.primitives.bool()
+                            && cx.program.unit_only_enum(lhs_ty)
+                    }
                 };
                 if !valid {
                     cx.push(

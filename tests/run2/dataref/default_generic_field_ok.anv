@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+dataref Container<T> {
+    items: [T] = [],
+}
+
+fn main() {
+    let c: Container<int> = Container {};
+    var items = c.items;
+    items.push(7);
+    println(items[0]);
+}

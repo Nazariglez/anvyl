@@ -114,6 +114,15 @@ impl RirProgram {
             RirType::List(_) | RirType::Map { .. }
         )
     }
+
+    pub fn unit_only_enum(&self, ty: RirTypeId) -> bool {
+        let Some(RirType::Enum(enum_id)) = self.types.get(ty.index()) else {
+            return false;
+        };
+        self.enums
+            .get(enum_id.index())
+            .is_some_and(RirEnum::is_unit_only)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +196,14 @@ pub struct RirEnum {
     pub display: RirSymbol,
     pub copyable: bool,
     pub variants: Vec<RirVariant>,
+}
+
+impl RirEnum {
+    pub fn is_unit_only(&self) -> bool {
+        self.variants
+            .iter()
+            .all(|variant| matches!(variant.kind, RirVariantKind::Unit))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -5384,6 +5401,14 @@ impl VerifyCx<'_> {
             self.scalar(ret),
         ) {
             (Some(lhs), Some(rhs), Some(ret)) => op.scalar_result(lhs, rhs) == Some(ret),
+            _ if matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
+                && self.type_id(RirType::Bool) == Some(ret) =>
+            {
+                match (lhs, rhs) {
+                    (Some(lhs), Some(rhs)) if lhs == rhs => self.program.unit_only_enum(lhs),
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }

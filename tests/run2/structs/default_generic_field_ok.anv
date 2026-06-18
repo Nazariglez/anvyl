@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+struct Container<T> {
+    items: [T] = [],
+}
+
+fn main() {
+    var c: Container<int> = Container {};
+    c.items.push(7);
+    println(c.items[0]);
+}

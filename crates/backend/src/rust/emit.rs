@@ -83,10 +83,6 @@ impl EmitCx<'_> {
     }
 
     fn emit_program(&mut self) {
-        if !self.program.stringify_helpers.is_empty() {
-            self.w.line("use std::fmt::Write;");
-            self.w.blank();
-        }
         self.emit_ctx();
         for dataref in &self.program.datarefs {
             self.emit_dataref(dataref);
@@ -486,19 +482,25 @@ impl EmitCx<'_> {
     fn emit_enum(&mut self, enm: &RirEnum) {
         let cx_dependent = RustRepPolicy::new(self.program).enum_cx_dependent(enm);
         let needs_trace = self.trace_plan.needs_enum_trace(enm.id);
+        let copy = enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty();
+        let mut derives = vec!["Clone"];
+        if copy {
+            derives.push("Copy");
+        }
+        if enm.is_unit_only() {
+            derives.extend(["PartialEq", "Eq"]);
+        }
         if needs_trace {
-            if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
-                self.w.line(target::trace_derive(&["Clone", "Copy"]));
-                self.w.line("#[repr(i64)]");
-            } else {
-                self.w.line(target::trace_derive(&["Clone"]));
-            }
+            self.w.line(target::trace_derive(&derives));
             self.w.line(target::trace_crate_attr(cx_dependent));
-        } else if enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty() {
-            self.w.line("#[derive(Clone, Copy)]");
-            self.w.line("#[repr(i64)]");
         } else {
-            self.w.line("#[derive(Clone)]");
+            self.w.line(format_args!(
+                "#[derive({})]",
+                comma(derives.iter().map(|derive| (*derive).to_string()))
+            ));
+        }
+        if copy {
+            self.w.line("#[repr(i64)]");
         }
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
         let variants = enm
@@ -577,9 +579,13 @@ impl EmitCx<'_> {
                     rust_string(&format!("{field}: "))
                 ));
                 match ty {
-                    RirType::Int | RirType::Float | RirType::Bool => {
+                    RirType::Float => {
+                        let text = Self::default_scalar_display(&format!("value.{field}"), ty);
+                        w.line(format_args!("out.push_str({text}.as_str());"));
+                    }
+                    RirType::Int | RirType::Bool => {
                         w.line(format_args!(
-                            "let _ = write!(out, \"{{}}\", value.{field});"
+                            "std::fmt::Write::write_fmt(&mut out, format_args!(\"{{}}\", value.{field})).unwrap();"
                         ));
                     }
                     RirType::String => {
@@ -1674,7 +1680,10 @@ impl EmitCx<'_> {
                 match self.program.types[source_ty.index()] {
                     RirType::String => values.value_operand(value),
                     RirType::Int | RirType::Float | RirType::Bool => {
-                        target::anv_string_format("\"{}\"", &values.operand(value))
+                        target::anv_string_from(&Self::default_scalar_display(
+                            &values.operand(value),
+                            &self.program.types[source_ty.index()],
+                        ))
                     }
                     RirType::Struct(_) => self.stringify_struct(function, value, *source_ty),
                     RirType::Void
@@ -1692,6 +1701,18 @@ impl EmitCx<'_> {
                 }
             }
             RirRValue::StringConcat { parts } => self.string_concat(function, parts),
+            RirRValue::Format {
+                value,
+                source_ty,
+                spec,
+            } if *spec == RirFormatSpec::default()
+                && matches!(self.program.types[source_ty.index()], RirType::Float) =>
+            {
+                target::anv_string_from(&Self::default_scalar_display(
+                    &values.operand(value),
+                    &self.program.types[source_ty.index()],
+                ))
+            }
             RirRValue::Format {
                 value,
                 source_ty,
@@ -2843,6 +2864,14 @@ impl EmitCx<'_> {
                 });
                 struct_variant(&path, fields)
             }
+        }
+    }
+
+    fn default_scalar_display(value: &str, ty: &RirType) -> String {
+        match ty {
+            RirType::Float => target::display_float(value),
+            RirType::Int | RirType::Bool => format!("format!(\"{{}}\", {value})"),
+            _ => unreachable!("verified scalar display type"),
         }
     }
 

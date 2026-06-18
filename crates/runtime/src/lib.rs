@@ -60,4 +60,4 @@ pub use scoped_lambda::ScopedLambda;
 pub use type_registry::{
     get_type_entry, is_cycle_capable, register_child_traverser, register_cycle_capable,
 };
-pub use value::{AnvList, AnvMap, AnvSlice, AnvString};
+pub use value::{AnvList, AnvMap, AnvSlice, AnvString, display_float};

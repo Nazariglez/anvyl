@@ -8,7 +8,7 @@ use super::{
     const_term::ConstTerm,
     decls::{
         CoreRangeKind, FieldSchema, ModuleMemberLookup, NamedSchemas, NominalKey, TypeBinding,
-        nominal_generic_args, nominal_type, nominal_type_with_args,
+        nominal_generic_args, nominal_type, nominal_type_with_args, substitute_aggregate_member,
     },
     enum_variant, expected_assignable_type, extern_boundary, field_check,
     generic::{ArityError, GenericArgs, GenericParams},
@@ -454,6 +454,14 @@ pub(super) fn check_struct_lit_hint(
     let Some(ty) = inf.finalize(&key, &agg.generics, lit.span, tc) else {
         return checked_from_type(expr, Type::Infer, tc);
     };
+    record_default_fields(
+        expr.node.id,
+        &ty,
+        &key,
+        &agg.generics,
+        field_check.default_fields,
+        tc,
+    );
     tc.reject_user_any_type(&ty, lit.span);
     let handle = tc.type_handle(&ty);
     let mut checked = solve_and_checked_from_handle(expr, handle, tc);
@@ -629,6 +637,7 @@ fn cannot_infer_inferred_enum(
 struct NominalFieldCheck {
     failed: bool,
     contains_extern_any: bool,
+    default_fields: Vec<field_check::OmittedDefaultField>,
 }
 
 fn check_nominal_fields(
@@ -702,6 +711,7 @@ fn check_expr_fields(
     let mut check = NominalFieldCheck {
         failed: shape.failed,
         contains_extern_any: false,
+        default_fields: vec![],
     };
     for field in shape.fields {
         let value = &fields[field.index].1;
@@ -712,7 +722,31 @@ fn check_expr_fields(
         check.contains_extern_any |= checked.contains_extern_any;
         check.failed |= tc.solve_constraints();
     }
+    if !shape.failed && matches!(owner, field_check::FieldOwner::Nominal(_)) {
+        check.default_fields = shape.default_fields;
+    }
     check
+}
+
+fn record_default_fields(
+    aggregate: ExprId,
+    owner: &Type,
+    owner_key: &NominalKey,
+    generics: &GenericParams,
+    fields: Vec<field_check::OmittedDefaultField>,
+    tc: &mut TypeChecker,
+) {
+    for field in fields {
+        tc.record_default_field(
+            aggregate,
+            owner.clone(),
+            owner_key.clone(),
+            field.name,
+            field.slot,
+            field.default,
+            substitute_aggregate_member(owner, generics, &field.ty),
+        );
+    }
 }
 
 pub(super) fn check_unknown_nominal_fields(fields: &[(Ident, ExprNode)], tc: &mut TypeChecker) {

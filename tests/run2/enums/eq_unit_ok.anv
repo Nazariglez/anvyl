@@ -1,11 +1,14 @@
 // @mode: run
 // @frontend: new
-// @skip: enum equality is not executable yet
 // @expect: success
-// @match: true
+// @match-begin
+// true
+// true
+// @match-end
 
 enum Choice { One, Two }
 
 fn main() {
     println(Choice.One == Choice.One);
+    println(Choice.One != Choice.Two);
 }

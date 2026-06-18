@@ -91,6 +91,15 @@ impl Program {
         self.entry
     }
 
+    pub fn unit_only_enum(&self, ty: TypeId) -> bool {
+        let Some(TypeData::Enum(enum_id)) = self.type_arena.get(ty) else {
+            return false;
+        };
+        self.enums
+            .get(enum_id.index())
+            .is_some_and(EnumDecl::is_unit_only)
+    }
+
     pub fn alloc_function(&mut self, func: Function) -> FunctionId {
         let id = FunctionId::from_index(self.functions.len());
         self.functions.push(func);

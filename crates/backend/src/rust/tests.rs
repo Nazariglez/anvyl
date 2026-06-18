@@ -3261,14 +3261,15 @@ fn source_job_compiles_struct_stringify_helper() {
     }
     let source = plan_source(program);
 
-    assert!(source.as_str().contains("use std::fmt::Write;"));
+    assert!(!source.as_str().contains("use std::fmt::Write;"));
     assert!(source.as_str().contains("fn anvstringify_t3_point"));
     assert!(
-        source
-            .as_str()
-            .contains("let _ = write!(out, \"{}\", value.x);")
+        source.as_str().contains(
+            "std::fmt::Write::write_fmt(&mut out, format_args!(\"{}\", value.x)).unwrap();"
+        )
     );
     assert!(!source.as_str().contains("format!(\"{}\", value.x)"));
+    assert!(!source.as_str().contains("write!(out,"));
     assert!(!source.as_str().contains("{:?}"));
     assert!(!source.as_str().contains(".clone()"));
     assert!(!source.as_str().contains(".to_owned()"));
@@ -17722,7 +17723,7 @@ fn raw_int_enum_cast_emits_repr_discriminants_and_cast() {
 
     let source = plan_source(program);
     let text = source.as_str();
-    assert!(text.contains("#[derive(Clone, Copy)]"));
+    assert!(text.contains("#[derive(Clone, Copy, PartialEq, Eq)]"));
     assert!(text.contains("#[repr(i64)]"));
     assert!(text.contains("Dead = -1"));
     assert!(text.contains("v0 as i64"));

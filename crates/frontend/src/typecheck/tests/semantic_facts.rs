@@ -1,6 +1,6 @@
 use super::support::{check, generic_body};
 use crate::{
-    ast::{ArrayLen, EscapeMode, Ident, Type},
+    ast::{ArrayLen, ConstValue, EscapeMode, Ident, Type},
     typecheck::{
         BodyInstanceKey, FunctionValueKind, GenericArgs, LambdaBodyKey, LocalDefKind, LocalUseMode,
     },
@@ -124,6 +124,105 @@ fn explicit_default_param_records_no_default_arg() {
     let result = check(r#"fn f(a: int, message: string = "ok") {} fn main() { f(1, "x"); }"#)
         .expect("typecheck failed");
     assert!(result.default_args().is_empty());
+}
+
+#[test]
+fn const_uses_record_values() {
+    let result = check("const BASE: int = 10; fn f(a: int = BASE) {} fn main() { f(); }")
+        .expect("typecheck failed");
+    assert!(
+        result
+            .const_values()
+            .values()
+            .any(|value| value == &ConstValue::Int(10))
+    );
+}
+
+#[test]
+fn omitted_struct_defaults_are_recorded_in_declaration_order() {
+    let result = check(
+        "struct Point { x: int = 1, y: int = 2, z: int } fn main() { let p = Point { z: 3 }; }",
+    )
+    .expect("typecheck failed");
+    let defaults = result.default_fields();
+    assert_eq!(defaults.len(), 1);
+    let fields = defaults
+        .values()
+        .next()
+        .expect("missing default field facts");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].field.as_str(), "x");
+    assert_eq!(fields[0].slot, 0);
+    assert_eq!(fields[0].ty, Type::Int);
+    assert_eq!(fields[1].field.as_str(), "y");
+    assert_eq!(fields[1].slot, 1);
+    assert_eq!(fields[1].ty, Type::Int);
+}
+
+#[test]
+fn explicit_fields_record_no_default_fields() {
+    let result = check("struct Point { x: int = 1 } fn main() { let p = Point { x: 2 }; }")
+        .expect("typecheck failed");
+    assert!(result.default_fields().is_empty());
+}
+
+#[test]
+fn dataref_defaults_are_recorded() {
+    let result = check("dataref Box { x: int = 1 } fn main() { let b = Box {}; }")
+        .expect("typecheck failed");
+    let fields = result
+        .default_fields()
+        .values()
+        .next()
+        .expect("missing dataref default field facts");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].field.as_str(), "x");
+    assert_eq!(fields[0].slot, 0);
+    assert_eq!(fields[0].ty, Type::Int);
+}
+
+#[test]
+fn generic_default_field_records_instantiated_owner_and_type() {
+    let result =
+        check("struct Box<T> { value: T? = nil } fn main() { let b: Box<int> = Box<int> {}; }")
+            .expect("typecheck failed");
+    let field = result
+        .default_fields()
+        .values()
+        .next()
+        .and_then(|fields| fields.first())
+        .expect("missing generic default field fact");
+    assert_eq!(field.field.as_str(), "value");
+    assert!(!matches!(field.ty, Type::Var(_)));
+    let Type::Nominal(owner) = &field.owner else {
+        panic!("default owner is not nominal");
+    };
+    assert_eq!(owner.type_args, vec![Type::Int]);
+}
+
+#[test]
+fn declaration_generic_default_call_does_not_export_template_specialization() {
+    let result = check(
+        "fn default_value<T>() -> T? { nil } struct Box<T> { value: T? = default_value<T>() } fn main() { let b: Box<int> = Box<int> {}; }",
+    )
+    .expect("typecheck failed");
+    assert!(result.function_facts().iter().all(|fact| {
+        fact.id.name != Ident::new("default_value")
+            || fact
+                .args
+                .type_args
+                .iter()
+                .all(|arg| !matches!(arg, Type::Var(_)))
+    }));
+}
+
+#[test]
+fn enum_variant_and_extern_literals_record_no_default_fields() {
+    let result = check(
+        "enum E { A { x: int } } extern type Point rep inline { init; x: int; } fn main() { let e = E.A { x: 1 }; let p = Point { x: 2 }; }",
+    )
+    .expect("typecheck failed");
+    assert!(result.default_fields().is_empty());
 }
 
 #[test]

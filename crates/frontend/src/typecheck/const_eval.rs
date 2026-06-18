@@ -498,7 +498,11 @@ impl TypeChecker {
         self.warn_local_const_deprecated(info, name, expr.span);
         let module = self.current_module.clone();
         let ty = match self.eval_top_const(&module, name, self.error_span(expr.span)) {
-            Ok(value) => const_type(&value),
+            Ok(value) => {
+                let ty = const_type(&value);
+                self.record_const_value(expr.node.id, value);
+                ty
+            }
             Err(error) => {
                 self.push_error(error);
                 Type::Infer

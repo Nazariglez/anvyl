@@ -12,10 +12,11 @@ use crate::{
     },
     typecheck::{
         self, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey, CaptureCellRequirementMap,
-        ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap, DynDowncastMap,
-        DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap, ExternUseMap,
-        GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap, SemanticBodyFacts,
-        SemanticCheckOutput, SemanticProgram, TypeError, decls::DeclarationIndex,
+        ConstValueMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
+        DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap,
+        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap,
+        SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
+        decls::DeclarationIndex,
     },
 };
 
@@ -68,8 +69,16 @@ impl TypecheckTestResult {
         &self.flat_facts.calls
     }
 
+    pub(crate) fn const_values(&self) -> &ConstValueMap {
+        &self.flat_facts.const_values
+    }
+
     pub(crate) fn default_args(&self) -> &typecheck::DefaultArgMap {
         &self.flat_facts.default_args
+    }
+
+    pub(crate) fn default_fields(&self) -> &typecheck::DefaultFieldMap {
+        &self.flat_facts.default_fields
     }
 
     pub(crate) fn extern_uses(&self) -> &ExternUseMap {

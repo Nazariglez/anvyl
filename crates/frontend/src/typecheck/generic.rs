@@ -7,6 +7,7 @@ use super::{
     decls::CallableId,
     dyn_infer::DynInferenceFacts,
     infer::{GenericSolverSeeds, Solver},
+    type_ops::type_has_unfinished_facts,
 };
 use crate::{
     ast::{
@@ -183,6 +184,16 @@ pub(super) fn specialization_key(id: CallableId, args: &GenericArgs) -> Callable
         target: id,
         args: args.clone(),
     }
+}
+
+pub(crate) fn generic_args_are_concrete(args: &GenericArgs) -> bool {
+    args.type_args
+        .iter()
+        .all(|ty| !type_has_unfinished_facts(ty))
+        && args
+            .const_args
+            .iter()
+            .all(|term| matches!(term, ConstTerm::Value(_)))
 }
 
 pub(super) fn check_with_specialization(

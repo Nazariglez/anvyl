@@ -318,6 +318,10 @@ pub(super) fn anv_string_format(fmt: &str, arg: &str) -> String {
     anv_string_from(&format!("format!({fmt}, {arg})"))
 }
 
+pub(super) fn display_float(value: &str) -> String {
+    rt_path(&format!("display_float({value})"))
+}
+
 pub(super) fn anv_list_from_elems(rt: &str, storage_ty: &str, elems: &str) -> String {
     format!(
         "{}::from_elems({rt}, {storage_ty}, [{elems}])",

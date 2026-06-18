@@ -2205,6 +2205,11 @@ impl TypeChecker {
         self.semantic_facts.record_call(site, target);
     }
 
+    fn record_const_value(&mut self, expr_id: ExprId, value: ConstValue) {
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_const_value(site, value);
+    }
+
     pub(super) fn record_function_value(&mut self, expr_id: ExprId, fact: FunctionValueFact) {
         let site = self.current_expr_site(expr_id);
         self.semantic_facts.record_function_value(site, fact);
@@ -2285,6 +2290,33 @@ impl TypeChecker {
                 },
             );
         }
+    }
+
+    pub(super) fn record_default_field(
+        &mut self,
+        aggregate: ExprId,
+        owner: Type,
+        owner_key: NominalKey,
+        field: Ident,
+        slot: usize,
+        default: FieldDefault,
+        ty: Type,
+    ) {
+        self.semantic_facts.record_default_field(
+            self.current_body(),
+            DefaultFieldFact {
+                aggregate,
+                owner,
+                owner_key,
+                field,
+                slot,
+                default: DefaultExprSite {
+                    expr: default.expr_id,
+                    source: default.span.source(),
+                },
+                ty,
+            },
+        );
     }
 
     fn record_extern_use(&mut self, expr_id: ExprId, target: ExternUseTarget) {
@@ -2932,14 +2964,18 @@ impl TypeChecker {
             .specializations
             .iter()
             .filter_map(|(key, state)| match state {
-                SpecializationState::Done(body) if key.target == *id => Some((
-                    key.args.clone(),
-                    body.params.clone(),
-                    ReturnSpec {
-                        access: ret.access,
-                        ty: body.return_ty.clone(),
-                    },
-                )),
+                SpecializationState::Done(body)
+                    if key.target == *id && generic_args_are_concrete(&key.args) =>
+                {
+                    Some((
+                        key.args.clone(),
+                        body.params.clone(),
+                        ReturnSpec {
+                            access: ret.access,
+                            ty: body.return_ty.clone(),
+                        },
+                    ))
+                }
                 SpecializationState::InProgress | SpecializationState::Done(_) => None,
             })
             .collect::<Vec<_>>();
@@ -4191,7 +4227,9 @@ fn check_expr_checked_with_hint(
                     match *value {
                         ValueDecl::Const(_) => match tc.eval_visible_const(*name, expr.span) {
                             Some(Ok(value)) => {
-                                checked_from_type(expr, const_eval::const_type(&value), tc)
+                                let ty = const_eval::const_type(&value);
+                                tc.record_const_value(expr.node.id, value);
+                                checked_from_type(expr, ty, tc)
                             }
                             Some(Err(err)) => {
                                 tc.push_error(err);

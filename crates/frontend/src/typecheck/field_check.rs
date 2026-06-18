@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use super::{
     MemberAccessKind, TypeChecker, TypeError,
     annotation::AccessPolicy,
-    decls::{FieldSchema, NamedSchemas, NominalKey},
+    decls::{FieldDefault, FieldSchema, NamedSchemas, NominalKey},
     member,
 };
 use crate::{
@@ -23,6 +23,13 @@ pub(super) struct CheckedField {
     pub(super) index: usize,
     pub(super) ty: Type,
     pub(super) policy: AccessPolicy,
+}
+
+pub(super) struct OmittedDefaultField {
+    pub(super) name: Ident,
+    pub(super) slot: usize,
+    pub(super) ty: Type,
+    pub(super) default: FieldDefault,
 }
 
 pub(super) enum FieldOwner {
@@ -61,6 +68,7 @@ pub(super) enum MissingFields<'a> {
 #[derive(Default)]
 pub(super) struct FieldShape {
     pub(super) fields: Vec<CheckedField>,
+    pub(super) default_fields: Vec<OmittedDefaultField>,
     pub(super) invalid_indices: Vec<usize>,
     pub(super) failed: bool,
 }
@@ -124,17 +132,33 @@ pub(super) fn check(
         }
     }
 
+    let mut default_fields = vec![];
     if let Some(span) = span {
-        for (name, field) in schema.iter() {
-            if !seen.contains(&name) && missing_required(missing, name, field) {
-                push_missing(owner, name, span, tc);
-                failed = true;
+        for (slot, (name, field)) in schema.iter().enumerate() {
+            if seen.contains(&name) {
+                continue;
+            }
+            match (missing, &field.default) {
+                (MissingFields::AllowDefaults, Some(default)) => {
+                    default_fields.push(OmittedDefaultField {
+                        name,
+                        slot,
+                        ty: field.ty.clone(),
+                        default: default.clone(),
+                    });
+                }
+                _ if missing_required(missing, name, field) => {
+                    push_missing(owner, name, span, tc);
+                    failed = true;
+                }
+                _ => {}
             }
         }
     }
 
     FieldShape {
         fields,
+        default_fields,
         invalid_indices,
         failed,
     }

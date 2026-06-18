@@ -5,12 +5,12 @@ use std::{
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
-    decls::{CallableId, ExtendId, GlobalKey},
+    decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_key_for_type},
     infer::{SemanticLocalId, TypeHandle},
     type_ops::type_has_unfinished_facts,
 };
 use crate::{
-    ast::{ContractRef, ExprId, Ident, ReturnSpec, TypeVisitor},
+    ast::{ConstValue, ContractRef, ExprId, Ident, ReturnSpec, TypeVisitor},
     externs::catalog::{
         ExternFieldRef, ExternFunctionId, ExternMethodRef, ExternOperatorRef, ExternStaticRef,
         ExternTypeId,
@@ -19,10 +19,12 @@ use crate::{
 };
 
 pub(crate) type SemanticExprTypeMap = HashMap<ExprId, SemanticExprType>;
+pub(crate) type ConstValueMap = HashMap<ExprId, ConstValue>;
 pub(crate) type CallMap = HashMap<ExprId, CallTarget>;
 pub(crate) type FunctionValueMap = HashMap<ExprId, FunctionValueFact>;
 pub(crate) type FunctionValueCallMap = HashMap<ExprId, FunctionValueCallFact>;
 pub(crate) type DefaultArgMap = HashMap<ExprId, Vec<DefaultArgFact>>;
+pub(crate) type DefaultFieldMap = HashMap<ExprId, Vec<DefaultFieldFact>>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ExpectedProjectionMap = HashMap<ExprId, ExpectedProjectionFact>;
@@ -298,7 +300,18 @@ pub(crate) struct DefaultArgFact {
     pub(crate) ty: Type,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultFieldFact {
+    pub(crate) aggregate: ExprId,
+    pub(crate) owner: Type,
+    pub(crate) owner_key: NominalKey,
+    pub(crate) field: Ident,
+    pub(crate) slot: usize,
+    pub(crate) default: DefaultExprSite,
+    pub(crate) ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DefaultExprSite {
     pub(crate) expr: ExprId,
     pub(crate) source: crate::source::SourceId,
@@ -328,10 +341,12 @@ pub(crate) struct SemanticExprType {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SemanticBodyFacts {
     pub(crate) expr_types: SemanticExprTypeMap,
+    pub(crate) const_values: ConstValueMap,
     pub(crate) calls: CallMap,
     pub(crate) function_values: FunctionValueMap,
     pub(crate) function_value_calls: FunctionValueCallMap,
     pub(crate) default_args: DefaultArgMap,
+    pub(crate) default_fields: DefaultFieldMap,
     pub(crate) extern_uses: ExternUseMap,
     pub(crate) member_paths: MemberPathMap,
     pub(crate) expected_projections: ExpectedProjectionMap,
@@ -348,10 +363,12 @@ pub(crate) struct SemanticBodyFacts {
 impl SemanticBodyFacts {
     fn merge_from(&mut self, facts: Self) {
         self.expr_types.extend(facts.expr_types);
+        self.const_values.extend(facts.const_values);
         self.calls.extend(facts.calls);
         self.function_values.extend(facts.function_values);
         self.function_value_calls.extend(facts.function_value_calls);
         self.default_args.extend(facts.default_args);
+        self.default_fields.extend(facts.default_fields);
         self.extern_uses.extend(facts.extern_uses);
         self.member_paths.extend(facts.member_paths);
         self.expected_projections.extend(facts.expected_projections);
@@ -369,6 +386,9 @@ impl SemanticBodyFacts {
         for fact in self.expr_types.values() {
             debug_assert!(fact.span.is_some());
         }
+        for expr_id in self.const_values.keys() {
+            debug_assert!(self.expr_types.contains_key(expr_id));
+        }
         for (expr_id, fact) in &self.function_values {
             debug_assert_eq!(*expr_id, fact.expr);
         }
@@ -385,6 +405,18 @@ impl SemanticBodyFacts {
                 } else {
                     debug_assert!(false, "default arg fact missing call target");
                 }
+                debug_assert!(!type_has_unfinished_facts(&fact.ty));
+            }
+        }
+        for (expr_id, facts) in &self.default_fields {
+            debug_assert!(self.expr_types.contains_key(expr_id));
+            for fact in facts {
+                debug_assert_eq!(*expr_id, fact.aggregate);
+                debug_assert_eq!(
+                    nominal_key_for_type(&fact.owner),
+                    Some(fact.owner_key.clone())
+                );
+                debug_assert!(!type_has_unfinished_facts(&fact.owner));
                 debug_assert!(!type_has_unfinished_facts(&fact.ty));
             }
         }
@@ -608,6 +640,12 @@ impl SemanticFactMaps {
         fact.ty = Some(ty);
     }
 
+    pub(crate) fn record_const_value(&mut self, site: SemanticExprSite, value: ConstValue) {
+        self.body_mut(site.body)
+            .const_values
+            .insert(site.expr, value);
+    }
+
     pub(crate) fn record_call(&mut self, site: SemanticExprSite, target: CallTarget) {
         self.body_mut(site.body).calls.insert(site.expr, target);
     }
@@ -636,6 +674,14 @@ impl SemanticFactMaps {
         self.body_mut(body)
             .default_args
             .entry(fact.call)
+            .or_default()
+            .push(fact);
+    }
+
+    pub(crate) fn record_default_field(&mut self, body: BodyInstanceKey, fact: DefaultFieldFact) {
+        self.body_mut(body)
+            .default_fields
+            .entry(fact.aggregate)
             .or_default()
             .push(fact);
     }

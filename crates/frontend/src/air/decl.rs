@@ -292,6 +292,14 @@ pub struct EnumDecl {
     pub variants: Vec<VariantDecl>,
 }
 
+impl EnumDecl {
+    pub fn is_unit_only(&self) -> bool {
+        self.variants
+            .iter()
+            .all(|variant| matches!(variant.shape, VariantShape::Unit))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreEnumKind {
     Option,
