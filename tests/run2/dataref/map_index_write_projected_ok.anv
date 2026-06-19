@@ -2,10 +2,13 @@
 // @frontend: new
 // @expect: success
 // @match-begin
-// 5
-// 0
-// 0
+// 2
+// 3
 // @match-end
+
+dataref Bag {
+    values: [string: int],
+}
 
 fn print_slot(slot: int?) {
     if let value? = slot {
@@ -16,10 +19,9 @@ fn print_slot(slot: int?) {
 }
 
 fn main() {
-    var counts: [string: int] = ["a": 5];
-    let removed = counts.remove("a");
-    let missing = counts.remove("a");
-    print_slot(removed);
-    print_slot(counts["a"]);
-    print_slot(missing);
+    var bag = Bag { values: ["a": 1] };
+    bag.values["a"] = 2;
+    bag.values["b"] = 3;
+    print_slot(bag.values["a"]);
+    print_slot(bag.values["b"]);
 }

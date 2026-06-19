@@ -31,13 +31,14 @@ use super::{
         RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
         RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
         RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
-        RirOptionSubject, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
+        RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
+        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
     target,
@@ -333,7 +334,7 @@ fn analysis_detects_tuple_before_index_write() {
 }
 
 #[test]
-fn analysis_keeps_map_index_projection_unsupported() {
+fn analysis_ignores_index_projection_on_map_value() {
     let program = nested_index_write_program(RirType::Map {
         key: RirTypeId::from_index(1),
         value: RirTypeId::from_index(1),
@@ -1086,6 +1087,11 @@ fn profile_accepts_dataref_field_projections() {
 }
 
 #[test]
+fn profile_accepts_dataref_map_index_assignment() {
+    check(dataref_map_index_assignment_program());
+}
+
+#[test]
 fn rir_verifies_valid_global_declaration_and_operations() {
     let program = valid_global_rir(|_| {});
 
@@ -1633,6 +1639,7 @@ fn rir_rejects_global_roots_in_unsupported_collection_operations() {
             map: rir_global_place(RirTypeId::from_index(0)),
             key: RirOperand::Const(RirConstId::from_index(0)),
             value: RirOperand::Const(RirConstId::from_index(0)),
+            kind: RirMapWriteKind::StructuralInsert,
         },
     ] {
         assert_rir_error(
@@ -3301,6 +3308,17 @@ fn emit_dataref_set_uses_short_mut_heap_borrow() {
 
     assert!(source.contains("rt.heap().with_mut(&v0, |storage| { storage.value = 1; })"));
     assert!(!source.contains("with_mut(&v0, |storage| { anv"));
+}
+
+#[test]
+fn emit_dataref_map_index_assignment_uses_mut_place() {
+    let source = plan_source(dataref_map_index_assignment_program()).into_string();
+
+    assert!(source.contains(&target::mut_place_dataref(
+        "__anv_dataref_collection_object",
+        "&__anv_dataref_collection_ops",
+    )));
+    assert!(!source.contains("rt.heap().with_mut(&v0, |storage| { storage.value ="));
 }
 
 #[test]
@@ -6997,162 +7015,6 @@ fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
     };
 
     rir::verify(&program).expect("multi-dynamic projected mut-place arg should verify");
-}
-
-#[test]
-fn rir_accepts_map_slot_projected_param_mut_place_arg() {
-    let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
-    let string = RirTypeId::from_index(2);
-    let slot = RirTypeId::from_index(3);
-    let map = RirTypeId::from_index(4);
-    let counts = RirLocalId::from_index(0);
-    let key = RirLocalId::from_index(1);
-    let program = RirProgram {
-        types: vec![
-            RirType::Void,
-            RirType::Int,
-            RirType::String,
-            RirType::Option(int),
-            RirType::Map {
-                key: string,
-                value: int,
-            },
-        ],
-        collection_storages: vec![rir_map_storage(0, map, string, int)],
-        functions: vec![
-            rir_function(
-                RirFunctionId::from_index(0),
-                void,
-                vec![rir_param(
-                    counts,
-                    map,
-                    RirParamSemantic::MutPlace,
-                    RirParamAbi::MutPlace,
-                )],
-                vec![
-                    rir_local(counts, map, true, "counts"),
-                    rir_local(key, string, false, "key"),
-                ],
-                vec![RirStmt::Eval(RirRValue::Call {
-                    callee: RirCallTarget::Function(RirFunctionId::from_index(1)),
-                    args: vec![RirCallArg::MutPlace(RirMutPlaceArg::projected(
-                        RirMutPlaceHandle::Param {
-                            local: counts,
-                            ty: map,
-                        },
-                        vec![RirProjection::MapIndex(key)],
-                        slot,
-                    ))],
-                    ty: void,
-                })],
-            ),
-            mut_place_optional_sink_function(RirFunctionId::from_index(1), slot),
-        ],
-        ..RirProgram::default()
-    };
-
-    rir::verify(&program).expect("map slot projected mut-place arg should verify");
-}
-
-#[test]
-fn rir_accepts_nested_dynamic_map_slot_projection() {
-    let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
-    let string = RirTypeId::from_index(2);
-    let slot = RirTypeId::from_index(3);
-    let map = RirTypeId::from_index(4);
-    let list = RirTypeId::from_index(5);
-    let maps = RirLocalId::from_index(0);
-    let index = RirLocalId::from_index(1);
-    let key = RirLocalId::from_index(2);
-    let program = RirProgram {
-        types: vec![
-            RirType::Void,
-            RirType::Int,
-            RirType::String,
-            RirType::Option(int),
-            RirType::Map {
-                key: string,
-                value: int,
-            },
-            RirType::List(map),
-        ],
-        collection_storages: vec![
-            rir_map_storage(0, map, string, int),
-            rir_list_storage_id(1, list, map),
-        ],
-        functions: vec![rir_function(
-            RirFunctionId::from_index(0),
-            void,
-            vec![],
-            vec![
-                rir_local(maps, list, true, "maps"),
-                rir_local(index, int, false, "i"),
-                rir_local(key, string, false, "key"),
-            ],
-            vec![RirStmt::Assign {
-                dst: RirPlace::local(
-                    maps,
-                    vec![RirProjection::Index(index), RirProjection::MapIndex(key)],
-                    slot,
-                ),
-                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
-            }],
-        )],
-        consts: vec![RirConst {
-            id: RirConstId::from_index(0),
-            ty: slot,
-            value: RirConstValue::Nil,
-        }],
-        ..RirProgram::default()
-    };
-
-    rir::verify(&program).expect("nested dynamic map slot projection should verify");
-}
-
-#[test]
-fn rir_rejects_map_slot_bad_key_type() {
-    let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
-    let string = RirTypeId::from_index(2);
-    let slot = RirTypeId::from_index(3);
-    let map = RirTypeId::from_index(4);
-    let counts = RirLocalId::from_index(0);
-    let key = RirLocalId::from_index(1);
-    let program = RirProgram {
-        types: vec![
-            RirType::Void,
-            RirType::Int,
-            RirType::String,
-            RirType::Option(int),
-            RirType::Map {
-                key: string,
-                value: int,
-            },
-        ],
-        functions: vec![rir_function(
-            RirFunctionId::from_index(0),
-            void,
-            vec![],
-            vec![
-                rir_local(counts, map, true, "counts"),
-                rir_local(key, int, false, "key"),
-            ],
-            vec![RirStmt::Assign {
-                dst: RirPlace::local(counts, vec![RirProjection::MapIndex(key)], slot),
-                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
-            }],
-        )],
-        consts: vec![RirConst {
-            id: RirConstId::from_index(0),
-            ty: slot,
-            value: RirConstValue::Nil,
-        }],
-        ..RirProgram::default()
-    };
-
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -12873,10 +12735,6 @@ fn mut_place_sink_function(id: RirFunctionId) -> RirFunction {
     mut_place_sink_function_with_ty(id, RirTypeId::from_index(1))
 }
 
-fn mut_place_optional_sink_function(id: RirFunctionId, ty: RirTypeId) -> RirFunction {
-    mut_place_sink_function_with_ty(id, ty)
-}
-
 fn mut_place_sink_function_with_ty(id: RirFunctionId, ty: RirTypeId) -> RirFunction {
     let source = RirLocalId::from_index(0);
     RirFunction {
@@ -14242,6 +14100,60 @@ fn dataref_field_projection_program() -> Program {
                 },
             ],
             air::AirTail::Return(Some(Operand::Place(place(out, int)))),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program
+}
+
+fn dataref_map_index_assignment_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let map = program.alloc_type(TypeData::Map {
+        key: int,
+        value: int,
+        order: air::MapOrder::Insertion,
+    });
+    let module = program.alloc_module(root_module());
+    let aggregate = dataref_decl(&mut program, module, map);
+    let node = program.alloc_type(TypeData::DataRef(aggregate));
+    let one = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let two = program.const_arena.alloc(ConstData {
+        ty: int,
+        value: ConstValue::Int(2),
+    });
+    let arg = air::LocalId::from_index(0);
+    let map_place = Place {
+        root: PlaceRoot::Local(arg),
+        projection: vec![Projection::Field(air::FieldId::from_index(0))],
+        ty: map,
+    };
+    let main = program.alloc_function(Function {
+        name: Ident::new("update"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("node", node, ParamMode::Value, arg)], void),
+        locals: vec![Local {
+            name: None,
+            binding: None,
+            ty: node,
+            mutability: Mutability::Mutable,
+            kind: LocalKind::Arg,
+        }],
+        body: structured_body(
+            vec![Statement::Eval(RValue::MapInsert {
+                map: map_place,
+                key: Operand::Const(one),
+                value: Operand::Const(two),
+                kind: air::MapWriteKind::IndexedAssignment,
+            })],
+            air::AirTail::Return(None),
         ),
     });
     program.module_mut(module).functions.push(main);

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mismatched types
+
+fn main() {
+    var counts: [string: int] = [:];
+    counts["a"] = nil;
+}

@@ -2,17 +2,11 @@
 // @frontend: new
 // @expect: success
 // @match-begin
-// 0
-// 7
+// a
+// 3
+// b
+// 4
 // @match-end
-
-fn clear(var slot: int?) {
-    slot = nil;
-}
-
-fn set_seven(var slot: int?) {
-    slot = 7;
-}
 
 fn print_slot(slot: int?) {
     if let value? = slot {
@@ -24,8 +18,13 @@ fn print_slot(slot: int?) {
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    clear(counts["a"]);
-    print_slot(counts["a"]);
-    set_seven(counts["b"]);
-    print_slot(counts["b"]);
+    let key = "a";
+    counts[key] = 3;
+    println(key);
+    print_slot(counts[key]);
+
+    let other = "b";
+    counts[other] = 4;
+    println(other);
+    print_slot(counts[other]);
 }

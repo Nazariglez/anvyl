@@ -2,15 +2,11 @@
 // @frontend: new
 // @expect: success
 // @match-begin
-// a
-// 3
-// b
+// 1
+// 2
 // 4
+// 0
 // @match-end
-
-fn set_four(var slot: int?) {
-    slot = 4;
-}
 
 fn print_slot(slot: int?) {
     if let value? = slot {
@@ -22,13 +18,12 @@ fn print_slot(slot: int?) {
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    let key = "a";
-    counts[key] = 3;
-    println(key);
-    print_slot(counts[key]);
+    var snapshot = counts;
+    counts["a"] = 2;
+    counts["b"] = 4;
 
-    let other = "b";
-    set_four(counts[other]);
-    println(other);
-    print_slot(counts[other]);
+    print_slot(snapshot["a"]);
+    print_slot(counts["a"]);
+    print_slot(counts["b"]);
+    print_slot(counts["c"]);
 }

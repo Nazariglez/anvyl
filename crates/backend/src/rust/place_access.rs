@@ -216,7 +216,6 @@ pub enum PlaceProjectionKind {
     ArrayIndex(LocalId),
     ListIndex(LocalId),
     SliceIndex(LocalId),
-    MapIndex(LocalId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,7 +709,6 @@ fn ordinary_projection_supported(kind: air_place::ProjectionKind) -> bool {
             | air_place::ProjectionKind::ArrayIndex(_)
             | air_place::ProjectionKind::ListIndex(_)
             | air_place::ProjectionKind::SliceIndex(_)
-            | air_place::ProjectionKind::MapIndex { .. }
     )
 }
 
@@ -720,7 +718,6 @@ fn projection_is_dynamic(kind: PlaceProjectionKind) -> bool {
         PlaceProjectionKind::ArrayIndex(_)
             | PlaceProjectionKind::ListIndex(_)
             | PlaceProjectionKind::SliceIndex(_)
-            | PlaceProjectionKind::MapIndex(_)
     )
 }
 
@@ -781,10 +778,6 @@ fn global_structural_mutation_projection_supported(
                 TypeData::Array { .. },
                 air_place::ProjectionKind::ArrayIndex(_),
             ) | (TypeData::List(_), air_place::ProjectionKind::ListIndex(_))
-                | (
-                    TypeData::Map { .. },
-                    air_place::ProjectionKind::MapIndex { .. }
-                )
         );
         if !supported {
             return false;
@@ -844,10 +837,6 @@ fn ordinary_mut_place_supported(
             && matches!(
                 (data, step.kind()),
                 (TypeData::List(_), air_place::ProjectionKind::ListIndex(_))
-                    | (
-                        TypeData::Map { .. },
-                        air_place::ProjectionKind::MapIndex { .. }
-                    )
             );
         let slice = allow_collections
             && matches!(
@@ -877,9 +866,6 @@ fn convert_projection(step: &air_place::ProjectionStep) -> PlaceProjection {
             air_place::ProjectionKind::ArrayIndex(local) => PlaceProjectionKind::ArrayIndex(local),
             air_place::ProjectionKind::ListIndex(local) => PlaceProjectionKind::ListIndex(local),
             air_place::ProjectionKind::SliceIndex(local) => PlaceProjectionKind::SliceIndex(local),
-            air_place::ProjectionKind::MapIndex { local, .. } => {
-                PlaceProjectionKind::MapIndex(local)
-            }
         },
     }
 }

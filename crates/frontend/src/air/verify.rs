@@ -4346,7 +4346,7 @@ fn verify_air_place_write(
     state: &LocalInit,
 ) {
     for projection in &place.projection {
-        if let Projection::Index(local) | Projection::MapIndex(local) = projection {
+        if let Projection::Index(local) = projection {
             verify_air_local_read(cx, function_id, index, *local, state);
         }
     }
@@ -5964,36 +5964,6 @@ fn verify_place(
                     return None;
                 }
                 current_ty = elem;
-            }
-            Projection::MapIndex(local) => {
-                let Some(key_local) = cx.program.function(function_id).locals.get(local.index())
-                else {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadReference(BadReference::InvalidLocal(*local)),
-                    );
-                    return None;
-                };
-                let Some((key, slot)) = typing::map_slot(cx.program, current_ty) else {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadPlace(BadPlace::IndexProjectionOnNonIndexable(
-                            current_ty,
-                        )),
-                    );
-                    return None;
-                };
-                if key_local.ty != key {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadPlace(BadPlace::IndexLocalTypeMismatch {
-                            expected: key,
-                            found: key_local.ty,
-                        }),
-                    );
-                    return None;
-                }
-                current_ty = slot;
             }
         }
     }

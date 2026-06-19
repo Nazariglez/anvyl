@@ -5,7 +5,7 @@ use super::{
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirCollectionLoanScope,
-        RirCollectionStorageKind, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
+        RirCollectionStorageKind, RirDataRefId, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
@@ -1780,7 +1780,9 @@ impl EmitCx<'_> {
                     )
                 }
             }
-            RirRValue::MapInsert { map, key, value } => {
+            RirRValue::MapInsert {
+                map, key, value, ..
+            } => {
                 let key = values.value_operand(key);
                 let value = values.value_operand(value);
                 if let Some(mutation) = self.collection_mutation(
@@ -2079,7 +2081,75 @@ impl EmitCx<'_> {
         if matches!(root.root, RirPlaceRoot::Local(_)) && places.mut_place_root_param(root) {
             return Some((vec![], places.local_place(root)));
         }
+        if let Some(place) = self.local_projected_mut_place(function, root) {
+            return Some(place);
+        }
+        if let Some(place) = self.dataref_projected_mut_place(function, root) {
+            return Some(place);
+        }
         self.global_mut_place(function, root)
+    }
+
+    fn dataref_projected_mut_place(
+        &self,
+        function: &RirFunction,
+        place: &RirPlace,
+    ) -> Option<(Vec<String>, String)> {
+        let RirPlaceRoot::Local(local) = place.root else {
+            return None;
+        };
+        let root_ty = function.locals.get(local.index())?.ty;
+        let RirType::DataRef(dataref) = self.program.types[root_ty.index()] else {
+            return None;
+        };
+        Some(self.prepared_dataref_place(
+            function,
+            &RirOperand::Place(RirPlace::local(local, vec![], root_ty)),
+            dataref,
+            &place.projections,
+            place.ty,
+            "__anv_dataref_collection_object",
+            "__anv_dataref_collection_ops",
+        ))
+    }
+
+    fn local_projected_mut_place(
+        &self,
+        function: &RirFunction,
+        place: &RirPlace,
+    ) -> Option<(Vec<String>, String)> {
+        if place.projections.is_empty() {
+            return None;
+        }
+        let RirPlaceRoot::Local(local) = place.root else {
+            return None;
+        };
+        let places = RustPlaces::new(self.program, function);
+        let (projection, root) = if let Some(projection) = places.mut_place_projection(place) {
+            let root = target::mut_place_reborrow(&projection.root);
+            (projection, root)
+        } else {
+            let local = function.locals.get(local.index())?;
+            let projection = places.projected_place(
+                local.ty,
+                local.symbol.as_str(),
+                place.ty,
+                &place.projections,
+            )?;
+            let root = target::mut_place_local(&projection.root);
+            (projection, root)
+        };
+        let values = RustValues::new(self.program, function);
+        let descriptor =
+            values.mut_place_projection_descriptor("__AnvCollectionPlaceOps", &projection);
+        Some((
+            vec![
+                descriptor.struct_decl,
+                descriptor.impl_decl,
+                format!("let __anv_collection_place_ops = {};", descriptor.ctor),
+            ],
+            target::mut_place_projected(&root, "&__anv_collection_place_ops"),
+        ))
     }
 
     fn global_mut_place(
@@ -2383,12 +2453,32 @@ impl EmitCx<'_> {
                     .1,
             );
         };
+        self.prepared_dataref_place(
+            function,
+            object,
+            *dataref,
+            &mut_place.projections,
+            mut_place.ty,
+            &format!("__anv_dataref_place_object_{index}"),
+            &format!("__anv_dataref_place_ops_{index}"),
+        )
+    }
+
+    fn prepared_dataref_place(
+        &self,
+        function: &RirFunction,
+        object: &RirOperand,
+        dataref: RirDataRefId,
+        projections: &[RirProjection],
+        ty: RirTypeId,
+        object_tmp: &str,
+        ops_tmp: &str,
+    ) -> (Vec<String>, String) {
+        let values = RustValues::new(self.program, function);
         let descriptor = self
             .dataref_places
-            .find(*dataref, &mut_place.projections, mut_place.ty)
+            .find(dataref, projections, ty)
             .expect("verified dataref place descriptor");
-        let object_tmp = format!("__anv_dataref_place_object_{index}");
-        let ops_tmp = format!("__anv_dataref_place_ops_{index}");
         let object = values.operand_ref(object);
         let heap_type = descriptor.heap_type_field(self.program);
         (
@@ -2404,7 +2494,7 @@ impl EmitCx<'_> {
                     target::heap_type_access("types", &heap_type)
                 ),
             ],
-            target::mut_place_dataref(&object_tmp, &format!("&{ops_tmp}")),
+            target::mut_place_dataref(object_tmp, &format!("&{ops_tmp}")),
         )
     }
 
@@ -2823,7 +2913,7 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         object: &RirOperand,
-        dataref: super::rir::RirDataRefId,
+        dataref: RirDataRefId,
         projections: &[RirProjection],
         ty: RirTypeId,
     ) -> String {
@@ -2842,7 +2932,7 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         object: &RirOperand,
-        dataref: super::rir::RirDataRefId,
+        dataref: RirDataRefId,
         projections: &[RirProjection],
         value: &RirOperand,
     ) -> String {

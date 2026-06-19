@@ -1,6 +1,5 @@
 use super::{
     dataref_place::{self as dataref_paths},
-    rep_policy::RustRepPolicy,
     rir::{
         RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirOptionSubject,
         RirParamAbi, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram, RirProjection, RirStmt,
@@ -35,24 +34,10 @@ pub(super) enum MutPlaceProjectionStep {
     ArrayIndex { index: String, len: u64 },
     ListIndex { index: String, version: String },
     SliceIndex { index: String },
-    MapIndex { key: String, value_ty: RirTypeId },
-}
-
-pub(super) struct MapSlotAccess {
-    pub map: String,
-    pub key: String,
-    pub key_value: String,
-    pub value_ty: RirTypeId,
-}
-
-pub(super) enum DynamicPlaceAccess {
-    MapSlot(MapSlotAccess),
-    SliceIndex(SliceIndexAccess),
 }
 
 pub(super) struct ProjectionFacts {
     pub(super) fallible_projection: bool,
-    pub(super) indexed_collection_write: bool,
 }
 
 pub(super) fn place_dynamic_facts(
@@ -82,11 +67,10 @@ fn dynamic_facts_from(
     ty: RirTypeId,
     projections: &[RirProjection],
 ) -> Option<ProjectionFacts> {
-    let (fallible_projection, indexed_collection_write) =
+    let fallible_projection =
         RirPlaceModel::new(program).projection_dynamic_facts(ty, projections)?;
     Some(ProjectionFacts {
         fallible_projection,
-        indexed_collection_write,
     })
 }
 
@@ -156,35 +140,6 @@ impl<'a> RustPlaces<'a> {
         };
         self.apply_projections(&mut rendered, projections, true);
         (rendered.ty == slot_ty).then_some(rendered.expr)
-    }
-
-    pub(super) fn map_slot_access_from(
-        &self,
-        root_ty: RirTypeId,
-        root: &str,
-        projections: &[RirProjection],
-    ) -> Option<MapSlotAccess> {
-        let (last, prefix) = projections.split_last()?;
-        let RirProjection::MapIndex(index) = last else {
-            return None;
-        };
-        let mut rendered = RenderedPlace {
-            expr: root.to_string(),
-            ty: root_ty,
-        };
-        self.apply_projections(&mut rendered, prefix, true);
-        let RirType::Map { key, value } = self.program.types[rendered.ty.index()] else {
-            return None;
-        };
-        Some(MapSlotAccess {
-            map: rendered.expr,
-            key: self.function.locals[index.index()]
-                .symbol
-                .as_str()
-                .to_string(),
-            key_value: self.captured_local_value(*index, key),
-            value_ty: value,
-        })
     }
 
     pub(super) fn record_field_place(&self, place: &RirPlace, field: &RirField) -> RirPlace {
@@ -289,22 +244,6 @@ impl<'a> RustPlaces<'a> {
                     ));
                     ty = field.ty;
                 }
-                RirProjection::MapIndex(index) => {
-                    let RirType::Map { key, value } = self.program.types[ty.index()] else {
-                        return None;
-                    };
-                    let field = format!("__k{}", fields.len());
-                    fields.push(format!(
-                        "{field}: {}",
-                        RustRepPolicy::new(self.program).rust_ty(key)
-                    ));
-                    inits.push((field.clone(), self.captured_local_value(*index, key)));
-                    steps.push(MutPlaceProjectionStep::MapIndex {
-                        key: field,
-                        value_ty: value,
-                    });
-                    ty = self.program.option_ty(value)?;
-                }
                 RirProjection::Index(index) => {
                     let local = self.function.locals[index.index()].symbol.as_str();
                     let field = format!("__i{}", fields.len());
@@ -380,51 +319,12 @@ impl<'a> RustPlaces<'a> {
                     "{{ let index = {checked}; {expr}.with_elem_shared_short(rt, index, {expr}.structural_version(), |value| {{ {body} }}) }}"
                 ))
             }
-            MutPlaceProjectionStep::SliceIndex { .. } | MutPlaceProjectionStep::MapIndex { .. } => {
-                None
-            }
+            MutPlaceProjectionStep::SliceIndex { .. } => None,
         }
     }
 
-    pub(super) fn dynamic_place_access(&self, place: &RirPlace) -> Option<DynamicPlaceAccess> {
-        if let Some(access) = self.map_slot_dynamic_access(place) {
-            return Some(DynamicPlaceAccess::MapSlot(access));
-        }
+    pub(super) fn dynamic_place_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
         self.slice_index_dynamic_access(place)
-            .map(DynamicPlaceAccess::SliceIndex)
-    }
-
-    fn map_slot_dynamic_access(&self, place: &RirPlace) -> Option<MapSlotAccess> {
-        let (last, prefix) = place.projections.split_last()?;
-        let RirProjection::MapIndex(index) = last else {
-            return None;
-        };
-        let RirPlaceRoot::Local(root_local) = place.root else {
-            unreachable!("expected a local RIR place")
-        };
-        let local = &self.function.locals[root_local.index()];
-        let root = local.symbol.as_str().to_string();
-        let mut rendered = RenderedPlace {
-            expr: if self.root_needs_deref(place) {
-                format!("(*{})", local.symbol.as_str())
-            } else {
-                root.clone()
-            },
-            ty: local.ty,
-        };
-        self.apply_projections(&mut rendered, prefix, true);
-        let RirType::Map { key, value } = self.program.types[rendered.ty.index()] else {
-            return None;
-        };
-        Some(MapSlotAccess {
-            map: rendered.expr,
-            key: self.function.locals[index.index()]
-                .symbol
-                .as_str()
-                .to_string(),
-            key_value: self.captured_local_value(*index, key),
-            value_ty: value,
-        })
     }
 
     fn slice_index_dynamic_access(&self, place: &RirPlace) -> Option<SliceIndexAccess> {
@@ -475,18 +375,6 @@ impl<'a> RustPlaces<'a> {
             || self.param_abi_for_local(local) == Some(RirParamAbi::MutBorrow)
     }
 
-    fn captured_local_value(&self, local: RirLocalId, ty: RirTypeId) -> String {
-        let symbol = self.function.locals[local.index()].symbol.as_str();
-        let policy = RustRepPolicy::new(self.program);
-        if policy.cow_value(ty) {
-            format!("{symbol}.share()")
-        } else if policy.copyable(ty) {
-            symbol.to_string()
-        } else {
-            format!("{symbol}.clone()")
-        }
-    }
-
     fn local_is_mut_place_param(&self, local: RirLocalId) -> bool {
         self.param_abi_for_local(local) == Some(RirParamAbi::MutPlace)
     }
@@ -529,9 +417,6 @@ impl<'a> RustPlaces<'a> {
                     rendered.expr.push('.');
                     rendered.expr.push_str(field.symbol.as_str());
                     rendered.ty = field.ty;
-                }
-                RirProjection::MapIndex(_) => {
-                    unreachable!("map slot projection has no Rust lvalue path")
                 }
                 RirProjection::Index(index) => {
                     let index = self.function.locals[index.index()].symbol.as_str();

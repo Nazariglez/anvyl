@@ -441,12 +441,6 @@ pub(super) fn map_remove_region(key: &str) -> String {
     format!("value.remove(rt, &{key})")
 }
 
-pub(super) fn map_optional_slot_set(map: &str, rt: &str, key: &str, slot: &str) -> String {
-    format!(
-        "match {slot} {{ Some(slot) => {{ {map}.insert({rt}, {key}.clone(), slot)?; Ok(()) }} None => {{ {map}.remove({rt}, &{key})?; Ok(()) }} }}"
-    )
-}
-
 pub(super) fn collection_structural_version(collection: &str) -> String {
     format!("{collection}.structural_version()")
 }

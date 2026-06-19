@@ -1,14 +1,11 @@
-// @mode: run
+// @mode: check
+// @expect: error
 // @frontend: new
-// @expect: success
-// @match: 2
+// @contains: var pattern requires a mutable place
 
 fn main() {
     var counts: [string: int] = ["a": 1];
     if var value? = counts["a"] {
-        value = 2;
-    }
-    if let value? = counts["a"] {
         println(value);
     }
 }

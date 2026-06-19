@@ -3509,13 +3509,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     }
                 }
                 let index_local = self.lower_index_local(&index.node.index)?;
-                if let Some((_, value_ty)) = typing::map_kv(&self.cx.program, place.ty) {
-                    place
-                        .projection
-                        .push(crate::air::Projection::MapIndex(index_local));
-                    place.ty = self.cx.optional_ty(value_ty);
-                    return Ok(place);
-                }
                 let Some(ty) = typing::index_elem(&self.cx.program, place.ty) else {
                     return Err(unsupported_expr(expr));
                 };
@@ -7126,6 +7119,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     ) -> Result<(), LowerError> {
         match assign.node.op {
             AssignOp::Assign => {
+                if self.lower_map_index_assignment(&assign.node.target, &assign.node.value)? {
+                    return Ok(());
+                }
                 if let Some(target) =
                     self.select_extern_target(assign.node.target.node.id, |target| {
                         matches!(target, ExternUseTarget::FieldWrite(_))
@@ -7224,6 +7220,48 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
             }
         }
+    }
+
+    fn lower_map_index_assignment(
+        &mut self,
+        target: &ExprNode,
+        value_expr: &ExprNode,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Index(index) = &target.node.kind else {
+            return Ok(false);
+        };
+        if index.node.safe || matches!(index.node.index.node.kind, ExprKind::Range(_)) {
+            return Ok(false);
+        }
+        if !matches!(
+            self.lower_expr_ty(index.node.target.node.id)?,
+            Type::Map { .. }
+        ) {
+            return Ok(false);
+        }
+
+        let map = if let Some(fact) = self.global_access(target.node.id).cloned() {
+            if fact.mode != GlobalAccessMode::ProjectedAssign {
+                return Err(unsupported_expr(target));
+            }
+            self.lower_global_projected_place(&index.node.target, &fact)?
+        } else {
+            let fact = self.local_use(target, LocalUseMode::Assign)?;
+            self.lower_projected_place(&index.node.target, self.binding_place(&fact)?)?
+        };
+        let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
+            return Err(unsupported_expr(target));
+        };
+        self.require_mutable_place(target, &map)?;
+        let key = self.lower_value_to(&index.node.index, key_ty, target)?;
+        let value = self.lower_value_to(value_expr, value_ty, value_expr)?;
+        self.emit_eval(RValue::MapInsert {
+            map,
+            key,
+            value,
+            kind: MapWriteKind::IndexedAssignment,
+        })?;
+        Ok(true)
     }
 
     fn lower_place(&mut self, expr: &ExprNode, fact: &LocalUseFact) -> Result<Place, LowerError> {
@@ -13080,25 +13118,7 @@ fn f() {
     }
 
     #[test]
-    fn source_var_map_index_lowers_to_mut_borrow_projection() {
-        let air = lower_root(
-            "fn clear(var slot: int?) {} fn f(var counts: [string: int]) { clear(counts[\"a\"]); }",
-            "f",
-        )
-        .expect("lower failed");
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Eval(RValue::Call {
-                    callee: Callee::Function(_),
-                    args,
-                }) if matches!(args.as_slice(), [CallArg::MutBorrow(place)] if matches!(place.projection.as_slice(), [crate::air::Projection::MapIndex(_)]))
-            )
-        }));
-    }
-
-    #[test]
-    fn map_index_assignment_lowers_to_optional_slot_place() {
+    fn map_index_assignment_lowers_to_indexed_insert() {
         let air = lower_root(
             "fn f(var counts: [string: int]) { counts[\"a\"] = 1; }",
             "f",
@@ -13107,10 +13127,16 @@ fn f() {
         assert!(program_statements(&air).any(|statement| {
             matches!(
                 statement,
-                AirStmt::Assign { dst, value: RValue::Use(_) }
-                    if matches!(dst.projection.as_slice(), [crate::air::Projection::MapIndex(_)])
+                AirStmt::Eval(RValue::MapInsert {
+                    kind: MapWriteKind::IndexedAssignment,
+                    ..
+                })
             )
         }));
+        assert!(
+            !program_statements(&air)
+                .any(|statement| { matches!(statement, AirStmt::Assign { .. }) })
+        );
     }
 
     #[test]

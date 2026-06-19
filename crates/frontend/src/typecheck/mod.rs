@@ -39,7 +39,7 @@ use self::{
     },
     pattern::{PatternBindMode, PatternContext, PatternRoot, PatternRootInput},
     place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
-    postfix::{PostfixStep, check_postfix_chain, collect_postfix_chain},
+    postfix::{PostfixStep, check_map_key, check_postfix_chain, collect_postfix_chain},
     type_ops::type_contains_dyn_value,
     type_refs::LocalTypeScopes,
 };
@@ -5196,7 +5196,16 @@ fn sync_assigned_flow(
 }
 
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
-    let target = check_place(&assign.node.target, tc);
+    if assign.node.op == AssignOp::Assign && check_simple_index_assignment(assign, tc) {
+        return;
+    }
+
+    let target = check_assignment_place(&assign.node.target, tc);
+    if assign.node.op == AssignOp::Assign {
+        check_simple_assignment(assign, &target, tc);
+        return;
+    }
+
     if let Some(error) = target.value.access.assign_error(
         assignment_target_name(&assign.node.target),
         tc.error_span(assign.node.target.span),
@@ -5211,48 +5220,126 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
         tc.push_error(error);
     }
 
-    match assign_op_to_binary_op(assign.node.op) {
-        None => {
-            let value =
-                check_expected_value_expr(&assign.node.value, target.checked().handle.clone(), tc);
-            let function_value = matches!(value.ty, Type::Func { .. });
-            if !target.accepts_extern_any() {
-                tc.reject_extern_any_escape(&value, assign.node.value.span);
-            }
-            if target.value.access.can_assign() {
-                sync_assigned_flow(&assign.node.target, &assign.node.value, function_value, tc);
-                place::record_write(assign.node.target.node.id, &target, tc);
-            }
-        }
-        Some(op) => {
-            let value = check_expr_checked(&assign.node.value, tc);
-            let target_value = CheckedType {
-                ty: target.checked().ty.clone(),
-                handle: target.checked().handle.clone(),
-                contains_extern_any: target.checked().contains_extern_any,
-            };
-            let result = check_binary_checked(
-                expr_id,
-                op,
-                &assign.node.target,
-                target_value,
-                &assign.node.value,
-                value,
-                assign.span,
-                tc,
-            );
-            if !target.checked().ty.is_void() && !result.ty.is_void() {
-                tc.expect_assignable_expr(
-                    assign.node.value.span,
-                    assign.node.value.node.id,
-                    result.handle,
-                    target.checked().handle.clone(),
-                );
-            }
-            if target.value.access.can_assign() {
-                place::record_compound_write(assign.node.target.node.id, &target, tc);
-            }
-        }
+    let Some(op) = assign_op_to_binary_op(assign.node.op) else {
+        return;
+    };
+    let value = check_expr_checked(&assign.node.value, tc);
+    let target_value = CheckedType {
+        ty: target.checked().ty.clone(),
+        handle: target.checked().handle.clone(),
+        contains_extern_any: target.checked().contains_extern_any,
+    };
+    let result = check_binary_checked(
+        expr_id,
+        op,
+        &assign.node.target,
+        target_value,
+        &assign.node.value,
+        value,
+        assign.span,
+        tc,
+    );
+    if !target.checked().ty.is_void() && !result.ty.is_void() {
+        tc.expect_assignable_expr(
+            assign.node.value.span,
+            assign.node.value.node.id,
+            result.handle,
+            target.checked().handle.clone(),
+        );
+    }
+    if target.value.access.can_assign() {
+        place::record_compound_write(assign.node.target.node.id, &target, tc);
+    }
+}
+
+fn check_assignment_place(target: &ExprNode, tc: &mut TypeChecker) -> place::CheckedPlace {
+    let ExprKind::Index(index) = &target.node.kind else {
+        return check_place(target, tc);
+    };
+    let receiver = check_place(&index.node.target, tc);
+    place::check_indexed_place(target, index, receiver, tc)
+}
+
+fn check_simple_index_assignment(assign: &AssignNode, tc: &mut TypeChecker) -> bool {
+    let ExprKind::Index(index) = &assign.node.target.node.kind else {
+        return false;
+    };
+    if index.node.safe || matches!(index.node.index.node.kind, ExprKind::Range(_)) {
+        return false;
+    }
+
+    let target = check_place(&index.node.target, tc);
+    let Type::Map { key, value } = target.checked().ty.clone() else {
+        let target = place::check_indexed_place(&assign.node.target, index, target, tc);
+        check_simple_assignment(assign, &target, tc);
+        return true;
+    };
+
+    check_map_index_assignment(assign, index, &target, &key, &value, tc);
+    true
+}
+
+fn check_map_index_assignment(
+    assign: &AssignNode,
+    index: &IndexNode,
+    target: &place::CheckedPlace,
+    key: &Type,
+    value: &Type,
+    tc: &mut TypeChecker,
+) {
+    check_map_key(index, key, tc);
+    if let Some(error) = target.value.access.assign_error(
+        assignment_target_name(&index.node.target),
+        tc.error_span(index.node.target.span),
+    ) {
+        tc.push_error(error);
+    }
+    let projected_identity = target.value.identity.clone().index();
+    if let Some(error) = collection_loan::root_rebind_error(
+        &tc.active_collection_loans,
+        &projected_identity,
+        tc.error_span(assign.node.target.span),
+    ) {
+        tc.push_error(error);
+    }
+
+    let value_handle = tc.type_handle(value);
+    let value = check_expected_value_expr(&assign.node.value, value_handle, tc);
+    if !target.accepts_extern_any() {
+        tc.reject_extern_any_escape(&value, assign.node.value.span);
+    }
+    if target.value.access.can_assign() {
+        tc.record_escaping_use(&assign.node.value);
+        place::record_projected_write(assign.node.target.node.id, target, tc);
+    }
+}
+
+fn check_simple_assignment(
+    assign: &AssignNode,
+    target: &place::CheckedPlace,
+    tc: &mut TypeChecker,
+) {
+    if let Some(error) = target.value.access.assign_error(
+        assignment_target_name(&assign.node.target),
+        tc.error_span(assign.node.target.span),
+    ) {
+        tc.push_error(error);
+    }
+    if let Some(error) = collection_loan::root_rebind_error(
+        &tc.active_collection_loans,
+        &target.value.identity,
+        tc.error_span(assign.node.target.span),
+    ) {
+        tc.push_error(error);
+    }
+    let value = check_expected_value_expr(&assign.node.value, target.checked().handle.clone(), tc);
+    let function_value = matches!(value.ty, Type::Func { .. });
+    if !target.accepts_extern_any() {
+        tc.reject_extern_any_escape(&value, assign.node.value.span);
+    }
+    if target.value.access.can_assign() {
+        sync_assigned_flow(&assign.node.target, &assign.node.value, function_value, tc);
+        place::record_write(assign.node.target.node.id, target, tc);
     }
 }
 

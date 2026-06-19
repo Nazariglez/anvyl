@@ -2790,6 +2790,14 @@ pub(super) fn check_index_access(
     check_index_access_inner(node, target, tc)
 }
 
+pub(super) fn check_map_key(node: &IndexNode, key: &Type, tc: &mut TypeChecker) -> CheckedType {
+    let key_handle = tc.type_handle(key);
+    let index = check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
+    tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
+    tc.solve_constraints();
+    index
+}
+
 fn check_index_access_inner(
     node: &IndexNode,
     target: &CheckedType,
@@ -2808,13 +2816,9 @@ fn check_index_access_inner(
             check_sequence_scalar_index(node, target, elem, None, tc)
         }
         Type::Map { key, value } => {
-            let key_handle = tc.type_handle(key);
-            let index =
-                check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
-            tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
-            tc.solve_constraints();
-            let value = tc.core_option_or_infer((**value).clone(), node.span);
-            CheckedIndex::same_projected(value, target, &index)
+            let index = check_map_key(node, key, tc);
+            let read_ty = tc.core_option_or_infer((**value).clone(), node.span);
+            CheckedIndex::value(read_ty, target, &index)
         }
         Type::Infer => {
             let index = check_expr_checked(&node.node.index, tc);

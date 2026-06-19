@@ -25,8 +25,8 @@ use std::{
 use anvyx_frontend::{
     air::{
         self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, GlobalId,
-        LocalId, LocalKind, Mutability, Operand, ParamEscape, ParamMode, Place, Projection, RValue,
-        TypeData, TypeId, TypePassClasses, VerifiedProgram,
+        LocalId, LocalKind, MapWriteKind, Mutability, Operand, ParamEscape, ParamMode, Place,
+        Projection, RValue, TypeData, TypeId, TypePassClasses, VerifiedProgram,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -50,10 +50,10 @@ use self::{
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern,
-        RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirLoop, RirLoopId, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
+        RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi,
+        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
         RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
         RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
         RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
@@ -2541,11 +2541,18 @@ impl<'a> PlanCx<'a> {
                 map,
                 key,
                 value,
-                kind: _,
+                kind,
             } => {
                 let key = self.plan_operand_read(function, key, locals);
                 let value = self.plan_operand_read(function, value, locals);
-                let map = self.lower_structural_mutation_place(function, map);
+                let map = match kind {
+                    MapWriteKind::StructuralInsert => {
+                        self.lower_structural_mutation_place(function, map)
+                    }
+                    MapWriteKind::IndexedAssignment => {
+                        self.lower_collection_write_place(function, map)
+                    }
+                };
                 let mut stmts = key.stmts;
                 stmts.extend(value.stmts);
                 stmts.extend(map.stmts);
@@ -2555,6 +2562,7 @@ impl<'a> PlanCx<'a> {
                         map: map.place,
                         key: key.operand,
                         value: value.operand,
+                        kind: rir_map_write_kind(*kind),
                     },
                     post_stmts: map.post_stmts,
                 }
@@ -3451,7 +3459,7 @@ impl<'a> PlanCx<'a> {
         for projection in &dataref.remaining {
             current_place
                 .projections
-                .push(Self::rir_plan_projection(projection));
+                .push(Self::rir_place_projection(projection));
             current_place.ty = self.type_map[&projection.ty];
         }
         PlannedOperand {
@@ -3501,6 +3509,18 @@ impl<'a> PlanCx<'a> {
         PlannedPlace {
             stmts: vec![],
             place: self.plan_place_in_function(function, place),
+            post_stmts: vec![],
+        }
+    }
+
+    fn lower_collection_write_place(&self, function: FunctionId, place: &Place) -> PlannedPlace {
+        let plan = self
+            .access()
+            .plan(function, PlaceAccessIntent::Assign, place)
+            .expect("profile verifies collection writes");
+        PlannedPlace {
+            stmts: vec![],
+            place: self.plan_access_place(function, &plan, place),
             post_stmts: vec![],
         }
     }
@@ -3839,7 +3859,7 @@ impl<'a> PlanCx<'a> {
         for projection in &dataref.object_prefix {
             current_place
                 .projections
-                .push(Self::rir_plan_projection(projection));
+                .push(Self::rir_place_projection(projection));
             current_place.ty = self.type_map[&projection.ty];
         }
         current_place
@@ -3859,7 +3879,7 @@ impl<'a> PlanCx<'a> {
             projections: segment
                 .storage
                 .iter()
-                .map(Self::rir_plan_projection)
+                .map(Self::rir_place_projection)
                 .collect(),
             ty: segment.storage_ty,
         }
@@ -4079,7 +4099,7 @@ impl<'a> PlanCx<'a> {
         id
     }
 
-    fn rir_plan_projection(projection: &PlaceProjection) -> RirProjection {
+    fn rir_place_projection(projection: &PlaceProjection) -> RirProjection {
         match projection.kind {
             PlaceProjectionKind::Field(field) | PlaceProjectionKind::DataRefField(field) => {
                 RirProjection::Field(RirFieldId::from_index(field.index()))
@@ -4092,9 +4112,6 @@ impl<'a> PlanCx<'a> {
             | PlaceProjectionKind::SliceIndex(local) => {
                 RirProjection::Index(RirLocalId::from_index(local.index()))
             }
-            PlaceProjectionKind::MapIndex(local) => {
-                RirProjection::MapIndex(RirLocalId::from_index(local.index()))
-            }
             PlaceProjectionKind::ExternField | PlaceProjectionKind::VariantField => {
                 unreachable!("profile rejects unsupported projection")
             }
@@ -4105,9 +4122,6 @@ impl<'a> PlanCx<'a> {
         match projection {
             Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
             Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
-            Projection::MapIndex(local) => {
-                RirProjection::MapIndex(RirLocalId::from_index(local.index()))
-            }
             Projection::TupleField(index) => {
                 RirProjection::TupleField(RirFieldId::from_index(*index as usize))
             }
@@ -4175,31 +4189,9 @@ impl<'a> PlanCx<'a> {
             projections: plan
                 .projection
                 .iter()
-                .map(Self::rir_access_projection)
+                .map(Self::rir_place_projection)
                 .collect(),
             ty: self.type_map[&plan.ty],
-        }
-    }
-
-    fn rir_access_projection(projection: &PlaceProjection) -> RirProjection {
-        match projection.kind {
-            PlaceProjectionKind::Field(field) | PlaceProjectionKind::DataRefField(field) => {
-                RirProjection::Field(RirFieldId::from_index(field.index()))
-            }
-            PlaceProjectionKind::TupleField(index) => {
-                RirProjection::TupleField(RirFieldId::from_index(index as usize))
-            }
-            PlaceProjectionKind::ArrayIndex(local)
-            | PlaceProjectionKind::ListIndex(local)
-            | PlaceProjectionKind::SliceIndex(local) => {
-                RirProjection::Index(RirLocalId::from_index(local.index()))
-            }
-            PlaceProjectionKind::MapIndex(local) => {
-                RirProjection::MapIndex(RirLocalId::from_index(local.index()))
-            }
-            PlaceProjectionKind::ExternField | PlaceProjectionKind::VariantField => {
-                unreachable!("profile rejects unsupported collection-loan projection")
-            }
         }
     }
 
@@ -4241,6 +4233,13 @@ fn rir_collection_root_kind(kind: air::AirCollectionRootKind) -> RirCollectionRo
         air::AirCollectionRootKind::FixedArray => RirCollectionRootKind::FixedArray,
         air::AirCollectionRootKind::Slice => RirCollectionRootKind::Slice,
         air::AirCollectionRootKind::Map => RirCollectionRootKind::Map,
+    }
+}
+
+fn rir_map_write_kind(kind: MapWriteKind) -> RirMapWriteKind {
+    match kind {
+        MapWriteKind::IndexedAssignment => RirMapWriteKind::IndexedAssignment,
+        MapWriteKind::StructuralInsert => RirMapWriteKind::StructuralInsert,
     }
 }
 

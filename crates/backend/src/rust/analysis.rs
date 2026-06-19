@@ -64,7 +64,7 @@ fn stmt_calls_fallible(
         | RirStmt::MapValueSet { .. } => true,
         RirStmt::Assign { dst, value } => {
             place_is_mut_place_param(function, dst)
-                || place_has_indexed_collection_write(program, function, dst)
+                || place_has_fallible_projection(program, function, dst)
                 || program.collection_replace_ty(dst.ty)
                 || rvalue_calls_fallible(program, fallible, function, value)
         }
@@ -247,15 +247,6 @@ fn call_arg_has_fallible_place(
         }
         RirCallArg::SharedStringConst(_) | RirCallArg::MutPlace(_) => false,
     }
-}
-
-fn place_has_indexed_collection_write(
-    program: &RirProgram,
-    function: &RirFunction,
-    place: &RirPlace,
-) -> bool {
-    place_dynamic_facts(program, function, place)
-        .is_some_and(|facts| facts.indexed_collection_write)
 }
 
 fn place_has_fallible_projection(
@@ -533,8 +524,13 @@ fn rvalue_operand_context_use(
             place_context_use(program, function, map)
                 .union(operand_context_use(program, function, key))
         }
-        RirRValue::MapInsert { map, key, value } => place_context_use(program, function, map)
-            .union(operands_context_use(program, function, [key, value])),
+        RirRValue::MapInsert {
+            map, key, value, ..
+        } => place_context_use(program, function, map).union(operands_context_use(
+            program,
+            function,
+            [key, value],
+        )),
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
             place_context_use(program, function, map)
         }
@@ -830,7 +826,9 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
             place_is_mut_place_param(function, map) || operand_uses_mut_place_param(function, key)
         }
-        RirRValue::MapInsert { map, key, value } => {
+        RirRValue::MapInsert {
+            map, key, value, ..
+        } => {
             place_is_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
         }

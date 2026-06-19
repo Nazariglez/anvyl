@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mismatched types
+
+fn main() {
+    var counts: [string: int] = [:];
+    let maybe: int? = .Some(1);
+    counts["a"] = maybe;
+}

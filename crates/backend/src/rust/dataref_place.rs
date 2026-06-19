@@ -1,6 +1,7 @@
 use super::rir::{
-    RirCallArg, RirDataRefId, RirFieldId, RirMutPlaceAccess, RirOptionMatch, RirOptionSubject,
-    RirPlaceModel, RirProgram, RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
+    RirCallArg, RirDataRefId, RirFieldId, RirFunction, RirMapWriteKind, RirMutPlaceAccess,
+    RirOptionMatch, RirOptionSubject, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram,
+    RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -30,7 +31,7 @@ impl DataRefPlaceDescriptors {
     pub(super) fn build(program: &RirProgram) -> Self {
         let mut descriptors = Self::default();
         for function in &program.functions {
-            descriptors.collect_block(program, &function.body);
+            descriptors.collect_block(program, function, &function.body);
         }
         descriptors
     }
@@ -39,13 +40,18 @@ impl DataRefPlaceDescriptors {
         &self.descriptors
     }
 
-    fn collect_block(&mut self, program: &RirProgram, block: &RirStructuredBlock) {
+    fn collect_block(
+        &mut self,
+        program: &RirProgram,
+        function: &RirFunction,
+        block: &RirStructuredBlock,
+    ) {
         for stmt in &block.stmts {
-            self.collect_stmt(program, stmt);
+            self.collect_stmt(program, function, stmt);
         }
     }
 
-    fn collect_stmt(&mut self, program: &RirProgram, stmt: &RirStmt) {
+    fn collect_stmt(&mut self, program: &RirProgram, function: &RirFunction, stmt: &RirStmt) {
         match stmt {
             RirStmt::Init { value, .. }
             | RirStmt::Assign { value, .. }
@@ -56,52 +62,90 @@ impl DataRefPlaceDescriptors {
             | RirStmt::CellInit { value, .. }
             | RirStmt::CellSet { value, .. }
             | RirStmt::ScopedPlaceCellSet { value, .. } => {
-                self.collect_rvalue(program, value);
+                self.collect_rvalue(program, function, value);
             }
             RirStmt::GlobalEnsure { .. }
             | RirStmt::DataRefSet { .. }
             | RirStmt::MapValueSet { .. } => {}
             RirStmt::If(branch) => {
-                self.collect_block(program, &branch.then_block);
+                self.collect_block(program, function, &branch.then_block);
                 if let Some(block) = &branch.else_block {
-                    self.collect_block(program, block);
+                    self.collect_block(program, function, block);
                 }
             }
-            RirStmt::Loop(loop_) => self.collect_block(program, &loop_.body),
-            RirStmt::CollectionLoanScope(scope) => self.collect_block(program, &scope.body),
-            RirStmt::CollectionSlotScope(block) => self.collect_block(program, block),
+            RirStmt::Loop(loop_) => self.collect_block(program, function, &loop_.body),
+            RirStmt::CollectionLoanScope(scope) => {
+                self.collect_block(program, function, &scope.body);
+            }
+            RirStmt::CollectionSlotScope(block) => self.collect_block(program, function, block),
             RirStmt::EnumMatch(match_) => {
                 for arm in &match_.arms {
-                    self.collect_block(program, &arm.block);
+                    self.collect_block(program, function, &arm.block);
                 }
                 if let Some(block) = &match_.else_block {
-                    self.collect_block(program, block);
+                    self.collect_block(program, function, block);
                 }
             }
-            RirStmt::OptionMatch(match_) => self.collect_option_match(program, match_),
+            RirStmt::OptionMatch(match_) => self.collect_option_match(program, function, match_),
         }
     }
 
-    fn collect_option_match(&mut self, program: &RirProgram, match_: &RirOptionMatch) {
+    fn collect_option_match(
+        &mut self,
+        program: &RirProgram,
+        function: &RirFunction,
+        match_: &RirOptionMatch,
+    ) {
         if let RirOptionSubject::MutPlace(arg) = &match_.subject
             && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
         {
             self.intern(program, dataref, &arg.projections, arg.ty);
         }
-        self.collect_block(program, &match_.some_block);
-        self.collect_block(program, &match_.none_block);
+        self.collect_block(program, function, &match_.some_block);
+        self.collect_block(program, function, &match_.none_block);
     }
 
-    fn collect_rvalue(&mut self, program: &RirProgram, value: &RirRValue) {
-        let RirRValue::Call { args, .. } = value else {
+    fn collect_rvalue(&mut self, program: &RirProgram, function: &RirFunction, value: &RirRValue) {
+        match value {
+            RirRValue::Call { args, .. } => {
+                for arg in args {
+                    if let RirCallArg::MutPlace(arg) = arg
+                        && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
+                    {
+                        self.intern(program, dataref, &arg.projections, arg.ty);
+                    }
+                }
+            }
+            RirRValue::MapInsert {
+                map,
+                kind: RirMapWriteKind::IndexedAssignment,
+                ..
+            } => self.intern_dataref_place(program, function, map),
+            _ => {}
+        }
+    }
+
+    fn intern_dataref_place(
+        &mut self,
+        program: &RirProgram,
+        function: &RirFunction,
+        place: &RirPlace,
+    ) {
+        let RirPlaceRoot::Local(local) = place.root else {
             return;
         };
-        for arg in args {
-            if let RirCallArg::MutPlace(arg) = arg
-                && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
-            {
-                self.intern(program, dataref, &arg.projections, arg.ty);
-            }
+        let Some(local) = function.locals.get(local.index()) else {
+            return;
+        };
+        let Some(RirType::DataRef(dataref)) = program.types.get(local.ty.index()).copied() else {
+            return;
+        };
+        if !place.projections.is_empty()
+            && RirPlaceModel::new(program)
+                .dataref_storage_path(dataref, &place.projections)
+                .is_ok()
+        {
+            self.intern(program, dataref, &place.projections, place.ty);
         }
     }
 
@@ -170,7 +214,7 @@ fn descriptor_symbol(
         match step.projection {
             RirProjection::Field(_) => parts.push(step.symbol.as_str().to_string()),
             RirProjection::TupleField(field) => parts.push(tuple_field_part(field)),
-            RirProjection::Index(_) | RirProjection::MapIndex(_) => {
+            RirProjection::Index(_) => {
                 unreachable!("verified dataref place descriptor projection")
             }
         }

@@ -1,8 +1,5 @@
 use super::{
-    place::{
-        DynamicPlaceAccess, MutPlaceProjection, MutPlaceProjectionStep, RustPlaces,
-        projected_ops_ctor,
-    },
+    place::{MutPlaceProjection, MutPlaceProjectionStep, RustPlaces, projected_ops_ctor},
     rep_policy::{
         RustBorrowView, RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy,
     },
@@ -213,9 +210,6 @@ impl<'a> RustValues<'a> {
         if self.places.mut_place_projection(place).is_some() {
             return self.mut_place_projected_value_operand(place);
         }
-        if let Some(value) = self.map_slot_value_operand(place) {
-            return value;
-        }
         let place_expr = self.place(place);
         match self.policy.materialization_for(
             place.ty,
@@ -256,9 +250,6 @@ impl<'a> RustValues<'a> {
                 if let Some(value) = self.global_value_operand(place) {
                     return value;
                 }
-                if let Some(value) = self.map_slot_value_operand(place) {
-                    return value;
-                }
                 match self.program.types[place.ty.index()] {
                     RirType::Struct(id) if self.program.structs[id.index()].copyable => {
                         self.copy_struct_place(place)
@@ -295,17 +286,10 @@ impl<'a> RustValues<'a> {
         let root_ty = self.program.globals[global.index()].ty;
         let guard = "__anv_global";
         let root = format!("(&*{guard})");
-        let value = if let Some(access) =
-            self.places
-                .map_slot_access_from(root_ty, &root, &place.projections)
-        {
-            self.map_slot_value_expr(&access)
-        } else {
-            let expr = self
-                .places
-                .projected_expr(root_ty, &root, place.ty, &place.projections)?;
-            self.value_from_place(place.ty, &expr)
-        };
+        let expr = self
+            .places
+            .projected_expr(root_ty, &root, place.ty, &place.projections)?;
+        let value = self.value_from_place(place.ty, &expr);
         let read = target::global_read(
             &Self::global_slot_expr(self.program, global),
             &Self::global_init_call(self.program, global),
@@ -336,7 +320,7 @@ impl<'a> RustValues<'a> {
             return set;
         }
         if let Some(access) = self.places.dynamic_place_access(dst) {
-            return Self::dynamic_place_assign(access, value);
+            return Self::assign_slice_index(&access, value);
         }
         let dst_expr = self.places.local_place(dst);
         if self.places.mut_place_root_param(dst) {
@@ -345,13 +329,6 @@ impl<'a> RustValues<'a> {
             target::replace_collection(&dst_expr, value)
         } else {
             format!("{dst_expr} = {value}")
-        }
-    }
-
-    fn dynamic_place_assign(access: DynamicPlaceAccess, value: &str) -> String {
-        match access {
-            DynamicPlaceAccess::MapSlot(access) => Self::assign_map_slot(&access, value),
-            DynamicPlaceAccess::SliceIndex(access) => Self::assign_slice_index(&access, value),
         }
     }
 
@@ -394,36 +371,6 @@ impl<'a> RustValues<'a> {
         }
     }
 
-    fn assign_map_slot(access: &super::place::MapSlotAccess, value: &str) -> String {
-        let set = target::map_optional_slot_set(
-            "value",
-            target::runtime_param_name(),
-            "__anv_map_key",
-            "__anv_map_slot",
-        );
-        format!(
-            "{{ let __anv_map_key = {}; let __anv_map_slot = {value}; let value = &mut {}; {set}?; }}",
-            access.key_value, access.map
-        )
-    }
-
-    fn map_slot_value_operand(&self, place: &RirPlace) -> Option<String> {
-        let DynamicPlaceAccess::MapSlot(access) = self.places.dynamic_place_access(place)? else {
-            return None;
-        };
-        Some(self.map_slot_value_expr(&access))
-    }
-
-    fn map_slot_value_expr(&self, access: &super::place::MapSlotAccess) -> String {
-        let value = self.value_from_place(access.value_ty, "value");
-        format!(
-            "{}.get({}, &{})?.map(|value| {value})",
-            access.map,
-            target::runtime_param_name(),
-            access.key
-        )
-    }
-
     fn needs_dynamic_set_region(projection: &MutPlaceProjection) -> bool {
         projection
             .steps
@@ -434,9 +381,7 @@ impl<'a> RustValues<'a> {
     fn dynamic_projection_step(step: &MutPlaceProjectionStep) -> bool {
         matches!(
             step,
-            MutPlaceProjectionStep::ListIndex { .. }
-                | MutPlaceProjectionStep::SliceIndex { .. }
-                | MutPlaceProjectionStep::MapIndex { .. }
+            MutPlaceProjectionStep::ListIndex { .. } | MutPlaceProjectionStep::SliceIndex { .. }
         )
     }
 
@@ -572,8 +517,8 @@ impl<'a> RustValues<'a> {
         slot_ty: &str,
         steps: &[MutPlaceProjectionStep],
     ) -> String {
-        let access = self.projected_access("root", true, steps);
-        let mutate = self.projected_mutate("root", true, steps);
+        let access = Self::projected_access("root", true, steps);
+        let mutate = Self::projected_mutate("root", true, steps);
         format!(
             "impl<'cx> {} for {ops} {{ fn access(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
             target::projection_ops_ty(root_ty, slot_ty),
@@ -584,12 +529,7 @@ impl<'a> RustValues<'a> {
         )
     }
 
-    fn projected_access(
-        &self,
-        expr: &str,
-        by_ref: bool,
-        steps: &[MutPlaceProjectionStep],
-    ) -> String {
+    fn projected_access(expr: &str, by_ref: bool, steps: &[MutPlaceProjectionStep]) -> String {
         let Some((step, rest)) = steps.split_first() else {
             return if by_ref {
                 format!("f({expr})")
@@ -599,7 +539,7 @@ impl<'a> RustValues<'a> {
         };
         match step {
             MutPlaceProjectionStep::Field(field) => {
-                self.projected_access(&format!("{expr}.{field}"), false, rest)
+                Self::projected_access(&format!("{expr}.{field}"), false, rest)
             }
             MutPlaceProjectionStep::ArrayIndex { index, len } => {
                 let checked = target::checked_index_result(
@@ -607,7 +547,7 @@ impl<'a> RustValues<'a> {
                     &len.to_string(),
                     "array",
                 );
-                let body = self.projected_access(&format!("{expr}[index]"), false, rest);
+                let body = Self::projected_access(&format!("{expr}[index]"), false, rest);
                 format!("{{ let index = {checked}; {body} }}")
             }
             MutPlaceProjectionStep::ListIndex { index, version } => {
@@ -616,7 +556,7 @@ impl<'a> RustValues<'a> {
                     &format!("{expr}.len()"),
                     "list",
                 );
-                let body = self.projected_access("value", true, rest);
+                let body = Self::projected_access("value", true, rest);
                 let access = target::list_with_elem_shared_short(
                     expr,
                     "rt",
@@ -627,25 +567,13 @@ impl<'a> RustValues<'a> {
                 format!("{{ let index = {checked}; {access} }}")
             }
             MutPlaceProjectionStep::SliceIndex { index } => {
-                let body = self.projected_access("value", false, rest);
+                let body = Self::projected_access("value", false, rest);
                 format!("{{ let value = {expr}.elem_at_shared(rt, self.{index})?; {body} }}")
-            }
-            MutPlaceProjectionStep::MapIndex { key, value_ty } => {
-                debug_assert!(rest.is_empty());
-                let value = self.value_from_place(*value_ty, "value");
-                format!(
-                    "{{ let value = {expr}.get(rt, &self.{key})?.map(|value| {value}); f(&value) }}"
-                )
             }
         }
     }
 
-    fn projected_mutate(
-        &self,
-        expr: &str,
-        by_ref: bool,
-        steps: &[MutPlaceProjectionStep],
-    ) -> String {
+    fn projected_mutate(expr: &str, by_ref: bool, steps: &[MutPlaceProjectionStep]) -> String {
         let Some((step, rest)) = steps.split_first() else {
             return if by_ref {
                 format!("f({expr})")
@@ -655,7 +583,7 @@ impl<'a> RustValues<'a> {
         };
         match step {
             MutPlaceProjectionStep::Field(field) => {
-                self.projected_mutate(&format!("{expr}.{field}"), false, rest)
+                Self::projected_mutate(&format!("{expr}.{field}"), false, rest)
             }
             MutPlaceProjectionStep::ArrayIndex { index, len } => {
                 let checked = target::checked_index_result(
@@ -663,7 +591,7 @@ impl<'a> RustValues<'a> {
                     &len.to_string(),
                     "array",
                 );
-                let body = self.projected_mutate(&format!("{expr}[index]"), false, rest);
+                let body = Self::projected_mutate(&format!("{expr}[index]"), false, rest);
                 format!("{{ let index = {checked}; {body} }}")
             }
             MutPlaceProjectionStep::ListIndex { index, version } => {
@@ -672,7 +600,7 @@ impl<'a> RustValues<'a> {
                     &format!("{expr}.len()"),
                     "list",
                 );
-                let body = self.projected_mutate("value", true, rest);
+                let body = Self::projected_mutate("value", true, rest);
                 let access = target::list_with_elem_owned_mut_short(
                     expr,
                     "rt",
@@ -683,16 +611,8 @@ impl<'a> RustValues<'a> {
                 format!("{{ let index = {checked}; {access} }}")
             }
             MutPlaceProjectionStep::SliceIndex { index } => {
-                let body = self.projected_mutate("value", true, rest);
+                let body = Self::projected_mutate("value", true, rest);
                 target::slice_with_elem_owned_mut_short(expr, "rt", &format!("self.{index}"), &body)
-            }
-            MutPlaceProjectionStep::MapIndex { key, value_ty } => {
-                debug_assert!(rest.is_empty());
-                let value = self.value_from_place(*value_ty, "value");
-                let set = target::map_optional_slot_set(expr, "rt", &format!("self.{key}"), "slot");
-                format!(
-                    "{{ let mut slot = {expr}.get(rt, &self.{key})?.map(|value| {value}); f(&mut slot)?; {set} }}"
-                )
             }
         }
     }

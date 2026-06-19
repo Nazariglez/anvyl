@@ -5,7 +5,7 @@
 // @match-begin
 // 1
 // 0
-// 0
+// -1
 // 1
 // @match-end
 
@@ -17,17 +17,20 @@ fn print_nested(slot: Option<int?>) {
             println(0);
         }
     } else {
-        println(0);
+        println(-1);
     }
 }
 
 fn main() {
     var slots: [string: int?] = ["a": 1];
     print_nested(slots["a"]);
-    slots["a"] = Option.Some(nil);
-    print_nested(slots["a"]);
+
     slots["a"] = nil;
     print_nested(slots["a"]);
-    slots["b"] = Option.Some(1);
+
+    slots.remove("a");
+    print_nested(slots["a"]);
+
+    slots["b"] = 1;
     print_nested(slots["b"]);
 }

@@ -34,11 +34,6 @@ pub enum ProjectionKind {
     ArrayIndex(LocalId),
     ListIndex(LocalId),
     SliceIndex(LocalId),
-    MapIndex {
-        local: LocalId,
-        key: TypeId,
-        value: TypeId,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +156,6 @@ pub fn project_ty(program: &Program, source_ty: TypeId, projection: &Projection)
                 .then(|| typing::enum_variant_field(program, source_ty, variant, field))?
         }
         Projection::Index(_) => typing::index_elem(program, source_ty),
-        Projection::MapIndex(_) => typing::map_slot(program, source_ty).map(|(_, slot)| slot),
     }
 }
 
@@ -230,12 +224,6 @@ pub fn project_step(
             local_has_type(program, function, local, expected)?;
             (kind, ty)
         }
-        Projection::MapIndex(local) => {
-            let (key, value) = typing::map_kv(program, source_ty)?;
-            local_has_type(program, function, local, key)?;
-            let (_, slot) = typing::map_slot(program, source_ty)?;
-            (ProjectionKind::MapIndex { local, key, value }, slot)
-        }
     };
     Some(ProjectionStep {
         kind,
@@ -295,8 +283,8 @@ mod tests {
     use crate::{
         air::{
             AggregateDecl, AggregateKind, AirBlock, AirBody, EnumDecl, EnumRepr, FieldDecl,
-            Function, FunctionKind, GlobalDecl, Local, LocalKind, MapOrder, ModuleId, Signature,
-            VariantDecl, VariantShape,
+            Function, FunctionKind, GlobalDecl, Local, LocalKind, ModuleId, Signature, VariantDecl,
+            VariantShape,
         },
         ast::Ident,
     };
@@ -308,12 +296,6 @@ mod tests {
         let item_id = super::super::AggregateId::from_index(0);
         let item_ty = program.type_arena.alloc(TypeData::Aggregate(item_id));
         let list_ty = program.type_arena.alloc(TypeData::List(item_ty));
-        let option_item = program.type_arena.alloc(TypeData::Optional(item_ty));
-        let map_ty = program.type_arena.alloc(TypeData::Map {
-            key: int,
-            value: item_ty,
-            order: MapOrder::Insertion,
-        });
         program
             .aggregates
             .push(aggregate("Item", AggregateKind::Struct, int));
@@ -338,18 +320,6 @@ mod tests {
         assert_eq!(
             path.steps()[1].kind(),
             ProjectionKind::Field(FieldId::from_index(0))
-        );
-
-        program.functions[0].locals[0].ty = map_ty;
-        let map_place = Place {
-            root: PlaceRoot::Local(LocalId::from_index(0)),
-            projection: vec![Projection::MapIndex(LocalId::from_index(1))],
-            ty: option_item,
-        };
-        let path = walk_place(&program, FunctionId::from_index(0), &map_place).unwrap();
-        assert_eq!(path.ty(), option_item);
-        assert!(
-            matches!(path.steps()[0].kind(), ProjectionKind::MapIndex { key, value, .. } if key == int && value == item_ty)
         );
     }
 

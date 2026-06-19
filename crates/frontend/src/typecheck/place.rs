@@ -5,7 +5,7 @@ use super::{
     postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
-    ast::{ExprId, ExprKind, ExprNode, Ident, Lit, Mutability, Type},
+    ast::{ExprId, ExprKind, ExprNode, Ident, IndexNode, Lit, Mutability, Type},
     externs::catalog::ExternFieldRef,
     span::Span,
 };
@@ -794,6 +794,38 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
     place
 }
 
+pub(super) fn check_indexed_place(
+    expr: &ExprNode,
+    index: &IndexNode,
+    target: CheckedPlace,
+    tc: &mut TypeChecker,
+) -> CheckedPlace {
+    let indexed = check_index_access(index, &target.value.checked, tc);
+    let ty = indexed
+        .write_ty
+        .as_ref()
+        .unwrap_or(&indexed.read_ty)
+        .clone();
+    let mut checked = super::checked_from_type(expr, ty, tc);
+    checked.contains_extern_any = indexed.contains_extern_any;
+    let value = if indexed.write_ty.is_some() {
+        project_index_value(
+            &target.value,
+            checked,
+            index.node.target.node.id,
+            &index.node.index,
+            expr.node.id,
+            tc,
+        )
+    } else {
+        PlaceValue::not_place(checked)
+    };
+    CheckedPlace {
+        value,
+        accepts_extern_any: target.accepts_extern_any,
+    }
+}
+
 fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     if let ExprKind::Ident(name) = &expr.node.kind {
         match tc.resolve_ident_subject(*name, expr.span, super::NameSubjectMode::Place) {
@@ -862,30 +894,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::Index(index) = &expr.node.kind {
         let target = check_place_inner(&index.node.target, tc);
-        let indexed = check_index_access(index, &target.value.checked, tc);
-        let ty = indexed
-            .write_ty
-            .as_ref()
-            .unwrap_or(&indexed.read_ty)
-            .clone();
-        let mut checked = super::checked_from_type(expr, ty, tc);
-        checked.contains_extern_any = indexed.contains_extern_any;
-        let value = if indexed.write_ty.is_some() {
-            project_index_value(
-                &target.value,
-                checked,
-                index.node.target.node.id,
-                &index.node.index,
-                expr.node.id,
-                tc,
-            )
-        } else {
-            PlaceValue::not_place(checked)
-        };
-        return CheckedPlace {
-            value,
-            accepts_extern_any: target.accepts_extern_any,
-        };
+        return check_indexed_place(expr, index, target, tc);
     }
 
     if let ExprKind::TupleIndex(index) = &expr.node.kind {
@@ -1097,6 +1106,13 @@ pub(super) fn record_place_use(
 
 pub(super) fn record_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
     record_place_use(expr_id, &place.value, PlaceUseKind::Assign, tc);
+}
+
+pub(super) fn record_projected_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {
+    let mut value = place.value.clone();
+    value.identity = value.identity.index();
+    value.global = value.global.as_ref().map(GlobalPlace::projected);
+    record_place_use(expr_id, &value, PlaceUseKind::Assign, tc);
 }
 
 pub(super) fn record_compound_write(expr_id: ExprId, place: &CheckedPlace, tc: &mut TypeChecker) {

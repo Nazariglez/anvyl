@@ -182,9 +182,7 @@ impl Place {
         }
         for projection in &self.projection {
             match projection {
-                Projection::Index(local) | Projection::MapIndex(local) => {
-                    f(PlaceReadLocal::Index(*local));
-                }
+                Projection::Index(local) => f(PlaceReadLocal::Index(*local)),
                 Projection::Field(_)
                 | Projection::TupleField(_)
                 | Projection::VariantField { .. } => {}
@@ -216,7 +214,6 @@ pub enum Projection {
         field: u16,
     },
     Index(LocalId),
-    MapIndex(LocalId),
 }
 
 fn place_roots_may_overlap(left: PlaceRoot, right: PlaceRoot) -> bool {
@@ -243,14 +240,13 @@ fn projections_equal(left: &Projection, right: &Projection) -> bool {
                 field: right_field,
             },
         ) => left_enum == right_enum && left_variant == right_variant && left_field == right_field,
-        (Projection::Index(left), Projection::Index(right))
-        | (Projection::MapIndex(left), Projection::MapIndex(right)) => left == right,
+        (Projection::Index(left), Projection::Index(right)) => left == right,
         _ => false,
     }
 }
 
 fn projection_may_overlap(projection: &Projection) -> bool {
-    matches!(projection, Projection::Index(_) | Projection::MapIndex(_))
+    matches!(projection, Projection::Index(_))
 }
 
 #[derive(Debug, Clone, PartialEq)]

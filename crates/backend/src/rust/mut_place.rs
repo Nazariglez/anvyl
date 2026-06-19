@@ -92,7 +92,7 @@ impl PlanCx<'_> {
         let projections = plan
             .projection
             .iter()
-            .map(Self::rir_plan_projection)
+            .map(Self::rir_place_projection)
             .collect();
         self.plan_handle_mut_place_arg(function, plan.root, root_ty, projections, plan.ty)
     }

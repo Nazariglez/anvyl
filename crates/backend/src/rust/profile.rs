@@ -486,16 +486,22 @@ impl ProfileCx<'_> {
     }
 
     fn check_structural_mutation(&mut self, site: ProfileSite, place: &Place) {
+        self.check_collection_write_place(site, place, PlaceAccessIntent::StructuralMutation);
+    }
+
+    fn check_collection_write_place(
+        &mut self,
+        site: ProfileSite,
+        place: &Place,
+        intent: PlaceAccessIntent,
+    ) {
         let Some(function) = Self::current_function_id(site) else {
             if matches!(place.root, PlaceRoot::Global(_)) {
                 self.push(site, ProfileErrorKind::UnsupportedGlobalRooting);
             }
             return;
         };
-        if let Err(gap) = self
-            .access()
-            .plan(function, PlaceAccessIntent::StructuralMutation, place)
-        {
+        if let Err(gap) = self.access().plan(function, intent, place) {
             self.push(site, profile_gap_kind(gap));
             return;
         }
@@ -663,9 +669,16 @@ impl ProfileCx<'_> {
                 map,
                 key,
                 value,
-                kind: _,
+                kind,
             } => {
-                self.check_structural_mutation(site, map);
+                match kind {
+                    air::MapWriteKind::StructuralInsert => {
+                        self.check_structural_mutation(site, map);
+                    }
+                    air::MapWriteKind::IndexedAssignment => {
+                        self.check_collection_write_place(site, map, PlaceAccessIntent::Assign);
+                    }
+                }
                 self.check_place(site, map);
                 self.check_operand(site, key);
                 self.check_operand(site, value);

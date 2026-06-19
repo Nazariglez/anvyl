@@ -1,6 +1,7 @@
 // @mode: check
-// @expect: success
+// @expect: error
 // @frontend: new
+// @contains: non-lvalue cannot be passed to var parameter
 
 fn clear(var slot: int?) {
     slot = nil;
@@ -8,7 +9,5 @@ fn clear(var slot: int?) {
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    let key = "a";
-
-    clear(counts[key]);
+    clear(counts["a"]);
 }

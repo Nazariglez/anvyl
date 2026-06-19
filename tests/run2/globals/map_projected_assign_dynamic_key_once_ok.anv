@@ -14,12 +14,8 @@ fn key() -> string {
     "a"
 }
 
-fn bump(var value: int?) {
-    value = 2;
-}
-
 fn main() {
-    bump(values[key()]);
+    values[key()] = 2;
     println(calls);
     match values["a"] {
         value? => println(value),
