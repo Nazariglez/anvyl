@@ -464,6 +464,114 @@ pub enum RustReturnAbi {
     List(Box<RustReturnAbi>),
 }
 
+impl RustExternAbi {
+    pub fn has_scoped_lambda(&self) -> bool {
+        self.params.iter().any(RustParamAbi::is_scoped_lambda)
+    }
+
+    pub fn has_collection_wrapper(&self) -> bool {
+        self.params
+            .iter()
+            .any(RustParamAbi::contains_collection_wrapper)
+            || self.ret.contains_collection_wrapper()
+    }
+
+    pub fn supported_collection_wrapper(&self) -> bool {
+        self.ctx == RustWrapperCtx::HiddenRuntime
+            && !self.has_scoped_lambda()
+            && self.has_collection_wrapper()
+            && self.params.iter().all(|param| match param {
+                RustParamAbi::List(_) => param.supported_collection_wrapper(),
+                RustParamAbi::Value(_)
+                | RustParamAbi::Borrow(_)
+                | RustParamAbi::MutBorrow(_)
+                | RustParamAbi::MutPlace(_) => !param.direct_collection_abi(),
+                RustParamAbi::Option(_) | RustParamAbi::ScopedLambda(_) => false,
+            })
+            && match &self.ret {
+                RustReturnAbi::List(_) => self.ret.supported_collection_wrapper(),
+                RustReturnAbi::Void | RustReturnAbi::Value(_) | RustReturnAbi::Option(_) => {
+                    !self.ret.contains_collection_wrapper() && !self.ret.direct_collection_abi()
+                }
+            }
+    }
+}
+
+impl RustParamAbi {
+    pub fn is_scoped_lambda(&self) -> bool {
+        matches!(self, Self::ScopedLambda(_))
+    }
+
+    pub fn contains_collection_wrapper(&self) -> bool {
+        match self {
+            Self::List(_) => true,
+            Self::Option(inner) => inner.contains_collection_wrapper(),
+            Self::Value(_)
+            | Self::Borrow(_)
+            | Self::MutBorrow(_)
+            | Self::MutPlace(_)
+            | Self::ScopedLambda(_) => false,
+        }
+    }
+
+    pub fn supported_collection_wrapper(&self) -> bool {
+        matches!(self, Self::List(inner) if matches!(inner.as_ref(), Self::Value(ty) if scalar_collection_wrapper_leaf(ty)))
+    }
+
+    pub fn direct_collection_abi(&self) -> bool {
+        match self {
+            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
+                type_contains_collection(ty)
+            }
+            Self::Option(inner) => inner.direct_collection_abi(),
+            Self::ScopedLambda(_) | Self::List(_) => false,
+        }
+    }
+
+    pub fn direct_mut_collection_abi(&self) -> bool {
+        matches!(self, Self::MutBorrow(ty) | Self::MutPlace(ty) if type_contains_collection(ty))
+    }
+
+    fn contains_callback(&self) -> bool {
+        match self {
+            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
+                type_contains_callback(ty)
+            }
+            Self::ScopedLambda(_) => true,
+            Self::Option(inner) | Self::List(inner) => inner.contains_callback(),
+        }
+    }
+}
+
+impl RustReturnAbi {
+    pub fn contains_collection_wrapper(&self) -> bool {
+        match self {
+            Self::List(_) => true,
+            Self::Option(inner) => inner.contains_collection_wrapper(),
+            Self::Void | Self::Value(_) => false,
+        }
+    }
+
+    pub fn supported_collection_wrapper(&self) -> bool {
+        matches!(self, Self::List(inner) if matches!(inner.as_ref(), Self::Value(ty) if scalar_collection_wrapper_leaf(ty)))
+    }
+
+    pub fn direct_collection_abi(&self) -> bool {
+        match self {
+            Self::Value(ty) => type_contains_collection(ty),
+            Self::Option(inner) => inner.direct_collection_abi(),
+            Self::Void | Self::List(_) => false,
+        }
+    }
+}
+
+fn scalar_collection_wrapper_leaf(ty: &ExternTypeExpr) -> bool {
+    matches!(
+        ty,
+        ExternTypeExpr::Bool | ExternTypeExpr::Int | ExternTypeExpr::Float | ExternTypeExpr::String
+    )
+}
+
 #[derive(Clone)]
 struct NativeSignature {
     signature: ExternSignature,
@@ -717,7 +825,7 @@ fn validate_native_abi(
             "parameter count mismatch",
         ));
     }
-    let has_scoped_lambda = abi.params.iter().any(rust_param_abi_is_scoped_lambda);
+    let has_scoped_lambda = abi.has_scoped_lambda();
     validate_wrapper_ctx(descriptor, key, abi, has_scoped_lambda)?;
     validate_scoped_lambda_isolated(descriptor, key, abi, has_scoped_lambda)?;
     for (index, (param, param_abi)) in signature
@@ -746,18 +854,20 @@ fn validate_native_abi(
             "native callback return ABI is unsupported",
         ));
     }
-    if abi.params.iter().any(direct_mut_collection_abi) {
+    if abi
+        .params
+        .iter()
+        .any(RustParamAbi::direct_mut_collection_abi)
+    {
         return Err(native_abi_error(
             descriptor,
             key,
             "direct mutable collection ABI is unsupported",
         ));
     }
-    let direct_collection = abi.params.iter().any(direct_collection_abi)
-        || direct_collection_return_abi(&abi.ret)
-        || (abi.support == RustAbiSupport::Direct
-            && (abi.params.iter().any(collection_wrapper_param_abi)
-                || collection_wrapper_return_abi(&abi.ret)));
+    let direct_collection = abi.params.iter().any(RustParamAbi::direct_collection_abi)
+        || abi.ret.direct_collection_abi()
+        || (abi.support == RustAbiSupport::Direct && abi.has_collection_wrapper());
     if direct_collection {
         return Err(native_abi_error(
             descriptor,
@@ -765,6 +875,7 @@ fn validate_native_abi(
             "direct collection ABI is unsupported",
         ));
     }
+    validate_wrapper_conversion_abi(descriptor, key, abi, has_scoped_lambda)?;
     Ok(())
 }
 
@@ -787,6 +898,27 @@ fn validate_wrapper_ctx(
             key,
             "wrapper ctx mode mismatch",
         ))
+    }
+}
+
+fn validate_wrapper_conversion_abi(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustExternAbi,
+    has_scoped_lambda: bool,
+) -> Result<(), String> {
+    match abi.support {
+        RustAbiSupport::Direct | RustAbiSupport::Unsupported => Ok(()),
+        RustAbiSupport::NeedsWrapperConversion
+            if has_scoped_lambda || abi.supported_collection_wrapper() =>
+        {
+            Ok(())
+        }
+        RustAbiSupport::NeedsWrapperConversion => Err(native_abi_error(
+            descriptor,
+            key,
+            "unsupported collection wrapper ABI",
+        )),
     }
 }
 
@@ -822,6 +954,13 @@ fn validate_scoped_lambda_isolated(
             "scoped Lambda ABI cannot be combined with borrowed provider parameters",
         ));
     }
+    if abi.has_collection_wrapper() {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "scoped Lambda ABI cannot be combined with collection wrapper conversion",
+        ));
+    }
     Ok(())
 }
 
@@ -836,7 +975,7 @@ fn validate_param_callback_abi(
         (ExternTypeExpr::Callback(callback), RustParamAbi::ScopedLambda(_)) => {
             validate_scoped_lambda_abi(descriptor, key, param, callback, abi.support)
         }
-        _ if param_contains_callback(param) || param_abi_contains_callback(param_abi) => Err(
+        _ if param_contains_callback(param) || param_abi.contains_callback() => Err(
             native_abi_error(descriptor, key, "direct callback ABI is unsupported"),
         ),
         _ => Ok(()),
@@ -875,66 +1014,6 @@ fn validate_scoped_lambda_abi(
         ));
     }
     Ok(())
-}
-
-fn rust_param_abi_is_scoped_lambda(abi: &RustParamAbi) -> bool {
-    matches!(abi, RustParamAbi::ScopedLambda(_))
-}
-
-fn param_abi_contains_callback(abi: &RustParamAbi) -> bool {
-    match abi {
-        RustParamAbi::Value(ty)
-        | RustParamAbi::Borrow(ty)
-        | RustParamAbi::MutBorrow(ty)
-        | RustParamAbi::MutPlace(ty) => type_contains_callback(ty),
-        RustParamAbi::ScopedLambda(_) => true,
-        RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
-            param_abi_contains_callback(inner)
-        }
-    }
-}
-
-fn direct_mut_collection_abi(abi: &RustParamAbi) -> bool {
-    matches!(abi, RustParamAbi::MutBorrow(ty) | RustParamAbi::MutPlace(ty) if type_contains_collection(ty))
-}
-
-fn direct_collection_abi(abi: &RustParamAbi) -> bool {
-    match abi {
-        RustParamAbi::Value(ty) | RustParamAbi::Borrow(ty) => type_contains_collection(ty),
-        RustParamAbi::Option(inner) => direct_collection_abi(inner),
-        RustParamAbi::MutBorrow(_)
-        | RustParamAbi::MutPlace(_)
-        | RustParamAbi::ScopedLambda(_)
-        | RustParamAbi::List(_) => false,
-    }
-}
-
-fn direct_collection_return_abi(abi: &RustReturnAbi) -> bool {
-    match abi {
-        RustReturnAbi::Value(ty) => type_contains_collection(ty),
-        RustReturnAbi::Option(inner) => direct_collection_return_abi(inner),
-        RustReturnAbi::Void | RustReturnAbi::List(_) => false,
-    }
-}
-
-fn collection_wrapper_param_abi(abi: &RustParamAbi) -> bool {
-    match abi {
-        RustParamAbi::Option(inner) => collection_wrapper_param_abi(inner),
-        RustParamAbi::List(_) => true,
-        RustParamAbi::Value(_)
-        | RustParamAbi::Borrow(_)
-        | RustParamAbi::MutBorrow(_)
-        | RustParamAbi::MutPlace(_)
-        | RustParamAbi::ScopedLambda(_) => false,
-    }
-}
-
-fn collection_wrapper_return_abi(abi: &RustReturnAbi) -> bool {
-    match abi {
-        RustReturnAbi::Option(inner) => collection_wrapper_return_abi(inner),
-        RustReturnAbi::List(_) => true,
-        RustReturnAbi::Void | RustReturnAbi::Value(_) => false,
-    }
 }
 
 fn param_contains_callback(param: &ExternParam) -> bool {
@@ -1259,6 +1338,77 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_collection_wrapper_abis() {
+        fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
+            binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
+            binding
+        }
+
+        let nested_list = ExternTypeExpr::List(Box::new(ExternTypeExpr::List(Box::new(
+            ExternTypeExpr::Int,
+        ))));
+        let nested_list_abi = RustParamAbi::List(Box::new(RustParamAbi::List(Box::new(
+            RustParamAbi::Value(ExternTypeExpr::Int),
+        ))));
+        assert_abi_error(
+            param_descriptor(
+                "nested",
+                nested_list,
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            wrapper(void_binding("nested", nested_list_abi)),
+            "unsupported collection wrapper ABI",
+        );
+
+        let option_list = ExternTypeExpr::Option(Box::new(ExternTypeExpr::List(Box::new(
+            ExternTypeExpr::Int,
+        ))));
+        let option_list_abi = RustReturnAbi::Option(Box::new(RustReturnAbi::List(Box::new(
+            RustReturnAbi::Value(ExternTypeExpr::Int),
+        ))));
+        assert_abi_error(
+            param_descriptor(
+                "maybe_make",
+                ExternTypeExpr::Void,
+                ParamFlow::Value,
+                option_list,
+            ),
+            wrapper(binding_with_abi(
+                "maybe_make",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                option_list_abi,
+            )),
+            "unsupported collection wrapper ABI",
+        );
+
+        let named = ExternTypeExpr::Named {
+            module: Some(module()),
+            name: "Vec2".to_string(),
+            args: vec![],
+        };
+        assert_abi_error(
+            param_descriptor(
+                "named",
+                ExternTypeExpr::List(Box::new(named.clone())),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            wrapper(void_binding(
+                "named",
+                RustParamAbi::List(Box::new(RustParamAbi::Value(named))),
+            )),
+            "unsupported collection wrapper ABI",
+        );
+
+        assert_abi_error(
+            descriptor(),
+            wrapper(binding("ping")),
+            "unsupported collection wrapper ABI",
+        );
+    }
+
+    #[test]
     fn accepts_scoped_lambda_abi() {
         let callback = callback_signature(
             vec![ExternCallbackParam {
@@ -1343,6 +1493,42 @@ mod tests {
             descriptor,
             binding,
             "scoped Lambda ABI cannot be combined with borrowed provider parameters",
+        );
+    }
+
+    #[test]
+    fn rejects_collection_wrapper_with_scoped_lambda() {
+        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
+        let callback = callback_signature(vec![], ExternTypeExpr::Void);
+        let descriptor = descriptor_with_params(
+            "mixed",
+            vec![
+                ExternParam {
+                    name: Some("items".to_string()),
+                    ty: list.clone(),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("cb".to_string()),
+                    ty: ExternTypeExpr::Callback(callback.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+            ],
+            list.clone(),
+        );
+        let mut binding = scoped_lambda_binding("mixed", callback);
+        binding.abi.params.insert(
+            0,
+            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+        );
+        binding.abi.ret = RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "scoped Lambda ABI cannot be combined with collection wrapper conversion",
         );
     }
 

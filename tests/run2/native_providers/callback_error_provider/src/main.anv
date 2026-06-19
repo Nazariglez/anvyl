@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @stderr-contains: index out of bounds
+// @stderr-contains: array index 99 out of bounds for len 2
 
 import pkg:host.host { host_apply };
 

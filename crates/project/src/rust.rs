@@ -994,22 +994,19 @@ anvyx_runtime::builtin_module! {{
     }
 
     #[test]
-    fn clean_rust_rejects_core_string_list_return_before_emission() {
+    fn clean_rust_emits_core_string_list_return_conversion() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("main.anv");
         fs::write(&file, "fn main() { \"a,b\".split(\",\"); }\n").unwrap();
 
-        let Err(CleanRustError::Plan(anvyx_backend::rust::RustPlanError::TargetGaps(gaps))) =
-            emit_source(file, FrontendConfig::default(), &system_native_context())
-        else {
-            panic!("str_split should be rejected by Rust backend planning");
-        };
+        let source = emit_source(file, FrontendConfig::default(), &system_native_context())
+            .unwrap()
+            .source
+            .into_string();
 
-        assert!(
-            gaps.iter().any(|gap| {
-                gap.kind == anvyx_backend::rust::RustTargetGapKind::UnsupportedRustAbi
-            })
-        );
+        assert!(source.contains("str_split"));
+        assert!(source.contains("AnvList::from_elems"));
+        assert!(source.contains("AnvString::from"));
     }
 
     #[test]

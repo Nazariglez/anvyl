@@ -1387,7 +1387,10 @@ impl<'a> RirPlaceModel<'a> {
         let mut fallible = false;
         for projection in projections {
             match (self.ty(ty), projection) {
-                (Some(RirType::List(_) | RirType::Slice(_)), RirProjection::Index(_))
+                (
+                    Some(RirType::Array { .. } | RirType::List(_) | RirType::Slice(_)),
+                    RirProjection::Index(_),
+                )
                 | (Some(RirType::Map { .. }), RirProjection::MapIndex(_)) => fallible = true,
                 _ => {}
             }
@@ -1702,30 +1705,33 @@ pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
     match abi.support {
         anvyx_runtime::RustAbiSupport::Direct => {
             abi.ctx == anvyx_runtime::RustWrapperCtx::HiddenRuntime
-                && !abi
-                    .params
-                    .iter()
-                    .any(|param| matches!(param, RustParamAbi::ScopedLambda(_)))
+                && !abi.params.iter().any(|param| {
+                    param.is_scoped_lambda()
+                        || param.contains_collection_wrapper()
+                        || param.direct_collection_abi()
+                })
+                && !abi.ret.contains_collection_wrapper()
+                && !abi.ret.direct_collection_abi()
         }
         anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
-            abi.ctx == anvyx_runtime::RustWrapperCtx::None
-                && abi
-                    .params
-                    .iter()
-                    .any(|param| matches!(param, RustParamAbi::ScopedLambda(_)))
-                && !abi.params.iter().any(|param| {
-                    matches!(
-                        param,
-                        RustParamAbi::Borrow(_)
-                            | RustParamAbi::MutBorrow(_)
-                            | RustParamAbi::MutPlace(_)
-                            | RustParamAbi::List(_)
-                    )
-                })
-                && !matches!(abi.ret, RustReturnAbi::List(_))
+            scoped_lambda_wrapper_supported(abi) || abi.supported_collection_wrapper()
         }
         anvyx_runtime::RustAbiSupport::Unsupported => false,
     }
+}
+
+fn scoped_lambda_wrapper_supported(abi: &RustExternAbi) -> bool {
+    abi.ctx == anvyx_runtime::RustWrapperCtx::None
+        && abi.has_scoped_lambda()
+        && !abi.params.iter().any(|param| {
+            matches!(
+                param,
+                RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::MutPlace(_)
+            ) || param.contains_collection_wrapper()
+                || param.direct_collection_abi()
+        })
+        && !abi.ret.contains_collection_wrapper()
+        && !abi.ret.direct_collection_abi()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1743,7 +1749,8 @@ pub(super) fn rust_param_abi(abi: &RustParamAbi) -> Option<NativeParamAbi> {
         RustParamAbi::ScopedLambda(_) => {
             (RirParamSemantic::ScopedLambda, RirParamAbi::ScopedLambda)
         }
-        RustParamAbi::Option(_) | RustParamAbi::List(_) => return None,
+        RustParamAbi::List(_) => (RirParamSemantic::Value, RirParamAbi::Value),
+        RustParamAbi::Option(_) => return None,
     };
     Some(NativeParamAbi { semantic, abi })
 }
@@ -1766,7 +1773,11 @@ fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExter
             RustParamAbi::ScopedLambda(callback) => {
                 rir_type_matches_callback(program, param.ty, callback)
             }
-            RustParamAbi::Option(_) | RustParamAbi::List(_) => false,
+            RustParamAbi::List(inner) => {
+                abi.supported_collection_wrapper()
+                    && rir_type_matches_list_wrapper_param(program, param.ty, inner)
+            }
+            RustParamAbi::Option(_) => false,
         }
 }
 
@@ -1811,8 +1822,44 @@ fn native_return_abi_ok(
             !extern_type_contains_collection(ty) && rir_type_matches_extern(program, ret, ty)
         }
         RustReturnAbi::Option(inner) => rir_type_matches_option(program, ret, inner),
-        RustReturnAbi::List(_) => false,
+        RustReturnAbi::List(inner) => {
+            abi.supported_collection_wrapper()
+                && rir_type_matches_list_wrapper_return(program, ret, inner)
+        }
     }
+}
+
+fn rir_type_matches_list_wrapper_param(
+    program: &RirProgram,
+    id: RirTypeId,
+    inner: &RustParamAbi,
+) -> bool {
+    let RustParamAbi::Value(expected) = inner else {
+        return false;
+    };
+    rir_type_matches_list_wrapper(program, id, expected)
+}
+
+fn rir_type_matches_list_wrapper_return(
+    program: &RirProgram,
+    id: RirTypeId,
+    inner: &RustReturnAbi,
+) -> bool {
+    let RustReturnAbi::Value(expected) = inner else {
+        return false;
+    };
+    rir_type_matches_list_wrapper(program, id, expected)
+}
+
+fn rir_type_matches_list_wrapper(
+    program: &RirProgram,
+    id: RirTypeId,
+    expected: &ExternTypeExpr,
+) -> bool {
+    let Some(RirType::List(elem)) = program.types.get(id.index()) else {
+        return false;
+    };
+    rir_type_matches_extern(program, *elem, expected)
 }
 
 fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &ExternTypeExpr) -> bool {

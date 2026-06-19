@@ -33,8 +33,13 @@ pub fn marker() -> i64 {
     0
 }
 
+#[function]
+pub fn len2_of(value: Vec2) -> f64 {
+    value.x * value.x + value.y * value.y
+}
+
 anvyx_runtime::builtin_module! {
     name: "host",
     source: "",
-    exports: [marker, Vec2],
+    exports: [marker, len2_of, Vec2],
 }

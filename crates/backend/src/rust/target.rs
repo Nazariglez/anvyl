@@ -697,6 +697,7 @@ pub(super) fn runtime_ctx_new(heap: &str) -> String {
     format!("{}::new({heap})", rt_path("Ctx"))
 }
 
+#[cfg(test)]
 pub(super) fn checked_index(index: &str, len: &str) -> String {
     format!("{}({index}, {len})", rt_path("checked_index"))
 }

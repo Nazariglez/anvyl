@@ -1,8 +1,8 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: no source-level scalar initializer currently returns RuntimeError without panicking
 // @stderr-contains: poisoned lazy global
+// @stderr-contains: array index 2 out of bounds for len 2
 
 fn fail() -> int {
     var xs: [int; 2] = [0, 1];

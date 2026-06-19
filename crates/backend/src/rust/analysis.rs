@@ -134,7 +134,10 @@ fn rvalue_calls_fallible(
                     || match callee {
                         RirCallTarget::Function(id) => fallible[id.index()],
                         RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
-                            RirExternKind::Native(native) => native.abi.fallible,
+                            RirExternKind::Native(native) => {
+                                native.abi.fallible
+                                    || native_arg_conversion_fallible(&native.abi.params)
+                            }
                         },
                         RirCallTarget::LambdaValue { sig, .. } => program
                             .lambdas_for_sig(*sig)
@@ -561,11 +564,27 @@ fn term_context_use(
 
 fn extern_context_use(program: &RirProgram, id: super::rir::RirExternId) -> ContextUse {
     match &program.externs[id.index()].kind {
-        RirExternKind::Native(native) => match native.abi.ctx {
-            anvyx_runtime::RustWrapperCtx::HiddenRuntime => ContextUse::rt(),
-            anvyx_runtime::RustWrapperCtx::None => ContextUse::default(),
-        },
+        RirExternKind::Native(native) => {
+            let base = match native.abi.ctx {
+                anvyx_runtime::RustWrapperCtx::HiddenRuntime => ContextUse::rt(),
+                anvyx_runtime::RustWrapperCtx::None => ContextUse::default(),
+            };
+            if native_return_needs_types(&native.abi.ret) {
+                base.union(ContextUse::rt_types())
+            } else {
+                base
+            }
+        }
     }
+}
+
+fn native_return_needs_types(ret: &anvyx_runtime::RustReturnAbi) -> bool {
+    ret.supported_collection_wrapper()
+}
+
+fn native_arg_conversion_fallible(abis: &[anvyx_runtime::RustParamAbi]) -> bool {
+    abis.iter()
+        .any(anvyx_runtime::RustParamAbi::supported_collection_wrapper)
 }
 
 fn stringify_context_use(program: &RirProgram, ty: RirTypeId) -> ContextUse {

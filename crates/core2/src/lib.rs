@@ -324,7 +324,8 @@ mod tests {
             string_support
                 .bindings
                 .iter()
-                .any(|binding| binding.abi.support == anvyx_runtime::RustAbiSupport::Unsupported)
+                .any(|binding| binding.abi.support
+                    == anvyx_runtime::RustAbiSupport::NeedsWrapperConversion)
         );
     }
 

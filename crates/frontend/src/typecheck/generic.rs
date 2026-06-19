@@ -218,7 +218,8 @@ pub(super) fn check_with_specialization(
     tc.push_generic_owner_frame(owner_frame);
     let specialization = key.args.clone();
     let body_key = BodyInstanceKey::Callable(key.clone());
-    let inferred_ret = tc.with_body_instance(body_key.clone(), check_body);
+    let inferred_ret =
+        tc.with_outer_lambdas_suspended(|tc| tc.with_body_instance(body_key.clone(), check_body));
     tc.solve_constraints();
     tc.pop_generic_owner_frame();
     tc.pop_generic_context();

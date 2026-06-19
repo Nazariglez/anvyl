@@ -537,18 +537,18 @@ impl<'a> RustPlaces<'a> {
                     let index = self.function.locals[index.index()].symbol.as_str();
                     match self.program.types[rendered.ty.index()] {
                         RirType::Array { elem, len } => {
-                            rendered.expr.push('[');
-                            rendered
-                                .expr
-                                .push_str(&target::checked_index(index, &len.to_string()));
-                            rendered.expr.push(']');
+                            let array = rendered.expr.clone();
+                            let checked =
+                                target::checked_index_result(index, &len.to_string(), "array");
+                            rendered.expr = format!("({array})[{checked}]");
                             rendered.ty = elem;
                         }
                         RirType::List(elem) if allow_list_index => {
                             let list = rendered.expr.clone();
-                            let checked = target::checked_index(index, &format!("{list}.len()"));
+                            let checked =
+                                target::checked_index_result(index, "__anv_list.len()", "list");
                             rendered.expr = format!(
-                                "{list}.elem_at_shared({}, {checked}, {list}.structural_version())?",
+                                "{{ let __anv_list = &({list}); let index = {checked}; __anv_list.elem_at_shared({}, index, __anv_list.structural_version())? }}",
                                 target::runtime_param_name()
                             );
                             rendered.ty = elem;

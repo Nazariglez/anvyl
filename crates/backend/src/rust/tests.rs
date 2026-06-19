@@ -111,6 +111,102 @@ fn native_scoped_lambda_provider_abi_rejects_visible_borrows() {
 }
 
 #[test]
+fn native_scoped_lambda_provider_abi_rejects_collection_wrappers() {
+    let callback = native_callback_sig();
+    let list = anvyx_runtime::RustParamAbi::List(Box::new(anvyx_runtime::RustParamAbi::Value(
+        anvyx_runtime::ExternTypeExpr::Int,
+    )));
+    let abi = anvyx_runtime::RustExternAbi {
+        params: vec![list, anvyx_runtime::RustParamAbi::ScopedLambda(callback)],
+        ret: anvyx_runtime::RustReturnAbi::Void,
+        fallible: false,
+        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+        ctx: anvyx_runtime::RustWrapperCtx::None,
+    };
+
+    assert!(!rir::rust_extern_abi_supported(&abi));
+}
+
+#[test]
+fn native_direct_provider_abi_rejects_collection_wrappers() {
+    use anvyx_runtime::{
+        ExternTypeExpr, RustAbiSupport, RustExternAbi, RustParamAbi, RustReturnAbi, RustWrapperCtx,
+    };
+
+    let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
+    let map = ExternTypeExpr::Map(
+        Box::new(ExternTypeExpr::String),
+        Box::new(ExternTypeExpr::Int),
+    );
+    let wrapper_param = RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)));
+    let wrapper_ret = RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)));
+
+    for (params, ret) in [
+        (vec![wrapper_param], wrapper_ret),
+        (vec![RustParamAbi::Value(list.clone())], RustReturnAbi::Void),
+        (
+            vec![RustParamAbi::Borrow(list.clone())],
+            RustReturnAbi::Void,
+        ),
+        (
+            vec![RustParamAbi::MutBorrow(list.clone())],
+            RustReturnAbi::Void,
+        ),
+        (
+            vec![RustParamAbi::MutPlace(list.clone())],
+            RustReturnAbi::Void,
+        ),
+        (vec![RustParamAbi::Value(map.clone())], RustReturnAbi::Void),
+        (vec![], RustReturnAbi::Value(list)),
+        (vec![], RustReturnAbi::Value(map)),
+    ] {
+        let abi = RustExternAbi {
+            params,
+            ret,
+            fallible: false,
+            support: RustAbiSupport::Direct,
+            ctx: RustWrapperCtx::HiddenRuntime,
+        };
+
+        assert!(!rir::rust_extern_abi_supported(&abi));
+    }
+}
+
+#[test]
+fn native_collection_wrapper_provider_abi_accepts_scalar_lists() {
+    let abi = anvyx_runtime::RustExternAbi {
+        params: vec![anvyx_runtime::RustParamAbi::List(Box::new(
+            anvyx_runtime::RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::String),
+        ))],
+        ret: anvyx_runtime::RustReturnAbi::List(Box::new(anvyx_runtime::RustReturnAbi::Value(
+            anvyx_runtime::ExternTypeExpr::Int,
+        ))),
+        fallible: false,
+        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+    };
+
+    assert!(rir::rust_extern_abi_supported(&abi));
+}
+
+#[test]
+fn native_collection_wrapper_provider_abi_rejects_nested_lists() {
+    let abi = anvyx_runtime::RustExternAbi {
+        params: vec![anvyx_runtime::RustParamAbi::List(Box::new(
+            anvyx_runtime::RustParamAbi::List(Box::new(anvyx_runtime::RustParamAbi::Value(
+                anvyx_runtime::ExternTypeExpr::Int,
+            ))),
+        ))],
+        ret: anvyx_runtime::RustReturnAbi::Void,
+        fallible: false,
+        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+    };
+
+    assert!(!rir::rust_extern_abi_supported(&abi));
+}
+
+#[test]
 fn plan_lowers_native_scoped_lambda_call_arg() {
     let program = native_scoped_lambda_air();
     let verified = air::verify(&program).expect("AIR verify failed");
@@ -222,12 +318,12 @@ fn analysis_detects_nested_slice_indexed_write() {
 }
 
 #[test]
-fn analysis_keeps_nested_array_indexed_write_non_fallible() {
+fn analysis_detects_nested_array_indexed_write() {
     let program = nested_index_write_program(RirType::Array {
         elem: RirTypeId::from_index(1),
         len: 4,
     });
-    assert!(!super::analysis::fallible_functions(&program)[0]);
+    assert!(super::analysis::fallible_functions(&program)[0]);
 }
 
 #[test]
@@ -16343,9 +16439,8 @@ mod arrays {
         assert!(text.contains("[1, 2]"));
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
-        assert!(text.contains("v0[anvyx_runtime::checked_index(v1, 2)]"));
-        assert!(!text.contains("negative index"));
-        assert!(!text.contains("index out of bounds"));
+        assert!(text.contains("(v0)[anvyx_runtime::checked_index_result(v1, 2, \"array\")?]"));
+        assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
         assert!(text.contains(".len() as i64"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
@@ -16570,7 +16665,7 @@ mod arrays {
     }
 
     #[test]
-    fn negative_index_panics_without_wrapping() {
+    fn negative_index_returns_runtime_error() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
@@ -16622,11 +16717,15 @@ mod arrays {
         let source = plan_source(program);
         let output = run_source(source);
         assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(output.stderr.contains("negative index"));
+        assert!(
+            output
+                .stderr
+                .contains("array index -1 out of bounds for len 1")
+        );
     }
 
     #[test]
-    fn out_of_bounds_index_panics() {
+    fn out_of_bounds_index_returns_runtime_error() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
@@ -16678,7 +16777,11 @@ mod arrays {
         let source = plan_source(program);
         let output = run_source(source);
         assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(output.stderr.contains("index out of bounds"));
+        assert!(
+            output
+                .stderr
+                .contains("array index 1 out of bounds for len 1")
+        );
     }
 
     #[test]
@@ -16855,9 +16958,7 @@ mod lists {
         assert!(!text.contains("vec!"));
         assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
         assert!(text.contains(".push(rt, 2)?"));
-        assert!(text.contains(".elem_at_shared(rt, anvyx_runtime::checked_index(v1, v0.len()), v0.structural_version())?"));
-        assert!(!text.contains("negative index"));
-        assert!(!text.contains("index out of bounds"));
+        assert!(text.contains("let __anv_list = &(v0); let index = anvyx_runtime::checked_index_result(v1, __anv_list.len(), \"list\")?; __anv_list.elem_at_shared(rt, index, __anv_list.structural_version())?"));
         assert!(text.contains(".len() as i64"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -16921,6 +17022,71 @@ mod lists {
         assert!(text.contains(".remove(rt, &1)?;"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    }
+
+    #[test]
+    fn map_entry_index_oob_returns_runtime_error() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let void = program.alloc_type(TypeData::Void);
+        let entry = program.alloc_type(TypeData::Tuple(vec![int, int]));
+        let map = program.alloc_type(TypeData::Map {
+            key: int,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
+        let module = program.alloc_module(root_module());
+        let one = int_const(&mut program, int, 1);
+        let two = int_const(&mut program, int, 2);
+        let map_local = air::LocalId::from_index(0);
+        let index_local = air::LocalId::from_index(1);
+        let main = program.alloc_function(Function {
+            name: Ident::new("main"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![local(map, LocalKind::Temp), local(int, LocalKind::Temp)],
+            body: structured_body(
+                vec![
+                    Statement::Init {
+                        local: map_local,
+                        value: RValue::Aggregate {
+                            kind: AggregateCtor::Map,
+                            fields: vec![Operand::Const(one), Operand::Const(two)],
+                            ty: map,
+                        },
+                    },
+                    Statement::Init {
+                        local: index_local,
+                        value: RValue::Use(Operand::Const(one)),
+                    },
+                    Statement::Eval(RValue::MapEntryAt {
+                        map: place(map_local, map),
+                        index: index_local,
+                        ty: entry,
+                    }),
+                ],
+                air::AirTail::Return(None),
+            ),
+        });
+        program.module_mut(module).functions.push(main);
+        program.set_entry(main);
+
+        let source = plan_source(program);
+        assert!(
+            source
+                .as_str()
+                .contains("checked_index_result(v1, __anv_map.len(), \"map entry\")?")
+        );
+        let output = run_source(source);
+        assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
+        assert!(
+            output
+                .stderr
+                .contains("map entry index 1 out of bounds for len 1")
+        );
     }
 
     #[test]
@@ -16990,7 +17156,7 @@ mod lists {
     }
 
     #[test]
-    fn negative_index_panics_without_wrapping() {
+    fn negative_index_returns_runtime_error() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let list = program.alloc_type(TypeData::List(int));
@@ -17042,7 +17208,11 @@ mod lists {
         let source = plan_source(program);
         let output = run_source(source);
         assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(output.stderr.contains("negative index"));
+        assert!(
+            output
+                .stderr
+                .contains("list index -1 out of bounds for len 1")
+        );
     }
 
     #[test]

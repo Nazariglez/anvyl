@@ -158,6 +158,15 @@ fn type_tokens(ty: &CleanType) -> TokenStream {
         CleanType::Int => quote! { anvyx_externs::ExternTypeExpr::Int },
         CleanType::Float => quote! { anvyx_externs::ExternTypeExpr::Float },
         CleanType::String => quote! { anvyx_externs::ExternTypeExpr::String },
+        CleanType::Named(name) => {
+            quote! {
+                anvyx_externs::ExternTypeExpr::Named {
+                    module: None,
+                    name: #name.to_string(),
+                    args: vec![],
+                }
+            }
+        }
         CleanType::Callback(callback) => callback_tokens(callback),
         CleanType::List(item) => {
             let item = type_tokens(item);
@@ -201,42 +210,39 @@ mod tests {
 
     #[test]
     fn rejects_callback_return() {
-        let err = match syn::parse2::<DescriptorArgs>(quote! {
+        let err = syn::parse2::<DescriptorArgs>(quote! {
             provider = "host",
             module = "host",
             fn make() -> fn(int);
-        }) {
-            Ok(_) => panic!("expected callback return rejection"),
-            Err(err) => err,
-        };
+        })
+        .err()
+        .expect("expected callback return rejection");
 
         assert!(err.to_string().contains("callbacks are only supported"));
     }
 
     #[test]
     fn rejects_nested_callback() {
-        let err = match syn::parse2::<DescriptorArgs>(quote! {
+        let err = syn::parse2::<DescriptorArgs>(quote! {
             provider = "host",
             module = "host",
             fn each(fs: [fn(int)]) -> void;
-        }) {
-            Ok(_) => panic!("expected nested callback rejection"),
-            Err(err) => err,
-        };
+        })
+        .err()
+        .expect("expected nested callback rejection");
 
         assert!(err.to_string().contains("callbacks are only supported"));
     }
 
     #[test]
     fn rejects_callback_above_max_arity() {
-        let err = match syn::parse2::<DescriptorArgs>(quote! {
+        let err = syn::parse2::<DescriptorArgs>(quote! {
             provider = "host",
             module = "host",
             fn bad(f: fn(int, int, int, int, int, int, int, int, int)) -> void;
-        }) {
-            Ok(_) => panic!("expected callback arity rejection"),
-            Err(err) => err,
-        };
+        })
+        .err()
+        .expect("expected callback arity rejection");
 
         assert!(err.to_string().contains("at most 8"));
     }
@@ -252,14 +258,13 @@ mod tests {
             quote! { fn bad(f: fn(int) -> [int]) -> void; },
             quote! { fn bad(f: fn(int) -> int?) -> void; },
         ] {
-            let err = match syn::parse2::<DescriptorArgs>(quote! {
+            let err = syn::parse2::<DescriptorArgs>(quote! {
                 provider = "host",
                 module = "host",
                 #source
-            }) {
-                Ok(_) => panic!("expected unsupported callback leaf rejection"),
-                Err(err) => err,
-            };
+            })
+            .err()
+            .expect("expected unsupported callback leaf rejection");
 
             assert!(err.to_string().contains("unsupported callback"));
         }

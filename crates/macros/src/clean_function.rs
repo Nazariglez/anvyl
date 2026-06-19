@@ -9,10 +9,10 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    classify_param, classify_return, conversion_tokens, flow_tokens, has_scoped_lambda,
-    merge_conversions, param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow,
-    type_tokens_with_override, validate_callable_signature, validate_ctx_param,
-    validate_mut_place_ctx,
+    classify_param, classify_return, conversion_tokens, flow_tokens, has_scoped_lambda, param_abi,
+    param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow, signature_conversion,
+    type_expr_tokens, type_tokens_with_override, type_with_override, validate_callable_signature,
+    validate_ctx_param, validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -149,36 +149,45 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         proc_macro2::Span::call_site(),
         "#[function(ret)] override does not match Rust return ABI",
     )?;
+    let param_types = params
+        .iter()
+        .map(|param| {
+            type_with_override(
+                &param.ty,
+                args.params.get(&param.name).map(String::as_str),
+                proc_macro2::Span::call_site(),
+                format!(
+                    "#[function(params)] override for `{}` does not match Rust ABI",
+                    param.name
+                ),
+            )
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
     let descriptor_params = params
         .iter()
-        .map(|param| {
+        .zip(&param_types)
+        .map(|(param, ty)| {
             let name = &param.name;
-            let ty = type_tokens_with_override(
-                &param.ty,
-                args.params.get(name).map(String::as_str),
-                proc_macro2::Span::call_site(),
-                format!("#[function(params)] override for `{name}` does not match Rust ABI"),
-            )?;
+            let ty = type_expr_tokens(ty);
             let flow = flow_tokens(param.flow);
-            Ok::<_, syn::Error>(quote! {
+            quote! {
                 anvyx_runtime::ExternParam {
                     name: Some(#name.to_string()),
                     ty: #ty,
                     flow: #flow,
                     escape: anvyx_runtime::CallbackEscape::NonEscaping,
                 }
-            })
+            }
         })
-        .collect::<syn::Result<Vec<_>>>()?;
-    let param_abis = params.iter().map(|param| param_abi_tokens(&param.abi));
+        .collect::<Vec<_>>();
+    let param_abis = params
+        .iter()
+        .zip(&param_types)
+        .map(|(param, ty)| param_abi_tokens(&param_abi(ty, param.flow)))
+        .collect::<Vec<_>>();
     let ret_abi = return_abi_tokens(&ret.abi);
-    let support = conversion_tokens(merge_conversions(
-        params
-            .iter()
-            .map(|param| param.conversion)
-            .chain(std::iter::once(ret.conversion)),
-    ));
+    let support = conversion_tokens(signature_conversion(&params, &ret));
     let wrapper_ctx = if scoped_lambda {
         quote! { anvyx_runtime::RustWrapperCtx::None }
     } else {

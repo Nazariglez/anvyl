@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
+    mem,
 };
 
 use super::{
@@ -58,6 +59,14 @@ impl TypeChecker {
                 }
             }
         }
+    }
+
+    pub(super) fn with_outer_lambdas_suspended<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = mem::take(&mut self.closure.active_lambdas);
+        let result = f(self);
+        debug_assert!(self.closure.active_lambdas.is_empty());
+        self.closure.active_lambdas = outer;
+        result
     }
 
     pub(super) fn check_argument_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
@@ -222,8 +231,8 @@ impl ClosureClassifier {
 
     pub(super) fn replace_scope_state(&mut self, state: ClosureScopeState) -> ClosureScopeState {
         ClosureScopeState {
-            bindings: std::mem::replace(&mut self.bindings, state.bindings),
-            local_flows: std::mem::replace(&mut self.local_flows, state.local_flows),
+            bindings: mem::replace(&mut self.bindings, state.bindings),
+            local_flows: mem::replace(&mut self.local_flows, state.local_flows),
         }
     }
 
@@ -674,7 +683,7 @@ impl ClosureClassifier {
     }
 
     pub(super) fn take_escape_events(&mut self) -> Vec<EscapeEvent> {
-        std::mem::take(&mut self.escape_events)
+        mem::take(&mut self.escape_events)
     }
 
     fn collect_escaping_flow_events(&mut self, flow: &EscapeFlow, span: Span) {
@@ -1082,7 +1091,7 @@ impl PartialEq for FlowOrigin {
 
 impl Hash for FlowOrigin {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
+        mem::discriminant(self).hash(state);
         match self {
             Self::Callback(origin) => origin.id.hash(state),
             Self::Borrowed(capture) => capture.id.hash(state),

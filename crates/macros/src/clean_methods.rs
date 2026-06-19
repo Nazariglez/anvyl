@@ -10,9 +10,10 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    classify_param, classify_return, flow_tokens, has_scoped_lambda, merge_conversions,
-    param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow, type_expr_tokens,
-    type_tokens_with_override, type_with_override, validate_callable_signature, validate_ctx_param,
+    classify_param, classify_return, flow_tokens, has_scoped_lambda, named_type_expr_tokens,
+    param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow, signature_conversion,
+    type_expr_tokens, type_tokens_with_override, type_with_override, validate_callable_signature,
+    validate_ctx_param,
 };
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -841,7 +842,7 @@ fn self_operator_signature(
         syn::Pat::Ident(ident) => ident.ident.to_string(),
         _ => "rhs".to_string(),
     };
-    let owner_ty = named_type_expr(export_name);
+    let owner_ty = named_type_expr_tokens(export_name);
     let ret_ty = if return_is_owner(&method.sig.output, owner) {
         owner_ty.clone()
     } else {
@@ -859,16 +860,6 @@ fn self_operator_signature(
             ret: #ret_ty,
         }
     })
-}
-
-fn named_type_expr(name: &str) -> TokenStream {
-    quote! {
-        anvyx_runtime::ExternTypeExpr::Named {
-            module: None,
-            name: #name.to_string(),
-            args: vec![],
-        }
-    }
 }
 
 fn return_is_owner(output: &ReturnType, owner: &Ident) -> bool {
@@ -1075,7 +1066,7 @@ fn member_binding(
 ) -> syn::Result<TokenStream> {
     let symbol = method.sig.ident.to_string();
     let module = methods_native_module_ident_string(owner);
-    let owner_ty = named_type_expr(export_name);
+    let owner_ty = named_type_expr_tokens(export_name);
     let self_operator = matches!(&export.role, Role::Operator(op) if op.rhs_self);
     let scoped_lambda = has_scoped_lambda(params);
     let mut abis = match role_receiver(method, &export.role) {
@@ -1098,7 +1089,7 @@ fn member_binding(
         )
     } else if self_operator {
         let ret_abi = if return_is_owner(&method.sig.output, owner) {
-            let owner_ty = named_type_expr(export_name);
+            let owner_ty = named_type_expr_tokens(export_name);
             quote! { anvyx_runtime::RustReturnAbi::Value(#owner_ty) }
         } else {
             let ret = classify_return(&method.sig.output)?;
@@ -1112,12 +1103,7 @@ fn member_binding(
     } else {
         let ret = classify_return(&method.sig.output)?;
         let ret_abi = return_abi_tokens(&ret.abi);
-        let support = crate::clean_type_map::conversion_tokens(merge_conversions(
-            params
-                .iter()
-                .map(|param| param.conversion)
-                .chain(std::iter::once(ret.conversion)),
-        ));
+        let support = crate::clean_type_map::conversion_tokens(signature_conversion(params, &ret));
         (ret_abi, support, ret.fallible)
     };
     let wrapper_ctx = if scoped_lambda {

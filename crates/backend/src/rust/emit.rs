@@ -1944,26 +1944,29 @@ impl EmitCx<'_> {
         let places = RustPlaces::new(self.program, function);
         let index = function.locals[index.index()].symbol.as_str();
         if places.mut_place_root_param(map) {
-            let checked = target::checked_index(index, "value.len()");
+            let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
             let version =
-                self.collection_version(map, target::collection_structural_version("value"));
+                self.collection_version(map, target::collection_structural_version("__anv_map"));
             return target::mut_place_access_ctx(
                 &places.local_place(map),
                 target::runtime_param_name(),
                 &format!(
-                    "Ok({{ let index = {checked}; {} }})",
-                    value("value", &version)
+                    "Ok({{ let __anv_map = value; let index = {checked}; {} }})",
+                    value("__anv_map", &version)
                 ),
             );
         }
 
         let map_expr = places.local_place(map);
-        let checked = target::checked_index(index, &format!("{map_expr}.len()"));
+        let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
         let version =
-            self.collection_version(map, target::collection_structural_version(&map_expr));
+            self.collection_version(map, target::collection_structural_version("__anv_map"));
         block_expr(
-            [format!("let index = {checked};")],
-            Some(value(&map_expr, &version)),
+            [
+                format!("let __anv_map = &({map_expr});"),
+                format!("let index = {checked};"),
+            ],
+            Some(value("__anv_map", &version)),
         )
     }
 
@@ -1977,23 +1980,26 @@ impl EmitCx<'_> {
         let places = RustPlaces::new(self.program, function);
         let index = function.locals[index.index()].symbol.as_str();
         if places.mut_place_root_param(map) {
-            let checked = target::checked_index(index, "value.len()");
+            let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
             let version =
-                self.collection_version(map, target::collection_structural_version("value"));
+                self.collection_version(map, target::collection_structural_version("__anv_map"));
             return target::mut_place_mutate_ctx(
                 &places.local_place(map),
                 target::runtime_param_name(),
-                &format!("{{ let index = {checked}; {} }}", update("value", &version)),
+                &format!(
+                    "{{ let __anv_map = value; let index = {checked}; {} }}",
+                    update("__anv_map", &version)
+                ),
             );
         }
 
         let map_expr = places.local_place(map);
-        let checked = target::checked_index(index, &format!("{map_expr}.len()"));
+        let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
         let version =
-            self.collection_version(map, target::collection_structural_version(&map_expr));
+            self.collection_version(map, target::collection_structural_version("__anv_map"));
         format!(
-            "{{ let index = {checked}; {}?; }}",
-            update(&map_expr, &version)
+            "{{ let __anv_map = &mut ({map_expr}); let index = {checked}; {}?; }}",
+            update("__anv_map", &version)
         )
     }
 
@@ -2270,13 +2276,27 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
+        rendered: Vec<String>,
+        render: impl FnOnce(String) -> String,
+    ) -> String {
+        self.prepared_native_call_expr(function, args, &[], rendered, render)
+    }
+
+    fn prepared_native_call_expr(
+        &self,
+        function: &RirFunction,
+        args: &[RirCallArg],
+        abis: &[anvyx_runtime::RustParamAbi],
         mut rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
         let mut prelude = vec![];
         for (index, arg) in args.iter().enumerate() {
-            let (mut stmts, expr) = self.prepared_call_arg(function, index, arg);
+            let (mut stmts, mut expr) = self.prepared_call_arg(function, index, arg);
             prelude.append(&mut stmts);
+            if let Some(abi) = abis.get(index) {
+                expr = self.native_arg_expr(abi, expr);
+            }
             rendered.push(expr);
         }
         let call = render(comma(rendered));
@@ -2284,6 +2304,27 @@ impl EmitCx<'_> {
             call
         } else {
             format!("{{ {} {call} }}", prelude.join(" "))
+        }
+    }
+
+    fn native_arg_expr(&self, abi: &anvyx_runtime::RustParamAbi, expr: String) -> String {
+        let anvyx_runtime::RustParamAbi::List(inner) = abi else {
+            return expr;
+        };
+        let anvyx_runtime::RustParamAbi::Value(ty) = inner.as_ref() else {
+            unreachable!("verified scalar native list param ABI");
+        };
+        match ty {
+            anvyx_runtime::ExternTypeExpr::String => format!(
+                "({expr}).to_vec({})?.into_iter().map(|value| value.as_str().to_string()).collect::<Vec<_>>()",
+                target::runtime_param_name()
+            ),
+            anvyx_runtime::ExternTypeExpr::Bool
+            | anvyx_runtime::ExternTypeExpr::Int
+            | anvyx_runtime::ExternTypeExpr::Float => {
+                format!("({expr}).to_vec({})?", target::runtime_param_name())
+            }
+            _ => unreachable!("verified scalar native list param ABI"),
         }
     }
 
@@ -2703,6 +2744,30 @@ impl EmitCx<'_> {
         block_expr(rendered, Some(target::anv_string_from("out")))
     }
 
+    fn native_return_call(
+        &self,
+        function: &RirFunction,
+        ret: RirTypeId,
+        abi: &anvyx_runtime::RustReturnAbi,
+        call: String,
+    ) -> String {
+        let anvyx_runtime::RustReturnAbi::List(inner) = abi else {
+            return RustValues::new(self.program, function).native_return_call(ret, abi, call);
+        };
+        let storage_ty = self.collection_storage_heap_type(ret);
+        let tmp = "__anv_native_ret";
+        let elems = match inner.as_ref() {
+            anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String) => {
+                let value = target::anv_string_from("value");
+                format!("{tmp}.into_iter().map(|value| {value})")
+            }
+            anvyx_runtime::RustReturnAbi::Value(_) => tmp.to_string(),
+            _ => unreachable!("verified native list return ABI"),
+        };
+        let list = target::anv_list_from_iter(target::runtime_param_name(), &storage_ty, &elems);
+        format!("{{ let {tmp} = {call}; {list} }}")
+    }
+
     fn extern_call(
         &self,
         function: &RirFunction,
@@ -2710,8 +2775,7 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
     ) -> String {
         let ext = &self.program.externs[id.index()];
-        let values = RustValues::new(self.program, function);
-        let (symbol, rendered, fallible, ret_abi) = match &ext.kind {
+        let (symbol, rendered, fallible, ret_abi, param_abis) = match &ext.kind {
             RirExternKind::Native(native) => {
                 let rendered = match native.abi.ctx {
                     anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
@@ -2722,13 +2786,14 @@ impl EmitCx<'_> {
                     rendered,
                     native.abi.fallible,
                     &native.abi.ret,
+                    native.abi.params.as_slice(),
                 )
             }
         };
-        self.prepared_call_expr(function, args, rendered, |rendered| {
+        self.prepared_native_call_expr(function, args, param_abis, rendered, |rendered| {
             let call = format!("{symbol}({rendered})");
             let call = if fallible { format!("{call}?") } else { call };
-            values.native_return_call(ext.ret, ret_abi, call)
+            self.native_return_call(function, ext.ret, ret_abi, call)
         })
     }
 

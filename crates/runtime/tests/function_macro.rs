@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    CallbackEscape, CallbackThread, Ctx, ExternCallbackParam, ExternCallbackSignature,
+    AnvyxInline, CallbackEscape, CallbackThread, Ctx, ExternCallbackParam, ExternCallbackSignature,
     ExternTypeExpr, Heap, MutPlace, ParamFlow, RuntimeError, RustAbiSupport, RustParamAbi,
     RustWrapperCtx, ScopedLambda, function,
 };
@@ -20,6 +20,18 @@ fn draw_line(message: &str) {
 #[function(ret = "int", params(value = "int"))]
 fn renamed_type(value: i64) -> i64 {
     value
+}
+
+#[derive(Clone, Copy, AnvyxInline)]
+#[anvyx(name = "Point")]
+struct RustPoint {
+    #[anvyx(field)]
+    x: f64,
+}
+
+#[function(params(point = "Point"))]
+fn point_x(point: RustPoint) -> f64 {
+    point.x
 }
 
 #[function]
@@ -56,13 +68,13 @@ fn with_ctx_lifetime<'cx>(ctx: &mut Ctx<'cx, '_>, name: &'cx str) -> i64 {
 #[function(ctx)]
 fn bump_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, i64>) {
     let _ = ctx.heap();
-    let _ = value;
+    drop(value);
 }
 
 #[function(ctx)]
 fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Option<i64>>) {
     let _ = ctx.heap();
-    let _ = value;
+    drop(value);
 }
 
 #[function]
@@ -72,8 +84,7 @@ fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
 
 #[function(params(f = "fn(int) -> bool"))]
 fn callback_override(f: ScopedLambda<'_, '_, (i64,), bool>) -> Result<(), RuntimeError> {
-    let _ = f;
-    Ok(())
+    f.call(1).map(|_| ())
 }
 
 #[test]
@@ -127,6 +138,26 @@ fn type_overrides_are_parsed_into_descriptors() {
 }
 
 #[test]
+fn named_type_override_updates_descriptor_and_rust_abi() {
+    let export = __anvyx_export_point_x();
+    let point = ExternTypeExpr::Named {
+        module: None,
+        name: "Point".to_string(),
+        args: vec![],
+    };
+
+    assert_eq!(export.descriptor.signature.params[0].ty, point);
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::Value(ExternTypeExpr::Named {
+            module: None,
+            name: "Point".to_string(),
+            args: vec![],
+        })
+    );
+}
+
+#[test]
 fn option_result_and_list_support_metadata() {
     let export = __anvyx_export_maybe();
 
@@ -146,7 +177,10 @@ fn option_result_and_list_support_metadata() {
     assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
 
     let export = __anvyx_export_strings();
-    assert_eq!(export.rust.abi.support, RustAbiSupport::Unsupported);
+    assert_eq!(
+        export.rust.abi.support,
+        RustAbiSupport::NeedsWrapperConversion
+    );
 }
 
 #[test]

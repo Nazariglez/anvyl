@@ -34,6 +34,7 @@ pub enum CleanType {
     Int,
     Float,
     String,
+    Named(String),
     Callback(CleanCallback),
     Option(Box<CleanType>),
     List(Box<CleanType>),
@@ -421,6 +422,31 @@ fn classify_path(path: &TypePath, position: Position) -> syn::Result<(CleanType,
         reject_wrapper_element(inner, &ty, flow)?;
         return Ok((CleanType::List(Box::new(ty)), CleanFlow::Value));
     }
+    if position == Position::Param && path.path.segments.len() == 1 {
+        let segment = path.path.segments.first().expect("checked len");
+        if segment.ident == "Self" {
+            return Err(syn::Error::new_spanned(
+                path,
+                "Self is not supported in #[function] parameters",
+            ));
+        }
+        if reserved_named_boundary_type(&segment.ident) {
+            return Err(syn::Error::new_spanned(
+                path,
+                "unsupported #[function] boundary type",
+            ));
+        }
+        if matches!(segment.arguments, PathArguments::None) {
+            return Ok((
+                CleanType::Named(segment.ident.to_string()),
+                CleanFlow::Value,
+            ));
+        }
+        return Err(syn::Error::new_spanned(
+            path,
+            "generic named boundary types are not supported",
+        ));
+    }
     Err(syn::Error::new_spanned(
         path,
         "unsupported #[function] boundary type",
@@ -437,7 +463,12 @@ pub fn type_with_override(
         return Ok(inferred.clone());
     };
     let override_ty = parse_type_expr(override_ty)?;
-    if override_ty == *inferred {
+    if override_ty == *inferred
+        || matches!(
+            (inferred, &override_ty),
+            (CleanType::Named(_), CleanType::Named(_))
+        )
+    {
         Ok(override_ty)
     } else {
         Err(syn::Error::new(span, mismatch.into()))
@@ -460,6 +491,7 @@ pub fn type_expr_tokens(ty: &CleanType) -> TokenStream {
         CleanType::Int => quote! { anvyx_runtime::ExternTypeExpr::Int },
         CleanType::Float => quote! { anvyx_runtime::ExternTypeExpr::Float },
         CleanType::String => quote! { anvyx_runtime::ExternTypeExpr::String },
+        CleanType::Named(name) => named_type_expr_tokens(name),
         CleanType::Callback(callback) => callback_type_tokens(callback),
         CleanType::Option(inner) => {
             let inner = type_expr_tokens(inner);
@@ -468,6 +500,16 @@ pub fn type_expr_tokens(ty: &CleanType) -> TokenStream {
         CleanType::List(inner) => {
             let inner = type_expr_tokens(inner);
             quote! { anvyx_runtime::ExternTypeExpr::List(Box::new(#inner)) }
+        }
+    }
+}
+
+pub fn named_type_expr_tokens(name: &str) -> TokenStream {
+    quote! {
+        anvyx_runtime::ExternTypeExpr::Named {
+            module: None,
+            name: #name.to_string(),
+            args: vec![],
         }
     }
 }
@@ -555,7 +597,7 @@ pub fn return_abi_tokens(abi: &CleanReturnAbi) -> TokenStream {
     }
 }
 
-fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
+pub fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
     match flow {
         CleanFlow::MutBorrow => CleanParamAbi::MutPlace(ty.clone()),
         CleanFlow::Borrow => CleanParamAbi::Borrow(ty.clone()),
@@ -628,12 +670,44 @@ pub fn merge_conversions(
         })
 }
 
+pub fn signature_conversion(params: &[CleanParam], ret: &CleanReturn) -> BoundaryConversion {
+    let conversion = merge_conversions(
+        params
+            .iter()
+            .map(|param| param.conversion)
+            .chain(std::iter::once(ret.conversion)),
+    );
+    if has_scoped_lambda(params) && signature_uses_collection_wrapper(params, ret) {
+        BoundaryConversion::Unsupported
+    } else {
+        conversion
+    }
+}
+
+fn signature_uses_collection_wrapper(params: &[CleanParam], ret: &CleanReturn) -> bool {
+    params
+        .iter()
+        .any(|param| matches!(param.ty, CleanType::List(_)))
+        || matches!(ret.ty, CleanType::List(_))
+}
+
 fn mut_place_macro_payload_supported(ty: &CleanType) -> bool {
     match ty {
         CleanType::Bool | CleanType::Int | CleanType::Float => true,
         CleanType::Option(inner) => mut_place_macro_payload_supported(inner),
-        CleanType::Void | CleanType::String | CleanType::Callback(_) | CleanType::List(_) => false,
+        CleanType::Void
+        | CleanType::String
+        | CleanType::Named(_)
+        | CleanType::Callback(_)
+        | CleanType::List(_) => false,
     }
+}
+
+fn scalar_list_wrapper_supported(inner: &CleanType) -> bool {
+    matches!(
+        inner,
+        CleanType::Bool | CleanType::Int | CleanType::Float | CleanType::String
+    )
 }
 
 fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
@@ -642,6 +716,9 @@ fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
     }
     match ty {
         CleanType::Callback(_) => BoundaryConversion::NeedsWrapper,
+        CleanType::List(inner) if scalar_list_wrapper_supported(inner) => {
+            BoundaryConversion::NeedsWrapper
+        }
         CleanType::Option(_) | CleanType::List(_) => BoundaryConversion::Unsupported,
         _ => BoundaryConversion::Direct,
     }
@@ -651,6 +728,9 @@ fn return_conversion_for_type(ty: &CleanType) -> BoundaryConversion {
     match ty {
         CleanType::Option(inner) if return_option_inner_supported(inner) => {
             BoundaryConversion::Direct
+        }
+        CleanType::List(inner) if scalar_list_wrapper_supported(inner) => {
+            BoundaryConversion::NeedsWrapper
         }
         CleanType::Callback(_) | CleanType::Option(_) | CleanType::List(_) => {
             BoundaryConversion::Unsupported
@@ -679,6 +759,12 @@ fn reject_wrapper_element(ty: &Type, classified: &CleanType, flow: CleanFlow) ->
             "wrapper element types cannot be borrowed",
         ));
     }
+    if matches!(classified, CleanType::Named(_)) {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "named types are not supported in wrapper positions",
+        ));
+    }
     Ok(())
 }
 
@@ -687,6 +773,34 @@ enum Position {
     Param,
     Return,
     WrapperElement,
+}
+
+fn reserved_named_boundary_type(ident: &Ident) -> bool {
+    matches!(
+        ident.to_string().as_str(),
+        "str"
+            | "char"
+            | "f32"
+            | "usize"
+            | "isize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i128"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Option"
+            | "Vec"
+            | "Result"
+            | "String"
+            | "ScopedLambda"
+            | "MutPlace"
+            | "Ctx"
+            | "RuntimeError"
+    )
 }
 
 fn path_is(path: &TypePath, segments: &[&str]) -> bool {
@@ -814,6 +928,14 @@ fn extern_callback_signature(callback: &CleanCallback) -> ExternCallbackSignatur
     }
 }
 
+fn named_type_expr(name: &str) -> ExternTypeExpr {
+    ExternTypeExpr::Named {
+        module: None,
+        name: name.to_string(),
+        args: vec![],
+    }
+}
+
 fn extern_type_expr(ty: &CleanType) -> ExternTypeExpr {
     match ty {
         CleanType::Void => ExternTypeExpr::Void,
@@ -821,6 +943,7 @@ fn extern_type_expr(ty: &CleanType) -> ExternTypeExpr {
         CleanType::Int => ExternTypeExpr::Int,
         CleanType::Float => ExternTypeExpr::Float,
         CleanType::String => ExternTypeExpr::String,
+        CleanType::Named(name) => named_type_expr(name),
         CleanType::Callback(callback) => {
             ExternTypeExpr::Callback(extern_callback_signature(callback))
         }
@@ -1050,6 +1173,11 @@ pub fn parse_type_expr(text: &str) -> syn::Result<CleanType> {
     {
         return Ok(CleanType::List(Box::new(parse_wrapper_override(inner)?)));
     }
+    if let Ok(ident) = syn::parse_str::<Ident>(text)
+        && !reserved_named_boundary_type(&ident)
+    {
+        return Ok(CleanType::Named(ident.to_string()));
+    }
     Err(syn::Error::new(
         proc_macro2::Span::call_site(),
         format!("unsupported extern type override `{text}`"),
@@ -1123,6 +1251,43 @@ mod tests {
     }
 
     #[test]
+    fn maps_named_value_params() {
+        let param = first_param(quote! { config: WindowConfig }).unwrap();
+        let named = CleanType::Named("WindowConfig".to_string());
+
+        assert_eq!(param.ty, named.clone());
+        assert_eq!(param.abi, CleanParamAbi::Value(named.clone()));
+        assert_eq!(extern_type_expr(&named), named_type_expr("WindowConfig"));
+    }
+
+    #[test]
+    fn named_overrides_can_rename_external_type() {
+        let inferred = CleanType::Named("RustWindowConfig".to_string());
+        let exported = CleanType::Named("WindowConfig".to_string());
+
+        assert_eq!(parse_type_expr("WindowConfig").unwrap(), exported);
+        assert_eq!(
+            type_with_override(
+                &inferred,
+                Some("WindowConfig"),
+                proc_macro2::Span::call_site(),
+                "mismatch"
+            )
+            .unwrap(),
+            CleanType::Named("WindowConfig".to_string())
+        );
+        assert!(
+            type_with_override(
+                &CleanType::Int,
+                Some("WindowConfig"),
+                proc_macro2::Span::call_site(),
+                "mismatch"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn maps_borrow_string_param() {
         let param = first_param(quote! { x: &str }).unwrap();
 
@@ -1174,9 +1339,39 @@ mod tests {
             first_param(quote! { x: Option<i64> }).unwrap().ty,
             CleanType::Option(Box::new(CleanType::Int))
         );
+        let param = first_param(quote! { x: Vec<String> }).unwrap();
+        assert_eq!(param.ty, CleanType::List(Box::new(CleanType::String)));
+        assert_eq!(param.conversion, BoundaryConversion::NeedsWrapper);
         assert_eq!(
-            first_param(quote! { x: Vec<String> }).unwrap().ty,
-            CleanType::List(Box::new(CleanType::String))
+            param.abi,
+            CleanParamAbi::List(Box::new(CleanParamAbi::Value(CleanType::String)))
+        );
+        assert_eq!(
+            ret(parse_quote! { -> Vec<i64> }).unwrap().conversion,
+            BoundaryConversion::NeedsWrapper
+        );
+        assert_eq!(
+            ret(parse_quote! { -> Vec<Option<i64>> })
+                .unwrap()
+                .conversion,
+            BoundaryConversion::Unsupported
+        );
+    }
+
+    #[test]
+    fn scoped_lambda_and_list_wrappers_are_not_mixed() {
+        let callback = first_param(quote! { f: ScopedLambda<'_, '_, (i64,), ()> }).unwrap();
+        let list = first_param(quote! { xs: Vec<i64> }).unwrap();
+        let ret_list = ret(parse_quote! { -> Vec<i64> }).unwrap();
+        let ret_void = ret(ReturnType::Default).unwrap();
+
+        assert_eq!(
+            signature_conversion(&[callback.clone(), list], &ret_void),
+            BoundaryConversion::Unsupported
+        );
+        assert_eq!(
+            signature_conversion(&[callback], &ret_list),
+            BoundaryConversion::Unsupported
         );
     }
 
@@ -1252,11 +1447,19 @@ mod tests {
     fn rejects_unsupported_types() {
         assert!(first_param(quote! { x: f32 }).is_err());
         assert!(first_param(quote! { x: usize }).is_err());
+        assert!(first_param(quote! { x: i128 }).is_err());
+        assert!(first_param(quote! { x: u128 }).is_err());
+        assert!(first_param(quote! { x: char }).is_err());
+        assert!(first_param(quote! { x: str }).is_err());
         assert!(first_param(quote! { x: &i64 }).is_err());
         assert!(first_param(quote! { x: () }).is_err());
         assert!(first_param(quote! { x: Option<()> }).is_err());
         assert!(first_param(quote! { x: Option<&str> }).is_err());
         assert!(first_param(quote! { x: my_crate::Option<i64> }).is_err());
+        assert!(first_param(quote! { x: my_crate::WindowConfig }).is_err());
+        assert!(first_param(quote! { x: WindowConfig<i64> }).is_err());
+        assert!(first_param(quote! { x: Vec<WindowConfig> }).is_err());
+        assert!(first_param(quote! { x: Option<WindowConfig> }).is_err());
         assert!(ret(parse_quote! { -> &str }).is_err());
         assert!(ret(parse_quote! { -> Result<i64, String> }).is_err());
         assert!(ret(parse_quote! { -> foo::Result<i64, RuntimeError> }).is_err());

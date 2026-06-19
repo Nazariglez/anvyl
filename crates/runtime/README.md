@@ -75,9 +75,10 @@ Supported scalar mapping for `#[function]`:
 | `string` borrowed parameter | `&str` |
 | `string` return | `String` |
 
-`Option<T>` returns are supported for scalar `T`. `Vec<T>` and several complex
-ABIs are described in metadata but rejected by the clean Rust backend until
-wrapper conversion support exists.
+`Option<T>` returns are supported for scalar `T`. `Vec<T>` parameters and
+returns are supported through wrapper conversion for scalar `T` (`bool`, `i64`,
+`f64`, `String`). Direct collection ABI, nested lists, maps, mutable collection
+ABI, and list-of-native-struct wrappers remain unsupported.
 
 Mutable provider parameters have two Rust ABI shapes:
 
@@ -112,7 +113,7 @@ Provider functions can accept non-escaping Anvyx function values with
 callback ABI leaves (`bool`, `i64`, `f64`); `Ret` may also be `()`. Call it
 synchronously and return or handle `RuntimeError`; do not store it.
 `ScopedLambda` cannot be combined with `#[function(ctx)]`, method receivers,
-borrowed params, or mutable provider params in this slice.
+borrowed params, mutable provider params, or `Vec<T>` wrapper conversion in this slice.
 
 ```rust
 use anvyx_runtime::{function, RuntimeError, ScopedLambda};
