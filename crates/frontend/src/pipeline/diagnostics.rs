@@ -904,6 +904,9 @@ pub(super) fn diagnose_type_error(
         TypeError::TupleIndexOutOfBounds { index, len, .. } => {
             format!("tuple index {index} is out of bounds for tuple of length {len}")
         }
+        TypeError::ArrayIndexOutOfBounds { index, len, .. } => {
+            format!("array index {index} is out of bounds for array of length {len}")
+        }
         TypeError::IndexNotInt { found, .. } => {
             format!("index must be an integer: found '{}'", render_surface_type(found, type_ctx))
         }
@@ -1198,6 +1201,10 @@ fn type_error_rich_message(
         TypeError::TupleIndexOutOfBounds { index, len, .. } => (
             "Tuple index out of bounds",
             format!("tuple index {index} is out of bounds for length {len}"),
+        ),
+        TypeError::ArrayIndexOutOfBounds { index, len, .. } => (
+            "Array index out of bounds",
+            format!("array index {index} is out of bounds for length {len}"),
         ),
         TypeError::IndexNotInt { found, .. } => (
             "Invalid index type",

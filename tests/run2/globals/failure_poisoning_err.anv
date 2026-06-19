@@ -6,7 +6,8 @@
 
 fn fail() -> int {
     var xs: [int; 2] = [0, 1];
-    xs[2]
+    let i = 2;
+    xs[i]
 }
 
 lazy let score = fail();

@@ -627,6 +627,11 @@ pub(crate) enum TypeError {
         len: usize,
         span: Option<SourceSpan>,
     },
+    ArrayIndexOutOfBounds {
+        index: i64,
+        len: usize,
+        span: Option<SourceSpan>,
+    },
     IndexNotInt {
         found: Type,
         span: Option<SourceSpan>,
@@ -944,6 +949,7 @@ impl TypeError {
             | TypeError::MethodGenericShadow { span, .. }
             | TypeError::TupleIndexOnNonTuple { span, .. }
             | TypeError::TupleIndexOutOfBounds { span, .. }
+            | TypeError::ArrayIndexOutOfBounds { span, .. }
             | TypeError::IndexNotInt { span, .. }
             | TypeError::IndexOnNonIndexable { span, .. }
             | TypeError::RangeIndexNotInt { span, .. }

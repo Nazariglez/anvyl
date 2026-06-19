@@ -29,8 +29,8 @@ use super::{
 };
 use crate::{
     ast::{
-        CallNode, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode, FuncParam, GenericArg,
-        Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type,
+        ArrayLen, CallNode, ConstValue, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode,
+        FuncParam, GenericArg, Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type,
     },
     collection_effect::CollectionStructuralEffect,
     externs::catalog::{
@@ -2800,19 +2800,12 @@ fn check_index_access_inner(
     }
 
     match &target.ty {
+        Type::Array {
+            elem,
+            len: ArrayLen::Fixed(len),
+        } => check_sequence_scalar_index(node, target, elem, Some(*len), tc),
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
-            let index = check_value_expr_checked_with_hint(
-                &node.node.index,
-                Some(tc.type_handle(&Type::Int)),
-                tc,
-            );
-            if !matches!(index.ty, Type::Infer | Type::Int) {
-                tc.push_error(TypeError::IndexNotInt {
-                    found: index.ty.clone(),
-                    span: tc.error_span(node.node.index.span),
-                });
-            }
-            CheckedIndex::same_projected((**elem).clone(), target, &index)
+            check_sequence_scalar_index(node, target, elem, None, tc)
         }
         Type::Map { key, value } => {
             let key_handle = tc.type_handle(key);
@@ -2838,6 +2831,41 @@ fn check_index_access_inner(
             CheckedIndex::infer(target, &index)
         }
     }
+}
+
+fn check_sequence_scalar_index(
+    node: &IndexNode,
+    target: &CheckedType,
+    elem: &Type,
+    fixed_len: Option<usize>,
+    tc: &mut TypeChecker,
+) -> CheckedIndex {
+    let index =
+        check_value_expr_checked_with_hint(&node.node.index, Some(tc.type_handle(&Type::Int)), tc);
+    if !matches!(index.ty, Type::Infer | Type::Int) {
+        tc.push_error(TypeError::IndexNotInt {
+            found: index.ty.clone(),
+            span: tc.error_span(node.node.index.span),
+        });
+    }
+    if let (Type::Int, Some(len)) = (&index.ty, fixed_len) {
+        check_static_array_index_bounds(&node.node.index, len, tc);
+    }
+    CheckedIndex::same_projected(elem.clone(), target, &index)
+}
+
+fn check_static_array_index_bounds(index_expr: &ExprNode, len: usize, tc: &mut TypeChecker) {
+    let Ok(ConstValue::Int(index)) = tc.eval_const_expr(index_expr, false) else {
+        return;
+    };
+    if index >= 0 && usize::try_from(index).is_ok_and(|index| index < len) {
+        return;
+    }
+    tc.push_error(TypeError::ArrayIndexOutOfBounds {
+        index,
+        len,
+        span: tc.error_span(index_expr.span),
+    });
 }
 
 fn check_range_index_access(

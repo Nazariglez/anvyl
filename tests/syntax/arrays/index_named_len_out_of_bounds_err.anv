@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: array index 3 is out of bounds
+
+const N = 3;
+
+fn main() {
+    let xs: [int; N] = [1, 2, 3];
+    let _ = xs[3];
+}

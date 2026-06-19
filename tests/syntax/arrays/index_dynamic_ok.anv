@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn get(xs: [int; 3], i: int) -> int {
+    xs[i]
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: array index 3 is out of bounds
+
+fn main() {
+    const I = 3;
+    let xs = [1, 2, 3];
+    let _ = xs[I];
+}

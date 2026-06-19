@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn get<N: int>(xs: [int; N]) -> int {
+    xs[3]
+}

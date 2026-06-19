@@ -5,5 +5,6 @@
 
 fn main() {
     var xs: [int; 2] = [0, 1];
-    println(xs[2]);
+    let i = 2;
+    println(xs[i]);
 }

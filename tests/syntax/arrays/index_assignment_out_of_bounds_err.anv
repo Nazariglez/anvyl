@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: array index 3 is out of bounds
+
+fn main() {
+    var xs = [1, 2, 3];
+    xs[3] = 4;
+}

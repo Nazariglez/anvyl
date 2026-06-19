@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: array index 3 is out of bounds
+
+fn bump(var x: int) {
+    x += 1;
+}
+
+fn main() {
+    var xs = [1, 2, 3];
+    bump(xs[3]);
+}
