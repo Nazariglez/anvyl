@@ -4,7 +4,7 @@ use super::{
     place::RustPlaces,
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
-        RirCallArg, RirCallTarget, RirCellDecl, RirCellStorage, RirCollectionLoanScope,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellRef, RirCellStorage, RirCollectionLoanScope,
         RirCollectionStorageKind, RirDataRefId, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
@@ -14,6 +14,7 @@ use super::{
         RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
         RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
         RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        stmt_child_blocks_any,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -1445,6 +1446,22 @@ impl EmitCx<'_> {
         ));
     }
 
+    fn emit_map_entry_alias_drop(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        payload: RirLocalId,
+        guard: &str,
+    ) {
+        self.w.line(format_args!(
+            "drop({});",
+            function.locals[payload.index()].symbol.as_str()
+        ));
+        self.w
+            .line(format_args!("drop(__anv_map_entry_ops_{index});"));
+        self.w.line(format_args!("drop({guard});"));
+    }
+
     fn emit_option_match(
         &mut self,
         function: &RirFunction,
@@ -1626,6 +1643,19 @@ impl EmitCx<'_> {
                     "drop({});",
                     function.locals[local.index()].symbol.as_str()
                 ));
+            }
+            for (alias_index, payload) in escaping_map_entry_payloads(&block.stmts[..=index]) {
+                let guard = format!("__anv_map_entry_guard_{alias_index}");
+                let alias_used_here = stmt_uses_local(self.program, stmt, payload);
+                let alias_declared_here = alias_index == index;
+                if (alias_used_here || alias_declared_here)
+                    && !block.stmts[index + 1..]
+                        .iter()
+                        .any(|stmt| stmt_uses_local(self.program, stmt, payload))
+                    && !term_uses_local(self.program, &block.term, payload)
+                {
+                    self.emit_map_entry_alias_drop(function, alias_index, payload, &guard);
+                }
             }
         }
         self.emit_term(function, &block.term);
@@ -1889,8 +1919,12 @@ impl EmitCx<'_> {
                     "value.get(rt, &{key})?.map(|value| {})",
                     values.value_from_place(value_ty, "value")
                 );
-                if matches!(map.root, RirPlaceRoot::Local(_)) && places.mut_place_root_param(map) {
-                    self.mut_place_access(function, map, &format!("Ok({body})"))
+                if let Some(place) = self.collection_root_place(function, map) {
+                    target::mut_place_access_ctx(
+                        &place,
+                        target::runtime_param_name(),
+                        &format!("Ok({body})"),
+                    )
                 } else {
                     format!(
                         "{}.get({}, &{key})?.map(|value| {})",
@@ -2065,12 +2099,12 @@ impl EmitCx<'_> {
     ) -> String {
         let places = RustPlaces::new(self.program, function);
         let index = function.locals[index.index()].symbol.as_str();
-        if places.mut_place_root_param(map) {
+        if let Some(place) = self.collection_root_place(function, map) {
             let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
             let version =
                 self.collection_version(map, target::collection_structural_version("__anv_map"));
             return target::mut_place_access_ctx(
-                &places.local_place(map),
+                &place,
                 target::runtime_param_name(),
                 &format!(
                     "Ok({{ let __anv_map = value; let index = {checked}; {} }})",
@@ -2101,12 +2135,12 @@ impl EmitCx<'_> {
     ) -> String {
         let places = RustPlaces::new(self.program, function);
         let index = function.locals[index.index()].symbol.as_str();
-        if places.mut_place_root_param(map) {
+        if let Some(place) = self.collection_root_place(function, map) {
             let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
             let version =
                 self.collection_version(map, target::collection_structural_version("__anv_map"));
             return target::mut_place_mutate_ctx(
-                &places.local_place(map),
+                &place,
                 target::runtime_param_name(),
                 &format!(
                     "{{ let __anv_map = value; let index = {checked}; {} }}",
@@ -2192,20 +2226,27 @@ impl EmitCx<'_> {
         ))
     }
 
+    fn collection_root_place(&self, function: &RirFunction, root: &RirPlace) -> Option<String> {
+        let places = RustPlaces::new(self.program, function);
+        let RirPlaceRoot::Local(local) = root.root else {
+            return None;
+        };
+        if !places.mut_place_root_param(root) {
+            return None;
+        }
+        Some(if places.payload_ref_cell_local(local) {
+            target::mut_place_scoped_cell(&format!("&{}", places.local_place(root)))
+        } else {
+            places.local_place(root)
+        })
+    }
+
     fn collection_mutation_place(
         &self,
         function: &RirFunction,
         root: &RirPlace,
     ) -> Option<(Vec<String>, String)> {
-        let places = RustPlaces::new(self.program, function);
-        if let RirPlaceRoot::Local(local) = root.root
-            && places.mut_place_root_param(root)
-        {
-            let place = if places.payload_ref_cell_local(local) {
-                target::mut_place_scoped_cell(&format!("&{}", places.local_place(root)))
-            } else {
-                places.local_place(root)
-            };
+        if let Some(place) = self.collection_root_place(function, root) {
             return Some((vec![], place));
         }
         if let Some(place) = self.local_projected_mut_place(function, root) {
@@ -2329,20 +2370,18 @@ impl EmitCx<'_> {
         )
     }
 
-    fn cell_decl(&self, cell: super::rir::RirCellRef) -> &RirCellDecl {
+    fn cell_decl(&self, cell: RirCellRef) -> &RirCellDecl {
         match cell {
-            super::rir::RirCellRef::Owner(cell) | super::rir::RirCellRef::Capture { cell, .. } => {
+            RirCellRef::Owner(cell) | RirCellRef::Capture { cell, .. } => {
                 &self.program.cells[cell.index()]
             }
         }
     }
 
-    fn cell_ref(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+    fn cell_ref(&self, function: &RirFunction, cell: RirCellRef) -> String {
         match cell {
-            super::rir::RirCellRef::Owner(cell) => {
-                self.program.cells[cell.index()].symbol.as_str().to_string()
-            }
-            super::rir::RirCellRef::Capture { local, .. } => {
+            RirCellRef::Owner(cell) => self.program.cells[cell.index()].symbol.as_str().to_string(),
+            RirCellRef::Capture { local, .. } => {
                 function.locals[local.index()].symbol.as_str().to_string()
             }
         }
@@ -2373,11 +2412,11 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cell_payload_ty(&self, cell: super::rir::RirCellRef) -> String {
+    fn cell_payload_ty(&self, cell: RirCellRef) -> String {
         self.ty(self.cell_decl(cell).payload_ty)
     }
 
-    fn cell_ty(&self, _function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+    fn cell_ty(&self, _function: &RirFunction, cell: RirCellRef) -> String {
         let payload = self.cell_payload_ty(cell);
         match self.cell_decl(cell).storage {
             RirCellStorage::StackScoped => target::stack_lambda_cell_ty(&payload),
@@ -2385,12 +2424,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cell_init(
-        &mut self,
-        function: &RirFunction,
-        cell: super::rir::RirCellRef,
-        value: &RirRValue,
-    ) -> String {
+    fn cell_init(&mut self, function: &RirFunction, cell: RirCellRef, value: &RirRValue) -> String {
         let payload = self.cell_payload_ty(cell);
         let value = self.rvalue(function, value);
         match self.cell_decl(cell).storage {
@@ -2411,12 +2445,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cell_set(
-        &mut self,
-        function: &RirFunction,
-        cell: super::rir::RirCellRef,
-        value: &RirRValue,
-    ) -> String {
+    fn cell_set(&mut self, function: &RirFunction, cell: RirCellRef, value: &RirRValue) -> String {
         let value = self.rvalue(function, value);
         let decl = self.cell_decl(cell);
         let set =
@@ -2436,7 +2465,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cell_get_copy(&self, function: &RirFunction, cell: super::rir::RirCellRef) -> String {
+    fn cell_get_copy(&self, function: &RirFunction, cell: RirCellRef) -> String {
         let decl = self.cell_decl(cell);
         let policy = RustRepPolicy::new(self.program);
         let access = if !policy.copyable(decl.payload_ty) && policy.shareable_value(decl.payload_ty)
@@ -2785,8 +2814,8 @@ impl EmitCx<'_> {
                 RirParamSemantic::StackCell,
                 RirLambdaCaptureArg::StackCell { cell },
             ) => match cell {
-                super::rir::RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
-                super::rir::RirCellRef::Capture { .. } => self.cell_ref(function, *cell),
+                RirCellRef::Owner(_) => format!("&{}", self.cell_ref(function, *cell)),
+                RirCellRef::Capture { .. } => self.cell_ref(function, *cell),
             },
             (
                 RirLambdaCaptureKind::HeapCell { .. },
@@ -3271,6 +3300,275 @@ fn stmt_call_args(stmt: &RirStmt) -> Option<&[RirCallArg]> {
     }
 }
 
+fn escaping_map_entry_payloads(
+    stmts: &[RirStmt],
+) -> impl Iterator<Item = (usize, RirLocalId)> + '_ {
+    stmts.iter().enumerate().filter_map(|(index, stmt)| {
+        let RirStmt::MapEntryMatch(match_) = stmt else {
+            return None;
+        };
+        match_.payload_escapes.then_some((index, match_.payload?))
+    })
+}
+
+fn stmt_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLocalId) -> bool {
+    stmt_directly_uses_local(program, stmt, local)
+        || stmt_child_blocks_any(stmt, |block| block_uses_local(program, block, local))
+}
+
+fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLocalId) -> bool {
+    match stmt {
+        RirStmt::Init { value, .. }
+        | RirStmt::GlobalSetRoot { value, .. }
+        | RirStmt::GlobalUpdateRoot { value, .. }
+        | RirStmt::Eval(value) => rvalue_uses_local(program, value, local),
+        RirStmt::Assign { dst, value } => {
+            place_uses_local(dst, local) || rvalue_uses_local(program, value, local)
+        }
+        RirStmt::CellInit { cell, value } | RirStmt::CellSet { cell, value } => {
+            cell_uses_local(cell, local) || rvalue_uses_local(program, value, local)
+        }
+        RirStmt::ScopedPlaceCellSet { cell, value } => {
+            scoped_cell_uses_local(program, cell, local) || rvalue_uses_local(program, value, local)
+        }
+        RirStmt::MutPlaceSet { place, value } => {
+            mut_place_arg_uses_local(program, place, local)
+                || rvalue_uses_local(program, value, local)
+        }
+        RirStmt::DataRefSet {
+            object,
+            projections,
+            value,
+            ..
+        } => {
+            operand_uses_local(program, object, local)
+                || projections_use_local(projections, local)
+                || operand_uses_local(program, value, local)
+        }
+        RirStmt::MapValueSet { map, index, value } => {
+            place_uses_local(map, local)
+                || *index == local
+                || operand_uses_local(program, value, local)
+        }
+        RirStmt::If(RirIf { cond, .. }) => operand_uses_local(program, cond, local),
+        RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => {
+            place_uses_local(root, local)
+        }
+        RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
+        RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
+            option_subject_uses_local(program, subject, local)
+        }
+        RirStmt::MapEntryMatch(RirMapEntryMatch { map, key, .. }) => {
+            mut_place_arg_uses_local(program, map, local) || operand_uses_local(program, key, local)
+        }
+        RirStmt::GlobalEnsure { .. } | RirStmt::Loop(_) | RirStmt::CollectionSlotScope(_) => false,
+    }
+}
+
+fn block_uses_local(program: &RirProgram, block: &RirStructuredBlock, local: RirLocalId) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_uses_local(program, stmt, local))
+        || term_uses_local(program, &block.term, local)
+}
+
+fn term_uses_local(program: &RirProgram, term: &RirTerm, local: RirLocalId) -> bool {
+    match term {
+        RirTerm::Return(Some(operand)) => operand_uses_local(program, operand, local),
+        RirTerm::None
+        | RirTerm::Return(None)
+        | RirTerm::Break(_)
+        | RirTerm::Continue(_)
+        | RirTerm::Unreachable => false,
+    }
+}
+
+fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId) -> bool {
+    match value {
+        RirRValue::Use(operand)
+        | RirRValue::Unary { value: operand, .. }
+        | RirRValue::Cast { value: operand, .. }
+        | RirRValue::OptionalSome { value: operand, .. }
+        | RirRValue::Stringify { value: operand, .. }
+        | RirRValue::Format { value: operand, .. } => operand_uses_local(program, operand, local),
+        RirRValue::Struct { fields, .. }
+        | RirRValue::Tuple { fields, .. }
+        | RirRValue::Array { elems: fields, .. }
+        | RirRValue::List { elems: fields, .. }
+        | RirRValue::EnumVariant { fields, .. } => fields
+            .iter()
+            .any(|operand| operand_uses_local(program, operand, local)),
+        RirRValue::Map { entries, .. } => entries.iter().any(|(key, value)| {
+            operand_uses_local(program, key, local) || operand_uses_local(program, value, local)
+        }),
+        RirRValue::DataRefAlloc { fields, .. } => fields
+            .iter()
+            .any(|value| operand_uses_local(program, value, local)),
+        RirRValue::DataRefGet {
+            object,
+            projections,
+            ..
+        } => {
+            operand_uses_local(program, object, local) || projections_use_local(projections, local)
+        }
+        RirRValue::CellGetCopy { cell, .. } => cell_uses_local(cell, local),
+        RirRValue::ScopedPlaceCellGet { cell, .. } => scoped_cell_uses_local(program, cell, local),
+        RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
+            operand_uses_local(program, lhs, local) || operand_uses_local(program, rhs, local)
+        }
+        RirRValue::Call { callee, args, .. } => {
+            call_target_uses_local(program, callee, local)
+                || args
+                    .iter()
+                    .any(|arg| call_arg_uses_local(program, arg, local))
+        }
+        RirRValue::StringConcat { parts } => parts
+            .iter()
+            .any(|part| operand_uses_local(program, part, local)),
+        RirRValue::Len { source } => place_uses_local(source, local),
+        RirRValue::SliceView {
+            source, start, end, ..
+        }
+        | RirRValue::RangeListCopy {
+            source, start, end, ..
+        } => place_uses_local(source, local) || *start == local || *end == local,
+        RirRValue::MapEntryAt {
+            map: source, index, ..
+        }
+        | RirRValue::MapValueAt {
+            map: source, index, ..
+        } => place_uses_local(source, local) || *index == local,
+        RirRValue::ListPush { list, value } => {
+            place_uses_local(list, local) || operand_uses_local(program, value, local)
+        }
+        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
+            place_uses_local(map, local) || operand_uses_local(program, key, local)
+        }
+        RirRValue::MapInsert {
+            map, key, value, ..
+        } => {
+            place_uses_local(map, local)
+                || operand_uses_local(program, key, local)
+                || operand_uses_local(program, value, local)
+        }
+        RirRValue::Lambda { captures, .. } => captures.iter().any(|capture| match capture {
+            RirLambdaCaptureArg::Readonly { value } => operand_uses_local(program, value, local),
+            RirLambdaCaptureArg::Scoped { place } => place_uses_local(place, local),
+            RirLambdaCaptureArg::StackCell { cell } | RirLambdaCaptureArg::HeapCell { cell } => {
+                cell_uses_local(cell, local)
+            }
+            RirLambdaCaptureArg::ScopedPlaceCell { cell } => {
+                scoped_cell_uses_local(program, cell, local)
+            }
+        }),
+    }
+}
+
+fn call_target_uses_local(program: &RirProgram, callee: &RirCallTarget, local: RirLocalId) -> bool {
+    match callee {
+        RirCallTarget::LambdaValue { callee, .. } => operand_uses_local(program, callee, local),
+        RirCallTarget::Function(_) | RirCallTarget::Extern(_) => false,
+    }
+}
+
+fn call_arg_uses_local(program: &RirProgram, arg: &RirCallArg, local: RirLocalId) -> bool {
+    match arg {
+        RirCallArg::Value(operand) => operand_uses_local(program, operand, local),
+        RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
+            place_uses_local(place, local)
+        }
+        RirCallArg::MutPlace(place) => mut_place_arg_uses_local(program, place, local),
+        RirCallArg::ScopedLambda { callee, .. } => operand_uses_local(program, callee, local),
+        RirCallArg::SharedStringConst(_) => false,
+    }
+}
+
+fn option_subject_uses_local(
+    program: &RirProgram,
+    subject: &RirOptionSubject,
+    local: RirLocalId,
+) -> bool {
+    match subject {
+        RirOptionSubject::Place(place) => place_uses_local(place, local),
+        RirOptionSubject::MutPlace(place) => mut_place_arg_uses_local(program, place, local),
+    }
+}
+
+fn mut_place_arg_uses_local(program: &RirProgram, arg: &RirMutPlaceArg, local: RirLocalId) -> bool {
+    mut_place_access_uses_local(program, &arg.access, local)
+        || projections_use_local(&arg.projections, local)
+}
+
+fn mut_place_access_uses_local(
+    program: &RirProgram,
+    access: &RirMutPlaceAccess,
+    local: RirLocalId,
+) -> bool {
+    match access {
+        RirMutPlaceAccess::Handle(handle) => mut_place_handle_uses_local(program, handle, local),
+        RirMutPlaceAccess::DataRef { object, .. } => operand_uses_local(program, object, local),
+    }
+}
+
+fn mut_place_handle_uses_local(
+    program: &RirProgram,
+    handle: &RirMutPlaceHandle,
+    local: RirLocalId,
+) -> bool {
+    match handle {
+        RirMutPlaceHandle::Local { local: root, .. }
+        | RirMutPlaceHandle::Param { local: root, .. } => *root == local,
+        RirMutPlaceHandle::StackCell { cell, .. } | RirMutPlaceHandle::HeapCell { cell, .. } => {
+            cell_uses_local(cell, local)
+        }
+        RirMutPlaceHandle::ScopedPlaceCell { cell, .. } => {
+            scoped_cell_uses_local(program, cell, local)
+        }
+        RirMutPlaceHandle::Global { .. } => false,
+    }
+}
+
+fn cell_uses_local(cell: &RirCellRef, local: RirLocalId) -> bool {
+    matches!(cell, RirCellRef::Capture { local: captured, .. } if *captured == local)
+}
+
+fn scoped_cell_uses_local(
+    program: &RirProgram,
+    cell: &RirScopedPlaceCellRef,
+    local: RirLocalId,
+) -> bool {
+    if let RirScopedPlaceCellRef::Capture {
+        local: captured, ..
+    } = cell
+        && *captured == local
+    {
+        return true;
+    }
+    let cell = match cell {
+        RirScopedPlaceCellRef::Owner(cell) | RirScopedPlaceCellRef::Capture { cell, .. } => cell,
+    };
+    program.scoped_place_cells[cell.index()].source_local == local
+}
+
+fn operand_uses_local(_program: &RirProgram, operand: &RirOperand, local: RirLocalId) -> bool {
+    match operand {
+        RirOperand::Place(place) => place_uses_local(place, local),
+        RirOperand::Const(_) => false,
+    }
+}
+
+fn place_uses_local(place: &RirPlace, local: RirLocalId) -> bool {
+    matches!(place.root, RirPlaceRoot::Local(root) if root == local)
+        || projections_use_local(&place.projections, local)
+}
+
+fn projections_use_local(projections: &[RirProjection], local: RirLocalId) -> bool {
+    projections
+        .iter()
+        .any(|projection| matches!(projection, RirProjection::Index(index) if *index == local))
+}
+
 fn block_uses_scoped_lambda_sig(block: &RirStructuredBlock, sig: RirLambdaSigId) -> bool {
     block
         .stmts
@@ -3279,6 +3577,11 @@ fn block_uses_scoped_lambda_sig(block: &RirStructuredBlock, sig: RirLambdaSigId)
 }
 
 fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
+    stmt_directly_uses_scoped_lambda_sig(stmt, sig)
+        || stmt_child_blocks_any(stmt, |block| block_uses_scoped_lambda_sig(block, sig))
+}
+
+fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
     match stmt {
         RirStmt::Init { value, .. }
         | RirStmt::Assign { value, .. }
@@ -3289,44 +3592,16 @@ fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
         | RirStmt::Eval(value) => rvalue_uses_scoped_lambda_sig(value, sig),
-        RirStmt::If(RirIf {
-            then_block,
-            else_block,
-            ..
-        }) => {
-            block_uses_scoped_lambda_sig(then_block, sig)
-                || else_block
-                    .as_ref()
-                    .is_some_and(|block| block_uses_scoped_lambda_sig(block, sig))
-        }
-        RirStmt::Loop(RirLoop { body, .. })
-        | RirStmt::CollectionLoanScope(RirCollectionLoanScope { body, .. })
-        | RirStmt::CollectionSlotScope(body) => block_uses_scoped_lambda_sig(body, sig),
-        RirStmt::EnumMatch(RirEnumMatch {
-            arms, else_block, ..
-        }) => {
-            arms.iter()
-                .any(|arm| block_uses_scoped_lambda_sig(&arm.block, sig))
-                || else_block
-                    .as_ref()
-                    .is_some_and(|block| block_uses_scoped_lambda_sig(block, sig))
-        }
-        RirStmt::OptionMatch(RirOptionMatch {
-            some_block,
-            none_block,
-            ..
-        })
-        | RirStmt::MapEntryMatch(RirMapEntryMatch {
-            some_block,
-            none_block,
-            ..
-        }) => {
-            block_uses_scoped_lambda_sig(some_block, sig)
-                || block_uses_scoped_lambda_sig(none_block, sig)
-        }
-        RirStmt::GlobalEnsure { .. } | RirStmt::DataRefSet { .. } | RirStmt::MapValueSet { .. } => {
-            false
-        }
+        RirStmt::GlobalEnsure { .. }
+        | RirStmt::DataRefSet { .. }
+        | RirStmt::MapValueSet { .. }
+        | RirStmt::If(_)
+        | RirStmt::Loop(_)
+        | RirStmt::CollectionLoanScope(_)
+        | RirStmt::CollectionSlotScope(_)
+        | RirStmt::EnumMatch(_)
+        | RirStmt::OptionMatch(_)
+        | RirStmt::MapEntryMatch(_) => false,
     }
 }
 

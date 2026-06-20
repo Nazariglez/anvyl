@@ -105,7 +105,7 @@ impl CollectionLoanState {
         }
     }
 
-    pub fn before_unloaned_value_mutation(&self) -> Result<(), RuntimeError> {
+    pub fn before_unloaned_storage_access(&self) -> Result<(), RuntimeError> {
         if self.inner.active_value_loan.get().is_none() {
             Ok(())
         } else {
@@ -237,13 +237,13 @@ mod tests {
         let id = guard.id();
 
         assert_eq!(state.active_shape_loans(), 1);
-        assert!(state.before_unloaned_value_mutation().is_err());
+        assert!(state.before_unloaned_storage_access().is_err());
         assert!(state.begin_value_loan().is_err());
         assert!(state.check_value_loan(id).is_ok());
         drop(guard);
 
         assert_eq!(state.active_shape_loans(), 0);
-        assert!(state.before_unloaned_value_mutation().is_ok());
+        assert!(state.before_unloaned_storage_access().is_ok());
         assert!(state.check_value_loan(id).is_err());
     }
 

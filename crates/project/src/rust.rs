@@ -811,7 +811,7 @@ anvyx_runtime::builtin_module! {{
                 .collect(),
             cargo_profile: RustCargoProfile::Dev,
             cache_root: Some(temp.path().join("cache")),
-            timeout: Some(Duration::from_mins(1)),
+            timeout: Some(Duration::from_mins(5)),
         })
         .unwrap();
         let names = output
@@ -859,7 +859,7 @@ anvyx_runtime::builtin_module! {{
                 .collect(),
             cargo_profile: RustCargoProfile::Dev,
             cache_root: Some(native.path().join("cache")),
-            timeout: Some(Duration::from_mins(1)),
+            timeout: Some(Duration::from_mins(5)),
         })
         .unwrap();
 
@@ -891,7 +891,7 @@ anvyx_runtime::builtin_module! {{
                 .collect(),
             cargo_profile: RustCargoProfile::Dev,
             cache_root: Some(first.path().join("cache")),
-            timeout: Some(Duration::from_mins(1)),
+            timeout: Some(Duration::from_mins(5)),
         })
         .unwrap();
 

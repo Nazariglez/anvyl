@@ -216,8 +216,8 @@ impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
 
 impl<'cx, K, V> ProjectionOps<'cx, AnvMap<'cx, K, V>, V> for MapValueOps<K>
 where
-    K: Eq + Hash + Clone + 'cx,
-    V: Clone + 'cx,
+    K: Eq + Hash + 'cx,
+    V: 'cx,
 {
     fn access(
         &self,
@@ -225,13 +225,7 @@ where
         root: &AnvMap<'cx, K, V>,
         f: &mut dyn FnMut(&V) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        root.with_value_shared_by_key(
-            ctx,
-            &self.key,
-            self.expected_version,
-            self.value_loan,
-            |value| f(value),
-        )
+        root.with_value_shared_by_key(ctx, &self.key, self.expected_version, self.value_loan, f)
     }
 
     fn mutate(
@@ -240,13 +234,7 @@ where
         root: &mut AnvMap<'cx, K, V>,
         f: &mut dyn FnMut(&mut V) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        root.with_value_owned_mut_short_by_key(
-            ctx,
-            &self.key,
-            self.expected_version,
-            self.value_loan,
-            |value| f(value),
-        )
+        root.with_value_mut_by_key(ctx, &self.key, self.expected_version, self.value_loan, f)
     }
 }
 
@@ -934,7 +922,8 @@ mod tests {
             assert_eq!(err.message(), "early");
         }
 
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
+        drop(guard);
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(9));
         assert_eq!(map.structural_version(), 0);
             );
     }
@@ -951,7 +940,6 @@ mod tests {
             assert_eq!(place.get_copy(&mut ctx).unwrap_err().message(), "map entry key is missing");
             assert_eq!(place.set(&mut ctx, 3).unwrap_err().message(), "map entry key is missing");
         }
-        assert_eq!(map.get(&ctx, &"missing").unwrap(), None);
 
         let ops = MapValueOps::new("a", &guard);
         drop(guard);
@@ -974,8 +962,37 @@ mod tests {
             place.set(&mut ctx, 2).unwrap();
         }
 
+        drop(guard);
         assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
         assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            );
+    }
+
+    #[test]
+    fn projected_map_value_composes_through_nested_map() {
+        with_ctx!(ctx;
+        let inner = map(&mut ctx, [("x", 1_i64)]);
+        let mut groups = map(&mut ctx, [("a", inner)]);
+        let guard = groups.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        let mut place = MutPlace::projected(MutPlace::local(&mut groups), &ops);
+
+        place.mutate_with_ctx(&mut ctx, |ctx, inner| {
+            let inner_guard = inner.begin_value_loan_by_key(ctx, &"x")?;
+            let inner_ops = MapValueOps::new("x", &inner_guard);
+            let mut inner_place = MutPlace::projected(MutPlace::local(inner), &inner_ops);
+            inner_place.update_copy(ctx, |value| value + 2)
+        }).unwrap();
+        place.access_with_ctx(&mut ctx, |ctx, inner| {
+            assert_eq!(inner.get(ctx, &"x")?, Some(3));
+            Ok(())
+        }).unwrap();
+
+        drop(place);
+        drop(guard);
+        let stored = groups.get(&ctx, &"a").unwrap().unwrap();
+        assert_eq!(stored.get(&ctx, &"x").unwrap(), Some(3));
+        assert_eq!(groups.structural_version(), 0);
             );
     }
 
@@ -1010,6 +1027,7 @@ mod tests {
             cell.set(&mut ctx, 5).unwrap();
         }
 
+        drop(guard);
         assert_eq!(map.get(&ctx, &"a").unwrap(), Some(5));
             );
     }

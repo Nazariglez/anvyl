@@ -396,6 +396,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
     }
 
     pub fn begin_shape_loan(&self) -> Result<ShapeLoanGuard, RuntimeError> {
+        self.loan.before_unloaned_storage_access()?;
         self.loan.begin_shape_loan()
     }
 
@@ -408,10 +409,8 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         K: Clone,
         V: Clone,
     {
-        self.with_storage(ctx, |storage| {
-            storage
-                .get_index_of(key)
-                .ok_or_else(|| RuntimeError::new("map entry key is missing"))?;
+        self.with_unloaned_storage(ctx, |storage| {
+            storage.get_index_of(key).ok_or_else(Self::missing_key)?;
             Ok(())
         })?;
         self.make_unique(ctx)?;
@@ -422,7 +421,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         self.loan.current_version()
     }
 
-    fn with_storage<'rt, R>(
+    fn with_storage_unchecked<'rt, R>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
         f: impl FnOnce(&MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
@@ -432,7 +431,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
             .map_err(heap_access_error)?
     }
 
-    fn with_storage_mut<'rt, R>(
+    fn with_storage_mut_unchecked<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&mut MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
@@ -442,15 +441,36 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
             .map_err(heap_access_error)?
     }
 
+    fn with_unloaned_storage<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        f: impl FnOnce(&MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        self.loan.before_unloaned_storage_access()?;
+        self.with_storage_unchecked(ctx, f)
+    }
+
+    fn check_projected_value_storage(&self) -> Result<(), RuntimeError> {
+        if self.storage.is_unique() {
+            Ok(())
+        } else {
+            Err(RuntimeError::new("map entry value loan storage is shared"))
+        }
+    }
+
+    fn missing_key() -> RuntimeError {
+        RuntimeError::new("map entry key is missing")
+    }
+
     pub fn get<'rt>(&self, ctx: &Ctx<'cx, 'rt>, key: &K) -> Result<Option<V>, RuntimeError>
     where
         V: Clone,
     {
-        self.with_storage(ctx, |storage| Ok(storage.get(key).cloned()))
+        self.with_unloaned_storage(ctx, |storage| Ok(storage.get(key).cloned()))
     }
 
     pub fn contains_key<'rt>(&self, ctx: &Ctx<'cx, 'rt>, key: &K) -> Result<bool, RuntimeError> {
-        self.with_storage(ctx, |storage| Ok(storage.contains_key(key)))
+        self.with_unloaned_storage(ctx, |storage| Ok(storage.contains_key(key)))
     }
 
     fn make_unique<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>) -> Result<(), RuntimeError>
@@ -475,7 +495,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         let loan = self.loan.clone();
         loan.structural_mutation_result(|| {
             self.make_unique(ctx)?;
-            let (result, len) = self.with_storage_mut(ctx, |storage| {
+            let (result, len) = self.with_storage_mut_unchecked(ctx, |storage| {
                 let result = f(storage)?;
                 Ok((result, storage.len()))
             })?;
@@ -495,7 +515,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         V: Clone,
     {
         self.loan.check_stable(expected_version)?;
-        self.with_storage(ctx, |storage| {
+        self.with_unloaned_storage(ctx, |storage| {
             storage
                 .get_index(index)
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -522,7 +542,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         K: Clone,
         V: Clone,
     {
-        self.loan.before_unloaned_value_mutation()?;
+        self.loan.before_unloaned_storage_access()?;
         self.loan.check_stable(expected_version)?;
         let len = self.len();
         if index >= len {
@@ -531,7 +551,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
             )));
         }
         self.make_unique(ctx)?;
-        self.with_storage_mut(ctx, |storage| {
+        self.with_storage_mut_unchecked(ctx, |storage| {
             let Some((_, value)) = storage.get_index_mut(index) else {
                 return Err(RuntimeError::new(format!(
                     "map entry index {index} out of bounds for len {len}"
@@ -589,46 +609,28 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
     ) -> Result<R, RuntimeError> {
         self.loan.check_value_loan(value_loan)?;
         self.loan.check_stable(expected_version)?;
-        self.with_storage(ctx, |storage| {
-            let value = storage
-                .get(key)
-                .ok_or_else(|| RuntimeError::new("map entry key is missing"))?;
+        self.check_projected_value_storage()?;
+        self.with_storage_unchecked(ctx, |storage| {
+            let value = storage.get(key).ok_or_else(Self::missing_key)?;
             f(value)
         })
     }
 
-    pub fn with_value_owned_mut_short_by_key<'rt, R>(
+    pub fn with_value_mut_by_key<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         key: &K,
         expected_version: u64,
         value_loan: u64,
         f: impl FnOnce(&mut V) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         self.loan.check_value_loan(value_loan)?;
         self.loan.check_stable(expected_version)?;
-        self.make_unique(ctx)?;
-        let mut value = self.with_storage(ctx, |storage| {
-            storage
-                .get(key)
-                .cloned()
-                .ok_or_else(|| RuntimeError::new("map entry key is missing"))
-        })?;
-        let result = f(&mut value)?;
-        self.loan.check_value_loan(value_loan)?;
-        self.loan.check_stable(expected_version)?;
-        self.with_storage_mut(ctx, |storage| {
-            let slot = storage
-                .get_mut(key)
-                .ok_or_else(|| RuntimeError::new("map entry key is missing"))?;
-            *slot = value;
-            Ok(())
-        })?;
-        Ok(result)
+        self.check_projected_value_storage()?;
+        self.with_storage_mut_unchecked(ctx, |storage| {
+            let value = storage.get_mut(key).ok_or_else(Self::missing_key)?;
+            f(value)
+        })
     }
 
     pub fn insert<'rt>(
@@ -642,9 +644,8 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         V: Clone,
     {
         if self.contains_key(ctx, &key)? {
-            self.loan.before_unloaned_value_mutation()?;
             self.make_unique(ctx)?;
-            return self.with_storage_mut(ctx, |storage| Ok(storage.insert(key, value)));
+            return self.with_storage_mut_unchecked(ctx, |storage| Ok(storage.insert(key, value)));
         }
         let old =
             self.structurally_mutate_storage(ctx, |storage| Ok(storage.insert(key, value)))?;
@@ -1452,17 +1453,17 @@ mod tests {
             shared.insert(&mut ctx, 2, replacement).unwrap();
 
             let original_inner_owners = map
-                .with_storage(&ctx, |storage| {
+                .with_storage_unchecked(&ctx, |storage| {
                     Ok(storage.get(&1).unwrap().storage.logical_owners())
                 })
                 .unwrap();
             let shared_inner_owners = shared
-                .with_storage(&ctx, |storage| {
+                .with_storage_unchecked(&ctx, |storage| {
                     Ok(storage.get(&1).unwrap().storage.logical_owners())
                 })
                 .unwrap();
             let replacement_owners = shared
-                .with_storage(&ctx, |storage| {
+                .with_storage_unchecked(&ctx, |storage| {
                     Ok(storage.get(&2).unwrap().storage.logical_owners())
                 })
                 .unwrap();
@@ -1508,6 +1509,7 @@ mod tests {
             let ty = map_ty::<&str, i64>(heap);
             let mut ctx = Ctx::new(heap);
             let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let shared = map.share();
             let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
             let version = guard.version();
 
@@ -1523,7 +1525,60 @@ mod tests {
             }
             drop(guard);
 
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
             assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
+        });
+    }
+
+    #[test]
+    fn map_value_loan_blocks_ordinary_storage_access() {
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+            let version = guard.version();
+
+            assert!(map.get(&ctx, &"a").is_err());
+            assert!(map.contains_key(&ctx, &"a").is_err());
+            assert!(map.begin_shape_loan().is_err());
+            assert!(map.key_at_shared(&ctx, 0, version).is_err());
+            assert!(map.value_at_shared(&ctx, 0, version).is_err());
+            assert!(map.insert(&mut ctx, "b", 2).is_err());
+            assert!(map.remove(&mut ctx, &"missing").is_err());
+
+            map.with_value_mut_by_key(&mut ctx, &"a", version, guard.id(), |value| {
+                *value = 3;
+                Ok(())
+            })
+            .unwrap();
+            drop(guard);
+
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
+        });
+    }
+
+    #[test]
+    fn map_value_loan_rejects_projection_after_share() {
+        Heap::scope(|heap| {
+            let ty = map_ty::<&str, i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
+            let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+            let shared = map.share();
+
+            assert!(
+                map.with_value_mut_by_key(&mut ctx, &"a", guard.version(), guard.id(), |value| {
+                    *value = 3;
+                    Ok(())
+                })
+                .is_err()
+            );
+            drop(guard);
+
+            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
         });
     }
 
@@ -1536,7 +1591,6 @@ mod tests {
             let shared = map.share();
 
             assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
-
             assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
             assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
             assert_eq!(map.structural_version(), 0);
