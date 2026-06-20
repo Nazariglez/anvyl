@@ -31,6 +31,13 @@ fn checked(source: &str) -> TypecheckTestResult {
     check(source).expect("program should typecheck")
 }
 
+fn assert_borrowed_scoped_capture(result: &TypecheckTestResult, name: &str) {
+    let capture = capture(result, name);
+    assert_eq!(capture.origin, CaptureStorageOrigin::BorrowedParam);
+    assert_eq!(capture.storage, CaptureStorage::BorrowedScoped);
+    assert!(!requires_cell(result, capture));
+}
+
 #[test]
 fn non_escaping_mutable_captures_share_one_cell_requirement() {
     let result = checked(
@@ -354,8 +361,41 @@ fn non_escaping_borrowed_capture_records_scoped_storage() {
         ",
     );
 
-    let capture = capture(&result, "x");
-    assert_eq!(capture.origin, CaptureStorageOrigin::BorrowedParam);
-    assert_eq!(capture.storage, CaptureStorage::BorrowedScoped);
-    assert!(!requires_cell(&result, capture));
+    assert_borrowed_scoped_capture(&result, "x");
+}
+
+#[test]
+fn slice_param_captures_are_borrowed_scoped() {
+    let result = checked(
+        r"
+        fn use_slice_now(xs: slice[int]) -> int {
+            let f = || xs[0];
+            f()
+        }
+
+        fn use_tuple_now(pair: (slice[int], int)) -> int {
+            let f = || pair.0[0];
+            f()
+        }
+        ",
+    );
+
+    assert_borrowed_scoped_capture(&result, "xs");
+    assert_borrowed_scoped_capture(&result, "pair");
+}
+
+#[test]
+fn slice_signature_callback_capture_stays_owned() {
+    let result = checked(
+        r"
+        fn use_now(cb: fn(slice[int]) -> int) {
+            let f = || { let g = cb; };
+            f();
+        }
+        ",
+    );
+
+    let capture = capture(&result, "cb");
+    assert_eq!(capture.origin, CaptureStorageOrigin::Owned);
+    assert_eq!(capture.storage, CaptureStorage::OwnedReadonly);
 }

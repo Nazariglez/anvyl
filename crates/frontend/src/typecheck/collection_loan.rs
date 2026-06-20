@@ -1,4 +1,8 @@
-use super::{ModuleScope, TypeError, place::PlaceIdentity};
+use super::{
+    ModuleScope, TypeError,
+    place::PlaceIdentity,
+    type_ops::{contains_nested_stored_slice_view, contains_stored_slice_view},
+};
 use crate::{
     ast::{Ident, Type},
     collection_effect::{self, CollectionStructuralEffect},
@@ -181,46 +185,11 @@ pub(super) fn mutable_collection_arg_error(
 }
 
 pub(super) fn stored_slice_local_error(ty: &Type, span: Option<SourceSpan>) -> Option<TypeError> {
-    contains_stored_slice(ty).then_some(TypeError::StoredSliceLocal { span })
+    contains_stored_slice_view(ty).then_some(TypeError::StoredSliceLocal { span })
 }
 
 pub(super) fn stored_nested_slice_error(ty: &Type, span: Option<SourceSpan>) -> Option<TypeError> {
-    contains_nested_slice(ty).then_some(TypeError::StoredSliceLocal { span })
-}
-
-fn contains_nested_slice(ty: &Type) -> bool {
-    match ty {
-        Type::Tuple(items) => items.iter().any(contains_nested_slice),
-        Type::List { elem } | Type::Array { elem, .. } | Type::Optional { inner: elem } => {
-            contains_stored_slice(elem)
-        }
-        Type::Map { key, value } => contains_stored_slice(key) || contains_stored_slice(value),
-        _ => false,
-    }
-}
-
-fn contains_stored_slice(ty: &Type) -> bool {
-    match ty {
-        Type::Slice { .. } => true,
-        Type::Tuple(items) => items.iter().any(contains_stored_slice),
-        Type::List { elem } | Type::Array { elem, .. } => contains_stored_slice(elem),
-        Type::Map { key, value } => contains_stored_slice(key) || contains_stored_slice(value),
-        Type::Optional { inner } => contains_stored_slice(inner),
-        Type::Func { .. }
-        | Type::Infer
-        | Type::InferReturn
-        | Type::Any
-        | Type::Int
-        | Type::Float
-        | Type::Bool
-        | Type::String
-        | Type::Void
-        | Type::Dyn(_)
-        | Type::Var(_)
-        | Type::UnresolvedName(_)
-        | Type::UnresolvedNominal { .. }
-        | Type::Nominal(_) => false,
-    }
+    contains_nested_stored_slice_view(ty).then_some(TypeError::StoredSliceLocal { span })
 }
 
 fn sequence_match_kind(identity: &PlaceIdentity, active: &PlaceIdentity) -> ActiveSequenceMatch {

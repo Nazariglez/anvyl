@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture borrowed parameter 'opt' in an escaping lambda
+// @frontend: new
+
+fn hold(opt: slice[int]?) -> fn() -> int {
+    || { opt; 0 }
+}

@@ -40,7 +40,7 @@ use self::{
     pattern::{PatternBindMode, PatternContext, PatternRoot, PatternRootInput},
     place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
     postfix::{PostfixStep, check_map_key, check_postfix_chain, collect_postfix_chain},
-    type_ops::type_contains_dyn_value,
+    type_ops::{contains_borrowed_slice_view, type_contains_dyn_value},
     type_refs::LocalTypeScopes,
 };
 use crate::{
@@ -1089,7 +1089,7 @@ impl LocalBindingKind {
         let mutability = BindingMutability::from_bool(mutable);
         let storage = if mutable && matches!(ty, Type::Dyn(_)) {
             CaptureStorageOrigin::DynView
-        } else if mutable {
+        } else if mutable || contains_borrowed_slice_view(ty) {
             CaptureStorageOrigin::BorrowedParam
         } else {
             CaptureStorageOrigin::Owned

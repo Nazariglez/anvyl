@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn use_slice_now(xs: slice[int]) -> int {
+    let f = || xs[0];
+    f()
+}
+
+fn use_tuple_now(pair: (slice[int], int)) -> int {
+    let f = || pair.0[0];
+    f()
+}
+
+fn use_optional_now(opt: slice[int]?) -> int {
+    let f = || { opt; 0 };
+    f()
+}

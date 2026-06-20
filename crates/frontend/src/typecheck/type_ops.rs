@@ -40,6 +40,47 @@ pub(crate) fn type_has_unfinished_facts(ty: &Type) -> bool {
         || type_depends_on_generics(ty)
 }
 
+pub(super) fn contains_borrowed_slice_view(ty: &Type) -> bool {
+    contains_stored_slice_view(ty)
+}
+
+pub(super) fn contains_stored_slice_view(ty: &Type) -> bool {
+    contains_slice_view(ty, true)
+}
+
+pub(super) fn contains_nested_stored_slice_view(ty: &Type) -> bool {
+    contains_slice_view(ty, false)
+}
+
+fn contains_slice_view(ty: &Type, stored: bool) -> bool {
+    match ty {
+        Type::Slice { .. } => stored,
+        Type::Tuple(items) => items.iter().any(|ty| contains_slice_view(ty, stored)),
+        Type::Nominal(nominal) => nominal
+            .type_args
+            .iter()
+            .any(|ty| contains_slice_view(ty, stored)),
+        Type::List { elem } | Type::Array { elem, .. } => contains_slice_view(elem, true),
+        Type::Map { key, value } => {
+            contains_slice_view(key, true) || contains_slice_view(value, true)
+        }
+        Type::Optional { inner } => contains_slice_view(inner, stored),
+        Type::Func { .. }
+        | Type::Infer
+        | Type::InferReturn
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void
+        | Type::Dyn(_)
+        | Type::Var(_)
+        | Type::UnresolvedName(_)
+        | Type::UnresolvedNominal { .. } => false,
+    }
+}
+
 struct GenericDependencyVisitor;
 
 impl TypeVisitor for GenericDependencyVisitor {

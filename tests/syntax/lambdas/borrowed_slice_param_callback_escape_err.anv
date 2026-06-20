@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture borrowed parameter 'xs' in an escaping lambda
+// @frontend: new
+
+extern fn later(f: escaping fn() -> int) -> void;
+
+fn bad(xs: slice[int]) {
+    later(|| xs[0]);
+}

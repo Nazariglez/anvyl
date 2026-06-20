@@ -1,14 +1,8 @@
-// @mode: run
-// @frontend: new
+// @mode: check
 // @expect: error
 // @contains: cannot capture borrowed parameter 'xs' in an escaping lambda
+// @frontend: new
 
 fn hold(xs: slice[int]) -> fn() -> int {
     || xs[0]
-}
-
-fn main() {
-    var list: [int] = [1, 2];
-    let f = hold(list);
-    println(f());
 }
