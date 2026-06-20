@@ -1,10 +1,16 @@
-use super::support::{check, generic_body};
+use super::support::{check, check_named, generic_body};
 use crate::{
     ast::{ArrayLen, ConstValue, EscapeMode, Ident, Type},
     typecheck::{
         BodyInstanceKey, FunctionValueKind, GenericArgs, LambdaBodyKey, LocalDefKind, LocalUseMode,
+        semantic_use::ConstValueMap,
     },
 };
+
+fn assert_single_const(values: &ConstValueMap, value: ConstValue) {
+    assert_eq!(values.len(), 1);
+    assert_eq!(values.values().next(), Some(&value));
+}
 
 #[test]
 fn records_params_bindings_and_uses() {
@@ -127,15 +133,88 @@ fn explicit_default_param_records_no_default_arg() {
 }
 
 #[test]
-fn const_uses_record_values() {
-    let result = check("const BASE: int = 10; fn f(a: int = BASE) {} fn main() { f(); }")
+fn top_level_const_value_records_one_fact() {
+    let result =
+        check("const BASE: int = 10; fn main() { let value = BASE; }").expect("typecheck failed");
+    assert_single_const(result.const_values(), ConstValue::Int(10));
+}
+
+#[test]
+fn imported_const_value_records_fact() {
+    let result = check_named(
+        "import helper { BASE }; fn main() { let value = BASE; }",
+        &[("helper", "pub const BASE: int = 10;")],
+    )
+    .expect("typecheck failed");
+    assert_single_const(result.const_values(), ConstValue::Int(10));
+}
+
+#[test]
+fn module_qualified_const_value_records_fact() {
+    let result = check_named(
+        "import helper as h; fn main() { let value = h.BASE; }",
+        &[("helper", "pub const BASE: int = 10;")],
+    )
+    .expect("typecheck failed");
+    assert_single_const(result.const_values(), ConstValue::Int(10));
+}
+
+#[test]
+fn module_qualified_global_records_no_const_fact() {
+    let result = check_named(
+        "import helper as h; fn main() { let value = h.count; }",
+        &[("helper", "pub lazy var count = 10;")],
+    )
+    .expect("typecheck failed");
+    assert!(result.const_values().is_empty());
+    assert_eq!(result.global_accesses().len(), 1);
+}
+
+#[test]
+fn local_const_value_records_fact_without_local_use() {
+    let result =
+        check("fn main() { const BASE: int = 10; let value = BASE; }").expect("typecheck failed");
+    let body = result.expect_body(&result.function_body("main"));
+    assert_single_const(&body.const_values, ConstValue::Int(10));
+    assert!(body.locals.uses.is_empty());
+}
+
+#[test]
+fn lambda_local_const_value_records_fact_without_capture() {
+    let result = check("fn main() { const N: int = 10; let f: fn() -> int = || { N + 1 }; f(); }")
         .expect("typecheck failed");
-    assert!(
-        result
-            .const_values()
-            .values()
-            .any(|value| value == &ConstValue::Int(10))
-    );
+    let lambda = result
+        .lambda_escapes()
+        .keys()
+        .next()
+        .copied()
+        .expect("missing lambda fact");
+    let body = result.expect_body(&BodyInstanceKey::Lambda(LambdaBodyKey {
+        expr: lambda,
+        specialization: GenericArgs::default(),
+    }));
+    assert_single_const(&body.const_values, ConstValue::Int(10));
+    assert!(body.locals.uses.is_empty());
+    assert!(result.lambda_captures().is_empty());
+}
+
+#[test]
+fn non_const_local_value_records_no_const_fact() {
+    let result =
+        check("fn main() { let value = 10; let copy = value; }").expect("typecheck failed");
+    assert!(result.const_values().is_empty());
+}
+
+#[test]
+fn const_facts_remain_body_scoped_when_flattened() {
+    let result =
+        check("const BASE: int = 10; fn value() -> int { BASE } fn main() { let value = BASE; }")
+            .expect("typecheck failed");
+    let value_body = result.function_body("value");
+    let main_body = result.function_body("main");
+    assert_eq!(result.expect_body(&value_body).const_values.len(), 1);
+    assert_eq!(result.expect_body(&main_body).const_values.len(), 1);
+    assert_eq!(result.const_values().len(), 2);
 }
 
 #[test]
@@ -640,7 +719,7 @@ fn const_generic_function_fact_uses_concrete_array_len() {
 
 #[test]
 fn generic_function_fact_order_distinguishes_same_named_types() {
-    let result = super::support::check_named(
+    let result = check_named(
         r#"
 import a;
 import b;

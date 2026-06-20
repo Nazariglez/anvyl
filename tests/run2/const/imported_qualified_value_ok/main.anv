@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 42
+// 42
+// 5
+// @match-end
+
+import helper as h;
+import helper { ANSWER };
+
+fn main() {
+    println(h.ANSWER + 1);
+    println(ANSWER + 1);
+    println(h.MESSAGE.len());
+}

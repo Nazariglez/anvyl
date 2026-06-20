@@ -4173,7 +4173,7 @@ fn check_expr_checked_with_hint(
         ExprKind::Ident(name) => {
             match tc.resolve_ident_subject(*name, expr.span, NameSubjectMode::Value) {
                 ResolvedIdentSubject::Local(LocalSymbol::Value(ref info), depth) => {
-                    if let Some(checked) = tc.check_top_const_local_expr(expr, *name, info) {
+                    if let Some(checked) = tc.check_local_const_value_expr(expr, *name, info) {
                         return checked;
                     }
                     let value = tc.local_value_from_info(info.clone(), depth);
@@ -4213,57 +4213,45 @@ fn check_expr_checked_with_hint(
                 }
                 ResolvedIdentSubject::Named(module, value_name, value) => {
                     tc.warn_named_value_deprecated(value.as_ref(), value_name, expr.span);
-                    if let ValueDecl::Global(sig) = value.as_ref() {
-                        let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
-                        let value = place::global_value(sig, expr.node.id, checked);
-                        tc.record_expr_place(expr.node.id, &value);
-                        place::record_value_read(expr.node.id, &value, tc);
-                        tc.record_function_value_expr(
-                            expr.node.id,
-                            &value.checked.ty,
-                            FunctionValueKind::LocalOrPlace,
-                        );
-                        return value.checked;
-                    }
-                    if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
-                        module: module.clone(),
-                        name: value_name,
-                        decl: (*value).clone(),
-                    }) && callee.def.sig.ret.is_infer()
-                    {
-                        tc.push_error(TypeError::InferReturnValue {
-                            span: tc.error_span(expr.span),
-                        });
-                        return checked_from_type(expr, Type::Infer, tc);
-                    }
-                    match *value {
-                        ValueDecl::Const(_) => match tc.eval_visible_const(*name, expr.span) {
-                            Some(Ok(value)) => {
-                                let ty = const_eval::const_type(&value);
-                                tc.record_const_value(expr.node.id, value);
-                                checked_from_type(expr, ty, tc)
-                            }
-                            Some(Err(err)) => {
-                                tc.push_error(err);
-                                checked_from_type(expr, Type::Infer, tc)
-                            }
-                            None => checked_from_type(expr, Type::Infer, tc),
-                        },
+                    match value.as_ref() {
+                        ValueDecl::Const(_) => {
+                            let value =
+                                tc.eval_top_const(&module, value_name, tc.error_span(expr.span));
+                            tc.check_const_value_expr(expr, value)
+                        }
+                        ValueDecl::Global(sig) => {
+                            let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                            let value = place::global_value(sig, expr.node.id, checked);
+                            tc.record_expr_place(expr.node.id, &value);
+                            place::record_value_read(expr.node.id, &value, tc);
+                            tc.record_function_value_expr(
+                                expr.node.id,
+                                &value.checked.ty,
+                                FunctionValueKind::LocalOrPlace,
+                            );
+                            value.checked
+                        }
                         ValueDecl::Func(sig) => {
-                            if let Some(callee) = tc.decls.callable_for_value(&ResolvedValue {
+                            let resolved = ResolvedValue {
                                 module,
                                 name: value_name,
                                 decl: ValueDecl::Func(sig.clone()),
-                            }) {
+                            };
+                            if let Some(callee) = tc.decls.callable_for_value(&resolved) {
+                                if callee.def.sig.ret.is_infer() {
+                                    tc.push_error(TypeError::InferReturnValue {
+                                        span: tc.error_span(expr.span),
+                                    });
+                                    return checked_from_type(expr, Type::Infer, tc);
+                                }
                                 tc.record_function_value_expr(
                                     expr.node.id,
                                     &sig.ty,
                                     TypeChecker::function_value_kind_for_callee(&callee),
                                 );
                             }
-                            checked_from_type(expr, sig.ty, tc)
+                            checked_from_type(expr, sig.ty.clone(), tc)
                         }
-                        ValueDecl::Global(_) => unreachable!("global handled above"),
                     }
                 }
                 ResolvedIdentSubject::Missing => {

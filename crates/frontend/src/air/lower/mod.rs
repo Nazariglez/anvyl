@@ -2279,6 +2279,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             Stmt::For(for_) => self.lower_for(&for_.node),
             Stmt::Break => self.lower_loop_tail(stmt, AirTail::Break),
             Stmt::Continue => self.lower_loop_tail(stmt, AirTail::Continue),
+            Stmt::Const(_) => Ok(()),
             _ => Err(LowerError::UnsupportedStmt {
                 kind: stmt_kind(&stmt.node),
                 span: Some(self.source_span(stmt.span)),
@@ -3413,11 +3414,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 .materialize_shared_operand(expr, value, ty)
                 .map(CallArg::SharedBorrow);
         }
-        if matches!(expr.node.kind, ExprKind::Lit(Lit::String(_))) {
-            let Operand::Const(id) = self.lower_value(expr)? else {
-                unreachable!("string literal lowers to const")
-            };
-            return Ok(CallArg::SharedStringConst(id));
+        if self.facts.const_values.contains_key(&expr.node.id)
+            || matches!(expr.node.kind, ExprKind::Lit(Lit::String(_)))
+        {
+            let value = self.lower_value(expr)?;
+            return self.lower_operand_call_arg(
+                value,
+                ParamType {
+                    ty,
+                    mode: ParamMode::SharedBorrow,
+                    escape: ParamEscape::NonEscaping,
+                },
+                expr,
+            );
         }
         if matches!(self.cx.program.type_data(ty), TypeData::Slice(_))
             && let Ok(place) = self.lower_shared_slice_call_arg(expr, ty)

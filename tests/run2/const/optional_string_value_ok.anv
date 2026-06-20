@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: hello
+
+const MESSAGE: string = "hello";
+
+fn take(message: string?) {
+    if let text? = message {
+        println(text);
+    }
+}
+
+fn main() { take(MESSAGE); }

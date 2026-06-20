@@ -1,0 +1,4 @@
+// @helper
+
+pub const ANSWER: int = 41;
+pub const MESSAGE: string = "hello";

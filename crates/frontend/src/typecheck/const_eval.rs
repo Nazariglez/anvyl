@@ -5,8 +5,9 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstValue, ExprKind, ExprNode,
-        FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, TypeFolder, UnaryOp,
+        ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstValue, ExprId, ExprKind,
+        ExprNode, FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, TypeFolder,
+        UnaryOp,
     },
     span::{SourceSpan, Span},
 };
@@ -43,8 +44,15 @@ pub(super) enum ConstNameLookup {
     Value(ConstValue),
     RuntimeGlobal(super::GlobalKey),
     NotConstLocal,
-    Error(TypeError),
+    Error(Box<TypeError>),
     Missing,
+}
+
+fn const_lookup(result: Result<ConstValue, TypeError>) -> ConstNameLookup {
+    match result {
+        Ok(value) => ConstNameLookup::Value(value),
+        Err(error) => ConstNameLookup::Error(Box::new(error)),
+    }
 }
 
 struct ConstNormalizer<'tc> {
@@ -144,7 +152,7 @@ impl TypeChecker {
                         None
                     }
                     ConstNameLookup::Error(error) => {
-                        self.push_error(error);
+                        self.push_error(*error);
                         None
                     }
                     ConstNameLookup::NotConstLocal => {
@@ -312,7 +320,7 @@ impl TypeChecker {
                     ConstNameLookup::NotConstLocal => Err(TypeError::NonConstExpression {
                         span: self.error_span(expr.span),
                     }),
-                    ConstNameLookup::Error(error) => Err(error),
+                    ConstNameLookup::Error(error) => Err(*error),
                     ConstNameLookup::Missing => Err(TypeError::UnknownConst {
                         name: *name,
                         span: self.error_span(expr.span),
@@ -430,28 +438,14 @@ impl TypeChecker {
     pub(super) fn lookup_visible_const_name(&mut self, name: Ident, span: Span) -> ConstNameLookup {
         match self.resolve_ident_subject(name, span, super::NameSubjectMode::Const) {
             super::ResolvedIdentSubject::Local(LocalSymbol::Value(info), _) => {
-                if let Some(value) = info.const_value.clone() {
-                    return ConstNameLookup::Value(value);
-                }
-                if let Some(id) = info.local_const {
-                    return match self.eval_local_const(id, span) {
-                        Ok(value) => ConstNameLookup::Value(value),
-                        Err(error) => ConstNameLookup::Error(error),
-                    };
-                }
-                if info.kind.is_const() && self.has_top_const(&self.current_module, name) {
-                    let module = self.current_module.clone();
-                    return match self.eval_top_const(&module, name, self.error_span(span)) {
-                        Ok(value) => ConstNameLookup::Value(value),
-                        Err(error) => ConstNameLookup::Error(error),
-                    };
-                }
-                return ConstNameLookup::NotConstLocal;
+                return self
+                    .eval_const_symbol_value(&info, name, span)
+                    .map_or(ConstNameLookup::NotConstLocal, const_lookup);
             }
             super::ResolvedIdentSubject::Local(LocalSymbol::Callable(_), _) => {
                 return ConstNameLookup::NotConstLocal;
             }
-            super::ResolvedIdentSubject::Blocked(error) => return ConstNameLookup::Error(*error),
+            super::ResolvedIdentSubject::Blocked(error) => return ConstNameLookup::Error(error),
             super::ResolvedIdentSubject::Missing => {}
             super::ResolvedIdentSubject::Named(..)
             | super::ResolvedIdentSubject::Module(_)
@@ -460,10 +454,7 @@ impl TypeChecker {
 
         if self.has_top_const(&self.current_module, name) {
             let module = self.current_module.clone();
-            return match self.eval_top_const(&module, name, self.error_span(span)) {
-                Ok(value) => ConstNameLookup::Value(value),
-                Err(error) => ConstNameLookup::Error(error),
-            };
+            return const_lookup(self.eval_top_const(&module, name, self.error_span(span)));
         }
 
         if let Some((_, _, ValueDecl::Global(sig))) = self.current_module_value(name) {
@@ -472,60 +463,67 @@ impl TypeChecker {
 
         match self.imported_value(name) {
             Some((module, imported_name, ValueDecl::Const(_))) => {
-                match self.eval_top_const(&module, imported_name, self.error_span(span)) {
-                    Ok(value) => ConstNameLookup::Value(value),
-                    Err(error) => ConstNameLookup::Error(error),
-                }
+                const_lookup(self.eval_top_const(&module, imported_name, self.error_span(span)))
             }
             Some((_, _, ValueDecl::Global(sig))) => ConstNameLookup::RuntimeGlobal(sig.key),
             Some((_, _, ValueDecl::Func(_))) | None => ConstNameLookup::Missing,
         }
     }
 
-    pub(super) fn check_top_const_local_expr(
+    fn eval_const_symbol_value(
+        &mut self,
+        info: &VarInfo,
+        name: Ident,
+        span: Span,
+    ) -> Option<Result<ConstValue, TypeError>> {
+        if let Some(value) = info.const_value.clone() {
+            return Some(Ok(value));
+        }
+        if let Some(id) = info.local_const {
+            return Some(self.eval_local_const(id, span));
+        }
+        if info.kind.is_const() && self.has_top_const(&self.current_module, name) {
+            let module = self.current_module.clone();
+            return Some(self.eval_top_const(&module, name, self.error_span(span)));
+        }
+        None
+    }
+
+    pub(super) fn check_local_const_value_expr(
         &mut self,
         expr: &ExprNode,
         name: Ident,
         info: &VarInfo,
     ) -> Option<CheckedType> {
-        if info.local_const.is_some()
-            || !info.kind.is_const()
-            || !self.has_top_const(&self.current_module, name)
-        {
-            return None;
-        }
-
+        let value = self.eval_const_symbol_value(info, name, expr.span)?;
         self.warn_local_const_deprecated(info, name, expr.span);
-        let module = self.current_module.clone();
-        let ty = match self.eval_top_const(&module, name, self.error_span(expr.span)) {
+        Some(self.check_const_value_expr(expr, value))
+    }
+
+    pub(super) fn check_const_value_expr(
+        &mut self,
+        expr: &ExprNode,
+        value: Result<ConstValue, TypeError>,
+    ) -> CheckedType {
+        let ty = self.record_const_value_result(expr.node.id, value);
+        checked_from_type(expr, ty, self)
+    }
+
+    pub(super) fn record_const_value_result(
+        &mut self,
+        expr_id: ExprId,
+        value: Result<ConstValue, TypeError>,
+    ) -> Type {
+        match value {
             Ok(value) => {
                 let ty = const_type(&value);
-                self.record_const_value(expr.node.id, value);
+                self.record_const_value(expr_id, value);
                 ty
             }
             Err(error) => {
                 self.push_error(error);
                 Type::Infer
             }
-        };
-        Some(checked_from_type(expr, ty, self))
-    }
-
-    pub(super) fn eval_visible_const(
-        &mut self,
-        name: Ident,
-        span: Span,
-    ) -> Option<Result<ConstValue, TypeError>> {
-        match self.lookup_visible_const_name(name, span) {
-            ConstNameLookup::Value(value) => Some(Ok(value)),
-            ConstNameLookup::RuntimeGlobal(global) => {
-                Some(Err(TypeError::RuntimeGlobalInConstPosition {
-                    global,
-                    span: self.error_span(span),
-                }))
-            }
-            ConstNameLookup::Error(error) => Some(Err(error)),
-            ConstNameLookup::NotConstLocal | ConstNameLookup::Missing => None,
         }
     }
 
@@ -591,7 +589,7 @@ impl TypeChecker {
         self.consts.contains_key(&(module.clone(), name))
     }
 
-    fn eval_top_const(
+    pub(super) fn eval_top_const(
         &mut self,
         module: &ModuleScope,
         name: Ident,
@@ -821,9 +819,10 @@ fn eval_int_binary(
         BinaryOp::Add => a.checked_add(b).map(ConstValue::Int),
         BinaryOp::Sub => a.checked_sub(b).map(ConstValue::Int),
         BinaryOp::Mul => a.checked_mul(b).map(ConstValue::Int),
-        BinaryOp::Div if b == 0 => return Err(TypeError::ConstDivisionByZero { span }),
+        BinaryOp::Div | BinaryOp::Rem if b == 0 => {
+            return Err(TypeError::ConstDivisionByZero { span });
+        }
         BinaryOp::Div => a.checked_div(b).map(ConstValue::Int),
-        BinaryOp::Rem if b == 0 => return Err(TypeError::ConstDivisionByZero { span }),
         BinaryOp::Rem => a.checked_rem(b).map(ConstValue::Int),
         BinaryOp::Eq => return bool(a == b),
         BinaryOp::NotEq => return bool(a != b),

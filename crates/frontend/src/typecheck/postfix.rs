@@ -257,6 +257,9 @@ fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
                     Some(callable_subject(info.callee.clone(), None))
                 }
                 super::ResolvedIdentSubject::Local(super::LocalSymbol::Value(info), depth) => {
+                    if let Some(checked) = tc.check_local_const_value_expr(expr, *name, &info) {
+                        return Some(value_subject_checked(checked));
+                    }
                     let value = tc.local_value_from_info(info, depth);
                     Some(local_value_subject(expr, *name, &value, tc))
                 }
@@ -265,7 +268,7 @@ fn resolve_base(expr: &ExprNode, tc: &mut TypeChecker) -> Option<Subject> {
                     Some(Subject::Error)
                 }
                 super::ResolvedIdentSubject::Named(module, value_name, value) => Some(
-                    named_value_subject(tc, module, value_name, &value, expr.node.id, expr.span),
+                    named_value_subject(tc, &module, value_name, &value, expr.node.id, expr.span),
                 ),
                 super::ResolvedIdentSubject::Module(scope) => Some(Subject::Module(scope)),
                 super::ResolvedIdentSubject::Type(ty) => Some(Subject::Type(ty)),
@@ -720,19 +723,23 @@ fn field_access_on_non_aggregate(
 
 fn named_value_subject(
     tc: &mut TypeChecker,
-    module: ModuleScope,
+    module: &ModuleScope,
     name: Ident,
     value: &ValueDecl,
     root_expr_id: ExprId,
     span: Span,
 ) -> Subject {
     tc.warn_named_value_deprecated(value, name, span);
+    if matches!(value, ValueDecl::Const(_)) {
+        let value = tc.eval_top_const(module, name, tc.error_span(span));
+        return value_subject(tc.record_const_value_result(root_expr_id, value), tc);
+    }
     let resolved = ResolvedValue {
-        module: module.clone(),
+        module: (*module).clone(),
         name,
         decl: value.clone(),
     };
-    let local_dyn_infer_ty = (module == tc.current_module
+    let local_dyn_infer_ty = (module == &tc.current_module
         && super::dyn_infer::DynInference::has_raw_hole(value.ty()))
     .then(|| tc.lookup(name))
     .flatten()
@@ -1164,7 +1171,7 @@ fn apply_module_field(
     match tc.decls.module_value(scope, name) {
         ModuleMemberLookup::Found(value) => {
             let (module, value_name, decl) = TypeChecker::resolved_value(value);
-            return named_value_subject(tc, module, value_name, &decl, field_id, span);
+            return named_value_subject(tc, &module, value_name, &decl, field_id, span);
         }
         ModuleMemberLookup::Private => private = true,
         ModuleMemberLookup::Missing => {}

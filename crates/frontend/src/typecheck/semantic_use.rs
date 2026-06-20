@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type,
+    ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type, const_eval,
     decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_key_for_type},
     infer::{SemanticLocalId, TypeHandle},
     type_ops::type_has_unfinished_facts,
@@ -386,9 +386,7 @@ impl SemanticBodyFacts {
         for fact in self.expr_types.values() {
             debug_assert!(fact.span.is_some());
         }
-        for expr_id in self.const_values.keys() {
-            debug_assert!(self.expr_types.contains_key(expr_id));
-        }
+        self.validate_const_values(false);
         for (expr_id, fact) in &self.function_values {
             debug_assert_eq!(*expr_id, fact.expr);
         }
@@ -448,11 +446,33 @@ impl SemanticBodyFacts {
         self.locals.validate();
     }
 
+    fn validate_const_values(&self, finished: bool) {
+        for (expr_id, value) in &self.const_values {
+            let Some(fact) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "const value fact missing expression type");
+                continue;
+            };
+            let Some(ty) = &fact.ty else {
+                debug_assert!(!finished, "const value expression type not finalized");
+                continue;
+            };
+            let expected = const_eval::const_type(value);
+            let valid = matches!(ty, Type::Infer)
+                || *ty == expected
+                || (!finished && type_has_unfinished_facts(ty));
+            debug_assert!(
+                valid,
+                "const value fact type mismatch: expected {expected:?}, got {ty:?}"
+            );
+        }
+    }
+
     pub(crate) fn validate_finished(&self) {
         self.validate();
         for fact in self.expr_types.values() {
             debug_assert!(fact.ty.is_some());
         }
+        self.validate_const_values(true);
         self.locals.validate_finished();
         for fact in self.function_values.values() {
             debug_assert!(matches!(fact.ty, Type::Func { .. }));
