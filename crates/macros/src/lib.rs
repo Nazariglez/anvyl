@@ -80,6 +80,11 @@ pub fn builtin_module(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn provider_package(input: TokenStream) -> TokenStream {
+    clean_module::expand_provider_package(input.into()).into()
+}
+
+#[proc_macro]
 pub fn provider(input: TokenStream) -> TokenStream {
     provider::expand(input.into()).into()
 }

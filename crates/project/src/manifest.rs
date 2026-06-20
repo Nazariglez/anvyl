@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -15,7 +15,7 @@ use anvyx_backend::rust::{
 };
 use anvyx_lang2::LintConfig;
 use anvyx_runtime::{
-    ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
+    ModulePath, ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
     validate_rust_provider_support,
 };
 use serde::Deserialize;
@@ -96,7 +96,7 @@ struct ProviderCargoPackage {
 
 #[derive(Debug, Deserialize)]
 struct ProviderProbeOutput {
-    descriptor: ProviderDescriptor,
+    descriptors: Vec<ProviderDescriptor>,
     supports: Vec<RustModuleSupport>,
 }
 
@@ -115,53 +115,112 @@ fn parse_provider_cargo(path: &Path, label: &str) -> Result<ProviderCargoManifes
     })
 }
 
-fn load_native_package_provider(
+fn load_native_package_providers(
     package: PackageId,
     native: &NativePackageInfo,
     cache_root: &Path,
-) -> Result<LoadedNativeProvider, String> {
+) -> Result<Vec<LoadedNativeProvider>, String> {
     let probe = native_provider_probe_input(package, native)?;
     let output = run_provider_probe(&probe, cache_root)?;
-    native_provider_from_probe(&probe, output)
+    native_providers_from_probe(&probe, output)
 }
 
-fn native_provider_from_probe(
+fn native_providers_from_probe(
     probe: &NativeProviderProbeInput,
     output: ProviderProbeOutput,
-) -> Result<LoadedNativeProvider, String> {
-    anvyx_externs::validate(&output.descriptor).map_err(|errors| {
-        format!(
-            "native provider package `{}` has invalid provider descriptor: {errors:?}",
-            probe.package
-        )
-    })?;
+) -> Result<Vec<LoadedNativeProvider>, String> {
     let ProviderProbeOutput {
-        descriptor,
+        descriptors,
         supports,
     } = output;
-    let support = rust_provider_support(probe, descriptor.provider.clone(), supports);
-    validate_rust_provider_support(
-        std::slice::from_ref(&descriptor),
-        std::slice::from_ref(&support),
-    )
-    .map_err(|error| {
+    if descriptors.is_empty() {
+        return Err(format!(
+            "native provider package `{}` exposed no provider descriptors",
+            probe.package
+        ));
+    }
+
+    for descriptor in &descriptors {
+        anvyx_externs::validate(descriptor).map_err(|errors| {
+            format!(
+                "native provider package `{}` has invalid provider descriptor `{}`: {errors:?}",
+                probe.package, descriptor.provider.name
+            )
+        })?;
+    }
+
+    let owners = provider_module_owners(probe, &descriptors)?;
+    let mut grouped = vec![vec![]; descriptors.len()];
+    for support in supports {
+        let owner = owners.get(&support.module).ok_or_else(|| {
+            format!(
+                "native provider package `{}` has native support for unknown module `{}`",
+                probe.package, support.module
+            )
+        })?;
+        grouped[*owner].push(support);
+    }
+
+    let mut provider_supports = descriptors
+        .iter()
+        .zip(grouped)
+        .map(|(descriptor, modules)| {
+            rust_provider_support(probe, descriptor.provider.clone(), modules)
+        })
+        .collect::<Vec<_>>();
+    for support in &mut provider_supports {
+        retarget_rust_modules(&mut support.modules, &probe.cargo_alias);
+    }
+    validate_rust_provider_support(&descriptors, &provider_supports).map_err(|error| {
         format!(
             "native provider package `{}` has invalid native support: {error}",
             probe.package
         )
     })?;
-    Ok(LoadedNativeProvider {
-        descriptor,
-        support,
-    })
+
+    Ok(descriptors
+        .into_iter()
+        .zip(provider_supports)
+        .map(|(descriptor, support)| LoadedNativeProvider {
+            descriptor,
+            support,
+        })
+        .collect())
+}
+
+fn provider_module_owners(
+    probe: &NativeProviderProbeInput,
+    descriptors: &[ProviderDescriptor],
+) -> Result<HashMap<ModulePath, usize>, String> {
+    let mut providers = HashSet::new();
+    let mut owners = HashMap::new();
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if !providers.insert(&descriptor.provider) {
+            return Err(format!(
+                "native provider package `{}` has duplicate native provider `{}`",
+                probe.package, descriptor.provider.name
+            ));
+        }
+        for module in &descriptor.modules {
+            if let Some(first) = owners.insert(module.path.clone(), index) {
+                return Err(format!(
+                    "native provider package `{}` has duplicate native module `{}` in providers `{}` and `{}`",
+                    probe.package,
+                    module.path,
+                    descriptors[first].provider.name,
+                    descriptor.provider.name
+                ));
+            }
+        }
+    }
+    Ok(owners)
 }
 
 fn rust_provider_support(
     probe: &NativeProviderProbeInput,
     provider: anvyx_runtime::ProviderId,
-    mut modules: Vec<RustModuleSupport>,
+    modules: Vec<RustModuleSupport>,
 ) -> RustProviderSupport {
-    retarget_rust_modules(&mut modules, &probe.cargo_alias);
     RustProviderSupport {
         package: package_lang_id(&probe.package),
         provider,
@@ -699,11 +758,7 @@ impl PackageGraphLoader {
             ));
         }
         let providers = match &native {
-            Some(native) => vec![load_native_package_provider(
-                id.clone(),
-                native,
-                &self.cache_root,
-            )?],
+            Some(native) => load_native_package_providers(id.clone(), native, &self.cache_root)?,
             None => vec![],
         };
         self.packages.push(PackageNode {
@@ -1086,15 +1141,13 @@ mod tests {
     fn package_attachment_uses_package_id_and_retargeted_crate_paths() {
         let probe = package_provider_fixture("Game Host", "host-provider");
         let output = ProviderProbeOutput {
-            descriptor: provider_descriptor("host"),
-            supports: vec![RustModuleSupport {
-                module: module_path("host"),
-                types: vec![rust_type_binding("host_provider")],
-                bindings: vec![rust_binding("host_provider")],
-            }],
+            descriptors: vec![provider_descriptor("host")],
+            supports: vec![rust_support("host", "host_provider")],
         };
 
-        let provider = native_provider_from_probe(&probe, output).unwrap();
+        let provider = native_providers_from_probe(&probe, output)
+            .unwrap()
+            .remove(0);
         let support = provider.support;
 
         assert_eq!(support.package, package_lang_id(&probe.package));
@@ -1112,6 +1165,109 @@ mod tests {
             support.modules[0].bindings[0].path.crate_name,
             probe.cargo_alias
         );
+    }
+
+    #[test]
+    fn package_attachment_groups_multiple_provider_descriptors() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let output = ProviderProbeOutput {
+            descriptors: vec![
+                provider_descriptor_for_module("window", "window"),
+                provider_descriptor_for_module("gpu", "gpu"),
+            ],
+            supports: vec![
+                rust_support("window", "host_provider"),
+                rust_support("gpu", "host_provider"),
+            ],
+        };
+
+        let providers = native_providers_from_probe(&probe, output).unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].descriptor.provider.name, "window");
+        assert_eq!(providers[1].descriptor.provider.name, "gpu");
+        assert_eq!(providers[0].support.provider.name, "window");
+        assert_eq!(providers[1].support.provider.name, "gpu");
+        assert_eq!(providers[0].support.modules[0].module.segments, ["window"]);
+        assert_eq!(providers[1].support.modules[0].module.segments, ["gpu"]);
+        assert_eq!(
+            providers[0].support.modules[0].bindings[0].path.crate_name,
+            probe.cargo_alias
+        );
+        assert_eq!(
+            providers[1].support.modules[0].bindings[0].path.crate_name,
+            probe.cargo_alias
+        );
+    }
+
+    #[test]
+    fn package_attachment_rejects_duplicate_provider_modules() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let output = ProviderProbeOutput {
+            descriptors: vec![
+                provider_descriptor_for_module("window", "window"),
+                provider_descriptor_for_module("other", "window"),
+            ],
+            supports: vec![],
+        };
+
+        let error = native_providers_from_probe(&probe, output).unwrap_err();
+
+        assert!(error.contains("duplicate native module"), "{error}");
+        assert!(error.contains("Game Host"), "{error}");
+        assert!(error.contains("window"), "{error}");
+        assert!(error.contains("other"), "{error}");
+    }
+
+    #[test]
+    fn package_attachment_rejects_duplicate_provider_ids() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let output = ProviderProbeOutput {
+            descriptors: vec![
+                provider_descriptor_for_module("host", "window"),
+                provider_descriptor_for_module("host", "gpu"),
+            ],
+            supports: vec![],
+        };
+
+        let error = native_providers_from_probe(&probe, output).unwrap_err();
+
+        assert!(error.contains("duplicate native provider"), "{error}");
+        assert!(error.contains("Game Host"), "{error}");
+        assert!(error.contains("host"), "{error}");
+    }
+
+    #[test]
+    fn package_attachment_rejects_empty_provider_output() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let output = ProviderProbeOutput {
+            descriptors: vec![],
+            supports: vec![],
+        };
+
+        let error = native_providers_from_probe(&probe, output).unwrap_err();
+
+        assert!(error.contains("no provider descriptors"), "{error}");
+        assert!(error.contains("Game Host"), "{error}");
+    }
+
+    #[test]
+    fn package_attachment_rejects_unknown_support_modules() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let output = ProviderProbeOutput {
+            descriptors: vec![provider_descriptor_for_module("window", "window")],
+            supports: vec![RustModuleSupport {
+                module: module_path("gpu"),
+                types: vec![],
+                bindings: vec![],
+            }],
+        };
+
+        let error = native_providers_from_probe(&probe, output).unwrap_err();
+
+        assert!(error.contains("unknown module"), "{error}");
+        assert!(error.contains("Game Host"), "{error}");
+        assert!(error.contains("gpu"), "{error}");
     }
 
     #[test]
@@ -1190,13 +1346,14 @@ mod tests {
     }
 
     #[test]
-    fn provider_probe_main_calls_descriptor_and_supports_through_alias() {
+    fn provider_probe_main_calls_descriptors_and_supports_through_alias() {
         let provider = provider_fixture("physics", "type");
 
         let main = provider_probe_main(&provider);
 
-        assert!(main.contains("descriptor: anvyx_provider_physics::provider_descriptor(),"));
+        assert!(main.contains("descriptors: anvyx_provider_physics::provider_descriptors(),"));
         assert!(main.contains("supports: anvyx_provider_physics::rust_module_supports(),"));
+        assert!(!main.contains("provider_descriptor()"));
         assert!(!main.contains("type::"));
     }
 
@@ -1223,27 +1380,28 @@ mod tests {
 
     fn loaded_provider(package: &str, cargo_package: &str) -> LoadedNativeProvider {
         let probe = package_provider_fixture(package, cargo_package);
-        native_provider_from_probe(
+        native_providers_from_probe(
             &probe,
             ProviderProbeOutput {
-                descriptor: provider_descriptor(package),
-                supports: vec![RustModuleSupport {
-                    module: module_path("host"),
-                    types: vec![rust_type_binding("host_provider")],
-                    bindings: vec![rust_binding("host_provider")],
-                }],
+                descriptors: vec![provider_descriptor(package)],
+                supports: vec![rust_support("host", "host_provider")],
             },
         )
         .unwrap()
+        .remove(0)
     }
 
     fn provider_descriptor(name: &str) -> ProviderDescriptor {
+        provider_descriptor_for_module(name, "host")
+    }
+
+    fn provider_descriptor_for_module(provider: &str, module: &str) -> ProviderDescriptor {
         ProviderDescriptor {
             provider: anvyx_runtime::ProviderId {
-                name: name.to_string(),
+                name: provider.to_string(),
             },
             modules: vec![anvyx_runtime::ExternModuleDescriptor {
-                path: module_path("host"),
+                path: module_path(module),
                 types: vec![anvyx_runtime::ExternTypeDescriptor {
                     name: "Handle".to_string(),
                     doc: None,
@@ -1267,16 +1425,24 @@ mod tests {
         }
     }
 
-    fn module_path(name: &str) -> anvyx_runtime::ModulePath {
-        anvyx_runtime::ModulePath {
+    fn module_path(name: &str) -> ModulePath {
+        ModulePath {
             segments: vec![name.to_string()],
         }
     }
 
-    fn rust_type_binding(crate_name: &str) -> anvyx_runtime::RustTypeBinding {
+    fn rust_support(module: &str, crate_name: &str) -> RustModuleSupport {
+        RustModuleSupport {
+            module: module_path(module),
+            types: vec![rust_type_binding(module, crate_name)],
+            bindings: vec![rust_binding(module, crate_name)],
+        }
+    }
+
+    fn rust_type_binding(module: &str, crate_name: &str) -> anvyx_runtime::RustTypeBinding {
         anvyx_runtime::RustTypeBinding {
             key: anvyx_runtime::ExternTypeKey {
-                module: module_path("host"),
+                module: module_path(module),
                 name: "Handle".to_string(),
             },
             path: anvyx_runtime::RustPath {
@@ -1286,12 +1452,12 @@ mod tests {
         }
     }
 
-    fn rust_binding(crate_name: &str) -> anvyx_runtime::RustExternBinding {
+    fn rust_binding(module: &str, crate_name: &str) -> anvyx_runtime::RustExternBinding {
         anvyx_runtime::RustExternBinding {
             key: anvyx_runtime::ExternBindingKey {
                 target: anvyx_runtime::ExternBindingTarget::Function(
                     anvyx_runtime::ExternFunctionKey {
-                        module: module_path("host"),
+                        module: module_path(module),
                         name: "ping".to_string(),
                     },
                 ),
@@ -1375,23 +1541,15 @@ mod tests {
 
         fn write_invalid_native_package(&self, package: &str) {
             self.write_raw_manifest(package, "[project]\nname = \"native\"\n");
+            self.write_provider_cargo(package, "native");
             let dir = self.root.path().join(package);
-            fs::create_dir_all(dir.join("src")).unwrap();
-            fs::write(
-                dir.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
-                    toml_string(&rust_deps::workspace_crate_path("runtime").display().to_string())
-                ),
-            )
-            .unwrap();
             fs::write(
                 dir.join("src/lib.rs"),
-                r#"pub fn provider_descriptor() -> anvyx_runtime::ProviderDescriptor {
-    anvyx_runtime::ProviderDescriptor {
+                r#"pub fn provider_descriptors() -> Vec<anvyx_runtime::ProviderDescriptor> {
+    vec![anvyx_runtime::ProviderDescriptor {
         provider: anvyx_runtime::ProviderId { name: "Bad Name".to_string() },
         modules: vec![],
-    }
+    }]
 }
 
 pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
@@ -1403,16 +1561,8 @@ pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
         }
 
         fn write_provider_crate(&self, package: &str, provider: &str) {
+            self.write_provider_cargo(package, provider);
             let dir = self.root.path().join(package);
-            fs::create_dir_all(dir.join("src")).unwrap();
-            fs::write(
-                dir.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"{provider}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
-                    toml_string(&rust_deps::workspace_crate_path("runtime").display().to_string())
-                ),
-            )
-            .unwrap();
             fs::write(
                 dir.join("src/lib.rs"),
                 format!(
@@ -1427,6 +1577,64 @@ anvyx_runtime::builtin_module! {{
     exports: [ping],
 }}
 "#
+                ),
+            )
+            .unwrap();
+        }
+
+        fn write_multi_module_provider_crate(&self, package: &str) {
+            self.write_raw_manifest(package, "[project]\nname = \"host\"\n");
+            self.write_provider_cargo(package, "host-provider");
+            let dir = self.root.path().join(package);
+            fs::write(
+                dir.join("src/lib.rs"),
+                r#"mod window;
+mod gpu;
+
+anvyx_runtime::provider_package! { modules: [window, gpu] }
+"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.join("src/window.rs"),
+                r#"use anvyx_runtime::function;
+
+#[function]
+pub fn open_window() -> i64 { 11 }
+
+anvyx_runtime::builtin_module! {
+    name: "window",
+    source: "",
+    exports: [open_window],
+}
+"#,
+            )
+            .unwrap();
+            fs::write(
+                dir.join("src/gpu.rs"),
+                r#"use anvyx_runtime::function;
+
+#[function]
+pub fn create_device() -> i64 { 29 }
+
+anvyx_runtime::builtin_module! {
+    name: "gpu",
+    source: "",
+    exports: [create_device],
+}
+"#,
+            )
+            .unwrap();
+        }
+
+        fn write_provider_cargo(&self, package: &str, cargo_package: &str) {
+            let dir = self.root.path().join(package);
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{cargo_package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
+                    toml_string(&rust_deps::workspace_crate_path("runtime").display().to_string())
                 ),
             )
             .unwrap();
@@ -1610,6 +1818,74 @@ anvyx_runtime::builtin_module! {{
         assert!(root_cache.join("crates").is_dir());
         assert!(root_cache.join("target").is_dir());
         assert!(!fixture.root.path().join("host/.anvyx").exists());
+    }
+
+    #[test]
+    fn multi_module_native_provider_package_loads_all_modules() {
+        let fixture = PackageFixture::default();
+        fixture.write_package("game", &[("host", "../host")]);
+        fixture.write_multi_module_provider_crate("host");
+
+        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
+        let host = graph
+            .packages()
+            .iter()
+            .find(|package| package.id.manifest_path().ends_with("host/anvyx.toml"))
+            .expect("host package");
+
+        assert_eq!(host.providers.len(), 2);
+        assert_eq!(host.providers[0].descriptor.provider.name, "window");
+        assert_eq!(host.providers[1].descriptor.provider.name, "gpu");
+        assert_eq!(
+            host.providers[0].descriptor.modules[0].path.segments,
+            ["window"]
+        );
+        assert_eq!(
+            host.providers[1].descriptor.modules[0].path.segments,
+            ["gpu"]
+        );
+
+        let externs = graph
+            .package_externs()
+            .into_iter()
+            .find(|(package, _)| package == &package_frontend_id(&host.id))
+            .expect("host externs")
+            .1;
+        assert_eq!(externs.len(), 2);
+        assert_eq!(externs[0].modules[0].path.segments, ["window"]);
+        assert_eq!(externs[1].modules[0].path.segments, ["gpu"]);
+
+        let supports = graph
+            .rust_provider_supports()
+            .into_iter()
+            .filter(|support| support.package == package_lang_id(&host.id))
+            .collect::<Vec<_>>();
+        assert_eq!(supports.len(), 2);
+        assert_ne!(supports[0].cargo.manifest_key, "host");
+        assert_eq!(
+            supports[0].cargo.manifest_key,
+            supports[1].cargo.manifest_key
+        );
+        assert_eq!(supports[0].modules[0].module.segments, ["window"]);
+        assert_eq!(supports[1].modules[0].module.segments, ["gpu"]);
+        assert_eq!(
+            supports[0].modules[0].bindings[0].path.segments,
+            [
+                "__anvyx_native_package",
+                "window",
+                "__anvyx_native",
+                "open_window",
+            ]
+        );
+        assert_eq!(
+            supports[1].modules[0].bindings[0].path.segments,
+            [
+                "__anvyx_native_package",
+                "gpu",
+                "__anvyx_native",
+                "create_device",
+            ]
+        );
     }
 
     #[test]

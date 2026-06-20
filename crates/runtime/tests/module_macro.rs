@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{AnvyxInline, Ctx, ExternBindingOp, ExternBindingTarget, Heap, function};
+use anvyx_runtime::{
+    AnvyxInline, Ctx, ExternBindingOp, ExternBindingTarget, Heap, function, methods,
+};
 
 mod root_module {
     use super::{AnvyxInline, function};
@@ -62,6 +64,72 @@ mod builtin {
     }
 }
 
+mod package {
+    use super::{AnvyxInline, function, methods};
+
+    pub mod window {
+        use super::{AnvyxInline, function, methods};
+
+        #[derive(Clone, Copy, AnvyxInline)]
+        pub struct WindowConfig {
+            #[anvyx(field)]
+            pub width: i64,
+        }
+
+        #[methods]
+        impl WindowConfig {
+            pub fn doubled(&self) -> i64 {
+                self.width * 2
+            }
+        }
+
+        #[function]
+        pub fn open_window() -> i64 {
+            11
+        }
+
+        anvyx_runtime::builtin_module! {
+            name: "window",
+            source: "",
+            exports: [open_window, WindowConfig],
+        }
+    }
+
+    pub mod gpu {
+        use super::function;
+
+        #[function]
+        pub fn create_device() -> i64 {
+            29
+        }
+
+        anvyx_runtime::builtin_module! {
+            name: "gpu",
+            source: "",
+            exports: [create_device],
+        }
+    }
+
+    pub mod platform {
+        pub mod input {
+            use super::super::function;
+
+            #[function]
+            pub fn poll_input() -> i64 {
+                3
+            }
+
+            anvyx_runtime::builtin_module! {
+                name: "input",
+                source: "",
+                exports: [poll_input],
+            }
+        }
+    }
+
+    anvyx_runtime::provider_package! { modules: [window, gpu, platform::input] }
+}
+
 #[test]
 fn module_assembles_root_provider_and_native_tree() {
     let provider = root_module::provider_descriptor();
@@ -74,6 +142,9 @@ fn module_assembles_root_provider_and_native_tree() {
         let mut ctx = Ctx::new(heap);
         assert_eq!(root_module::__anvyx_native::ping(&mut ctx, 41), 42);
     });
+
+    let descriptors = root_module::provider_descriptors();
+    assert_eq!(descriptors, vec![provider]);
 
     let support = root_module::rust_module_support();
     assert_eq!(support.module.segments, ["game"]);
@@ -88,6 +159,7 @@ fn module_assembles_child_descriptors_and_support() {
     assert_eq!(provider.modules[0].path.segments, ["game"]);
     assert_eq!(provider.modules[1].path.segments, ["game", "child"]);
     assert_eq!(provider.modules[1].functions[0].name, "pong");
+    assert_eq!(tree_module::provider_descriptors(), vec![provider.clone()]);
     Heap::scope(|heap| {
         let mut ctx = Ctx::new(heap);
         assert_eq!(tree_module::__anvyx_native::child::pong(&mut ctx, 21), 42);
@@ -111,6 +183,7 @@ fn builtin_assembles_descriptor_and_native_support() {
     assert_eq!(provider.provider.name, "core_int");
     assert_eq!(provider.modules[0].path.segments, ["core_int"]);
     assert_eq!(provider.modules[0].functions[0].name, "int_abs");
+    assert_eq!(builtin::provider_descriptors(), vec![provider.clone()]);
     Heap::scope(|heap| {
         let mut ctx = Ctx::new(heap);
         assert_eq!(builtin::__anvyx_native::int_abs(&mut ctx, -3), 3);
@@ -131,4 +204,75 @@ fn builtin_assembles_descriptor_and_native_support() {
     };
     assert_eq!(function.module.segments, ["core_int"]);
     assert_eq!(function.name, "int_abs");
+}
+
+#[test]
+fn provider_package_aggregates_child_descriptors_and_prefixes_native_paths() {
+    let descriptors = package::provider_descriptors();
+
+    assert_eq!(descriptors.len(), 3);
+    assert_eq!(descriptors[0].provider.name, "window");
+    assert_eq!(descriptors[1].provider.name, "gpu");
+    assert_eq!(descriptors[2].provider.name, "input");
+    assert_eq!(descriptors[0].modules[0].path.segments, ["window"]);
+    assert_eq!(descriptors[1].modules[0].path.segments, ["gpu"]);
+    assert_eq!(descriptors[2].modules[0].path.segments, ["input"]);
+
+    let supports = package::rust_module_supports();
+    assert_eq!(supports.len(), 3);
+    assert_eq!(supports[0].module.segments, ["window"]);
+    assert_eq!(supports[1].module.segments, ["gpu"]);
+    assert_eq!(supports[2].module.segments, ["input"]);
+    assert_eq!(supports[0].bindings[0].path.crate_name, "crate");
+    assert_eq!(
+        supports[0].bindings[0].path.segments,
+        [
+            "package",
+            "__anvyx_native_package",
+            "window",
+            "__anvyx_native",
+            "open_window",
+        ]
+    );
+    assert_eq!(
+        supports[1].bindings[0].path.segments,
+        [
+            "package",
+            "__anvyx_native_package",
+            "gpu",
+            "__anvyx_native",
+            "create_device",
+        ]
+    );
+    assert_eq!(
+        supports[2].bindings[0].path.segments,
+        [
+            "package",
+            "__anvyx_native_package",
+            "platform",
+            "input",
+            "__anvyx_native",
+            "poll_input",
+        ]
+    );
+    assert_eq!(supports[0].types[0].path.crate_name, "crate");
+    assert_eq!(
+        supports[0].types[0].path.segments,
+        [
+            "package",
+            "__anvyx_native_package",
+            "window",
+            "WindowConfig",
+        ]
+    );
+    assert!(supports[0].bindings.iter().any(|binding| {
+        binding.path.segments
+            == [
+                "package",
+                "__anvyx_native_package",
+                "window",
+                "__anvyx_methods_native_windowconfig",
+                "doubled",
+            ]
+    }));
 }

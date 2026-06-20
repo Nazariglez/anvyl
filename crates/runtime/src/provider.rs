@@ -421,6 +421,16 @@ impl RustPath {
         );
         self.segments.splice(index..index, prefix.iter().cloned());
     }
+
+    pub fn retarget_native_root(&mut self, root: &[String]) {
+        self.segments.splice(0..0, root.iter().cloned());
+    }
+
+    pub fn retarget_prefix(&mut self, from: &[String], to: &[String]) {
+        if self.segments.starts_with(from) {
+            self.segments.splice(0..from.len(), to.iter().cloned());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

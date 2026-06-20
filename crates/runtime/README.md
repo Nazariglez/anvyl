@@ -2,7 +2,7 @@
 
 Rust provider crates expose Anvyx extern modules with runtime macros.
 
-Minimal provider crate:
+## Single-module provider crates
 
 ```rust
 use anvyx_runtime::function;
@@ -22,6 +22,16 @@ anvyx_runtime::builtin_module! {
     source: "",
     exports: [host_add, host_len],
 }
+```
+
+`builtin_module!` describes one native module. It generates the module-level
+helpers and the plural package-probe helpers used by Anvyx:
+
+```rust
+provider_descriptor() -> ProviderDescriptor
+provider_descriptors() -> Vec<ProviderDescriptor>
+rust_module_support() -> RustModuleSupport
+rust_module_supports() -> Vec<RustModuleSupport>
 ```
 
 Provider package `anvyx.toml`:
@@ -52,17 +62,99 @@ Root package manifest:
 host = { path = "../host" }
 ```
 
-Anvyx source in the root package imports native-only dependency modules with `pkg:`:
+Root package source imports native-only dependency modules with `pkg:`:
 
 ```anvyx
 import pkg:host.host { host_add, host_len };
 ```
 
-Anvyx source inside a source+native provider package imports its own provider modules with `ext:`:
+Source inside a source+native provider package imports its own provider modules
+with `ext:`:
 
 ```anvyx
 import ext:host { host_add, host_len };
 ```
+
+## Multi-module provider crates
+
+Use `provider_package!` at the Rust crate root when one provider crate exposes
+several Anvyx native modules:
+
+```rust
+mod window;
+mod gpu;
+
+anvyx_runtime::provider_package! {
+    modules: [window, gpu],
+}
+```
+
+Each listed Rust module uses `builtin_module!` for one Anvyx module:
+
+```rust
+// src/window.rs
+use anvyx_runtime::function;
+
+#[function]
+pub fn open_window() -> i64 {
+    1
+}
+
+anvyx_runtime::builtin_module! {
+    name: "window",
+    source: "",
+    exports: [open_window],
+}
+```
+
+```rust
+// src/gpu.rs
+use anvyx_runtime::function;
+
+#[function]
+pub fn create_device() -> i64 {
+    2
+}
+
+anvyx_runtime::builtin_module! {
+    name: "gpu",
+    source: "",
+    exports: [create_device],
+}
+```
+
+The module list is explicit. Paths are crate-root-relative Rust module paths;
+there is no auto-discovery. Nested paths such as `platform::window` are allowed.
+`provider_package!` preserves each child provider id, aggregates child
+descriptors/supports, and retargets native wrapper/type paths so private Rust
+submodules can still be used by generated package users.
+
+Dependents import the exposed modules with `pkg:`:
+
+```anvyx
+import pkg:host.window { open_window };
+import pkg:host.gpu { create_device };
+```
+
+A source+native provider package can import its own native modules with `ext:`
+and re-export source APIs as usual:
+
+```anvyx
+pub import ext:window;
+pub import ext:gpu;
+```
+
+Anvyx probes provider crates through the plural package ABI:
+
+```rust
+provider_descriptors() -> Vec<ProviderDescriptor>
+rust_module_supports() -> Vec<RustModuleSupport>
+```
+
+Do not hand-write descriptor merging for multi-module packages; use
+`provider_package!`.
+
+## Function ABI
 
 Supported scalar mapping for `#[function]`:
 
@@ -124,6 +216,3 @@ pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
     f.call(2)
 }
 ```
-
-Provider crates must export `provider_descriptor()` and `rust_module_support()`;
-`builtin_module!` generates both.

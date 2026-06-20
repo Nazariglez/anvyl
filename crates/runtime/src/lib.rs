@@ -22,7 +22,9 @@ pub use anvyx_heap::{
     HeapType, HeapTypeId, LeakReport, LeakTypeReport, RootId, Trace, TraceDriver, TraceMode,
     Visitor,
 };
-pub use anvyx_macros::{AnvyxInline, AnvyxRef, builtin_module, function, methods, module};
+pub use anvyx_macros::{
+    AnvyxInline, AnvyxRef, builtin_module, function, methods, module, provider_package,
+};
 pub use check::{checked_index, checked_index_result, checked_range};
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};

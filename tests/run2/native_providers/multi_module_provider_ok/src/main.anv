@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match-begin
+// 11
+// 7
+// 29
+// @match-end
+
+import pkg:host.window { open_window, window_width, WindowConfig };
+import pkg:host.gpu { create_device };
+
+fn main() {
+    let config = WindowConfig { width: 7 };
+    println(open_window());
+    println(window_width(config));
+    println(create_device());
+}
