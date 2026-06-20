@@ -1,3 +1,6 @@
+mod cache;
+mod rust_deps;
+
 pub mod check;
 pub mod manifest;
 pub mod rust;

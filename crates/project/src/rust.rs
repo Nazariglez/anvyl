@@ -17,7 +17,11 @@ use anvyx_backend::rust::{
 use anvyx_lang2::{AirBuildError, AirBuildOutput, DiagnosticReport, FrontendConfig};
 use anvyx_runtime::{RustProviderSupport, validate_rust_provider_support};
 
-use crate::check::{air_error_ref, build_air_path_typed, build_air_path_with_graph_typed};
+use crate::{
+    cache,
+    check::{air_error_ref, build_air_path_typed, build_air_path_with_graph_typed},
+    rust_deps,
+};
 
 #[derive(Debug, Clone)]
 pub struct CleanRustRunInput {
@@ -76,8 +80,8 @@ pub enum CleanRustError {
     Plan(anvyx_backend::rust::RustPlanError),
     Cargo(cargo_job::RustCargoError),
     Dependency(String),
-    CargoBuild(RustCargoFailure),
-    Run(RustCargoFailure),
+    CargoBuild(Box<RustCargoFailure>),
+    Run(Box<RustCargoFailure>),
 }
 
 impl std::fmt::Display for CleanRustError {
@@ -131,7 +135,7 @@ pub fn run_clean_rust_with_events(
         .cache_root
         .unwrap_or_else(|| default_run_cache_root(&input.file));
     let output = execute_clean_rust(
-        input.file,
+        &input.file,
         input.frontend,
         cache_root,
         input.cargo_profile,
@@ -147,7 +151,9 @@ pub fn run_clean_rust_with_events(
 
 pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBatchOutput, String> {
     let cargo_profile = input.cargo_profile;
-    let cache_root = input.cache_root.unwrap_or_else(default_cache_root);
+    let cache_root = input
+        .cache_root
+        .unwrap_or_else(cache::default_rust_cache_root);
     let mut emitted_cases = vec![];
     let mut native_providers = vec![];
     let mut semantic_profile = None;
@@ -161,9 +167,10 @@ pub fn build_clean_rust_batch(input: CleanRustBatchInput) -> Result<CleanRustBat
             Some(_) => {}
         }
         let file = case.file;
-        let native = native_provider_context_for_file(&file).map_err(|error| error.to_string())?;
+        let native = native_provider_context_for_file(&file, &cache_root)
+            .map_err(|error| error.to_string())?;
         let emitted =
-            emit_source(file.clone(), case.frontend, &native).map_err(|error| error.to_string())?;
+            emit_source(&file, case.frontend, &native).map_err(|error| error.to_string())?;
         native_providers.extend(emitted.native_providers);
         emitted_cases.push((index, file, profile, emitted.source));
     }
@@ -228,9 +235,9 @@ pub fn build_clean_rust_with_events(
 ) -> Result<CleanRustBuildOutput, CleanRustError> {
     let cache_root = input
         .cache_root
-        .unwrap_or_else(|| default_cache_root_for(&input.project_root));
+        .unwrap_or_else(|| cache::rust_cache_root_for(&input.project_root));
     let output = execute_clean_rust(
-        input.file,
+        &input.file,
         input.frontend,
         cache_root,
         input.cargo_profile,
@@ -250,7 +257,7 @@ pub fn build_clean_rust_with_events(
 }
 
 fn execute_clean_rust(
-    file: PathBuf,
+    file: &Path,
     frontend: FrontendConfig,
     cache_root: PathBuf,
     cargo_profile: RustCargoProfile,
@@ -258,11 +265,11 @@ fn execute_clean_rust(
     events: &mut impl FnMut(CleanRustEvent),
 ) -> Result<RustCargoSuccess, CleanRustError> {
     let semantic_profile = semantic_profile_name(frontend.context.profile);
-    let native = native_provider_context_for_file(&file)?;
-    let metadata = cargo_metadata_for_file(&file)?;
-    let emitted = emit_source_with_events(file.clone(), frontend, &native, events)?;
+    let native = native_provider_context_for_file(file, &cache_root)?;
+    let metadata = cargo_metadata_for_file(file)?;
+    let emitted = emit_source_with_events(file, frontend, &native, events)?;
     let dependencies = native_provider_dependencies(&emitted.native_providers)?;
-    let seed = stable_file_seed(&file)?;
+    let seed = stable_file_seed(file)?;
     let crate_identity = cargo_job::single_program_crate_identity(&RustCargoCrateIdentityInput {
         seed: &seed,
         semantic_profile,
@@ -282,35 +289,25 @@ fn execute_clean_rust(
 
     match cargo_job::execute_with_events(&job, |event| match event {
         RustCargoEvent::Compiling => events(CleanRustEvent::CompilingRust),
-        RustCargoEvent::Running => events(CleanRustEvent::Running { file: file.clone() }),
+        RustCargoEvent::Running => events(CleanRustEvent::Running {
+            file: file.to_path_buf(),
+        }),
     })
     .map_err(CleanRustError::Cargo)?
     {
         RustCargoOutput::Success(output) => Ok(output),
-        RustCargoOutput::CargoFailed(output) => Err(CleanRustError::CargoBuild(output)),
-        RustCargoOutput::RunFailed(output) => Err(CleanRustError::Run(output)),
+        RustCargoOutput::CargoFailed(output) => Err(CleanRustError::CargoBuild(Box::new(output))),
+        RustCargoOutput::RunFailed(output) => Err(CleanRustError::Run(Box::new(output))),
     }
-}
-
-fn default_cache_root() -> PathBuf {
-    std::env::current_dir()
-        .map_or_else(|_| std::env::temp_dir(), |dir| default_cache_root_for(&dir))
 }
 
 fn default_run_cache_root(file: &Path) -> PathBuf {
     match crate::manifest::find_nearest_manifest(file) {
         Ok(Some(manifest)) => manifest
             .parent()
-            .map_or_else(default_cache_root, default_cache_root_for),
-        Ok(None) | Err(_) => default_cache_root(),
+            .map_or_else(cache::default_rust_cache_root, cache::rust_cache_root_for),
+        Ok(None) | Err(_) => cache::default_rust_cache_root(),
     }
-}
-
-fn default_cache_root_for(project_root: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("ANVYX_CACHE_DIR") {
-        return PathBuf::from(path);
-    }
-    project_root.join(".anvyx").join("cache").join("rust")
 }
 
 fn cargo_metadata_for_file(file: &Path) -> Result<RustCargoPackageMetadata, CleanRustError> {
@@ -416,7 +413,7 @@ struct NativeProviderContext {
 }
 
 fn emit_source(
-    file: PathBuf,
+    file: &Path,
     frontend: FrontendConfig,
     native: &NativeProviderContext,
 ) -> Result<EmittedRustSource, CleanRustError> {
@@ -424,15 +421,17 @@ fn emit_source(
 }
 
 fn emit_source_with_events(
-    file: PathBuf,
+    file: &Path,
     frontend: FrontendConfig,
     native: &NativeProviderContext,
     events: &mut impl FnMut(CleanRustEvent),
 ) -> Result<EmittedRustSource, CleanRustError> {
-    events(CleanRustEvent::Checking { file: file.clone() });
+    events(CleanRustEvent::Checking {
+        file: file.to_path_buf(),
+    });
     let output = match &native.graph {
-        Some(graph) => build_air_path_with_graph_typed(&file, frontend, graph),
-        None => build_air_path_typed(&file, frontend),
+        Some(graph) => build_air_path_with_graph_typed(file, frontend, graph),
+        None => build_air_path_typed(file, frontend),
     }
     .map_err(CleanRustError::Air)?;
     let AirBuildOutput { report, air } = output;
@@ -453,9 +452,12 @@ fn emit_source_with_events(
     })
 }
 
-fn native_provider_context_for_file(file: &Path) -> Result<NativeProviderContext, CleanRustError> {
+fn native_provider_context_for_file(
+    file: &Path,
+    cache_root: &Path,
+) -> Result<NativeProviderContext, CleanRustError> {
     let mut supports = system_native_provider_supports()?;
-    let graph = load_provider_graph(file)?;
+    let graph = load_provider_graph(file, cache_root)?;
     if let Some(graph) = &graph {
         supports.extend(graph.rust_provider_supports());
     }
@@ -464,13 +466,14 @@ fn native_provider_context_for_file(file: &Path) -> Result<NativeProviderContext
 
 fn load_provider_graph(
     file: &Path,
+    cache_root: &Path,
 ) -> Result<Option<crate::manifest::PackageGraph>, CleanRustError> {
     let Some(manifest_path) =
         crate::manifest::find_nearest_manifest(file).map_err(CleanRustError::Dependency)?
     else {
         return Ok(None);
     };
-    crate::manifest::load_package_graph(&manifest_path)
+    crate::manifest::load_package_graph_with_rust_cache(&manifest_path, cache_root.to_path_buf())
         .map(Some)
         .map_err(CleanRustError::Dependency)
 }
@@ -522,7 +525,7 @@ fn native_provider_dependencies(
     supports: &[RustProviderSupport],
 ) -> Result<Vec<RustCargoDependency>, CleanRustError> {
     let mut dependencies = std::collections::BTreeMap::new();
-    merge_dependency(&mut dependencies, runtime_dependency())?;
+    merge_dependency(&mut dependencies, rust_deps::runtime_dependency())?;
     for support in supports {
         let cargo = support.cargo.clone();
         let source = cargo
@@ -543,20 +546,6 @@ fn native_provider_dependencies(
         merge_dependency(&mut dependencies, dep)?;
     }
     Ok(dependencies.into_values().collect())
-}
-
-fn runtime_dependency() -> RustCargoDependency {
-    RustCargoDependency {
-        name: RustCargoName::parse("anvyx_runtime").expect("valid runtime crate name"),
-        package: Some(
-            RustCargoPackageName::parse("anvyx-runtime").expect("valid runtime package name"),
-        ),
-        source: RustCargoDependencySource::Path(
-            workspace_crate_path("runtime").display().to_string(),
-        ),
-        features: vec![],
-        default_features: true,
-    }
 }
 
 fn merge_dependency(
@@ -584,17 +573,10 @@ fn merge_dependency(
 
 fn system_provider_path(manifest_key: &str) -> PathBuf {
     match manifest_key {
-        "anvyx_core2" => workspace_crate_path("core2"),
-        "anvyx_stdlib2" => workspace_crate_path("stdlib2"),
-        _ => workspace_crate_path(manifest_key),
+        "anvyx_core2" => rust_deps::workspace_crate_path("core2"),
+        "anvyx_stdlib2" => rust_deps::workspace_crate_path("stdlib2"),
+        _ => rust_deps::workspace_crate_path(manifest_key),
     }
-}
-
-fn workspace_crate_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("project crate lives below workspace crates directory")
-        .join(name)
 }
 
 #[cfg(test)]
@@ -630,7 +612,7 @@ mod tests {
             dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{cargo_name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
-                workspace_crate_path("runtime").display()
+                rust_deps::workspace_crate_path("runtime").display()
             ),
         )
         .unwrap();
@@ -732,7 +714,7 @@ anvyx_runtime::builtin_module! {{
         let mut checked_has_warnings = false;
 
         emit_source_with_events(
-            file,
+            &file,
             FrontendConfig::default(),
             &system_native_context(),
             &mut |event| {
@@ -756,7 +738,7 @@ anvyx_runtime::builtin_module! {{
         let mut events = vec![];
 
         let Err(error) = emit_source_with_events(
-            file,
+            &file,
             FrontendConfig::default(),
             &system_native_context(),
             &mut |event| events.push(clean_rust_event_name(&event)),
@@ -949,7 +931,7 @@ anvyx_runtime::builtin_module! {{
         fs::write(&file, "fn main() {}\n").unwrap();
 
         let emitted =
-            emit_source(file, FrontendConfig::default(), &system_native_context()).unwrap();
+            emit_source(&file, FrontendConfig::default(), &system_native_context()).unwrap();
         let deps = native_provider_dependencies(&emitted.native_providers).unwrap();
 
         assert_eq!(deps.len(), 1);
@@ -983,7 +965,7 @@ anvyx_runtime::builtin_module! {{
         let file = temp.path().join("main.anv");
         fs::write(&file, "fn main() { \"abcd\".substring(1, 2); }\n").unwrap();
 
-        let source = emit_source(file, FrontendConfig::default(), &system_native_context())
+        let source = emit_source(&file, FrontendConfig::default(), &system_native_context())
             .unwrap()
             .source
             .into_string();
@@ -999,7 +981,7 @@ anvyx_runtime::builtin_module! {{
         let file = temp.path().join("main.anv");
         fs::write(&file, "fn main() { \"a,b\".split(\",\"); }\n").unwrap();
 
-        let source = emit_source(file, FrontendConfig::default(), &system_native_context())
+        let source = emit_source(&file, FrontendConfig::default(), &system_native_context())
             .unwrap()
             .source
             .into_string();
@@ -1094,6 +1076,8 @@ anvyx_runtime::builtin_module! {{
         assert!(manifest.contains("anvyx_provider_host_"));
         assert!(manifest.contains("package = \"native-host\""));
         assert!(manifest.contains(&temp.path().join("host").display().to_string()));
+        assert!(temp.path().join("cache/target").is_dir());
+        assert!(!temp.path().join("game/.anvyx").exists());
     }
 
     #[test]

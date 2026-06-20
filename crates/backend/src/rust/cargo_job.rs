@@ -56,6 +56,14 @@ pub struct RustCargoBatchSuccess {
     pub binaries: Vec<(RustCargoName, PathBuf)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustCargoJobPaths {
+    pub manifest_path: PathBuf,
+    pub source_path: PathBuf,
+    pub target_dir: PathBuf,
+    pub binary_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustCargoMode {
     Build,
@@ -270,15 +278,16 @@ pub fn single_program_job_configured(
     crate_identity: Option<RustCargoCrateIdentity>,
 ) -> RustCargoJob {
     let dependencies = normalized_dependencies(dependencies);
-    let fingerprint = cargo_fingerprint(&RustCargoFingerprintInput {
-        source: source.as_str(),
-        manifest_template: SINGLE_MANIFEST_TEMPLATE,
-        semantic_profile,
-        cargo_profile: profile,
-        dependencies: &dependencies,
+    let crate_identity = crate_identity.unwrap_or_else(|| {
+        let fingerprint = cargo_fingerprint(&RustCargoFingerprintInput {
+            source: source.as_str(),
+            manifest_template: SINGLE_MANIFEST_TEMPLATE,
+            semantic_profile,
+            cargo_profile: profile,
+            dependencies: &dependencies,
+        });
+        RustCargoCrateIdentity(fingerprint.0)
     });
-    let crate_identity =
-        crate_identity.unwrap_or_else(|| RustCargoCrateIdentity(fingerprint.0.clone()));
     let name = single_package_name(&crate_identity);
     RustCargoJob {
         source,
@@ -302,6 +311,18 @@ pub fn batch_job(
     semantic_profile: &str,
 ) -> RustCargoBatchJob {
     batch_job_with_dependencies(cases, cache_root, profile, semantic_profile, vec![])
+}
+
+impl RustCargoJob {
+    pub fn paths(&self) -> RustCargoJobPaths {
+        let layout = RustCargoLayout::new(self.cache_root.clone(), self.crate_identity.clone());
+        RustCargoJobPaths {
+            manifest_path: layout.manifest_path(),
+            source_path: layout.source_path(),
+            target_dir: layout.target_dir(),
+            binary_path: layout.binary_path(self.profile, &self.package.binary_name),
+        }
+    }
 }
 
 pub fn batch_job_with_dependencies(
@@ -346,73 +367,79 @@ pub fn execute(job: &RustCargoJob) -> Result<RustCargoOutput, RustCargoError> {
 
 pub fn execute_with_events(
     job: &RustCargoJob,
+    events: impl FnMut(RustCargoEvent),
+) -> Result<RustCargoOutput, RustCargoError> {
+    execute_with_events_and_timeout(job, None, events)
+}
+
+pub fn execute_with_timeout(
+    job: &RustCargoJob,
+    timeout: Duration,
+) -> Result<RustCargoOutput, RustCargoError> {
+    execute_with_events_and_timeout(job, Some(timeout), |_| {})
+}
+
+pub fn execute_with_events_and_timeout(
+    job: &RustCargoJob,
+    timeout: Option<Duration>,
     mut events: impl FnMut(RustCargoEvent),
 ) -> Result<RustCargoOutput, RustCargoError> {
     validate_package(&job.package)?;
-
+    let started = Instant::now();
     let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
-    with_lock(layout.lock_path(), None, || {
-        write_single_package(job, &layout)?;
+    with_lock(
+        layout.lock_path(),
+        remaining_timeout(started, timeout)?,
+        || {
+            write_single_package(job, &layout)?;
 
-        events(RustCargoEvent::Compiling);
-        let cargo = Command::new("cargo")
-            .arg("build")
-            .args(job.profile.build_args())
-            .arg("--manifest-path")
-            .arg(layout.manifest_path())
-            .arg("--target-dir")
-            .arg(layout.target_dir())
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    RustCargoError::CargoUnavailable
-                } else {
-                    RustCargoError::Io(error)
-                }
-            })?;
+            let cargo_timeout = remaining_timeout(started, timeout)?;
+            events(RustCargoEvent::Compiling);
+            let cargo = build_cargo_output(job.profile, &layout, cargo_timeout)?;
 
-        if !cargo.status.success() {
-            return Ok(RustCargoOutput::CargoFailed(failure(
-                &layout,
-                cargo.status.code(),
-                cargo.stdout,
-                cargo.stderr,
-            )));
-        }
+            if !cargo.status.success() {
+                return Ok(RustCargoOutput::CargoFailed(failure(
+                    &layout,
+                    cargo.status.code(),
+                    cargo.stdout,
+                    cargo.stderr,
+                )));
+            }
 
-        let binary_path = layout.binary_path(job.profile, &job.package.binary_name);
-        if !binary_path.exists() {
-            return Err(RustCargoError::BinaryMissing(binary_path));
-        }
+            let binary_path = layout.binary_path(job.profile, &job.package.binary_name);
+            if !binary_path.exists() {
+                return Err(RustCargoError::BinaryMissing(binary_path));
+            }
 
-        match job.mode {
-            RustCargoMode::Build => Ok(RustCargoOutput::Success(success(
-                &layout,
-                binary_path,
-                cargo.stdout,
-                cargo.stderr,
-            ))),
-            RustCargoMode::Run => {
-                events(RustCargoEvent::Running);
-                let run = Command::new(&binary_path).output()?;
-                if !run.status.success() {
-                    return Ok(RustCargoOutput::RunFailed(failure(
-                        &layout,
-                        run.status.code(),
-                        run.stdout,
-                        run.stderr,
-                    )));
-                }
-                Ok(RustCargoOutput::Success(success(
+            match job.mode {
+                RustCargoMode::Build => Ok(RustCargoOutput::Success(success(
                     &layout,
                     binary_path,
-                    run.stdout,
-                    run.stderr,
-                )))
+                    cargo.stdout,
+                    cargo.stderr,
+                ))),
+                RustCargoMode::Run => {
+                    let run_timeout = remaining_timeout(started, timeout)?;
+                    events(RustCargoEvent::Running);
+                    let run = command_output(Command::new(&binary_path), run_timeout)?;
+                    if !run.status.success() {
+                        return Ok(RustCargoOutput::RunFailed(failure(
+                            &layout,
+                            run.status.code(),
+                            run.stdout,
+                            run.stderr,
+                        )));
+                    }
+                    Ok(RustCargoOutput::Success(success(
+                        &layout,
+                        binary_path,
+                        run.stdout,
+                        run.stderr,
+                    )))
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 pub fn execute_batch_with_timeout(
@@ -423,42 +450,38 @@ pub fn execute_batch_with_timeout(
     validate_batch_cases(&job.cases)?;
     let started = Instant::now();
     let layout = RustCargoLayout::new(job.cache_root.clone(), job.crate_identity.clone());
-    with_lock(layout.lock_path(), timeout, || {
-        write_batch_package(job, &layout)?;
+    with_lock(
+        layout.lock_path(),
+        remaining_timeout(started, timeout)?,
+        || {
+            write_batch_package(job, &layout)?;
 
-        let mut cargo = Command::new("cargo");
-        cargo
-            .arg("build")
-            .args(job.profile.build_args())
-            .arg("--manifest-path")
-            .arg(layout.manifest_path())
-            .arg("--target-dir")
-            .arg(layout.target_dir())
-            .env_remove("CARGO_TARGET_DIR");
-        let cargo = command_output(cargo, remaining_timeout(started, timeout)?)?;
+            let cargo =
+                build_cargo_output(job.profile, &layout, remaining_timeout(started, timeout)?)?;
 
-        if !cargo.status.success() {
-            return Ok(RustCargoBatchOutput::CargoFailed(failure(
-                &layout,
-                cargo.status.code(),
-                cargo.stdout,
-                cargo.stderr,
-            )));
-        }
-
-        let mut binaries = vec![];
-        for case in &job.cases {
-            let path = layout.binary_path(job.profile, &case.name);
-            if !path.exists() {
-                return Err(RustCargoError::BinaryMissing(path));
+            if !cargo.status.success() {
+                return Ok(RustCargoBatchOutput::CargoFailed(failure(
+                    &layout,
+                    cargo.status.code(),
+                    cargo.stdout,
+                    cargo.stderr,
+                )));
             }
-            binaries.push((case.name.clone(), path));
-        }
 
-        Ok(RustCargoBatchOutput::Success(RustCargoBatchSuccess {
-            binaries,
-        }))
-    })
+            let mut binaries = vec![];
+            for case in &job.cases {
+                let path = layout.binary_path(job.profile, &case.name);
+                if !path.exists() {
+                    return Err(RustCargoError::BinaryMissing(path));
+                }
+                binaries.push((case.name.clone(), path));
+            }
+
+            Ok(RustCargoBatchOutput::Success(RustCargoBatchSuccess {
+                binaries,
+            }))
+        },
+    )
 }
 
 fn write_single_package(
@@ -534,7 +557,6 @@ fn render_manifest(package: &RustPackageSpec) -> String {
 }
 
 fn render_dependencies(dependencies: &[RustCargoDependency]) -> String {
-    let dependencies = sorted_dependencies(dependencies);
     if dependencies.is_empty() {
         return String::new();
     }
@@ -680,27 +702,44 @@ fn remaining_timeout(
         .ok_or(RustCargoError::Timeout)
 }
 
+fn build_cargo_output(
+    profile: RustCargoProfile,
+    layout: &RustCargoLayout,
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, RustCargoError> {
+    let mut cargo = Command::new("cargo");
+    cargo
+        .arg("build")
+        .args(profile.build_args())
+        .arg("--manifest-path")
+        .arg(layout.manifest_path())
+        .arg("--target-dir")
+        .arg(layout.target_dir())
+        .env_remove("CARGO_TARGET_DIR");
+    cargo_output(cargo, timeout)
+}
+
+fn cargo_output(
+    command: Command,
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, RustCargoError> {
+    command_output(command, timeout).map_err(|error| match error {
+        RustCargoError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            RustCargoError::CargoUnavailable
+        }
+        error => error,
+    })
+}
+
 fn command_output(
     mut command: Command,
     timeout: Option<Duration>,
 ) -> Result<std::process::Output, RustCargoError> {
     let Some(timeout) = timeout else {
-        return command.output().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                RustCargoError::CargoUnavailable
-            } else {
-                RustCargoError::Io(error)
-            }
-        });
+        return command.output().map_err(RustCargoError::Io);
     };
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            RustCargoError::CargoUnavailable
-        } else {
-            RustCargoError::Io(error)
-        }
-    })?;
+    let mut child = command.spawn().map_err(RustCargoError::Io)?;
     let stdout = child
         .stdout
         .take()
@@ -1465,7 +1504,7 @@ mod tests {
              done",
         );
 
-        let output = command_output(command, Some(Duration::from_secs(5))).unwrap();
+        let output = cargo_output(command, Some(Duration::from_secs(5))).unwrap();
 
         assert!(output.status.success());
         assert!(output.stdout.len() > 100_000);
@@ -1479,7 +1518,7 @@ mod tests {
         command.arg("-c").arg("sleep 10");
 
         assert!(matches!(
-            command_output(command, Some(Duration::from_millis(50))),
+            cargo_output(command, Some(Duration::from_millis(50))),
             Err(RustCargoError::Timeout)
         ));
     }
@@ -1506,6 +1545,68 @@ mod tests {
         assert!(output.manifest_path.exists());
         assert!(output.source_path.exists());
         assert!(output.binary_path.exists());
+    }
+
+    #[test]
+    fn single_job_paths_are_centralized() {
+        let cache = tempfile::tempdir().unwrap();
+        let job = single_program_job(
+            RustSource::new("fn main() {}\n".to_string()),
+            cache.path().to_path_buf(),
+            RustCargoProfile::Dev,
+            RustCargoMode::Run,
+            "debug",
+        );
+
+        let paths = job.paths();
+
+        assert!(paths.manifest_path.starts_with(cache.path().join("crates")));
+        assert_eq!(
+            paths.source_path,
+            paths
+                .manifest_path
+                .parent()
+                .expect("manifest path has parent")
+                .join("src/main.rs")
+        );
+        assert_eq!(paths.target_dir, cache.path().join("target"));
+        assert!(
+            paths
+                .binary_path
+                .starts_with(cache.path().join("target/debug"))
+        );
+    }
+
+    #[test]
+    fn single_run_job_times_out() {
+        let cache = tempfile::tempdir().unwrap();
+        let source = RustSource::new(
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n".to_string(),
+        );
+        let build = single_program_job(
+            source.clone(),
+            cache.path().to_path_buf(),
+            RustCargoProfile::Dev,
+            RustCargoMode::Build,
+            "debug",
+        );
+        execute(&build).unwrap();
+        let run = single_program_job(
+            source,
+            cache.path().to_path_buf(),
+            RustCargoProfile::Dev,
+            RustCargoMode::Run,
+            "debug",
+        );
+        let mut events = vec![];
+
+        assert!(matches!(
+            execute_with_events_and_timeout(&run, Some(Duration::from_secs(5)), |event| {
+                events.push(event);
+            }),
+            Err(RustCargoError::Timeout)
+        ));
+        assert_eq!(events, [RustCargoEvent::Compiling, RustCargoEvent::Running]);
     }
 
     #[test]

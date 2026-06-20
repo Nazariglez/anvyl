@@ -2,19 +2,49 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
+use anvyx_backend::rust::{
+    cargo_job::{
+        self, RustCargoCrateIdentity, RustCargoCrateIdentityInput, RustCargoDependency,
+        RustCargoDependencySource, RustCargoError, RustCargoJob, RustCargoMode, RustCargoName,
+        RustCargoOutput, RustCargoPackageMetadata, RustCargoPackageName, RustCargoProfile,
+    },
+    emit::RustSource,
+};
 use anvyx_lang2::LintConfig;
 use anvyx_runtime::{
     ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
     validate_rust_provider_support,
 };
 use serde::Deserialize;
-use wait_timeout::ChildExt;
 
-const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_mins(2);
+use crate::{cache, rust_deps};
+
+const PROVIDER_PROBE_TIMEOUT_ENV: &str = "ANVYX_PROVIDER_PROBE_TIMEOUT_SECS";
+const DEFAULT_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 600;
+const PROVIDER_PROBE_PROFILE: &str = "provider-probe-v1";
+
+fn provider_probe_timeout() -> Result<Duration, String> {
+    parse_provider_probe_timeout(std::env::var(PROVIDER_PROBE_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_provider_probe_timeout(value: Option<&str>) -> Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(DEFAULT_PROVIDER_PROBE_TIMEOUT_SECS));
+    };
+    let seconds = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            format!(
+                "invalid {PROVIDER_PROBE_TIMEOUT_ENV} '{value}': expected positive integer seconds"
+            )
+        })?;
+    Ok(Duration::from_secs(seconds))
+}
 
 pub type ManifestLint = BTreeMap<String, String>;
 
@@ -88,15 +118,15 @@ fn parse_provider_cargo(path: &Path, label: &str) -> Result<ProviderCargoManifes
 fn load_native_package_provider(
     package: PackageId,
     native: &NativePackageInfo,
+    cache_root: &Path,
 ) -> Result<LoadedNativeProvider, String> {
     let probe = native_provider_probe_input(package, native)?;
-    let label = probe.package.to_string();
-    let output = run_provider_probe(&probe, &label)?;
-    native_provider_from_probe(probe, output)
+    let output = run_provider_probe(&probe, cache_root)?;
+    native_provider_from_probe(&probe, output)
 }
 
 fn native_provider_from_probe(
-    probe: NativeProviderProbeInput,
+    probe: &NativeProviderProbeInput,
     output: ProviderProbeOutput,
 ) -> Result<LoadedNativeProvider, String> {
     anvyx_externs::validate(&output.descriptor).map_err(|errors| {
@@ -105,9 +135,13 @@ fn native_provider_from_probe(
             probe.package
         )
     })?;
-    let support = rust_provider_support(&probe, &output);
+    let ProviderProbeOutput {
+        descriptor,
+        supports,
+    } = output;
+    let support = rust_provider_support(probe, descriptor.provider.clone(), supports);
     validate_rust_provider_support(
-        std::slice::from_ref(&output.descriptor),
+        std::slice::from_ref(&descriptor),
         std::slice::from_ref(&support),
     )
     .map_err(|error| {
@@ -117,20 +151,20 @@ fn native_provider_from_probe(
         )
     })?;
     Ok(LoadedNativeProvider {
-        descriptor: output.descriptor,
+        descriptor,
         support,
     })
 }
 
 fn rust_provider_support(
     probe: &NativeProviderProbeInput,
-    output: &ProviderProbeOutput,
+    provider: anvyx_runtime::ProviderId,
+    mut modules: Vec<RustModuleSupport>,
 ) -> RustProviderSupport {
-    let mut modules = output.supports.clone();
     retarget_rust_modules(&mut modules, &probe.cargo_alias);
     RustProviderSupport {
         package: package_lang_id(&probe.package),
-        provider: output.descriptor.provider.clone(),
+        provider,
         cargo: RustProviderCargo {
             manifest_key: probe.cargo_alias.clone(),
             package: Some(probe.cargo_package.clone()),
@@ -155,101 +189,173 @@ fn retarget_rust_modules(modules: &mut [RustModuleSupport], cargo_alias: &str) {
 
 fn run_provider_probe(
     provider: &NativeProviderProbeInput,
-    label: &str,
+    cache_root: &Path,
 ) -> Result<ProviderProbeOutput, String> {
-    let dir = provider_probe_dir(provider);
-    fs::create_dir_all(dir.join("src")).map_err(|error| {
-        format!(
-            "failed to create native provider package `{label}` probe at {}: {error}",
-            dir.display()
-        )
-    })?;
-    fs::write(dir.join("Cargo.toml"), provider_probe_manifest(provider)).map_err(|error| {
-        format!("failed to write native provider package `{label}` probe manifest: {error}")
-    })?;
-    fs::write(dir.join("src/main.rs"), provider_probe_main(provider)).map_err(|error| {
-        format!("failed to write native provider package `{label}` probe main: {error}")
-    })?;
-
-    let stdout_path = dir.join("stdout.json");
-    let stderr_path = dir.join("stderr.txt");
-    let stdout_file = fs::File::create(&stdout_path).map_err(|error| {
-        format!("failed to create native provider package `{label}` probe stdout file: {error}")
-    })?;
-    let stderr_file = fs::File::create(&stderr_path).map_err(|error| {
-        format!("failed to create native provider package `{label}` probe stderr file: {error}")
-    })?;
-    let mut child = Command::new("cargo")
-        .args(["run", "--quiet"])
-        .current_dir(&dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .map_err(|error| {
-            format!("failed to run native provider package `{label}` probe: {error}")
-        })?;
-    let Some(status) = child
-        .wait_timeout(PROVIDER_PROBE_TIMEOUT)
-        .map_err(|error| {
-            format!("failed to wait for native provider package `{label}` probe: {error}")
-        })?
-    else {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = fs::remove_dir_all(&dir);
-        return Err(format!("native provider package `{label}` probe timed out"));
-    };
-    let stdout = fs::read(&stdout_path).unwrap_or_default();
-    let stderr = fs::read(&stderr_path).unwrap_or_default();
-    let _ = fs::remove_dir_all(&dir);
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Err(format!(
-            "native provider package `{label}` probe failed\n{stderr}"
-        ));
+    let timeout = provider_probe_timeout()?;
+    let job = provider_probe_job(provider, cache_root)?;
+    let paths = job.paths();
+    let label = provider.package.to_string();
+    match cargo_job::execute_with_timeout(&job, timeout) {
+        Ok(RustCargoOutput::Success(output)) => {
+            serde_json::from_str(&output.stdout).map_err(|error| {
+                format!(
+                    "native provider package `{label}` probe emitted invalid metadata: {error}\nmanifest: {}\nstdout: {}",
+                    output.manifest_path.display(),
+                    text_excerpt(&output.stdout)
+                )
+            })
+        }
+        Ok(RustCargoOutput::CargoFailed(output)) => Err(format!(
+            "native provider package `{label}` probe build failed{}\nmanifest: {}\ntarget: {}\nstderr: {}\nstdout: {}",
+            status_suffix(output.status),
+            output.manifest_path.display(),
+            output.target_dir.display(),
+            text_excerpt(&output.stderr),
+            text_excerpt(&output.stdout)
+        )),
+        Ok(RustCargoOutput::RunFailed(output)) => Err(format!(
+            "native provider package `{label}` probe failed{}\nbinary: {}\nstderr: {}\nstdout: {}",
+            status_suffix(output.status),
+            paths.binary_path.display(),
+            text_excerpt(&output.stderr),
+            text_excerpt(&output.stdout)
+        )),
+        Err(RustCargoError::Timeout) => Err(provider_probe_timeout_error(
+            &label,
+            cache_root,
+            &paths.target_dir,
+            timeout,
+            None,
+        )),
+        Err(RustCargoError::LockTimeout(path)) => Err(provider_probe_timeout_error(
+            &label,
+            cache_root,
+            &paths.target_dir,
+            timeout,
+            Some(&path),
+        )),
+        Err(error) => Err(format!(
+            "failed to run native provider package `{label}` probe\nmanifest: {}\ntarget: {}\n{error}",
+            paths.manifest_path.display(),
+            paths.target_dir.display()
+        )),
     }
-    serde_json::from_slice(&stdout).map_err(|error| {
-        format!("native provider package `{label}` probe emitted invalid metadata: {error}")
-    })
 }
 
-fn provider_probe_dir(provider: &NativeProviderProbeInput) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time is after unix epoch")
-        .as_nanos();
-    let hash = stable_hash_hex(&provider.crate_root.display().to_string());
-    std::env::temp_dir().join(format!(
-        "anvyx-provider-{}-{hash}-{stamp}",
-        std::process::id()
-    ))
-}
-
-fn provider_probe_manifest(provider: &NativeProviderProbeInput) -> String {
-    let dependency = format!(
-        "{} = {{ package = {}, path = {} }}",
-        provider.cargo_alias,
-        toml_string(&provider.cargo_package),
-        toml_string(&provider.crate_root.display().to_string())
+fn provider_probe_timeout_error(
+    label: &str,
+    cache_root: &Path,
+    target_dir: &Path,
+    timeout: Duration,
+    lock_path: Option<&Path>,
+) -> String {
+    let wait = lock_path.map_or_else(
+        || format!(" after {}s", timeout.as_secs()),
+        |path| format!(" waiting for lock {}", path.display()),
     );
-    render_probe_template(
-        include_str!("templates/provider_probe_manifest.toml.in"),
-        &[
-            (
-                "runtime_path",
-                toml_string(&workspace_crate_path("runtime").display().to_string()),
-            ),
-            ("provider_dependency", dependency),
-        ],
+    format!(
+        "native provider package `{label}` probe timed out{wait}\ncache: {}\ntarget: {}\nset {PROVIDER_PROBE_TIMEOUT_ENV} to allow a longer cold build",
+        cache_root.display(),
+        target_dir.display()
     )
+}
+
+fn status_suffix(status: Option<i32>) -> String {
+    status.map_or_else(String::new, |code| format!(" with status {code}"))
+}
+
+fn text_excerpt(text: &str) -> String {
+    const LIMIT: usize = 400;
+    if text.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut chars = text.chars();
+    let mut excerpt = chars.by_ref().take(LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 fn provider_probe_main(provider: &NativeProviderProbeInput) -> String {
-    render_probe_template(
-        include_str!("templates/provider_probe_main.rs.in"),
-        &[("provider_crate", provider.cargo_alias.clone())],
-    )
+    include_str!("templates/provider_probe_main.rs.in")
+        .replace("{{provider_crate}}", &provider.cargo_alias)
+}
+
+fn provider_probe_dependencies(
+    provider: &NativeProviderProbeInput,
+) -> Result<Vec<RustCargoDependency>, String> {
+    Ok(vec![
+        rust_deps::runtime_dependency(),
+        registry_probe_dependency("serde", &["derive"]),
+        registry_probe_dependency("serde_json", &[]),
+        RustCargoDependency {
+            name: RustCargoName::parse(&provider.cargo_alias)
+                .expect("generated provider Cargo alias is valid"),
+            package: Some(
+                RustCargoPackageName::parse(&provider.cargo_package).map_err(|error| {
+                    format!(
+                        "invalid native provider package `{}` Cargo package `{}`: {error}",
+                        provider.package, provider.cargo_package
+                    )
+                })?,
+            ),
+            source: RustCargoDependencySource::Path(provider.crate_root.display().to_string()),
+            features: vec![],
+            default_features: true,
+        },
+    ])
+}
+
+fn registry_probe_dependency(name: &str, features: &[&str]) -> RustCargoDependency {
+    RustCargoDependency {
+        name: RustCargoName::parse(name).expect("valid probe dependency name"),
+        package: None,
+        source: RustCargoDependencySource::Registry {
+            version: "1".to_string(),
+        },
+        features: features
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect(),
+        default_features: true,
+    }
+}
+
+fn provider_probe_crate_identity(
+    provider: &NativeProviderProbeInput,
+    dependencies: &[RustCargoDependency],
+) -> RustCargoCrateIdentity {
+    let seed = format!(
+        "{PROVIDER_PROBE_PROFILE}\n{}\n{}\n{}",
+        provider.package.manifest_path().display(),
+        provider.cargo_package,
+        provider.cargo_alias
+    );
+    cargo_job::single_program_crate_identity(&RustCargoCrateIdentityInput {
+        seed: &seed,
+        semantic_profile: PROVIDER_PROBE_PROFILE,
+        cargo_profile: RustCargoProfile::Dev,
+        dependencies,
+    })
+}
+
+fn provider_probe_job(
+    provider: &NativeProviderProbeInput,
+    cache_root: &Path,
+) -> Result<RustCargoJob, String> {
+    let dependencies = provider_probe_dependencies(provider)?;
+    let identity = provider_probe_crate_identity(provider, &dependencies);
+    Ok(cargo_job::single_program_job_configured(
+        RustSource::new(provider_probe_main(provider)),
+        cache_root.to_path_buf(),
+        RustCargoProfile::Dev,
+        RustCargoMode::Run,
+        PROVIDER_PROBE_PROFILE,
+        dependencies,
+        RustCargoPackageMetadata::default(),
+        Some(identity),
+    ))
 }
 
 fn generated_provider_cargo_alias(package: &PackageId) -> String {
@@ -293,44 +399,6 @@ fn stable_hash_hex(text: &str) -> String {
         hash = hash.wrapping_mul(PRIME);
     }
     format!("{hash:016x}")
-}
-
-fn toml_string(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len() + 2);
-    escaped.push('"');
-    for ch in text.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            ch if ch.is_control() => {
-                use std::fmt::Write as _;
-                write!(escaped, "\\u{:04X}", ch as u32).expect("write to string succeeds");
-            }
-            ch => escaped.push(ch),
-        }
-    }
-    escaped.push('"');
-    escaped
-}
-
-fn render_probe_template(template: &str, values: &[(&str, String)]) -> String {
-    let mut rendered = template.to_string();
-    for (key, value) in values {
-        rendered = rendered.replace(&format!("{{{{{key}}}}}"), value);
-    }
-    rendered
-}
-
-fn workspace_crate_path(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("project crate lives below workspace crates directory")
-        .join(name)
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,7 +565,27 @@ impl PackageGraph {
 }
 
 pub fn load_package_graph(manifest_path: &Path) -> Result<PackageGraph, String> {
-    PackageGraphLoader::default().load(manifest_path)
+    let root = package_id(manifest_path)?;
+    let root_dir = root
+        .manifest_path()
+        .parent()
+        .expect("canonical manifest path has a parent");
+    let cache_root = cache::rust_cache_root_for(root_dir);
+    load_package_graph_with_probe(root, cache_root)
+}
+
+pub(crate) fn load_package_graph_with_rust_cache(
+    manifest_path: &Path,
+    cache_root: PathBuf,
+) -> Result<PackageGraph, String> {
+    load_package_graph_with_probe(package_id(manifest_path)?, cache_root)
+}
+
+fn load_package_graph_with_probe(
+    root: PackageId,
+    cache_root: PathBuf,
+) -> Result<PackageGraph, String> {
+    PackageGraphLoader::new(cache_root).load(root)
 }
 
 pub fn find_nearest_manifest(start: &Path) -> Result<Option<PathBuf>, String> {
@@ -549,16 +637,24 @@ enum VisitState {
     Done,
 }
 
-#[derive(Default)]
 struct PackageGraphLoader {
     states: HashMap<PackageId, VisitState>,
     stack: Vec<PackageId>,
     packages: Vec<PackageNode>,
+    cache_root: PathBuf,
 }
 
 impl PackageGraphLoader {
-    fn load(mut self, manifest_path: &Path) -> Result<PackageGraph, String> {
-        let root = package_id(manifest_path)?;
+    fn new(cache_root: PathBuf) -> Self {
+        Self {
+            states: HashMap::new(),
+            stack: vec![],
+            packages: vec![],
+            cache_root,
+        }
+    }
+
+    fn load(mut self, root: PackageId) -> Result<PackageGraph, String> {
         self.load_package(&root)?;
         Ok(PackageGraph {
             root,
@@ -603,7 +699,11 @@ impl PackageGraphLoader {
             ));
         }
         let providers = match &native {
-            Some(native) => vec![load_native_package_provider(id.clone(), native)?],
+            Some(native) => vec![load_native_package_provider(
+                id.clone(),
+                native,
+                &self.cache_root,
+            )?],
             None => vec![],
         };
         self.packages.push(PackageNode {
@@ -715,6 +815,114 @@ mod tests {
 
     fn synthetic_package_id(manifest_path: PathBuf) -> PackageId {
         PackageId { manifest_path }
+    }
+
+    fn toml_string(text: &str) -> String {
+        let mut escaped = String::with_capacity(text.len() + 2);
+        escaped.push('"');
+        for ch in text.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                '\u{08}' => escaped.push_str("\\b"),
+                '\u{0c}' => escaped.push_str("\\f"),
+                ch if ch.is_control() => {
+                    write!(escaped, "\\u{:04X}", ch as u32).expect("write to string succeeds");
+                }
+                ch => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
+    }
+
+    #[test]
+    fn provider_probe_timeout_defaults() {
+        assert_eq!(
+            parse_provider_probe_timeout(None).unwrap(),
+            Duration::from_secs(DEFAULT_PROVIDER_PROBE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn provider_probe_timeout_accepts_positive_seconds() {
+        assert_eq!(
+            parse_provider_probe_timeout(Some("900")).unwrap(),
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn provider_probe_timeout_rejects_invalid_text() {
+        let error = parse_provider_probe_timeout(Some("abc")).unwrap_err();
+
+        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
+        assert!(error.contains("expected positive integer seconds"));
+    }
+
+    #[test]
+    fn provider_probe_timeout_rejects_zero() {
+        let error = parse_provider_probe_timeout(Some("0")).unwrap_err();
+
+        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
+        assert!(error.contains("expected positive integer seconds"));
+    }
+
+    #[test]
+    fn provider_probe_timeout_rejects_whitespace() {
+        let error = parse_provider_probe_timeout(Some(" 900")).unwrap_err();
+
+        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
+    }
+
+    #[test]
+    fn provider_probe_text_excerpt_is_bounded() {
+        let text = "x".repeat(500);
+        let excerpt = text_excerpt(&text);
+
+        assert_eq!(excerpt.chars().count(), 403);
+        assert!(excerpt.ends_with("..."));
+        assert_eq!(text_excerpt(""), "<empty>");
+    }
+
+    #[test]
+    fn provider_probe_status_suffix_formats_status() {
+        assert_eq!(status_suffix(Some(7)), " with status 7");
+        assert_eq!(status_suffix(None), "");
+    }
+
+    #[test]
+    fn provider_probe_timeout_error_names_cache_target_and_override() {
+        let error = provider_probe_timeout_error(
+            "host",
+            Path::new("/game/.anvyx/cache/rust"),
+            Path::new("/game/.anvyx/cache/rust/target"),
+            Duration::from_secs(7),
+            None,
+        );
+
+        assert!(error.contains("probe timed out after 7s"));
+        assert!(error.contains("cache: /game/.anvyx/cache/rust"));
+        assert!(error.contains("target: /game/.anvyx/cache/rust/target"));
+        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
+    }
+
+    #[test]
+    fn provider_probe_lock_timeout_error_names_lock() {
+        let error = provider_probe_timeout_error(
+            "host",
+            Path::new("/cache"),
+            Path::new("/cache/target"),
+            Duration::from_secs(7),
+            Some(Path::new("/cache/locks/probe.lock")),
+        );
+
+        assert!(error.contains("probe timed out waiting for lock /cache/locks/probe.lock"));
+        assert!(error.contains("target: /cache/target"));
+        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
     }
 
     #[test]
@@ -875,19 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn package_probe_manifest_uses_generated_alias_and_local_path() {
-        let provider = package_provider_fixture("Game Host", "host-provider");
-
-        let manifest = provider_probe_manifest(&provider);
-
-        assert!(manifest.contains("anvyx_provider_game_host_"));
-        assert!(
-            manifest.contains(" = { package = \"host-provider\", path = \"/tmp/host-provider\" }")
-        );
-        assert!(!manifest.contains("anvyx_provider_host-provider"));
-    }
-
-    #[test]
     fn package_attachment_uses_package_id_and_retargeted_crate_paths() {
         let probe = package_provider_fixture("Game Host", "host-provider");
         let output = ProviderProbeOutput {
@@ -899,7 +1094,7 @@ mod tests {
             }],
         };
 
-        let provider = native_provider_from_probe(probe.clone(), output).unwrap();
+        let provider = native_provider_from_probe(&probe, output).unwrap();
         let support = provider.support;
 
         assert_eq!(support.package, package_lang_id(&probe.package));
@@ -920,28 +1115,78 @@ mod tests {
     }
 
     #[test]
-    fn provider_probe_manifest_renders_template_package_shape() {
-        let provider = provider_fixture("physics", "physics-provider");
+    fn provider_probe_dependencies_use_cargo_job_shapes() {
+        let provider = package_provider_fixture("Game Host", "host-provider");
 
-        let manifest = provider_probe_manifest(&provider);
+        let dependencies = provider_probe_dependencies(&provider).unwrap();
 
-        assert!(manifest.contains("[package]\nname = \"anvyx-provider-probe\""));
-        assert!(manifest.contains("anvyx-runtime = { path = "));
-        assert!(manifest.contains("serde = { version = \"1\", features = [\"derive\"] }"));
-        assert!(manifest.contains("serde_json = \"1\""));
-        assert!(manifest.contains(
-            "anvyx_provider_physics = { package = \"physics-provider\", path = \"/tmp/physics-provider\" }"
-        ));
+        assert!(dependencies.contains(&rust_deps::runtime_dependency()));
+        assert!(dependencies.iter().any(|dep| {
+            dep.name.as_str() == "serde"
+                && dep.package.is_none()
+                && dep.source
+                    == (RustCargoDependencySource::Registry {
+                        version: "1".to_string(),
+                    })
+                && dep.features == ["derive"]
+                && dep.default_features
+        }));
+        assert!(dependencies.iter().any(|dep| {
+            dep.name.as_str() == "serde_json"
+                && dep.package.is_none()
+                && dep.source
+                    == (RustCargoDependencySource::Registry {
+                        version: "1".to_string(),
+                    })
+                && dep.features.is_empty()
+                && dep.default_features
+        }));
+        assert!(dependencies.iter().any(|dep| {
+            dep.name.as_str() == provider.cargo_alias
+                && dep.package.as_ref().map(RustCargoPackageName::as_str) == Some("host-provider")
+                && dep.source == RustCargoDependencySource::Path("/tmp/host-provider".to_string())
+                && dep.features.is_empty()
+                && dep.default_features
+        }));
     }
 
     #[test]
-    fn provider_probe_manifest_escapes_toml_paths() {
-        let mut provider = provider_fixture("physics", "physics-provider");
-        provider.crate_root = PathBuf::from("/tmp/physics \"quoted\"");
+    fn provider_probe_identity_is_stable_and_path_based() {
+        let provider = package_provider_fixture("Game Host", "host-provider");
+        let dependencies = provider_probe_dependencies(&provider).unwrap();
 
-        let manifest = provider_probe_manifest(&provider);
+        let first = provider_probe_crate_identity(&provider, &dependencies);
+        let second = provider_probe_crate_identity(&provider, &dependencies);
+        let mut other = provider.clone();
+        other.package = synthetic_package_id(PathBuf::from("/tmp/Other/anvyx.toml"));
 
-        assert!(manifest.contains("path = \"/tmp/physics \\\"quoted\\\"\""));
+        assert_eq!(first, second);
+        assert_ne!(first, provider_probe_crate_identity(&other, &dependencies));
+    }
+
+    #[test]
+    fn provider_probe_job_paths_are_under_root_cache() {
+        let provider = package_provider_fixture("Game Host", "host-provider");
+        let cache_root = PathBuf::from("/game/.anvyx/cache/rust");
+
+        let first = provider_probe_job(&provider, &cache_root).unwrap().paths();
+        let second = provider_probe_job(&provider, &cache_root).unwrap().paths();
+
+        assert_eq!(first, second);
+        assert!(
+            first
+                .manifest_path
+                .starts_with("/game/.anvyx/cache/rust/crates")
+        );
+        assert!(
+            first
+                .source_path
+                .starts_with("/game/.anvyx/cache/rust/crates")
+        );
+        assert_eq!(
+            first.target_dir,
+            PathBuf::from("/game/.anvyx/cache/rust/target")
+        );
     }
 
     #[test]
@@ -979,7 +1224,7 @@ mod tests {
     fn loaded_provider(package: &str, cargo_package: &str) -> LoadedNativeProvider {
         let probe = package_provider_fixture(package, cargo_package);
         native_provider_from_probe(
-            probe,
+            &probe,
             ProviderProbeOutput {
                 descriptor: provider_descriptor(package),
                 supports: vec![RustModuleSupport {
@@ -1136,7 +1381,7 @@ mod tests {
                 dir.join("Cargo.toml"),
                 format!(
                     "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
-                    toml_string(&workspace_crate_path("runtime").display().to_string())
+                    toml_string(&rust_deps::workspace_crate_path("runtime").display().to_string())
                 ),
             )
             .unwrap();
@@ -1164,7 +1409,7 @@ pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
                 dir.join("Cargo.toml"),
                 format!(
                     "[package]\nname = \"{provider}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = {} }}\n",
-                    toml_string(&workspace_crate_path("runtime").display().to_string())
+                    toml_string(&rust_deps::workspace_crate_path("runtime").display().to_string())
                 ),
             )
             .unwrap();
@@ -1351,6 +1596,20 @@ anvyx_runtime::builtin_module! {{
         assert_eq!(host.providers[0].descriptor.provider.name, "native");
         assert_ne!(host.providers[0].support.cargo.manifest_key, "host_alias");
         assert_eq!(host.providers[0].support.package, package_lang_id(&host.id));
+    }
+
+    #[test]
+    fn dependency_provider_probe_uses_root_cache() {
+        let fixture = PackageFixture::default();
+        fixture.write_package("game", &[("host_alias", "../host")]);
+        fixture.write_native_package("host", &[]);
+
+        load_package_graph(&fixture.manifest("game")).unwrap();
+
+        let root_cache = fixture.root.path().join("game/.anvyx/cache/rust");
+        assert!(root_cache.join("crates").is_dir());
+        assert!(root_cache.join("target").is_dir());
+        assert!(!fixture.root.path().join("host/.anvyx").exists());
     }
 
     #[test]
