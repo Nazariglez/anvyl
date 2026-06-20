@@ -1,8 +1,6 @@
 // @mode: check
-// @expect: error
+// @expect: success
 // @frontend: new
-// @contains: var pattern requires a mutable place
-
 fn main() {
     var counts: [string: int] = ["a": 1];
     var value? = counts["a"] else return;

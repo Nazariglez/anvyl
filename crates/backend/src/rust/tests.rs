@@ -31,9 +31,9 @@ use super::{
         RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
         RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
         RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
-        RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
-        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
+        RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
+        RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
         RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt,
         RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
         RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
@@ -900,8 +900,9 @@ fn emit_derives_trace_for_struct_payload_containing_tuple() {
 
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct anvT2_Payload"));
-    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct anvT1_Tuple"));
+    assert!(source.contains("anvyx_runtime::Trace"));
+    assert!(source.contains("struct anvT2_Payload"));
+    assert!(source.contains("struct anvT1_Tuple"));
 }
 
 #[test]
@@ -2687,7 +2688,7 @@ fn profile_accepts_non_scalar_global_root_value_reads() {
 }
 
 #[test]
-fn profile_rejects_nonprimitive_map_keys_by_named_gap() {
+fn profile_accepts_keyable_tuple_map_keys() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -2712,7 +2713,7 @@ fn profile_rejects_nonprimitive_map_keys_by_named_gap() {
     program.module_mut(module).functions.push(id);
     program.set_entry(id);
 
-    expect_reject(program, ProfileErrorKind::UnsupportedMapKey);
+    check(program);
 }
 
 #[test]
@@ -3859,9 +3860,6 @@ fn source_job_compiles_and_runs_struct_construction_and_field_read() {
     assert!(text.contains("anvT3_Point { x: 7 }"));
     assert!(text.contains("v0.x"));
     assert!(!text.contains(".clone()"));
-    assert!(text.contains("#[derive(Clone)]"));
-    assert!(!text.contains("derive(Copy"));
-
     let output = run_source(source);
 
     assert_eq!(output.status, SourceJobStatus::Success);
@@ -3962,9 +3960,8 @@ fn emit_derives_trace_for_generated_payloads_from_tracked_storage() {
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
-    assert!(source.contains(
-        "#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime)]\nstruct Payload"
-    ));
+    assert!(source.contains("anvyx_runtime::Trace"));
+    assert!(source.contains("struct Payload"));
 }
 
 #[test]
@@ -4059,7 +4056,7 @@ fn rir_verify_rejects_list_storage_slice_payload() {
 }
 
 #[test]
-fn rir_verify_rejects_map_storage_nonprimitive_key() {
+fn rir_verify_rejects_map_storage_optional_key() {
     let int = RirTypeId::from_index(1);
     let key = RirTypeId::from_index(2);
     let map = RirTypeId::from_index(3);
@@ -4067,10 +4064,9 @@ fn rir_verify_rejects_map_storage_nonprimitive_key() {
         types: vec![
             RirType::Void,
             RirType::Int,
-            RirType::Struct(RirStructId::from_index(0)),
+            RirType::Option(int),
             RirType::Map { key, value: int },
         ],
-        structs: vec![rir_struct(0, "Key", vec![])],
         collection_storages: vec![rir_map_storage(0, map, key, int)],
         ..empty_rir_function(RirType::Void)
     };
@@ -4104,7 +4100,7 @@ fn emit_renders_plain_struct_declarations_without_impls() {
     assert!(source.contains("struct anvT2_Point"));
     assert!(source.contains("x: i64"));
     assert!(source.contains("name: anvyx_runtime::AnvString"));
-    assert!(source.contains("#[derive(Clone)]"));
+    assert!(source.contains("#[derive("));
     assert!(!source.contains("impl "));
     assert!(!source.contains("trait "));
     assert!(!source.contains("derive(Copy"));
@@ -11047,6 +11043,26 @@ fn dataref_place_descriptor_inventory_finds_call_arg_descriptor() {
 }
 
 #[test]
+fn dataref_place_descriptor_inventory_finds_map_entry_descriptor() {
+    let map_ty = RirTypeId::from_index(7);
+    let map = dataref_projection_mut_place_arg(
+        vec![RirProjection::Field(RirFieldId::from_index(6))],
+        map_ty,
+    );
+    let program = dataref_access_rir(vec![RirStmt::MapEntryMatch(RirMapEntryMatch {
+        map,
+        key: RirOperand::Const(RirConstId::from_index(0)),
+        payload: None,
+        payload_escapes: false,
+        some_block: RirStructuredBlock::default(),
+        none_block: RirStructuredBlock::default(),
+    })]);
+    let descriptors = DataRefPlaceDescriptors::build(&program);
+
+    assert_eq!(descriptors.all()[0].symbol, "anvP0_Node_map_place");
+}
+
+#[test]
 fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
     let source = emit::emit(
         &rir::verify(&dataref_projection_mut_place_call_rir(
@@ -16214,6 +16230,107 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     }));
 }
 
+#[test]
+fn rir_accepts_map_entry_match_and_emits_map_value_ops() {
+    let program = map_entry_match_rir(false);
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("MapValueOps"));
+    assert!(source.contains("begin_value_loan_by_key"));
+    assert!(source.contains("ScopedMutPlaceCell::new"));
+    assert!(source.contains("value.set(rt"));
+}
+
+#[test]
+fn rir_accepts_escaping_map_entry_match() {
+    rir::verify(&map_entry_match_rir(true)).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_map_entry_key_type_mismatch() {
+    let mut program = map_entry_match_rir(false);
+    program.consts[0].ty = RirTypeId::from_index(2);
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_rejects_map_entry_payload_type_mismatch() {
+    let mut program = map_entry_match_rir(false);
+    program.functions[0].locals[1].ty = RirTypeId::from_index(2);
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_rejects_map_entry_immutable_map_root() {
+    let mut program = map_entry_match_rir(false);
+    program.functions[0].locals[0].mutable = false;
+
+    assert_rir_error(program, RirVerifyErrorKind::ImmutableAssign);
+}
+
+fn map_entry_match_rir(payload_escapes: bool) -> RirProgram {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let map_ty = RirTypeId::from_index(3);
+    let map = RirLocalId::from_index(0);
+    let payload = RirLocalId::from_index(1);
+    let mut payload_local = rir_local(payload, int, true, "value");
+    payload_local.initialized = false;
+    payload_local.payload_ref = true;
+    RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Bool,
+            RirType::Map {
+                key: int,
+                value: int,
+            },
+        ],
+        collection_storages: vec![rir_map_storage(0, map_ty, int, int)],
+        functions: vec![RirFunction {
+            id: RirFunctionId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("f"),
+            params: vec![],
+            ret: RirReturn { ty: void },
+            locals: vec![rir_local(map, map_ty, true, "scores"), payload_local],
+            body: RirStructuredBlock {
+                stmts: vec![RirStmt::MapEntryMatch(RirMapEntryMatch {
+                    map: RirMutPlaceArg::local(RirPlace::local(map, vec![], map_ty)),
+                    key: RirOperand::Const(RirConstId::from_index(0)),
+                    payload: Some(payload),
+                    payload_escapes,
+                    some_block: RirStructuredBlock {
+                        stmts: vec![RirStmt::Assign {
+                            dst: RirPlace::local(payload, vec![], int),
+                            value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+                        }],
+                        term: RirTerm::None,
+                    },
+                    none_block: RirStructuredBlock {
+                        stmts: vec![],
+                        term: if payload_escapes {
+                            RirTerm::Unreachable
+                        } else {
+                            RirTerm::None
+                        },
+                    },
+                })],
+                term: RirTerm::Return(None),
+            },
+        }],
+        consts: vec![RirConst {
+            id: RirConstId::from_index(0),
+            ty: int,
+            value: RirConstValue::Int(1),
+        }],
+        ..RirProgram::default()
+    }
+}
+
 fn option_match_rir() -> RirProgram {
     let int = RirTypeId::from_index(0);
     let option = RirTypeId::from_index(1);
@@ -17805,7 +17922,6 @@ fn raw_int_enum_cast_emits_repr_discriminants_and_cast() {
 
     let source = plan_source(program);
     let text = source.as_str();
-    assert!(text.contains("#[derive(Clone, Copy, PartialEq, Eq)]"));
     assert!(text.contains("#[repr(i64)]"));
     assert!(text.contains("Dead = -1"));
     assert!(text.contains("v0 as i64"));

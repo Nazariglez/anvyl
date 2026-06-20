@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use anvyx_frontend::air::{
-    self, ParamMode, Program as AirProgram, TypeData, TypeId, TypePassClass, TypePassClasses,
-    VariantShape,
+    self, AggregateKind, ParamMode, Program as AirProgram, TypeData, TypeId, TypePassClass,
+    TypePassClasses, VariantShape,
 };
 
 use super::{
@@ -475,10 +475,44 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     pub fn map_key_supported(self, ty: TypeId) -> bool {
-        matches!(
-            self.program.type_arena.data(ty),
-            TypeData::Int | TypeData::Bool | TypeData::String
-        )
+        self.map_key_supported_inner(ty, &mut BTreeSet::new())
+    }
+
+    fn map_key_supported_inner(self, ty: TypeId, active: &mut BTreeSet<TypeId>) -> bool {
+        if !active.insert(ty) {
+            return false;
+        }
+        let supported = match self.program.type_arena.data(ty) {
+            TypeData::Int | TypeData::Bool | TypeData::String => true,
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .all(|elem| self.map_key_supported_inner(*elem, active)),
+            TypeData::Aggregate(id) => {
+                let aggregate = self.program.aggregate(*id);
+                aggregate.kind == AggregateKind::Struct
+                    && aggregate
+                        .fields
+                        .iter()
+                        .all(|field| self.map_key_supported_inner(field.ty, active))
+            }
+            TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
+                Self::variant_field_tys(variant).all(|ty| self.map_key_supported_inner(ty, active))
+            }),
+            TypeData::Float
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::Slice(_)
+            | TypeData::Optional(_)
+            | TypeData::Array { .. }
+            | TypeData::DataRef(_)
+            | TypeData::Extern(_)
+            | TypeData::Function(_)
+            | TypeData::Dyn(_)
+            | TypeData::Any
+            | TypeData::Void => false,
+        };
+        active.remove(&ty);
+        supported
     }
 
     pub fn map_value_supported(self, ty: TypeId) -> bool {
@@ -893,10 +927,81 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     fn map_key_supported(self, ty: RirTypeId) -> bool {
-        matches!(
-            self.ty_opt(ty),
-            Some(RirType::Int | RirType::Bool | RirType::String)
-        )
+        self.map_key_supported_inner(ty, &mut BTreeSet::new())
+    }
+
+    fn map_key_supported_inner(self, ty: RirTypeId, active: &mut BTreeSet<RirTypeId>) -> bool {
+        if !active.insert(ty) {
+            return false;
+        }
+        let supported = match self.ty_opt(ty) {
+            Some(RirType::Int | RirType::Bool | RirType::String) => true,
+            Some(RirType::Struct(id)) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt.native_path.is_none()
+                        && self.record_key_supported(&strukt.fields, active)
+                })
+            }
+            Some(RirType::Tuple(id)) => self
+                .program
+                .tuples
+                .get(id.index())
+                .is_some_and(|tuple| self.record_key_supported(&tuple.fields, active)),
+            Some(RirType::Enum(id)) => self
+                .program
+                .enums
+                .get(id.index())
+                .is_some_and(|enm| self.enum_key_supported(enm, active)),
+            Some(
+                RirType::Float
+                | RirType::List(_)
+                | RirType::Map { .. }
+                | RirType::Slice(_)
+                | RirType::Option(_)
+                | RirType::Array { .. }
+                | RirType::DataRef(_)
+                | RirType::Lambda(_)
+                | RirType::Void,
+            )
+            | None => false,
+        };
+        active.remove(&ty);
+        supported
+    }
+
+    fn record_key_supported(self, fields: &[RirField], active: &mut BTreeSet<RirTypeId>) -> bool {
+        fields
+            .iter()
+            .all(|field| self.map_key_supported_inner(field.ty, active))
+    }
+
+    fn enum_key_supported(self, enm: &RirEnum, active: &mut BTreeSet<RirTypeId>) -> bool {
+        enm.variants
+            .iter()
+            .all(|variant| self.record_key_supported(&variant.fields, active))
+    }
+
+    pub fn record_derives(self, fields: &[RirField]) -> Vec<&'static str> {
+        let mut derives = vec!["Clone"];
+        if self.record_key_supported(fields, &mut BTreeSet::new()) {
+            derives.extend(["PartialEq", "Eq", "Hash"]);
+        }
+        derives
+    }
+
+    pub fn enum_derives(self, enm: &RirEnum) -> Vec<&'static str> {
+        let mut derives = vec!["Clone"];
+        if enm.repr == super::rir::RirEnumRepr::RawInt && !enm.variants.is_empty() {
+            derives.push("Copy");
+        }
+        let key_supported = self.enum_key_supported(enm, &mut BTreeSet::new());
+        if enm.is_unit_only() || key_supported {
+            derives.extend(["PartialEq", "Eq"]);
+        }
+        if key_supported {
+            derives.push("Hash");
+        }
+        derives
     }
 
     fn composite_materialization(
@@ -1626,10 +1731,11 @@ mod tests {
         RustValueRep,
     };
     use crate::rust::rir::{
-        RirDataRef, RirDataRefId, RirField, RirFieldId, RirLambda, RirLambdaEscape, RirLambdaId,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi,
-        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
-        RirType, RirTypeId,
+        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirField, RirFieldId, RirLambda,
+        RirLambdaEscape, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaSource,
+        RirLambdaStorage, RirParamAbi, RirParamSemantic, RirProgram, RirStruct, RirStructId,
+        RirSymbol, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind,
     };
 
     #[test]
@@ -1677,7 +1783,40 @@ mod tests {
     fn air_policy_splits_map_key_and_value_support() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
+        let string = program.alloc_type(TypeData::String);
         let float = program.alloc_type(TypeData::Float);
+        let tuple = program.alloc_type(TypeData::Tuple(vec![int, string]));
+        let optional = program.alloc_type(TypeData::Optional(int));
+        let module = program.alloc_module(air::Module::default());
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Key"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("pos"),
+                ty: tuple,
+            }],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let aggregate = program.alloc_type(TypeData::Aggregate(aggregate));
+        let enm = program.alloc_enum(air::EnumDecl {
+            name: Ident::new("KeyEnum"),
+            module,
+            type_args: vec![],
+            const_args: vec![],
+            core: None,
+            repr: air::EnumRepr::Adt,
+            raw_type: None,
+            variants: vec![air::VariantDecl {
+                name: Ident::new("Payload"),
+                shape: air::VariantShape::Tuple(vec![aggregate]),
+                raw_value: None,
+            }],
+        });
+        let enm = program.alloc_type(TypeData::Enum(enm));
         let float_key = program.alloc_type(TypeData::Map {
             key: float,
             value: int,
@@ -1688,11 +1827,35 @@ mod tests {
             value: float,
             order: air::MapOrder::Insertion,
         });
+        let tuple_key = program.alloc_type(TypeData::Map {
+            key: tuple,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
+        let aggregate_key = program.alloc_type(TypeData::Map {
+            key: aggregate,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
+        let enum_key = program.alloc_type(TypeData::Map {
+            key: enm,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
+        let optional_key = program.alloc_type(TypeData::Map {
+            key: optional,
+            value: int,
+            order: air::MapOrder::Insertion,
+        });
         let classes = TypePassClasses::analyze(&program);
         let policy = AirRustRepPolicy::new(&program, &classes);
 
         assert!(!policy.map_supported(float_key));
+        assert!(!policy.map_supported(optional_key));
         assert!(policy.map_supported(float_value));
+        assert!(policy.map_supported(tuple_key));
+        assert!(policy.map_supported(aggregate_key));
+        assert!(policy.map_supported(enum_key));
     }
 
     #[test]
@@ -1773,6 +1936,95 @@ mod tests {
 
         assert!(!policy.copyable(label));
         assert!(policy.shareable_value(label));
+    }
+
+    #[test]
+    fn rir_policy_supports_keyable_aggregates_and_owns_derives() {
+        fn ty(index: usize) -> RirTypeId {
+            RirTypeId::from_index(index)
+        }
+
+        fn field(id: usize, symbol: &str, ty: RirTypeId) -> RirField {
+            RirField {
+                id: RirFieldId::from_index(id),
+                symbol: RirSymbol::new(symbol),
+                ty,
+            }
+        }
+
+        fn strukt(id: usize, symbol: &str, fields: Vec<RirField>) -> RirStruct {
+            RirStruct {
+                id: RirStructId::from_index(id),
+                air_id: None,
+                symbol: RirSymbol::new(symbol),
+                display: RirSymbol::new(symbol),
+                native_path: None,
+                native_key: None,
+                copyable: false,
+                fields,
+            }
+        }
+
+        let key_fields = vec![field(0, "x", ty(0)), field(1, "name", ty(1))];
+        let float_fields = vec![field(0, "x", ty(2))];
+        let program = RirProgram {
+            types: vec![
+                RirType::Int,
+                RirType::String,
+                RirType::Float,
+                RirType::Struct(RirStructId::from_index(0)),
+                RirType::Struct(RirStructId::from_index(1)),
+                RirType::Tuple(RirTupleId::from_index(0)),
+                RirType::Enum(RirEnumId::from_index(0)),
+                RirType::Option(ty(0)),
+            ],
+            structs: vec![
+                strukt(0, "Key", key_fields.clone()),
+                strukt(1, "FloatKey", float_fields.clone()),
+            ],
+            tuples: vec![RirTuple {
+                id: RirTupleId::from_index(0),
+                symbol: RirSymbol::new("Tuple"),
+                display: RirSymbol::new("Tuple"),
+                copyable: false,
+                fields: key_fields.clone(),
+            }],
+            enums: vec![RirEnum {
+                id: RirEnumId::from_index(0),
+                air_id: None,
+                core: None,
+                repr: RirEnumRepr::Adt,
+                raw_type: None,
+                symbol: RirSymbol::new("KeyEnum"),
+                display: RirSymbol::new("KeyEnum"),
+                copyable: false,
+                variants: vec![RirVariant {
+                    id: RirVariantId::from_index(0),
+                    symbol: RirSymbol::new("Payload"),
+                    display: RirSymbol::new("Payload"),
+                    kind: RirVariantKind::Tuple,
+                    raw_value: None,
+                    fields: key_fields.clone(),
+                }],
+            }],
+            ..RirProgram::default()
+        };
+        let policy = RustRepPolicy::new(&program);
+
+        assert!(policy.map_key_supported(ty(3)));
+        assert!(policy.map_key_supported(ty(5)));
+        assert!(policy.map_key_supported(ty(6)));
+        assert!(!policy.map_key_supported(ty(4)));
+        assert!(!policy.map_key_supported(ty(7)));
+        assert_eq!(
+            policy.record_derives(&key_fields),
+            vec!["Clone", "PartialEq", "Eq", "Hash"]
+        );
+        assert_eq!(policy.record_derives(&float_fields), vec!["Clone"]);
+        assert_eq!(
+            policy.enum_derives(&program.enums[0]),
+            vec!["Clone", "PartialEq", "Eq", "Hash"]
+        );
     }
 
     #[test]

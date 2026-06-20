@@ -2472,11 +2472,17 @@ impl TypeChecker {
         let Some(root_name) = root_name else {
             return;
         };
-        if let Some(root) = self
+        let allowed_depth = self
             .active_mut_alias_roots
             .iter()
-            .find(|root| root.allowed != root_name && root.identity.conflicts_with(identity))
-        {
+            .filter(|root| root.allowed == root_name && root.identity.conflicts_with(identity))
+            .map(|root| root.scope_depth)
+            .max();
+        if let Some(root) = self.active_mut_alias_roots.iter().find(|root| {
+            root.identity.conflicts_with(identity)
+                && root.allowed != root_name
+                && allowed_depth.is_none_or(|depth| depth <= root.scope_depth)
+        }) {
             self.push_compile_error(span, root.message);
         }
     }

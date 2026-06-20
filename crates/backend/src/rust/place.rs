@@ -22,6 +22,7 @@ pub(super) struct SliceIndexAccess {
 
 pub(super) struct MutPlaceProjection {
     pub root: String,
+    pub root_owned: bool,
     pub root_ty: RirTypeId,
     pub slot_ty: RirTypeId,
     pub fields: Vec<String>,
@@ -174,16 +175,22 @@ impl<'a> RustPlaces<'a> {
         let RirPlaceRoot::Local(root) = place.root else {
             unreachable!("expected a local RIR place")
         };
-        if place.projections.is_empty() || !self.local_is_mut_place_param(root) {
+        if place.projections.is_empty()
+            || !(self.local_is_mut_place_param(root) || self.payload_ref_cell_local(root))
+        {
             return None;
         }
         let local = &self.function.locals[root.index()];
-        self.projected_mut_place(
-            local.ty,
-            local.symbol.as_str(),
-            place.ty,
-            &place.projections,
-        )
+        let payload_ref_root = self.payload_ref_cell_local(root);
+        let root_expr = if payload_ref_root {
+            target::mut_place_scoped_cell(&format!("&{}", local.symbol.as_str()))
+        } else {
+            local.symbol.as_str().to_string()
+        };
+        let mut projection =
+            self.projected_mut_place(local.ty, &root_expr, place.ty, &place.projections)?;
+        projection.root_owned = payload_ref_root;
+        Some(projection)
     }
 
     pub(super) fn projected_place(
@@ -284,6 +291,7 @@ impl<'a> RustPlaces<'a> {
         }
         Some(MutPlaceProjection {
             root: root.to_string(),
+            root_owned: false,
             root_ty,
             slot_ty,
             fields,
@@ -465,10 +473,13 @@ fn block_has_mut_place_payload(block: &RirStructuredBlock, local: RirLocalId) ->
 }
 
 fn stmt_has_mut_place_payload(stmt: &RirStmt, local: RirLocalId) -> bool {
-    let RirStmt::OptionMatch(match_) = stmt else {
-        return false;
-    };
-    match_.payload == Some(local)
-        && match_.payload_ref
-        && matches!(match_.subject, RirOptionSubject::MutPlace(_))
+    match stmt {
+        RirStmt::OptionMatch(match_) => {
+            match_.payload == Some(local)
+                && match_.payload_ref
+                && matches!(match_.subject, RirOptionSubject::MutPlace(_))
+        }
+        RirStmt::MapEntryMatch(match_) => match_.payload == Some(local),
+        _ => false,
+    }
 }

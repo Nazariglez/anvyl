@@ -201,6 +201,13 @@ impl CompileCx<'_> {
                     self.check_block(function, &match_.some_block, calls);
                     self.check_block(function, &match_.none_block, calls);
                 }
+                AirStmt::MapEntryMatch(match_) => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.check_place(function, &match_.map);
+                    self.check_operand(function, &match_.key);
+                    self.check_block(function, &match_.some_block, calls);
+                    self.check_block(function, &match_.none_block, calls);
+                }
             }
         }
         if let AirTail::Return(Some(value)) = &block.tail {

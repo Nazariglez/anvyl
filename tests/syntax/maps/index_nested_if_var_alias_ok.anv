@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var groups: [string: [string: int]] = ["a": ["x": 1]];
+    if var inner? = groups["a"] {
+        if var n? = inner["x"] {
+            n += 2;
+        }
+    }
+}

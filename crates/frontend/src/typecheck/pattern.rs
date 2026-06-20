@@ -65,6 +65,7 @@ pub(super) struct PatternPlace {
     pub(super) facts: PlaceUseFacts,
     pub(super) identity: PlaceIdentity,
     pub(super) accepts_extern_any: bool,
+    pub(super) map_entry_alias: bool,
 }
 
 pub(super) enum PatternRootInput {
@@ -92,6 +93,7 @@ struct PatternInput {
     identity: PlaceIdentity,
     facts: PlaceUseFacts,
     accepts_extern_any: bool,
+    map_entry_alias: bool,
 }
 
 impl PatternInput {
@@ -103,6 +105,7 @@ impl PatternInput {
             identity: PlaceIdentity::unknown(),
             facts: PlaceUseFacts::default(),
             accepts_extern_any: false,
+            map_entry_alias: false,
         }
     }
 
@@ -114,6 +117,7 @@ impl PatternInput {
             identity: PlaceIdentity::unknown(),
             facts: PlaceUseFacts::default(),
             accepts_extern_any: false,
+            map_entry_alias: false,
         }
     }
 
@@ -125,6 +129,7 @@ impl PatternInput {
             identity: place.identity,
             facts: place.facts,
             accepts_extern_any: place.accepts_extern_any,
+            map_entry_alias: place.map_entry_alias,
         }
     }
 
@@ -140,14 +145,16 @@ impl PatternInput {
     }
 
     fn optional_some(&self, expected_ty: Type, tc: &mut TypeChecker) -> Self {
-        self.project(
+        let mut input = self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
             |identity| identity.variant(Ident::new("Some")).tuple(0),
             tc,
-        )
+        );
+        input.map_entry_alias = false;
+        input
     }
 
     fn enum_tuple_field(
@@ -220,6 +227,7 @@ impl PatternInput {
             identity: project_identity(self.identity.clone()),
             facts,
             accepts_extern_any,
+            map_entry_alias: false,
         }
     }
 }
@@ -477,6 +485,12 @@ impl<'tc> PatternChecker<'tc> {
     fn check_ident(&mut self, name: Ident, input: PatternInput, span: Span) -> PatternCheckResult {
         let kind = match self.mode {
             PatternBindMode::Alias => {
+                if input.map_entry_alias {
+                    self.tc.push_error(TypeError::CompileError {
+                        message: "map entry aliases require a `?` payload pattern".to_string(),
+                        span: self.tc.error_span(span),
+                    });
+                }
                 if let Some(error) = input
                     .access
                     .error_for(MutableUseKind::AliasPattern, self.tc.error_span(span))
@@ -512,7 +526,15 @@ impl<'tc> PatternChecker<'tc> {
         match &pattern.node {
             Pattern::Ident(name) => self.check_ident(*name, input, pattern.span),
             Pattern::Wildcard => {
-                PatternCheckResult::empty(PatternOutcome::irrefutable(PatternCover::CatchAll))
+                let mut outcome = PatternOutcome::irrefutable(PatternCover::CatchAll);
+                if input.map_entry_alias {
+                    self.tc.push_error(TypeError::CompileError {
+                        message: "map entry aliases require a `?` payload pattern".to_string(),
+                        span: self.tc.error_span(pattern.span),
+                    });
+                    outcome.had_error = true;
+                }
+                PatternCheckResult::empty(outcome)
             }
             Pattern::Tuple(elems) => self.check_tuple(elems, pattern.span, input),
             Pattern::Lit(lit) => {
@@ -735,6 +757,22 @@ impl<'tc> PatternChecker<'tc> {
     fn check_optional(&mut self, inner: &PatternNode, input: PatternInput) -> PatternCheckResult {
         if matches!(inner.node, Pattern::Optional(_)) {
             self.tc.push_error(TypeError::NestedOptionalPattern {
+                span: self.tc.error_span(inner.span),
+            });
+            let recovery = input.project(
+                Type::Infer,
+                input.access,
+                input.facts.clone(),
+                input.accepts_extern_any,
+                |identity| identity,
+                self.tc,
+            );
+            self.check(inner, recovery);
+            return PatternCheckResult::empty(PatternOutcome::error());
+        }
+        if input.map_entry_alias && self.context == PatternContext::Binding {
+            self.tc.push_error(TypeError::CompileError {
+                message: "map entry aliases require if/while/else/match var syntax".to_string(),
                 span: self.tc.error_span(inner.span),
             });
             let recovery = input.project(
@@ -1373,6 +1411,7 @@ pub(super) struct PatternScrutinee {
     facts: PlaceUseFacts,
     identity: PlaceIdentity,
     accepts_extern_any: bool,
+    map_entry_alias: bool,
 }
 
 impl PatternScrutinee {
@@ -1383,6 +1422,7 @@ impl PatternScrutinee {
             facts: PlaceUseFacts::default(),
             identity: PlaceIdentity::unknown(),
             accepts_extern_any: false,
+            map_entry_alias: false,
         }
     }
 
@@ -1393,6 +1433,7 @@ impl PatternScrutinee {
             access,
             facts,
             identity,
+            map_entry_alias,
             ..
         } = place.value;
         Self {
@@ -1401,6 +1442,7 @@ impl PatternScrutinee {
             facts,
             identity,
             accepts_extern_any,
+            map_entry_alias,
         }
     }
 
@@ -1416,6 +1458,7 @@ impl PatternScrutinee {
             facts: self.facts.clone(),
             identity: self.identity.clone(),
             accepts_extern_any: self.accepts_extern_any,
+            map_entry_alias: self.map_entry_alias,
         }
     }
 }

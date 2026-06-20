@@ -86,6 +86,7 @@ fn stmt_calls_fallible(
                     block_calls_fallible(program, fallible, function, block)
                 })
         }
+        RirStmt::MapEntryMatch(_) => true,
         _ => stmt_child_blocks_any(stmt, |block| {
             block_calls_fallible(program, fallible, function, block)
         }),
@@ -395,6 +396,10 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
                 .union(payload)
                 .union(stmt_child_blocks_context_use(program, function, stmt))
         }
+        RirStmt::MapEntryMatch(match_) => mut_place_context_use(program, function, &match_.map)
+            .union(ContextUse::rt())
+            .union(operand_context_use(program, function, &match_.key))
+            .union(stmt_child_blocks_context_use(program, function, stmt)),
         _ => stmt_child_blocks_context_use(program, function, stmt),
     }
 }

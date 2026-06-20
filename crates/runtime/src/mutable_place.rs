@@ -1,8 +1,8 @@
-use std::{cell::UnsafeCell, marker::PhantomData, rc::Rc};
+use std::{cell::UnsafeCell, hash::Hash, marker::PhantomData, rc::Rc};
 
 use crate::{
-    AnvList, AnvSlice, Ctx, ErasedHandle, GlobalSlot, Handle, LambdaCell, RuntimeError,
-    StackLambdaCell, heap_access_error, lambda_cell::CellBorrowFlag,
+    AnvList, AnvMap, AnvSlice, Ctx, ErasedHandle, GlobalSlot, Handle, LambdaCell, RuntimeError,
+    StackLambdaCell, ValueLoanGuard, heap_access_error, lambda_cell::CellBorrowFlag,
 };
 
 pub enum MutPlace<'place, 'cx, T> {
@@ -68,6 +68,22 @@ pub trait ProjectionOps<'cx, R, T> {
 
 #[derive(Default)]
 pub struct OptionalPayloadOps<T>(PhantomData<T>);
+
+pub struct MapValueOps<K> {
+    key: K,
+    expected_version: u64,
+    value_loan: u64,
+}
+
+impl<K> MapValueOps<K> {
+    pub fn new(key: K, loan: &ValueLoanGuard) -> Self {
+        Self {
+            key,
+            expected_version: loan.version(),
+            value_loan: loan.id(),
+        }
+    }
+}
 
 pub trait DataRefPlaceOps<'cx, T> {
     fn access(
@@ -195,6 +211,42 @@ impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
             return Err(RuntimeError::new("optional payload is nil"));
         };
         f(payload)
+    }
+}
+
+impl<'cx, K, V> ProjectionOps<'cx, AnvMap<'cx, K, V>, V> for MapValueOps<K>
+where
+    K: Eq + Hash + Clone + 'cx,
+    V: Clone + 'cx,
+{
+    fn access(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        root: &AnvMap<'cx, K, V>,
+        f: &mut dyn FnMut(&V) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        root.with_value_shared_by_key(
+            ctx,
+            &self.key,
+            self.expected_version,
+            self.value_loan,
+            |value| f(value),
+        )
+    }
+
+    fn mutate(
+        &self,
+        ctx: &mut Ctx<'cx, '_>,
+        root: &mut AnvMap<'cx, K, V>,
+        f: &mut dyn FnMut(&mut V) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        root.with_value_owned_mut_short_by_key(
+            ctx,
+            &self.key,
+            self.expected_version,
+            self.value_loan,
+            |value| f(value),
+        )
     }
 }
 
@@ -610,9 +662,9 @@ mod tests {
     use std::{cell::Cell, mem::ManuallyDrop};
 
     use crate::{
-        AnvList, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType, LambdaCell,
-        ListStorage, MutPlace, OptionalPayloadOps, ProjectionOps, RuntimeError, ScopedMutPlaceCell,
-        StackLambdaCell, heap_access_error,
+        AnvList, AnvMap, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType,
+        LambdaCell, ListStorage, MapStorage, MapValueOps, MutPlace, OptionalPayloadOps,
+        ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -699,6 +751,21 @@ mod tests {
     ) -> AnvList<'cx, i64> {
         let ty = list_storage_ty(ctx);
         AnvList::from_elems(ctx, ty, elems)
+    }
+
+    fn map_storage_ty<'cx, V: 'cx>(
+        ctx: &mut Ctx<'cx, '_>,
+    ) -> HeapType<'cx, MapStorage<'cx, &'static str, V>> {
+        ctx.heap()
+            .register_untracked::<MapStorage<'_, &'static str, V>>()
+    }
+
+    fn map<'cx, V: 'cx>(
+        ctx: &mut Ctx<'cx, '_>,
+        entries: impl IntoIterator<Item = (&'static str, V)>,
+    ) -> AnvMap<'cx, &'static str, V> {
+        let ty = map_storage_ty(ctx);
+        AnvMap::from_entries(ctx, ty, entries)
     }
 
     struct Pair {
@@ -844,6 +911,106 @@ mod tests {
         place.set(&mut ctx, 5).unwrap();
         drop(place);
         assert_eq!(list.elem_at_shared(&ctx, 1, list.structural_version()).unwrap(), 5);
+            );
+    }
+
+    #[test]
+    fn projected_map_value_updates_existing_entry() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", 1_i64)]);
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+
+            assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
+            place.update_copy(&mut ctx, |value| value + 1).unwrap();
+            let err = place
+                .mutate(&mut ctx, |value| {
+                    *value = 9;
+                    Err::<(), _>(RuntimeError::new("early"))
+                })
+                .unwrap_err();
+            assert_eq!(err.message(), "early");
+        }
+
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
+        assert_eq!(map.structural_version(), 0);
+            );
+    }
+
+    #[test]
+    fn projected_map_value_rejects_missing_and_inactive_loans() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", 1_i64)]);
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let missing_ops = MapValueOps::new("missing", &guard);
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut map), &missing_ops);
+
+            assert_eq!(place.get_copy(&mut ctx).unwrap_err().message(), "map entry key is missing");
+            assert_eq!(place.set(&mut ctx, 3).unwrap_err().message(), "map entry key is missing");
+        }
+        assert_eq!(map.get(&ctx, &"missing").unwrap(), None);
+
+        let ops = MapValueOps::new("a", &guard);
+        drop(guard);
+        let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+
+        assert!(place.get_copy(&mut ctx).is_err());
+        assert!(place.set(&mut ctx, 4).is_err());
+            );
+    }
+
+    #[test]
+    fn projected_map_value_detaches_shared_outer_map() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", 1_i64)]);
+        let shared = map.share();
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+            place.set(&mut ctx, 2).unwrap();
+        }
+
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
+        assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            );
+    }
+
+    #[test]
+    fn projected_map_optional_value_writes_back_present_nil() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", Some(1_i64))]);
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+            place.set(&mut ctx, None).unwrap();
+        }
+        drop(guard);
+
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(None));
+        assert_eq!(map.remove(&mut ctx, &"a").unwrap(), Some(None));
+            );
+    }
+
+    #[test]
+    fn scoped_cell_wraps_projected_map_value() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", 1_i64)]);
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        {
+            let place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+            let cell = ScopedMutPlaceCell::new(place);
+
+            assert_eq!(cell.get_copy(&mut ctx).unwrap(), 1);
+            cell.set(&mut ctx, 5).unwrap();
+        }
+
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(5));
             );
     }
 

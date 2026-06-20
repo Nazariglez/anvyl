@@ -917,6 +917,7 @@ fn alias_for_root<'a>(
         facts: source.value.facts.clone(),
         identity: source.value.identity.clone().index(),
         accepts_extern_any: source.accepts_extern_any(),
+        map_entry_alias: false,
     };
     PatternRoot {
         pattern: &binding.pattern,

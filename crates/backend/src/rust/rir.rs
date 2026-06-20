@@ -542,6 +542,7 @@ pub enum RirStmt {
     CollectionSlotScope(RirStructuredBlock),
     EnumMatch(RirEnumMatch),
     OptionMatch(RirOptionMatch),
+    MapEntryMatch(RirMapEntryMatch),
 }
 
 pub(super) fn stmt_child_blocks_any(
@@ -557,6 +558,9 @@ pub(super) fn stmt_child_blocks_any(
         RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
         RirStmt::CollectionSlotScope(block) => block_matches(block),
         RirStmt::OptionMatch(match_) => {
+            block_matches(&match_.some_block) || block_matches(&match_.none_block)
+        }
+        RirStmt::MapEntryMatch(match_) => {
             block_matches(&match_.some_block) || block_matches(&match_.none_block)
         }
         RirStmt::EnumMatch(match_) => {
@@ -659,6 +663,16 @@ pub struct RirOptionMatch {
     pub subject: RirOptionSubject,
     pub payload: Option<RirLocalId>,
     pub payload_ref: bool,
+    pub payload_escapes: bool,
+    pub some_block: RirStructuredBlock,
+    pub none_block: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirMapEntryMatch {
+    pub map: RirMutPlaceArg,
+    pub key: RirOperand,
+    pub payload: Option<RirLocalId>,
     pub payload_escapes: bool,
     pub some_block: RirStructuredBlock,
     pub none_block: RirStructuredBlock,
@@ -3540,6 +3554,107 @@ impl VerifyCx<'_> {
                 }
                 self.merge_structured_states(states);
             }
+            RirStmt::MapEntryMatch(match_) => {
+                let map_ty = self.check_mut_place_arg(site, function_id, function, &match_.map);
+                let (key_ty, value_ty) = match self.ty(map_ty) {
+                    Some(RirType::Map { key, value }) => (Some(key), Some(value)),
+                    _ => {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        (None, None)
+                    }
+                };
+                if let Some(key_ty) = key_ty {
+                    self.check_value_operand_ty(site, function, &match_.key, key_ty);
+                } else {
+                    self.check_value_operand_ty(site, function, &match_.key, map_ty);
+                }
+                let entry_definite = self.initialized.clone();
+                let entry_possible = self.possibly_initialized.clone();
+                let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_globals = self.global_initialized.clone();
+                let mut some_definite = entry_definite.clone();
+                let mut some_possible = entry_possible.clone();
+                let mut some_lambda_escapes = entry_lambda_escapes.clone();
+                if match_.payload_escapes && match_.payload.is_none() {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
+                }
+                if let Some(payload) = match_.payload {
+                    if let Some(local) = function.locals.get(payload.index()) {
+                        if function.params.iter().any(|param| param.local == payload)
+                            || entry_possible
+                                .get(payload.index())
+                                .copied()
+                                .unwrap_or(false)
+                        {
+                            self.push(site, RirVerifyErrorKind::InitParamLocal);
+                        }
+                        if !local.mutable || !local.payload_ref {
+                            self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
+                        }
+                        if let Some(slot) = self.payload_ref_owned.get_mut(payload.index()) {
+                            *slot = true;
+                        }
+                        if let Some(value_ty) = value_ty
+                            && local.ty != value_ty
+                        {
+                            self.push(
+                                site,
+                                RirVerifyErrorKind::TypeMismatch {
+                                    expected: value_ty,
+                                    found: local.ty,
+                                },
+                            );
+                        }
+                        if let Some(slot) = some_definite.get_mut(payload.index()) {
+                            *slot = true;
+                        }
+                        if let Some(slot) = some_possible.get_mut(payload.index()) {
+                            *slot = true;
+                        }
+                        if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
+                            *slot = None;
+                        }
+                    } else {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                    }
+                }
+                let escaping_payload = match_.payload_escapes.then_some(match_.payload).flatten();
+                let mut some_state = self.check_structured_block(
+                    function_id,
+                    function,
+                    &match_.some_block,
+                    some_definite,
+                    some_possible,
+                    some_lambda_escapes,
+                    entry_globals.clone(),
+                    escaping_payload,
+                );
+                if !match_.payload_escapes
+                    && let (Some(payload), Some((definite, possible, _, _, _, _))) =
+                        (match_.payload, &mut some_state)
+                {
+                    if let Some(slot) = definite.get_mut(payload.index()) {
+                        *slot = false;
+                    }
+                    if let Some(slot) = possible.get_mut(payload.index()) {
+                        *slot = false;
+                    }
+                }
+                let none_state = self.check_structured_block(
+                    function_id,
+                    function,
+                    &match_.none_block,
+                    entry_definite,
+                    entry_possible,
+                    entry_lambda_escapes,
+                    entry_globals,
+                    None,
+                );
+                if match_.payload_escapes && none_state.is_some() {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadEscapeNoneMustDiverge);
+                }
+                self.merge_structured_states([some_state, none_state]);
+            }
             RirStmt::OptionMatch(match_) => {
                 let subject_ty = match &match_.subject {
                     RirOptionSubject::Place(place) => {
@@ -4031,7 +4146,15 @@ impl VerifyCx<'_> {
             let cell_possible = self.possibly_initialized_cells.clone();
             let globals = self.global_initialized.clone();
             for local in &function.locals {
-                if local.payload_ref && Some(local.id) != preserved_payload_ref {
+                let payload_ref_owned = self
+                    .payload_ref_owned
+                    .get(local.id.index())
+                    .copied()
+                    .unwrap_or(false);
+                if local.payload_ref
+                    && Some(local.id) != preserved_payload_ref
+                    && !payload_ref_owned
+                {
                     if let Some(slot) = definite.get_mut(local.id.index()) {
                         *slot = false;
                     }
@@ -4087,6 +4210,10 @@ impl VerifyCx<'_> {
                 }
             }
             RirStmt::OptionMatch(match_) => {
+                self.structured_block_falls_through(&match_.some_block)
+                    || self.structured_block_falls_through(&match_.none_block)
+            }
+            RirStmt::MapEntryMatch(match_) => {
                 self.structured_block_falls_through(&match_.some_block)
                     || self.structured_block_falls_through(&match_.none_block)
             }

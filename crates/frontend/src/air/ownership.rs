@@ -402,6 +402,12 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_air_block(&match_.some_block);
                 self.observe_air_block(&match_.none_block);
             }
+            AirStmt::MapEntryMatch(match_) => {
+                self.observe_place(&match_.map, ParamUse::ReborrowMut);
+                self.observe_operand(&match_.key, ValueContext::Read);
+                self.observe_air_block(&match_.some_block);
+                self.observe_air_block(&match_.none_block);
+            }
         }
     }
 
@@ -1024,6 +1030,25 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
                 block.stmts.push(AirStmt::OptionalMatch(match_));
+            }
+            AirStmt::MapEntryMatch(mut match_) => {
+                rewrite_air_block_call_args(
+                    &mut match_.some_block,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                rewrite_air_block_call_args(
+                    &mut match_.none_block,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::MapEntryMatch(match_));
             }
         }
     }

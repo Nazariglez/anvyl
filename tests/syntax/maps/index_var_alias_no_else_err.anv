@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: map entry aliases require if/while/else/match var syntax
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    var value? = counts["a"];
+    value = 2;
+}

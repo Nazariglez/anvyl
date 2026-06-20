@@ -15,12 +15,20 @@ pub struct CollectionLoanState {
 #[derive(Default)]
 struct CollectionLoanStateInner {
     active_shape_loans: Cell<u32>,
+    active_value_loan: Cell<Option<u64>>,
+    next_value_loan: Cell<u64>,
     structural_version: Cell<u64>,
 }
 
 pub struct ShapeLoanGuard {
     state: CollectionLoanState,
     expected_version: u64,
+}
+
+pub struct ValueLoanGuard {
+    state: CollectionLoanState,
+    shape: ShapeLoanGuard,
+    id: u64,
 }
 
 impl Clone for ShapeLoanGuard {
@@ -55,6 +63,24 @@ impl CollectionLoanState {
         })
     }
 
+    pub fn begin_value_loan(&self) -> Result<ValueLoanGuard, RuntimeError> {
+        if self.inner.active_value_loan.get().is_some() {
+            return Err(RuntimeError::new(ACTIVE_COLLECTION_LOAN_ERROR));
+        }
+        let id = self.inner.next_value_loan.get();
+        let next_id = id
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::new(ERR_LOAN_OVERFLOW))?;
+        let shape = self.begin_shape_loan()?;
+        self.inner.next_value_loan.set(next_id);
+        self.inner.active_value_loan.set(Some(id));
+        Ok(ValueLoanGuard {
+            state: self.clone(),
+            shape,
+            id,
+        })
+    }
+
     pub fn active_shape_loans(&self) -> u32 {
         self.inner.active_shape_loans.get()
     }
@@ -73,6 +99,22 @@ impl CollectionLoanState {
 
     pub fn before_structural_mutation(&self) -> Result<(), RuntimeError> {
         if self.active_shape_loans() == 0 {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(ACTIVE_COLLECTION_LOAN_ERROR))
+        }
+    }
+
+    pub fn before_unloaned_value_mutation(&self) -> Result<(), RuntimeError> {
+        if self.inner.active_value_loan.get().is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(ACTIVE_COLLECTION_LOAN_ERROR))
+        }
+    }
+
+    pub fn check_value_loan(&self, loan_id: u64) -> Result<(), RuntimeError> {
+        if self.inner.active_value_loan.get() == Some(loan_id) {
             Ok(())
         } else {
             Err(RuntimeError::new(ACTIVE_COLLECTION_LOAN_ERROR))
@@ -105,6 +147,30 @@ impl ShapeLoanGuard {
 
     pub fn check_stable(&self) -> Result<(), RuntimeError> {
         self.state.check_stable(self.expected_version)
+    }
+}
+
+impl ValueLoanGuard {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn version(&self) -> u64 {
+        self.shape.version()
+    }
+
+    pub fn check_stable(&self) -> Result<(), RuntimeError> {
+        self.shape.check_stable()
+    }
+}
+
+impl Drop for ValueLoanGuard {
+    fn drop(&mut self) {
+        let active = self.state.inner.active_value_loan.get();
+        debug_assert_eq!(active, Some(self.id));
+        if active == Some(self.id) {
+            self.state.inner.active_value_loan.set(None);
+        }
     }
 }
 
@@ -162,6 +228,23 @@ mod tests {
         assert!(state.before_structural_mutation().is_err());
         drop(clone);
         assert_eq!(state.active_shape_loans(), 0);
+    }
+
+    #[test]
+    fn value_loan_blocks_other_value_mutations() {
+        let state = CollectionLoanState::default();
+        let guard = state.begin_value_loan().unwrap();
+        let id = guard.id();
+
+        assert_eq!(state.active_shape_loans(), 1);
+        assert!(state.before_unloaned_value_mutation().is_err());
+        assert!(state.begin_value_loan().is_err());
+        assert!(state.check_value_loan(id).is_ok());
+        drop(guard);
+
+        assert_eq!(state.active_shape_loans(), 0);
+        assert!(state.before_unloaned_value_mutation().is_ok());
+        assert!(state.check_value_loan(id).is_err());
     }
 
     #[test]

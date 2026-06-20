@@ -426,6 +426,18 @@ impl ProfileCx<'_> {
                     self.check_air_block(function, &match_.some_block);
                     self.check_air_block(function, &match_.none_block);
                 }
+                air::AirStmt::MapEntryMatch(match_) => {
+                    self.check_operand(site, &match_.key);
+                    match self
+                        .access()
+                        .plan(function, PlaceAccessIntent::MutPlaceArg, &match_.map)
+                    {
+                        Ok(_) => self.check_type_ref(site, match_.map.ty),
+                        Err(gap) => self.push(site, profile_gap_kind(gap)),
+                    }
+                    self.check_air_block(function, &match_.some_block);
+                    self.check_air_block(function, &match_.none_block);
+                }
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
                 air::AirStmt::CollectionLoan(loan) => {
                     if let Err(gap) = self.access().collection_loan_plan(function, loan) {

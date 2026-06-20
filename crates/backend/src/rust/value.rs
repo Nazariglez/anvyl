@@ -389,7 +389,7 @@ impl<'a> RustValues<'a> {
         let projection = self.places.mut_place_projection(place)?;
         Some(self.projected_set_region(
             &projection,
-            &target::mut_place_reborrow(&projection.root),
+            &Self::projection_root_place(&projection),
             value,
         ))
     }
@@ -422,10 +422,18 @@ impl<'a> RustValues<'a> {
             .expect("checked mut-place projection");
         self.mut_place_projected_region(
             &projection,
-            &target::mut_place_reborrow(&projection.root),
+            &Self::projection_root_place(&projection),
             "",
             &self.place_value_from_access(place.ty, "__anv_place"),
         )
+    }
+
+    fn projection_root_place(projection: &MutPlaceProjection) -> String {
+        if projection.root_owned {
+            projection.root.clone()
+        } else {
+            target::mut_place_reborrow(&projection.root)
+        }
     }
 
     fn projected_set_region(
@@ -460,11 +468,11 @@ impl<'a> RustValues<'a> {
     ) -> String {
         let descriptor = self.mut_place_projection_descriptor("__AnvProjectedPlaceOps", projection);
         format!(
-            "{{ {} {} let __anv_ops = {}; {before_place} let mut __anv_place = {}; {body} }}",
+            "{{ {} {} let __anv_ops = {}; {before_place} let __anv_root = {root_place}; let mut __anv_place = {}; {body} }}",
             descriptor.struct_decl,
             descriptor.impl_decl,
             descriptor.ctor,
-            target::mut_place_projected(root_place, "&__anv_ops"),
+            target::mut_place_projected("__anv_root", "&__anv_ops"),
         )
     }
 

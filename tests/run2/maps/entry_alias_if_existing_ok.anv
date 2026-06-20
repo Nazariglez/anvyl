@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    if var value? = counts["a"] {
+        value = 2;
+    }
+    println(counts["a"] ?? 0);
+}

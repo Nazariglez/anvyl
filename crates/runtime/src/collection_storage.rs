@@ -67,8 +67,20 @@ impl<K: Eq + Hash, V> MapStorage<'_, K, V> {
         self.entries.get(key)
     }
 
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.entries.get_index_of(key).is_some()
+    }
+
     pub(crate) fn get_index(&self, index: usize) -> Option<(&K, &V)> {
         self.entries.get_index(index)
+    }
+
+    pub(crate) fn get_index_of(&self, key: &K) -> Option<usize> {
+        self.entries.get_index_of(key)
     }
 
     pub(crate) fn get_index_mut(&mut self, index: usize) -> Option<(&K, &mut V)> {

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: map entry aliases require a `?` payload pattern
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    match var counts["a"] {
+        _ => {},
+    }
+}

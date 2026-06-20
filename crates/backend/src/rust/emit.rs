@@ -9,11 +9,11 @@ use super::{
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
         RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
-        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMutPlaceAccess, RirMutPlaceArg,
-        RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi,
-        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject,
+        RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -435,20 +435,24 @@ impl EmitCx<'_> {
             self.w.blank();
             return;
         }
+        let policy = RustRepPolicy::new(self.program);
         self.emit_record_struct(
             strukt.symbol.as_str(),
             &strukt.fields,
             self.trace_plan.needs_struct_trace(strukt.id),
-            RustRepPolicy::new(self.program).struct_cx_dependent(strukt),
+            policy.struct_cx_dependent(strukt),
+            &policy.record_derives(&strukt.fields),
         );
     }
 
     fn emit_tuple(&mut self, tuple: &super::rir::RirTuple) {
+        let policy = RustRepPolicy::new(self.program);
         self.emit_record_struct(
             tuple.symbol.as_str(),
             &tuple.fields,
             self.trace_plan.needs_tuple_trace(tuple.id),
-            RustRepPolicy::new(self.program).tuple_cx_dependent(tuple),
+            policy.tuple_cx_dependent(tuple),
+            &policy.record_derives(&tuple.fields),
         );
     }
 
@@ -458,12 +462,16 @@ impl EmitCx<'_> {
         fields: &[super::rir::RirField],
         trace: bool,
         cx_dependent: bool,
+        derives: &[&str],
     ) {
         if trace {
-            self.w.line(target::trace_derive(&["Clone"]));
+            self.w.line(target::trace_derive(derives));
             self.w.line(target::trace_crate_attr(cx_dependent));
         } else {
-            self.w.line("#[derive(Clone)]");
+            self.w.line(format_args!(
+                "#[derive({})]",
+                comma(derives.iter().map(|derive| (*derive).to_string()))
+            ));
         }
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
         let fields = fields
@@ -480,16 +488,11 @@ impl EmitCx<'_> {
     }
 
     fn emit_enum(&mut self, enm: &RirEnum) {
-        let cx_dependent = RustRepPolicy::new(self.program).enum_cx_dependent(enm);
+        let policy = RustRepPolicy::new(self.program);
+        let cx_dependent = policy.enum_cx_dependent(enm);
         let needs_trace = self.trace_plan.needs_enum_trace(enm.id);
         let copy = enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty();
-        let mut derives = vec!["Clone"];
-        if copy {
-            derives.push("Copy");
-        }
-        if enm.is_unit_only() {
-            derives.extend(["PartialEq", "Eq"]);
-        }
+        let derives = policy.enum_derives(enm);
         if needs_trace {
             self.w.line(target::trace_derive(&derives));
             self.w.line(target::trace_crate_attr(cx_dependent));
@@ -970,6 +973,7 @@ impl EmitCx<'_> {
                         | RirStmt::CollectionSlotScope(_)
                         | RirStmt::EnumMatch(_)
                         | RirStmt::OptionMatch(_)
+                        | RirStmt::MapEntryMatch(_)
                 )
             });
             if predeclare {
@@ -1211,6 +1215,9 @@ impl EmitCx<'_> {
             RirStmt::OptionMatch(match_) => {
                 self.emit_option_match(function, index, match_, predeclared);
             }
+            RirStmt::MapEntryMatch(match_) => {
+                self.emit_map_entry_match(function, index, match_, predeclared);
+            }
         }
     }
 
@@ -1336,6 +1343,108 @@ impl EmitCx<'_> {
         self.w.line("}");
     }
 
+    fn emit_map_entry_match(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        match_: &RirMapEntryMatch,
+        predeclared: bool,
+    ) {
+        let key_tmp = format!("__anv_map_entry_key_{index}");
+        let guard_tmp = format!("__anv_map_entry_guard_{index}");
+        let (mut prelude, map) =
+            self.prepared_escaping_payload_place_arg(function, index, &match_.map);
+        for line in prelude.drain(..) {
+            self.w.line(format_args!("{line}"));
+        }
+        let values = RustValues::new(self.program, function);
+        let key = values.value_operand(&match_.key);
+        self.w.line(format_args!("let {key_tmp} = {key};"));
+        let is_some = target::mut_place_access_ctx(
+            &map,
+            target::runtime_param_name(),
+            &target::map_contains_key_region(&key_tmp),
+        );
+        if match_.payload_escapes {
+            self.w.line(format_args!("if !({is_some}) {{"));
+            self.indented(|this| {
+                this.emit_structured_block(function, &match_.none_block, predeclared);
+            });
+            self.w.line("}");
+            self.emit_map_entry_alias(
+                function,
+                index,
+                match_,
+                match_.map.ty,
+                &map,
+                &key_tmp,
+                &guard_tmp,
+            );
+            self.emit_structured_block(function, &match_.some_block, predeclared);
+            return;
+        }
+        self.w.line(format_args!("if {is_some} {{"));
+        self.indented(|this| {
+            this.emit_map_entry_alias(
+                function,
+                index,
+                match_,
+                match_.map.ty,
+                &map,
+                &key_tmp,
+                &guard_tmp,
+            );
+            this.emit_structured_block(function, &match_.some_block, predeclared);
+        });
+        self.w.line("} else {");
+        self.indented(|this| {
+            this.emit_structured_block(function, &match_.none_block, predeclared);
+        });
+        self.w.line("}");
+    }
+
+    fn emit_map_entry_alias(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        match_: &RirMapEntryMatch,
+        map_ty: RirTypeId,
+        map: &str,
+        key: &str,
+        guard: &str,
+    ) {
+        let Some(payload) = match_.payload else {
+            return;
+        };
+        let payload = &function.locals[payload.index()];
+        let RirType::Map { key: key_ty, .. } = self.program.types[map_ty.index()] else {
+            unreachable!("verified map-entry match")
+        };
+        let key_ty = self.ty(key_ty);
+        let ops = format!("__anv_map_entry_ops_{index}");
+        self.w.line(format_args!(
+            "let {guard} = {};",
+            target::mut_place_mutate_ctx(
+                map,
+                target::runtime_param_name(),
+                &target::map_begin_value_loan_region(key),
+            )
+        ));
+        self.w.line(format_args!(
+            "let {ops}: {} = {};",
+            target::map_value_ops_ty(&key_ty),
+            target::map_value_ops_ctor(&format!("{key}.clone()"), guard)
+        ));
+        self.w.line(format_args!(
+            "let {} = {};",
+            payload.symbol.as_str(),
+            target::scoped_mut_place_cell_new(&target::mut_place_projected(
+                map,
+                &format!("&{ops}")
+            ))
+        ));
+    }
+
     fn emit_option_match(
         &mut self,
         function: &RirFunction,
@@ -1350,7 +1459,18 @@ impl EmitCx<'_> {
         let RirType::Option(inner) = self.program.types[subject.ty.index()] else {
             unreachable!("verified option match")
         };
-        let subject = RustPlaces::new(self.program, function).local_place(subject);
+        let places = RustPlaces::new(self.program, function);
+        let subject = if let RirPlaceRoot::Local(local) = subject.root
+            && places.payload_ref_cell_local(local)
+        {
+            let tmp = format!("__anv_option_subject_{index}");
+            let value = RustValues::new(self.program, function)
+                .value_operand(&RirOperand::Place(subject.clone()));
+            self.w.line(format_args!("let {tmp} = {value};"));
+            tmp
+        } else {
+            places.local_place(subject)
+        };
         let borrow = if match_.payload_ref { "&mut " } else { "&" };
         if match_.payload_escapes {
             let payload = match_.payload.expect("escaping option payload local");
@@ -2078,8 +2198,15 @@ impl EmitCx<'_> {
         root: &RirPlace,
     ) -> Option<(Vec<String>, String)> {
         let places = RustPlaces::new(self.program, function);
-        if matches!(root.root, RirPlaceRoot::Local(_)) && places.mut_place_root_param(root) {
-            return Some((vec![], places.local_place(root)));
+        if let RirPlaceRoot::Local(local) = root.root
+            && places.mut_place_root_param(root)
+        {
+            let place = if places.payload_ref_cell_local(local) {
+                target::mut_place_scoped_cell(&format!("&{}", places.local_place(root)))
+            } else {
+                places.local_place(root)
+            };
+            return Some((vec![], place));
         }
         if let Some(place) = self.local_projected_mut_place(function, root) {
             return Some(place);
@@ -2408,14 +2535,22 @@ impl EmitCx<'_> {
         if let RirCallArg::ScopedLambda { callee, sig } = arg {
             return self.prepared_scoped_lambda_call_arg(function, index, callee, *sig);
         }
-        if let RirCallArg::Value(operand @ RirOperand::Place(place)) = arg
-            && (matches!(place.root, RirPlaceRoot::Global(_)) || !place.projections.is_empty())
-        {
-            let tmp = format!("__anv_arg_{index}");
-            return (
-                vec![format!("let {tmp} = {};", values.value_operand(operand))],
-                tmp,
-            );
+        if let RirCallArg::Value(operand @ RirOperand::Place(place)) = arg {
+            let places = RustPlaces::new(self.program, function);
+            let payload_ref_root = match place.root {
+                RirPlaceRoot::Local(local) => places.payload_ref_cell_local(local),
+                RirPlaceRoot::Global(_) => false,
+            };
+            if matches!(place.root, RirPlaceRoot::Global(_))
+                || !place.projections.is_empty()
+                || payload_ref_root
+            {
+                let tmp = format!("__anv_arg_{index}");
+                return (
+                    vec![format!("let {tmp} = {};", values.value_operand(operand))],
+                    tmp,
+                );
+            }
         }
         if let RirCallArg::SharedBorrow(place) = arg
             && let RirPlaceRoot::Global(global) = place.root
@@ -2504,6 +2639,37 @@ impl EmitCx<'_> {
         index: usize,
         mut_place: &RirMutPlaceArg,
     ) -> (Vec<String>, String) {
+        if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, ty }) =
+            mut_place.access
+        {
+            let init = format!("__anv_global_place_init_{index}");
+            let root = format!("__anv_global_place_root_{index}");
+            let prelude = vec![
+                format!(
+                    "let {init}: &dyn for<'__anv_rt> Fn(&mut {}) -> Result<{}, {}> = &|rt| {};",
+                    target::runtime_ctx_ty_with("'__anv_rt"),
+                    self.ty(ty),
+                    target::runtime_error_ty(),
+                    RustValues::global_init_call(self.program, global)
+                ),
+                format!(
+                    "let mut {root} = {};",
+                    target::mut_place_global_with_init(
+                        &RustValues::global_slot_expr(self.program, global),
+                        &init,
+                    )
+                ),
+            ];
+            if mut_place.projections.is_empty() {
+                return (prelude, root);
+            }
+            let (projected_prelude, place) =
+                self.prepared_projected_call_arg(function, index, mut_place, ty, &root);
+            return (
+                prelude.into_iter().chain(projected_prelude).collect(),
+                place,
+            );
+        }
         let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) = mut_place.access
         else {
             return self.prepared_mut_place_arg(function, index, mut_place);
@@ -3146,6 +3312,11 @@ fn stmt_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> bool {
                     .is_some_and(|block| block_uses_scoped_lambda_sig(block, sig))
         }
         RirStmt::OptionMatch(RirOptionMatch {
+            some_block,
+            none_block,
+            ..
+        })
+        | RirStmt::MapEntryMatch(RirMapEntryMatch {
             some_block,
             none_block,
             ..

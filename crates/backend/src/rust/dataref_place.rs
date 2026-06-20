@@ -1,7 +1,7 @@
 use super::rir::{
     RirCallArg, RirDataRefId, RirFieldId, RirFunction, RirMapWriteKind, RirMutPlaceAccess,
-    RirOptionMatch, RirOptionSubject, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram,
-    RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
+    RirMutPlaceArg, RirOptionMatch, RirOptionSubject, RirPlace, RirPlaceModel, RirPlaceRoot,
+    RirProgram, RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -87,6 +87,11 @@ impl DataRefPlaceDescriptors {
                 }
             }
             RirStmt::OptionMatch(match_) => self.collect_option_match(program, function, match_),
+            RirStmt::MapEntryMatch(match_) => {
+                self.collect_mut_place_arg(program, &match_.map);
+                self.collect_block(program, function, &match_.some_block);
+                self.collect_block(program, function, &match_.none_block);
+            }
         }
     }
 
@@ -96,10 +101,8 @@ impl DataRefPlaceDescriptors {
         function: &RirFunction,
         match_: &RirOptionMatch,
     ) {
-        if let RirOptionSubject::MutPlace(arg) = &match_.subject
-            && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
-        {
-            self.intern(program, dataref, &arg.projections, arg.ty);
+        if let RirOptionSubject::MutPlace(arg) = &match_.subject {
+            self.collect_mut_place_arg(program, arg);
         }
         self.collect_block(program, function, &match_.some_block);
         self.collect_block(program, function, &match_.none_block);
@@ -109,10 +112,8 @@ impl DataRefPlaceDescriptors {
         match value {
             RirRValue::Call { args, .. } => {
                 for arg in args {
-                    if let RirCallArg::MutPlace(arg) = arg
-                        && let RirMutPlaceAccess::DataRef { dataref, .. } = arg.access
-                    {
-                        self.intern(program, dataref, &arg.projections, arg.ty);
+                    if let RirCallArg::MutPlace(arg) = arg {
+                        self.collect_mut_place_arg(program, arg);
                     }
                 }
             }
@@ -122,6 +123,12 @@ impl DataRefPlaceDescriptors {
                 ..
             } => self.intern_dataref_place(program, function, map),
             _ => {}
+        }
+    }
+
+    fn collect_mut_place_arg(&mut self, program: &RirProgram, arg: &RirMutPlaceArg) {
+        if let RirMutPlaceAccess::DataRef { dataref, .. } = &arg.access {
+            self.intern(program, *dataref, &arg.projections, arg.ty);
         }
     }
 

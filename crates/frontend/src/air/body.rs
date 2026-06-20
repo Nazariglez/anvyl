@@ -41,6 +41,7 @@ pub enum AirStmt {
     CollectionSlotScope(AirCollectionSlotScope),
     EnumMatch(AirEnumMatch),
     OptionalMatch(AirOptionalMatch),
+    MapEntryMatch(AirMapEntryMatch),
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -136,6 +137,16 @@ pub struct AirOptionalMatch {
     pub discr: Place,
     pub payload: Option<LocalId>,
     pub payload_ref: bool,
+    pub payload_escapes: bool,
+    pub some_block: AirBlock,
+    pub none_block: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirMapEntryMatch {
+    pub map: Place,
+    pub key: Operand,
+    pub payload: Option<LocalId>,
     pub payload_escapes: bool,
     pub some_block: AirBlock,
     pub none_block: AirBlock,
@@ -461,6 +472,10 @@ impl AirStmt {
                 }
             }
             Self::OptionalMatch(match_) => {
+                match_.some_block.for_each_rvalue(f);
+                match_.none_block.for_each_rvalue(f);
+            }
+            Self::MapEntryMatch(match_) => {
                 match_.some_block.for_each_rvalue(f);
                 match_.none_block.for_each_rvalue(f);
             }

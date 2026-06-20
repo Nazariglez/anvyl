@@ -50,14 +50,14 @@ use self::{
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
-        RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -2228,6 +2228,76 @@ impl<'a> PlanCx<'a> {
                 }));
                 Ok(stmts)
             }
+            air::AirStmt::MapEntryMatch(match_) => {
+                let mut key = self.plan_operand_read(function, &match_.key, locals);
+                let payload = match_
+                    .payload
+                    .map(|payload| RirLocalId::from_index(payload.index()));
+                if let Some(payload) = payload
+                    && let Some(local) = locals.get_mut(payload.index())
+                {
+                    local.payload_ref = true;
+                }
+                let entry_lambdas = lambda_values.clone();
+                let entry_cells = initialized_cells.to_vec();
+                let entry_possible = possible_cells.to_vec();
+                let mut some_lambdas = entry_lambdas.clone();
+                let mut some_cells = entry_cells.clone();
+                let mut some_possible = entry_possible.clone();
+                let some_block = self.plan_air_block(
+                    function,
+                    &match_.some_block,
+                    locals,
+                    &mut some_lambdas,
+                    &mut some_cells,
+                    &mut some_possible,
+                    in_loop,
+                )?;
+                let mut none_lambdas = entry_lambdas;
+                let mut none_cells = entry_cells;
+                let mut none_possible = entry_possible;
+                let none_block = self.plan_air_block(
+                    function,
+                    &match_.none_block,
+                    locals,
+                    &mut none_lambdas,
+                    &mut none_cells,
+                    &mut none_possible,
+                    in_loop,
+                )?;
+                Self::merge_known_lambdas(
+                    lambda_values,
+                    locals.len(),
+                    [&some_lambdas, &none_lambdas],
+                );
+                for (dst, (some, none)) in initialized_cells
+                    .iter_mut()
+                    .zip(some_cells.iter().zip(&none_cells))
+                {
+                    *dst = *some && *none;
+                }
+                for (dst, (some, none)) in possible_cells
+                    .iter_mut()
+                    .zip(some_possible.iter().zip(&none_possible))
+                {
+                    *dst = *some || *none;
+                }
+                let map_plan = self
+                    .access()
+                    .plan(function, PlaceAccessIntent::MutPlaceArg, &match_.map)
+                    .map_err(|gap| Self::access_gap(function, gap))?;
+                let planned_map = self.plan_mut_place_arg(function, &map_plan, locals)?;
+                key.stmts.extend(planned_map.stmts);
+                key.stmts.push(RirStmt::MapEntryMatch(RirMapEntryMatch {
+                    map: planned_map.arg,
+                    key: key.operand,
+                    payload,
+                    payload_escapes: match_.payload_escapes,
+                    some_block,
+                    none_block,
+                }));
+                Ok(key.stmts)
+            }
         }
     }
 
@@ -3070,6 +3140,18 @@ impl<'a> PlanCx<'a> {
                     some_updates_slot || none_updates_slot,
                 )
             }
+            RirStmt::MapEntryMatch(mut match_) => {
+                let (some_block, some_updates_slot) =
+                    self.collection_slot_block(function, scope, match_.some_block, false)?;
+                let (none_block, none_updates_slot) =
+                    self.collection_slot_block(function, scope, match_.none_block, false)?;
+                match_.some_block = some_block;
+                match_.none_block = none_block;
+                (
+                    RirStmt::MapEntryMatch(match_),
+                    some_updates_slot || none_updates_slot,
+                )
+            }
             stmt => {
                 let updates_slot = Self::direct_stmt_updates_collection_slot(scope, &stmt);
                 (stmt, updates_slot)
@@ -3587,6 +3669,23 @@ impl<'a> PlanCx<'a> {
             .access()
             .plan(function, PlaceAccessIntent::Assign, place)
             .expect("profile verifies assignable places");
+        if let Some(local) = place.root.local()
+            && let Some(root) = locals.get(local.index())
+            && root.payload_ref
+        {
+            stmts.push(RirStmt::MutPlaceSet {
+                place: RirMutPlaceArg::projected(
+                    RirMutPlaceHandle::Local {
+                        local: RirLocalId::from_index(local.index()),
+                        ty: root.ty,
+                    },
+                    place.projection.iter().map(Self::rir_projection).collect(),
+                    self.type_map[&place.ty],
+                ),
+                value,
+            });
+            return Ok(());
+        }
         match Self::assign_target(&plan, place) {
             AssignTarget::CaptureCell(cell) => {
                 self.lower_capture_cell_write(

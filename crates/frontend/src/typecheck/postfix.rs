@@ -138,6 +138,7 @@ impl ReceiverUse {
             root_local: self.identity.root_local(),
             root_name: self.root_name,
             global: self.global.clone(),
+            map_entry_alias: false,
         }
     }
 
@@ -1895,6 +1896,7 @@ impl CheckedCall {
             root_local,
             root_name: source.root_name,
             global: source.global.as_ref().map(place::GlobalPlace::projected),
+            map_entry_alias: false,
         }
     }
 }

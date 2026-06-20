@@ -1,0 +1,32 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 10
+// 20
+// -1
+// 20
+// 30
+// @match-end
+
+fn print_slot(slot: int?) {
+    if let value? = slot {
+        println(value);
+    } else {
+        println(-1);
+    }
+}
+
+fn main() {
+    var scores: [(int, string): int] = [(1, "a"): 10];
+    print_slot(scores[(1, "a")]);
+
+    scores[(1, "a")] = 20;
+    scores[(2, "b")] = 30;
+    print_slot(scores[(1, "a")]);
+    print_slot(scores[(3, "c")]);
+
+    for key, value in scores {
+        println(value);
+    }
+}

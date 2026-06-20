@@ -526,6 +526,7 @@ pub(super) struct PlaceValue {
     pub(super) root_local: Option<SemanticLocalId>,
     pub(super) root_name: Option<Ident>,
     pub(super) global: Option<GlobalPlace>,
+    pub(super) map_entry_alias: bool,
 }
 
 #[derive(Clone)]
@@ -580,6 +581,7 @@ impl PlaceValue {
             root_local: None,
             root_name: None,
             global: None,
+            map_entry_alias: false,
         }
     }
 
@@ -602,6 +604,7 @@ impl PlaceValue {
             root_local: self.root_local,
             root_name: self.root_name,
             global: self.global.as_ref().map(GlobalPlace::projected),
+            map_entry_alias: false,
         }
     }
 }
@@ -776,7 +779,7 @@ fn field_checked(
 }
 
 pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
-    let place = check_place(expr, tc);
+    let place = check_map_entry_alias_scrutinee(expr, tc).unwrap_or_else(|| check_place(expr, tc));
     if let Some(error) = place
         .value
         .access
@@ -786,6 +789,37 @@ pub(super) fn check_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Ch
     }
     record_mut_borrow(expr.node.id, &place.value, tc);
     place
+}
+
+fn check_map_entry_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Option<CheckedPlace> {
+    let ExprKind::Index(index) = &expr.node.kind else {
+        return None;
+    };
+    let ExprKind::Range(_) = index.node.index.node.kind else {
+        let target = check_place(&index.node.target, tc);
+        let Type::Map { .. } = &target.value.checked.ty else {
+            return None;
+        };
+        let indexed = check_index_access(index, &target.value.checked, tc);
+        let mut checked = super::checked_from_type(expr, indexed.read_ty, tc);
+        checked.contains_extern_any = indexed.contains_extern_any;
+        let mut value = project_index_value(
+            &target.value,
+            checked,
+            index.node.target.node.id,
+            &index.node.index,
+            expr.node.id,
+            tc,
+        );
+        value.identity = target.value.identity.clone();
+        value.map_entry_alias = true;
+        record_mut_borrow(index.node.target.node.id, &target.value, tc);
+        return Some(CheckedPlace {
+            value,
+            accepts_extern_any: target.accepts_extern_any || indexed.contains_extern_any,
+        });
+    };
+    None
 }
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {

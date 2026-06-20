@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+fn main() {
+    var scores: [string: int?] = ["a": 1];
+    if var score? = scores["a"] {
+        let current: int? = score;
+        score = nil;
+    }
+}

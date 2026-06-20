@@ -3,9 +3,13 @@
 // @expect: success
 // @match-begin
 // 1
+// -1
 // 0
 // -1
-// 1
+// 3
+// 0
+// 0
+// -1
 // @match-end
 
 fn print_nested(slot: Option<int?>) {
@@ -22,14 +26,19 @@ fn print_nested(slot: Option<int?>) {
 
 fn main() {
     var slots: [string: int?] = ["a": 1];
+
+    print_nested(slots.remove("a"));
+    print_nested(slots["a"]);
+
+    slots["a"] = nil;
+    print_nested(slots.remove("a"));
+    print_nested(slots.remove("a"));
+
+    slots["a"] = 3;
     print_nested(slots["a"]);
 
     slots["a"] = nil;
     print_nested(slots["a"]);
-
-    slots.remove("a");
+    print_nested(slots.remove("a"));
     print_nested(slots["a"]);
-
-    slots["b"] = 1;
-    print_nested(slots["b"]);
 }

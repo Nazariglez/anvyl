@@ -125,6 +125,14 @@ pub(super) fn optional_payload_ops_ctor(payload: &str) -> String {
     format!("{}::<{payload}>::default()", rt_path("OptionalPayloadOps"))
 }
 
+pub(super) fn map_value_ops_ty(key: &str) -> String {
+    format!("{}<{key}>", rt_path("MapValueOps"))
+}
+
+pub(super) fn map_value_ops_ctor(key: &str, loan: &str) -> String {
+    format!("{}::new({key}, &{loan})", rt_path("MapValueOps"))
+}
+
 pub(super) fn erased_handle_ty() -> String {
     format!("{}<'cx>", rt_path("ErasedHandle"))
 }
@@ -437,6 +445,10 @@ pub(super) fn map_remove(map: &str, rt: &str, key: &str) -> String {
     format!("{map}.remove({rt}, &{key})?")
 }
 
+pub(super) fn map_contains_key_region(key: &str) -> String {
+    format!("value.contains_key(rt, &{key})")
+}
+
 pub(super) fn map_remove_region(key: &str) -> String {
     format!("value.remove(rt, &{key})")
 }
@@ -506,6 +518,10 @@ pub(super) fn begin_shape_loan(root: &str) -> String {
 
 pub(super) fn begin_shape_loan_region() -> String {
     "value.begin_shape_loan()".into()
+}
+
+pub(super) fn map_begin_value_loan_region(key: &str) -> String {
+    format!("value.begin_value_loan_by_key(rt, &{key})")
 }
 
 pub(super) fn shape_loan_version(loan: &str) -> String {
@@ -615,6 +631,10 @@ pub(super) fn mut_place_heap_cell(cell: &str) -> String {
 
 pub(super) fn mut_place_global(slot: &str, init: &str) -> String {
     format!("{}::global(&{slot}, &|rt| {init})", mut_place_ty())
+}
+
+pub(super) fn mut_place_global_with_init(slot: &str, init: &str) -> String {
+    format!("{}::global(&{slot}, {init})", mut_place_ty())
 }
 
 pub(super) fn mut_place_scoped_cell(cell: &str) -> String {

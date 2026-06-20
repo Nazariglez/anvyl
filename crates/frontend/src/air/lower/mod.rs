@@ -6,8 +6,8 @@ use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionLoan,
     AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
     AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
-    AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee,
-    CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstData, ConstId, ConstValue,
+    AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg,
+    Callee, CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstData, ConstId, ConstValue,
     CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
     ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
@@ -1956,7 +1956,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match classify_optional_pattern(&if_let.node.pattern)? {
             OptionalPattern::Some(pattern) => {
                 let mode = optional_payload_mode(pattern, alias);
-                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
                 self.emit_optional_match_with_payload_ref(
                     subject,
                     payload,
@@ -1992,7 +1992,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match classify_optional_pattern(&if_let.node.pattern)? {
             OptionalPattern::Some(pattern) => {
                 let mode = optional_payload_mode(pattern, alias);
-                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
                 self.emit_optional_match_with_payload_ref(
                     subject,
                     payload,
@@ -2030,7 +2030,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             OptionalPattern::Some(pattern) => optional_payload_mode(pattern, alias),
             OptionalPattern::None => PayloadMode::None,
         };
-        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
         let some_block = match pattern {
             OptionalPattern::Some(pattern) => self.with_nested_block(|this| {
                 this.lower_optional_payload_binding(pattern, payload, alias)
@@ -2934,7 +2934,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match classify_optional_pattern(&while_let.pattern)? {
             OptionalPattern::Some(pattern) => {
                 let mode = optional_payload_mode(pattern, alias);
-                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+                let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
                 self.emit_optional_match_with_payload_ref(
                     subject,
                     payload,
@@ -4070,7 +4070,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match step {
             ChainStep::Field { expr, node } if node.node.safe => {
                 let subject = self.optional_subject_from_operand(current, site)?;
-                let payload = self.temp(subject.inner_ty);
+                let payload = self.temp(subject.inner_ty());
                 self.emit_optional_match(
                     subject,
                     Some(payload),
@@ -4091,7 +4091,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             ChainStep::Index { expr, node } if node.node.safe => {
                 let subject = self.optional_subject_from_operand(current, site)?;
-                let payload = self.temp(subject.inner_ty);
+                let payload = self.temp(subject.inner_ty());
                 self.emit_optional_match(
                     subject,
                     Some(payload),
@@ -4320,8 +4320,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     ) -> Result<Operand, LowerError> {
         let result_ty = self.cx.lower_ty(result_ty)?;
         let subject = self.lower_optional_subject(&binary.node.left, expr)?;
-        let inner_ty = subject.inner_ty;
-        let optional_ty = subject.optional_ty;
+        let inner_ty = subject.inner_ty();
+        let optional_ty = subject.optional_ty();
         self.lower_optional_value(
             subject,
             result_ty,
@@ -4632,7 +4632,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Err(unsupported_expr(site));
         };
         let place = self.place_from_operand(operand, site)?;
-        Ok(OptionalSubject {
+        Ok(OptionalSubject::Place {
             place,
             optional_ty,
             inner_ty,
@@ -4657,17 +4657,43 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !alias {
             return self.lower_optional_subject(expr, site);
         }
+        if let Some(subject) = self.lower_map_entry_pattern_subject(expr)? {
+            return Ok(subject);
+        }
         let fact = self.local_use(expr, LocalUseMode::MutBorrow)?;
         let place = self.lower_place(expr, &fact)?;
         let optional_ty = place.ty;
         let Some(inner_ty) = typing::optional_inner(&self.cx.program, optional_ty) else {
             return Err(unsupported_expr(site));
         };
-        Ok(OptionalSubject {
+        Ok(OptionalSubject::Place {
             place: place.clone(),
             optional_ty,
             inner_ty,
         })
+    }
+
+    fn lower_map_entry_pattern_subject(
+        &mut self,
+        expr: &ExprNode,
+    ) -> Result<Option<OptionalSubject>, LowerError> {
+        let ExprKind::Index(index) = &expr.node.kind else {
+            return Ok(None);
+        };
+        if matches!(index.node.index.node.kind, ExprKind::Range(_)) {
+            return Ok(None);
+        }
+        let map = self.lower_place_arg(&index.node.target, true)?;
+        let Some((key_ty, inner_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
+            return Ok(None);
+        };
+        let key = self.lower_value_to(&index.node.index, key_ty, expr)?;
+        Ok(Some(OptionalSubject::MapEntry {
+            map,
+            key,
+            optional_ty: self.cx.optional_ty(inner_ty),
+            inner_ty,
+        }))
     }
 
     fn emit_optional_match(
@@ -4711,16 +4737,32 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let some_falls = air_block_falls_through(&some_block);
         let none_falls = air_block_falls_through(&none_block);
         self.ensure_open()?;
-        self.block
-            .stmts
-            .push(AirStmt::OptionalMatch(AirOptionalMatch {
-                discr: subject.place,
-                payload,
-                payload_ref,
-                payload_escapes,
-                some_block,
-                none_block,
-            }));
+        match subject {
+            OptionalSubject::Place { place, .. } => {
+                self.block
+                    .stmts
+                    .push(AirStmt::OptionalMatch(AirOptionalMatch {
+                        discr: place,
+                        payload,
+                        payload_ref,
+                        payload_escapes,
+                        some_block,
+                        none_block,
+                    }));
+            }
+            OptionalSubject::MapEntry { map, key, .. } => {
+                self.block
+                    .stmts
+                    .push(AirStmt::MapEntryMatch(AirMapEntryMatch {
+                        map,
+                        key,
+                        payload,
+                        payload_escapes,
+                        some_block,
+                        none_block,
+                    }));
+            }
+        }
         Ok((some_falls, none_falls))
     }
 
@@ -4733,7 +4775,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         none: impl FnOnce(&mut Self) -> Result<Option<Operand>, LowerError>,
     ) -> Result<Operand, LowerError> {
         let result = self.temp(result_ty);
-        let payload = self.temp(subject.inner_ty);
+        let payload = self.temp(subject.inner_ty());
         self.emit_optional_match(
             subject,
             Some(payload),
@@ -5316,10 +5358,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
         let plan = optional_match_plan(expr, &match_expr.node.arms)?;
         let mode = optional_match_payload_mode(&plan, alias);
-        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
         let (some_block, none_block) = self.lower_optional_match_blocks(
             &plan,
-            subject.place.clone(),
+            subject.place(),
+            expr,
             alias,
             payload,
             OptionalMatchOutput::Effect,
@@ -5350,10 +5393,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
         let plan = optional_match_plan(expr, &match_expr.node.arms)?;
         let mode = optional_match_payload_mode(&plan, alias);
-        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty));
+        let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
         let (some_block, none_block) = self.lower_optional_match_blocks(
             &plan,
-            subject.place.clone(),
+            subject.place(),
+            expr,
             alias,
             payload,
             OptionalMatchOutput::Value { result, result_ty },
@@ -5376,7 +5420,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_optional_match_blocks(
         &mut self,
         plan: &OptionalMatchPlan<'_>,
-        subject: Place,
+        subject: Option<&Place>,
+        site: &ExprNode,
         alias: bool,
         payload: Option<LocalId>,
         output: OptionalMatchOutput,
@@ -5386,7 +5431,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 if optional_plan_arm_is_default(plan, pattern, body) {
                     this.lower_optional_default_binding(
                         pattern,
-                        Operand::Place(subject.clone()),
+                        Operand::Place(subject.ok_or_else(|| unsupported_expr(site))?.clone()),
                         alias,
                     )?;
                 } else {
@@ -5396,7 +5441,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             } else if let Some((pattern, body)) = plan.default {
                 this.lower_optional_default_binding(
                     pattern,
-                    Operand::Place(subject.clone()),
+                    Operand::Place(subject.ok_or_else(|| unsupported_expr(site))?.clone()),
                     alias,
                 )?;
                 this.lower_optional_match_body(body, output)
@@ -5408,7 +5453,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             if let Some(body) = plan.none {
                 this.lower_optional_match_body(body, output)
             } else if let Some((pattern, body)) = plan.default {
-                this.lower_optional_default_binding(pattern, Operand::Place(subject), alias)?;
+                this.lower_optional_default_binding(
+                    pattern,
+                    Operand::Place(subject.ok_or_else(|| unsupported_expr(site))?.clone()),
+                    alias,
+                )?;
                 this.lower_optional_match_body(body, output)
             } else {
                 this.terminate(AirTail::Unreachable)
@@ -8554,10 +8603,39 @@ enum ReachableBodyFacts<'a> {
     Empty(Box<SemanticBodyFacts>),
 }
 
-struct OptionalSubject {
-    place: Place,
-    optional_ty: TypeId,
-    inner_ty: TypeId,
+enum OptionalSubject {
+    Place {
+        place: Place,
+        optional_ty: TypeId,
+        inner_ty: TypeId,
+    },
+    MapEntry {
+        map: Place,
+        key: Operand,
+        optional_ty: TypeId,
+        inner_ty: TypeId,
+    },
+}
+
+impl OptionalSubject {
+    fn optional_ty(&self) -> TypeId {
+        match self {
+            Self::Place { optional_ty, .. } | Self::MapEntry { optional_ty, .. } => *optional_ty,
+        }
+    }
+
+    fn inner_ty(&self) -> TypeId {
+        match self {
+            Self::Place { inner_ty, .. } | Self::MapEntry { inner_ty, .. } => *inner_ty,
+        }
+    }
+
+    fn place(&self) -> Option<&Place> {
+        match self {
+            Self::Place { place, .. } => Some(place),
+            Self::MapEntry { .. } => None,
+        }
+    }
 }
 
 struct ForPlan {
@@ -14519,6 +14597,10 @@ fn main() {}
                     collect_block_statements(&scope.body, statements);
                 }
                 AirStmt::OptionalMatch(match_) => {
+                    collect_block_statements(&match_.some_block, statements);
+                    collect_block_statements(&match_.none_block, statements);
+                }
+                AirStmt::MapEntryMatch(match_) => {
                     collect_block_statements(&match_.some_block, statements);
                     collect_block_statements(&match_.none_block, statements);
                 }
