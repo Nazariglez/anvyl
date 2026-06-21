@@ -634,23 +634,25 @@ impl EmitCx<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        let params =
-            [
-                format!("rt: {}", target::runtime_ctx_ref_ty()),
-                format!(
-                    "types: {}",
-                    target::types_ref_ty(target::generated_types_symbol(&self.program.ctx))
-                ),
-                format!(
-                    "globals: {}",
-                    target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
-                ),
-            ]
-            .into_iter()
-            .chain(sig.params.iter().enumerate().map(|(index, param)| {
-                format!("arg_{index}: {}", policy.param_ty(param.ty, param.abi))
-            }))
-            .collect::<Vec<_>>();
+        let params = [
+            format!("rt: {}", target::runtime_ctx_ref_ty()),
+            format!(
+                "types: {}",
+                target::types_ref_ty(target::generated_types_symbol(&self.program.ctx))
+            ),
+            format!(
+                "globals: {}",
+                target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
+            ),
+        ]
+        .into_iter()
+        .chain(sig.params.iter().enumerate().map(|(index, param)| {
+            format!(
+                "arg_{index}: {}",
+                policy.callable_param_ty(param.ty, param.abi, param.escape)
+            )
+        }))
+        .collect::<Vec<_>>();
         let fallible = variants
             .iter()
             .any(|(_, function, _, _)| self.fallible_functions[function.index()]);
@@ -908,7 +910,7 @@ impl EmitCx<'_> {
     }
 
     fn lambda_sig_ret_ty(&self, sig: &RirLambdaSig, fallible: bool) -> String {
-        let ret = self.ty(sig.ret);
+        let ret = RustRepPolicy::new(self.program).callable_ret_ty(sig.ret);
         if !fallible {
             return ret;
         }
@@ -921,6 +923,7 @@ impl EmitCx<'_> {
 
     fn emit_function(&mut self, function: &RirFunction) {
         let ctx_use = analysis::function_context_use(self.program, function);
+        let policy = RustRepPolicy::new(self.program);
         let mut params = vec![
             format!(
                 "{}: {}",
@@ -949,7 +952,7 @@ impl EmitCx<'_> {
             format!(
                 "{mutability}{}: {}",
                 local.symbol.as_str(),
-                RustRepPolicy::new(self.program).param_ty(param.ty, param.abi)
+                policy.callable_param_ty(param.ty, param.abi, param.escape)
             )
         }));
         let ret = self.function_ret_ty(function);
@@ -994,7 +997,7 @@ impl EmitCx<'_> {
     }
 
     fn function_ret_ty(&self, function: &RirFunction) -> String {
-        let ret = self.ty(function.ret.ty);
+        let ret = RustRepPolicy::new(self.program).callable_ret_ty(function.ret.ty);
         if !self.fallible_functions[function.id.index()] {
             return ret;
         }

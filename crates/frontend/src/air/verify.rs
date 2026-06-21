@@ -7082,6 +7082,13 @@ fn rvalue_function_escape(
                     }
                 })
         }
+        RValue::Call { .. } => match typing::rvalue_ty(program, primitives, value) {
+            Some(ty) if matches!(program.type_arena.get(ty), Some(TypeData::Function(_))) => {
+                FunctionValueCapability::Escaping
+            }
+            Some(_) => FunctionValueCapability::NonFunction,
+            None => FunctionValueCapability::Unknown,
+        },
         _ => typing::rvalue_ty(program, primitives, value)
             .map_or(FunctionValueCapability::Unknown, |ty| {
                 type_function_capability(program, ty)

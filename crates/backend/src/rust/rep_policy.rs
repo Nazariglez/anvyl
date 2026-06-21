@@ -8,9 +8,10 @@ use anvyx_frontend::air::{
 use super::{
     rir::{
         RirCellDecl, RirCellStorage, RirCollectionStorageKind, RirDataRef, RirEnum, RirEnumId,
-        RirField, RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaSigId,
-        RirLambdaStorage, RirParamAbi, RirParamSemantic, RirProgram, RirStruct, RirStructId,
-        RirTuple, RirTupleId, RirType, RirTypeId,
+        RirField, RirLambda, RirLambdaCapture, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvLayout, RirLambdaSigId, RirLambdaStorage, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirTuple, RirTupleId, RirType,
+        RirTypeId,
     },
     target,
 };
@@ -73,6 +74,24 @@ pub enum RustMaterialIntent {
     Read,
     Store,
     MutPlacePayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct LambdaSigStorageShape {
+    pub(super) heap_env: bool,
+    pub(super) lifetime: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LambdaCaptureLayoutEdge {
+    InlineValue,
+    HeapEnvField,
+    SharedBorrow,
+    MutBorrow,
+    StackCell,
+    HeapCell,
+    ScopedPlaceCell,
+    Unsupported,
 }
 
 fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
@@ -1084,6 +1103,19 @@ impl<'a> RustRepPolicy<'a> {
         self.param_ty_with_lifetime(ty, abi, None)
     }
 
+    pub fn callable_param_ty(
+        self,
+        ty: RirTypeId,
+        abi: RirParamAbi,
+        escape: RirParamEscape,
+    ) -> String {
+        if abi == RirParamAbi::Value && escape == RirParamEscape::Escaping {
+            self.escaping_value_ty(ty)
+        } else {
+            self.param_ty(ty, abi)
+        }
+    }
+
     pub fn capture_field_ty(self, ty: RirTypeId, abi: RirParamAbi) -> String {
         self.param_ty_with_lifetime(ty, abi, Some("'env"))
     }
@@ -1099,9 +1131,15 @@ impl<'a> RustRepPolicy<'a> {
             RirParamAbi::Value => self.rust_ty(ty),
             RirParamAbi::SharedBorrow => match self.borrow_view(ty) {
                 RustBorrowView::Str => format!("&{reference_lifetime}str"),
-                _ => format!("&{reference_lifetime}{}", self.rust_ty(ty)),
+                _ => format!(
+                    "&{reference_lifetime}{}",
+                    self.rust_ty_with_env_lifetime(ty, lifetime)
+                ),
             },
-            RirParamAbi::MutBorrow => format!("&{reference_lifetime}mut {}", self.rust_ty(ty)),
+            RirParamAbi::MutBorrow => format!(
+                "&{reference_lifetime}mut {}",
+                self.rust_ty_with_env_lifetime(ty, lifetime)
+            ),
             RirParamAbi::MutPlace => {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
@@ -1219,37 +1257,180 @@ impl<'a> RustRepPolicy<'a> {
         format!("LambdaSig{}", id.index())
     }
 
-    pub fn lambda_sig_needs_lifetime(self, id: RirLambdaSigId) -> bool {
-        self.program.lambdas_for_sig(id).any(|lambda| {
-            lambda.captures.iter().any(|capture| {
-                matches!(
-                    capture.abi,
-                    RirParamAbi::SharedBorrow
-                        | RirParamAbi::MutBorrow
-                        | RirParamAbi::StackCell
-                        | RirParamAbi::ScopedPlaceCell
+    fn rust_ty_with_env_lifetime(self, ty: RirTypeId, lifetime: Option<&str>) -> String {
+        match (self.ty(ty), lifetime) {
+            (RirType::Lambda(sig), Some(lifetime)) => {
+                format!(
+                    "{}{}",
+                    self.lambda_sig_symbol(sig),
+                    self.lambda_sig_ty_generics_with_lifetime(sig, lifetime)
                 )
-            })
-        })
+            }
+            _ => self.rust_ty(ty),
+        }
+    }
+
+    fn lambda_sig_ty_generics_with_lifetime(self, id: RirLambdaSigId, lifetime: &str) -> String {
+        match (
+            self.lambda_sig_needs_lifetime(id),
+            self.lambda_sig_needs_ctx_lifetime(id),
+        ) {
+            (true, true) => format!("<{lifetime}, 'cx>"),
+            (true, false) => format!("<{lifetime}>"),
+            (false, true) => "<'cx>".into(),
+            (false, false) => String::new(),
+        }
+    }
+
+    pub(super) fn lambda_sig_storage_shape(self, id: RirLambdaSigId) -> LambdaSigStorageShape {
+        let mut shape = LambdaSigStorageShape::default();
+        for lambda in self.program.lambdas_for_sig(id) {
+            shape.heap_env |= matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. });
+            shape.lifetime |= lambda.captures.iter().any(|capture| {
+                matches!(
+                    self.lambda_capture_layout_edge(lambda, capture),
+                    LambdaCaptureLayoutEdge::SharedBorrow
+                        | LambdaCaptureLayoutEdge::MutBorrow
+                        | LambdaCaptureLayoutEdge::StackCell
+                        | LambdaCaptureLayoutEdge::ScopedPlaceCell
+                )
+            });
+        }
+        shape
+    }
+
+    pub fn lambda_sig_needs_lifetime(self, id: RirLambdaSigId) -> bool {
+        self.lambda_sig_storage_shape(id).lifetime
     }
 
     pub fn lambda_sig_needs_ctx_lifetime(self, id: RirLambdaSigId) -> bool {
-        self.lambda_sig_has_heap_env(id)
+        self.lambda_sig_needs_ctx_lifetime_inner(id, &mut BTreeSet::new())
+    }
+
+    fn lambda_sig_needs_ctx_lifetime_inner(
+        self,
+        id: RirLambdaSigId,
+        active: &mut BTreeSet<RirLambdaSigId>,
+    ) -> bool {
+        if !active.insert(id) {
+            return false;
+        }
+        let needs = self.lambda_sig_storage_shape(id).heap_env
             || self.program.lambdas_for_sig(id).any(|lambda| {
                 lambda.captures.iter().any(|capture| {
-                    self.type_cx_dependent(capture.ty)
-                        || matches!(
-                            capture.abi,
-                            RirParamAbi::HeapCell | RirParamAbi::ScopedPlaceCell
-                        )
+                    let edge = self.lambda_capture_layout_edge(lambda, capture);
+                    self.type_cx_dependent_inner(capture.ty, &mut BTreeSet::new(), active)
+                        || edge == LambdaCaptureLayoutEdge::HeapCell
+                        || edge == LambdaCaptureLayoutEdge::ScopedPlaceCell
                 })
-            })
+            });
+        active.remove(&id);
+        needs
     }
 
     pub fn lambda_sig_has_heap_env(self, id: RirLambdaSigId) -> bool {
-        self.program
-            .lambdas_for_sig(id)
-            .any(|lambda| matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }))
+        self.lambda_sig_storage_shape(id).heap_env
+    }
+
+    pub(super) fn lambda_sig_has_cell_and_mut_borrow(self, id: RirLambdaSigId) -> bool {
+        let mut has_cell = false;
+        let mut has_mut_borrow = false;
+        for lambda in self.program.lambdas_for_sig(id) {
+            has_cell |= lambda.captures.iter().any(|capture| {
+                matches!(
+                    self.lambda_capture_layout_edge(lambda, capture),
+                    LambdaCaptureLayoutEdge::StackCell
+                        | LambdaCaptureLayoutEdge::HeapCell
+                        | LambdaCaptureLayoutEdge::ScopedPlaceCell
+                )
+            });
+            has_mut_borrow |= lambda
+                .captures
+                .iter()
+                .any(|capture| capture.abi == RirParamAbi::MutBorrow);
+        }
+        has_cell && has_mut_borrow
+    }
+
+    pub(super) fn lambda_env_field_storage_supported(self, field: &RirLambdaEnvField) -> bool {
+        match field.kind {
+            RirLambdaEnvFieldKind::Value => self.value_from_ref_supported(field.ty),
+            RirLambdaEnvFieldKind::HeapCell { .. } => true,
+        }
+    }
+
+    pub(super) fn lambda_capture_layout_edge(
+        self,
+        lambda: &RirLambda,
+        capture: &RirLambdaCapture,
+    ) -> LambdaCaptureLayoutEdge {
+        match capture.abi {
+            RirParamAbi::Value if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }) => {
+                LambdaCaptureLayoutEdge::HeapEnvField
+            }
+            RirParamAbi::Value => LambdaCaptureLayoutEdge::InlineValue,
+            RirParamAbi::SharedBorrow => LambdaCaptureLayoutEdge::SharedBorrow,
+            RirParamAbi::MutBorrow => LambdaCaptureLayoutEdge::MutBorrow,
+            RirParamAbi::StackCell => LambdaCaptureLayoutEdge::StackCell,
+            RirParamAbi::HeapCell => LambdaCaptureLayoutEdge::HeapCell,
+            RirParamAbi::ScopedPlaceCell => LambdaCaptureLayoutEdge::ScopedPlaceCell,
+            RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => {
+                LambdaCaptureLayoutEdge::Unsupported
+            }
+        }
+    }
+
+    pub(super) fn inline_lambda_value_sig(
+        self,
+        lambda: &RirLambda,
+        capture: &RirLambdaCapture,
+    ) -> Option<RirLambdaSigId> {
+        if self.lambda_capture_layout_edge(lambda, capture) != LambdaCaptureLayoutEdge::InlineValue
+        {
+            return None;
+        }
+        match self.ty(capture.ty) {
+            RirType::Lambda(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    pub(super) fn lambda_has_recursive_inline_value_capture(self, lambda: &RirLambda) -> bool {
+        lambda.captures.iter().any(|capture| {
+            self.inline_lambda_value_sig(lambda, capture)
+                .is_some_and(|sig| self.lambda_sig_reaches_inline_lambda_value(sig, lambda.sig))
+        })
+    }
+
+    pub(super) fn lambda_sig_reaches_inline_lambda_value(
+        self,
+        from: RirLambdaSigId,
+        target: RirLambdaSigId,
+    ) -> bool {
+        self.lambda_sig_reaches_inline_lambda_value_inner(from, target, &mut BTreeSet::new())
+    }
+
+    fn lambda_sig_reaches_inline_lambda_value_inner(
+        self,
+        from: RirLambdaSigId,
+        target: RirLambdaSigId,
+        visited: &mut BTreeSet<RirLambdaSigId>,
+    ) -> bool {
+        if from == target {
+            return true;
+        }
+        if !visited.insert(from) {
+            return false;
+        }
+        let reaches = self.program.lambdas_for_sig(from).any(|lambda| {
+            lambda
+                .captures
+                .iter()
+                .filter_map(|capture| self.inline_lambda_value_sig(lambda, capture))
+                .any(|sig| self.lambda_sig_reaches_inline_lambda_value_inner(sig, target, visited))
+        });
+        visited.remove(&from);
+        reaches
     }
 
     pub fn lambda_sig_copyable(self, id: RirLambdaSigId) -> bool {
@@ -1317,6 +1498,21 @@ impl<'a> RustRepPolicy<'a> {
         enm.variants
             .iter()
             .any(|variant| self.fields_cx_dependent(&variant.fields))
+    }
+
+    pub fn callable_ret_ty(self, ty: RirTypeId) -> String {
+        self.escaping_value_ty(ty)
+    }
+
+    fn escaping_value_ty(self, ty: RirTypeId) -> String {
+        match self.ty(ty) {
+            RirType::Lambda(sig) if self.lambda_sig_needs_lifetime(sig) => format!(
+                "{}{}",
+                self.lambda_sig_symbol(sig),
+                self.lambda_sig_ty_generics_with_lifetime(sig, "'static")
+            ),
+            _ => self.rust_ty(ty),
+        }
     }
 
     pub fn rust_ty(self, ty: RirTypeId) -> String {
@@ -1389,9 +1585,9 @@ impl<'a> RustRepPolicy<'a> {
 
     pub fn lambda_env_field_ty(self, field: &RirLambdaEnvField) -> String {
         match field.kind {
-            RirLambdaEnvFieldKind::Value => self.rust_ty(field.ty),
+            RirLambdaEnvFieldKind::Value => self.escaping_value_ty(field.ty),
             RirLambdaEnvFieldKind::HeapCell { .. } => {
-                let payload = self.rust_ty(field.ty);
+                let payload = self.escaping_value_ty(field.ty);
                 target::handle_ty(&target::lambda_cell_ty(&payload))
             }
         }
@@ -1427,7 +1623,48 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
-        self.type_has_heap_shape(ty, Self::lambda_sig_needs_ctx_lifetime)
+        self.type_cx_dependent_inner(ty, &mut BTreeSet::new(), &mut BTreeSet::new())
+    }
+
+    fn type_cx_dependent_inner(
+        self,
+        ty: RirTypeId,
+        active_tys: &mut BTreeSet<RirTypeId>,
+        active_sigs: &mut BTreeSet<RirLambdaSigId>,
+    ) -> bool {
+        if !active_tys.insert(ty) {
+            return false;
+        }
+        let has_shape = match self.ty(ty) {
+            RirType::DataRef(_) | RirType::List(_) | RirType::Slice(_) | RirType::Map { .. } => {
+                true
+            }
+            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
+                self.type_cx_dependent_inner(inner, active_tys, active_sigs)
+            }
+            RirType::Lambda(sig) => self.lambda_sig_needs_ctx_lifetime_inner(sig, active_sigs),
+            RirType::Struct(id) => self.program.structs[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)),
+            RirType::Tuple(id) => self.program.tuples[id.index()]
+                .fields
+                .iter()
+                .any(|field| self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)),
+            RirType::Enum(id) => self.program.enums[id.index()]
+                .variants
+                .iter()
+                .any(|variant| {
+                    variant.fields.iter().any(|field| {
+                        self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)
+                    })
+                }),
+            RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void => {
+                false
+            }
+        };
+        active_tys.remove(&ty);
+        has_shape
     }
 
     fn type_has_heap_shape(
@@ -1542,12 +1779,9 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Array { .. }
                 | RirType::List(_)
                 | RirType::Map { .. }
-                | RirType::Slice(_) => true,
-                RirType::Int
-                | RirType::Float
-                | RirType::Bool
-                | RirType::Void
-                | RirType::Lambda(_) => false,
+                | RirType::Slice(_)
+                | RirType::Lambda(_) => true,
+                RirType::Int | RirType::Float | RirType::Bool | RirType::Void => false,
             },
             RirParamSemantic::MutBorrow => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
@@ -1731,11 +1965,12 @@ mod tests {
         RustValueRep,
     };
     use crate::rust::rir::{
-        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirField, RirFieldId, RirLambda,
-        RirLambdaEscape, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaSource,
-        RirLambdaStorage, RirParamAbi, RirParamSemantic, RirProgram, RirStruct, RirStructId,
-        RirSymbol, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind,
+        RirCellId, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirField, RirFieldId,
+        RirFunctionId, RirLambda, RirLambdaCapture, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaSig,
+        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
     };
 
     #[test]
@@ -2132,7 +2367,7 @@ mod tests {
         program.lambdas.push(RirLambda {
             id: RirLambdaId::from_index(0),
             source: RirLambdaSource::Function(FunctionId::from_index(0)),
-            function: crate::rust::rir::RirFunctionId::from_index(0),
+            function: RirFunctionId::from_index(0),
             sig: lambda_sig,
             escape: RirLambdaEscape::NonEscaping,
             storage: RirLambdaStorage::ZeroEnv,
@@ -2219,21 +2454,175 @@ mod tests {
         program.lambdas.push(RirLambda {
             id: RirLambdaId::from_index(0),
             source: RirLambdaSource::Function(FunctionId::from_index(0)),
-            function: crate::rust::rir::RirFunctionId::from_index(0),
+            function: RirFunctionId::from_index(0),
             sig: lambda_sig,
             escape: RirLambdaEscape::NonEscaping,
             storage: RirLambdaStorage::ScopedCaptures,
-            captures: vec![crate::rust::rir::RirLambdaCapture {
+            captures: vec![RirLambdaCapture {
                 ty: int,
                 semantic: RirParamSemantic::MutBorrow,
                 abi: RirParamAbi::MutBorrow,
-                kind: crate::rust::rir::RirLambdaCaptureKind::Param,
+                kind: RirLambdaCaptureKind::Param,
             }],
         });
         let policy = RustRepPolicy::new(&program);
 
         assert_eq!(policy.materialization(lambda), RustMaterialization::Gap);
         assert!(!policy.value_from_ref_supported(lambda));
+    }
+
+    #[test]
+    fn policy_centralizes_lambda_storage_and_layout_edges() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(0);
+        let lambda_a_ty = RirTypeId::from_index(1);
+        let lambda_b_ty = RirTypeId::from_index(2);
+        let sig_a = RirLambdaSigId::from_index(0);
+        let sig_b = RirLambdaSigId::from_index(1);
+        program.types.push(RirType::Int);
+        program.types.push(RirType::Lambda(sig_a));
+        program.types.push(RirType::Lambda(sig_b));
+        program.lambda_sigs.push(RirLambdaSig {
+            id: sig_a,
+            params: vec![],
+            ret: int,
+        });
+        program.lambda_sigs.push(RirLambdaSig {
+            id: sig_b,
+            params: vec![],
+            ret: int,
+        });
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(0),
+            source: RirLambdaSource::Function(FunctionId::from_index(0)),
+            function: RirFunctionId::from_index(0),
+            sig: sig_a,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: lambda_b_ty,
+                semantic: RirParamSemantic::SharedBorrow,
+                abi: RirParamAbi::SharedBorrow,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        });
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(1),
+            source: RirLambdaSource::Function(FunctionId::from_index(1)),
+            function: RirFunctionId::from_index(1),
+            sig: sig_a,
+            escape: RirLambdaEscape::Escaping,
+            storage: RirLambdaStorage::HeapEnv {
+                env: RirLambdaEnvId::from_index(0),
+            },
+            captures: vec![],
+        });
+        program.lambdas.push(RirLambda {
+            id: RirLambdaId::from_index(2),
+            source: RirLambdaSource::Function(FunctionId::from_index(2)),
+            function: RirFunctionId::from_index(2),
+            sig: sig_b,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: lambda_a_ty,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        });
+        let policy = RustRepPolicy::new(&program);
+
+        let shape = policy.lambda_sig_storage_shape(sig_a);
+        assert!(shape.heap_env);
+        assert!(shape.lifetime);
+        assert_eq!(
+            policy.callable_ret_ty(lambda_a_ty),
+            "LambdaSig0<'static, 'cx>"
+        );
+        assert_eq!(
+            policy.callable_param_ty(lambda_a_ty, RirParamAbi::Value, RirParamEscape::NonEscaping),
+            "LambdaSig0<'_, 'cx>"
+        );
+        assert_eq!(
+            policy.callable_param_ty(lambda_a_ty, RirParamAbi::Value, RirParamEscape::Escaping),
+            "LambdaSig0<'static, 'cx>"
+        );
+        let lambda_field = RirLambdaEnvField {
+            ty: lambda_a_ty,
+            symbol: RirSymbol::new("f"),
+            kind: RirLambdaEnvFieldKind::Value,
+        };
+        let lambda_cell_field = RirLambdaEnvField {
+            ty: lambda_a_ty,
+            symbol: RirSymbol::new("cell"),
+            kind: RirLambdaEnvFieldKind::HeapCell {
+                cell: RirCellId::from_index(0),
+            },
+        };
+        assert_eq!(
+            policy.lambda_env_field_ty(&lambda_field),
+            "LambdaSig0<'static, 'cx>"
+        );
+        assert!(policy.lambda_env_field_storage_supported(&lambda_field));
+        assert!(policy.lambda_env_field_storage_supported(&lambda_cell_field));
+        assert_eq!(
+            policy.inline_lambda_value_sig(&program.lambdas[0], &program.lambdas[0].captures[0]),
+            None
+        );
+        assert_eq!(
+            policy.inline_lambda_value_sig(&program.lambdas[2], &program.lambdas[2].captures[0]),
+            Some(sig_a)
+        );
+        let same_sig_shared = RirLambda {
+            id: RirLambdaId::from_index(3),
+            source: RirLambdaSource::Function(FunctionId::from_index(3)),
+            function: RirFunctionId::from_index(3),
+            sig: sig_a,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: lambda_a_ty,
+                semantic: RirParamSemantic::SharedBorrow,
+                abi: RirParamAbi::SharedBorrow,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        };
+        let same_sig_value = RirLambda {
+            id: RirLambdaId::from_index(4),
+            source: RirLambdaSource::Function(FunctionId::from_index(4)),
+            function: RirFunctionId::from_index(4),
+            sig: sig_a,
+            escape: RirLambdaEscape::NonEscaping,
+            storage: RirLambdaStorage::ScopedCaptures,
+            captures: vec![RirLambdaCapture {
+                ty: lambda_a_ty,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        };
+        let same_sig_heap_env = RirLambda {
+            id: RirLambdaId::from_index(5),
+            source: RirLambdaSource::Function(FunctionId::from_index(5)),
+            function: RirFunctionId::from_index(5),
+            sig: sig_a,
+            escape: RirLambdaEscape::Escaping,
+            storage: RirLambdaStorage::HeapEnv {
+                env: RirLambdaEnvId::from_index(1),
+            },
+            captures: vec![RirLambdaCapture {
+                ty: lambda_a_ty,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                kind: RirLambdaCaptureKind::Param,
+            }],
+        };
+        assert!(!policy.lambda_has_recursive_inline_value_capture(&same_sig_shared));
+        assert!(policy.lambda_has_recursive_inline_value_capture(&same_sig_value));
+        assert!(!policy.lambda_has_recursive_inline_value_capture(&same_sig_heap_env));
+        assert!(policy.lambda_sig_reaches_inline_lambda_value(sig_b, sig_a));
+        assert!(!policy.lambda_sig_reaches_inline_lambda_value(sig_a, sig_b));
     }
 
     #[test]

@@ -27,6 +27,25 @@ fn requires_cell(result: &TypecheckTestResult, capture: &LambdaCaptureFact) -> b
         .contains_key(&capture.binding_id)
 }
 
+fn escaping_lambdas(result: &TypecheckTestResult) -> usize {
+    result
+        .lambda_escapes()
+        .values()
+        .filter(|fact| fact.escape == LambdaEscapeKind::Escaping)
+        .count()
+}
+
+fn function_capture<'a>(
+    result: &'a TypecheckTestResult,
+    name: &str,
+    storage: CaptureStorage,
+) -> &'a LambdaCaptureFact {
+    let capture = capture(result, name);
+    assert!(matches!(capture.ty, Type::Func { .. }));
+    assert_eq!(capture.storage, storage);
+    capture
+}
+
 fn checked(source: &str) -> TypecheckTestResult {
     check(source).expect("program should typecheck")
 }
@@ -323,6 +342,93 @@ fn escaping_capture_of_local_closure_marks_closure_escaping() {
     let capture = capture(&result, "x");
     assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
     assert!(requires_cell(&result, capture));
+}
+
+#[test]
+fn nested_readonly_function_value_capture_records_ordinary_capture() {
+    let result = checked(
+        r"
+        fn main() {
+            let seed = 3;
+            let f = || seed;
+            let g = || f();
+            g();
+        }
+        ",
+    );
+
+    let function_capture = function_capture(&result, "f", CaptureStorage::OwnedReadonly);
+    assert_eq!(function_capture.origin, CaptureStorageOrigin::Owned);
+    assert!(!requires_cell(&result, function_capture));
+    assert_eq!(
+        capture(&result, "seed").storage,
+        CaptureStorage::OwnedReadonly
+    );
+    assert_eq!(escaping_lambdas(&result), 0);
+}
+
+#[test]
+fn escaping_function_value_capture_marks_captured_lambda_escaping() {
+    let result = checked(
+        r"
+        fn make(seed: int) -> fn() -> int {
+            let f = || seed;
+            || f()
+        }
+        ",
+    );
+
+    function_capture(&result, "f", CaptureStorage::OwnedReadonly);
+    assert_eq!(
+        capture(&result, "seed").storage,
+        CaptureStorage::OwnedReadonly
+    );
+    assert_eq!(escaping_lambdas(&result), 2);
+}
+
+#[test]
+fn assignment_after_function_value_capture_updates_escaping_flow() {
+    let result = checked(
+        r"
+        fn make(cond: bool) -> fn() -> int {
+            let seed = 1;
+            var f = || seed;
+            let g = || f();
+            if cond {
+                f = || 2;
+            }
+            g
+        }
+        ",
+    );
+
+    let function_capture = function_capture(&result, "f", CaptureStorage::OwnedMutableUpvalue);
+    assert!(requires_cell(&result, function_capture));
+    assert_eq!(
+        capture(&result, "seed").storage,
+        CaptureStorage::OwnedReadonly
+    );
+    assert_eq!(escaping_lambdas(&result), 3);
+}
+
+#[test]
+fn function_call_return_capture_is_escaping_safe() {
+    let result = checked(
+        r"
+        fn make(seed: int) -> fn() -> int {
+            || seed
+        }
+
+        fn outer(seed: int) -> fn() -> int {
+            let f = make(seed);
+            || f()
+        }
+        ",
+    );
+
+    let function_capture = function_capture(&result, "f", CaptureStorage::OwnedReadonly);
+    assert!(!requires_cell(&result, function_capture));
+    assert_eq!(escaping_lambdas(&result), 2);
 }
 
 #[test]

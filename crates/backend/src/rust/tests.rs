@@ -5184,14 +5184,15 @@ fn rir_rejects_unknown_function_value_captured_by_heap_env() {
 }
 
 #[test]
-fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
+fn rir_accepts_heap_env_and_borrowed_variants_sharing_signature() {
     let mut program = valid_heap_env_lambda_rir();
     let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
+    let string = RirTypeId::from_index(3);
     let sig = RirLambdaSigId::from_index(0);
     let lambda = RirLambdaId::from_index(1);
     let target = RirFunctionId::from_index(2);
     let source = RirLocalId::from_index(0);
+    program.types.push(RirType::String);
 
     program.lambdas.push(RirLambda {
         id: lambda,
@@ -5201,7 +5202,7 @@ fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
         escape: RirLambdaEscape::NonEscaping,
         storage: RirLambdaStorage::ScopedCaptures,
         captures: vec![RirLambdaCapture {
-            ty: int,
+            ty: string,
             semantic: RirParamSemantic::SharedBorrow,
             abi: RirParamAbi::SharedBorrow,
             kind: RirLambdaCaptureKind::Param,
@@ -5213,7 +5214,7 @@ fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
         symbol: RirSymbol::new("borrowed_target"),
         params: vec![RirParam {
             local: source,
-            ty: int,
+            ty: string,
             semantic: RirParamSemantic::SharedBorrow,
             abi: RirParamAbi::SharedBorrow,
             escape: RirParamEscape::NonEscaping,
@@ -5221,7 +5222,7 @@ fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
         ret: RirReturn { ty: void },
         locals: vec![RirLocal {
             id: source,
-            ty: int,
+            ty: string,
             mutable: false,
             symbol: RirSymbol::new("capture"),
             initialized: true,
@@ -5230,7 +5231,7 @@ fn rir_rejects_heap_env_and_borrowed_variants_sharing_signature() {
         body: RirStructuredBlock::default(),
     });
 
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
+    rir::verify(&program).expect("RIR verify failed");
 }
 
 #[test]

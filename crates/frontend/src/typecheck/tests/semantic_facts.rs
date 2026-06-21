@@ -14,7 +14,7 @@ fn assert_single_const(values: &ConstValueMap, value: ConstValue) {
 
 #[test]
 fn records_params_bindings_and_uses() {
-    let source = r#"
+    let source = r"
 fn f(a: int, var b: int) -> int {
     let x = a;
     var y = x;
@@ -22,7 +22,7 @@ fn f(a: int, var b: int) -> int {
     y += 1;
     y
 }
-"#;
+";
     let result = check(source).expect("typecheck failed");
     let body_key = result.function_body("f");
     let body = result.expect_body(&body_key);
@@ -357,12 +357,12 @@ fn direct_named_call_is_not_function_value_call() {
 #[test]
 fn function_value_call_preserves_parameter_escape_modes() {
     let result = check(
-        r#"
+        r"
 fn main(non: fn(fn()), esc: fn(escaping fn()), cb: escaping fn()) {
     non(cb);
     esc(cb);
 }
-"#,
+",
     )
     .expect("typecheck failed");
     let body = result.expect_body(&result.function_body("main"));
@@ -381,13 +381,13 @@ fn main(non: fn(fn()), esc: fn(escaping fn()), cb: escaping fn()) {
 #[test]
 fn optional_function_call_has_unwrapped_callee_fact() {
     let result = check(
-        r#"
+        r"
 fn tick() {}
 fn main(cond: bool) {
     let f: fn()? = if cond { tick } else { nil };
     f?();
 }
-"#,
+",
     )
     .expect("typecheck failed");
     let body = result.expect_body(&result.function_body("main"));
@@ -416,7 +416,7 @@ fn immediately_called_returned_function_has_callee_fact() {
     assert!(body.function_values.contains_key(&call.callee));
     assert!(matches!(
         body.function_values[&call.callee].kind,
-        FunctionValueKind::LocalOrPlace
+        FunctionValueKind::EscapingValue
     ));
     assert!(!body.calls.contains_key(&call.expr));
 }
@@ -424,14 +424,14 @@ fn immediately_called_returned_function_has_callee_fact() {
 #[test]
 fn branch_joined_function_value_is_local_or_place_fact() {
     let result = check(
-        r#"
+        r"
 fn a() {}
 fn b() {}
 fn main(cond: bool) {
     let f: fn() = if cond { a } else { b };
     f();
 }
-"#,
+",
     )
     .expect("typecheck failed");
 
@@ -720,12 +720,12 @@ fn const_generic_function_fact_uses_concrete_array_len() {
 #[test]
 fn generic_function_fact_order_distinguishes_same_named_types() {
     let result = check_named(
-        r#"
+        r"
 import a;
 import b;
 fn id<T>(x: T) -> T { x }
 fn main(a_id: a.Id, b_id: b.Id) { id(b_id); id(a_id); }
-"#,
+",
         &[("a", "pub struct Id {}"), ("b", "pub struct Id {}")],
     )
     .expect("typecheck failed");

@@ -1,6 +1,6 @@
 // @mode: run
 // @expect: success
-// @match: 7
+// @match: 8
 // @frontend: new
 
 fn make(seed: int) -> fn() -> int {
@@ -8,11 +8,11 @@ fn make(seed: int) -> fn() -> int {
 }
 
 fn call(f: fn() -> int) -> int {
-    let g = |x: int| f() + x;
-    g(4)
+    let alias = f;
+    let g = |x: int| alias() + x;
+    g(5)
 }
 
 fn main() {
-    let f = make(3);
-    println(call(f));
+    println(call(make(3)));
 }

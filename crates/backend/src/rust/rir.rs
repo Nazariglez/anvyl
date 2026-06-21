@@ -2263,31 +2263,14 @@ impl VerifyCx<'_> {
     }
 
     fn check_lambda_sig_capture_kinds(&mut self, site: RirVerifySite, sig: RirLambdaSigId) {
-        let mut has_cell = false;
-        let mut has_mut_borrow = false;
-        for lambda in self.program.lambdas_for_sig(sig) {
-            has_cell |= lambda.captures.iter().any(|capture| {
-                matches!(
-                    capture.kind,
-                    RirLambdaCaptureKind::StackCell { .. }
-                        | RirLambdaCaptureKind::HeapCell { .. }
-                        | RirLambdaCaptureKind::ScopedPlaceCell { .. }
-                )
-            });
-            has_mut_borrow |= lambda
-                .captures
-                .iter()
-                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow);
-        }
         let policy = RustRepPolicy::new(self.program);
-        let mixed_heap_env_and_borrows =
-            policy.lambda_sig_has_heap_env(sig) && policy.lambda_sig_needs_lifetime(sig);
-        if (has_cell && has_mut_borrow) || mixed_heap_env_and_borrows {
+        if policy.lambda_sig_has_cell_and_mut_borrow(sig) {
             self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
         }
     }
 
     fn check_lambdas(&mut self) {
+        let policy = RustRepPolicy::new(self.program);
         let mut env_owners = vec![None; self.program.lambda_envs.len()];
         for (index, lambda) in self.program.lambdas.iter().enumerate() {
             let site = RirVerifySite::Program;
@@ -2298,6 +2281,9 @@ impl VerifyCx<'_> {
             self.check_function_id(site, lambda.function);
             self.check_lambda_sig_id(site, lambda.sig);
             self.check_lambda_storage(site, lambda);
+            if policy.lambda_has_recursive_inline_value_capture(lambda) {
+                self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+            }
             if let RirLambdaStorage::HeapEnv { env } = lambda.storage
                 && let Some(owner) = env_owners.get_mut(env.index())
                 && owner.replace(lambda.id).is_some()
@@ -2309,6 +2295,7 @@ impl VerifyCx<'_> {
     }
 
     fn check_lambda_envs(&mut self) {
+        let policy = RustRepPolicy::new(self.program);
         for (index, env) in self.program.lambda_envs.iter().enumerate() {
             let site = RirVerifySite::Program;
             let id = RirLambdaEnvId::from_index(index);
@@ -2331,9 +2318,7 @@ impl VerifyCx<'_> {
             }
             for (index, field) in env.fields.iter().enumerate() {
                 self.check_type_id(site, field.ty);
-                if self.ty(field.ty).is_some()
-                    && matches!(field.kind, RirLambdaEnvFieldKind::Value)
-                    && !self.value_from_ref_supported(field.ty)
+                if self.ty(field.ty).is_some() && !policy.lambda_env_field_storage_supported(field)
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                 }
@@ -4102,6 +4087,9 @@ impl VerifyCx<'_> {
                 .lambdas
                 .get(lambda.index())
                 .map(|decl| decl.escape),
+            RirRValue::Call { ty, .. } if matches!(self.ty(*ty), Some(RirType::Lambda(_))) => {
+                Some(RirLambdaEscape::Escaping)
+            }
             RirRValue::Use(operand) => self.operand_lambda_escape(function, operand),
             _ => None,
         }
@@ -4539,8 +4527,8 @@ impl VerifyCx<'_> {
                         continue;
                     };
                     self.check_lambda_capture_place(site, function, place, decl.ty);
-                    if matches!(self.ty(decl.ty), Some(RirType::Lambda(_)))
-                        && matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })
+                    if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })
+                        && matches!(self.ty(decl.ty), Some(RirType::Lambda(_)))
                         && self.operand_lambda_escape(function, value)
                             != Some(RirLambdaEscape::Escaping)
                     {

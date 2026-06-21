@@ -987,6 +987,7 @@ pub(crate) struct FunctionValueFact {
 pub(crate) enum FunctionValueKind {
     Named(CallableInstanceKey),
     Lambda { lambda_expr: ExprId },
+    EscapingValue,
     LocalOrPlace,
 }
 

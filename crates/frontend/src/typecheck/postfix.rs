@@ -345,12 +345,16 @@ pub(super) fn check_postfix_chain_place(
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
                 let value = apply_call(&subject, node, *id, call_expected, tc);
+                let returned_function = matches!(value.checked.ty, Type::Func { .. });
                 let next_subject = if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
                     Subject::Value(value)
                 };
-                set_postfix_step_type(*id, &next_subject, optional_chain, node.span, tc);
+                let ty = set_postfix_step_type(*id, &next_subject, optional_chain, node.span, tc);
+                if returned_function {
+                    tc.record_function_value_expr(*id, &ty, FunctionValueKind::EscapingValue);
+                }
                 next_subject
             }
             PostfixStep::Index { node, id } => {
@@ -456,12 +460,13 @@ fn set_postfix_step_type(
     optional_chain: bool,
     span: Span,
     tc: &mut TypeChecker,
-) {
+) -> Type {
     let ty = chain_type(subject, optional_chain, span, tc);
     tc.set_type(id, ty.clone(), span);
     if matches!(subject, Subject::Value(_)) {
         tc.record_function_value_expr(id, &ty, FunctionValueKind::LocalOrPlace);
     }
+    ty
 }
 
 fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> Type {

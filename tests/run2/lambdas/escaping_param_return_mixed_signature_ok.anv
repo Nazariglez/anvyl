@@ -1,13 +1,22 @@
 // @mode: run
 // @expect: success
 // @match-begin
+// 4
 // 3
 // 1
 // @match-end
 // @frontend: new
 
+fn four() -> int {
+    4
+}
+
 fn make(seed: int) -> fn() -> int {
     || seed
+}
+
+fn id(f: escaping fn() -> int) -> fn() -> int {
+    f
 }
 
 fn use_now() -> int {
@@ -20,7 +29,10 @@ fn use_now() -> int {
 }
 
 fn main() {
-    let f = make(3);
+    let f = id(four);
     println(f());
+    let h0 = make(3);
+    let h = id(h0);
+    println(h());
     println(use_now());
 }

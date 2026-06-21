@@ -2,12 +2,17 @@
 // @expect: success
 // @match-begin
 // 3
+// 10
 // 1
 // @match-end
 // @frontend: new
 
 fn make(seed: int) -> fn() -> int {
     || seed
+}
+
+fn zero() -> int {
+    10
 }
 
 fn use_now() -> int {
@@ -21,6 +26,8 @@ fn use_now() -> int {
 
 fn main() {
     let f = make(3);
+    let z = zero;
     println(f());
+    println(z());
     println(use_now());
 }

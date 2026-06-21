@@ -594,6 +594,11 @@ impl ClosureClassifier {
                     .or_default()
                     .insert_known_function();
             }
+            FunctionValueKind::EscapingValue => {
+                let mut flow = EscapeFlow::default();
+                flow.insert_known_function();
+                self.expr_flows.insert(expr, flow);
+            }
             FunctionValueKind::Lambda { .. } => {}
             FunctionValueKind::LocalOrPlace => {
                 self.record_local_or_place_function_origin(expr, &mut is_function_source);
