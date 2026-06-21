@@ -363,7 +363,14 @@ pub struct RirCellDecl {
     pub source_local: RirLocalId,
     pub payload_ty: RirTypeId,
     pub storage: RirCellStorage,
+    pub lifetime: RirCellLifetime,
     pub symbol: RirSymbol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirCellLifetime {
+    Function,
+    Loop { loop_id: RirLoopId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,9 +383,30 @@ pub enum RirCellRef {
 pub struct RirScopedPlaceCellDecl {
     pub id: RirScopedPlaceCellId,
     pub owner: RirFunctionId,
-    pub source_local: RirLocalId,
+    pub source: RirScopedPlaceSource,
     pub payload_ty: RirTypeId,
     pub symbol: RirSymbol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirScopedPlaceSource {
+    SourceMutParam { place: RirMutPlaceArg },
+    VarSelf { place: RirMutPlaceArg },
+    PatternAlias { place: RirMutPlaceArg },
+}
+
+impl RirScopedPlaceSource {
+    pub fn place(&self) -> &RirMutPlaceArg {
+        match self {
+            Self::SourceMutParam { place }
+            | Self::VarSelf { place }
+            | Self::PatternAlias { place } => place,
+        }
+    }
+
+    pub fn root_local(&self) -> Option<RirLocalId> {
+        self.place().root_local()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,6 +741,10 @@ pub enum RirRValue {
         cell: RirScopedPlaceCellRef,
         ty: RirTypeId,
     },
+    MutPlaceGetCopy {
+        place: RirMutPlaceArg,
+        ty: RirTypeId,
+    },
     Array {
         ty: RirTypeId,
         elems: Vec<RirOperand>,
@@ -775,7 +807,7 @@ pub enum RirRValue {
         source: RirPlace,
     },
     ListPush {
-        list: RirPlace,
+        list: RirMutPlaceArg,
         value: RirOperand,
     },
     SliceView {
@@ -799,13 +831,13 @@ pub enum RirRValue {
         ty: RirTypeId,
     },
     MapInsert {
-        map: RirPlace,
+        map: RirMutPlaceArg,
         key: RirOperand,
         value: RirOperand,
         kind: RirMapWriteKind,
     },
     MapRemove {
-        map: RirPlace,
+        map: RirMutPlaceArg,
         key: RirOperand,
         ty: RirTypeId,
     },
@@ -1057,6 +1089,21 @@ impl RirMutPlaceArg {
         }
     }
 
+    pub fn root_local(&self) -> Option<RirLocalId> {
+        match &self.access {
+            RirMutPlaceAccess::Handle(handle) => handle.local(),
+            RirMutPlaceAccess::DataRef { .. } => None,
+        }
+    }
+
+    pub fn uses_local(&self, local: RirLocalId) -> bool {
+        self.root_local() == Some(local)
+            || self.projections.iter().any(
+                |projection| matches!(projection, RirProjection::Index(index) if *index == local),
+            )
+            || matches!(&self.access, RirMutPlaceAccess::DataRef { object: RirOperand::Place(place), .. } if place.uses_local(local))
+    }
+
     pub fn dataref(
         object: RirOperand,
         dataref: RirDataRefId,
@@ -1099,6 +1146,13 @@ impl RirPlace {
             projections,
             ty,
         }
+    }
+
+    pub fn uses_local(&self, local: RirLocalId) -> bool {
+        self.root == RirPlaceRoot::Local(local)
+            || self.projections.iter().any(
+                |projection| matches!(projection, RirProjection::Index(index) if *index == local),
+            )
     }
 }
 
@@ -1213,10 +1267,13 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         possibly_initialized: vec![],
         payload_ref_owned: vec![],
         lambda_escapes: vec![],
+        loop_lambda_scopes: vec![],
+        local_decl_scopes: vec![],
         initialized_cells: vec![],
         possibly_initialized_cells: vec![],
         global_initialized: vec![],
         loops: vec![],
+        scope_depth: 0,
         collection_loans: vec![],
     };
     cx.check();
@@ -1256,6 +1313,29 @@ pub enum RirVerifySite {
 enum StorageProjectionMode {
     Ordinary,
     MutPlace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutPlaceUse {
+    ReadCopy,
+    Write,
+    CallArg,
+    ScopedPlaceSource,
+    CollectionMutation,
+    IndexedMapMutation,
+}
+
+impl MutPlaceUse {
+    fn allow_dataref(self) -> bool {
+        matches!(
+            self,
+            Self::ReadCopy | Self::CallArg | Self::IndexedMapMutation
+        )
+    }
+
+    fn allow_cell_collection_projection(self) -> bool {
+        matches!(self, Self::ReadCopy)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1646,6 +1726,7 @@ type RirBlockState = (
     Vec<bool>,
     Vec<bool>,
     Vec<Option<RirLambdaEscape>>,
+    Vec<Option<usize>>,
     Vec<bool>,
     Vec<bool>,
     Vec<bool>,
@@ -1658,10 +1739,13 @@ struct VerifyCx<'a> {
     possibly_initialized: Vec<bool>,
     payload_ref_owned: Vec<bool>,
     lambda_escapes: Vec<Option<RirLambdaEscape>>,
+    loop_lambda_scopes: Vec<Option<usize>>,
+    local_decl_scopes: Vec<Option<usize>>,
     initialized_cells: Vec<bool>,
     possibly_initialized_cells: Vec<bool>,
     global_initialized: Vec<bool>,
     loops: Vec<RirLoopId>,
+    scope_depth: usize,
     collection_loans: Vec<ActiveRirCollectionLoan>,
 }
 
@@ -1678,6 +1762,12 @@ fn place_prefix(prefix: &RirPlace, place: &RirPlace) -> bool {
             .iter()
             .zip(&place.projections)
             .all(|(prefix, projection)| prefix == projection)
+}
+
+fn cell_ref_id(cell: RirCellRef) -> RirCellId {
+    match cell {
+        RirCellRef::Owner(cell) | RirCellRef::Capture { cell, .. } => cell,
+    }
 }
 
 fn native_extern_signature_ok(
@@ -2567,24 +2657,51 @@ impl VerifyCx<'_> {
         if owner.locals.iter().any(|local| local.symbol == cell.symbol) {
             self.push(site, RirVerifyErrorKind::DuplicateSymbol);
         }
-        match owner.locals.get(cell.source_local.index()) {
-            Some(local) if local.id != cell.source_local => {
-                self.push(site, RirVerifyErrorKind::BadId);
+        if cell.source.place().ty != cell.payload_ty {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: cell.payload_ty,
+                    found: cell.source.place().ty,
+                },
+            );
+        }
+        self.check_mut_place_arg(
+            site,
+            cell.owner,
+            owner,
+            cell.source.place(),
+            MutPlaceUse::ScopedPlaceSource,
+        );
+        match &cell.source {
+            RirScopedPlaceSource::SourceMutParam { place }
+            | RirScopedPlaceSource::VarSelf { place } => {
+                let Some(source_local) = place.root_local() else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return;
+                };
+                if !place.projections.is_empty() {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                }
+                match owner.locals.get(source_local.index()) {
+                    Some(local) if local.id != source_local => {
+                        self.push(site, RirVerifyErrorKind::BadId);
+                    }
+                    Some(_) if !Self::function_local_is_mut_place_param(owner, source_local) => {
+                        self.push(site, RirVerifyErrorKind::CallArgMode);
+                    }
+                    Some(_) => {}
+                    None => self.push(site, RirVerifyErrorKind::BadId),
+                }
             }
-            Some(local) if local.ty != cell.payload_ty => {
-                self.push(
-                    site,
-                    RirVerifyErrorKind::TypeMismatch {
-                        expected: cell.payload_ty,
-                        found: local.ty,
-                    },
-                );
+            RirScopedPlaceSource::PatternAlias { place } => {
+                if !matches!(
+                    &place.access,
+                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { .. })
+                ) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                }
             }
-            Some(_) if !Self::function_local_is_mut_place_param(owner, cell.source_local) => {
-                self.push(site, RirVerifyErrorKind::CallArgMode);
-            }
-            Some(_) => {}
-            None => self.push(site, RirVerifyErrorKind::BadId),
         }
     }
 
@@ -2593,12 +2710,15 @@ impl VerifyCx<'_> {
             let id = RirScopedPlaceCellId::from_index(index);
             for (other_index, other) in self.program.scoped_place_cells[..index].iter().enumerate()
             {
-                if cell.owner == other.owner && cell.source_local == other.source_local {
+                if cell.owner == other.owner && cell.source.place() == other.source.place() {
                     self.push(
                         RirVerifySite::ScopedPlaceCell(id),
                         RirVerifyErrorKind::DuplicateScopedPlaceCell {
                             owner: cell.owner,
-                            source_local: cell.source_local,
+                            source_local: cell
+                                .source
+                                .root_local()
+                                .unwrap_or(RirLocalId::from_index(usize::MAX)),
                             first: RirScopedPlaceCellId::from_index(other_index),
                             second: id,
                         },
@@ -3148,9 +3268,12 @@ impl VerifyCx<'_> {
         let previous_possible = std::mem::take(&mut self.possibly_initialized);
         let previous_payload_ref_owned = std::mem::take(&mut self.payload_ref_owned);
         let previous_lambda_escapes = std::mem::take(&mut self.lambda_escapes);
+        let previous_loop_lambda_scopes = std::mem::take(&mut self.loop_lambda_scopes);
+        let previous_local_decl_scopes = std::mem::take(&mut self.local_decl_scopes);
         let previous_initialized_cells = std::mem::take(&mut self.initialized_cells);
         let previous_possible_cells = std::mem::take(&mut self.possibly_initialized_cells);
         let previous_global_initialized = std::mem::take(&mut self.global_initialized);
+        let previous_scope_depth = self.scope_depth;
         self.initialized = function
             .locals
             .iter()
@@ -3159,9 +3282,16 @@ impl VerifyCx<'_> {
         self.possibly_initialized.clone_from(&self.initialized);
         self.payload_ref_owned = vec![false; function.locals.len()];
         self.lambda_escapes = vec![None; function.locals.len()];
+        self.loop_lambda_scopes = vec![None; function.locals.len()];
+        self.local_decl_scopes = function
+            .locals
+            .iter()
+            .map(|local| local.initialized.then_some(0))
+            .collect();
         self.initialized_cells = vec![false; self.program.cells.len()];
         self.possibly_initialized_cells = vec![false; self.program.cells.len()];
         self.global_initialized = vec![false; self.program.globals.len()];
+        self.scope_depth = 0;
         for lambda in self
             .program
             .lambdas
@@ -3219,9 +3349,12 @@ impl VerifyCx<'_> {
         self.possibly_initialized = previous_possible;
         self.payload_ref_owned = previous_payload_ref_owned;
         self.lambda_escapes = previous_lambda_escapes;
+        self.loop_lambda_scopes = previous_loop_lambda_scopes;
+        self.local_decl_scopes = previous_local_decl_scopes;
         self.initialized_cells = previous_initialized_cells;
         self.possibly_initialized_cells = previous_possible_cells;
         self.global_initialized = previous_global_initialized;
+        self.scope_depth = previous_scope_depth;
     }
 
     fn check_stmt(
@@ -3258,6 +3391,9 @@ impl VerifyCx<'_> {
                 }
                 let escape = self.rvalue_lambda_escape(function, value);
                 self.set_local_lambda_escape(function, *local, escape);
+                self.set_local_decl_scope(*local);
+                let loop_scope = self.rvalue_loop_lambda_scope(function, value);
+                self.set_local_loop_lambda_scope(function, *local, loop_scope);
                 if let Some(initialized) = self.initialized.get_mut(local.index()) {
                     *initialized = true;
                 }
@@ -3309,7 +3445,13 @@ impl VerifyCx<'_> {
                 if self.mut_place_set_replaces_active_collection_root(place) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
-                let ty = self.check_mut_place_arg(site, function_id, function, place);
+                let ty = self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    place,
+                    MutPlaceUse::Write,
+                );
                 self.check_rvalue(function_id, function, index, value, Some(ty));
             }
             RirStmt::Assign { dst, value } => {
@@ -3328,9 +3470,14 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                let loop_scope = self.rvalue_loop_lambda_scope(function, value);
                 if dst.projections.is_empty() {
                     let escape = self.rvalue_lambda_escape(function, value);
                     self.set_local_lambda_escape(function, dst_local, escape);
+                    self.check_loop_lambda_assignment_scope(site, dst_local, loop_scope);
+                    self.set_local_loop_lambda_scope(function, dst_local, loop_scope);
+                } else if loop_scope.is_some() {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
                 }
             }
             RirStmt::CellInit { cell, value } => {
@@ -3339,8 +3486,16 @@ impl VerifyCx<'_> {
                     return;
                 }
                 if let Some(decl) = self.check_function_cell_ref(site, function_id, *cell) {
-                    if !self.loops.is_empty() {
-                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+                    match decl.lifetime {
+                        RirCellLifetime::Function if !self.loops.is_empty() => {
+                            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+                        }
+                        RirCellLifetime::Loop { loop_id }
+                            if self.loops.last().copied() != Some(loop_id) =>
+                        {
+                            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+                        }
+                        RirCellLifetime::Function | RirCellLifetime::Loop { .. } => {}
                     }
                     if self.cell_possibly_initialized(decl.id) {
                         self.push(site, RirVerifyErrorKind::InitCellTwice(decl.id));
@@ -3436,6 +3591,7 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
                 let entry_globals = self.global_initialized.clone();
                 let then_state = self.check_structured_block(
                     function_id,
@@ -3444,6 +3600,7 @@ impl VerifyCx<'_> {
                     entry_definite.clone(),
                     entry_possible.clone(),
                     entry_lambda_escapes.clone(),
+                    entry_loop_lambda_scopes.clone(),
                     entry_globals.clone(),
                     None,
                 );
@@ -3452,6 +3609,7 @@ impl VerifyCx<'_> {
                         entry_definite.clone(),
                         entry_possible.clone(),
                         entry_lambda_escapes.clone(),
+                        entry_loop_lambda_scopes.clone(),
                         self.initialized_cells.clone(),
                         self.possibly_initialized_cells.clone(),
                         entry_globals.clone(),
@@ -3464,6 +3622,7 @@ impl VerifyCx<'_> {
                             entry_definite.clone(),
                             entry_possible.clone(),
                             entry_lambda_escapes.clone(),
+                            entry_loop_lambda_scopes.clone(),
                             entry_globals.clone(),
                             None,
                         )
@@ -3480,6 +3639,7 @@ impl VerifyCx<'_> {
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
                     self.lambda_escapes.clone(),
+                    self.loop_lambda_scopes.clone(),
                     self.global_initialized.clone(),
                     None,
                 );
@@ -3496,6 +3656,7 @@ impl VerifyCx<'_> {
                     self.initialized.clone(),
                     self.possibly_initialized.clone(),
                     self.lambda_escapes.clone(),
+                    self.loop_lambda_scopes.clone(),
                     self.global_initialized.clone(),
                     None,
                 );
@@ -3517,6 +3678,7 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
                 let entry_globals = self.global_initialized.clone();
                 let mut states = vec![];
                 for arm in &match_.arms {
@@ -3534,6 +3696,7 @@ impl VerifyCx<'_> {
                         entry_definite.clone(),
                         entry_possible.clone(),
                         entry_lambda_escapes.clone(),
+                        entry_loop_lambda_scopes.clone(),
                         entry_globals.clone(),
                         None,
                     ));
@@ -3546,6 +3709,7 @@ impl VerifyCx<'_> {
                         entry_definite.clone(),
                         entry_possible.clone(),
                         entry_lambda_escapes.clone(),
+                        entry_loop_lambda_scopes.clone(),
                         entry_globals.clone(),
                         None,
                     ));
@@ -3555,7 +3719,13 @@ impl VerifyCx<'_> {
                 self.merge_structured_states(states);
             }
             RirStmt::MapEntryMatch(match_) => {
-                let map_ty = self.check_mut_place_arg(site, function_id, function, &match_.map);
+                let map_ty = self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    &match_.map,
+                    MutPlaceUse::IndexedMapMutation,
+                );
                 let (key_ty, value_ty) = match self.ty(map_ty) {
                     Some(RirType::Map { key, value }) => (Some(key), Some(value)),
                     _ => {
@@ -3571,10 +3741,12 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
                 let entry_globals = self.global_initialized.clone();
                 let mut some_definite = entry_definite.clone();
                 let mut some_possible = entry_possible.clone();
                 let mut some_lambda_escapes = entry_lambda_escapes.clone();
+                let mut some_loop_lambda_scopes = entry_loop_lambda_scopes.clone();
                 if match_.payload_escapes && match_.payload.is_none() {
                     self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
                 }
@@ -3614,6 +3786,9 @@ impl VerifyCx<'_> {
                         if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
                             *slot = None;
                         }
+                        if let Some(slot) = some_loop_lambda_scopes.get_mut(payload.index()) {
+                            *slot = None;
+                        }
                     } else {
                         self.push(site, RirVerifyErrorKind::BadId);
                     }
@@ -3626,11 +3801,12 @@ impl VerifyCx<'_> {
                     some_definite,
                     some_possible,
                     some_lambda_escapes,
+                    some_loop_lambda_scopes,
                     entry_globals.clone(),
                     escaping_payload,
                 );
                 if !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible, _, _, _, _))) =
+                    && let (Some(payload), Some((definite, possible, _, _, _, _, _))) =
                         (match_.payload, &mut some_state)
                 {
                     if let Some(slot) = definite.get_mut(payload.index()) {
@@ -3647,6 +3823,7 @@ impl VerifyCx<'_> {
                     entry_definite,
                     entry_possible,
                     entry_lambda_escapes,
+                    entry_loop_lambda_scopes,
                     entry_globals,
                     None,
                 );
@@ -3662,7 +3839,13 @@ impl VerifyCx<'_> {
                         place.ty
                     }
                     RirOptionSubject::MutPlace(place) => {
-                        let ty = self.check_mut_place_arg(site, function_id, function, place);
+                        let ty = self.check_mut_place_arg(
+                            site,
+                            function_id,
+                            function,
+                            place,
+                            MutPlaceUse::CallArg,
+                        );
                         if !match_.payload_ref {
                             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                         }
@@ -3683,10 +3866,12 @@ impl VerifyCx<'_> {
                 let entry_definite = self.initialized.clone();
                 let entry_possible = self.possibly_initialized.clone();
                 let entry_lambda_escapes = self.lambda_escapes.clone();
+                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
                 let entry_globals = self.global_initialized.clone();
                 let mut some_definite = entry_definite.clone();
                 let mut some_possible = entry_possible.clone();
                 let mut some_lambda_escapes = entry_lambda_escapes.clone();
+                let mut some_loop_lambda_scopes = entry_loop_lambda_scopes.clone();
                 if (match_.payload_ref || match_.payload_escapes) && match_.payload.is_none() {
                     self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
                 }
@@ -3744,6 +3929,9 @@ impl VerifyCx<'_> {
                         if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
                             *slot = None;
                         }
+                        if let Some(slot) = some_loop_lambda_scopes.get_mut(payload.index()) {
+                            *slot = None;
+                        }
                     } else {
                         self.push(site, RirVerifyErrorKind::BadId);
                     }
@@ -3766,12 +3954,13 @@ impl VerifyCx<'_> {
                     some_definite,
                     some_possible,
                     some_lambda_escapes,
+                    some_loop_lambda_scopes,
                     entry_globals.clone(),
                     escaping_payload,
                 );
                 if match_.payload_ref
                     && !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible, _, _, _, _))) =
+                    && let (Some(payload), Some((definite, possible, _, _, _, _, _))) =
                         (match_.payload, &mut some_state)
                 {
                     if let Some(slot) = definite.get_mut(payload.index()) {
@@ -3788,6 +3977,7 @@ impl VerifyCx<'_> {
                     entry_definite,
                     entry_possible,
                     entry_lambda_escapes,
+                    entry_loop_lambda_scopes,
                     entry_globals,
                     None,
                 );
@@ -3812,6 +4002,93 @@ impl VerifyCx<'_> {
         if let Some(slot) = self.lambda_escapes.get_mut(local.index()) {
             *slot = is_lambda.then_some(escape).flatten();
         }
+    }
+
+    fn set_local_decl_scope(&mut self, local: RirLocalId) {
+        if let Some(slot) = self.local_decl_scopes.get_mut(local.index())
+            && slot.is_none()
+        {
+            *slot = Some(self.scope_depth);
+        }
+    }
+
+    fn set_local_loop_lambda_scope(
+        &mut self,
+        function: &RirFunction,
+        local: RirLocalId,
+        scope: Option<usize>,
+    ) {
+        let is_lambda = function
+            .locals
+            .get(local.index())
+            .is_some_and(|local| matches!(self.ty(local.ty), Some(RirType::Lambda(_))));
+        if let Some(slot) = self.loop_lambda_scopes.get_mut(local.index()) {
+            *slot = is_lambda.then_some(scope).flatten();
+        }
+    }
+
+    fn check_loop_lambda_assignment_scope(
+        &mut self,
+        site: RirVerifySite,
+        local: RirLocalId,
+        scope: Option<usize>,
+    ) {
+        if scope.is_some() && self.local_decl_scopes.get(local.index()).copied().flatten() != scope
+        {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+        }
+    }
+
+    fn rvalue_loop_lambda_scope(&self, function: &RirFunction, value: &RirRValue) -> Option<usize> {
+        match value {
+            RirRValue::Lambda { captures, .. } => captures
+                .iter()
+                .any(|capture| self.lambda_capture_arg_uses_loop_cell(capture))
+                .then_some(self.scope_depth),
+            RirRValue::Use(operand) => self.operand_loop_lambda_scope(function, operand),
+            _ => None,
+        }
+    }
+
+    fn operand_loop_lambda_scope(
+        &self,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) -> Option<usize> {
+        let RirOperand::Place(place) = operand else {
+            return None;
+        };
+        let RirPlaceRoot::Local(local) = place.root else {
+            return None;
+        };
+        if !place.projections.is_empty()
+            || !matches!(self.ty(place.ty), Some(RirType::Lambda(_)))
+            || function
+                .locals
+                .get(local.index())
+                .is_none_or(|local_decl| local_decl.ty != place.ty)
+        {
+            return None;
+        }
+        self.loop_lambda_scopes
+            .get(local.index())
+            .copied()
+            .flatten()
+    }
+
+    fn lambda_capture_arg_uses_loop_cell(&self, capture: &RirLambdaCaptureArg) -> bool {
+        let cell = match capture {
+            RirLambdaCaptureArg::StackCell { cell } | RirLambdaCaptureArg::HeapCell { cell } => {
+                *cell
+            }
+            RirLambdaCaptureArg::Readonly { .. }
+            | RirLambdaCaptureArg::Scoped { .. }
+            | RirLambdaCaptureArg::ScopedPlaceCell { .. } => return false,
+        };
+        self.program
+            .cells
+            .get(cell_ref_id(cell).index())
+            .is_some_and(|cell| matches!(cell.lifetime, RirCellLifetime::Loop { .. }))
     }
 
     fn rvalue_lambda_escape(
@@ -3894,6 +4171,7 @@ impl VerifyCx<'_> {
             self.initialized.clone(),
             self.possibly_initialized.clone(),
             self.lambda_escapes.clone(),
+            self.loop_lambda_scopes.clone(),
             self.global_initialized.clone(),
             None,
         );
@@ -3990,101 +4268,6 @@ impl VerifyCx<'_> {
         }
     }
 
-    fn check_collection_mutation_root(
-        &mut self,
-        site: RirVerifySite,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) {
-        if self.assignment_replaces_active_collection_root(place) {
-            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-        }
-        self.check_collection_write_root(site, function, place, false);
-    }
-
-    fn check_collection_write_root(
-        &mut self,
-        site: RirVerifySite,
-        function: &RirFunction,
-        place: &RirPlace,
-        allow_dataref: bool,
-    ) {
-        match place.root {
-            RirPlaceRoot::Local(_) => {
-                let local = self.local_root(site, place);
-                if !(allow_dataref && self.check_dataref_storage_place(site, function, place)) {
-                    self.check_place(site, function, place);
-                }
-                self.check_mutable_local_root(site, function, local);
-            }
-            RirPlaceRoot::Global(global) => {
-                let Some(decl) = self.check_global_id(site, global).cloned() else {
-                    self.check_place(site, function, place);
-                    return;
-                };
-                self.check_place(site, function, place);
-                if !decl.mutable {
-                    self.push(site, RirVerifyErrorKind::ImmutableAssign);
-                }
-                if !self
-                    .global_initialized
-                    .get(global.index())
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    self.push(site, RirVerifyErrorKind::UninitializedGlobal(global));
-                }
-            }
-        }
-    }
-
-    fn check_dataref_storage_place(
-        &mut self,
-        site: RirVerifySite,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) -> bool {
-        let RirPlaceRoot::Local(local) = place.root else {
-            return false;
-        };
-        let Some(local_decl) = function.locals.get(local.index()) else {
-            return false;
-        };
-        let Some(RirType::DataRef(dataref)) = self.ty(local_decl.ty) else {
-            return false;
-        };
-        if place.projections.is_empty() {
-            return false;
-        }
-        if Self::function_local_is_hidden_cell_param(function, local)
-            || self.function_local_is_scoped_place_source(function.id, local)
-        {
-            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
-            return true;
-        }
-        self.check_type_id(site, place.ty);
-        if !self
-            .initialized
-            .get(local.index())
-            .copied()
-            .unwrap_or(false)
-        {
-            self.push(site, RirVerifyErrorKind::UninitializedLocal(local));
-        }
-        match RirPlaceModel::new(self.program).dataref_storage_path(dataref, &place.projections) {
-            Ok(path) if path.ty() == place.ty => {}
-            Ok(path) => self.push(
-                site,
-                RirVerifyErrorKind::TypeMismatch {
-                    expected: path.ty(),
-                    found: place.ty,
-                },
-            ),
-            Err(error) => self.push_place_error(site, error),
-        }
-        true
-    }
-
     fn place_is_mutable_root(function: &RirFunction, place: &RirPlace) -> bool {
         match place.root {
             RirPlaceRoot::Local(local) => {
@@ -4124,15 +4307,20 @@ impl VerifyCx<'_> {
         definite: Vec<bool>,
         possible: Vec<bool>,
         lambda_escapes: Vec<Option<RirLambdaEscape>>,
+        loop_lambda_scopes: Vec<Option<usize>>,
         global_initialized: Vec<bool>,
         preserved_payload_ref: Option<RirLocalId>,
     ) -> Option<RirBlockState> {
         let outer_definite = std::mem::replace(&mut self.initialized, definite);
         let outer_possible = std::mem::replace(&mut self.possibly_initialized, possible);
         let outer_lambda_escapes = std::mem::replace(&mut self.lambda_escapes, lambda_escapes);
+        let outer_loop_lambda_scopes =
+            std::mem::replace(&mut self.loop_lambda_scopes, loop_lambda_scopes);
         let outer_globals = std::mem::replace(&mut self.global_initialized, global_initialized);
         let outer_cell_definite = self.initialized_cells.clone();
         let outer_cell_possible = self.possibly_initialized_cells.clone();
+        let outer_scope_depth = self.scope_depth;
+        self.scope_depth += 1;
         for (index, stmt) in body.stmts.iter().enumerate() {
             self.check_stmt(function_id, function, index, stmt);
         }
@@ -4142,6 +4330,7 @@ impl VerifyCx<'_> {
             let mut definite = self.initialized.clone();
             let mut possible = self.possibly_initialized.clone();
             let lambda_escapes = self.lambda_escapes.clone();
+            let loop_lambda_scopes = self.loop_lambda_scopes.clone();
             let cell_definite = self.initialized_cells.clone();
             let cell_possible = self.possibly_initialized_cells.clone();
             let globals = self.global_initialized.clone();
@@ -4167,6 +4356,7 @@ impl VerifyCx<'_> {
                 definite,
                 possible,
                 lambda_escapes,
+                loop_lambda_scopes,
                 cell_definite,
                 cell_possible,
                 globals,
@@ -4175,9 +4365,11 @@ impl VerifyCx<'_> {
         self.initialized = outer_definite;
         self.possibly_initialized = outer_possible;
         self.lambda_escapes = outer_lambda_escapes;
+        self.loop_lambda_scopes = outer_loop_lambda_scopes;
         self.global_initialized = outer_globals;
         self.initialized_cells = outer_cell_definite;
         self.possibly_initialized_cells = outer_cell_possible;
+        self.scope_depth = outer_scope_depth;
         result
     }
 
@@ -4258,6 +4450,7 @@ impl VerifyCx<'_> {
             mut definite,
             mut possible,
             mut lambda_escapes,
+            mut loop_lambda_scopes,
             mut cell_definite,
             mut cell_possible,
             mut globals,
@@ -4269,6 +4462,7 @@ impl VerifyCx<'_> {
             next_definite,
             next_possible,
             next_lambda_escapes,
+            next_loop_lambda_scopes,
             next_cell_definite,
             next_cell_possible,
             next_globals,
@@ -4287,6 +4481,11 @@ impl VerifyCx<'_> {
             lambda_escapes = lambda_escapes
                 .iter()
                 .zip(&next_lambda_escapes)
+                .map(|(lhs, rhs)| if lhs == rhs { *lhs } else { None })
+                .collect();
+            loop_lambda_scopes = loop_lambda_scopes
+                .iter()
+                .zip(&next_loop_lambda_scopes)
                 .map(|(lhs, rhs)| if lhs == rhs { *lhs } else { None })
                 .collect();
             cell_definite = cell_definite
@@ -4308,6 +4507,7 @@ impl VerifyCx<'_> {
         self.initialized = definite;
         self.possibly_initialized = possible;
         self.lambda_escapes = lambda_escapes;
+        self.loop_lambda_scopes = loop_lambda_scopes;
         self.initialized_cells = cell_definite;
         self.possibly_initialized_cells = cell_possible;
         self.global_initialized = globals;
@@ -4607,6 +4807,29 @@ impl VerifyCx<'_> {
                 }
                 Some(*ty)
             }
+            RirRValue::MutPlaceGetCopy { place, ty } => {
+                self.check_type_id(site, *ty);
+                let found = self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    place,
+                    MutPlaceUse::ReadCopy,
+                );
+                if found != *ty {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: found,
+                            found: *ty,
+                        },
+                    );
+                }
+                if !self.copyable_type(*ty) {
+                    self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
+                }
+                Some(*ty)
+            }
             RirRValue::Array { ty, elems } => {
                 self.check_type_id(site, *ty);
                 let Some(RirType::Array { elem, len }) = self.ty(*ty) else {
@@ -4777,14 +5000,20 @@ impl VerifyCx<'_> {
                 self.type_id(RirType::Int)
             }
             RirRValue::ListPush { list, value } => {
-                self.check_collection_mutation_root(site, function, list);
-                let Some(RirType::List(elem)) = self.ty(list.ty) else {
+                if self.mut_place_set_replaces_active_collection_root(list) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                let list_ty = self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    list,
+                    MutPlaceUse::CollectionMutation,
+                );
+                let Some(RirType::List(elem)) = self.ty(list_ty) else {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if Self::place_is_mut_place_param_root(function, list) {
-                    self.check_short_region_operand(site, function, value);
-                }
                 self.check_value_operand_ty(site, function, value, elem);
                 self.type_id(RirType::Void)
             }
@@ -4829,11 +5058,9 @@ impl VerifyCx<'_> {
                 }
                 Some(*ty)
             }
-            RirRValue::MapGet { map, key, ty } | RirRValue::MapRemove { map, key, ty } => {
+            RirRValue::MapGet { map, key, ty } => {
                 self.check_place(site, function, map);
-                if matches!(value, RirRValue::MapRemove { .. }) {
-                    self.check_collection_mutation_root(site, function, map);
-                } else if matches!(map.root, RirPlaceRoot::Local(_)) {
+                if matches!(map.root, RirPlaceRoot::Local(_)) {
                     self.local_root(site, map);
                 }
                 self.check_type_id(site, *ty);
@@ -4856,6 +5083,38 @@ impl VerifyCx<'_> {
                 }
                 if Self::place_is_mut_place_param_root(function, map) {
                     self.check_short_region_operand(site, function, key);
+                }
+                self.check_value_operand_ty(site, function, key, key_ty);
+                Some(*ty)
+            }
+            RirRValue::MapRemove { map, key, ty } => {
+                if self.mut_place_set_replaces_active_collection_root(map) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                let map_ty = self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    map,
+                    MutPlaceUse::CollectionMutation,
+                );
+                self.check_type_id(site, *ty);
+                let Some(RirType::Map { key: key_ty, value }) = self.ty(map_ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                let Some(RirType::Option(option_value)) = self.ty(*ty) else {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                };
+                if option_value != value {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: value,
+                            found: option_value,
+                        },
+                    );
                 }
                 self.check_value_operand_ty(site, function, key, key_ty);
                 Some(*ty)
@@ -4942,23 +5201,22 @@ impl VerifyCx<'_> {
                 value,
                 kind,
             } => {
-                if *kind == RirMapWriteKind::StructuralInsert {
-                    self.check_collection_mutation_root(site, function, map);
-                } else {
-                    self.check_collection_write_root(site, function, map, true);
+                if self.mut_place_set_replaces_active_collection_root(map) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
+                let use_ = match kind {
+                    RirMapWriteKind::IndexedAssignment => MutPlaceUse::IndexedMapMutation,
+                    RirMapWriteKind::StructuralInsert => MutPlaceUse::CollectionMutation,
+                };
+                let map_ty = self.check_mut_place_arg(site, function_id, function, map, use_);
                 let Some(RirType::Map {
                     key: key_ty,
                     value: value_ty,
-                }) = self.ty(map.ty)
+                }) = self.ty(map_ty)
                 else {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                     return;
                 };
-                if Self::place_is_mut_place_param_root(function, map) {
-                    self.check_short_region_operand(site, function, key);
-                    self.check_short_region_operand(site, function, value);
-                }
                 self.check_value_operand_ty(site, function, key, key_ty);
                 self.check_value_operand_ty(site, function, value, value_ty);
                 self.type_id(RirType::Void)
@@ -5133,9 +5391,13 @@ impl VerifyCx<'_> {
                     }
                     Some(place.ty)
                 }
-                RirCallArg::MutPlace(arg) => {
-                    Some(self.check_mut_place_arg(site, function_id, function, arg))
-                }
+                RirCallArg::MutPlace(arg) => Some(self.check_mut_place_arg(
+                    site,
+                    function_id,
+                    function,
+                    arg,
+                    MutPlaceUse::CallArg,
+                )),
                 RirCallArg::ScopedLambda { callee, sig } => {
                     self.check_lambda_sig_id(site, *sig);
                     let found = self.value_operand_ty(site, function, callee);
@@ -5185,20 +5447,29 @@ impl VerifyCx<'_> {
         function_id: RirFunctionId,
         function: &RirFunction,
         arg: &RirMutPlaceArg,
+        use_: MutPlaceUse,
     ) -> RirTypeId {
         self.check_type_id(site, arg.ty);
         match &arg.access {
             RirMutPlaceAccess::Handle(handle) => {
-                self.check_mut_place_handle(site, function_id, function, handle, arg)
+                self.check_mut_place_handle(site, function_id, function, handle, arg, use_)
             }
             RirMutPlaceAccess::DataRef { object, dataref } => {
+                if !use_.allow_dataref() {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+                let mode = if use_ == MutPlaceUse::IndexedMapMutation {
+                    StorageProjectionMode::Ordinary
+                } else {
+                    StorageProjectionMode::MutPlace
+                };
                 let found = self.check_dataref_access(
                     site,
                     function,
                     object,
                     *dataref,
                     &arg.projections,
-                    StorageProjectionMode::MutPlace,
+                    mode,
                 );
                 if let Some(found) = found
                     && found != arg.ty
@@ -5223,16 +5494,21 @@ impl VerifyCx<'_> {
         function: &RirFunction,
         handle: &RirMutPlaceHandle,
         arg: &RirMutPlaceArg,
+        use_: MutPlaceUse,
     ) -> RirTypeId {
         match handle {
             RirMutPlaceHandle::Local { local, ty } => {
-                self.check_place(
-                    site,
-                    function,
-                    &RirPlace::local(*local, arg.projections.clone(), arg.ty),
-                );
-                if Self::function_local_is_mut_place_param(function, *local) {
-                    self.push(site, RirVerifyErrorKind::CallArgMode);
+                if use_ == MutPlaceUse::ScopedPlaceSource {
+                    self.check_scoped_place_source_projection(site, function, *ty, arg);
+                } else {
+                    self.check_place(
+                        site,
+                        function,
+                        &RirPlace::local(*local, arg.projections.clone(), arg.ty),
+                    );
+                    if Self::function_local_is_mut_place_param(function, *local) {
+                        self.push(site, RirVerifyErrorKind::CallArgMode);
+                    }
                 }
                 match function.locals.get(local.index()) {
                     Some(local) if local.mutable || local.payload_ref => {
@@ -5256,7 +5532,9 @@ impl VerifyCx<'_> {
             }
             RirMutPlaceHandle::Param { local, ty } => {
                 self.check_local_id(site, function, *local);
-                if self.function_local_is_scoped_place_source(function_id, *local) {
+                if use_ != MutPlaceUse::ScopedPlaceSource
+                    && self.function_local_is_scoped_place_source(function_id, *local)
+                {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
                 }
                 match function.params.iter().find(|param| param.local == *local) {
@@ -5287,6 +5565,8 @@ impl VerifyCx<'_> {
                             },
                         );
                     }
+                } else if use_ == MutPlaceUse::ScopedPlaceSource {
+                    self.check_scoped_place_source_projection(site, function, *ty, arg);
                 } else {
                     self.check_place(
                         site,
@@ -5313,6 +5593,7 @@ impl VerifyCx<'_> {
                     *ty,
                     &arg.projections,
                     arg.ty,
+                    use_,
                 );
                 arg.ty
             }
@@ -5324,6 +5605,7 @@ impl VerifyCx<'_> {
                     *ty,
                     &arg.projections,
                     arg.ty,
+                    use_,
                 );
                 arg.ty
             }
@@ -5346,6 +5628,7 @@ impl VerifyCx<'_> {
                     *ty,
                     &arg.projections,
                     arg.ty,
+                    use_,
                 );
                 arg.ty
             }
@@ -5402,10 +5685,15 @@ impl VerifyCx<'_> {
         root_ty: RirTypeId,
         projections: &[RirProjection],
         final_ty: RirTypeId,
+        use_: MutPlaceUse,
     ) {
-        let Some(expected) =
-            self.check_projection_chain(site, function, root_ty, projections, false)
-        else {
+        let Some(expected) = self.check_projection_chain(
+            site,
+            function,
+            root_ty,
+            projections,
+            use_.allow_cell_collection_projection(),
+        ) else {
             return;
         };
         if expected != final_ty {
@@ -5497,6 +5785,32 @@ impl VerifyCx<'_> {
             self.push(site, RirVerifyErrorKind::UninitializedLocal(local));
         }
         Some(index_local)
+    }
+
+    fn check_scoped_place_source_projection(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        root_ty: RirTypeId,
+        arg: &RirMutPlaceArg,
+    ) {
+        let Some(found) =
+            self.check_projection_chain(site, function, root_ty, &arg.projections, true)
+        else {
+            return;
+        };
+        if found != arg.ty {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: found,
+                    found: arg.ty,
+                },
+            );
+        }
+        if !self.projected_mut_place_arg_supported(root_ty, &arg.projections, true) {
+            self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+        }
     }
 
     fn check_cell_mut_place_arg(
@@ -6108,7 +6422,7 @@ impl VerifyCx<'_> {
         self.program
             .scoped_place_cells
             .iter()
-            .any(|cell| cell.owner == function && cell.source_local == local)
+            .any(|cell| cell.owner == function && cell.source.root_local() == Some(local))
     }
 
     fn function_local_is_mut_place_param(function: &RirFunction, local: RirLocalId) -> bool {

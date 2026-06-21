@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 7
+
+struct Point { x: int, y: int }
+
+fn read(var point: Point) -> int {
+    var Point { x } = point;
+    let f = || x;
+    f()
+}
+
+fn main() {
+    var point = Point { x: 7, y: 0 };
+    println(read(point));
+}

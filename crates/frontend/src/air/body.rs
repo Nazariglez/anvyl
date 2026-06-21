@@ -152,7 +152,7 @@ pub struct AirMapEntryMatch {
     pub none_block: AirBlock,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     pub root: PlaceRoot,
     pub projection: Vec<Projection>,

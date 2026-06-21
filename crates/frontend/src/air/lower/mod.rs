@@ -7,9 +7,9 @@ use super::{
     AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
     AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
     AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg,
-    Callee, CaptureCellDecl, CaptureCellId, CaptureLocalSource, ConstData, ConstId, ConstValue,
-    CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl, ExternDecl,
-    ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
+    Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData,
+    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl,
+    ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
     FunctionSpecialization, GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg,
@@ -1723,6 +1723,7 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
     function: Function,
     locals: HashMap<SemanticLocalId, Place>,
     capture_sources: HashMap<BindingId, LambdaCaptureSource>,
+    binding_scoped_borrows: HashMap<BindingId, ScopedBorrowId>,
     binding_cells: HashMap<BindingId, CaptureCellId>,
     owned_lambdas: Vec<(ExprId, LambdaId)>,
     block: AirBlock,
@@ -1747,7 +1748,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let owned_lambdas = owned_reachable_lambdas(cx, functions, body);
         let binding_cells = binding_capture_cells(&cx.program, function_id);
         let mut binding_scoped_borrows = binding_scoped_borrows(&cx.program, function_id);
-        alloc_borrowed_param_scoped_borrows(
+        alloc_scoped_borrows(
             cx,
             function_id,
             &function,
@@ -1780,6 +1781,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             function,
             locals,
             capture_sources,
+            binding_scoped_borrows,
             binding_cells,
             owned_lambdas,
             block: AirBlock::default(),
@@ -1819,11 +1821,21 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Some(cell) = self.binding_cells.get(&binding).copied() {
             return Ok(cell);
         }
+        let lifetime = match self.active_loops.last().copied() {
+            Some(loop_id) => {
+                if let Some(expr_id) = self.escaping_capture_cell_lambda(binding) {
+                    return Err(lambda_capture_gap(expr_id));
+                }
+                CaptureCellLifetime::Loop { loop_id }
+            }
+            None => CaptureCellLifetime::Function,
+        };
         let cell = self.cx.program.alloc_capture_cell(CaptureCellDecl {
             binding: air_binding_id(binding),
             owner: self.function_id,
             source_local,
             ty,
+            lifetime,
         });
         if self.binding_cells.insert(binding, cell).is_some() {
             return Err(LowerError::DuplicateBindingBridge {
@@ -1832,6 +1844,18 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             });
         }
         Ok(cell)
+    }
+
+    fn escaping_capture_cell_lambda(&self, binding: BindingId) -> Option<ExprId> {
+        self.cx
+            .typecheck_facts?
+            .lambda_captures()
+            .values()
+            .find_map(|capture| {
+                (capture.binding_id == binding
+                    && capture.storage == CaptureStorage::OwnedMutableUpvalue)
+                    .then_some(capture.lambda_id)
+            })
     }
 
     fn current_specialization(&self) -> GenericArgs {
@@ -2196,7 +2220,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     ) -> Result<(), LowerError> {
         let name = pattern_ident(pattern)?;
         let semantic = self.pattern_binding_semantic(pattern)?;
-        let binding = self.local_def(semantic)?.binding_id.map(air_binding_id);
+        let source_binding = self.local_def(semantic)?.binding_id;
+        let binding = source_binding.map(air_binding_id);
         let Operand::Place(place) = value else {
             return Err(unsupported_pattern_stmt(pattern));
         };
@@ -2211,7 +2236,70 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             local.kind = LocalKind::PatternBinding;
         }
         self.locals.insert(semantic, place.clone());
-        self.insert_capture_source(semantic, place)
+        self.insert_capture_source(semantic, place.clone())?;
+        self.promote_pattern_alias_scoped_borrow(semantic, source_binding, &place)
+    }
+
+    fn promote_pattern_alias_scoped_borrow(
+        &mut self,
+        semantic: SemanticLocalId,
+        binding: Option<BindingId>,
+        source: &Place,
+    ) -> Result<(), LowerError> {
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        let ty = source.ty;
+        for (expr_id, _) in self.owned_lambdas.clone() {
+            for capture in self.cx.ordered_lambda_capture_facts(expr_id)? {
+                if capture.binding_id != binding
+                    || capture.storage != CaptureStorage::BorrowedScoped
+                    || capture.origin != CaptureStorageOrigin::PatternAlias
+                {
+                    continue;
+                }
+                if !self.pattern_alias_scoped_source_supported(source) {
+                    return Err(lambda_capture_gap(expr_id));
+                }
+                let borrow = match self.binding_scoped_borrows.get(&binding).copied() {
+                    Some(borrow) => borrow,
+                    None => {
+                        let borrow = self.cx.program.alloc_scoped_borrow(ScopedBorrowDecl {
+                            owner: self.function_id,
+                            binding: air_binding_id(binding),
+                            source: ScopedBorrowSource::PatternAlias {
+                                source: source.clone(),
+                            },
+                            ty,
+                            mutability: AirMutability::Mutable,
+                        });
+                        self.binding_scoped_borrows.insert(binding, borrow);
+                        borrow
+                    }
+                };
+                let place = self
+                    .cx
+                    .program
+                    .scoped_borrow_place(borrow)
+                    .ok_or_else(|| lambda_capture_gap(expr_id))?;
+                self.locals.insert(semantic, place.clone());
+                self.capture_sources
+                    .insert(binding, LambdaCaptureSource::Local(place));
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn pattern_alias_scoped_source_supported(&self, source: &Place) -> bool {
+        let PlaceRoot::Local(local) = source.root else {
+            return false;
+        };
+        self.function
+            .signature
+            .params
+            .iter()
+            .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
     }
 
     fn lower_match_effect(
@@ -3052,6 +3140,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 self.locals.insert(semantic, place.clone());
                 self.insert_capture_source(semantic, place)
             }
+            Pattern::Tuple(_) | Pattern::Struct { .. }
+                if binding.node.mutability == AstMutability::Mutable =>
+            {
+                let place = self
+                    .lower_place_arg(&binding.node.value, true)
+                    .map_err(|_| unsupported_pattern_stmt(&binding.node.pattern))?;
+                self.lower_for_pattern_binding(&binding.node.pattern, Operand::Place(place), true)
+            }
             Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
                 self.lower_effect(&binding.node.value)
             }
@@ -3206,18 +3302,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         let root = self.binding_place(&fact)?;
         if requires_mut {
-            if self.place_is_capture_cell(&root) {
-                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
-            }
-            if self.place_is_scoped_borrow(&root) {
-                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
-            }
-            let Some(root_local) = root.root.local() else {
-                return Err(unsupported_expr(expr));
-            };
-            if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
-                return Err(unsupported_expr(expr));
-            }
+            return self.lower_mut_source_place(expr, root, allow_promoted_root);
         }
         self.lower_projected_place(expr, root)
     }
@@ -3230,22 +3315,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(&fact)?;
-            if self.place_is_capture_cell(&root) {
-                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
-            }
-            if self.place_is_scoped_borrow(&root) {
-                return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
-            }
-            let Some(root_local) = root.root.local() else {
-                return Err(unsupported_expr(expr));
-            };
-            if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
-                return Err(unsupported_expr(expr));
-            }
-            return self.lower_projected_place(expr, root);
+            return self.lower_mut_source_place(expr, root, allow_promoted_root);
         }
         self.lower_self_mut_place_arg(expr)
             .or_else(|_| self.lower_unique_named_mut_place_arg(expr))
+    }
+
+    fn lower_mut_source_place(
+        &mut self,
+        expr: &ExprNode,
+        root: Place,
+        allow_promoted_root: bool,
+    ) -> Result<Place, LowerError> {
+        if self.place_is_capture_cell(&root) || self.place_is_scoped_borrow(&root) {
+            return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
+        }
+        let Some(root_local) = root.root.local() else {
+            return Err(unsupported_expr(expr));
+        };
+        if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
+            return Err(unsupported_expr(expr));
+        }
+        self.lower_projected_place(expr, root)
     }
 
     fn lower_promoted_mut_arg(
@@ -6887,10 +6978,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn require_mutable_place(&self, expr: &ExprNode, place: &Place) -> Result<(), LowerError> {
-        if self.place_is_capture_cell(place) {
-            return Err(lambda_capture_gap(expr.node.id));
-        }
-        if self.place_is_scoped_borrow(place) {
+        if self.place_is_capture_cell(place) || self.place_is_scoped_borrow(place) {
             return if place.projection.is_empty() {
                 Ok(())
             } else {
@@ -8773,7 +8861,12 @@ fn lowered_capture_kind(
         CaptureStorage::OwnedMutableUpvalue if requires_cell => Ok(LoweredCaptureKind::CaptureCell),
         CaptureStorage::BorrowedScoped
             if escape == LambdaEscapeKind::NonEscaping
-                && origin == CaptureStorageOrigin::BorrowedParam =>
+                && matches!(
+                    origin,
+                    CaptureStorageOrigin::BorrowedParam
+                        | CaptureStorageOrigin::VarSelf
+                        | CaptureStorageOrigin::PatternAlias
+                ) =>
         {
             Ok(LoweredCaptureKind::ScopedBorrow)
         }
@@ -8951,7 +9044,7 @@ fn owned_reachable_lambdas(
         .collect()
 }
 
-fn alloc_borrowed_param_scoped_borrows(
+fn alloc_scoped_borrows(
     cx: &mut LowerCx<'_>,
     owner: FunctionId,
     owner_function: &Function,
@@ -8962,7 +9055,10 @@ fn alloc_borrowed_param_scoped_borrows(
     for (expr_id, _) in owned_lambdas {
         for capture in cx.ordered_lambda_capture_facts(*expr_id)? {
             if capture.storage != CaptureStorage::BorrowedScoped
-                || capture.origin != CaptureStorageOrigin::BorrowedParam
+                || !matches!(
+                    capture.origin,
+                    CaptureStorageOrigin::BorrowedParam | CaptureStorageOrigin::VarSelf
+                )
             {
                 continue;
             }
@@ -8985,7 +9081,7 @@ fn alloc_borrowed_param_scoped_borrows(
             let borrow = match binding_scoped_borrows.get(&binding).copied() {
                 Some(borrow) => borrow,
                 None => {
-                    let source_local = exact_source_mut_param_local(
+                    let source = scoped_borrow_source(
                         *expr_id,
                         owner,
                         owner_function,
@@ -8996,9 +9092,7 @@ fn alloc_borrowed_param_scoped_borrows(
                     let borrow = cx.program.alloc_scoped_borrow(ScopedBorrowDecl {
                         owner,
                         binding: air_binding_id(binding),
-                        source: ScopedBorrowSource::SourceMutParam {
-                            local: source_local,
-                        },
+                        source,
                         ty,
                         mutability: AirMutability::Mutable,
                     });
@@ -9016,15 +9110,20 @@ fn alloc_borrowed_param_scoped_borrows(
     Ok(())
 }
 
-fn exact_source_mut_param_local(
+fn scoped_borrow_source(
     expr_id: ExprId,
     owner: FunctionId,
     owner_function: &Function,
     sources: &HashMap<BindingId, LambdaCaptureSource>,
     capture: &LambdaCaptureFact,
     ty: TypeId,
-) -> Result<LocalId, LowerError> {
+) -> Result<ScopedBorrowSource, LowerError> {
     let source = exact_local_capture_source(expr_id, owner, owner_function, sources, capture, ty)?;
+    let role = match capture.origin {
+        CaptureStorageOrigin::BorrowedParam => ParamRole::Normal,
+        CaptureStorageOrigin::VarSelf => ParamRole::Receiver,
+        _ => return Err(lambda_capture_gap(expr_id)),
+    };
     owner_function
         .signature
         .params
@@ -9032,9 +9131,17 @@ fn exact_source_mut_param_local(
         .any(|param| {
             param.local_id == source.local
                 && param.mode == ParamMode::MutBorrow
-                && param.role == ParamRole::Normal
+                && param.role == role
         })
-        .then_some(source.local)
+        .then_some(match capture.origin {
+            CaptureStorageOrigin::BorrowedParam => ScopedBorrowSource::SourceMutParam {
+                local: source.local,
+            },
+            CaptureStorageOrigin::VarSelf => ScopedBorrowSource::VarSelf {
+                local: source.local,
+            },
+            _ => unreachable!("scoped borrow origin checked above"),
+        })
         .ok_or_else(|| lambda_capture_gap(expr_id))
 }
 
@@ -13712,6 +13819,10 @@ fn main() {}
         let cell = CaptureCellId::from_index(0);
         let source_local = air.capture_cells[cell.index()].source_local;
 
+        assert_eq!(
+            air.capture_cells[cell.index()].lifetime,
+            CaptureCellLifetime::Function
+        );
         assert!(matches!(
             &lambda.captures[..],
             [LambdaCaptureDecl::CaptureCell { cell: captured, .. }] if *captured == cell
@@ -13733,6 +13844,33 @@ fn main() {}
                 if matches!(dst.root, PlaceRoot::LambdaCapture(_)))
             })
         );
+    }
+
+    #[test]
+    fn loop_local_mutable_capture_cell_records_loop_lifetime() {
+        let source = "fn f(seed: int) { while seed < 1 { var x = seed; let g = || { x = x + 1; }; g(); break; } }";
+        let air = lower_root(source, "f").expect("lower failed");
+
+        assert!(matches!(
+            air.capture_cells[0].lifetime,
+            CaptureCellLifetime::Loop {
+                loop_id: AirLoopId(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn escaping_loop_local_mutable_capture_is_rejected() {
+        let source = "fn f(seed: int) -> fn() { while seed < 1 { var x = seed; return || { x = x + 1; }; } || {} }";
+        let err = lower_root(source, "f").expect_err("loop-local escaping capture lowered");
+
+        assert!(matches!(
+            err,
+            LowerError::UnsupportedExpr {
+                kind: "UnsupportedLambdaCapture",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -14170,6 +14308,89 @@ fn main() {}
                 if matches!(&captures[..], [LambdaCaptureArg::ScopedBorrow { place }]
                     if place.root == PlaceRoot::ScopedBorrow(scoped)))
         }));
+        assert!(
+            function_statements(air.function(lambda.body)).any(|statement| {
+                matches!(statement, AirStmt::Assign { dst, .. }
+                if dst.root == PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)))
+            })
+        );
+    }
+
+    #[test]
+    fn mutable_struct_pattern_alias_lowers_to_source_place() {
+        let source = "struct Point { x: int, y: int } fn main() { var p = Point { x: 1, y: 2 }; var Point { x } = p; x = 3; }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(function_statements(main).any(|statement| {
+            matches!(statement, AirStmt::Assign { dst, .. }
+                if matches!(dst.root, PlaceRoot::Local(_))
+                    && matches!(&dst.projection[..], [crate::air::Projection::Field(_)]))
+        }));
+    }
+
+    #[test]
+    fn mutable_tuple_pattern_alias_lowers_to_source_place() {
+        let source = "fn main() { var pair = (1, 2); var (a, b) = pair; a = 10; b = 20; }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+        let assignments = function_statements(main)
+            .filter_map(|statement| match statement {
+                AirStmt::Assign { dst, .. } if matches!(dst.root, PlaceRoot::Local(_)) => Some(dst),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            assignments
+                .iter()
+                .any(|dst| matches!(&dst.projection[..], [crate::air::Projection::TupleField(0)]))
+        );
+        assert!(
+            assignments
+                .iter()
+                .any(|dst| matches!(&dst.projection[..], [crate::air::Projection::TupleField(1)]))
+        );
+    }
+
+    #[test]
+    fn pattern_alias_capture_lowers_to_projected_scoped_borrow() {
+        let source = "struct Point { x: int, y: int } fn inc(var value: int) { value += 1; } fn touch(var point: Point) { var Point { x } = point; let f = || { inc(x); }; f(); } fn main() { var p = Point { x: 0, y: 0 }; touch(p); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let scoped = air.scoped_borrows.first().expect("missing scoped borrow");
+
+        assert!(matches!(
+            &scoped.source,
+            ScopedBorrowSource::PatternAlias { source }
+                if matches!(source.root, PlaceRoot::Local(_))
+                    && matches!(&source.projection[..], [crate::air::Projection::Field(_)])
+        ));
+    }
+
+    #[test]
+    fn var_self_capture_lowers_to_receiver_scoped_borrow() {
+        let source = "struct Counter { value: int } extend Counter { fn touch(var self) { let f = || { self.value = 1; }; f(); } } fn main() { var c = Counter { value: 0 }; c.touch(); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let scoped = ScopedBorrowId::from_index(0);
+        let lambda = air.lambdas.first().expect("missing lambda");
+
+        assert_eq!(air.scoped_borrows.len(), 1);
+        assert!(matches!(
+            air.scoped_borrows[scoped.index()].source,
+            ScopedBorrowSource::VarSelf { .. }
+        ));
+        assert!(matches!(
+            &lambda.captures[..],
+            [LambdaCaptureDecl::ScopedBorrow { borrow, .. }] if *borrow == scoped
+        ));
         assert!(
             function_statements(air.function(lambda.body)).any(|statement| {
                 matches!(statement, AirStmt::Assign { dst, .. }

@@ -496,21 +496,11 @@ impl<'a> PlaceAccessCx<'a> {
         {
             return Err(PlaceAccessGapKind::PlaceProjection);
         }
-        if matches!(intent, PlaceAccessIntent::MutPlaceArg) && !place.projection.is_empty() {
-            return self.check_projected_mut_place(path, true);
-        }
-        if matches!(intent, PlaceAccessIntent::Assign)
+        if matches!(root.storage, Some(air_place::PlaceStorage::Local(_)))
+            && matches!(intent, PlaceAccessIntent::MutPlaceArg)
             && !place.projection.is_empty()
-            && !path.crosses_dataref()
-            && matches!(
-                root.storage,
-                Some(
-                    air_place::PlaceStorage::CaptureCell(_)
-                        | air_place::PlaceStorage::ScopedBorrow(_)
-                )
-            )
         {
-            return Err(PlaceAccessGapKind::MutablePlaceProjection);
+            return self.check_projected_mut_place(path, true);
         }
         match root.storage {
             Some(air_place::PlaceStorage::Local(local))
@@ -523,10 +513,13 @@ impl<'a> PlaceAccessCx<'a> {
             }
             Some(
                 air_place::PlaceStorage::CaptureCell(_) | air_place::PlaceStorage::ScopedBorrow(_),
-            ) if !place.projection.is_empty()
-                && !ordinary_mut_place_supported(self.program, path, false) =>
-            {
-                self.check_projected_mut_place(path, false)
+            ) if !place.projection.is_empty() => {
+                let allow_collections = intent == PlaceAccessIntent::ReadValue;
+                if ordinary_mut_place_supported(self.program, path, allow_collections) {
+                    Ok(())
+                } else {
+                    self.check_projected_mut_place(path, allow_collections)
+                }
             }
             Some(
                 air_place::PlaceStorage::Local(_)
@@ -874,11 +867,13 @@ fn convert_projection(step: &air_place::ProjectionStep) -> PlaceProjection {
 mod tests {
     use anvyx_frontend::{
         air::{
-            AggregateDecl, AggregateKind, AirBody, FieldDecl, Function, FunctionKind, GlobalDecl,
-            Local, LocalKind, Mutability, Param, ParamEscape, ParamRole, Signature, TypeData,
-            TypePassClasses,
+            AggregateDecl, AggregateKind, AirBody, BindingId, CaptureCellDecl, CaptureCellId,
+            CaptureCellLifetime, FieldDecl, Function, FunctionKind, GlobalDecl, LambdaCaptureDecl,
+            LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalKind, Mutability,
+            Param, ParamEscape, ParamRole, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
+            ScopedBorrowSource, Signature, SignatureType, TypeData, TypePassClasses,
         },
-        ast::Ident,
+        ast::{ExprId, Ident},
     };
 
     use super::*;
@@ -1233,6 +1228,97 @@ mod tests {
     }
 
     #[test]
+    fn accepts_capture_cell_field_assignment() {
+        let (program, cell, place) =
+            captured_field_program(PlaceRoot::CaptureCell(CaptureCellId::from_index(0)));
+
+        let plan = cx(&program)
+            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
+            .expect("capture-cell field assignment uses mutable-place support");
+
+        assert_eq!(plan.root, PlaceAccessRoot::CaptureCell(cell));
+        assert_eq!(plan.projection.len(), 1);
+    }
+
+    #[test]
+    fn accepts_lambda_capture_field_assignment() {
+        let (program, cell, place) =
+            captured_field_program(PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)));
+
+        let plan = cx(&program)
+            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
+            .expect("lambda capture field assignment resolves to the backing cell");
+
+        assert_eq!(plan.root, PlaceAccessRoot::CaptureCell(cell));
+        assert_eq!(plan.projection.len(), 1);
+    }
+
+    #[test]
+    fn accepts_scoped_borrow_field_assignment() {
+        let (program, _, place) =
+            captured_field_program(PlaceRoot::ScopedBorrow(ScopedBorrowId::from_index(0)));
+
+        let plan = cx(&program)
+            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
+            .expect("scoped-borrow field assignment uses mutable-place support");
+
+        assert_eq!(
+            plan.root,
+            PlaceAccessRoot::ScopedPlaceCell(ScopedBorrowId::from_index(0))
+        );
+        assert_eq!(plan.projection.len(), 1);
+    }
+
+    #[test]
+    fn rejects_dynamic_capture_cell_assignment_projection() {
+        let (program, place) =
+            captured_list_index_program(PlaceRoot::CaptureCell(CaptureCellId::from_index(0)));
+
+        let gap = cx(&program)
+            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
+            .expect_err("dynamic collection projection through cells stays unsupported");
+
+        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceProjection);
+    }
+
+    #[test]
+    fn rejects_dynamic_scoped_borrow_assignment_projection() {
+        let (program, place) =
+            captured_list_index_program(PlaceRoot::ScopedBorrow(ScopedBorrowId::from_index(0)));
+
+        let gap = cx(&program)
+            .plan(FunctionId::from_index(0), PlaceAccessIntent::Assign, &place)
+            .expect_err("dynamic collection projection through scoped cells stays unsupported");
+
+        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceProjection);
+    }
+
+    #[test]
+    fn keeps_projected_source_param_mut_place_arg_support() {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let aggregate = air::AggregateId::from_index(0);
+        let aggregate_ty = program.type_arena.alloc(TypeData::Aggregate(aggregate));
+        program.aggregates.push(aggregate_decl(int));
+        program.functions.push(source_param_function(aggregate_ty));
+        let place = Place {
+            root: PlaceRoot::Local(LocalId::from_index(0)),
+            projection: vec![air::Projection::Field(air::FieldId::from_index(0))],
+            ty: int,
+        };
+
+        let plan = cx(&program)
+            .plan(
+                FunctionId::from_index(0),
+                PlaceAccessIntent::MutPlaceArg,
+                &place,
+            )
+            .expect("source-param projected mut-place args keep existing support");
+
+        assert_eq!(plan.projection.len(), 1);
+    }
+
+    #[test]
     fn rejects_unsupported_dataref_mut_place_payload() {
         let (program, place) = dataref_field_program(TypeData::String, true);
 
@@ -1245,6 +1331,100 @@ mod tests {
             .expect_err("string dataref mut-place payloads stay unsupported");
 
         assert_eq!(gap, PlaceAccessGapKind::MutablePlaceDataRef);
+    }
+
+    fn captured_field_program(root: PlaceRoot) -> (Program, CaptureCellId, Place) {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let aggregate = air::AggregateId::from_index(0);
+        let aggregate_ty = program.type_arena.alloc(TypeData::Aggregate(aggregate));
+        let cell = CaptureCellId::from_index(0);
+        program.aggregates.push(aggregate_decl(int));
+        program.capture_cells.push(CaptureCellDecl {
+            binding: BindingId::from_index(0),
+            owner: FunctionId::from_index(0),
+            source_local: LocalId::from_index(0),
+            ty: aggregate_ty,
+            lifetime: CaptureCellLifetime::Function,
+        });
+        program.scoped_borrows.push(ScopedBorrowDecl {
+            owner: FunctionId::from_index(0),
+            binding: BindingId::from_index(0),
+            source: ScopedBorrowSource::SourceMutParam {
+                local: LocalId::from_index(0),
+            },
+            ty: aggregate_ty,
+            mutability: Mutability::Mutable,
+        });
+        push_lambda_capture_function(
+            &mut program,
+            LambdaCaptureDecl::CaptureCell {
+                binding: BindingId::from_index(0),
+                cell,
+                ty: aggregate_ty,
+            },
+        );
+        let place = Place {
+            root,
+            projection: vec![air::Projection::Field(air::FieldId::from_index(0))],
+            ty: int,
+        };
+        (program, cell, place)
+    }
+
+    fn captured_list_index_program(root: PlaceRoot) -> (Program, Place) {
+        let mut program = Program::default();
+        let int = program.type_arena.alloc(TypeData::Int);
+        let list = program.type_arena.alloc(TypeData::List(int));
+        program.capture_cells.push(CaptureCellDecl {
+            binding: BindingId::from_index(0),
+            owner: FunctionId::from_index(0),
+            source_local: LocalId::from_index(0),
+            ty: list,
+            lifetime: CaptureCellLifetime::Function,
+        });
+        program.scoped_borrows.push(ScopedBorrowDecl {
+            owner: FunctionId::from_index(0),
+            binding: BindingId::from_index(0),
+            source: ScopedBorrowSource::SourceMutParam {
+                local: LocalId::from_index(0),
+            },
+            ty: list,
+            mutability: Mutability::Mutable,
+        });
+        push_lambda_capture_function(
+            &mut program,
+            LambdaCaptureDecl::CaptureCell {
+                binding: BindingId::from_index(0),
+                cell: CaptureCellId::from_index(0),
+                ty: list,
+            },
+        );
+        program.functions[0].locals.push(local(int, false));
+        let place = Place {
+            root,
+            projection: vec![air::Projection::Index(LocalId::from_index(0))],
+            ty: int,
+        };
+        (program, place)
+    }
+
+    fn push_lambda_capture_function(program: &mut Program, capture: LambdaCaptureDecl) {
+        let function_id = FunctionId::from_index(0);
+        let lambda = LambdaId::from_index(0);
+        program.lambdas.push(LambdaDecl {
+            source: ExprId(0),
+            module: air::ModuleId::from_index(0),
+            owner: function_id,
+            body: function_id,
+            signature: SignatureType::new(vec![], ReturnMode::Value(TypeId::from_index(0))),
+            escape: LambdaEscape::NonEscaping,
+            captures: vec![capture],
+        });
+        program.functions.push(Function {
+            kind: FunctionKind::Lambda(lambda),
+            ..function(vec![])
+        });
     }
 
     fn global_program(data: TypeData) -> (Program, GlobalId, TypeId) {

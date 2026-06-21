@@ -1385,6 +1385,7 @@ fn invalid_unused_root_decls_are_rejected() {
         owner: FunctionId::from_index(0),
         source_local: LocalId::from_index(0),
         ty: invalid_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let global = builder.alloc_global_raw(GlobalDecl {
         name: Ident::new("g"),
@@ -1612,6 +1613,34 @@ fn scoped_borrow_source_rejects_receiver_param() {
     ));
     let mut fb = FunctionBuilder::new("method", module, FunctionKind::Method, int_ty);
     let local = fb.push_param_with_mode("self", int_ty, ParamMode::MutBorrow, ParamRole::Receiver);
+    fb.bind_local(local, BindingId::from_index(0));
+    fb.push_block(term_return(op_place(local, int_ty)));
+    builder.alloc_function(fb.finish());
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::ScopedBorrowSourceLocalMustBeMutParam { borrow, local })
+            if borrow == scoped && local == LocalId::from_index(0)
+    )));
+}
+
+#[test]
+fn var_self_scoped_borrow_rejects_normal_param() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
+        owner: FunctionId::from_index(0),
+        binding: BindingId::from_index(0),
+        source: ScopedBorrowSource::VarSelf {
+            local: LocalId::from_index(0),
+        },
+        ty: int_ty,
+        mutability: Mutability::Mutable,
+    });
+    let mut fb = FunctionBuilder::new("f", module, FunctionKind::Normal, int_ty);
+    let local = fb.push_param_with_mode("x", int_ty, ParamMode::MutBorrow, ParamRole::Normal);
     fb.bind_local(local, BindingId::from_index(0));
     fb.push_block(term_return(op_place(local, int_ty)));
     builder.alloc_function(fb.finish());
@@ -3276,6 +3305,57 @@ fn escaping_function_param_rejects_unknown_function_value() {
 }
 
 #[test]
+fn loop_capture_cell_use_outside_declared_loop_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let module = test_module(&mut builder);
+    let int = builder.int_ty();
+    let void = builder.void_ty();
+    let value = builder.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let binding = BindingId::from_index(0);
+    let mut function = FunctionBuilder::new("f", module, FunctionKind::Normal, void);
+    let source = function.push_local(Some("x"), int, Mutability::Mutable, LocalKind::User);
+    function.bind_local(source, binding);
+    let block = function.push_block(AirTail::Return(None));
+    let cell = builder.alloc_capture_cell(CaptureCellDecl {
+        binding,
+        owner: FunctionId::from_index(0),
+        source_local: source,
+        ty: int,
+        lifetime: CaptureCellLifetime::Loop {
+            loop_id: AirLoopId::from_index(0),
+        },
+    });
+    function.add_statement(
+        block,
+        stmt_assign(
+            Place {
+                root: PlaceRoot::CaptureCell(cell),
+                projection: vec![],
+                ty: int,
+            },
+            RValue::Use(Operand::Const(value)),
+        ),
+    );
+    function.add_statement(
+        block,
+        AirStmt::Loop(AirLoop {
+            id: AirLoopId::from_index(0),
+            body: AirBlock::default(),
+        }),
+    );
+    builder.alloc_function(function.finish());
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFunction(BadFunction::CaptureCellOutsideLoop { cell: found, .. }) if found == cell
+    )));
+}
+
+#[test]
 fn duplicate_capture_cell_for_binding_owner_is_rejected() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -3286,12 +3366,14 @@ fn duplicate_capture_cell_for_binding_owner_is_rejected() {
         owner,
         source_local: LocalId::from_index(0),
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let second = builder.alloc_capture_cell(CaptureCellDecl {
         binding,
         owner,
         source_local: LocalId::from_index(0),
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3328,12 +3410,14 @@ fn duplicate_capture_cell_for_source_local_is_rejected() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let second = builder.alloc_capture_cell(CaptureCellDecl {
         binding: BindingId::from_index(1),
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3375,6 +3459,7 @@ fn promoted_binding_must_not_use_source_local_root() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3409,6 +3494,7 @@ fn promoted_binding_must_not_be_initialized_as_local() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3455,6 +3541,7 @@ fn capture_cell_read_requires_initialization() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3492,6 +3579,7 @@ fn lambda_body_must_not_use_raw_capture_cell_root_for_capture() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     assert_eq!(
         builder.alloc_lambda(LambdaDecl {
@@ -3550,6 +3638,7 @@ fn capture_cell_cannot_be_used_from_unrelated_function() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut owner_fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3599,6 +3688,7 @@ fn promoted_binding_must_not_use_source_local_as_index() {
         owner,
         source_local: index_local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3638,6 +3728,7 @@ fn capture_cell_source_local_must_match_payload_type() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3676,6 +3767,7 @@ fn capture_cell_source_local_must_match_binding() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3713,6 +3805,7 @@ fn capture_cell_source_local_must_be_owned_binding() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3749,6 +3842,7 @@ fn capture_cell_source_local_must_not_be_pattern_alias() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);
@@ -3790,6 +3884,7 @@ fn capture_cell_source_local_must_be_mutable() {
         owner,
         source_local: local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let module = test_module(&mut builder);
     let mut fb = FunctionBuilder::new("owner", module, FunctionKind::Normal, int_ty);

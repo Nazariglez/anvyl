@@ -5,10 +5,10 @@ use anvyx_externs::{
 
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, CaptureLocalSource, ConstValue, EnumRepr, ExternMember, ExternRep, Function,
-    FunctionKind, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Param,
-    ParamEscape, ParamMode, ParamRole, Program, RawEnumValue, ReturnMode, ScopedBorrowDecl,
-    ScopedBorrowSource, SignatureType, TypeData, VariantShape,
+    AggregateKind, CaptureCellLifetime, CaptureLocalSource, ConstValue, EnumRepr, ExternMember,
+    ExternRep, Function, FunctionKind, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local,
+    LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program, RawEnumValue,
+    ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
@@ -592,6 +592,14 @@ pub enum BadFunction {
         local: LocalId,
         first: CaptureCellId,
         second: CaptureCellId,
+    },
+    CaptureCellLoopMissing {
+        cell: CaptureCellId,
+        loop_id: AirLoopId,
+    },
+    CaptureCellOutsideLoop {
+        cell: CaptureCellId,
+        loop_id: AirLoopId,
     },
 }
 
@@ -1649,9 +1657,15 @@ fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
             VerifyErrorKind::BadReference(BadReference::InvalidFunction(decl.owner)),
         );
     }
-    match decl.source {
+    match &decl.source {
         ScopedBorrowSource::SourceMutParam { local } => {
-            verify_source_mut_param_scoped_borrow(cx, site.clone(), id, &decl, local);
+            verify_source_scoped_borrow(cx, site.clone(), id, &decl, *local, ParamRole::Normal);
+        }
+        ScopedBorrowSource::VarSelf { local } => {
+            verify_source_scoped_borrow(cx, site.clone(), id, &decl, *local, ParamRole::Receiver);
+        }
+        ScopedBorrowSource::PatternAlias { source } => {
+            verify_pattern_alias_scoped_borrow(cx, site.clone(), id, &decl, source);
         }
     }
     if decl.mutability != Mutability::Mutable {
@@ -1665,12 +1679,13 @@ fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
     cx.verify_type_ref(site, decl.ty);
 }
 
-fn verify_source_mut_param_scoped_borrow(
+fn verify_source_scoped_borrow(
     cx: &mut VerifyCx<'_>,
     site: VerifySite,
     id: ScopedBorrowId,
     decl: &ScopedBorrowDecl,
     local: LocalId,
+    role: ParamRole,
 ) {
     let Some(function) = cx.program.functions.get(decl.owner.index()) else {
         return;
@@ -1701,7 +1716,7 @@ fn verify_source_mut_param_scoped_borrow(
                     ),
                 );
             }
-            if !function_param_is_mut_borrow(function, local) {
+            if !function_param_is_mut_borrow(function, local, role) {
                 cx.push(
                     site,
                     VerifyErrorKind::BadFunction(
@@ -1721,17 +1736,72 @@ fn verify_source_mut_param_scoped_borrow(
     }
 }
 
-fn function_param_is_mut_borrow(function: &Function, local: LocalId) -> bool {
+fn verify_pattern_alias_scoped_borrow(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    id: ScopedBorrowId,
+    decl: &ScopedBorrowDecl,
+    source: &Place,
+) {
+    if source.ty != decl.ty {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceLocalTypeMismatch {
+                borrow: id,
+                expected: decl.ty,
+                found: source.ty,
+            }),
+        );
+    }
+    verify_place(cx, decl.owner, BlockId::from_index(0), None, source);
+    verify_mutable_place(cx, decl.owner, &site, source);
+    let Some(function) = cx.program.functions.get(decl.owner.index()) else {
+        return;
+    };
+    let Some(root_local) = source.root.local() else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedRoot(source.root)),
+        );
+        return;
+    };
+    if !function_local_is_any_mut_borrow(function, root_local) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceLocalMustBeMutParam {
+                borrow: id,
+                local: root_local,
+            }),
+        );
+    }
+    if !source
+        .projection
+        .iter()
+        .all(|projection| matches!(projection, Projection::Field(_) | Projection::TupleField(_)))
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedScopedBorrowProjection(id)),
+        );
+    }
+}
+
+fn function_param_is_mut_borrow(function: &Function, local: LocalId, role: ParamRole) -> bool {
     function.signature.params.iter().any(|param| {
-        param.local_id == local
-            && param.mode == ParamMode::MutBorrow
-            && param.role == ParamRole::Normal
+        param.local_id == local && param.mode == ParamMode::MutBorrow && param.role == role
     })
+}
+
+fn function_local_is_any_mut_borrow(function: &Function, local: LocalId) -> bool {
+    function
+        .signature
+        .params
+        .iter()
+        .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
 }
 
 fn verify_scoped_borrow_uniqueness(cx: &mut VerifyCx<'_>) {
     let mut bindings = std::collections::HashMap::new();
-    let mut sources = std::collections::HashMap::new();
     for (index, decl) in cx.program.scoped_borrows.iter().enumerate() {
         let id = ScopedBorrowId::from_index(index);
         if let Some(first) = bindings.insert((decl.owner, decl.binding), id) {
@@ -1745,12 +1815,19 @@ fn verify_scoped_borrow_uniqueness(cx: &mut VerifyCx<'_>) {
                 }),
             );
         }
-        if let Some(first) = sources.insert((decl.owner, decl.source), id) {
+        if let Some(first) = cx.program.scoped_borrows[..index]
+            .iter()
+            .enumerate()
+            .find_map(|(other_index, other)| {
+                (other.owner == decl.owner && other.source == decl.source)
+                    .then_some(ScopedBorrowId::from_index(other_index))
+            })
+        {
             cx.push(
                 VerifySite::ScopedBorrow(id),
                 VerifyErrorKind::BadFunction(BadFunction::DuplicateScopedBorrowSource {
                     owner: decl.owner,
-                    source: decl.source,
+                    source: decl.source.clone(),
                     first,
                     second: id,
                 }),
@@ -1769,6 +1846,19 @@ fn verify_capture_cell(cx: &mut VerifyCx<'_>, id: CaptureCellId) {
         );
     }
     let local = decl.source_local;
+    if let CaptureCellLifetime::Loop { loop_id } = decl.lifetime
+        && let Some(block) = cx
+            .program
+            .functions
+            .get(decl.owner.index())
+            .map(|function| function.body.block.clone())
+        && !verify_loop_capture_cell_block(cx, decl.owner, &block, id, loop_id, false)
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::CaptureCellLoopMissing { cell: id, loop_id }),
+        );
+    }
     if let Some(function) = cx.program.functions.get(decl.owner.index()) {
         match function.locals.get(local.index()) {
             Some(source) => {
@@ -1828,6 +1918,258 @@ fn verify_capture_cell(cx: &mut VerifyCx<'_>, id: CaptureCellId) {
         }
     }
     cx.verify_type_ref(site, decl.ty);
+}
+
+fn verify_loop_capture_cell_block(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block: &AirBlock,
+    cell: CaptureCellId,
+    loop_id: AirLoopId,
+    in_loop: bool,
+) -> bool {
+    let mut found_loop = false;
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if stmt_uses_capture_cell(stmt, cell) && !in_loop {
+            cx.push(
+                VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+                VerifyErrorKind::BadFunction(BadFunction::CaptureCellOutsideLoop { cell, loop_id }),
+            );
+        }
+        match stmt {
+            AirStmt::If(if_) => {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &if_.then_block,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+                if let Some(block) = &if_.else_block {
+                    found_loop |= verify_loop_capture_cell_block(
+                        cx,
+                        function_id,
+                        block,
+                        cell,
+                        loop_id,
+                        in_loop,
+                    );
+                }
+            }
+            AirStmt::Loop(loop_) => {
+                found_loop |= loop_.id == loop_id;
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &loop_.body,
+                    cell,
+                    loop_id,
+                    in_loop || loop_.id == loop_id,
+                );
+            }
+            AirStmt::CollectionLoan(loan) => {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &loan.body,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+            }
+            AirStmt::CollectionSlotScope(scope) => {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &scope.body,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+            }
+            AirStmt::EnumMatch(match_) => {
+                for arm in &match_.arms {
+                    found_loop |= verify_loop_capture_cell_block(
+                        cx,
+                        function_id,
+                        &arm.block,
+                        cell,
+                        loop_id,
+                        in_loop,
+                    );
+                }
+                if let Some(block) = &match_.else_block {
+                    found_loop |= verify_loop_capture_cell_block(
+                        cx,
+                        function_id,
+                        block,
+                        cell,
+                        loop_id,
+                        in_loop,
+                    );
+                }
+            }
+            AirStmt::OptionalMatch(match_) => {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &match_.some_block,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &match_.none_block,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+            }
+            AirStmt::MapEntryMatch(match_) => {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &match_.some_block,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &match_.none_block,
+                    cell,
+                    loop_id,
+                    in_loop,
+                );
+            }
+            AirStmt::Init { .. }
+            | AirStmt::Assign { .. }
+            | AirStmt::Eval(_)
+            | AirStmt::GlobalEnsure { .. }
+            | AirStmt::GlobalSetRoot { .. }
+            | AirStmt::GlobalUpdateRoot { .. } => {}
+        }
+    }
+    if tail_uses_capture_cell(&block.tail, cell) && !in_loop {
+        cx.push(
+            VerifySite::Function(function_id),
+            VerifyErrorKind::BadFunction(BadFunction::CaptureCellOutsideLoop { cell, loop_id }),
+        );
+    }
+    found_loop
+}
+
+fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
+    match stmt {
+        AirStmt::Init { value, .. }
+        | AirStmt::Eval(value)
+        | AirStmt::GlobalSetRoot { value, .. }
+        | AirStmt::GlobalUpdateRoot { value, .. } => rvalue_uses_capture_cell(value, cell),
+        AirStmt::Assign { dst, value } => {
+            place_uses_capture_cell(dst, cell) || rvalue_uses_capture_cell(value, cell)
+        }
+        AirStmt::If(if_) => operand_uses_capture_cell(&if_.cond, cell),
+        AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
+        AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
+        AirStmt::EnumMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
+        AirStmt::OptionalMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
+        AirStmt::MapEntryMatch(match_) => {
+            place_uses_capture_cell(&match_.map, cell)
+                || operand_uses_capture_cell(&match_.key, cell)
+        }
+        AirStmt::Loop(_) | AirStmt::GlobalEnsure { .. } => false,
+    }
+}
+
+fn tail_uses_capture_cell(tail: &AirTail, cell: CaptureCellId) -> bool {
+    match tail {
+        AirTail::Return(Some(operand)) => operand_uses_capture_cell(operand, cell),
+        AirTail::None
+        | AirTail::Return(None)
+        | AirTail::Break(_)
+        | AirTail::Continue(_)
+        | AirTail::Unreachable => false,
+    }
+}
+
+fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
+    match value {
+        RValue::Use(operand)
+        | RValue::Unary { value: operand, .. }
+        | RValue::OptionalSome { value: operand, .. }
+        | RValue::Cast { value: operand, .. }
+        | RValue::Stringify { value: operand, .. }
+        | RValue::Format { value: operand, .. } => operand_uses_capture_cell(operand, cell),
+        RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
+            operand_uses_capture_cell(lhs, cell) || operand_uses_capture_cell(rhs, cell)
+        }
+        RValue::Aggregate { fields, .. } | RValue::StringConcat { parts: fields } => fields
+            .iter()
+            .any(|operand| operand_uses_capture_cell(operand, cell)),
+        RValue::Call { callee, args } => {
+            matches!(callee, Callee::Lambda(operand) if operand_uses_capture_cell(operand, cell))
+                || args.iter().any(|arg| call_arg_uses_capture_cell(arg, cell))
+        }
+        RValue::Len { source }
+        | RValue::ListPop { list: source, .. }
+        | RValue::RangeListCopy { source, .. }
+        | RValue::MapGet { map: source, .. }
+        | RValue::MapEntryAt { map: source, .. }
+        | RValue::SliceView { source, .. } => place_uses_capture_cell(source, cell),
+        RValue::ListPush { list, value } => {
+            place_uses_capture_cell(list, cell) || operand_uses_capture_cell(value, cell)
+        }
+        RValue::MapInsert {
+            map, key, value, ..
+        } => {
+            place_uses_capture_cell(map, cell)
+                || operand_uses_capture_cell(key, cell)
+                || operand_uses_capture_cell(value, cell)
+        }
+        RValue::MapRemove { map, key, .. } => {
+            place_uses_capture_cell(map, cell) || operand_uses_capture_cell(key, cell)
+        }
+        RValue::MakeLambda { captures, .. } => captures
+            .iter()
+            .any(|capture| lambda_capture_arg_uses_capture_cell(capture, cell)),
+        RValue::FunctionRef { .. } => false,
+    }
+}
+
+fn call_arg_uses_capture_cell(arg: &CallArg, cell: CaptureCellId) -> bool {
+    match arg {
+        CallArg::Value(operand) => operand_uses_capture_cell(operand, cell),
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+            place_uses_capture_cell(place, cell)
+        }
+        CallArg::SharedStringConst(_) => false,
+    }
+}
+
+fn lambda_capture_arg_uses_capture_cell(arg: &LambdaCaptureArg, cell: CaptureCellId) -> bool {
+    match arg {
+        LambdaCaptureArg::CaptureCell { cell: found } => *found == cell,
+        LambdaCaptureArg::ReadonlyLocal { value } => operand_uses_capture_cell(value, cell),
+        LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+            place_uses_capture_cell(place, cell)
+        }
+        LambdaCaptureArg::NoRuntime => false,
+    }
+}
+
+fn operand_uses_capture_cell(operand: &Operand, cell: CaptureCellId) -> bool {
+    match operand {
+        Operand::Place(place) => place_uses_capture_cell(place, cell),
+        Operand::Const(_) => false,
+    }
+}
+
+fn place_uses_capture_cell(place: &Place, cell: CaptureCellId) -> bool {
+    place.root == PlaceRoot::CaptureCell(cell)
 }
 
 fn verify_capture_cell_uniqueness(cx: &mut VerifyCx<'_>) {
@@ -4602,8 +4944,12 @@ fn verify_promoted_local_not_used(
         }
     }
     for (borrow_index, decl) in cx.program.scoped_borrows.iter().enumerate() {
-        let ScopedBorrowSource::SourceMutParam { local: source } = decl.source;
-        if decl.owner == function_id && source == local {
+        let source = match &decl.source {
+            ScopedBorrowSource::SourceMutParam { local }
+            | ScopedBorrowSource::VarSelf { local } => Some(*local),
+            ScopedBorrowSource::PatternAlias { .. } => None,
+        };
+        if decl.owner == function_id && source == Some(local) {
             cx.push(
                 site.clone(),
                 VerifyErrorKind::BadPlace(BadPlace::PromotedBindingBypassesScopedBorrow {

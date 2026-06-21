@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @skip: mutable receiver captures are not executable yet
 // @match: 1
 
 fn main() {

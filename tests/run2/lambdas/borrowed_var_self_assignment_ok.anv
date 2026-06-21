@@ -7,14 +7,10 @@ struct Counter {
     value: int,
 }
 
-fn replace(var counter: Counter) {
-    counter = Counter { value: 1 };
-}
-
 extend Counter {
     fn touch(var self) {
         let f = || {
-            replace(self);
+            self.value = 1;
         };
         f();
     }

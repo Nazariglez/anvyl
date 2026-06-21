@@ -1,0 +1,22 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: mutable capture escaping an inner block is not executable yet
+// @match: 1
+
+fn main() {
+    var i = 0;
+    while i < 1 {
+        var f: fn() -> int = || 0;
+        if i == 0 {
+            var count = 0;
+            let inner = || {
+                count += 1;
+                count
+            };
+            f = inner;
+        }
+        println(f());
+        i += 1;
+    }
+}

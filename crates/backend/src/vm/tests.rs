@@ -1,10 +1,10 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, BindingId, CallArg, Callee, CaptureCellDecl, CaptureLocalSource, ExternDecl,
-        ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl, Function,
-        FunctionId, FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand,
-        ParamEscape, ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData,
+        self, BindingId, CallArg, Callee, CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource,
+        ExternDecl, ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl,
+        Function, FunctionId, FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability,
+        Operand, ParamEscape, ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData,
     },
     ast::{ExprId, Ident},
 };
@@ -651,6 +651,7 @@ fn compiler_rejects_capture_cell_roots() {
         owner: FunctionId::from_index(0),
         source_local: air::LocalId::from_index(0),
         ty: int,
+        lifetime: CaptureCellLifetime::Function,
     });
     let init = program.alloc_const(air::ConstData {
         ty: int,
@@ -818,6 +819,7 @@ fn mutable_upvalue_lambda_program(shared: bool) -> Program {
         owner,
         source_local: source,
         ty: int,
+        lifetime: CaptureCellLifetime::Function,
     });
     let lambda = program.alloc_lambda(LambdaDecl {
         source: ExprId(0),

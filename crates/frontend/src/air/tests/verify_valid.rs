@@ -70,6 +70,7 @@ fn non_local_roots_verify_with_declarations() {
         owner: FunctionId::from_index(1),
         source_local: LocalId::from_index(1),
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let (global, _) = builder.alloc_global_with_init(module, "g", int_ty, Mutability::Mutable);
 
@@ -372,6 +373,7 @@ fn capture_cell_is_shared_by_lambdas_and_owner() {
         owner,
         source_local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     for (lambda, body) in [(lambda_a, body_a), (lambda_b, body_b)] {
         assert_eq!(
@@ -475,6 +477,7 @@ fn nested_lambda_forwards_capture_cell() {
         owner,
         source_local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     for (lambda, body) in [(outer_lambda, outer_body), (inner_lambda, inner_body)] {
         assert_eq!(
@@ -591,12 +594,14 @@ fn distinct_capture_cell_call_args_do_not_alias() {
         owner,
         source_local: first_local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
     let second_cell = builder.alloc_capture_cell(CaptureCellDecl {
         binding: second_binding,
         owner,
         source_local: second_local,
         ty: int_ty,
+        lifetime: CaptureCellLifetime::Function,
     });
 
     let mut both = FunctionBuilder::new("both", module, FunctionKind::Normal, void_ty);

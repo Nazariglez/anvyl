@@ -1,0 +1,26 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: escaping mutable capture from a loop-local binding is not executable yet
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn make() -> fn() -> int {
+    var i = 0;
+    while i < 1 {
+        var count = 0;
+        return || {
+            count += 1;
+            count
+        };
+    }
+    || 0
+}
+
+fn main() {
+    let f = make();
+    println(f());
+    println(f());
+}

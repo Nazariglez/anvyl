@@ -3,6 +3,7 @@ use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeKey, ProviderId};
 
 pub use super::body::AirBody;
 use super::{
+    body::Place,
     ids::*,
     types::{
         BinaryOp, ConstValue, ParamEscape, ParamMode, ParamType, ReturnMode, SignatureType, UnaryOp,
@@ -221,9 +222,11 @@ pub struct ScopedBorrowDecl {
     pub mutability: Mutability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopedBorrowSource {
     SourceMutParam { local: LocalId },
+    VarSelf { local: LocalId },
+    PatternAlias { source: Place },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +235,13 @@ pub struct CaptureCellDecl {
     pub owner: FunctionId,
     pub source_local: LocalId,
     pub ty: TypeId,
+    pub lifetime: CaptureCellLifetime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureCellLifetime {
+    Function,
+    Loop { loop_id: AirLoopId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

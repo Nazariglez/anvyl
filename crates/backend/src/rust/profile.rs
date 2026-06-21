@@ -14,7 +14,9 @@ use anvyx_runtime::RustProviderSupport;
 
 use super::{
     native,
-    place_access::{PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan},
+    place_access::{
+        PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
+    },
     rep_policy::{AirRustRepPolicy, RustMaterialIntent, RustMaterialSource, RustMaterialization},
     rir,
 };
@@ -129,17 +131,6 @@ fn profile_gap_kind(kind: PlaceAccessGapKind) -> ProfileErrorKind {
         }
         PlaceAccessGapKind::SliceView => ProfileErrorKind::UnsupportedRValue,
         PlaceAccessGapKind::ReturnPlace => ProfileErrorKind::UnsupportedReturnMode,
-    }
-}
-
-fn unsupported_place_root(root: PlaceRoot) -> ProfileErrorKind {
-    match root {
-        PlaceRoot::CaptureCell(_) => ProfileErrorKind::UnsupportedLambdaCell,
-        PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
-            ProfileErrorKind::UnsupportedLambdaCapture
-        }
-        PlaceRoot::Global(_) => unreachable!("global roots require use-site gap classification"),
-        PlaceRoot::Local(_) => unreachable!("local roots are supported"),
     }
 }
 
@@ -373,6 +364,9 @@ impl ProfileCx<'_> {
                 }
                 air::AirStmt::Assign { dst, value } => {
                     self.check_rvalue(site, value);
+                    if self.place_uses_scoped_borrow_source_root(function, dst) {
+                        self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                    }
                     match self.access().plan(function, PlaceAccessIntent::Assign, dst) {
                         Ok(_) => self.check_type_ref(site, dst.ty),
                         Err(gap) => self.push(site, profile_gap_kind(gap)),
@@ -513,39 +507,43 @@ impl ProfileCx<'_> {
             }
             return;
         };
-        if let Err(gap) = self.access().plan(function, intent, place) {
-            self.push(site, profile_gap_kind(gap));
-            return;
+        let plan = match self.access().plan(function, intent, place) {
+            Ok(plan) => plan,
+            Err(gap) => {
+                self.push(site, profile_gap_kind(gap));
+                return;
+            }
+        };
+        if self.place_uses_scoped_borrow_source_root(function, place) {
+            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
         }
-        if !matches!(place.root, PlaceRoot::Global(_))
-            && self
-                .place_root_mutable(site, place)
-                .is_some_and(|mutable| !mutable)
+        if self
+            .access_root_mutable(site, plan.root)
+            .is_some_and(|mutable| !mutable)
         {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
         }
     }
 
-    fn place_root_mutable(&mut self, site: ProfileSite, place: &Place) -> Option<bool> {
-        match place.root {
-            PlaceRoot::Local(root) => self
-                .current_local(site, root)
+    fn access_root_mutable(&mut self, site: ProfileSite, root: PlaceAccessRoot) -> Option<bool> {
+        match root {
+            PlaceAccessRoot::Local { local, .. } => self
+                .current_local(site, local)
                 .map(|local| local.mutability == Mutability::Mutable),
-            PlaceRoot::LambdaCapture(slot) => self
-                .current_lambda_capture(site, slot)
-                .map(|capture| matches!(capture, air::LambdaCaptureDecl::CaptureCell { .. })),
-            PlaceRoot::CaptureCell(_) => Some(true),
-            PlaceRoot::ScopedBorrow(_) => {
-                self.push(site, unsupported_place_root(place.root));
+            PlaceAccessRoot::CaptureCell(_) | PlaceAccessRoot::ScopedPlaceCell(_) => Some(true),
+            PlaceAccessRoot::Global(global) => {
+                self.program.globals.get(global.index()).map_or_else(
+                    || {
+                        self.push(site, ProfileErrorKind::UnsupportedGlobalAccess);
+                        None
+                    },
+                    |global| Some(global.mutability == Mutability::Mutable),
+                )
+            }
+            PlaceAccessRoot::LambdaCapture(_) => {
+                self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                 None
             }
-            PlaceRoot::Global(global) => self.program.globals.get(global.index()).map_or_else(
-                || {
-                    self.push(site, ProfileErrorKind::UnsupportedGlobalAccess);
-                    None
-                },
-                |global| Some(global.mutability == Mutability::Mutable),
-            ),
         }
     }
 
@@ -626,7 +624,6 @@ impl ProfileCx<'_> {
             }
             RValue::ListPush { list, value } => {
                 self.check_structural_mutation(site, list);
-                self.check_place(site, list);
                 let TypeData::List(elem) = self.program.type_arena.data(list.ty) else {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
@@ -656,8 +653,9 @@ impl ProfileCx<'_> {
             RValue::MapGet { map, key, ty } | RValue::MapRemove { map, key, ty } => {
                 if matches!(value, RValue::MapRemove { .. }) {
                     self.check_structural_mutation(site, map);
+                } else {
+                    self.check_place(site, map);
                 }
-                self.check_place(site, map);
                 self.check_operand(site, key);
                 self.check_type_ref(site, *ty);
                 let TypeData::Map {
@@ -691,7 +689,6 @@ impl ProfileCx<'_> {
                         self.check_collection_write_place(site, map, PlaceAccessIntent::Assign);
                     }
                 }
-                self.check_place(site, map);
                 self.check_operand(site, key);
                 self.check_operand(site, value);
                 let TypeData::Map {
@@ -978,24 +975,6 @@ impl ProfileCx<'_> {
         self.program.function(function).locals.get(local.index())
     }
 
-    fn current_lambda_capture(
-        &self,
-        site: ProfileSite,
-        slot: air::LambdaCaptureSlotId,
-    ) -> Option<&air::LambdaCaptureDecl> {
-        let (ProfileSite::Statement(function, _) | ProfileSite::Terminator(function)) = site else {
-            return None;
-        };
-        let FunctionKind::Lambda(lambda) = self.program.function(function).kind else {
-            return None;
-        };
-        self.program
-            .lambdas
-            .get(lambda.index())?
-            .captures
-            .get(slot.index())
-    }
-
     fn check_callee(&mut self, site: ProfileSite, callee: &Callee) {
         match callee {
             Callee::Function(_) => {}
@@ -1223,10 +1202,29 @@ impl ProfileCx<'_> {
             }
             self.check_scoped_borrow_decl(site, borrow, decl.ty, decl.mutability);
         }
+        if self.place_uses_scoped_borrow_source_root(function, place) {
+            self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+        }
         if plan.ty != place.ty {
             self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
         }
         self.check_type_ref(site, place.ty);
+    }
+
+    fn place_uses_scoped_borrow_source_root(&self, function: FunctionId, place: &Place) -> bool {
+        let PlaceRoot::Local(local) = place.root else {
+            return false;
+        };
+        self.program.scoped_borrows.iter().any(|borrow| {
+            borrow.owner == function
+                && match &borrow.source {
+                    air::ScopedBorrowSource::SourceMutParam { local: source }
+                    | air::ScopedBorrowSource::VarSelf { local: source } => *source == local,
+                    air::ScopedBorrowSource::PatternAlias { source } => {
+                        source.root.local() == Some(local)
+                    }
+                }
+        })
     }
 
     fn function_local_is_source_mut_place_param(
@@ -1261,11 +1259,25 @@ impl ProfileCx<'_> {
         if decl.ty != ty || decl.mutability != mutability || mutability != Mutability::Mutable {
             self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
         }
-        match decl.source {
+        match &decl.source {
             air::ScopedBorrowSource::SourceMutParam { local }
-                if self.function_local_is_source_mut_place_param(decl.owner, local) => {}
-            air::ScopedBorrowSource::SourceMutParam { .. } => {
-                self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+            | air::ScopedBorrowSource::VarSelf { local } => {
+                if !self.function_local_is_source_mut_place_param(decl.owner, *local) {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                }
+            }
+            air::ScopedBorrowSource::PatternAlias { source } => {
+                let source_root_supported = source.root.local().is_some_and(|local| {
+                    self.function_local_is_source_mut_place_param(decl.owner, local)
+                });
+                if !source_root_supported
+                    || self
+                        .access()
+                        .plan(decl.owner, PlaceAccessIntent::MutPlaceArg, source)
+                        .is_err()
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                }
             }
         }
     }

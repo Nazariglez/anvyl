@@ -5,11 +5,15 @@
 
 struct Point { x: int }
 
-fn main() {
+fn make() -> fn() {
     var p = Point { x: 0 };
-    let f = || {
+    || {
         p.x = 1;
-    };
+        println(p.x);
+    }
+}
+
+fn main() {
+    let f = make();
     f();
-    println(p.x);
 }

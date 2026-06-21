@@ -4,17 +4,17 @@ use super::{
     place::RustPlaces,
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
-        RirCallArg, RirCallTarget, RirCellDecl, RirCellRef, RirCellStorage, RirCollectionLoanScope,
-        RirCollectionStorageKind, RirDataRefId, RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
-        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject,
-        RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
-        stmt_child_blocks_any,
+        RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
+        RirCollectionLoanScope, RirCollectionStorageKind, RirDataRefId, RirEnum, RirEnumMatch,
+        RirEnumRepr, RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
+        RirFunction, RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
+        RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
+        RirOptionSubject, RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
+        RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram, stmt_child_blocks_any,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -1023,11 +1023,10 @@ impl EmitCx<'_> {
 
     fn emit_local_declarations(&mut self, function: &RirFunction) {
         let policy = RustRepPolicy::new(self.program);
-        for cell in self
-            .program
-            .cells
-            .iter()
-            .filter(|cell| cell.owner == function.id)
+        for cell in
+            self.program.cells.iter().filter(|cell| {
+                cell.owner == function.id && cell.lifetime == RirCellLifetime::Function
+            })
         {
             let ty = match cell.storage {
                 RirCellStorage::StackScoped => {
@@ -1064,11 +1063,15 @@ impl EmitCx<'_> {
             .iter()
             .filter(|cell| cell.owner == function.id)
         {
-            let source = function.locals[cell.source_local.index()].symbol.as_str();
+            let (prelude, source) =
+                self.prepared_mut_place_arg(function, cell.id.index(), cell.source.place());
+            for line in prelude {
+                self.w.line(format_args!("{line}"));
+            }
             self.w.line(format_args!(
                 "let {} = {};",
                 cell.symbol.as_str(),
-                target::scoped_mut_place_cell_new(source)
+                target::scoped_mut_place_cell_new(&source)
             ));
         }
     }
@@ -1083,7 +1086,12 @@ impl EmitCx<'_> {
         match stmt {
             RirStmt::Init { local, value } => {
                 let local_data = &function.locals[local.index()];
-                let value = self.rvalue(function, value);
+                let value = match value {
+                    RirRValue::MutPlaceGetCopy { place, .. } => {
+                        self.mut_place_get_copy(function, index, place)
+                    }
+                    _ => self.rvalue(function, value),
+                };
                 if predeclared {
                     self.w
                         .line(format_args!("{} = {value};", local_data.symbol.as_str()));
@@ -1133,7 +1141,7 @@ impl EmitCx<'_> {
                 let (mut prelude, place) = if place.projections.is_empty() {
                     (vec![], root)
                 } else {
-                    self.prepared_projected_call_arg(function, index, place, root_ty, &root)
+                    self.prepared_projected_mut_place(function, index, place, root_ty, &root)
                 };
                 for line in prelude.drain(..) {
                     self.w.line(format_args!("{line}"));
@@ -1159,7 +1167,7 @@ impl EmitCx<'_> {
             }
             RirStmt::CellInit { cell, value } => {
                 let init = self.cell_init(function, *cell, value);
-                if predeclared {
+                if predeclared && self.cell_decl(*cell).lifetime == RirCellLifetime::Function {
                     self.w
                         .line(format_args!("{} = {init};", self.cell_ref(function, *cell)));
                 } else {
@@ -1758,6 +1766,9 @@ impl EmitCx<'_> {
             RirRValue::ScopedPlaceCellGet { cell, ty } => {
                 values.scoped_place_cell_value(*cell, *ty)
             }
+            RirRValue::MutPlaceGetCopy { .. } => {
+                unreachable!("mutable-place reads need statement-local prelude")
+            }
             RirRValue::Array { elems, .. } => {
                 format!(
                     "[{}]",
@@ -1880,20 +1891,12 @@ impl EmitCx<'_> {
             RirRValue::Len { source } => format!("{}.len() as i64", places.local_place(source)),
             RirRValue::ListPush { list, value } => {
                 let elem = values.value_operand(value);
-                if let Some(mutation) = self.collection_mutation(
+                self.collection_mutation(
                     function,
                     list,
-                    [("__anv_elem", elem.clone())],
+                    [("__anv_elem", elem)],
                     &target::list_push_ctx_region("__anv_elem"),
-                ) {
-                    mutation
-                } else {
-                    target::list_push(
-                        &places.local_place(list),
-                        target::runtime_param_name(),
-                        &elem,
-                    )
-                }
+                )
             }
             RirRValue::SliceView {
                 source,
@@ -1939,40 +1942,21 @@ impl EmitCx<'_> {
             } => {
                 let key = values.value_operand(key);
                 let value = values.value_operand(value);
-                if let Some(mutation) = self.collection_mutation(
+                self.collection_mutation(
                     function,
                     map,
-                    [("__anv_key", key.clone()), ("__anv_insert", value.clone())],
+                    [("__anv_key", key), ("__anv_insert", value)],
                     &target::map_insert_region("__anv_key", "__anv_insert"),
-                ) {
-                    mutation
-                } else {
-                    block_expr(
-                        [format!(
-                            "{};",
-                            target::map_insert(
-                                &places.local_place(map),
-                                target::runtime_param_name(),
-                                &key,
-                                &value
-                            )
-                        )],
-                        None,
-                    )
-                }
+                )
             }
             RirRValue::MapRemove { map, key, .. } => {
                 let key = values.operand(key);
-                if let Some(mutation) = self.collection_mutation(
+                self.collection_mutation(
                     function,
                     map,
-                    [("__anv_key", key.clone())],
+                    [("__anv_key", key)],
                     &target::map_remove_region("__anv_key"),
-                ) {
-                    mutation
-                } else {
-                    target::map_remove(&places.local_place(map), target::runtime_param_name(), &key)
-                }
+                )
             }
             RirRValue::MapEntryAt { map, index, ty } => {
                 self.map_entry_at(function, map, *index, *ty)
@@ -2206,24 +2190,24 @@ impl EmitCx<'_> {
     fn collection_mutation<const N: usize>(
         &self,
         function: &RirFunction,
-        root: &RirPlace,
+        root: &RirMutPlaceArg,
         bindings: [(&str, String); N],
         body: &str,
-    ) -> Option<String> {
-        let (mut prelude, place) = self.collection_mutation_place(function, root)?;
+    ) -> String {
+        let (mut prelude, place) = self.collection_mutation_place(function, root);
         prelude.extend(
             bindings
                 .into_iter()
                 .map(|(name, value)| format!("let {name} = {value};")),
         );
-        Some(block_expr(
+        block_expr(
             prelude,
             Some(target::mut_place_mutate_ctx(
                 &place,
                 target::runtime_param_name(),
                 body,
             )),
-        ))
+        )
     }
 
     fn collection_root_place(&self, function: &RirFunction, root: &RirPlace) -> Option<String> {
@@ -2244,114 +2228,9 @@ impl EmitCx<'_> {
     fn collection_mutation_place(
         &self,
         function: &RirFunction,
-        root: &RirPlace,
-    ) -> Option<(Vec<String>, String)> {
-        if let Some(place) = self.collection_root_place(function, root) {
-            return Some((vec![], place));
-        }
-        if let Some(place) = self.local_projected_mut_place(function, root) {
-            return Some(place);
-        }
-        if let Some(place) = self.dataref_projected_mut_place(function, root) {
-            return Some(place);
-        }
-        self.global_mut_place(function, root)
-    }
-
-    fn dataref_projected_mut_place(
-        &self,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) -> Option<(Vec<String>, String)> {
-        let RirPlaceRoot::Local(local) = place.root else {
-            return None;
-        };
-        let root_ty = function.locals.get(local.index())?.ty;
-        let RirType::DataRef(dataref) = self.program.types[root_ty.index()] else {
-            return None;
-        };
-        Some(self.prepared_dataref_place(
-            function,
-            &RirOperand::Place(RirPlace::local(local, vec![], root_ty)),
-            dataref,
-            &place.projections,
-            place.ty,
-            "__anv_dataref_collection_object",
-            "__anv_dataref_collection_ops",
-        ))
-    }
-
-    fn local_projected_mut_place(
-        &self,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) -> Option<(Vec<String>, String)> {
-        if place.projections.is_empty() {
-            return None;
-        }
-        let RirPlaceRoot::Local(local) = place.root else {
-            return None;
-        };
-        let places = RustPlaces::new(self.program, function);
-        let (projection, root) = if let Some(projection) = places.mut_place_projection(place) {
-            let root = target::mut_place_reborrow(&projection.root);
-            (projection, root)
-        } else {
-            let local = function.locals.get(local.index())?;
-            let projection = places.projected_place(
-                local.ty,
-                local.symbol.as_str(),
-                place.ty,
-                &place.projections,
-            )?;
-            let root = target::mut_place_local(&projection.root);
-            (projection, root)
-        };
-        let values = RustValues::new(self.program, function);
-        let descriptor =
-            values.mut_place_projection_descriptor("__AnvCollectionPlaceOps", &projection);
-        Some((
-            vec![
-                descriptor.struct_decl,
-                descriptor.impl_decl,
-                format!("let __anv_collection_place_ops = {};", descriptor.ctor),
-            ],
-            target::mut_place_projected(&root, "&__anv_collection_place_ops"),
-        ))
-    }
-
-    fn global_mut_place(
-        &self,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) -> Option<(Vec<String>, String)> {
-        let RirPlaceRoot::Global(global) = place.root else {
-            return None;
-        };
-        let root = target::mut_place_global(
-            &RustValues::global_slot_expr(self.program, global),
-            &RustValues::global_init_call(self.program, global),
-        );
-        if place.projections.is_empty() {
-            return Some((vec![], root));
-        }
-        let root_ty = self.program.globals[global.index()].ty;
-        let values = RustValues::new(self.program, function);
-        let descriptor = values.mut_place_projection_descriptor_for(
-            "__AnvGlobalProjectedPlaceOps",
-            root_ty,
-            &root,
-            place.ty,
-            &place.projections,
-        );
-        Some((
-            vec![
-                descriptor.struct_decl,
-                descriptor.impl_decl,
-                format!("let __anv_global_projected_ops = {};", descriptor.ctor),
-            ],
-            target::mut_place_projected(&root, "&__anv_global_projected_ops"),
-        ))
+        root: &RirMutPlaceArg,
+    ) -> (Vec<String>, String) {
+        self.prepared_mut_place_arg(function, 0, root)
     }
 
     fn collection_version(&self, root: &RirPlace, fallback: String) -> String {
@@ -2596,6 +2475,19 @@ impl EmitCx<'_> {
         self.prepared_mut_place_arg(function, index, mut_place)
     }
 
+    fn mut_place_get_copy(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        mut_place: &RirMutPlaceArg,
+    ) -> String {
+        let (prelude, place) = self.prepared_mut_place_arg(function, index, mut_place);
+        for line in prelude {
+            self.w.line(format_args!("{line}"));
+        }
+        target::mut_place_get_copy(&place, target::runtime_param_name())
+    }
+
     fn prepared_mut_place_arg(
         &self,
         function: &RirFunction,
@@ -2606,7 +2498,7 @@ impl EmitCx<'_> {
         if !mut_place.projections.is_empty()
             && let Some((root_ty, root)) = values.mut_place_access_arg(&mut_place.access)
         {
-            return self.prepared_projected_call_arg(function, index, mut_place, root_ty, &root);
+            return self.prepared_projected_mut_place(function, index, mut_place, root_ty, &root);
         }
         let RirMutPlaceAccess::DataRef { object, dataref } = &mut_place.access else {
             return (
@@ -2693,7 +2585,7 @@ impl EmitCx<'_> {
                 return (prelude, root);
             }
             let (projected_prelude, place) =
-                self.prepared_projected_call_arg(function, index, mut_place, ty, &root);
+                self.prepared_projected_mut_place(function, index, mut_place, ty, &root);
             return (
                 prelude.into_iter().chain(projected_prelude).collect(),
                 place,
@@ -2710,7 +2602,7 @@ impl EmitCx<'_> {
         if mut_place.projections.is_empty() {
             return (vec![], root);
         }
-        self.prepared_projected_call_arg(function, index, mut_place, ty, &root)
+        self.prepared_projected_mut_place(function, index, mut_place, ty, &root)
     }
 
     fn prepared_scoped_lambda_call_arg(
@@ -2742,7 +2634,7 @@ impl EmitCx<'_> {
         )
     }
 
-    fn prepared_projected_call_arg(
+    fn prepared_projected_mut_place(
         &self,
         function: &RirFunction,
         index: usize,
@@ -3414,6 +3306,7 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
         }
         RirRValue::CellGetCopy { cell, .. } => cell_uses_local(cell, local),
         RirRValue::ScopedPlaceCellGet { cell, .. } => scoped_cell_uses_local(program, cell, local),
+        RirRValue::MutPlaceGetCopy { place, .. } => mut_place_arg_uses_local(program, place, local),
         RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
             operand_uses_local(program, lhs, local) || operand_uses_local(program, rhs, local)
         }
@@ -3440,15 +3333,19 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
             map: source, index, ..
         } => place_uses_local(source, local) || *index == local,
         RirRValue::ListPush { list, value } => {
-            place_uses_local(list, local) || operand_uses_local(program, value, local)
+            mut_place_arg_uses_local(program, list, local)
+                || operand_uses_local(program, value, local)
         }
-        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
+        RirRValue::MapGet { map, key, .. } => {
             place_uses_local(map, local) || operand_uses_local(program, key, local)
+        }
+        RirRValue::MapRemove { map, key, .. } => {
+            mut_place_arg_uses_local(program, map, local) || operand_uses_local(program, key, local)
         }
         RirRValue::MapInsert {
             map, key, value, ..
         } => {
-            place_uses_local(map, local)
+            mut_place_arg_uses_local(program, map, local)
                 || operand_uses_local(program, key, local)
                 || operand_uses_local(program, value, local)
         }
@@ -3548,7 +3445,10 @@ fn scoped_cell_uses_local(
     let cell = match cell {
         RirScopedPlaceCellRef::Owner(cell) | RirScopedPlaceCellRef::Capture { cell, .. } => cell,
     };
-    program.scoped_place_cells[cell.index()].source_local == local
+    program.scoped_place_cells[cell.index()]
+        .source
+        .place()
+        .uses_local(local)
 }
 
 fn operand_uses_local(_program: &RirProgram, operand: &RirOperand, local: RirLocalId) -> bool {

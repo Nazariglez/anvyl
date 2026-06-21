@@ -3,17 +3,12 @@
 // @expect: success
 // @match: 1
 
-struct Point {
-    x: int,
-    y: int,
-}
-
 fn inc(var value: int) {
     value += 1;
 }
 
-fn touch(var point: Point) {
-    var Point { x } = point;
+fn touch(var pair: (int, int)) {
+    var (x, _) = pair;
     let f = || {
         inc(x);
     };
@@ -21,7 +16,7 @@ fn touch(var point: Point) {
 }
 
 fn main() {
-    var p = Point { x: 0, y: 0 };
-    touch(p);
-    println(p.x);
+    var pair = (0, 0);
+    touch(pair);
+    println(pair.0);
 }

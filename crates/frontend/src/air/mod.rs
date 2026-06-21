@@ -199,18 +199,32 @@ impl Program {
         })
     }
 
-    fn scoped_borrow_source_local(
+    fn scoped_borrow_source_place(
         &self,
         function_id: FunctionId,
         borrow: ScopedBorrowId,
-    ) -> Option<LocalId> {
+    ) -> Option<Place> {
         let decl = self.scoped_borrows.get(borrow.index())?;
         if decl.owner != function_id {
             return None;
         }
-        match decl.source {
-            ScopedBorrowSource::SourceMutParam { local } => Some(local),
-        }
+        Some(match &decl.source {
+            ScopedBorrowSource::SourceMutParam { local }
+            | ScopedBorrowSource::VarSelf { local } => Place {
+                root: PlaceRoot::Local(*local),
+                projection: vec![],
+                ty: decl.ty,
+            },
+            ScopedBorrowSource::PatternAlias { source } => source.clone(),
+        })
+    }
+
+    fn resolve_scoped_borrow_place(&self, function_id: FunctionId, place: &Place) -> Option<Place> {
+        let borrow = self.scoped_borrow_root(function_id, place.root)?;
+        let mut source = self.scoped_borrow_source_place(function_id, borrow)?;
+        source.projection.extend(place.projection.clone());
+        source.ty = place.ty;
+        Some(source)
     }
 
     fn lambda_capture(
@@ -236,23 +250,13 @@ impl Program {
         ) {
             return left == right;
         }
-        let left_borrow = self.scoped_borrow_root(function_id, left.root);
-        let right_borrow = self.scoped_borrow_root(function_id, right.root);
-        match (left_borrow, right_borrow) {
-            (Some(left), Some(right)) => return left == right,
-            (Some(borrow), None) => {
-                return right.root.local().is_some_and(|local| {
-                    self.scoped_borrow_source_local(function_id, borrow) == Some(local)
-                });
-            }
-            (None, Some(borrow)) => {
-                return left.root.local().is_some_and(|local| {
-                    self.scoped_borrow_source_local(function_id, borrow) == Some(local)
-                });
-            }
-            (None, None) => {}
-        }
-        left.may_overlap(right)
+        let left = self
+            .resolve_scoped_borrow_place(function_id, left)
+            .unwrap_or_else(|| left.clone());
+        let right = self
+            .resolve_scoped_borrow_place(function_id, right)
+            .unwrap_or_else(|| right.clone());
+        left.may_overlap(&right)
     }
 
     pub fn alloc_extern(&mut self, decl: ExternDecl) -> ExternId {

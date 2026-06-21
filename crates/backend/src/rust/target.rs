@@ -425,24 +425,12 @@ pub(super) fn anv_map_from_entries(rt: &str, storage_ty: &str, entries: &str) ->
     )
 }
 
-pub(super) fn list_push(list: &str, rt: &str, value: &str) -> String {
-    format!("{list}.push({rt}, {value})?")
-}
-
 pub(super) fn list_push_ctx_region(value: &str) -> String {
     format!("{{ value.push(rt, {value})?; Ok(()) }}")
 }
 
-pub(super) fn map_insert(map: &str, rt: &str, key: &str, value: &str) -> String {
-    format!("{map}.insert({rt}, {key}, {value})?")
-}
-
 pub(super) fn map_insert_region(key: &str, inserted: &str) -> String {
     format!("{{ value.insert(rt, {key}, {inserted})?; Ok(()) }}")
-}
-
-pub(super) fn map_remove(map: &str, rt: &str, key: &str) -> String {
-    format!("{map}.remove({rt}, &{key})?")
 }
 
 pub(super) fn map_contains_key_region(key: &str) -> String {

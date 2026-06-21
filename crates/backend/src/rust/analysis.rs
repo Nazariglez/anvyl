@@ -128,7 +128,8 @@ fn rvalue_calls_fallible(
             | RirRValue::MapValueAt { .. }
             | RirRValue::SliceView { .. }
             | RirRValue::CellGetCopy { .. }
-            | RirRValue::ScopedPlaceCellGet { .. } => true,
+            | RirRValue::ScopedPlaceCellGet { .. }
+            | RirRValue::MutPlaceGetCopy { .. } => true,
             RirRValue::Call { callee, args, .. } => {
                 args.iter()
                     .any(|arg| call_arg_preparation_fallible(program, arg))
@@ -216,6 +217,7 @@ fn rvalue_uses_fallible_place(
             place_has_fallible_projection(program, function, map)
         }
         RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => false,
+        RirRValue::MutPlaceGetCopy { place, .. } => mut_place_preparation_fallible(program, place),
     }
 }
 
@@ -371,9 +373,9 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
         RirStmt::GlobalSetRoot { value, .. } | RirStmt::GlobalUpdateRoot { value, .. } => {
             ContextUse::globals().union(rvalue_context_use(program, function, value))
         }
-        RirStmt::MutPlaceSet { value, .. } => {
-            ContextUse::generated_call().union(rvalue_context_use(program, function, value))
-        }
+        RirStmt::MutPlaceSet { place, value } => ContextUse::rt()
+            .union(mut_place_context_use(program, function, place))
+            .union(rvalue_context_use(program, function, value)),
         RirStmt::CellInit { cell, value } | RirStmt::CellSet { cell, value } => {
             cell_context_use(program, *cell).union(rvalue_context_use(program, function, value))
         }
@@ -469,6 +471,9 @@ fn rvalue_context_use(
         | RirRValue::MapEntryAt { .. }
         | RirRValue::MapValueAt { .. }
         | RirRValue::ScopedPlaceCellGet { .. } => uses.union(ContextUse::rt()),
+        RirRValue::MutPlaceGetCopy { place, .. } => uses
+            .union(ContextUse::rt())
+            .union(mut_place_context_use(program, function, place)),
         RirRValue::CellGetCopy { cell, .. } => uses.union(cell_context_use(program, *cell)),
         RirRValue::Stringify { source_ty, .. }
             if matches!(program.types[source_ty.index()], RirType::Struct(_)) =>
@@ -523,15 +528,15 @@ fn rvalue_operand_context_use(
         RirRValue::Len { source }
         | RirRValue::SliceView { source, .. }
         | RirRValue::RangeListCopy { source, .. } => place_context_use(program, function, source),
-        RirRValue::ListPush { list, value } => place_context_use(program, function, list)
+        RirRValue::ListPush { list, value } => mut_place_context_use(program, function, list)
             .union(operand_context_use(program, function, value)),
-        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
-            place_context_use(program, function, map)
-                .union(operand_context_use(program, function, key))
-        }
+        RirRValue::MapGet { map, key, .. } => place_context_use(program, function, map)
+            .union(operand_context_use(program, function, key)),
+        RirRValue::MapRemove { map, key, .. } => mut_place_context_use(program, function, map)
+            .union(operand_context_use(program, function, key)),
         RirRValue::MapInsert {
             map, key, value, ..
-        } => place_context_use(program, function, map).union(operands_context_use(
+        } => mut_place_context_use(program, function, map).union(operands_context_use(
             program,
             function,
             [key, value],
@@ -542,7 +547,8 @@ fn rvalue_operand_context_use(
         RirRValue::Call { .. }
         | RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }
-        | RirRValue::ScopedPlaceCellGet { .. } => ContextUse::default(),
+        | RirRValue::ScopedPlaceCellGet { .. }
+        | RirRValue::MutPlaceGetCopy { .. } => ContextUse::default(),
     }
 }
 
@@ -736,6 +742,16 @@ fn mut_place_preparation_fallible(program: &RirProgram, arg: &RirMutPlaceArg) ->
     }
 }
 
+fn mut_place_uses_mut_place_param(function: &RirFunction, arg: &RirMutPlaceArg) -> bool {
+    match arg.access {
+        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local, .. }) => function
+            .params
+            .iter()
+            .any(|param| param.local == local && param.abi == RirParamAbi::MutPlace),
+        _ => false,
+    }
+}
+
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {
     match arg {
         RirCallArg::Value(operand)
@@ -825,16 +841,20 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         | RirRValue::SliceView { source, .. }
         | RirRValue::RangeListCopy { source, .. } => place_is_mut_place_param(function, source),
         RirRValue::ListPush { list, value } => {
-            place_is_mut_place_param(function, list)
+            mut_place_uses_mut_place_param(function, list)
                 || operand_uses_mut_place_param(function, value)
         }
-        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
+        RirRValue::MapGet { map, key, .. } => {
             place_is_mut_place_param(function, map) || operand_uses_mut_place_param(function, key)
+        }
+        RirRValue::MapRemove { map, key, .. } => {
+            mut_place_uses_mut_place_param(function, map)
+                || operand_uses_mut_place_param(function, key)
         }
         RirRValue::MapInsert {
             map, key, value, ..
         } => {
-            place_is_mut_place_param(function, map)
+            mut_place_uses_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
         }
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
@@ -843,5 +863,6 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }
         | RirRValue::ScopedPlaceCellGet { .. } => false,
+        RirRValue::MutPlaceGetCopy { place, .. } => mut_place_uses_mut_place_param(function, place),
     }
 }

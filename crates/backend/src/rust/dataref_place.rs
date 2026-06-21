@@ -1,7 +1,7 @@
 use super::rir::{
     RirCallArg, RirDataRefId, RirFieldId, RirFunction, RirMapWriteKind, RirMutPlaceAccess,
-    RirMutPlaceArg, RirOptionMatch, RirOptionSubject, RirPlace, RirPlaceModel, RirPlaceRoot,
-    RirProgram, RirProjection, RirRValue, RirStmt, RirStructuredBlock, RirType, RirTypeId,
+    RirMutPlaceArg, RirOptionMatch, RirOptionSubject, RirPlaceModel, RirProgram, RirProjection,
+    RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -57,12 +57,15 @@ impl DataRefPlaceDescriptors {
             | RirStmt::Assign { value, .. }
             | RirStmt::GlobalSetRoot { value, .. }
             | RirStmt::GlobalUpdateRoot { value, .. }
-            | RirStmt::MutPlaceSet { value, .. }
             | RirStmt::Eval(value)
             | RirStmt::CellInit { value, .. }
             | RirStmt::CellSet { value, .. }
             | RirStmt::ScopedPlaceCellSet { value, .. } => {
-                self.collect_rvalue(program, function, value);
+                self.collect_rvalue(program, value);
+            }
+            RirStmt::MutPlaceSet { place, value } => {
+                self.collect_mut_place_arg(program, place);
+                self.collect_rvalue(program, value);
             }
             RirStmt::GlobalEnsure { .. }
             | RirStmt::DataRefSet { .. }
@@ -108,8 +111,9 @@ impl DataRefPlaceDescriptors {
         self.collect_block(program, function, &match_.none_block);
     }
 
-    fn collect_rvalue(&mut self, program: &RirProgram, function: &RirFunction, value: &RirRValue) {
+    fn collect_rvalue(&mut self, program: &RirProgram, value: &RirRValue) {
         match value {
+            RirRValue::MutPlaceGetCopy { place, .. } => self.collect_mut_place_arg(program, place),
             RirRValue::Call { args, .. } => {
                 for arg in args {
                     if let RirCallArg::MutPlace(arg) = arg {
@@ -121,7 +125,7 @@ impl DataRefPlaceDescriptors {
                 map,
                 kind: RirMapWriteKind::IndexedAssignment,
                 ..
-            } => self.intern_dataref_place(program, function, map),
+            } => self.collect_mut_place_arg(program, map),
             _ => {}
         }
     }
@@ -129,30 +133,6 @@ impl DataRefPlaceDescriptors {
     fn collect_mut_place_arg(&mut self, program: &RirProgram, arg: &RirMutPlaceArg) {
         if let RirMutPlaceAccess::DataRef { dataref, .. } = &arg.access {
             self.intern(program, *dataref, &arg.projections, arg.ty);
-        }
-    }
-
-    fn intern_dataref_place(
-        &mut self,
-        program: &RirProgram,
-        function: &RirFunction,
-        place: &RirPlace,
-    ) {
-        let RirPlaceRoot::Local(local) = place.root else {
-            return;
-        };
-        let Some(local) = function.locals.get(local.index()) else {
-            return;
-        };
-        let Some(RirType::DataRef(dataref)) = program.types.get(local.ty.index()).copied() else {
-            return;
-        };
-        if !place.projections.is_empty()
-            && RirPlaceModel::new(program)
-                .dataref_storage_path(dataref, &place.projections)
-                .is_ok()
-        {
-            self.intern(program, dataref, &place.projections, place.ty);
         }
     }
 
