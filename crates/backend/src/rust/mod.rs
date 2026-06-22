@@ -41,24 +41,24 @@ use self::{
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
-        RirCellStorage, RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind,
-        RirCollectionStorage, RirCollectionStorageId, RirCollectionStorageKind, RirConst,
-        RirConstId, RirConstValue, RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum,
-        RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId,
-        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatAlign, RirFormatKind,
-        RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf,
-        RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch,
-        RirOptionSubject, RirParam, RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot,
-        RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
+        RirCollectionRootKind, RirCollectionStorage, RirCollectionStorageId,
+        RirCollectionStorageKind, RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirCtxPlan,
+        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr,
+        RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
+        RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg,
+        RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId,
+        RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
+        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
+        RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
+        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -386,9 +386,75 @@ struct PlannedOperands {
 }
 
 struct PlannedCollectionLoanRoot {
-    place: RirPlace,
+    root: RirCollectionAccess,
     root_kind: RirCollectionRootKind,
     mode: RirCollectionLoanMode,
+}
+
+struct PlannedCollectionAccess {
+    stmts: Vec<RirStmt>,
+    access: RirCollectionAccess,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CollectionAccessOp {
+    ShapeLoan,
+    Len,
+    SequenceSlotRead,
+    SequenceSlotWrite,
+    MapGet,
+    MapEntryRead,
+    MapValueRead,
+    MapValueWrite,
+    IndexedMapAssign,
+    StructuralMutation,
+}
+
+impl CollectionAccessOp {
+    pub(super) fn intent(self) -> PlaceAccessIntent {
+        match self {
+            Self::ShapeLoan => PlaceAccessIntent::CollectionLoan,
+            Self::Len
+            | Self::SequenceSlotRead
+            | Self::MapGet
+            | Self::MapEntryRead
+            | Self::MapValueRead => PlaceAccessIntent::ReadValue,
+            Self::SequenceSlotWrite | Self::MapValueWrite | Self::IndexedMapAssign => {
+                PlaceAccessIntent::Assign
+            }
+            Self::StructuralMutation => PlaceAccessIntent::StructuralMutation,
+        }
+    }
+
+    pub(super) fn slot(slots: &[air::AirCollectionSlot]) -> Self {
+        let map = slots
+            .iter()
+            .any(|slot| matches!(slot.kind, air::AirCollectionSlotKind::MapValue));
+        let write = slots.iter().any(|slot| slot.mutable);
+        match (map, write) {
+            (true, true) => Self::MapValueWrite,
+            (true, false) => Self::MapValueRead,
+            (false, true) => Self::SequenceSlotWrite,
+            (false, false) => Self::SequenceSlotRead,
+        }
+    }
+
+    pub(super) fn requires_mutable_root(self) -> bool {
+        matches!(
+            self,
+            Self::SequenceSlotWrite
+                | Self::MapValueWrite
+                | Self::IndexedMapAssign
+                | Self::StructuralMutation
+        )
+    }
+
+    pub(super) fn map_write(kind: MapWriteKind) -> Self {
+        match kind {
+            MapWriteKind::StructuralInsert => Self::StructuralMutation,
+            MapWriteKind::IndexedAssignment => Self::IndexedMapAssign,
+        }
+    }
 }
 
 struct PlannedCallArg {
@@ -2057,7 +2123,7 @@ impl<'a> PlanCx<'a> {
                 })])
             }
             air::AirStmt::CollectionLoan(loan) => {
-                let root = self.lower_collection_loan_root(function, loan);
+                let root = self.lower_collection_loan_root(function, index, loan, locals)?;
                 let body = self.plan_air_block(
                     function,
                     &loan.body,
@@ -2068,7 +2134,7 @@ impl<'a> PlanCx<'a> {
                     in_loop,
                 )?;
                 Ok(vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                    root: root.place,
+                    root: root.root,
                     root_kind: root.root_kind,
                     mode: root.mode,
                     body,
@@ -2517,6 +2583,25 @@ impl<'a> PlanCx<'a> {
             RValue::Aggregate { kind, fields, ty } => {
                 return self.plan_aggregate(function, kind, fields, *ty, locals);
             }
+            RValue::Len { source }
+                if matches!(
+                    self.air.type_arena.data(source.ty),
+                    TypeData::Array { .. }
+                        | TypeData::List(_)
+                        | TypeData::Map { .. }
+                        | TypeData::Slice(_)
+                ) =>
+            {
+                let source =
+                    self.plan_collection_access(function, source, CollectionAccessOp::Len, locals)?;
+                PlannedRValue {
+                    stmts: source.stmts,
+                    value: RirRValue::CollectionLen {
+                        source: source.access,
+                    },
+                    post_stmts: vec![],
+                }
+            }
             RValue::Len { source } => {
                 let source = self.lower_place_read(function, source, locals);
                 let RirOperand::Place(source_place) = source.operand else {
@@ -2531,14 +2616,14 @@ impl<'a> PlanCx<'a> {
                 }
             }
             RValue::ListPush { list, value } => {
+                let list = self.structural_collection_access(function, list, locals)?;
                 let value = self.plan_operand_read(function, value, locals);
-                let list = self.lower_structural_mutation_place(function, list, locals)?;
-                let mut stmts = value.stmts;
-                stmts.extend(list.stmts);
+                let mut stmts = list.stmts;
+                stmts.extend(value.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::ListPush {
-                        list: list.arg,
+                        list: list.access,
                         value: value.operand,
                     },
                     post_stmts: vec![],
@@ -2582,17 +2667,15 @@ impl<'a> PlanCx<'a> {
                 }
             }
             RValue::MapGet { map, key, ty } => {
-                let map = self.lower_place_read(function, map, locals);
+                let map =
+                    self.plan_collection_access(function, map, CollectionAccessOp::MapGet, locals)?;
                 let key = self.plan_operand_read(function, key, locals);
-                let RirOperand::Place(map_place) = map.operand else {
-                    unreachable!("place read returns a place operand")
-                };
                 let mut stmts = map.stmts;
                 stmts.extend(key.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::MapGet {
-                        map: map_place,
+                        map: map.access,
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
@@ -2605,23 +2688,21 @@ impl<'a> PlanCx<'a> {
                 value,
                 kind,
             } => {
+                let map = self.plan_collection_access(
+                    function,
+                    map,
+                    CollectionAccessOp::map_write(*kind),
+                    locals,
+                )?;
                 let key = self.plan_operand_read(function, key, locals);
                 let value = self.plan_operand_read(function, value, locals);
-                let map = match kind {
-                    MapWriteKind::StructuralInsert => {
-                        self.lower_structural_mutation_place(function, map, locals)?
-                    }
-                    MapWriteKind::IndexedAssignment => {
-                        self.lower_collection_write_place(function, map, locals)?
-                    }
-                };
-                let mut stmts = key.stmts;
+                let mut stmts = map.stmts;
+                stmts.extend(key.stmts);
                 stmts.extend(value.stmts);
-                stmts.extend(map.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::MapInsert {
-                        map: map.arg,
+                        map: map.access,
                         key: key.operand,
                         value: value.operand,
                         kind: rir_map_write_kind(*kind),
@@ -2630,14 +2711,14 @@ impl<'a> PlanCx<'a> {
                 }
             }
             RValue::MapRemove { map, key, ty } => {
+                let map = self.structural_collection_access(function, map, locals)?;
                 let key = self.plan_operand_read(function, key, locals);
-                let map = self.lower_structural_mutation_place(function, map, locals)?;
-                let mut stmts = key.stmts;
-                stmts.extend(map.stmts);
+                let mut stmts = map.stmts;
+                stmts.extend(key.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::MapRemove {
-                        map: map.arg,
+                        map: map.access,
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
@@ -2665,14 +2746,16 @@ impl<'a> PlanCx<'a> {
                 })
             }
             RValue::MapEntryAt { map, index, ty } => {
-                let map = self.lower_place_read(function, map, locals);
-                let RirOperand::Place(map_place) = map.operand else {
-                    unreachable!("place read returns a place operand")
-                };
+                let map = self.plan_collection_access(
+                    function,
+                    map,
+                    CollectionAccessOp::MapEntryRead,
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: map.stmts,
                     value: RirRValue::MapEntryAt {
-                        map: map_place,
+                        map: map.access,
                         index: RirLocalId::from_index(index.index()),
                         ty: self.type_map[ty],
                     },
@@ -2817,19 +2900,20 @@ impl<'a> PlanCx<'a> {
                 }));
             }
         }
-        if self
+        let read_plan = self
             .access()
             .plan(function, PlaceAccessIntent::ReadValue, place)
-            .expect("profile verifies readable places")
-            .dataref_plan()
-            .is_some()
-        {
+            .expect("profile verifies readable places");
+        if read_plan.dataref_plan().is_some() {
             let planned = self.lower_place_read(function, place, locals);
             return Ok(PlannedRValue {
                 stmts: planned.stmts,
                 value: RirRValue::Use(planned.operand),
                 post_stmts: vec![],
             });
+        }
+        if let Some(value) = self.projected_sequence_read(function, place, &read_plan, locals)? {
+            return Ok(value);
         }
         if !self.air_place_value_readable(place.ty) {
             if let Some(known) = self.known_lambda_place(place, lambda_values) {
@@ -2868,6 +2952,51 @@ impl<'a> PlanCx<'a> {
                     RirOperand::Place(self.plan_place_in_function(function, &field_place))
                 })
                 .collect(),
+        }))
+    }
+
+    fn projected_sequence_read(
+        &self,
+        function: FunctionId,
+        place: &Place,
+        read_plan: &PlaceAccessPlan,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<Option<PlannedRValue>, RustPlanError> {
+        let Some(last) = read_plan.projection.last() else {
+            return Ok(None);
+        };
+        let (PlaceProjectionKind::ArrayIndex(index)
+        | PlaceProjectionKind::ListIndex(index)
+        | PlaceProjectionKind::SliceIndex(index)) = last.kind
+        else {
+            return Ok(None);
+        };
+        if matches!(
+            read_plan.root,
+            PlaceAccessRoot::Local {
+                source_mut_param: false,
+                ..
+            } | PlaceAccessRoot::Global(_)
+        ) {
+            return Ok(None);
+        }
+        let mut root = place.clone();
+        root.projection.pop();
+        root.ty = last.source_ty;
+        let collection = self.plan_collection_access(
+            function,
+            &root,
+            CollectionAccessOp::SequenceSlotRead,
+            locals,
+        )?;
+        Ok(Some(PlannedRValue {
+            stmts: collection.stmts,
+            value: RirRValue::SequenceSlotAt {
+                collection: collection.access,
+                index: RirLocalId::from_index(index.index()),
+                ty: self.type_map[&place.ty],
+            },
+            post_stmts: vec![],
         }))
     }
 
@@ -3020,6 +3149,7 @@ impl<'a> PlanCx<'a> {
         possible_cells: &mut [bool],
         in_loop: bool,
     ) -> Result<Vec<RirStmt>, RustPlanError> {
+        let access = self.collection_slot_access(function, scope, locals)?;
         let body = self.plan_air_block(
             function,
             &scope.body,
@@ -3029,7 +3159,7 @@ impl<'a> PlanCx<'a> {
             possible_cells,
             in_loop,
         )?;
-        let (body, _) = self.collection_slot_block(function, scope, body, true)?;
+        let (body, _) = self.collection_slot_block(function, scope, &access, body, true)?;
         Ok(vec![RirStmt::CollectionSlotScope(body)])
     }
 
@@ -3037,11 +3167,12 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
         mut body: RirStructuredBlock,
         init: bool,
     ) -> Result<(RirStructuredBlock, bool), RustPlanError> {
         let mut stmts = if init {
-            self.collection_slot_reads(function, scope, true)
+            self.collection_slot_reads(function, scope, access, true)
         } else {
             vec![]
         };
@@ -3051,13 +3182,14 @@ impl<'a> PlanCx<'a> {
             if first {
                 first = false;
             } else {
-                stmts.extend(self.collection_slot_reads(function, scope, false));
+                stmts.extend(self.collection_slot_reads(function, scope, access, false));
             }
-            let (stmt, stmt_updates_slot) = self.collection_slot_stmt(function, scope, stmt)?;
+            let (stmt, stmt_updates_slot) =
+                self.collection_slot_stmt(function, scope, access, stmt)?;
             block_updates_slot |= stmt_updates_slot;
             stmts.push(stmt);
             if stmt_updates_slot {
-                stmts.extend(self.collection_slot_writes(function, scope));
+                stmts.extend(self.collection_slot_writes(function, scope, access));
             }
         }
         body.stmts = stmts;
@@ -3068,16 +3200,17 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
         stmt: RirStmt,
     ) -> Result<(RirStmt, bool), RustPlanError> {
         Ok(match stmt {
             RirStmt::If(mut branch) => {
                 let (then_block, mut updates_slot) =
-                    self.collection_slot_block(function, scope, branch.then_block, false)?;
+                    self.collection_slot_block(function, scope, access, branch.then_block, false)?;
                 branch.then_block = then_block;
                 if let Some(block) = branch.else_block {
                     let (block, else_updates_slot) =
-                        self.collection_slot_block(function, scope, block, false)?;
+                        self.collection_slot_block(function, scope, access, block, false)?;
                     updates_slot |= else_updates_slot;
                     branch.else_block = Some(block);
                 }
@@ -3085,19 +3218,19 @@ impl<'a> PlanCx<'a> {
             }
             RirStmt::Loop(mut loop_) => {
                 let (body, updates_slot) =
-                    self.collection_slot_block(function, scope, loop_.body, false)?;
+                    self.collection_slot_block(function, scope, access, loop_.body, false)?;
                 loop_.body = body;
                 (RirStmt::Loop(loop_), updates_slot)
             }
             RirStmt::CollectionLoanScope(mut loan) => {
                 let (body, updates_slot) =
-                    self.collection_slot_block(function, scope, loan.body, false)?;
+                    self.collection_slot_block(function, scope, access, loan.body, false)?;
                 loan.body = body;
                 (RirStmt::CollectionLoanScope(loan), updates_slot)
             }
             RirStmt::CollectionSlotScope(block) => {
                 let (block, updates_slot) =
-                    self.collection_slot_block(function, scope, block, false)?;
+                    self.collection_slot_block(function, scope, access, block, false)?;
                 (RirStmt::CollectionSlotScope(block), updates_slot)
             }
             RirStmt::EnumMatch(mut match_) => {
@@ -3106,6 +3239,7 @@ impl<'a> PlanCx<'a> {
                     let (block, arm_updates_slot) = self.collection_slot_block(
                         function,
                         scope,
+                        access,
                         std::mem::take(&mut arm.block),
                         false,
                     )?;
@@ -3114,7 +3248,7 @@ impl<'a> PlanCx<'a> {
                 }
                 if let Some(block) = match_.else_block {
                     let (block, else_updates_slot) =
-                        self.collection_slot_block(function, scope, block, false)?;
+                        self.collection_slot_block(function, scope, access, block, false)?;
                     updates_slot |= else_updates_slot;
                     match_.else_block = Some(block);
                 }
@@ -3122,9 +3256,9 @@ impl<'a> PlanCx<'a> {
             }
             RirStmt::OptionMatch(mut match_) => {
                 let (some_block, some_updates_slot) =
-                    self.collection_slot_block(function, scope, match_.some_block, false)?;
+                    self.collection_slot_block(function, scope, access, match_.some_block, false)?;
                 let (none_block, none_updates_slot) =
-                    self.collection_slot_block(function, scope, match_.none_block, false)?;
+                    self.collection_slot_block(function, scope, access, match_.none_block, false)?;
                 match_.some_block = some_block;
                 match_.none_block = none_block;
                 (
@@ -3134,9 +3268,9 @@ impl<'a> PlanCx<'a> {
             }
             RirStmt::MapEntryMatch(mut match_) => {
                 let (some_block, some_updates_slot) =
-                    self.collection_slot_block(function, scope, match_.some_block, false)?;
+                    self.collection_slot_block(function, scope, access, match_.some_block, false)?;
                 let (none_block, none_updates_slot) =
-                    self.collection_slot_block(function, scope, match_.none_block, false)?;
+                    self.collection_slot_block(function, scope, access, match_.none_block, false)?;
                 match_.some_block = some_block;
                 match_.none_block = none_block;
                 (
@@ -3209,10 +3343,155 @@ impl<'a> PlanCx<'a> {
             .any(|slot| RirLocalId::from_index(slot.local.index()) == local)
     }
 
+    fn structural_collection_access(
+        &self,
+        function: FunctionId,
+        root: &Place,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedCollectionAccess, RustPlanError> {
+        self.plan_collection_access(
+            function,
+            root,
+            CollectionAccessOp::StructuralMutation,
+            locals,
+        )
+    }
+
+    fn collection_slot_access(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<RirCollectionAccess, RustPlanError> {
+        let op = CollectionAccessOp::slot(&scope.slots);
+        Ok(self
+            .plan_collection_access(function, &scope.root, op, locals)?
+            .access)
+    }
+
+    fn plan_collection_access(
+        &self,
+        function: FunctionId,
+        root: &Place,
+        op: CollectionAccessOp,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedCollectionAccess, RustPlanError> {
+        let plan = self
+            .access()
+            .plan(function, op.intent(), root)
+            .map_err(|gap| Self::access_gap(function, gap))?;
+        self.plan_collection_access_from_plan(
+            function,
+            RustTargetGapSite::Function(function),
+            plan,
+            op,
+            locals,
+        )
+    }
+
+    fn plan_collection_access_from_plan(
+        &self,
+        function: FunctionId,
+        site: RustTargetGapSite,
+        plan: PlaceAccessPlan,
+        op: CollectionAccessOp,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedCollectionAccess, RustPlanError> {
+        if plan.dataref_plan().is_some() {
+            if matches!(op, CollectionAccessOp::ShapeLoan) {
+                return Err(Self::gap(
+                    site,
+                    RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+                ));
+            }
+            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+            return Ok(PlannedCollectionAccess {
+                stmts: planned.stmts,
+                access: RirCollectionAccess::MutPlace(planned.arg),
+            });
+        }
+        if plan
+            .projection
+            .iter()
+            .any(|projection| matches!(projection.kind, PlaceProjectionKind::DataRefField(_)))
+        {
+            return Err(Self::gap(
+                site,
+                RustTargetGapKind::UnsupportedMutablePlaceDataRef,
+            ));
+        }
+        let payload_ref = match plan.root {
+            PlaceAccessRoot::Local { local, .. } => locals
+                .get(local.index())
+                .is_some_and(|local| local.payload_ref),
+            _ => false,
+        };
+        let dynamic_collection_projection = plan.projection.iter().any(|projection| {
+            matches!(
+                projection.kind,
+                PlaceProjectionKind::ListIndex(_) | PlaceProjectionKind::SliceIndex(_)
+            )
+        });
+        let use_mut_place = payload_ref
+            || dynamic_collection_projection
+            || matches!(
+                plan.root,
+                PlaceAccessRoot::Local {
+                    source_mut_param: true,
+                    ..
+                } | PlaceAccessRoot::CaptureCell(_)
+                    | PlaceAccessRoot::ScopedPlaceCell(_)
+            );
+        if use_mut_place {
+            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+            return Ok(PlannedCollectionAccess {
+                stmts: planned.stmts,
+                access: RirCollectionAccess::MutPlace(planned.arg),
+            });
+        }
+        let access = match plan.root {
+            PlaceAccessRoot::Local {
+                local,
+                source_mut_param: false,
+            } => RirCollectionAccess::Direct(RirPlace {
+                root: RirPlaceRoot::Local(RirLocalId::from_index(local.index())),
+                projections: plan
+                    .projection
+                    .iter()
+                    .map(Self::rir_place_projection)
+                    .collect(),
+                ty: self.type_map[&plan.ty],
+            }),
+            PlaceAccessRoot::Global(global) => RirCollectionAccess::Direct(RirPlace {
+                root: RirPlaceRoot::Global(self.global_map[&global]),
+                projections: plan
+                    .projection
+                    .iter()
+                    .map(Self::rir_place_projection)
+                    .collect(),
+                ty: self.type_map[&plan.ty],
+            }),
+            PlaceAccessRoot::LambdaCapture(_) => {
+                return Err(Self::gap(site, RustTargetGapKind::UnsupportedLambdaCapture));
+            }
+            PlaceAccessRoot::Local {
+                source_mut_param: true,
+                ..
+            }
+            | PlaceAccessRoot::CaptureCell(_)
+            | PlaceAccessRoot::ScopedPlaceCell(_) => unreachable!("mut-place roots handled above"),
+        };
+        Ok(PlannedCollectionAccess {
+            stmts: vec![],
+            access,
+        })
+    }
+
     fn collection_slot_reads(
         &self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
         init: bool,
     ) -> Vec<RirStmt> {
         scope
@@ -3220,7 +3499,7 @@ impl<'a> PlanCx<'a> {
             .iter()
             .map(|slot| {
                 let local = RirLocalId::from_index(slot.local.index());
-                let value = self.collection_slot_read(function, scope, slot);
+                let value = self.collection_slot_read(function, scope, access, slot);
                 if init {
                     RirStmt::Init { local, value }
                 } else {
@@ -3237,27 +3516,31 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
     ) -> Vec<RirStmt> {
         scope
             .slots
             .iter()
             .filter(|slot| slot.mutable)
-            .map(|slot| self.collection_slot_write(function, scope, slot))
+            .map(|slot| self.collection_slot_write(function, scope, access, slot))
             .collect()
     }
 
     fn collection_slot_read(
         &self,
-        function: FunctionId,
+        _function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
         slot: &air::AirCollectionSlot,
     ) -> RirRValue {
         match slot.kind {
-            air::AirCollectionSlotKind::SequenceElement => RirRValue::Use(RirOperand::Place(
-                self.collection_slot_place(function, scope, slot),
-            )),
+            air::AirCollectionSlotKind::SequenceElement => RirRValue::SequenceSlotAt {
+                collection: access.clone(),
+                index: RirLocalId::from_index(scope.index.index()),
+                ty: self.type_map[&slot.ty],
+            },
             air::AirCollectionSlotKind::MapValue => RirRValue::MapValueAt {
-                map: self.plan_place_in_function(function, &scope.root),
+                map: access.clone(),
                 index: RirLocalId::from_index(scope.index.index()),
                 ty: self.type_map[&slot.ty],
             },
@@ -3266,43 +3549,24 @@ impl<'a> PlanCx<'a> {
 
     fn collection_slot_write(
         &self,
-        function: FunctionId,
+        _function: FunctionId,
         scope: &air::AirCollectionSlotScope,
+        access: &RirCollectionAccess,
         slot: &air::AirCollectionSlot,
     ) -> RirStmt {
         let local = RirLocalId::from_index(slot.local.index());
         let value = RirOperand::Place(RirPlace::local(local, vec![], self.type_map[&slot.ty]));
         match slot.kind {
-            air::AirCollectionSlotKind::SequenceElement => RirStmt::Assign {
-                dst: self.collection_slot_place(function, scope, slot),
-                value: RirRValue::Use(value),
-            },
-            air::AirCollectionSlotKind::MapValue => RirStmt::MapValueSet {
-                map: self.plan_place_in_function(function, &scope.root),
+            air::AirCollectionSlotKind::SequenceElement => RirStmt::SequenceSlotSet {
+                collection: access.clone(),
                 index: RirLocalId::from_index(scope.index.index()),
                 value,
             },
-        }
-    }
-
-    fn collection_slot_place(
-        &self,
-        function: FunctionId,
-        scope: &air::AirCollectionSlotScope,
-        slot: &air::AirCollectionSlot,
-    ) -> RirPlace {
-        match slot.kind {
-            air::AirCollectionSlotKind::SequenceElement => {
-                let mut place = self.plan_place_in_function(function, &scope.root);
-                place
-                    .projections
-                    .push(RirProjection::Index(RirLocalId::from_index(
-                        scope.index.index(),
-                    )));
-                place.ty = self.type_map[&slot.ty];
-                place
-            }
-            air::AirCollectionSlotKind::MapValue => unreachable!("map value slots are not places"),
+            air::AirCollectionSlotKind::MapValue => RirStmt::MapValueSet {
+                map: access.clone(),
+                index: RirLocalId::from_index(scope.index.index()),
+                value,
+            },
         }
     }
 
@@ -3600,46 +3864,36 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn lower_structural_mutation_place(
-        &self,
-        function: FunctionId,
-        place: &Place,
-        locals: &mut Vec<RirLocal>,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
-        let plan = self
-            .access()
-            .plan(function, PlaceAccessIntent::StructuralMutation, place)
-            .expect("profile verifies structural mutations");
-        self.plan_mut_place_arg(function, &plan, locals)
-    }
-
-    fn lower_collection_write_place(
-        &self,
-        function: FunctionId,
-        place: &Place,
-        locals: &mut Vec<RirLocal>,
-    ) -> Result<PlannedMutPlaceArg, RustPlanError> {
-        let plan = self
-            .access()
-            .plan(function, PlaceAccessIntent::Assign, place)
-            .expect("profile verifies collection writes");
-        self.plan_mut_place_arg(function, &plan, locals)
-    }
-
     fn lower_collection_loan_root(
         &self,
         function: FunctionId,
+        index: usize,
         loan: &air::AirCollectionLoan,
-    ) -> PlannedCollectionLoanRoot {
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedCollectionLoanRoot, RustPlanError> {
         let plan = self
             .access()
             .collection_loan_plan(function, loan)
-            .expect("profile verifies collection loan roots");
-        PlannedCollectionLoanRoot {
-            place: self.plan_access_place(function, &plan.place, &loan.root),
+            .map_err(|gap| Self::access_gap(function, gap))?;
+        let site = RustTargetGapSite::Statement(function, index);
+        let root = self.plan_collection_access_from_plan(
+            function,
+            site,
+            plan.place,
+            CollectionAccessOp::ShapeLoan,
+            locals,
+        )?;
+        if !root.stmts.is_empty() {
+            return Err(Self::gap(
+                site,
+                RustTargetGapKind::UnsupportedMutablePlaceProjection,
+            ));
+        }
+        Ok(PlannedCollectionLoanRoot {
+            root: root.access,
             root_kind: rir_collection_root_kind(plan.root_kind),
             mode: rir_collection_loan_mode(plan.mode),
-        }
+        })
     }
 
     fn assign_target(plan: &PlaceAccessPlan, place: &Place) -> AssignTarget {
@@ -4293,34 +4547,6 @@ impl<'a> PlanCx<'a> {
 
     fn air_policy(&self) -> AirRustRepPolicy<'_> {
         AirRustRepPolicy::new(self.air, &self.classes)
-    }
-
-    fn plan_access_place(
-        &self,
-        function: FunctionId,
-        plan: &PlaceAccessPlan,
-        source: &Place,
-    ) -> RirPlace {
-        let root = match plan.root {
-            PlaceAccessRoot::Global(global) => RirPlaceRoot::Global(self.global_map[&global]),
-            PlaceAccessRoot::Local { local, .. } => {
-                RirPlaceRoot::Local(RirLocalId::from_index(local.index()))
-            }
-            PlaceAccessRoot::CaptureCell(_)
-            | PlaceAccessRoot::ScopedPlaceCell(_)
-            | PlaceAccessRoot::LambdaCapture(_) => {
-                return self.plan_place_in_function(function, source);
-            }
-        };
-        RirPlace {
-            root,
-            projections: plan
-                .projection
-                .iter()
-                .map(Self::rir_place_projection)
-                .collect(),
-            ty: self.type_map[&plan.ty],
-        }
     }
 
     fn plan_place_in_function(&self, function: FunctionId, place: &Place) -> RirPlace {

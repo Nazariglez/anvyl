@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: blocked by projected map-slot collection-loan owner before runtime guard
 // @contains: cannot structurally mutate collection during active iteration or slice view
 
 fn apply(cb: fn()) {

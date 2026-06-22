@@ -5,16 +5,16 @@ use super::{
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
-        RirCollectionLoanScope, RirCollectionStorageKind, RirDataRefId, RirEnum, RirEnumMatch,
-        RirEnumRepr, RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
-        RirFunction, RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
-        RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch,
-        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
-        RirOptionSubject, RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram,
-        RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef, RirStmt,
-        RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram, stmt_child_blocks_any,
+        RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirDataRefId,
+        RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign, RirFormatKind,
+        RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture, RirLambdaCaptureArg,
+        RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
+        RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop,
+        RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
+        RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi, RirParamSemantic, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef,
+        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram, stmt_child_blocks_any,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -70,7 +70,7 @@ struct EmitCx<'a> {
 }
 
 struct ActiveCollectionLoan {
-    root: RirPlace,
+    root: RirCollectionAccess,
     version: String,
 }
 
@@ -1207,6 +1207,15 @@ impl EmitCx<'_> {
                 "{};",
                 self.dataref_set(function, object, *dataref, projections, value)
             )),
+            RirStmt::SequenceSlotSet {
+                collection,
+                index,
+                value,
+            } => {
+                let value = RustValues::new(self.program, function).value_operand(value);
+                let set = self.sequence_slot_set(function, collection, *index, &value);
+                self.w.line(format_args!("{set};"));
+            }
             RirStmt::MapValueSet { map, index, value } => self.w.line(format_args!(
                 "{};",
                 self.map_value_set(function, map, *index, value)
@@ -1261,31 +1270,13 @@ impl EmitCx<'_> {
         self.indented(|this| {
             let track = scope.root_kind.tracks_shape_loan();
             if track {
-                let places = RustPlaces::new(this.program, function);
                 let depth = this.collection_loans.len();
                 let loan_var = format!("__anv_collection_loan_{depth}");
                 let version_var = format!("__anv_collection_version_{depth}");
-                if let RirPlaceRoot::Global(global) = scope.root.root
-                    && !scope.root.projections.is_empty()
-                {
-                    this.w.line(format_args!(
-                        "let __anv_global_projected_loan_{depth} = {};",
-                        target::global_begin_projected_loan(&RustValues::global_slot_expr(
-                            this.program,
-                            global,
-                        ))
-                    ));
+                let (prelude, loan) = this.collection_shape_loan(function, &scope.root, depth);
+                for line in prelude {
+                    this.w.line(format_args!("{line}"));
                 }
-                let loan = if matches!(scope.root.root, RirPlaceRoot::Local(_))
-                    && places.mut_place_root_param(&scope.root)
-                {
-                    this.mut_place_access(function, &scope.root, &target::begin_shape_loan_region())
-                } else if let Some(loan) = this.global_collection_loan(function, &scope.root, depth)
-                {
-                    loan
-                } else {
-                    target::begin_shape_loan(&places.local_place(&scope.root))
-                };
                 this.w.line(format_args!("let {loan_var} = {loan};"));
                 this.w.line(format_args!(
                     "let {version_var} = {};",
@@ -1885,13 +1876,13 @@ impl EmitCx<'_> {
                 &rust_string(&format_fragment(rust_format_spec(*spec))),
                 &values.format_arg(value, *source_ty),
             ),
-            RirRValue::Len { source }
-                if matches!(source.root, RirPlaceRoot::Local(_))
-                    && places.mut_place_root_param(source) =>
-            {
-                self.mut_place_access(function, source, "Ok(value.len() as i64)")
-            }
             RirRValue::Len { source } => format!("{}.len() as i64", places.local_place(source)),
+            RirRValue::CollectionLen { source } => self.collection_len(function, source),
+            RirRValue::SequenceSlotAt {
+                collection,
+                index,
+                ty,
+            } => self.sequence_slot_at(function, collection, *index, *ty),
             RirRValue::ListPush { list, value } => {
                 let elem = values.value_operand(value);
                 self.collection_mutation(
@@ -1916,30 +1907,7 @@ impl EmitCx<'_> {
                 inclusive,
                 ty,
             } => self.range_list_copy(function, source, *start, *end, *inclusive, *ty),
-            RirRValue::MapGet { map, key, ty } => {
-                let RirType::Option(value_ty) = self.program.types[ty.index()] else {
-                    unreachable!("verified map get result")
-                };
-                let key = values.operand(key);
-                let body = format!(
-                    "value.get(rt, &{key})?.map(|value| {})",
-                    values.value_from_place(value_ty, "value")
-                );
-                if let Some(place) = self.collection_root_place(function, map) {
-                    target::mut_place_access_ctx(
-                        &place,
-                        target::runtime_param_name(),
-                        &format!("Ok({body})"),
-                    )
-                } else {
-                    format!(
-                        "{}.get({}, &{key})?.map(|value| {})",
-                        places.local_place(map),
-                        target::runtime_param_name(),
-                        values.value_from_place(value_ty, "value")
-                    )
-                }
-            }
+            RirRValue::MapGet { map, key, ty } => self.map_get(function, map, key, *ty),
             RirRValue::MapInsert {
                 map, key, value, ..
             } => {
@@ -2025,10 +1993,480 @@ impl EmitCx<'_> {
         }
     }
 
+    fn collection_len(&self, function: &RirFunction, source: &RirCollectionAccess) -> String {
+        match source {
+            RirCollectionAccess::Direct(source) => {
+                let (prelude, collection) =
+                    self.direct_collection(function, source, "__anv_collection", false);
+                let len = target::collection_len(&collection);
+                if prelude.is_empty() {
+                    len
+                } else {
+                    block_expr(prelude, Some(len))
+                }
+            }
+            RirCollectionAccess::MutPlace(source) => self.mut_place_access_block(
+                function,
+                source,
+                format!("Ok({})", target::collection_len("value")),
+            ),
+        }
+    }
+
+    fn sequence_slot_at(
+        &self,
+        function: &RirFunction,
+        collection: &RirCollectionAccess,
+        index: RirLocalId,
+        ty: RirTypeId,
+    ) -> String {
+        match collection {
+            RirCollectionAccess::Direct(collection) => match self.program.types
+                [collection.ty.index()]
+            {
+                RirType::List(_) => self.list_slot_at(function, collection, index, ty),
+                RirType::Array { .. } | RirType::Slice(_) => {
+                    let place = Self::sequence_slot_place(collection, index, ty);
+                    RustValues::new(self.program, function).value_operand(&RirOperand::Place(place))
+                }
+                _ => unreachable!("verified sequence slot collection"),
+            },
+            RirCollectionAccess::MutPlace(collection) => match self.program.types
+                [collection.ty.index()]
+            {
+                RirType::Array { .. } => {
+                    self.mut_place_array_slot_at(function, collection, index, ty)
+                }
+                RirType::List(_) => self.mut_place_list_slot_at(function, collection, index, ty),
+                RirType::Slice(_) => self.mut_place_slice_slot_at(function, collection, index, ty),
+                _ => unreachable!("RIR verifier rejects unsupported mut-place sequence slots"),
+            },
+        }
+    }
+
+    fn sequence_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirCollectionAccess,
+        index: RirLocalId,
+        value: &str,
+    ) -> String {
+        match collection {
+            RirCollectionAccess::Direct(collection) => {
+                match self.program.types[collection.ty.index()] {
+                    RirType::List(_) => self.list_slot_set(function, collection, index, value),
+                    RirType::Array { .. } | RirType::Slice(_)
+                        if matches!(collection.root, RirPlaceRoot::Global(_)) =>
+                    {
+                        self.direct_sequence_slot_set(function, collection, index, value)
+                    }
+                    RirType::Array { elem, .. } | RirType::Slice(elem) => {
+                        let place = Self::sequence_slot_place(collection, index, elem);
+                        RustValues::new(self.program, function).assign(&place, value)
+                    }
+                    _ => unreachable!("verified sequence slot collection"),
+                }
+            }
+            RirCollectionAccess::MutPlace(collection) => {
+                match self.program.types[collection.ty.index()] {
+                    RirType::Array { elem, .. } => {
+                        self.mut_place_array_slot_set(function, collection, index, value, elem)
+                    }
+                    RirType::List(_) => {
+                        self.mut_place_list_slot_set(function, collection, index, value)
+                    }
+                    RirType::Slice(_) => {
+                        self.mut_place_slice_slot_set(function, collection, index, value)
+                    }
+                    _ => unreachable!("RIR verifier rejects unsupported mut-place sequence slots"),
+                }
+            }
+        }
+    }
+
+    fn direct_sequence_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirPlace,
+        index: RirLocalId,
+        value: &str,
+    ) -> String {
+        let (mut prelude, collection_expr) =
+            self.direct_collection(function, collection, "__anv_collection_guard", true);
+        let index = function.locals[index.index()].symbol.as_str();
+        prelude.extend([
+            format!("let __anv_sequence = &mut ({collection_expr});"),
+            format!(
+                "let index = {};",
+                target::checked_index_result(index, "__anv_sequence.len()", "sequence")
+            ),
+            format!("let __anv_sequence_value = {value};"),
+        ]);
+        let update = match self.program.types[collection.ty.index()] {
+            RirType::Array { elem, .. } if self.program.collection_replace_ty(elem) => {
+                format!(
+                    "{}?",
+                    target::replace_collection_result(
+                        "__anv_sequence[index]",
+                        "__anv_sequence_value"
+                    )
+                )
+            }
+            RirType::Array { .. } => "__anv_sequence[index] = __anv_sequence_value".to_string(),
+            RirType::Slice(_) => format!(
+                "{}?",
+                target::slice_with_elem_owned_mut_short(
+                    "__anv_sequence",
+                    target::runtime_param_name(),
+                    "index",
+                    "*value = __anv_sequence_value; Ok(())",
+                )
+            ),
+            _ => unreachable!("verified sequence slot collection"),
+        };
+        block_expr(prelude, Some(update))
+    }
+
+    fn list_slot_at(
+        &self,
+        function: &RirFunction,
+        collection: &RirPlace,
+        index: RirLocalId,
+        ty: RirTypeId,
+    ) -> String {
+        let (mut prelude, collection_expr) =
+            self.direct_collection(function, collection, "__anv_collection_guard", false);
+        let index = function.locals[index.index()].symbol.as_str();
+        let version = self.collection_version(
+            &RirCollectionAccess::Direct(collection.clone()),
+            target::collection_structural_version("__anv_list"),
+        );
+        let value = RustValues::new(self.program, function).value_from_ref(ty, "value");
+        prelude.extend([
+            format!("let __anv_list = &({collection_expr});"),
+            format!(
+                "let index = {};",
+                target::checked_index_result(index, "__anv_list.len()", "list")
+            ),
+        ]);
+        block_expr(
+            prelude,
+            Some(format!(
+                "{}?",
+                target::list_with_elem_shared_short(
+                    "__anv_list",
+                    target::runtime_param_name(),
+                    "index",
+                    &version,
+                    &format!("Ok({value})"),
+                )
+            )),
+        )
+    }
+
+    fn list_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirPlace,
+        index: RirLocalId,
+        value: &str,
+    ) -> String {
+        let (mut prelude, collection_expr) =
+            self.direct_collection(function, collection, "__anv_collection_guard", true);
+        let index = function.locals[index.index()].symbol.as_str();
+        let version = self.collection_version(
+            &RirCollectionAccess::Direct(collection.clone()),
+            target::collection_structural_version("__anv_list"),
+        );
+        prelude.extend([
+            format!("let __anv_list = &mut ({collection_expr});"),
+            format!(
+                "let index = {};",
+                target::checked_index_result(index, "__anv_list.len()", "list")
+            ),
+            format!("let __anv_sequence_value = {value};"),
+        ]);
+        block_expr(
+            prelude,
+            Some(format!(
+                "{}?",
+                target::list_with_elem_owned_mut_short(
+                    "__anv_list",
+                    target::runtime_param_name(),
+                    "index",
+                    &version,
+                    "*value = __anv_sequence_value; Ok(())",
+                )
+            )),
+        )
+    }
+
+    fn mut_place_access_block(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        body: String,
+    ) -> String {
+        let (prelude, place) = self.prepared_mut_place_arg(function, 0, collection);
+        block_expr(
+            prelude,
+            Some(target::mut_place_access_ctx(
+                &place,
+                target::runtime_param_name(),
+                &body,
+            )),
+        )
+    }
+
+    fn mut_place_mutate_block(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        body: String,
+    ) -> String {
+        let (prelude, place) = self.prepared_mut_place_arg(function, 0, collection);
+        block_expr(
+            prelude,
+            Some(target::mut_place_mutate_ctx(
+                &place,
+                target::runtime_param_name(),
+                &body,
+            )),
+        )
+    }
+
+    fn mut_place_array_slot_at(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        ty: RirTypeId,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let elem = RustValues::new(self.program, function).value_from_ref(ty, "elem");
+        let body = block_expr(
+            [format!(
+                "let index = {};",
+                target::checked_index_result(index, "value.len()", "array")
+            )],
+            Some(format!("let elem = &value[index]; Ok({elem})")),
+        );
+        self.mut_place_access_block(function, collection, body)
+    }
+
+    fn mut_place_array_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        new_value: &str,
+        elem: RirTypeId,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let update = if self.program.collection_replace_ty(elem) {
+            format!(
+                "{}?; Ok(())",
+                target::replace_collection_result("value[index]", "__anv_sequence_value")
+            )
+        } else {
+            "value[index] = __anv_sequence_value; Ok(())".to_string()
+        };
+        let body = block_expr(
+            [
+                format!(
+                    "let index = {};",
+                    target::checked_index_result(index, "value.len()", "array")
+                ),
+                format!("let __anv_sequence_value = {new_value};"),
+            ],
+            Some(update),
+        );
+        self.mut_place_mutate_block(function, collection, body)
+    }
+
+    fn mut_place_list_slot_at(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        ty: RirTypeId,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let version = self.collection_version(
+            &RirCollectionAccess::MutPlace(collection.clone()),
+            target::collection_structural_version("value"),
+        );
+        let value = RustValues::new(self.program, function).value_from_ref(ty, "value");
+        let body = block_expr(
+            [format!(
+                "let index = {};",
+                target::checked_index_result(index, "value.len()", "list")
+            )],
+            Some(format!(
+                "Ok({}?)",
+                target::list_with_elem_shared_short(
+                    "value",
+                    target::runtime_param_name(),
+                    "index",
+                    &version,
+                    &format!("Ok({value})"),
+                )
+            )),
+        );
+        self.mut_place_access_block(function, collection, body)
+    }
+
+    fn mut_place_list_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        new_value: &str,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let version = self.collection_version(
+            &RirCollectionAccess::MutPlace(collection.clone()),
+            target::collection_structural_version("value"),
+        );
+        let body = block_expr(
+            [
+                format!(
+                    "let index = {};",
+                    target::checked_index_result(index, "value.len()", "list")
+                ),
+                format!("let __anv_sequence_value = {new_value};"),
+            ],
+            Some(format!(
+                "{}?; Ok(())",
+                target::list_with_elem_owned_mut_short(
+                    "value",
+                    target::runtime_param_name(),
+                    "index",
+                    &version,
+                    "*value = __anv_sequence_value; Ok(())",
+                )
+            )),
+        );
+        self.mut_place_mutate_block(function, collection, body)
+    }
+
+    fn mut_place_slice_slot_at(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        _ty: RirTypeId,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let body = block_expr(
+            [format!("let index = {index};")],
+            Some(format!(
+                "Ok({}?)",
+                target::slice_elem_at_shared("value", target::runtime_param_name(), "index")
+            )),
+        );
+        self.mut_place_access_block(function, collection, body)
+    }
+
+    fn mut_place_slice_slot_set(
+        &self,
+        function: &RirFunction,
+        collection: &RirMutPlaceArg,
+        index: RirLocalId,
+        new_value: &str,
+    ) -> String {
+        let index = function.locals[index.index()].symbol.as_str();
+        let body = block_expr(
+            [
+                format!("let index = {index};"),
+                format!("let __anv_sequence_value = {new_value};"),
+            ],
+            Some(format!(
+                "{}?; Ok(())",
+                target::slice_with_elem_owned_mut_short(
+                    "value",
+                    target::runtime_param_name(),
+                    "index",
+                    "*value = __anv_sequence_value; Ok(())",
+                )
+            )),
+        );
+        self.mut_place_mutate_block(function, collection, body)
+    }
+
+    fn sequence_slot_place(collection: &RirPlace, index: RirLocalId, ty: RirTypeId) -> RirPlace {
+        let mut place = collection.clone();
+        place.projections.push(RirProjection::Index(index));
+        place.ty = ty;
+        place
+    }
+
+    fn direct_collection(
+        &self,
+        function: &RirFunction,
+        collection: &RirPlace,
+        guard: &str,
+        mutable: bool,
+    ) -> (Vec<String>, String) {
+        match collection.root {
+            RirPlaceRoot::Local(_) => (
+                vec![],
+                RustPlaces::new(self.program, function).local_place(collection),
+            ),
+            RirPlaceRoot::Global(global) => {
+                let root_ty = self.program.globals[global.index()].ty;
+                let root = if mutable {
+                    format!("(&mut *{guard})")
+                } else {
+                    format!("(&*{guard})")
+                };
+                let collection_expr = if collection.projections.is_empty() {
+                    root
+                } else {
+                    RustPlaces::new(self.program, function)
+                        .projected_expr(root_ty, &root, collection.ty, &collection.projections)
+                        .expect("verified global collection projection")
+                };
+                let slot = RustValues::global_slot_expr(self.program, global);
+                let init = RustValues::global_init_call(self.program, global);
+                let access = if mutable {
+                    target::global_write(&slot, &init)
+                } else {
+                    target::global_read(&slot, &init)
+                };
+                let binding = if mutable { "let mut" } else { "let" };
+                (
+                    vec![format!("{binding} {guard} = {access};")],
+                    collection_expr,
+                )
+            }
+        }
+    }
+
+    fn map_get(
+        &self,
+        function: &RirFunction,
+        map: &RirCollectionAccess,
+        key: &RirOperand,
+        ty: RirTypeId,
+    ) -> String {
+        let RirType::Option(value_ty) = self.program.types[ty.index()] else {
+            unreachable!("verified map get result")
+        };
+        let key = RustValues::new(self.program, function).operand(key);
+        self.map_read(function, map, |map| {
+            format!(
+                "{map}.get({}, &{key})?.map(|value| {})",
+                target::runtime_param_name(),
+                RustValues::new(self.program, function).value_from_place(value_ty, "value")
+            )
+        })
+    }
+
     fn map_value_set(
         &self,
         function: &RirFunction,
-        map: &RirPlace,
+        map: &RirCollectionAccess,
         index: RirLocalId,
         value: &RirOperand,
     ) -> String {
@@ -2048,7 +2486,7 @@ impl EmitCx<'_> {
     fn map_value_at(
         &self,
         function: &RirFunction,
-        map: &RirPlace,
+        map: &RirCollectionAccess,
         index: RirLocalId,
         _ty: RirTypeId,
     ) -> String {
@@ -2060,7 +2498,7 @@ impl EmitCx<'_> {
     fn map_entry_at(
         &self,
         function: &RirFunction,
-        map: &RirPlace,
+        map: &RirCollectionAccess,
         index: RirLocalId,
         ty: RirTypeId,
     ) -> String {
@@ -2077,73 +2515,112 @@ impl EmitCx<'_> {
         })
     }
 
+    fn map_read(
+        &self,
+        function: &RirFunction,
+        map: &RirCollectionAccess,
+        value: impl FnOnce(&str) -> String,
+    ) -> String {
+        match map {
+            RirCollectionAccess::Direct(map) => {
+                let (prelude, map_expr) =
+                    self.direct_collection(function, map, "__anv_map_guard", false);
+                block_expr(
+                    prelude
+                        .into_iter()
+                        .chain([format!("let __anv_map = &({map_expr});")]),
+                    Some(value("__anv_map")),
+                )
+            }
+            RirCollectionAccess::MutPlace(map) => {
+                self.mut_place_access_block(function, map, format!("Ok({})", value("value")))
+            }
+        }
+    }
+
     fn map_index_read(
         &self,
         function: &RirFunction,
-        map: &RirPlace,
+        map: &RirCollectionAccess,
         index: RirLocalId,
         value: impl FnOnce(&str, &str) -> String,
     ) -> String {
-        let places = RustPlaces::new(self.program, function);
-        let index = function.locals[index.index()].symbol.as_str();
-        if let Some(place) = self.collection_root_place(function, map) {
-            let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
-            let version =
-                self.collection_version(map, target::collection_structural_version("__anv_map"));
-            return target::mut_place_access_ctx(
-                &place,
-                target::runtime_param_name(),
-                &format!(
-                    "Ok({{ let __anv_map = value; let index = {checked}; {} }})",
-                    value("__anv_map", &version)
-                ),
-            );
+        match map {
+            RirCollectionAccess::Direct(place) => {
+                let index = function.locals[index.index()].symbol.as_str();
+                let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
+                let version = self
+                    .collection_version(map, target::collection_structural_version("__anv_map"));
+                let (prelude, map_expr) =
+                    self.direct_collection(function, place, "__anv_map_guard", false);
+                block_expr(
+                    prelude.into_iter().chain([
+                        format!("let __anv_map = &({map_expr});"),
+                        format!("let index = {checked};"),
+                    ]),
+                    Some(value("__anv_map", &version)),
+                )
+            }
+            RirCollectionAccess::MutPlace(map) => {
+                let index = function.locals[index.index()].symbol.as_str();
+                let version = self.collection_version(
+                    &RirCollectionAccess::MutPlace(map.clone()),
+                    target::collection_structural_version("value"),
+                );
+                let body = block_expr(
+                    [format!(
+                        "let index = {};",
+                        target::checked_index_result(index, "value.len()", "map entry")
+                    )],
+                    Some(format!("Ok({})", value("value", &version))),
+                );
+                self.mut_place_access_block(function, map, body)
+            }
         }
-
-        let map_expr = places.local_place(map);
-        let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
-        let version =
-            self.collection_version(map, target::collection_structural_version("__anv_map"));
-        block_expr(
-            [
-                format!("let __anv_map = &({map_expr});"),
-                format!("let index = {checked};"),
-            ],
-            Some(value("__anv_map", &version)),
-        )
     }
 
     fn map_index_update(
         &self,
         function: &RirFunction,
-        map: &RirPlace,
+        map: &RirCollectionAccess,
         index: RirLocalId,
         update: impl FnOnce(&str, &str) -> String,
     ) -> String {
-        let places = RustPlaces::new(self.program, function);
-        let index = function.locals[index.index()].symbol.as_str();
-        if let Some(place) = self.collection_root_place(function, map) {
-            let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
-            let version =
-                self.collection_version(map, target::collection_structural_version("__anv_map"));
-            return target::mut_place_mutate_ctx(
-                &place,
-                target::runtime_param_name(),
-                &format!(
-                    "{{ let __anv_map = value; let index = {checked}; {} }}",
-                    update("__anv_map", &version)
-                ),
-            );
+        match map {
+            RirCollectionAccess::Direct(place) => {
+                let index = function.locals[index.index()].symbol.as_str();
+                let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
+                let version = self
+                    .collection_version(map, target::collection_structural_version("__anv_map"));
+                let (prelude, map_expr) =
+                    self.direct_collection(function, place, "__anv_map_guard", true);
+                format!(
+                    "{}?",
+                    block_expr(
+                        prelude.into_iter().chain([
+                            format!("let __anv_map = &mut ({map_expr});"),
+                            format!("let index = {checked};"),
+                        ]),
+                        Some(update("__anv_map", &version)),
+                    )
+                )
+            }
+            RirCollectionAccess::MutPlace(map) => {
+                let index = function.locals[index.index()].symbol.as_str();
+                let version = self.collection_version(
+                    &RirCollectionAccess::MutPlace(map.clone()),
+                    target::collection_structural_version("value"),
+                );
+                let body = block_expr(
+                    [format!(
+                        "let index = {};",
+                        target::checked_index_result(index, "value.len()", "map entry")
+                    )],
+                    Some(format!("{}?; Ok(())", update("value", &version))),
+                );
+                self.mut_place_mutate_block(function, map, body)
+            }
         }
-
-        let map_expr = places.local_place(map);
-        let checked = target::checked_index_result(index, "__anv_map.len()", "map entry");
-        let version =
-            self.collection_version(map, target::collection_structural_version("__anv_map"));
-        format!(
-            "{{ let __anv_map = &mut ({map_expr}); let index = {checked}; {}?; }}",
-            update("__anv_map", &version)
-        )
     }
 
     fn map_entry_tuple(tuple: &super::rir::RirTuple, key: &str, value: &str) -> String {
@@ -2154,6 +2631,45 @@ impl EmitCx<'_> {
                 field_init(tuple.fields[1].symbol.as_str(), value.to_string()),
             ],
         )
+    }
+
+    fn collection_shape_loan(
+        &self,
+        function: &RirFunction,
+        root: &RirCollectionAccess,
+        index: usize,
+    ) -> (Vec<String>, String) {
+        match root {
+            RirCollectionAccess::Direct(root) => {
+                let mut prelude = vec![];
+                if let RirPlaceRoot::Global(global) = root.root
+                    && !root.projections.is_empty()
+                {
+                    prelude.push(format!(
+                        "let __anv_global_projected_loan_{index} = {};",
+                        target::global_begin_projected_loan(&RustValues::global_slot_expr(
+                            self.program,
+                            global,
+                        ))
+                    ));
+                }
+                let loan = if let Some(loan) = self.global_collection_loan(function, root, index) {
+                    loan
+                } else {
+                    target::begin_shape_loan(
+                        &RustPlaces::new(self.program, function).local_place(root),
+                    )
+                };
+                (prelude, loan)
+            }
+            RirCollectionAccess::MutPlace(root) => {
+                let (prelude, place) = self.prepared_mut_place_arg(function, index, root);
+                (
+                    prelude,
+                    target::mut_place_begin_shape_loan(&place, target::runtime_param_name()),
+                )
+            }
+        }
     }
 
     fn global_collection_loan(
@@ -2193,63 +2709,47 @@ impl EmitCx<'_> {
     fn collection_mutation<const N: usize>(
         &self,
         function: &RirFunction,
-        root: &RirMutPlaceArg,
+        root: &RirCollectionAccess,
         bindings: [(&str, String); N],
         body: &str,
     ) -> String {
-        let (mut prelude, place) = self.collection_mutation_place(function, root);
-        prelude.extend(
-            bindings
-                .into_iter()
-                .map(|(name, value)| format!("let {name} = {value};")),
-        );
-        block_expr(
-            prelude,
-            Some(target::mut_place_mutate_ctx(
-                &place,
-                target::runtime_param_name(),
-                body,
-            )),
-        )
-    }
-
-    fn collection_root_place(&self, function: &RirFunction, root: &RirPlace) -> Option<String> {
-        let places = RustPlaces::new(self.program, function);
-        let RirPlaceRoot::Local(local) = root.root else {
-            return None;
-        };
-        if !places.mut_place_root_param(root) {
-            return None;
+        match root {
+            RirCollectionAccess::Direct(root) => {
+                let (mut prelude, collection) =
+                    self.direct_collection(function, root, "__anv_collection_guard", true);
+                prelude.extend(
+                    bindings
+                        .into_iter()
+                        .map(|(name, value)| format!("let {name} = {value};")),
+                );
+                prelude.push(format!("let value = &mut ({collection});"));
+                block_expr(prelude, Some(format!("{body}?")))
+            }
+            RirCollectionAccess::MutPlace(root) => {
+                let (mut prelude, place) = self.prepared_mut_place_arg(function, 0, root);
+                prelude.extend(
+                    bindings
+                        .into_iter()
+                        .map(|(name, value)| format!("let {name} = {value};")),
+                );
+                block_expr(
+                    prelude,
+                    Some(target::mut_place_mutate_ctx(
+                        &place,
+                        target::runtime_param_name(),
+                        body,
+                    )),
+                )
+            }
         }
-        Some(if places.payload_ref_cell_local(local) {
-            target::mut_place_scoped_cell(&format!("&{}", places.local_place(root)))
-        } else {
-            places.local_place(root)
-        })
     }
 
-    fn collection_mutation_place(
-        &self,
-        function: &RirFunction,
-        root: &RirMutPlaceArg,
-    ) -> (Vec<String>, String) {
-        self.prepared_mut_place_arg(function, 0, root)
-    }
-
-    fn collection_version(&self, root: &RirPlace, fallback: String) -> String {
+    fn collection_version(&self, root: &RirCollectionAccess, fallback: String) -> String {
         self.collection_loans
             .iter()
             .rev()
             .find(|loan| loan.root == *root)
             .map_or(fallback, |loan| loan.version.clone())
-    }
-
-    fn mut_place_access(&self, function: &RirFunction, place: &RirPlace, body: &str) -> String {
-        target::mut_place_access(
-            &RustPlaces::new(self.program, function).local_place(place),
-            target::runtime_param_name(),
-            body,
-        )
     }
 
     fn cell_decl(&self, cell: RirCellRef) -> &RirCellDecl {
@@ -3240,15 +3740,20 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
                 || projections_use_local(projections, local)
                 || operand_uses_local(program, value, local)
         }
-        RirStmt::MapValueSet { map, index, value } => {
-            place_uses_local(map, local)
+        RirStmt::SequenceSlotSet {
+            collection,
+            index,
+            value,
+        } => {
+            collection.uses_local(local)
                 || *index == local
                 || operand_uses_local(program, value, local)
         }
-        RirStmt::If(RirIf { cond, .. }) => operand_uses_local(program, cond, local),
-        RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => {
-            place_uses_local(root, local)
+        RirStmt::MapValueSet { map, index, value } => {
+            map.uses_local(local) || *index == local || operand_uses_local(program, value, local)
         }
+        RirStmt::If(RirIf { cond, .. }) => operand_uses_local(program, cond, local),
+        RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
         RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
         RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
             option_subject_uses_local(program, subject, local)
@@ -3323,6 +3828,10 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
             .iter()
             .any(|part| operand_uses_local(program, part, local)),
         RirRValue::Len { source } => place_uses_local(source, local),
+        RirRValue::CollectionLen { source }
+        | RirRValue::SequenceSlotAt {
+            collection: source, ..
+        } => source.uses_local(local),
         RirRValue::SliceView {
             source, start, end, ..
         }
@@ -3334,21 +3843,20 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
         }
         | RirRValue::MapValueAt {
             map: source, index, ..
-        } => place_uses_local(source, local) || *index == local,
+        } => source.uses_local(local) || *index == local,
         RirRValue::ListPush { list, value } => {
-            mut_place_arg_uses_local(program, list, local)
-                || operand_uses_local(program, value, local)
+            list.uses_local(local) || operand_uses_local(program, value, local)
         }
         RirRValue::MapGet { map, key, .. } => {
-            place_uses_local(map, local) || operand_uses_local(program, key, local)
+            map.uses_local(local) || operand_uses_local(program, key, local)
         }
         RirRValue::MapRemove { map, key, .. } => {
-            mut_place_arg_uses_local(program, map, local) || operand_uses_local(program, key, local)
+            map.uses_local(local) || operand_uses_local(program, key, local)
         }
         RirRValue::MapInsert {
             map, key, value, ..
         } => {
-            mut_place_arg_uses_local(program, map, local)
+            map.uses_local(local)
                 || operand_uses_local(program, key, local)
                 || operand_uses_local(program, value, local)
         }
@@ -3495,6 +4003,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
         | RirStmt::Eval(value) => rvalue_uses_scoped_lambda_sig(value, sig),
+        RirStmt::SequenceSlotSet { .. } => false,
         RirStmt::GlobalEnsure { .. }
         | RirStmt::DataRefSet { .. }
         | RirStmt::MapValueSet { .. }

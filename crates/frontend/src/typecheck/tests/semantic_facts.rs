@@ -12,6 +12,23 @@ fn assert_single_const(values: &ConstValueMap, value: ConstValue) {
     assert_eq!(values.values().next(), Some(&value));
 }
 
+fn assert_main_mut_borrows(source: &str, name: &str) {
+    let result = check(source).expect("typecheck failed");
+    let body = result.expect_body(&result.function_body("main"));
+    let local = body
+        .locals
+        .defs
+        .values()
+        .find(|fact| fact.name.as_str() == name)
+        .expect("missing binding");
+    assert!(
+        body.locals
+            .uses
+            .values()
+            .any(|fact| fact.local == local.id && fact.mode == LocalUseMode::MutBorrow)
+    );
+}
+
 #[test]
 fn records_params_bindings_and_uses() {
     let source = r"
@@ -71,6 +88,53 @@ fn wildcard_creates_no_local() {
     let locals = &result.expect_body(&body_key).locals;
     assert!(locals.defs.is_empty());
     assert!(locals.binding_defs.is_empty());
+}
+
+#[test]
+fn mutating_receiver_records_mut_borrow_use() {
+    assert_main_mut_borrows(
+        r"
+struct Counter { value: int }
+extend Counter { fn reset(var self) { self.value = 0; } }
+fn main() { var counter = Counter { value: 1 }; counter.reset(); }
+",
+        "counter",
+    );
+}
+
+#[test]
+fn map_entry_payload_receiver_records_payload_alias_use() {
+    assert_main_mut_borrows(
+        r#"
+extend [int] { fn add(var self, _value: int) {} }
+fn main() {
+    var groups: [string: [int]] = ["a": [1, 2]];
+    if var xs? = groups["a"] {
+        xs.add(3);
+    }
+}
+"#,
+        "xs",
+    );
+}
+
+#[test]
+fn map_entry_payload_place_return_preserves_payload_alias_use() {
+    assert_main_mut_borrows(
+        r#"
+extend [int] {
+    fn id(var self) -> var [int] { self }
+    fn add(var self, _value: int) {}
+}
+fn main() {
+    var groups: [string: [int]] = ["a": [1, 2]];
+    if var xs? = groups["a"] {
+        xs.id().add(3);
+    }
+}
+"#,
+        "xs",
+    );
 }
 
 #[test]

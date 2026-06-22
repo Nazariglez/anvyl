@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     ast::{Ident, Type},
-    collection_effect::{self, CollectionStructuralEffect},
+    collection_effect::{self, CollectionKind, CollectionStructuralEffect},
     span::SourceSpan,
 };
 
@@ -49,15 +49,13 @@ pub(super) fn classify_method_effect(
     if !origin.is_core_module("collections") {
         return None;
     }
-    match CollectionRootKind::from_type(receiver_ty)? {
+    let kind = match CollectionRootKind::from_type(receiver_ty)? {
         CollectionRootKind::List | CollectionRootKind::Array | CollectionRootKind::Slice => {
-            collection_effect::classify_sequence_method(name)
-                .map(CollectionStructuralEffect::Sequence)
+            CollectionKind::Sequence
         }
-        CollectionRootKind::Map => {
-            collection_effect::classify_map_method(name).map(CollectionStructuralEffect::Map)
-        }
-    }
+        CollectionRootKind::Map => CollectionKind::Map,
+    };
+    collection_effect::classify_structural_method(kind, name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,33 +276,6 @@ mod tests {
 
     fn local(id: u32) -> PlaceIdentity {
         PlaceIdentity::root(PlaceRoot::Local(SemanticLocalId::new(id)))
-    }
-
-    #[test]
-    fn matches_exact_sequence_root() {
-        let loan = loan(local(1));
-        assert!(matches!(
-            active_sequence_match(&[loan], &local(1)),
-            ActiveSequenceMatch::Exact
-        ));
-    }
-
-    #[test]
-    fn matches_element_projection_from_root_sequence() {
-        let loan = loan(local(1));
-        assert!(matches!(
-            active_sequence_match(&[loan], &local(1).index()),
-            ActiveSequenceMatch::ElementProjection
-        ));
-    }
-
-    #[test]
-    fn distinguishes_shadowed_root() {
-        let loan = loan(local(1));
-        assert!(matches!(
-            active_sequence_match(&[loan], &local(2)),
-            ActiveSequenceMatch::Distinct
-        ));
     }
 
     #[test]

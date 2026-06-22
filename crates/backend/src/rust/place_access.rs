@@ -482,10 +482,26 @@ impl<'a> PlaceAccessCx<'a> {
             if !collection_loan_projection_supported(self.program, path) {
                 return Err(PlaceAccessGapKind::PlaceProjection);
             }
-            if !place.projection.is_empty()
-                && matches!(root.storage, Some(air_place::PlaceStorage::Local(local)) if self.local_is_source_mut_place_param(function, local))
-            {
-                return Err(PlaceAccessGapKind::MutablePlaceProjection);
+            match root.storage {
+                Some(air_place::PlaceStorage::Local(local))
+                    if self.local_is_source_mut_place_param(function, local)
+                        && !place.projection.is_empty() =>
+                {
+                    return Err(PlaceAccessGapKind::MutablePlaceProjection);
+                }
+                Some(
+                    air_place::PlaceStorage::CaptureCell(_)
+                    | air_place::PlaceStorage::ScopedBorrow(_),
+                ) if !place.projection.is_empty() => {
+                    return Err(PlaceAccessGapKind::MutablePlaceProjection);
+                }
+                None => return Err(PlaceAccessGapKind::MutablePlace),
+                Some(
+                    air_place::PlaceStorage::Local(_)
+                    | air_place::PlaceStorage::CaptureCell(_)
+                    | air_place::PlaceStorage::ScopedBorrow(_)
+                    | air_place::PlaceStorage::Global(_),
+                ) => {}
             }
         }
         if matches!(

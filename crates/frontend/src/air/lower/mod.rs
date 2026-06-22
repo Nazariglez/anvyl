@@ -3261,6 +3261,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         requires_mut: bool,
         allow_promoted_root: bool,
     ) -> Result<Place, LowerError> {
+        self.lower_place_arg_impl_with_fallback(expr, requires_mut, allow_promoted_root, true)
+    }
+
+    fn lower_place_arg_impl_with_fallback(
+        &mut self,
+        expr: &ExprNode,
+        requires_mut: bool,
+        allow_promoted_root: bool,
+        allow_named_fallback: bool,
+    ) -> Result<Place, LowerError> {
         if let Some(fact) = self.global_access(expr.node.id).cloned() {
             let valid = if requires_mut {
                 matches!(
@@ -3287,7 +3297,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             {
                 Ok(fact) => fact,
                 Err(LowerError::MissingLocalUse { .. }) => {
-                    return self.lower_mut_place_from_read_fact(expr, allow_promoted_root);
+                    return self.lower_mut_place_from_read_fact(
+                        expr,
+                        allow_promoted_root,
+                        allow_named_fallback,
+                    );
                 }
                 Err(err) => return Err(err),
             }
@@ -3311,14 +3325,20 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         &mut self,
         expr: &ExprNode,
         allow_promoted_root: bool,
+        allow_named_fallback: bool,
     ) -> Result<Place, LowerError> {
         let root = projection_root(expr).unwrap_or(expr);
         if let Ok(fact) = self.local_use(root, LocalUseMode::Read) {
             let root = self.binding_place(&fact)?;
             return self.lower_mut_source_place(expr, root, allow_promoted_root);
         }
-        self.lower_self_mut_place_arg(expr)
-            .or_else(|_| self.lower_unique_named_mut_place_arg(expr))
+        self.lower_self_mut_place_arg(expr).or_else(|err| {
+            if allow_named_fallback {
+                self.lower_unique_named_mut_place_arg(expr)
+            } else {
+                Err(err)
+            }
+        })
     }
 
     fn lower_mut_source_place(
@@ -6360,14 +6380,18 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !is_lowered_collection_stub(&target.id) {
             return Ok(false);
         }
-        let sequence_filter = collection_effect::classify_sequence_method(field.node.field)
-            .and_then(sequence_filter_remove_matches);
-        let map_filter = collection_effect::classify_map_method(field.node.field)
-            .and_then(map_filter_remove_matches);
+        let sequence_filter = collection_effect::filter_remove_matches(
+            collection_effect::CollectionKind::Sequence,
+            field.node.field,
+        );
+        let map_filter = collection_effect::filter_remove_matches(
+            collection_effect::CollectionKind::Map,
+            field.node.field,
+        );
         if sequence_filter.is_none() && map_filter.is_none() {
             return Ok(false);
         }
-        let root = self.lower_method_target(&field.node.target)?;
+        let root = self.lower_collection_method_target(&field.node.target)?;
         self.require_mutable_place(expr, &root)?;
         if let Some(elem) = typing::list_elem(&self.cx.program, root.ty) {
             let Some(remove_matches) = sequence_filter else {
@@ -6469,9 +6493,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 },
                 body,
             }));
-        self.rebuild_filtered_collection(
-            root, len, index, kept, flags, &step, collection, entry_ty,
-        )?;
+        let rebuild_body = self.with_nested_block(|this| {
+            this.rebuild_filtered_collection(
+                root, len, index, kept, flags, &step, collection, entry_ty,
+            )
+        })?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::CollectionLoan(AirCollectionLoan {
+                root: root.clone(),
+                root_kind: match collection {
+                    FilterCollection::List { .. } => AirCollectionRootKind::List,
+                    FilterCollection::Map { .. } => AirCollectionRootKind::Map,
+                },
+                mode: match collection {
+                    FilterCollection::List { .. } => AirCollectionLoanMode::ReadonlySequence,
+                    FilterCollection::Map { .. } => AirCollectionLoanMode::ReadonlyMap,
+                },
+                body: rebuild_body,
+            }));
         self.emit_assign(
             root.clone(),
             RValue::Use(Operand::Place(self.local_place(kept))),
@@ -6735,7 +6776,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let ExprKind::Field(field) = &call.node.func.node.kind else {
             return Ok(false);
         };
-        if field.node.field.as_str() != "for_each" || call.node.args.len() != 1 {
+        if !matches!(
+            collection_effect::classify_sequence_method(field.node.field),
+            Some(collection_effect::SequenceMethod::ForEach)
+        ) || call.node.args.len() != 1
+        {
             return Ok(false);
         }
         let Some(target) = self.facts.calls.get(&expr.node.id) else {
@@ -6744,7 +6789,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if !is_lowered_collection_stub(&target.id) {
             return Ok(false);
         }
-        let root = self.lower_method_target(&field.node.target)?;
+        let root = self.lower_collection_method_target(&field.node.target)?;
         let Some(elem) = typing::list_elem(&self.cx.program, root.ty) else {
             return Ok(false);
         };
@@ -6862,12 +6907,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         if !matches!(
             collection_effect::classify_sequence_method(field.node.field),
-            Some(collection_effect::SequenceStructuralEffect::Push)
+            Some(collection_effect::SequenceMethod::Push)
         ) || call.node.args.len() != 1
         {
             return Ok(None);
         }
-        let list = self.lower_method_target(&field.node.target)?;
+        let list = self.lower_collection_method_target(&field.node.target)?;
         let Some(elem) = typing::list_elem(&self.cx.program, list.ty) else {
             return Ok(None);
         };
@@ -6886,12 +6931,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         if !matches!(
             collection_effect::classify_map_method(field.node.field),
-            Some(collection_effect::MapStructuralEffect::Insert)
+            Some(collection_effect::MapMethod::Insert)
         ) || call.node.args.len() != 2
         {
             return Ok(None);
         }
-        let map = self.lower_method_target(&field.node.target)?;
+        let map = self.lower_collection_method_target(&field.node.target)?;
         let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
             return Ok(None);
         };
@@ -6916,12 +6961,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         if !matches!(
             collection_effect::classify_map_method(field.node.field),
-            Some(collection_effect::MapStructuralEffect::Remove)
+            Some(collection_effect::MapMethod::Remove)
         ) || call.node.args.len() != 1
         {
             return Ok(None);
         }
-        let map = self.lower_method_target(&field.node.target)?;
+        let map = self.lower_collection_method_target(&field.node.target)?;
         let Some((key_ty, value_ty)) = typing::map_kv(&self.cx.program, map.ty) else {
             return Ok(None);
         };
@@ -6931,50 +6976,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(Some(RValue::MapRemove { map, key, ty }))
     }
 
-    fn lower_method_target(&mut self, target: &ExprNode) -> Result<Place, LowerError> {
-        match self.lower_place_or_temp(target, true) {
-            Ok(place) => Ok(place),
-            Err(
-                LowerError::MissingLocalUse { .. }
-                | LowerError::UnsupportedExpr { kind: "Ident", .. }
-                | LowerError::MissingExprType { .. },
-            ) => self
-                .lambda_capture_place_by_name(target)
-                .or_else(|_| self.named_local_place(target)),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn lambda_capture_place_by_name(&self, target: &ExprNode) -> Result<Place, LowerError> {
-        let ExprKind::Ident(name) = &target.node.kind else {
-            return Err(unsupported_expr(target));
-        };
-        let FunctionKind::Lambda(lambda) = self.function.kind else {
-            return Err(unsupported_expr(target));
-        };
-        let Some(facts) = self.cx.typecheck_facts else {
-            return Err(unsupported_expr(target));
-        };
-        let source = self.cx.program.lambdas[lambda.index()].source;
-        let matches = self.cx.program.lambdas[lambda.index()]
-            .captures
-            .iter()
-            .enumerate()
-            .filter(|(_, decl)| {
-                facts
-                    .lambda_captures()
-                    .get(&(source, typecheck_binding_id(decl.binding())))
-                    .is_some_and(|capture| capture.name == *name)
-            })
-            .collect::<Vec<_>>();
-        let [(index, decl)] = matches.as_slice() else {
-            return Err(unsupported_expr(target));
-        };
-        Ok(Place {
-            root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(*index)),
-            projection: vec![],
-            ty: decl.ty(),
-        })
+    fn lower_collection_method_target(&mut self, target: &ExprNode) -> Result<Place, LowerError> {
+        self.lower_place_arg_impl_with_fallback(target, true, true, false)
     }
 
     fn require_mutable_place(&self, expr: &ExprNode, place: &Place) -> Result<(), LowerError> {
@@ -7001,26 +7004,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Ok(());
         }
         Err(unsupported_expr(expr))
-    }
-
-    fn named_local_place(&self, expr: &ExprNode) -> Result<Place, LowerError> {
-        let ExprKind::Ident(name) = expr.node.kind else {
-            return Err(unsupported_expr(expr));
-        };
-        let Some((local, data)) = self
-            .function
-            .locals
-            .iter()
-            .enumerate()
-            .find(|(_, local)| local.name == Some(name))
-        else {
-            return Err(unsupported_expr(expr));
-        };
-        Ok(Place {
-            root: PlaceRoot::Local(LocalId::from_index(local)),
-            projection: vec![],
-            ty: data.ty,
-        })
     }
 
     fn lower_extern_call(
@@ -9819,35 +9802,10 @@ fn enqueue_global_accesses(
     }
 }
 
-fn sequence_filter_remove_matches(
-    effect: collection_effect::SequenceStructuralEffect,
-) -> Option<bool> {
-    match effect {
-        collection_effect::SequenceStructuralEffect::Retain => Some(false),
-        collection_effect::SequenceStructuralEffect::RemoveWhere => Some(true),
-        collection_effect::SequenceStructuralEffect::Push
-        | collection_effect::SequenceStructuralEffect::Pop
-        | collection_effect::SequenceStructuralEffect::SortBy => None,
-    }
-}
-
-fn map_filter_remove_matches(effect: collection_effect::MapStructuralEffect) -> Option<bool> {
-    match effect {
-        collection_effect::MapStructuralEffect::Retain => Some(false),
-        collection_effect::MapStructuralEffect::RemoveWhere => Some(true),
-        collection_effect::MapStructuralEffect::Insert
-        | collection_effect::MapStructuralEffect::Remove => None,
-    }
-}
-
 fn is_lowered_collection_stub(id: &CallableId) -> bool {
-    matches!(
-        (id.kind, id.name.as_str()),
-        (
-            CallableKind::ExtendMethod(MethodSurface::Instance),
-            "push" | "for_each" | "retain" | "remove_where" | "insert" | "remove"
-        )
-    ) && id.module.is_core_module("collections")
+    matches!(id.kind, CallableKind::ExtendMethod(MethodSurface::Instance))
+        && id.module.is_core_module("collections")
+        && collection_effect::has_lowered_stub(id.name)
 }
 
 fn queue_reachable(

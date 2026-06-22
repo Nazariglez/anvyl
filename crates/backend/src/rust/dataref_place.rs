@@ -1,5 +1,5 @@
 use super::rir::{
-    RirCallArg, RirDataRefId, RirFieldId, RirFunction, RirMapWriteKind, RirMutPlaceAccess,
+    RirCallArg, RirCollectionAccess, RirDataRefId, RirFieldId, RirFunction, RirMutPlaceAccess,
     RirMutPlaceArg, RirOptionMatch, RirOptionSubject, RirPlaceModel, RirProgram, RirProjection,
     RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
 };
@@ -67,9 +67,11 @@ impl DataRefPlaceDescriptors {
                 self.collect_mut_place_arg(program, place);
                 self.collect_rvalue(program, value);
             }
-            RirStmt::GlobalEnsure { .. }
-            | RirStmt::DataRefSet { .. }
-            | RirStmt::MapValueSet { .. } => {}
+            RirStmt::SequenceSlotSet { collection, .. } => {
+                self.collect_collection_access(program, collection);
+            }
+            RirStmt::MapValueSet { map, .. } => self.collect_collection_access(program, map),
+            RirStmt::GlobalEnsure { .. } | RirStmt::DataRefSet { .. } => {}
             RirStmt::If(branch) => {
                 self.collect_block(program, function, &branch.then_block);
                 if let Some(block) = &branch.else_block {
@@ -121,12 +123,23 @@ impl DataRefPlaceDescriptors {
                     }
                 }
             }
-            RirRValue::MapInsert {
-                map,
-                kind: RirMapWriteKind::IndexedAssignment,
-                ..
-            } => self.collect_mut_place_arg(program, map),
+            RirRValue::CollectionLen { source } => self.collect_collection_access(program, source),
+            RirRValue::SequenceSlotAt { collection, .. } => {
+                self.collect_collection_access(program, collection);
+            }
+            RirRValue::ListPush { list, .. } => self.collect_collection_access(program, list),
+            RirRValue::MapGet { map, .. }
+            | RirRValue::MapInsert { map, .. }
+            | RirRValue::MapRemove { map, .. }
+            | RirRValue::MapEntryAt { map, .. }
+            | RirRValue::MapValueAt { map, .. } => self.collect_collection_access(program, map),
             _ => {}
+        }
+    }
+
+    fn collect_collection_access(&mut self, program: &RirProgram, access: &RirCollectionAccess) {
+        if let RirCollectionAccess::MutPlace(arg) = access {
+            self.collect_mut_place_arg(program, arg);
         }
     }
 

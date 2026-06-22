@@ -244,6 +244,10 @@ pub(super) fn global_read(slot: &str, init: &str) -> String {
     format!("{slot}.read(|| {init})?")
 }
 
+pub(super) fn global_write(slot: &str, init: &str) -> String {
+    format!("{slot}.write(|| {init})?")
+}
+
 pub(super) fn global_set_without_init(slot: &str, value: &str) -> String {
     format!("{slot}.set_without_init({value})?")
 }
@@ -500,12 +504,20 @@ pub(super) fn map_with_value_mut_short(
     )
 }
 
+pub(super) fn collection_len(root: &str) -> String {
+    format!("({root}).len() as i64")
+}
+
 pub(super) fn begin_shape_loan(root: &str) -> String {
     format!("{root}.begin_shape_loan()?")
 }
 
-pub(super) fn begin_shape_loan_region() -> String {
-    "value.begin_shape_loan()".into()
+pub(super) fn mut_place_begin_shape_loan(place: &str, runtime: &str) -> String {
+    mut_place_access_ctx(
+        place,
+        runtime,
+        &format!("Ok({})", begin_shape_loan("value")),
+    )
 }
 
 pub(super) fn map_begin_value_loan_region(key: &str) -> String {

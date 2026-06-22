@@ -1,0 +1,21 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// a
+// 9
+// b
+// 2
+// @match-end
+
+fn main() {
+    var m: [string: int] = ["a": 1, "b": 2];
+    m.retain(|key, value| {
+        m.insert("a", 9);
+        true
+    });
+    for key, value in m {
+        println(key);
+        println(value);
+    }
+}

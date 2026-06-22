@@ -199,6 +199,30 @@ impl Program {
         })
     }
 
+    fn capture_cell_source_place(
+        &self,
+        function_id: FunctionId,
+        cell: CaptureCellId,
+    ) -> Option<Place> {
+        let decl = self.capture_cells.get(cell.index())?;
+        if decl.owner != function_id {
+            return None;
+        }
+        Some(Place {
+            root: PlaceRoot::Local(decl.source_local),
+            projection: vec![],
+            ty: decl.ty,
+        })
+    }
+
+    fn resolve_capture_cell_place(&self, function_id: FunctionId, place: &Place) -> Option<Place> {
+        let cell = self.capture_cell_root(function_id, place.root)?;
+        let mut source = self.capture_cell_source_place(function_id, cell)?;
+        source.projection.extend(place.projection.clone());
+        source.ty = place.ty;
+        Some(source)
+    }
+
     fn scoped_borrow_source_place(
         &self,
         function_id: FunctionId,
@@ -251,10 +275,12 @@ impl Program {
             return left == right;
         }
         let left = self
-            .resolve_scoped_borrow_place(function_id, left)
+            .resolve_capture_cell_place(function_id, left)
+            .or_else(|| self.resolve_scoped_borrow_place(function_id, left))
             .unwrap_or_else(|| left.clone());
         let right = self
-            .resolve_scoped_borrow_place(function_id, right)
+            .resolve_capture_cell_place(function_id, right)
+            .or_else(|| self.resolve_scoped_borrow_place(function_id, right))
             .unwrap_or_else(|| right.clone());
         left.may_overlap(&right)
     }

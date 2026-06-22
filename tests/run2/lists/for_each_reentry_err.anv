@@ -1,7 +1,6 @@
 // @mode: run
 // @frontend: new
 // @expect: error
-// @skip: blocked by promoted collection receiver owner/RIR descriptor before runtime guard
 // @contains: cannot structurally mutate collection during active iteration or slice view
 
 fn main() {

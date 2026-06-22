@@ -1,12 +1,33 @@
 use crate::ast::Ident;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SequenceStructuralEffect {
+pub(crate) enum CollectionKind {
+    Sequence,
+    Map,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceMethod {
     Push,
-    Pop,
+    ForEach,
     Retain,
     RemoveWhere,
-    SortBy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MapMethod {
+    Insert,
+    Remove,
+    Retain,
+    RemoveWhere,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceStructuralEffect {
+    Push,
+    Retain,
+    RemoveWhere,
+    InternalPop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +48,9 @@ impl CollectionStructuralEffect {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Sequence(SequenceStructuralEffect::Push) => "ListPush",
-            Self::Sequence(SequenceStructuralEffect::Pop) => "ListPop",
             Self::Sequence(SequenceStructuralEffect::Retain) => "ListRetain",
             Self::Sequence(SequenceStructuralEffect::RemoveWhere) => "ListRemoveWhere",
-            Self::Sequence(SequenceStructuralEffect::SortBy) => "ListSortBy",
+            Self::Sequence(SequenceStructuralEffect::InternalPop) => "ListPop",
             Self::Map(MapStructuralEffect::Insert) => "MapInsert",
             Self::Map(MapStructuralEffect::Remove) => "MapRemove",
             Self::Map(MapStructuralEffect::Retain) => "MapRetain",
@@ -47,22 +67,87 @@ impl CollectionStructuralEffect {
     }
 }
 
-pub(crate) fn classify_sequence_method(name: Ident) -> Option<SequenceStructuralEffect> {
+impl SequenceMethod {
+    fn structural_effect(self) -> Option<SequenceStructuralEffect> {
+        match self {
+            Self::Push => Some(SequenceStructuralEffect::Push),
+            Self::Retain => Some(SequenceStructuralEffect::Retain),
+            Self::RemoveWhere => Some(SequenceStructuralEffect::RemoveWhere),
+            Self::ForEach => None,
+        }
+    }
+
+    fn remove_matches(self) -> Option<bool> {
+        match self {
+            Self::Retain => Some(false),
+            Self::RemoveWhere => Some(true),
+            Self::Push | Self::ForEach => None,
+        }
+    }
+}
+
+impl MapMethod {
+    fn structural_effect(self) -> MapStructuralEffect {
+        match self {
+            Self::Insert => MapStructuralEffect::Insert,
+            Self::Remove => MapStructuralEffect::Remove,
+            Self::Retain => MapStructuralEffect::Retain,
+            Self::RemoveWhere => MapStructuralEffect::RemoveWhere,
+        }
+    }
+
+    fn remove_matches(self) -> Option<bool> {
+        match self {
+            Self::Retain => Some(false),
+            Self::RemoveWhere => Some(true),
+            Self::Insert | Self::Remove => None,
+        }
+    }
+}
+
+pub(crate) fn classify_sequence_method(name: Ident) -> Option<SequenceMethod> {
     Some(match name.as_str() {
-        "push" => SequenceStructuralEffect::Push,
-        "retain" => SequenceStructuralEffect::Retain,
-        "remove_where" => SequenceStructuralEffect::RemoveWhere,
-        "sort_by" => SequenceStructuralEffect::SortBy,
+        "push" => SequenceMethod::Push,
+        "for_each" => SequenceMethod::ForEach,
+        "retain" => SequenceMethod::Retain,
+        "remove_where" => SequenceMethod::RemoveWhere,
         _ => return None,
     })
 }
 
-pub(crate) fn classify_map_method(name: Ident) -> Option<MapStructuralEffect> {
+pub(crate) fn classify_map_method(name: Ident) -> Option<MapMethod> {
     Some(match name.as_str() {
-        "insert" => MapStructuralEffect::Insert,
-        "remove" => MapStructuralEffect::Remove,
-        "retain" => MapStructuralEffect::Retain,
-        "remove_where" => MapStructuralEffect::RemoveWhere,
+        "insert" => MapMethod::Insert,
+        "remove" => MapMethod::Remove,
+        "retain" => MapMethod::Retain,
+        "remove_where" => MapMethod::RemoveWhere,
         _ => return None,
     })
+}
+
+pub(crate) fn classify_structural_method(
+    kind: CollectionKind,
+    name: Ident,
+) -> Option<CollectionStructuralEffect> {
+    match kind {
+        CollectionKind::Sequence => classify_sequence_method(name)
+            .and_then(SequenceMethod::structural_effect)
+            .map(CollectionStructuralEffect::Sequence),
+        CollectionKind::Map => classify_map_method(name)
+            .map(MapMethod::structural_effect)
+            .map(CollectionStructuralEffect::Map),
+    }
+}
+
+pub(crate) fn filter_remove_matches(kind: CollectionKind, name: Ident) -> Option<bool> {
+    match kind {
+        CollectionKind::Sequence => {
+            classify_sequence_method(name).and_then(SequenceMethod::remove_matches)
+        }
+        CollectionKind::Map => classify_map_method(name).and_then(MapMethod::remove_matches),
+    }
+}
+
+pub(crate) fn has_lowered_stub(name: Ident) -> bool {
+    classify_sequence_method(name).is_some() || classify_map_method(name).is_some()
 }

@@ -13,7 +13,7 @@ use anvyx_frontend::{
 };
 
 use super::{
-    RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
+    CollectionAccessOp, PlanCx, RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
     dataref_place::DataRefPlaceDescriptors,
     emit,
     place_access::{PlaceAccessCx, PlaceAccessIntent},
@@ -22,23 +22,23 @@ use super::{
     rep_policy::{RustRepPolicy, RustTracePlan},
     rir::{
         self, RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
-        RirCellStorage, RirCollectionLoanMode, RirCollectionLoanScope, RirCollectionRootKind,
-        RirCollectionStorage, RirCollectionStorageId, RirCollectionStorageKind, RirConst,
-        RirConstId, RirConstValue, RirCoreEnumKind, RirDataRef, RirDataRefId, RirEnum, RirEnumId,
-        RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId, RirExternKind, RirExternParam,
-        RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal,
-        RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
-        RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
-        RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
-        RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
-        RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
-        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource,
-        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind, RirVerifySite,
+        RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
+        RirCollectionRootKind, RirCollectionStorage, RirCollectionStorageId,
+        RirCollectionStorageKind, RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirDataRef,
+        RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId,
+        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec,
+        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi,
+        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
+        RirScopedPlaceSource, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     source_job::{self, SourceJobStatus},
     target,
@@ -457,7 +457,7 @@ fn nested_tuple_index_write_program() -> RirProgram {
 }
 
 #[test]
-fn plan_accepts_collection_loan_scopes() {
+fn plan_lowers_local_collection_loan_to_direct_descriptor() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let list = program.alloc_type(TypeData::List(int));
@@ -473,37 +473,74 @@ fn plan_accepts_collection_loan_scopes() {
         signature: Signature::new(vec![param("xs", list, ParamMode::Value, xs)], void),
         locals: vec![local(list, LocalKind::Arg)],
         body: structured_body(
-            vec![Statement::CollectionLoan(air::AirCollectionLoan {
-                root: place(xs, list),
-                root_kind: air::AirCollectionRootKind::List,
-                mode: air::AirCollectionLoanMode::ReadonlySequence,
-                body: air::AirBlock::default(),
-            })],
+            vec![collection_loan_stmt(
+                place(xs, list),
+                air::AirCollectionRootKind::List,
+            )],
             air::AirTail::Return(None),
         ),
     });
     program.module_mut(module).functions.push(function);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, RustPlanConfig::default()).expect("plan rejected loan scope");
-    let function = &plan.verified().program().functions[0];
+    let root = planned_collection_loan_root(program, function);
     assert!(matches!(
-        function.body.stmts.as_slice(),
-        [RirStmt::CollectionLoanScope(scope)]
-            if scope.root_kind == RirCollectionRootKind::List
-                && scope.mode == RirCollectionLoanMode::ReadonlySequence
+        root,
+        RirCollectionAccess::Direct(RirPlace {
+            root: RirPlaceRoot::Local(local),
+            projections,
+            ..
+        }) if local == RirLocalId::from_index(0) && projections.is_empty()
     ));
 }
 
 #[test]
-fn collection_loan_scope_emits_raii_guard_and_runs() {
+fn plan_lowers_source_mut_param_collection_loan_to_mut_place_param() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let list = program.alloc_type(TypeData::List(int));
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let one = int_const(&mut program, int, 1);
     let xs = air::LocalId::from_index(0);
+    let function = program.alloc_function(Function {
+        name: Ident::new("update"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("xs", list, ParamMode::MutBorrow, xs)], void),
+        locals: vec![mut_local(list, LocalKind::Arg)],
+        body: structured_body(
+            vec![collection_loan_stmt(
+                place(xs, list),
+                air::AirCollectionRootKind::List,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    let root = planned_collection_loan_root(program, function);
+    assert!(matches!(
+        root,
+        RirCollectionAccess::MutPlace(RirMutPlaceArg {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local, .. }),
+            ..
+        }) if local == RirLocalId::from_index(0)
+    ));
+}
+
+#[test]
+fn plan_lowers_owner_capture_cell_collection_loan_to_stack_cell() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let binding = BindingId::from_index(0);
+    let source = air::LocalId::from_index(0);
+    let owner = FunctionId::from_index(0);
+    let cell = capture_cell(&mut program, owner, source, binding, list);
+    let init = init_collection_cell(&mut program, cell, list, int);
     let function = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
@@ -511,35 +548,338 @@ fn collection_loan_scope_emits_raii_guard_and_runs() {
         owner: None,
         specialization: None,
         signature: Signature::new(vec![], void),
-        locals: vec![mut_local(list, LocalKind::Temp)],
+        locals: vec![bound_source_local(binding, list)],
+        body: structured_body(
+            vec![
+                init,
+                collection_loan_stmt(
+                    root_place(PlaceRoot::CaptureCell(cell), list),
+                    air::AirCollectionRootKind::List,
+                ),
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(function, owner);
+    program.module_mut(module).functions.push(function);
+
+    let root = planned_collection_loan_root(program, function);
+    assert!(matches!(
+        root,
+        RirCollectionAccess::MutPlace(RirMutPlaceArg {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::StackCell { cell: RirCellRef::Owner(id), .. }),
+            ..
+        }) if id == RirCellId::from_index(0)
+    ));
+}
+
+#[test]
+fn plan_lowers_lambda_capture_cell_collection_loan_to_heap_cell() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let map = program.alloc_type(TypeData::Map {
+        key: int,
+        value: int,
+        order: air::MapOrder::Insertion,
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
+    let module = program.alloc_module(root_module());
+    let binding = BindingId::from_index(0);
+    let source = air::LocalId::from_index(0);
+    let lambda_local = air::LocalId::from_index(1);
+    let body = FunctionId::from_index(0);
+    let owner = FunctionId::from_index(1);
+    let lambda = air::LambdaId::from_index(0);
+    let cell = capture_cell(&mut program, owner, source, binding, map);
+    assert_eq!(
+        program.alloc_lambda(LambdaDecl {
+            source: ExprId(0),
+            module,
+            owner,
+            body,
+            signature: sig,
+            escape: LambdaEscape::Escaping,
+            captures: vec![air::LambdaCaptureDecl::CaptureCell {
+                binding,
+                cell,
+                ty: map,
+            }],
+        }),
+        lambda
+    );
+    let lambda_body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Lambda(lambda),
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(
+            vec![collection_loan_stmt(
+                root_place(
+                    PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+                    map,
+                ),
+                air::AirCollectionRootKind::Map,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(lambda_body, body);
+    let init = init_collection_cell(&mut program, cell, map, int);
+    let owner_fn = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![
+            bound_source_local(binding, map),
+            local(lambda_ty, LocalKind::User),
+        ],
+        body: structured_body(
+            vec![
+                init,
+                Statement::Init {
+                    local: lambda_local,
+                    value: RValue::MakeLambda {
+                        lambda,
+                        captures: vec![air::LambdaCaptureArg::CaptureCell { cell }],
+                        ty: lambda_ty,
+                    },
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    assert_eq!(owner_fn, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([lambda_body, owner_fn]);
+
+    let root = planned_collection_loan_root(program, body);
+    assert!(matches!(
+        root,
+        RirCollectionAccess::MutPlace(RirMutPlaceArg {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::HeapCell { cell: RirCellRef::Capture { cell, .. }, .. }),
+            ..
+        }) if cell == RirCellId::from_index(0)
+    ));
+}
+
+#[test]
+fn plan_lowers_scoped_collection_loan_to_scoped_place_cell() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let list = program.alloc_type(TypeData::List(int));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let binding = BindingId::from_index(0);
+    let source = air::LocalId::from_index(0);
+    let function = FunctionId::from_index(0);
+    let borrow = scoped_borrow(&mut program, function, source, binding, list);
+    let function = program.alloc_function(Function {
+        name: Ident::new("update"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("xs", list, ParamMode::MutBorrow, source)], void),
+        locals: vec![bound_arg_source_local(binding, list)],
+        body: structured_body(
+            vec![collection_loan_stmt(
+                root_place(PlaceRoot::ScopedBorrow(borrow), list),
+                air::AirCollectionRootKind::List,
+            )],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    let root = planned_collection_loan_root(program, function);
+    assert!(matches!(
+        root,
+        RirCollectionAccess::MutPlace(RirMutPlaceArg {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell { cell: RirScopedPlaceCellRef::Owner(id), .. }),
+            ..
+        }) if id == RirScopedPlaceCellId::from_index(0)
+    ));
+}
+
+#[test]
+fn plan_lowers_list_index_collection_access_to_mut_place() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let value = program.alloc_type(TypeData::Optional(int));
+    let map = program.alloc_type(TypeData::Map {
+        key: int,
+        value: int,
+        order: air::MapOrder::Insertion,
+    });
+    let list = program.alloc_type(TypeData::List(map));
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let index_const = int_const(&mut program, int, 0);
+    let key_const = int_const(&mut program, int, 1);
+    let value_const = int_const(&mut program, int, 2);
+    let maps = air::LocalId::from_index(0);
+    let index = air::LocalId::from_index(1);
+    let slot = air::LocalId::from_index(2);
+    let map_place = Place {
+        root: PlaceRoot::Local(maps),
+        projection: vec![Projection::Index(index)],
+        ty: map,
+    };
+    let function = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("maps", list, ParamMode::Value, maps)], void),
+        locals: vec![
+            mut_local(list, LocalKind::Arg),
+            local(int, LocalKind::Temp),
+            local(value, LocalKind::Temp),
+        ],
         body: structured_body(
             vec![
                 Statement::Init {
-                    local: xs,
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::List,
-                        fields: vec![Operand::Const(one)],
-                        ty: list,
+                    local: index,
+                    value: RValue::Use(Operand::Const(index_const)),
+                },
+                Statement::Init {
+                    local: slot,
+                    value: RValue::MapGet {
+                        map: map_place.clone(),
+                        key: Operand::Const(key_const),
+                        ty: value,
                     },
                 },
-                Statement::CollectionLoan(air::AirCollectionLoan {
-                    root: place(xs, list),
-                    root_kind: air::AirCollectionRootKind::List,
-                    mode: air::AirCollectionLoanMode::ReadonlySequence,
-                    body: air::AirBlock::default(),
+                Statement::Eval(RValue::MapInsert {
+                    map: map_place,
+                    key: Operand::Const(key_const),
+                    value: Operand::Const(value_const),
+                    kind: air::MapWriteKind::IndexedAssignment,
                 }),
             ],
             air::AirTail::Return(None),
         ),
     });
     program.module_mut(module).functions.push(function);
-    program.set_entry(function);
 
-    let source = plan_source(program);
-    assert!(source.as_str().contains("begin_shape_loan()?"));
-    assert!(!source.as_str().contains(".iter()"));
-    let output = run_source(source);
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), function);
+    let accesses = function
+        .body
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            RirStmt::Init {
+                value: RirRValue::MapGet { map, .. },
+                ..
+            }
+            | RirStmt::Eval(RirRValue::MapInsert { map, .. }) => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(accesses.len(), 2);
+    assert!(accesses.iter().all(|access| matches!(
+        access,
+        RirCollectionAccess::MutPlace(RirMutPlaceArg {
+            access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }),
+            projections,
+            ..
+        }) if *local == RirLocalId::from_index(0) && !projections.is_empty()
+    )));
+}
+
+#[test]
+fn indexed_map_assignment_preserves_unsupported_lambda_capture_gap() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let map = program.alloc_type(TypeData::Map {
+        key: int,
+        value: int,
+        order: air::MapOrder::Insertion,
+    });
+    let void = program.alloc_type(TypeData::Void);
+    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
+    let module = program.alloc_module(root_module());
+    let owner = FunctionId::from_index(1);
+    let source = air::LocalId::from_index(0);
+    let body = program.alloc_function(Function {
+        name: Ident::new("lambda"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    let lambda = program.alloc_lambda(LambdaDecl {
+        source: ExprId(0),
+        module,
+        owner,
+        body,
+        signature: sig,
+        escape: LambdaEscape::NonEscaping,
+        captures: vec![air::LambdaCaptureDecl::ScopedLocal {
+            binding: BindingId::from_index(0),
+            source: CaptureLocalSource {
+                owner,
+                local: source,
+            },
+            ty: map,
+            mutability: Mutability::Mutable,
+        }],
+    });
+    program.function_mut(body).kind = FunctionKind::Lambda(lambda);
+    let owner_fn = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![bound_source_local(BindingId::from_index(0), map)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    assert_eq!(owner_fn, owner);
+    program
+        .module_mut(module)
+        .functions
+        .extend([body, owner_fn]);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let mut cx = PlanCx::new(&verified, RustPlanConfig::default());
+    cx.plan_types(&mut RirProgram::default())
+        .expect("type plan failed");
+    let mut locals = vec![];
+    let map = root_place(
+        PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
+        map,
+    );
+
+    let Err(RustPlanError::TargetGaps(gaps)) = cx.plan_collection_access(
+        body,
+        &map,
+        CollectionAccessOp::IndexedMapAssign,
+        &mut locals,
+    ) else {
+        panic!("expected indexed map assignment gap");
+    };
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.kind == RustTargetGapKind::UnsupportedLambdaCapture)
+    );
 }
 
 #[test]
@@ -1526,7 +1866,7 @@ fn rir_rejects_global_collection_loan_root() {
                 .body
                 .stmts
                 .push(RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                    root: rir_global_place(RirTypeId::from_index(0)),
+                    root: RirCollectionAccess::Direct(rir_global_place(RirTypeId::from_index(0))),
                     root_kind: RirCollectionRootKind::List,
                     mode: RirCollectionLoanMode::MutableSequenceElement,
                     body: RirStructuredBlock {
@@ -1622,19 +1962,6 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
     ));
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-}
-
-#[test]
-fn rir_rejects_global_roots_in_unsupported_collection_operations() {
-    let value = RirRValue::MapGet {
-        map: rir_global_place(RirTypeId::from_index(0)),
-        key: RirOperand::Const(RirConstId::from_index(0)),
-        ty: RirTypeId::from_index(0),
-    };
-    assert_rir_error(
-        valid_global_rir(|program| program.functions[1].body.stmts.push(RirStmt::Eval(value))),
-        RirVerifyErrorKind::UnsupportedRValueType,
-    );
 }
 
 #[test]
@@ -7161,7 +7488,7 @@ fn rir_accepts_collection_loan_scope_around_loop() {
             )],
             vec![rir_local(xs, list, true, "xs")],
             vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
                 root_kind: RirCollectionRootKind::List,
                 mode: RirCollectionLoanMode::ReadonlySequence,
                 body: RirStructuredBlock {
@@ -7177,6 +7504,38 @@ fn rir_accepts_collection_loan_scope_around_loop() {
     };
 
     rir::verify(&program).expect("valid collection loan scope rejected");
+}
+
+#[test]
+fn rir_rejects_direct_mut_place_param_collection_loan() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![rir_param(
+                xs,
+                list,
+                RirParamSemantic::MutPlace,
+                RirParamAbi::MutPlace,
+            )],
+            vec![rir_local(xs, list, true, "xs")],
+            vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
+                root_kind: RirCollectionRootKind::List,
+                mode: RirCollectionLoanMode::ReadonlySequence,
+                body: RirStructuredBlock::default(),
+            })],
+        )],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -7199,10 +7558,137 @@ fn rir_rejects_collection_loan_mode_root_mismatch() {
             )],
             vec![rir_local(xs, list, true, "xs")],
             vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
                 root_kind: RirCollectionRootKind::Map,
                 mode: RirCollectionLoanMode::ReadonlyMap,
                 body: RirStructuredBlock::default(),
+            })],
+        )],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_accepts_map_slot_read_without_active_loan() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let map = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Map {
+                key: int,
+                value: int,
+            },
+        ],
+        collection_storages: vec![rir_map_storage(0, map, int, int)],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![
+                rir_param(xs, map, RirParamSemantic::Value, RirParamAbi::Value),
+                rir_param(index, int, RirParamSemantic::Value, RirParamAbi::Value),
+            ],
+            vec![
+                rir_local(xs, map, false, "xs"),
+                rir_local(index, int, false, "index"),
+            ],
+            vec![RirStmt::Eval(RirRValue::MapValueAt {
+                map: RirCollectionAccess::Direct(rir_place(xs, map)),
+                index,
+                ty: int,
+            })],
+        )],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("RIR verify failed");
+}
+
+#[test]
+fn rir_rejects_sequence_slot_write_under_readonly_loan() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let list = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let value = RirLocalId::from_index(2);
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
+        collection_storages: vec![rir_list_storage(list, int)],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(xs, list, true, "xs"),
+                rir_local(index, int, false, "index"),
+                rir_local(value, int, false, "value"),
+            ],
+            vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
+                root_kind: RirCollectionRootKind::List,
+                mode: RirCollectionLoanMode::ReadonlySequence,
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::SequenceSlotSet {
+                        collection: RirCollectionAccess::Direct(rir_place(xs, list)),
+                        index,
+                        value: RirOperand::Place(rir_place(value, int)),
+                    }],
+                    term: RirTerm::None,
+                },
+            })],
+        )],
+        ..RirProgram::default()
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_rejects_map_slot_write_under_readonly_loan() {
+    let void = RirTypeId::from_index(0);
+    let int = RirTypeId::from_index(1);
+    let map = RirTypeId::from_index(2);
+    let xs = RirLocalId::from_index(0);
+    let index = RirLocalId::from_index(1);
+    let value = RirLocalId::from_index(2);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Map {
+                key: int,
+                value: int,
+            },
+        ],
+        collection_storages: vec![rir_map_storage(0, map, int, int)],
+        functions: vec![rir_function(
+            RirFunctionId::from_index(0),
+            void,
+            vec![],
+            vec![
+                rir_local(xs, map, true, "xs"),
+                rir_local(index, int, false, "index"),
+                rir_local(value, int, false, "value"),
+            ],
+            vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
+                root: RirCollectionAccess::Direct(rir_place(xs, map)),
+                root_kind: RirCollectionRootKind::Map,
+                mode: RirCollectionLoanMode::ReadonlyMap,
+                body: RirStructuredBlock {
+                    stmts: vec![RirStmt::MapValueSet {
+                        map: RirCollectionAccess::Direct(rir_place(xs, map)),
+                        index,
+                        value: RirOperand::Place(rir_place(value, int)),
+                    }],
+                    term: RirTerm::None,
+                },
             })],
         )],
         ..RirProgram::default()
@@ -7231,7 +7717,7 @@ fn rir_rejects_mutable_collection_loan_on_immutable_root() {
             )],
             vec![rir_local(xs, list, false, "xs")],
             vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
                 root_kind: RirCollectionRootKind::List,
                 mode: RirCollectionLoanMode::MutableSequenceElement,
                 body: RirStructuredBlock::default(),
@@ -7253,32 +7739,6 @@ fn rir_accepts_mutable_global_collection_loan() {
     );
 
     rir::verify(&program).expect("mutable global collection loans should verify");
-}
-
-#[test]
-fn rir_rejects_global_collection_mutation_during_active_loan() {
-    let int = RirTypeId::from_index(0);
-    let list = RirTypeId::from_index(2);
-    let global = RirGlobalId::from_index(0);
-    let value = RirConstId::from_index(0);
-    let program = global_list_collection_loan_rir(
-        RirCollectionLoanMode::ReadonlySequence,
-        vec![],
-        vec![RirConst {
-            id: value,
-            ty: int,
-            value: RirConstValue::Int(1),
-        }],
-        RirStructuredBlock {
-            stmts: vec![RirStmt::Eval(RirRValue::ListPush {
-                list: RirMutPlaceArg::global(global, list),
-                value: RirOperand::Const(value),
-            })],
-            term: RirTerm::None,
-        },
-    );
-
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -7411,7 +7871,11 @@ fn rir_rejects_dynamic_global_collection_loan() {
                         value: RirRValue::Use(RirOperand::Const(zero)),
                     },
                     RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                        root: RirPlace::global(global, vec![RirProjection::Index(index)], row),
+                        root: RirCollectionAccess::Direct(RirPlace::global(
+                            global,
+                            vec![RirProjection::Index(index)],
+                            row,
+                        )),
                         root_kind: RirCollectionRootKind::List,
                         mode: RirCollectionLoanMode::ReadonlySequence,
                         body: RirStructuredBlock::default(),
@@ -7445,7 +7909,7 @@ fn rir_rejects_active_collection_root_assignment() {
                 rir_local(ys, list, true, "ys"),
             ],
             vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
+                root: RirCollectionAccess::Direct(rir_place(xs, list)),
                 root_kind: RirCollectionRootKind::List,
                 mode: RirCollectionLoanMode::ReadonlySequence,
                 body: RirStructuredBlock {
@@ -7461,84 +7925,6 @@ fn rir_rejects_active_collection_root_assignment() {
     };
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
-}
-
-#[test]
-fn emit_collection_loan_scope_uses_lexical_raii_guard() {
-    let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
-    let list = RirTypeId::from_index(2);
-    let xs = RirLocalId::from_index(0);
-    let program = RirProgram {
-        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
-        collection_storages: vec![rir_list_storage(list, int)],
-        functions: vec![rir_function(
-            RirFunctionId::from_index(0),
-            void,
-            vec![rir_param(
-                xs,
-                list,
-                RirParamSemantic::Value,
-                RirParamAbi::Value,
-            )],
-            vec![rir_local(xs, list, true, "xs")],
-            vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
-                root_kind: RirCollectionRootKind::List,
-                mode: RirCollectionLoanMode::ReadonlySequence,
-                body: RirStructuredBlock::default(),
-            })],
-        )],
-        ..RirProgram::default()
-    };
-    let verified = rir::verify(&program).expect("valid collection loan scope rejected");
-    let source = emit::emit(&verified);
-    let text = source.as_str();
-
-    assert!(text.contains("let __anv_collection_loan_0 = xs.begin_shape_loan()?;"));
-    assert!(text.contains("let __anv_collection_version_0 = __anv_collection_loan_0.version();"));
-    assert!(!text.contains(".iter()"));
-    assert!(!text.contains("mem::forget"));
-}
-
-#[test]
-fn emit_collection_loan_scope_uses_short_mut_place_access() {
-    let void = RirTypeId::from_index(0);
-    let int = RirTypeId::from_index(1);
-    let list = RirTypeId::from_index(2);
-    let xs = RirLocalId::from_index(0);
-    let program = RirProgram {
-        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
-        collection_storages: vec![rir_list_storage(list, int)],
-        functions: vec![rir_function(
-            RirFunctionId::from_index(0),
-            void,
-            vec![rir_param(
-                xs,
-                list,
-                RirParamSemantic::MutPlace,
-                RirParamAbi::MutPlace,
-            )],
-            vec![rir_local(xs, list, true, "xs")],
-            vec![RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                root: rir_place(xs, list),
-                root_kind: RirCollectionRootKind::List,
-                mode: RirCollectionLoanMode::ReadonlySequence,
-                body: RirStructuredBlock::default(),
-            })],
-        )],
-        ..RirProgram::default()
-    };
-    let verified = rir::verify(&program).expect("valid collection loan scope rejected");
-    let source = emit::emit(&verified);
-    let text = source.as_str();
-
-    assert!(text.contains(&target::mut_place_access(
-        "xs",
-        "rt",
-        &target::begin_shape_loan_region(),
-    )));
-    assert!(!text.contains("iter_mut"));
 }
 
 #[test]
@@ -7600,37 +7986,44 @@ fn slice_type_uses_runtime_descriptor_not_raw_slice() {
 fn rir_rejects_mut_place_operand_inside_short_region() {
     let void = RirTypeId::from_index(0);
     let int = RirTypeId::from_index(1);
-    let list = RirTypeId::from_index(2);
+    let map = RirTypeId::from_index(2);
+    let option = RirTypeId::from_index(3);
     let xs = RirLocalId::from_index(0);
-    let value = RirLocalId::from_index(1);
+    let key = RirLocalId::from_index(1);
     let program = RirProgram {
-        types: vec![RirType::Void, RirType::Int, RirType::List(int)],
-        collection_storages: vec![rir_list_storage(list, int)],
+        types: vec![
+            RirType::Void,
+            RirType::Int,
+            RirType::Map {
+                key: int,
+                value: int,
+            },
+            RirType::Option(int),
+        ],
+        collection_storages: vec![rir_map_storage(0, map, int, int)],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
             void,
+            vec![rir_param(
+                key,
+                int,
+                RirParamSemantic::MutPlace,
+                RirParamAbi::MutPlace,
+            )],
             vec![
-                rir_param(xs, list, RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
-                rir_param(
-                    value,
-                    int,
-                    RirParamSemantic::MutPlace,
-                    RirParamAbi::MutPlace,
-                ),
+                rir_local(xs, map, true, "xs"),
+                rir_local(key, int, true, "key"),
             ],
-            vec![
-                rir_local(xs, list, true, "xs"),
-                rir_local(value, int, true, "value"),
-            ],
-            vec![RirStmt::Eval(RirRValue::ListPush {
-                list: RirMutPlaceArg::local(rir_place(xs, list)),
-                value: RirOperand::Place(rir_place(value, int)),
+            vec![RirStmt::Eval(RirRValue::MapGet {
+                map: RirCollectionAccess::MutPlace(RirMutPlaceArg::local(rir_place(xs, map))),
+                key: RirOperand::Place(rir_place(key, int)),
+                ty: option,
             })],
         )],
         ..RirProgram::default()
     };
 
-    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -11355,7 +11748,7 @@ fn rir_verify_rejects_dataref_structural_map_insert() {
         map_ty,
     );
     let program = dataref_access_rir(vec![RirStmt::Eval(RirRValue::MapInsert {
-        map,
+        map: RirCollectionAccess::MutPlace(map),
         key: RirOperand::Const(RirConstId::from_index(0)),
         value: RirOperand::Const(RirConstId::from_index(0)),
         kind: RirMapWriteKind::StructuralInsert,
@@ -13487,7 +13880,7 @@ fn global_list_collection_loan_rir(
                 vec![
                     RirStmt::GlobalEnsure { global },
                     RirStmt::CollectionLoanScope(RirCollectionLoanScope {
-                        root: RirPlace::global(global, vec![], list),
+                        root: RirCollectionAccess::Direct(RirPlace::global(global, vec![], list)),
                         root_kind: RirCollectionRootKind::List,
                         mode,
                         body,
@@ -17238,7 +17631,6 @@ mod lists {
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
         assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
-        assert!(text.contains(".mutate_with_ctx(rt, |rt, value| { value.push(rt,"));
         assert!(text.contains("let __anv_list = &(v0); let index = anvyx_runtime::checked_index_result(v1, __anv_list.len(), \"list\")?; __anv_list.elem_at_shared(rt, index, __anv_list.structural_version())?"));
         assert!(text.contains(".len() as i64"));
         let output = run_source(source);
@@ -17299,7 +17691,6 @@ mod lists {
         let source = plan_source(program);
         let text = source.as_str();
         assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
-        assert!(text.contains(".mutate_with_ctx(rt, |rt, value| { value.insert(rt,"));
         assert!(text.contains(".remove(rt,"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -19788,6 +20179,62 @@ fn root_place(root: PlaceRoot, ty: air::TypeId) -> Place {
         projection: vec![],
         ty,
     }
+}
+
+fn collection_loan_stmt(root: Place, root_kind: air::AirCollectionRootKind) -> Statement {
+    let mode = match root_kind {
+        air::AirCollectionRootKind::Map => air::AirCollectionLoanMode::ReadonlyMap,
+        air::AirCollectionRootKind::List
+        | air::AirCollectionRootKind::FixedArray
+        | air::AirCollectionRootKind::Slice => air::AirCollectionLoanMode::ReadonlySequence,
+    };
+    Statement::CollectionLoan(air::AirCollectionLoan {
+        root,
+        root_kind,
+        mode,
+        body: air::AirBlock::default(),
+    })
+}
+
+fn init_collection_cell(
+    program: &mut Program,
+    cell: air::CaptureCellId,
+    ty: air::TypeId,
+    int: air::TypeId,
+) -> Statement {
+    let fields = match program.type_arena.data(ty) {
+        TypeData::Map { .. } => vec![
+            Operand::Const(int_const(program, int, 0)),
+            Operand::Const(int_const(program, int, 1)),
+        ],
+        _ => vec![Operand::Const(int_const(program, int, 0))],
+    };
+    Statement::Assign {
+        dst: root_place(PlaceRoot::CaptureCell(cell), ty),
+        value: RValue::Aggregate {
+            kind: match program.type_arena.data(ty) {
+                TypeData::Map { .. } => AggregateCtor::Map,
+                _ => AggregateCtor::List,
+            },
+            fields,
+            ty,
+        },
+    }
+}
+
+fn planned_collection_loan_root(program: Program, air_id: FunctionId) -> RirCollectionAccess {
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let function = rir_function_for_air(plan.program(), air_id);
+    function
+        .body
+        .stmts
+        .iter()
+        .find_map(|stmt| match stmt {
+            RirStmt::CollectionLoanScope(scope) => Some(scope.root.clone()),
+            _ => None,
+        })
+        .expect("missing collection loan scope")
 }
 
 fn rir_function_for_air(program: &RirProgram, air_id: FunctionId) -> &RirFunction {

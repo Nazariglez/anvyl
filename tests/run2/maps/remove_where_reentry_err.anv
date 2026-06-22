@@ -4,9 +4,9 @@
 // @contains: cannot structurally mutate collection during active iteration or slice view
 
 fn main() {
-    var xs: [int] = [1, 2, 3];
-    xs.retain(|_| {
-        xs.push(4);
-        true
+    var m: [string: int] = ["a": 1, "b": 2];
+    m.remove_where(|key, value| {
+        m.insert("c", 3);
+        false
     });
 }

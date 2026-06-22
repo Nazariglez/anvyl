@@ -1,11 +1,12 @@
 use super::{
     place::{mut_place_dynamic_facts, place_dynamic_facts},
     rir::{
-        RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionLoanScope,
-        RirCollectionRootKind, RirExternKind, RirFunction, RirLambdaStorage, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionSubject, RirParamAbi, RirPlace,
-        RirPlaceRoot, RirProgram, RirRValue, RirStmt, RirStringifyReqKind, RirStruct,
-        RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
+        RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionAccess,
+        RirCollectionLoanScope, RirCollectionRootKind, RirExternKind, RirFunction,
+        RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
+        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirStmt,
+        RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
+        stmt_child_blocks_any,
     },
 };
 
@@ -61,6 +62,7 @@ fn stmt_calls_fallible(
         | RirStmt::MutPlaceSet { .. }
         | RirStmt::CellSet { .. }
         | RirStmt::ScopedPlaceCellSet { .. }
+        | RirStmt::SequenceSlotSet { .. }
         | RirStmt::MapValueSet { .. } => true,
         RirStmt::Assign { dst, value } => {
             place_is_mut_place_param(function, dst)
@@ -126,6 +128,7 @@ fn rvalue_calls_fallible(
             | RirRValue::MapRemove { .. }
             | RirRValue::MapEntryAt { .. }
             | RirRValue::MapValueAt { .. }
+            | RirRValue::SequenceSlotAt { .. }
             | RirRValue::SliceView { .. }
             | RirRValue::CellGetCopy { .. }
             | RirRValue::ScopedPlaceCellGet { .. }
@@ -208,13 +211,18 @@ fn rvalue_uses_fallible_place(
         RirRValue::DataRefGet { object, .. } => {
             operand_has_fallible_place(program, function, object)
         }
-        RirRValue::Len { source }
-        | RirRValue::SliceView { source, .. }
-        | RirRValue::RangeListCopy { source, .. } => {
+        RirRValue::Len { source } => place_has_fallible_projection(program, function, source),
+        RirRValue::CollectionLen { source } => {
+            collection_access_fallible(program, function, source)
+        }
+        RirRValue::SequenceSlotAt { collection, .. } => {
+            collection_access_fallible(program, function, collection)
+        }
+        RirRValue::SliceView { source, .. } | RirRValue::RangeListCopy { source, .. } => {
             place_has_fallible_projection(program, function, source)
         }
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
-            place_has_fallible_projection(program, function, map)
+            collection_access_fallible(program, function, map)
         }
         RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => false,
         RirRValue::MutPlaceGetCopy { place, .. } => mut_place_preparation_fallible(program, place),
@@ -260,6 +268,20 @@ fn place_has_fallible_projection(
     place_dynamic_facts(program, function, place).is_some_and(|facts| facts.fallible_projection)
 }
 
+fn collection_access_fallible(
+    program: &RirProgram,
+    function: &RirFunction,
+    access: &RirCollectionAccess,
+) -> bool {
+    match access {
+        RirCollectionAccess::Direct(place) => {
+            matches!(place.root, RirPlaceRoot::Global(_))
+                || place_has_fallible_projection(program, function, place)
+        }
+        RirCollectionAccess::MutPlace(_) => true,
+    }
+}
+
 fn operand_ty(program: &RirProgram, operand: &RirOperand) -> Option<RirTypeId> {
     match operand {
         RirOperand::Place(place) => Some(place.ty),
@@ -270,7 +292,7 @@ fn operand_ty(program: &RirProgram, operand: &RirOperand) -> Option<RirTypeId> {
 fn loan_scope_is_fallible(program: &RirProgram, scope: &RirCollectionLoanScope) -> bool {
     scope.root_kind.tracks_shape_loan()
         && matches!(
-            (scope.root_kind, program.types[scope.root.ty.index()]),
+            (scope.root_kind, program.types[scope.root.ty().index()]),
             (RirCollectionRootKind::List, RirType::List(_))
                 | (RirCollectionRootKind::Map, RirType::Map { .. })
         )
@@ -387,9 +409,18 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
         RirStmt::DataRefSet { object, value, .. } => ContextUse::rt_types()
             .union(operand_context_use(program, function, object))
             .union(operand_context_use(program, function, value)),
-        RirStmt::MapValueSet { .. } => ContextUse::rt(),
-        RirStmt::CollectionLoanScope(scope) => collection_loan_context_use(function, scope)
-            .union(block_context_use(program, function, &scope.body)),
+        RirStmt::SequenceSlotSet {
+            collection, value, ..
+        } => ContextUse::rt()
+            .union(collection_access_context_use(program, function, collection))
+            .union(operand_context_use(program, function, value)),
+        RirStmt::MapValueSet { map, value, .. } => ContextUse::rt()
+            .union(collection_access_context_use(program, function, map))
+            .union(operand_context_use(program, function, value)),
+        RirStmt::CollectionLoanScope(scope) => collection_loan_context_use(
+            program, function, scope,
+        )
+        .union(block_context_use(program, function, &scope.body)),
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);
@@ -422,16 +453,29 @@ fn stmt_child_blocks_context_use(
     uses
 }
 
+fn collection_access_context_use(
+    program: &RirProgram,
+    function: &RirFunction,
+    access: &RirCollectionAccess,
+) -> ContextUse {
+    match access {
+        RirCollectionAccess::Direct(place) => place_context_use(program, function, place),
+        RirCollectionAccess::MutPlace(place) => mut_place_context_use(program, function, place),
+    }
+}
+
 fn collection_loan_context_use(
+    program: &RirProgram,
     function: &RirFunction,
     scope: &RirCollectionLoanScope,
 ) -> ContextUse {
-    match scope.root.root {
-        RirPlaceRoot::Global(_) => ContextUse::generated_call(),
-        RirPlaceRoot::Local(_) if place_is_mut_place_param(function, &scope.root) => {
-            ContextUse::rt()
-        }
-        RirPlaceRoot::Local(_) => ContextUse::default(),
+    match &scope.root {
+        RirCollectionAccess::Direct(place) => match place.root {
+            RirPlaceRoot::Global(_) => ContextUse::generated_call(),
+            RirPlaceRoot::Local(_) if place_is_mut_place_param(function, place) => ContextUse::rt(),
+            RirPlaceRoot::Local(_) => ContextUse::default(),
+        },
+        RirCollectionAccess::MutPlace(place) => mut_place_context_use(program, function, place),
     }
 }
 
@@ -525,24 +569,35 @@ fn rvalue_operand_context_use(
             })
         }
         RirRValue::DataRefGet { object, .. } => operand_context_use(program, function, object),
-        RirRValue::Len { source }
-        | RirRValue::SliceView { source, .. }
-        | RirRValue::RangeListCopy { source, .. } => place_context_use(program, function, source),
-        RirRValue::ListPush { list, value } => mut_place_context_use(program, function, list)
-            .union(operand_context_use(program, function, value)),
-        RirRValue::MapGet { map, key, .. } => place_context_use(program, function, map)
+        RirRValue::Len { source } => place_context_use(program, function, source),
+        RirRValue::CollectionLen { source } => {
+            collection_access_context_use(program, function, source)
+        }
+        RirRValue::SequenceSlotAt { collection, .. } => {
+            ContextUse::rt().union(collection_access_context_use(program, function, collection))
+        }
+        RirRValue::SliceView { source, .. } | RirRValue::RangeListCopy { source, .. } => {
+            place_context_use(program, function, source)
+        }
+        RirRValue::ListPush { list, value } => {
+            collection_access_context_use(program, function, list)
+                .union(operand_context_use(program, function, value))
+        }
+        RirRValue::MapGet { map, key, .. } => collection_access_context_use(program, function, map)
             .union(operand_context_use(program, function, key)),
-        RirRValue::MapRemove { map, key, .. } => mut_place_context_use(program, function, map)
-            .union(operand_context_use(program, function, key)),
+        RirRValue::MapRemove { map, key, .. } => {
+            collection_access_context_use(program, function, map)
+                .union(operand_context_use(program, function, key))
+        }
         RirRValue::MapInsert {
             map, key, value, ..
-        } => mut_place_context_use(program, function, map).union(operands_context_use(
+        } => collection_access_context_use(program, function, map).union(operands_context_use(
             program,
             function,
             [key, value],
         )),
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
-            place_context_use(program, function, map)
+            collection_access_context_use(program, function, map)
         }
         RirRValue::Call { .. }
         | RirRValue::Lambda { .. }
@@ -805,6 +860,16 @@ fn cell_uses_ctx(program: &RirProgram, cell: RirCellRef) -> bool {
         .is_some_and(|cell| cell.storage == RirCellStorage::Heap)
 }
 
+fn collection_access_uses_mut_place_param(
+    function: &RirFunction,
+    access: &RirCollectionAccess,
+) -> bool {
+    match access {
+        RirCollectionAccess::Direct(place) => place_is_mut_place_param(function, place),
+        RirCollectionAccess::MutPlace(place) => mut_place_uses_mut_place_param(function, place),
+    }
+}
+
 fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> bool {
     match value {
         RirRValue::Use(operand)
@@ -837,28 +902,36 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         RirRValue::Call { args, .. } => args
             .iter()
             .any(|arg| call_arg_uses_mut_place_param(function, arg)),
-        RirRValue::Len { source }
-        | RirRValue::SliceView { source, .. }
-        | RirRValue::RangeListCopy { source, .. } => place_is_mut_place_param(function, source),
+        RirRValue::Len { source } => place_is_mut_place_param(function, source),
+        RirRValue::CollectionLen { source } => {
+            collection_access_uses_mut_place_param(function, source)
+        }
+        RirRValue::SequenceSlotAt { collection, .. } => {
+            collection_access_uses_mut_place_param(function, collection)
+        }
+        RirRValue::SliceView { source, .. } | RirRValue::RangeListCopy { source, .. } => {
+            place_is_mut_place_param(function, source)
+        }
         RirRValue::ListPush { list, value } => {
-            mut_place_uses_mut_place_param(function, list)
+            collection_access_uses_mut_place_param(function, list)
                 || operand_uses_mut_place_param(function, value)
         }
         RirRValue::MapGet { map, key, .. } => {
-            place_is_mut_place_param(function, map) || operand_uses_mut_place_param(function, key)
+            collection_access_uses_mut_place_param(function, map)
+                || operand_uses_mut_place_param(function, key)
         }
         RirRValue::MapRemove { map, key, .. } => {
-            mut_place_uses_mut_place_param(function, map)
+            collection_access_uses_mut_place_param(function, map)
                 || operand_uses_mut_place_param(function, key)
         }
         RirRValue::MapInsert {
             map, key, value, ..
         } => {
-            mut_place_uses_mut_place_param(function, map)
+            collection_access_uses_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
         }
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
-            place_is_mut_place_param(function, map)
+            collection_access_uses_mut_place_param(function, map)
         }
         RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }

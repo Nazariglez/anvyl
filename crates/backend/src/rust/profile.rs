@@ -13,7 +13,7 @@ use anvyx_frontend::{
 use anvyx_runtime::RustProviderSupport;
 
 use super::{
-    native,
+    CollectionAccessOp, native,
     place_access::{
         PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
     },
@@ -441,7 +441,11 @@ impl ProfileCx<'_> {
                     self.check_air_block(function, &loan.body);
                 }
                 air::AirStmt::CollectionSlotScope(scope) => {
-                    self.check_place(site, &scope.root);
+                    self.check_collection_access(
+                        site,
+                        &scope.root,
+                        CollectionAccessOp::slot(&scope.slots),
+                    );
                     self.check_air_block(function, &scope.body);
                 }
             }
@@ -492,14 +496,14 @@ impl ProfileCx<'_> {
     }
 
     fn check_structural_mutation(&mut self, site: ProfileSite, place: &Place) {
-        self.check_collection_write_place(site, place, PlaceAccessIntent::StructuralMutation);
+        self.check_collection_access(site, place, CollectionAccessOp::StructuralMutation);
     }
 
-    fn check_collection_write_place(
+    fn check_collection_access(
         &mut self,
         site: ProfileSite,
         place: &Place,
-        intent: PlaceAccessIntent,
+        op: CollectionAccessOp,
     ) {
         let Some(function) = Self::current_function_id(site) else {
             if matches!(place.root, PlaceRoot::Global(_)) {
@@ -507,7 +511,7 @@ impl ProfileCx<'_> {
             }
             return;
         };
-        let plan = match self.access().plan(function, intent, place) {
+        let plan = match self.access().plan(function, op.intent(), place) {
             Ok(plan) => plan,
             Err(gap) => {
                 self.push(site, profile_gap_kind(gap));
@@ -517,9 +521,10 @@ impl ProfileCx<'_> {
         if self.place_uses_scoped_borrow_source_root(function, place) {
             self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
         }
-        if self
-            .access_root_mutable(site, plan.root)
-            .is_some_and(|mutable| !mutable)
+        if op.requires_mutable_root()
+            && self
+                .access_root_mutable(site, plan.root)
+                .is_some_and(|mutable| !mutable)
         {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
         }
@@ -610,7 +615,17 @@ impl ProfileCx<'_> {
                 self.check_aggregate_rvalue(site, kind, fields, *ty);
             }
             RValue::Len { source } => {
-                self.check_place(site, source);
+                if matches!(
+                    self.program.type_arena.data(source.ty),
+                    TypeData::Array { .. }
+                        | TypeData::List(_)
+                        | TypeData::Map { .. }
+                        | TypeData::Slice(_)
+                ) {
+                    self.check_collection_access(site, source, CollectionAccessOp::Len);
+                } else {
+                    self.check_place(site, source);
+                }
                 if !matches!(
                     self.program.type_arena.data(source.ty),
                     TypeData::String
@@ -654,7 +669,7 @@ impl ProfileCx<'_> {
                 if matches!(value, RValue::MapRemove { .. }) {
                     self.check_structural_mutation(site, map);
                 } else {
-                    self.check_place(site, map);
+                    self.check_collection_access(site, map, CollectionAccessOp::MapGet);
                 }
                 self.check_operand(site, key);
                 self.check_type_ref(site, *ty);
@@ -686,7 +701,11 @@ impl ProfileCx<'_> {
                         self.check_structural_mutation(site, map);
                     }
                     air::MapWriteKind::IndexedAssignment => {
-                        self.check_collection_write_place(site, map, PlaceAccessIntent::Assign);
+                        self.check_collection_access(
+                            site,
+                            map,
+                            CollectionAccessOp::IndexedMapAssign,
+                        );
                     }
                 }
                 self.check_operand(site, key);
@@ -722,7 +741,7 @@ impl ProfileCx<'_> {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
             RValue::MapEntryAt { map, index, ty } => {
-                self.check_place(site, map);
+                self.check_collection_access(site, map, CollectionAccessOp::MapEntryRead);
                 self.check_type_ref(site, *ty);
                 if self.current_local(site, *index).is_none() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);

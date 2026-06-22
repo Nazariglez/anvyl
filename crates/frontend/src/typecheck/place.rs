@@ -1053,7 +1053,7 @@ impl PlaceUseKind {
             ),
             Self::MutReceiver => (
                 ClosurePlaceEffect::Mutable,
-                None,
+                Some(LocalUseMode::MutBorrow),
                 Some(GlobalAccessMode::MutReceiver),
                 ExternPlaceEffect::Write,
             ),

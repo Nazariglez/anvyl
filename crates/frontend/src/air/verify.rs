@@ -3892,7 +3892,7 @@ fn verify_collection_loan_contract_rvalue(
                 function_id,
                 active_loans,
                 list,
-                CollectionStructuralEffect::Sequence(SequenceStructuralEffect::Pop),
+                CollectionStructuralEffect::Sequence(SequenceStructuralEffect::InternalPop),
             );
         }
         RValue::SliceView {
