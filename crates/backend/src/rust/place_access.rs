@@ -321,10 +321,9 @@ impl<'a> PlaceAccessCx<'a> {
         match plan.materialization {
             RustMaterialization::Copy
             | RustMaterialization::Share
-            | RustMaterialization::CloneHandle => None,
-            RustMaterialization::CloneLambda
-            | RustMaterialization::BorrowGuard
-            | RustMaterialization::Gap => Some(match plan.gap {
+            | RustMaterialization::CloneHandle
+            | RustMaterialization::CloneLambda => None,
+            RustMaterialization::BorrowGuard | RustMaterialization::Gap => Some(match plan.gap {
                 Some(RustMaterialGap::UnsupportedType) => PlaceAccessGapKind::GlobalType,
                 Some(RustMaterialGap::UnsupportedRooting) | None => {
                     PlaceAccessGapKind::GlobalRooting

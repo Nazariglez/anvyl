@@ -1819,20 +1819,6 @@ fn rir_rejects_unsupported_global_payloads() {
     );
     assert_rir_error(
         valid_global_rir(|program| {
-            let sig = RirLambdaSigId::from_index(0);
-            let lambda = RirTypeId::from_index(program.types.len());
-            program.types.push(RirType::Lambda(sig));
-            program.lambda_sigs.push(RirLambdaSig {
-                id: sig,
-                params: vec![],
-                ret: RirTypeId::from_index(0),
-            });
-            program.globals[0].ty = lambda;
-        }),
-        RirVerifyErrorKind::UnsupportedRValueType,
-    );
-    assert_rir_error(
-        valid_global_rir(|program| {
             let tuple = RirTypeId::from_index(program.types.len());
             program
                 .types
@@ -1991,31 +1977,6 @@ fn rir_rejects_global_option_match_discriminant() {
 }
 
 #[test]
-fn profile_rejects_unsupported_global_declaration_and_initializer_by_named_gaps() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
-        vec![],
-        air::ReturnMode::Value(int),
-    )));
-    let module = program.alloc_module(root_module());
-    let global = global_with_init(&mut program, module, "g", function, Mutability::Mutable);
-    let init = program.globals[global.index()].init;
-
-    let errors = profile_errors(program);
-    assert_profile_error(
-        &errors,
-        ProfileSite::Global(global),
-        ProfileErrorKind::UnsupportedGlobalType,
-    );
-    assert_profile_error(
-        &errors,
-        ProfileSite::Function(init),
-        ProfileErrorKind::UnsupportedGlobalInitializer,
-    );
-}
-
-#[test]
 fn profile_accepts_exact_root_global_payloads() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -2125,12 +2086,7 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
     });
     program.module_mut(module).extern_types.push(ext_id);
     let ext = program.alloc_type(TypeData::Extern(ext_id));
-    let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
-        vec![],
-        air::ReturnMode::Value(int),
-    )));
     let list_slice = program.alloc_type(TypeData::List(slice));
-    let list_function = program.alloc_type(TypeData::List(function));
     let map_slice = program.alloc_type(TypeData::Map {
         key: int,
         value: slice,
@@ -2143,18 +2099,8 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
         ("any", any, ProfileErrorKind::UnsupportedGlobalType),
         ("dyn", dyn_ty, ProfileErrorKind::UnsupportedGlobalType),
         (
-            "function",
-            function,
-            ProfileErrorKind::UnsupportedGlobalType,
-        ),
-        (
             "list_slice",
             list_slice,
-            ProfileErrorKind::UnsupportedGlobalRooting,
-        ),
-        (
-            "list_function",
-            list_function,
             ProfileErrorKind::UnsupportedGlobalRooting,
         ),
         (
@@ -4215,6 +4161,117 @@ fn emit_renders_tracked_dataref_storage_with_context_lifetime() {
     assert!(source.contains("NodeHeapType: heap.register_tracked::<NodeStorage<'cx>>()"));
 }
 
+fn heap_edge_global_rir() -> RirProgram {
+    valid_global_rir(|program| {
+        let int = RirTypeId::from_index(0);
+        let list = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::List(int));
+        program
+            .collection_storages
+            .push(rir_list_storage(list, int));
+        program.globals[0].ty = list;
+        program.functions[0].ret.ty = list;
+        program.functions[0].locals.push(RirLocal {
+            id: RirLocalId::from_index(0),
+            ty: list,
+            mutable: true,
+            symbol: RirSymbol::new("xs"),
+            initialized: false,
+            payload_ref: false,
+        });
+        program.functions[0].body = RirStructuredBlock {
+            stmts: vec![RirStmt::Init {
+                local: RirLocalId::from_index(0),
+                value: RirRValue::List {
+                    ty: list,
+                    elems: vec![],
+                },
+            }],
+            term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                list,
+            )))),
+        };
+        program.functions[1].body.stmts = vec![RirStmt::GlobalEnsure {
+            global: RirGlobalId::from_index(0),
+        }];
+        program.entry = Some(RirFunctionId::from_index(1));
+    })
+}
+
+#[test]
+fn emit_anv_globals_trace_impl_for_heap_edge_slots() {
+    let source =
+        emit::emit(&rir::verify(&heap_edge_global_rir()).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for AnvGlobals<'cx>"));
+    assert!(source.contains("anvyx_runtime::Trace::trace(&self.g0_score, visitor);"));
+    assert!(source.contains("impl<'cx> anvyx_runtime::CtxRoots<'cx> for AnvGlobals<'cx>"));
+    assert!(source.contains("self.g0_score.validate_trace()?;"));
+    assert!(source.contains("let globals = AnvGlobals::new();"));
+    assert!(source.contains("let mut rt = anvyx_runtime::Ctx::new_with_roots(heap, &globals);"));
+    for forbidden in ["static ", "thread_local!", "OnceLock"] {
+        assert!(
+            !source.contains(forbidden),
+            "generated source contains {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn emit_anv_globals_omits_trace_impl_without_heap_edge_slots() {
+    let program = valid_global_rir(|program| {
+        program.entry = Some(RirFunctionId::from_index(1));
+    });
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(!source.contains("anvyx_runtime::Trace<'cx> for AnvGlobals<'cx>"));
+    assert!(!source.contains("anvyx_runtime::CtxRoots<'cx> for AnvGlobals<'cx>"));
+    assert!(source.contains("let mut rt = anvyx_runtime::Ctx::new(heap);"));
+}
+
+#[test]
+fn emit_lambda_sig_trace_impl_for_heap_env_lambda() {
+    let mut program = valid_heap_env_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    program.functions[0].locals.push(RirLocal {
+        id: RirLocalId::from_index(1),
+        ty: lambda_ty,
+        mutable: true,
+        symbol: RirSymbol::new("nested"),
+        initialized: true,
+        payload_ref: false,
+    });
+    program.lambdas.push(RirLambda {
+        id: RirLambdaId::from_index(1),
+        source: RirLambdaSource::Function(FunctionId::from_index(0)),
+        function: RirFunctionId::from_index(1),
+        sig: RirLambdaSigId::from_index(0),
+        escape: RirLambdaEscape::Escaping,
+        storage: RirLambdaStorage::ZeroEnv,
+        captures: vec![],
+    });
+    program.cells.push(RirCellDecl {
+        id: RirCellId::from_index(0),
+        owner: RirFunctionId::from_index(0),
+        source_local: RirLocalId::from_index(1),
+        payload_ty: lambda_ty,
+        storage: RirCellStorage::Heap,
+        lifetime: RirCellLifetime::Function,
+        symbol: RirSymbol::new("__cell0"),
+    });
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("#[derive(Clone)]\nenum LambdaSig0<'cx>"));
+    assert!(!source.contains("#[derive(Clone, anvyx_runtime::Trace)]\nenum LambdaSig0"));
+    assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for LambdaSig0<'cx>"));
+    assert!(source.contains("Self::L0 { env } => anvyx_runtime::Trace::trace(env, visitor)"));
+    assert!(source.contains("Self::L1 => {},"));
+}
+
 #[test]
 fn trace_plan_marks_generated_payloads_from_tracked_storage() {
     let mut program = dataref_metadata_rir();
@@ -4993,19 +5050,21 @@ fn profile_rejects_function_type_place_returns() {
 }
 
 #[test]
-fn profile_rejects_function_value_containers() {
+fn profile_rejects_function_value_map_keys() {
     let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
         vec![],
         air::ReturnMode::Value(void),
     )));
-    program.alloc_type(TypeData::Array {
-        elem: function,
-        len: 1,
+    program.alloc_type(TypeData::Map {
+        key: function,
+        value: int,
+        order: air::MapOrder::Insertion,
     });
 
-    expect_reject(program, ProfileErrorKind::UnsupportedLambdaValue);
+    expect_reject(program, ProfileErrorKind::UnsupportedMapKey);
 }
 
 #[test]
@@ -6843,18 +6902,66 @@ fn rir_verifies_lambda_signature_ids() {
 }
 
 #[test]
-fn rir_rejects_lambda_container_types() {
+fn rir_accepts_lambda_struct_and_tuple_fields() {
     let void = RirTypeId::from_index(0);
     let lambda_ty = RirTypeId::from_index(1);
-    let array_ty = RirTypeId::from_index(2);
     let sig = RirLambdaSigId::from_index(0);
     let program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Lambda(sig),
-            RirType::Array {
-                elem: lambda_ty,
-                len: 1,
+            RirType::Struct(RirStructId::from_index(0)),
+            RirType::Tuple(RirTupleId::from_index(0)),
+        ],
+        lambda_sigs: vec![RirLambdaSig {
+            id: sig,
+            params: vec![],
+            ret: void,
+        }],
+        structs: vec![RirStruct {
+            id: RirStructId::from_index(0),
+            air_id: None,
+            symbol: RirSymbol::new("Holder"),
+            display: RirSymbol::new("Holder"),
+            native_path: None,
+            native_key: None,
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("f"),
+                ty: lambda_ty,
+            }],
+        }],
+        tuples: vec![RirTuple {
+            id: RirTupleId::from_index(0),
+            symbol: RirSymbol::new("Tuple0"),
+            display: RirSymbol::new("(fn(),)"),
+            copyable: false,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("0"),
+                ty: lambda_ty,
+            }],
+        }],
+        ..RirProgram::default()
+    };
+
+    rir::verify(&program).expect("RIR rejected lambda aggregate fields");
+}
+
+#[test]
+fn rir_rejects_lambda_map_key_types() {
+    let void = RirTypeId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(1);
+    let map_ty = RirTypeId::from_index(2);
+    let sig = RirLambdaSigId::from_index(0);
+    let program = RirProgram {
+        types: vec![
+            RirType::Void,
+            RirType::Lambda(sig),
+            RirType::Map {
+                key: lambda_ty,
+                value: void,
             },
         ],
         lambda_sigs: vec![RirLambdaSig {
@@ -6865,9 +6972,9 @@ fn rir_rejects_lambda_container_types() {
         ..RirProgram::default()
     };
 
-    let errors = rir::verify(&program).expect_err("verified lambda array type");
+    let errors = rir::verify(&program).expect_err("verified lambda map-key type");
     assert!(errors.iter().any(|error| {
-        error.site == RirVerifySite::Type(array_ty)
+        error.site == RirVerifySite::Type(map_ty)
             && error.kind == RirVerifyErrorKind::UnsupportedRValueType
     }));
 }
@@ -8940,7 +9047,8 @@ fn emit_traces_tracked_lambda_env_and_lambda_value_fields() {
     assert!(source.contains("lambda_env0: heap.register_tracked::<LambdaEnv0"));
     assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct LambdaEnv0<'cx>"));
     assert!(source.contains("c0: LambdaSig0<'cx>,"));
-    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nenum LambdaSig0<'cx>"));
+    assert!(source.contains("#[derive(Clone)]\nenum LambdaSig0<'cx>"));
+    assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for LambdaSig0<'cx>"));
 }
 
 #[test]

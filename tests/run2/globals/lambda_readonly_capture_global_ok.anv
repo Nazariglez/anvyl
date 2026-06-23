@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 12
+
+fn make(seed: int) -> fn() -> int {
+    || seed + 5
+}
+
+lazy let add_seed: fn() -> int = make(7);
+
+fn main() {
+    println(add_seed());
+}

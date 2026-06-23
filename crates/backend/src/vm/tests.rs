@@ -1,10 +1,11 @@
 use air::AirStmt as Statement;
 use anvyx_frontend::{
     air::{
-        self, BindingId, CallArg, Callee, CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource,
-        ExternDecl, ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl,
-        Function, FunctionId, FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability,
-        Operand, ParamEscape, ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData,
+        self, AggregateDecl, AggregateKind, BindingId, CallArg, Callee, CaptureCellDecl,
+        CaptureCellLifetime, CaptureLocalSource, ExternDecl, ExternMember, ExternParamDecl,
+        ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionId,
+        FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand, ParamEscape,
+        ParamMode, Place, PlaceRoot, Program, RValue, Signature, TypeData, TypeId,
     },
     ast::{ExprId, Ident},
 };
@@ -404,6 +405,108 @@ fn compiler_rejects_lambda_types() {
     assert!(has_compile_error(
         &errors,
         func,
+        VmCompileErrorKind::UnsupportedLambdaType
+    ));
+}
+
+#[test]
+fn compiler_rejects_lambda_storage_family_types() {
+    fn case_ty(program: &mut Program, module: air::ModuleId, name: &str) -> TypeId {
+        let int = program.alloc_type(TypeData::Int);
+        let void = program.alloc_type(TypeData::Void);
+        let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
+            vec![],
+            air::ReturnMode::Value(void),
+        )));
+        match name {
+            "struct" => {
+                let id = program.alloc_aggregate(AggregateDecl {
+                    name: Ident::new("Payload"),
+                    module,
+                    kind: AggregateKind::Struct,
+                    type_args: vec![],
+                    const_args: vec![],
+                    fields: vec![FieldDecl {
+                        name: Ident::new("f"),
+                        ty: function,
+                    }],
+                    cycle_capable: false,
+                    stringify_override: None,
+                });
+                program.module_mut(module).aggregates.push(id);
+                program.alloc_type(TypeData::Aggregate(id))
+            }
+            "tuple" => program.alloc_type(TypeData::Tuple(vec![function])),
+            "array" => program.alloc_type(TypeData::Array {
+                elem: function,
+                len: 1,
+            }),
+            "list" => program.alloc_type(TypeData::List(function)),
+            "map_value" => program.alloc_type(TypeData::Map {
+                key: int,
+                value: function,
+                order: air::MapOrder::Insertion,
+            }),
+            "map_key" => program.alloc_type(TypeData::Map {
+                key: function,
+                value: int,
+                order: air::MapOrder::Insertion,
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    for name in ["struct", "tuple", "array", "list", "map_value", "map_key"] {
+        let mut program = Program::default();
+        let module = program.alloc_module(root_module());
+        let ty = case_ty(&mut program, module, name);
+        let void = TypeId::from_index(1);
+        let func = program.alloc_function(Function {
+            name: Ident::new("main"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![local(ty, Mutability::Immutable, LocalKind::User)],
+            body: structured_body(vec![], air::AirTail::Return(None)),
+        });
+        program.module_mut(module).functions.push(func);
+
+        let errors = compile_errors(&program);
+        assert!(
+            has_compile_error(&errors, func, VmCompileErrorKind::UnsupportedLambdaType),
+            "missing lambda type gap for {name}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn compiler_rejects_lambda_global_root_type() {
+    let mut program = Program::default();
+    let void = program.alloc_type(TypeData::Void);
+    let lambda = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let module = program.alloc_module(root_module());
+    let global = global_with_init(
+        &mut program,
+        module,
+        "callback",
+        lambda,
+        Mutability::Immutable,
+    );
+    let init = program.globals[global.index()].init;
+
+    let errors = compile_errors(&program);
+    assert!(errors.iter().any(|error| {
+        error.site == VmCompileErrorSite::Global(global)
+            && error.kind == VmCompileErrorKind::UnsupportedGlobal
+    }));
+    assert!(has_compile_error(
+        &errors,
+        init,
         VmCompileErrorKind::UnsupportedLambdaType
     ));
 }

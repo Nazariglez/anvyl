@@ -70,6 +70,105 @@ pub enum RustMaterialSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaStorageFamily {
+    StructField,
+    TupleField,
+    EnumPayload,
+    OptionalPayload,
+    FixedArrayElement,
+    SliceView,
+    ListElement,
+    MapKey,
+    MapValue,
+    DataRefProjection,
+    GlobalRoot,
+    GlobalProjection,
+    NativeExternBoundary,
+    UnknownOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LambdaStorageGap {
+    StorageImplementation,
+    ProvenanceOrigin,
+    Lifetime,
+    Trace,
+    GlobalRooting,
+    MapKeyEqualityHash,
+    ExternBoundary,
+    UnsupportedType,
+}
+
+impl From<LambdaStorageGap> for RustMaterialGap {
+    fn from(gap: LambdaStorageGap) -> Self {
+        match gap {
+            LambdaStorageGap::GlobalRooting => RustMaterialGap::UnsupportedRooting,
+            LambdaStorageGap::StorageImplementation
+            | LambdaStorageGap::ProvenanceOrigin
+            | LambdaStorageGap::Lifetime
+            | LambdaStorageGap::Trace
+            | LambdaStorageGap::MapKeyEqualityHash
+            | LambdaStorageGap::ExternBoundary
+            | LambdaStorageGap::UnsupportedType => RustMaterialGap::UnsupportedType,
+        }
+    }
+}
+
+impl LambdaStorageFamily {
+    fn lambda_gap(self) -> LambdaStorageGap {
+        match self {
+            LambdaStorageFamily::MapKey => LambdaStorageGap::MapKeyEqualityHash,
+            LambdaStorageFamily::GlobalProjection => LambdaStorageGap::GlobalRooting,
+            LambdaStorageFamily::GlobalRoot => LambdaStorageGap::StorageImplementation,
+            LambdaStorageFamily::NativeExternBoundary => LambdaStorageGap::ExternBoundary,
+            LambdaStorageFamily::UnknownOrigin => LambdaStorageGap::ProvenanceOrigin,
+            LambdaStorageFamily::SliceView => LambdaStorageGap::Lifetime,
+            LambdaStorageFamily::StructField
+            | LambdaStorageFamily::TupleField
+            | LambdaStorageFamily::EnumPayload
+            | LambdaStorageFamily::OptionalPayload
+            | LambdaStorageFamily::FixedArrayElement
+            | LambdaStorageFamily::ListElement
+            | LambdaStorageFamily::MapValue
+            | LambdaStorageFamily::DataRefProjection => LambdaStorageGap::StorageImplementation,
+        }
+    }
+
+    fn allows_function_payload(self) -> bool {
+        matches!(
+            self,
+            Self::StructField
+                | Self::TupleField
+                | Self::OptionalPayload
+                | Self::FixedArrayElement
+                | Self::ListElement
+                | Self::MapValue
+                | Self::GlobalRoot
+        )
+    }
+}
+
+fn nested_storage_family(
+    outer: LambdaStorageFamily,
+    nested: LambdaStorageFamily,
+) -> LambdaStorageFamily {
+    match (outer, nested) {
+        (
+            LambdaStorageFamily::GlobalRoot
+            | LambdaStorageFamily::GlobalProjection
+            | LambdaStorageFamily::NativeExternBoundary,
+            _,
+        ) => outer,
+        (
+            LambdaStorageFamily::MapKey | LambdaStorageFamily::MapValue,
+            LambdaStorageFamily::MapKey,
+        ) => LambdaStorageFamily::MapKey,
+        (LambdaStorageFamily::MapKey | LambdaStorageFamily::MapValue, _) => outer,
+        _ => nested,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustMaterialIntent {
     Read,
     Store,
@@ -92,6 +191,13 @@ pub(super) enum LambdaCaptureLayoutEdge {
     HeapCell,
     ScopedPlaceCell,
     Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LambdaTraceAction {
+    Noop,
+    HeapEnv,
+    HeapCellCaptures(Vec<usize>),
 }
 
 fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
@@ -190,11 +296,21 @@ impl<'a> AirRustRepPolicy<'a> {
     fn material_gap(self, ty: TypeId, source: RustMaterialSource) -> RustMaterialGap {
         match source {
             RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
+            RustMaterialSource::StoredPayload => self
+                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                .err()
+                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from),
             _ => RustMaterialGap::UnsupportedType,
         }
     }
 
     fn global_material_gap(self, ty: TypeId) -> RustMaterialGap {
+        if self.contains_function_payload(ty) {
+            return self
+                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
+                .err()
+                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from);
+        }
         match self.program.type_arena.data(ty) {
             TypeData::Void | TypeData::Any | TypeData::Function(_) | TypeData::Dyn(_) => {
                 RustMaterialGap::UnsupportedType
@@ -262,17 +378,24 @@ impl<'a> AirRustRepPolicy<'a> {
             }
             TypeData::DataRef(_) => RustMaterialization::CloneHandle,
             TypeData::Slice(_) => RustMaterialization::BorrowGuard,
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.composite_materialization([*inner])
-            }
-            TypeData::Tuple(elems) => self.composite_materialization(elems.iter().copied()),
-            TypeData::Aggregate(id) => self.composite_materialization(
-                self.program
-                    .aggregate(*id)
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
+            TypeData::Optional(inner) => self.composite_materialization([*inner]),
+            TypeData::Array { elem, .. } => self
+                .composite_storage_materialization([*elem], LambdaStorageFamily::FixedArrayElement),
+            TypeData::Tuple(elems) => self.composite_storage_materialization(
+                elems.iter().copied(),
+                LambdaStorageFamily::TupleField,
             ),
+            TypeData::Aggregate(id) => {
+                let decl = self.program.aggregate(*id);
+                let family = match decl.kind {
+                    AggregateKind::Struct => LambdaStorageFamily::StructField,
+                    AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
+                };
+                self.composite_storage_materialization(
+                    decl.fields.iter().map(|field| field.ty),
+                    family,
+                )
+            }
             TypeData::Enum(id) => self.composite_materialization(
                 self.program
                     .enum_decl(*id)
@@ -303,8 +426,15 @@ impl<'a> AirRustRepPolicy<'a> {
             | TypeData::Any
             | TypeData::Slice(_)
             | TypeData::Extern(_)
-            | TypeData::Function(_)
             | TypeData::Dyn(_) => RustMaterialization::Gap,
+            TypeData::Function(_)
+                if self
+                    .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
+                    .is_ok() =>
+            {
+                self.materialization(ty)
+            }
+            TypeData::Function(_) => RustMaterialization::Gap,
             TypeData::List(elem) if !self.exact_root_global_field_supported(*elem) => {
                 RustMaterialization::Gap
             }
@@ -346,10 +476,18 @@ impl<'a> AirRustRepPolicy<'a> {
         self,
         fields: impl IntoIterator<Item = TypeId>,
     ) -> RustMaterialization {
-        if fields
-            .into_iter()
-            .all(|field| self.stored_payload_supported(field))
-        {
+        self.composite_storage_materialization(fields, LambdaStorageFamily::UnknownOrigin)
+    }
+
+    fn composite_storage_materialization(
+        self,
+        fields: impl IntoIterator<Item = TypeId>,
+        family: LambdaStorageFamily,
+    ) -> RustMaterialization {
+        if fields.into_iter().all(|field| {
+            self.storage_supported(field, family).is_ok()
+                && !matches!(self.materialization(field), RustMaterialization::Gap)
+        }) {
             RustMaterialization::Share
         } else {
             RustMaterialization::Gap
@@ -378,60 +516,183 @@ impl<'a> AirRustRepPolicy<'a> {
         ))
     }
 
-    fn stored_payload_supported(self, ty: TypeId) -> bool {
-        self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
+    pub fn contains_function_payload(self, ty: TypeId) -> bool {
+        self.contains_function_payload_inner(ty, &mut BTreeSet::new())
     }
 
-    fn stored_payload_supported_inner(
+    fn contains_function_payload_inner(self, ty: TypeId, active: &mut BTreeSet<TypeId>) -> bool {
+        if !active.insert(ty) {
+            return false;
+        }
+        let contains = match self.program.type_arena.data(ty) {
+            TypeData::Function(_) => true,
+            TypeData::List(elem)
+            | TypeData::Slice(elem)
+            | TypeData::Optional(elem)
+            | TypeData::Array { elem, .. } => self.contains_function_payload_inner(*elem, active),
+            TypeData::Map { key, value, .. } => {
+                self.contains_function_payload_inner(*key, active)
+                    || self.contains_function_payload_inner(*value, active)
+            }
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .any(|elem| self.contains_function_payload_inner(*elem, active)),
+            TypeData::Aggregate(id) | TypeData::DataRef(id) => self
+                .program
+                .aggregate(*id)
+                .fields
+                .iter()
+                .any(|field| self.contains_function_payload_inner(field.ty, active)),
+            TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().any(|variant| {
+                Self::variant_field_tys(variant)
+                    .any(|ty| self.contains_function_payload_inner(ty, active))
+            }),
+            TypeData::Extern(id) => self
+                .program
+                .extern_type(*id)
+                .fields
+                .iter()
+                .any(|field| self.contains_function_payload_inner(field.ty, active)),
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Void
+            | TypeData::Any
+            | TypeData::String
+            | TypeData::Dyn(_) => false,
+        };
+        active.remove(&ty);
+        contains
+    }
+
+    pub fn storage_supported(
         self,
         ty: TypeId,
+        family: LambdaStorageFamily,
+    ) -> Result<(), LambdaStorageGap> {
+        self.storage_supported_inner(ty, family, false, &mut BTreeSet::new())
+    }
+
+    fn stored_payload_supported(self, ty: TypeId) -> bool {
+        self.storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+            .is_ok()
+    }
+
+    fn storage_supported_inner(
+        self,
+        ty: TypeId,
+        family: LambdaStorageFamily,
         cycle_broken: bool,
         active: &mut BTreeSet<TypeId>,
-    ) -> bool {
+    ) -> Result<(), LambdaStorageGap> {
         if !active.insert(ty) {
-            return cycle_broken;
+            return cycle_broken
+                .then_some(())
+                .ok_or(LambdaStorageGap::UnsupportedType);
         }
-        let supported =
-            match self.program.type_arena.data(ty) {
-                TypeData::Int
-                | TypeData::Float
-                | TypeData::Bool
-                | TypeData::String
-                | TypeData::DataRef(_) => true,
-                TypeData::List(elem) => self.stored_payload_supported_inner(*elem, true, active),
-                TypeData::Map { key, value, .. } => {
+        let result = match self.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::DataRef(_) => Ok(()),
+            TypeData::List(elem) => self.storage_supported_inner(
+                *elem,
+                nested_storage_family(family, LambdaStorageFamily::ListElement),
+                true,
+                active,
+            ),
+            TypeData::Map { key, value, .. } => self
+                .storage_supported_inner(
+                    *key,
+                    nested_storage_family(family, LambdaStorageFamily::MapKey),
+                    true,
+                    active,
+                )
+                .and_then(|()| {
                     self.map_key_supported(*key)
-                        && self.stored_payload_supported_inner(*value, true, active)
-                }
-                TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                    self.stored_payload_supported_inner(*inner, cycle_broken, active)
-                }
-                TypeData::Tuple(elems) => elems
+                        .then_some(())
+                        .ok_or(LambdaStorageGap::MapKeyEqualityHash)
+                })
+                .and_then(|()| {
+                    self.storage_supported_inner(
+                        *value,
+                        nested_storage_family(family, LambdaStorageFamily::MapValue),
+                        true,
+                        active,
+                    )
+                }),
+            TypeData::Optional(inner) => self.storage_supported_inner(
+                *inner,
+                nested_storage_family(family, LambdaStorageFamily::OptionalPayload),
+                cycle_broken,
+                active,
+            ),
+            TypeData::Array { elem, .. } => self.storage_supported_inner(
+                *elem,
+                nested_storage_family(family, LambdaStorageFamily::FixedArrayElement),
+                cycle_broken,
+                active,
+            ),
+            TypeData::Tuple(elems) => elems.iter().try_for_each(|elem| {
+                self.storage_supported_inner(
+                    *elem,
+                    nested_storage_family(family, LambdaStorageFamily::TupleField),
+                    cycle_broken,
+                    active,
+                )
+            }),
+            TypeData::Aggregate(id) => {
+                self.program
+                    .aggregate(*id)
+                    .fields
                     .iter()
-                    .all(|elem| self.stored_payload_supported_inner(*elem, cycle_broken, active)),
-                TypeData::Aggregate(id) => self.program.aggregate(*id).fields.iter().all(|field| {
-                    self.stored_payload_supported_inner(field.ty, cycle_broken, active)
-                }),
-                TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
-                    Self::variant_field_tys(variant)
-                        .all(|ty| self.stored_payload_supported_inner(ty, cycle_broken, active))
-                }),
-                TypeData::Void
-                | TypeData::Any
-                | TypeData::Slice(_)
-                | TypeData::Extern(_)
-                | TypeData::Function(_)
-                | TypeData::Dyn(_) => false,
-            };
+                    .try_for_each(|field| {
+                        let field_family = match self.program.aggregate(*id).kind {
+                            AggregateKind::Struct => LambdaStorageFamily::StructField,
+                            AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
+                        };
+                        self.storage_supported_inner(
+                            field.ty,
+                            nested_storage_family(family, field_family),
+                            cycle_broken,
+                            active,
+                        )
+                    })
+            }
+            TypeData::Enum(id) => {
+                self.program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .try_for_each(|variant| {
+                        Self::variant_field_tys(variant).try_for_each(|ty| {
+                            self.storage_supported_inner(
+                                ty,
+                                nested_storage_family(family, LambdaStorageFamily::EnumPayload),
+                                cycle_broken,
+                                active,
+                            )
+                        })
+                    })
+            }
+            TypeData::Function(_) if family.allows_function_payload() => Ok(()),
+            TypeData::Function(_) => Err(family.lambda_gap()),
+            TypeData::Slice(_) => Err(LambdaStorageGap::Lifetime),
+            TypeData::Extern(_) => Err(LambdaStorageGap::ExternBoundary),
+            TypeData::Void | TypeData::Any | TypeData::Dyn(_) => {
+                Err(LambdaStorageGap::UnsupportedType)
+            }
+        };
         active.remove(&ty);
-        supported
+        result
     }
 
     pub fn list_supported(self, ty: TypeId) -> bool {
-        let TypeData::List(elem) = self.program.type_arena.data(ty) else {
-            return false;
-        };
-        self.stored_payload_supported(*elem)
+        matches!(self.program.type_arena.data(ty), TypeData::List(_))
+            && self
+                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                .is_ok()
     }
 
     fn shareable_value(self, ty: TypeId) -> bool {
@@ -535,7 +796,8 @@ impl<'a> AirRustRepPolicy<'a> {
     }
 
     pub fn map_value_supported(self, ty: TypeId) -> bool {
-        self.stored_payload_supported(ty)
+        self.storage_supported(ty, LambdaStorageFamily::MapValue)
+            .is_ok()
     }
 
     pub fn supports_param_mode(self, ty: TypeId, mode: ParamMode) -> bool {
@@ -757,11 +1019,21 @@ impl<'a> RustRepPolicy<'a> {
     fn material_gap(self, ty: RirTypeId, source: RustMaterialSource) -> RustMaterialGap {
         match source {
             RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
+            RustMaterialSource::StoredPayload => self
+                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                .err()
+                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from),
             _ => RustMaterialGap::UnsupportedType,
         }
     }
 
     fn global_material_gap(self, ty: RirTypeId) -> RustMaterialGap {
+        if self.contains_function_payload(ty) {
+            return self
+                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
+                .err()
+                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from);
+        }
         match self.ty_opt(ty) {
             Some(RirType::Void | RirType::Lambda(_)) | None => RustMaterialGap::UnsupportedType,
             Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
@@ -839,20 +1111,22 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Lambda(sig) if self.lambda_sig_cloneable(sig) => {
                 RustMaterialization::CloneLambda
             }
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.composite_materialization([inner])
-            }
-            RirType::Struct(id) => self.composite_materialization(
+            RirType::Option(inner) => self.composite_materialization([inner]),
+            RirType::Array { elem, .. } => self
+                .composite_storage_materialization([elem], LambdaStorageFamily::FixedArrayElement),
+            RirType::Struct(id) => self.composite_storage_materialization(
                 self.program.structs[id.index()]
                     .fields
                     .iter()
                     .map(|field| field.ty),
+                LambdaStorageFamily::StructField,
             ),
-            RirType::Tuple(id) => self.composite_materialization(
+            RirType::Tuple(id) => self.composite_storage_materialization(
                 self.program.tuples[id.index()]
                     .fields
                     .iter()
                     .map(|field| field.ty),
+                LambdaStorageFamily::TupleField,
             ),
             RirType::Enum(id) => self.composite_materialization(
                 self.program.enums[id.index()]
@@ -871,14 +1145,14 @@ impl<'a> RustRepPolicy<'a> {
         let Some(data) = self.ty_opt(ty) else {
             return RustMaterialization::Gap;
         };
-        if matches!(data, RirType::Void | RirType::Slice(_) | RirType::Lambda(_)) {
+        if matches!(data, RirType::Void | RirType::Slice(_)) {
             return RustMaterialization::Gap;
         }
         if self.copyable(ty) {
             return RustMaterialization::Copy;
         }
         match data {
-            RirType::String | RirType::DataRef(_) => self.materialization(ty),
+            RirType::String | RirType::DataRef(_) | RirType::Lambda(_) => self.materialization(ty),
             RirType::List(elem) if self.exact_root_global_field_supported(elem) => {
                 self.materialization(ty)
             }
@@ -918,8 +1192,7 @@ impl<'a> RustRepPolicy<'a> {
             | RirType::Void
             | RirType::List(_)
             | RirType::Map { .. }
-            | RirType::Slice(_)
-            | RirType::Lambda(_) => RustMaterialization::Gap,
+            | RirType::Slice(_) => RustMaterialization::Gap,
         }
     }
 
@@ -1027,68 +1300,215 @@ impl<'a> RustRepPolicy<'a> {
         self,
         fields: impl IntoIterator<Item = RirTypeId>,
     ) -> RustMaterialization {
-        if fields
-            .into_iter()
-            .all(|field| self.stored_payload_supported(field))
-        {
+        self.composite_storage_materialization(fields, LambdaStorageFamily::UnknownOrigin)
+    }
+
+    fn composite_storage_materialization(
+        self,
+        fields: impl IntoIterator<Item = RirTypeId>,
+        family: LambdaStorageFamily,
+    ) -> RustMaterialization {
+        if fields.into_iter().all(|field| {
+            self.storage_supported(field, family).is_ok()
+                && !matches!(self.materialization(field), RustMaterialization::Gap)
+        }) {
             RustMaterialization::Share
         } else {
             RustMaterialization::Gap
         }
     }
 
-    fn stored_payload_supported(self, ty: RirTypeId) -> bool {
-        self.stored_payload_supported_inner(ty, false, &mut BTreeSet::new())
+    pub fn contains_function_payload(self, ty: RirTypeId) -> bool {
+        self.contains_function_payload_inner(ty, &mut BTreeSet::new())
     }
 
-    fn stored_payload_supported_inner(
+    fn contains_function_payload_inner(
         self,
         ty: RirTypeId,
-        cycle_broken: bool,
         active: &mut BTreeSet<RirTypeId>,
     ) -> bool {
         if !active.insert(ty) {
-            return cycle_broken;
+            return false;
         }
-        let supported = match self.ty_opt(ty) {
+        let contains = match self.ty_opt(ty) {
+            Some(RirType::Lambda(_)) => true,
+            Some(
+                RirType::List(elem)
+                | RirType::Slice(elem)
+                | RirType::Option(elem)
+                | RirType::Array { elem, .. },
+            ) => self.contains_function_payload_inner(elem, active),
+            Some(RirType::Map { key, value }) => {
+                self.contains_function_payload_inner(key, active)
+                    || self.contains_function_payload_inner(value, active)
+            }
+            Some(RirType::Struct(id)) => {
+                self.program.structs.get(id.index()).is_some_and(|strukt| {
+                    strukt
+                        .fields
+                        .iter()
+                        .any(|field| self.contains_function_payload_inner(field.ty, active))
+                })
+            }
+            Some(RirType::DataRef(id)) => {
+                self.program
+                    .datarefs
+                    .get(id.index())
+                    .is_some_and(|dataref| {
+                        dataref
+                            .fields
+                            .iter()
+                            .any(|field| self.contains_function_payload_inner(field.ty, active))
+                    })
+            }
+            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
+                tuple
+                    .fields
+                    .iter()
+                    .any(|field| self.contains_function_payload_inner(field.ty, active))
+            }),
+            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
+                enm.variants.iter().any(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .any(|field| self.contains_function_payload_inner(field.ty, active))
+                })
+            }),
+            Some(
+                RirType::Int | RirType::Float | RirType::Bool | RirType::Void | RirType::String,
+            )
+            | None => false,
+        };
+        active.remove(&ty);
+        contains
+    }
+
+    pub fn storage_supported(
+        self,
+        ty: RirTypeId,
+        family: LambdaStorageFamily,
+    ) -> Result<(), LambdaStorageGap> {
+        self.storage_supported_inner(ty, family, false, &mut BTreeSet::new())
+    }
+
+    fn stored_payload_supported(self, ty: RirTypeId) -> bool {
+        self.storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+            .is_ok()
+    }
+
+    fn storage_supported_inner(
+        self,
+        ty: RirTypeId,
+        family: LambdaStorageFamily,
+        cycle_broken: bool,
+        active: &mut BTreeSet<RirTypeId>,
+    ) -> Result<(), LambdaStorageGap> {
+        if !active.insert(ty) {
+            return cycle_broken
+                .then_some(())
+                .ok_or(LambdaStorageGap::UnsupportedType);
+        }
+        let result = match self.ty_opt(ty) {
             Some(
                 RirType::Int
                 | RirType::Float
                 | RirType::Bool
                 | RirType::String
                 | RirType::DataRef(_),
-            ) => true,
-            Some(RirType::List(elem)) => self.stored_payload_supported_inner(elem, true, active),
-            Some(RirType::Map { key, value }) => {
-                self.map_key_supported(key)
-                    && self.stored_payload_supported_inner(value, true, active)
-            }
-            Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
-                self.stored_payload_supported_inner(inner, cycle_broken, active)
-            }
-            Some(RirType::Struct(id)) => {
-                self.program.structs.get(id.index()).is_some_and(|strukt| {
-                    strukt.fields.iter().all(|field| {
-                        self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+            ) => Ok(()),
+            Some(RirType::List(elem)) => self.storage_supported_inner(
+                elem,
+                nested_storage_family(family, LambdaStorageFamily::ListElement),
+                true,
+                active,
+            ),
+            Some(RirType::Map { key, value }) => self
+                .storage_supported_inner(
+                    key,
+                    nested_storage_family(family, LambdaStorageFamily::MapKey),
+                    true,
+                    active,
+                )
+                .and_then(|()| {
+                    self.map_key_supported(key)
+                        .then_some(())
+                        .ok_or(LambdaStorageGap::MapKeyEqualityHash)
+                })
+                .and_then(|()| {
+                    self.storage_supported_inner(
+                        value,
+                        nested_storage_family(family, LambdaStorageFamily::MapValue),
+                        true,
+                        active,
+                    )
+                }),
+            Some(RirType::Option(inner)) => self.storage_supported_inner(
+                inner,
+                nested_storage_family(family, LambdaStorageFamily::OptionalPayload),
+                cycle_broken,
+                active,
+            ),
+            Some(RirType::Array { elem, .. }) => self.storage_supported_inner(
+                elem,
+                nested_storage_family(family, LambdaStorageFamily::FixedArrayElement),
+                cycle_broken,
+                active,
+            ),
+            Some(RirType::Struct(id)) => self
+                .program
+                .structs
+                .get(id.index())
+                .ok_or(LambdaStorageGap::UnsupportedType)
+                .and_then(|strukt| {
+                    strukt.fields.iter().try_for_each(|field| {
+                        self.storage_supported_inner(
+                            field.ty,
+                            nested_storage_family(family, LambdaStorageFamily::StructField),
+                            cycle_broken,
+                            active,
+                        )
                     })
-                })
-            }
-            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
-                tuple.fields.iter().all(|field| {
-                    self.stored_payload_supported_inner(field.ty, cycle_broken, active)
-                })
-            }),
-            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
-                enm.variants.iter().all(|variant| {
-                    variant.fields.iter().all(|field| {
-                        self.stored_payload_supported_inner(field.ty, cycle_broken, active)
+                }),
+            Some(RirType::Tuple(id)) => self
+                .program
+                .tuples
+                .get(id.index())
+                .ok_or(LambdaStorageGap::UnsupportedType)
+                .and_then(|tuple| {
+                    tuple.fields.iter().try_for_each(|field| {
+                        self.storage_supported_inner(
+                            field.ty,
+                            nested_storage_family(family, LambdaStorageFamily::TupleField),
+                            cycle_broken,
+                            active,
+                        )
                     })
-                })
-            }),
-            Some(RirType::Void | RirType::Slice(_) | RirType::Lambda(_)) | None => false,
+                }),
+            Some(RirType::Enum(id)) => self
+                .program
+                .enums
+                .get(id.index())
+                .ok_or(LambdaStorageGap::UnsupportedType)
+                .and_then(|enm| {
+                    enm.variants.iter().try_for_each(|variant| {
+                        variant.fields.iter().try_for_each(|field| {
+                            self.storage_supported_inner(
+                                field.ty,
+                                nested_storage_family(family, LambdaStorageFamily::EnumPayload),
+                                cycle_broken,
+                                active,
+                            )
+                        })
+                    })
+                }),
+            Some(RirType::Lambda(_)) if family.allows_function_payload() => Ok(()),
+            Some(RirType::Lambda(_)) => Err(family.lambda_gap()),
+            Some(RirType::Slice(_)) => Err(LambdaStorageGap::Lifetime),
+            Some(RirType::Void) | None => Err(LambdaStorageGap::UnsupportedType),
         };
         active.remove(&ty);
-        supported
+        result
     }
 
     pub fn borrow_view(self, ty: RirTypeId) -> RustBorrowView {
@@ -1319,7 +1739,7 @@ impl<'a> RustRepPolicy<'a> {
             || self.program.lambdas_for_sig(id).any(|lambda| {
                 lambda.captures.iter().any(|capture| {
                     let edge = self.lambda_capture_layout_edge(lambda, capture);
-                    self.type_cx_dependent_inner(capture.ty, &mut BTreeSet::new(), active)
+                    self.value_type_cx_dependent(capture.ty, active)
                         || edge == LambdaCaptureLayoutEdge::HeapCell
                         || edge == LambdaCaptureLayoutEdge::ScopedPlaceCell
                 })
@@ -1506,16 +1926,22 @@ impl<'a> RustRepPolicy<'a> {
 
     fn escaping_value_ty(self, ty: RirTypeId) -> String {
         match self.ty(ty) {
-            RirType::Lambda(sig) if self.lambda_sig_needs_lifetime(sig) => format!(
-                "{}{}",
-                self.lambda_sig_symbol(sig),
-                self.lambda_sig_ty_generics_with_lifetime(sig, "'static")
-            ),
+            RirType::Lambda(sig) if self.lambda_sig_needs_lifetime(sig) => {
+                self.lambda_sig_storage_ty(sig)
+            }
             _ => self.rust_ty(ty),
         }
     }
 
     pub fn rust_ty(self, ty: RirTypeId) -> String {
+        self.rust_ty_inner(ty, false)
+    }
+
+    pub fn rust_storage_ty(self, ty: RirTypeId) -> String {
+        self.rust_ty_inner(ty, true)
+    }
+
+    fn rust_ty_inner(self, ty: RirTypeId, storage: bool) -> String {
         match self.ty(ty) {
             RirType::Int => "i64".into(),
             RirType::Float => "f64".into(),
@@ -1537,15 +1963,31 @@ impl<'a> RustRepPolicy<'a> {
                 self.program.tuples[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
-            RirType::Array { elem, len } => format!("[{}; {len}]", self.rust_ty(elem)),
-            RirType::List(elem) => target::anv_list_ty(self.rust_ty(elem)),
-            RirType::Map { key, value } => {
-                target::anv_map_ty(self.rust_ty(key), self.rust_ty(value))
+            RirType::Array { elem, len } => {
+                format!("[{}; {len}]", self.rust_ty_inner(elem, storage))
             }
-            RirType::Option(inner) => format!("Option<{}>", self.rust_ty(inner)),
-            RirType::Slice(elem) => target::anv_slice_ty(self.rust_ty(elem)),
+            RirType::List(elem) => target::anv_list_ty(self.rust_ty_inner(elem, storage)),
+            RirType::Map { key, value } => target::anv_map_ty(
+                self.rust_ty_inner(key, storage),
+                self.rust_ty_inner(value, storage),
+            ),
+            RirType::Option(inner) => format!("Option<{}>", self.rust_ty_inner(inner, storage)),
+            RirType::Slice(elem) => target::anv_slice_ty(self.rust_ty_inner(elem, storage)),
+            RirType::Lambda(id) if storage => self.lambda_sig_storage_ty(id),
             RirType::Lambda(id) => self.lambda_sig_ty(id),
         }
+    }
+
+    fn lambda_sig_storage_ty(self, id: RirLambdaSigId) -> String {
+        let generics = match (
+            self.lambda_sig_needs_lifetime(id),
+            self.lambda_sig_needs_ctx_lifetime(id),
+        ) {
+            (true, true) => "<'cx, 'cx>",
+            (true, false) | (false, true) => "<'cx>",
+            (false, false) => "",
+        };
+        format!("{}{generics}", self.lambda_sig_symbol(id))
     }
 
     pub fn dataref_cx_dependent(self, dataref: &RirDataRef) -> bool {
@@ -1622,13 +2064,39 @@ impl<'a> RustRepPolicy<'a> {
             })
     }
 
+    pub(super) fn lambda_trace_action(self, lambda: &RirLambda) -> LambdaTraceAction {
+        if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }) {
+            return LambdaTraceAction::HeapEnv;
+        }
+        let cells = lambda
+            .captures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, capture)| (capture.abi == RirParamAbi::HeapCell).then_some(index))
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            LambdaTraceAction::Noop
+        } else {
+            LambdaTraceAction::HeapCellCaptures(cells)
+        }
+    }
+
     pub fn type_cx_dependent(self, ty: RirTypeId) -> bool {
-        self.type_cx_dependent_inner(ty, &mut BTreeSet::new(), &mut BTreeSet::new())
+        self.type_cx_dependent_inner(ty, true, &mut BTreeSet::new(), &mut BTreeSet::new())
+    }
+
+    fn value_type_cx_dependent(
+        self,
+        ty: RirTypeId,
+        active_sigs: &mut BTreeSet<RirLambdaSigId>,
+    ) -> bool {
+        self.type_cx_dependent_inner(ty, false, &mut BTreeSet::new(), active_sigs)
     }
 
     fn type_cx_dependent_inner(
         self,
         ty: RirTypeId,
+        storage: bool,
         active_tys: &mut BTreeSet<RirTypeId>,
         active_sigs: &mut BTreeSet<RirLambdaSigId>,
     ) -> bool {
@@ -1640,23 +2108,24 @@ impl<'a> RustRepPolicy<'a> {
                 true
             }
             RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.type_cx_dependent_inner(inner, active_tys, active_sigs)
+                self.type_cx_dependent_inner(inner, storage, active_tys, active_sigs)
             }
-            RirType::Lambda(sig) => self.lambda_sig_needs_ctx_lifetime_inner(sig, active_sigs),
-            RirType::Struct(id) => self.program.structs[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)),
-            RirType::Tuple(id) => self.program.tuples[id.index()]
-                .fields
-                .iter()
-                .any(|field| self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)),
+            RirType::Lambda(sig) => {
+                (storage && self.lambda_sig_needs_lifetime(sig))
+                    || self.lambda_sig_needs_ctx_lifetime_inner(sig, active_sigs)
+            }
+            RirType::Struct(id) => self.program.structs[id.index()].fields.iter().any(|field| {
+                self.type_cx_dependent_inner(field.ty, storage, active_tys, active_sigs)
+            }),
+            RirType::Tuple(id) => self.program.tuples[id.index()].fields.iter().any(|field| {
+                self.type_cx_dependent_inner(field.ty, storage, active_tys, active_sigs)
+            }),
             RirType::Enum(id) => self.program.enums[id.index()]
                 .variants
                 .iter()
                 .any(|variant| {
                     variant.fields.iter().any(|field| {
-                        self.type_cx_dependent_inner(field.ty, active_tys, active_sigs)
+                        self.type_cx_dependent_inner(field.ty, storage, active_tys, active_sigs)
                     })
                 }),
             RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void => {
@@ -1884,6 +2353,11 @@ impl RustTracePlan {
                 _ => {}
             }
         }
+        for global in &program.globals {
+            if policy.type_owns_heap_edges(global.ty) {
+                plan.mark_type(program, global.ty);
+            }
+        }
         plan
     }
 
@@ -1904,6 +2378,7 @@ impl RustTracePlan {
     }
 
     fn mark_type(&mut self, program: &RirProgram, ty: RirTypeId) {
+        let policy = RustRepPolicy::new(program);
         if !self.visited.insert(ty) {
             return;
         }
@@ -1940,9 +2415,10 @@ impl RustTracePlan {
                 self.mark_type(program, key);
                 self.mark_type(program, value);
             }
-            RirType::Lambda(id) => {
+            RirType::Lambda(id) if policy.lambda_sig_owns_heap_edges(id) => {
                 self.lambda_sigs.insert(id);
             }
+            RirType::Lambda(_) => {}
             RirType::Int
             | RirType::Float
             | RirType::Bool
@@ -1961,7 +2437,8 @@ mod tests {
     };
 
     use super::{
-        AirRustRepPolicy, RustBorrowView, RustMaterialization, RustRepPolicy, RustTracePlan,
+        AirRustRepPolicy, LambdaStorageFamily, LambdaStorageGap, RustBorrowView, RustMaterialGap,
+        RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy, RustTracePlan,
         RustValueRep,
     };
     use crate::rust::rir::{
@@ -2130,7 +2607,23 @@ mod tests {
         assert!(!policy.stored_payload_supported(slice));
         assert!(!policy.stored_payload_supported(function));
         assert!(!policy.stored_payload_supported(slice_tuple));
-        assert!(!policy.stored_payload_supported(function_tuple));
+        assert!(policy.stored_payload_supported(function_tuple));
+        assert_eq!(
+            policy.storage_supported(function, LambdaStorageFamily::StructField),
+            Ok(())
+        );
+        assert_eq!(
+            policy.storage_supported(function_tuple, LambdaStorageFamily::MapKey),
+            Err(LambdaStorageGap::MapKeyEqualityHash)
+        );
+        assert_eq!(
+            policy.storage_supported(function_tuple, LambdaStorageFamily::MapValue),
+            Ok(())
+        );
+        assert_eq!(
+            policy.storage_supported(function_tuple, LambdaStorageFamily::GlobalRoot),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2403,6 +2896,45 @@ mod tests {
             }],
             copyable: false,
         });
+        let lambda_enum = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+        program.enums.push(RirEnum {
+            id: RirEnumId::from_index(0),
+            air_id: None,
+            core: None,
+            repr: RirEnumRepr::Adt,
+            raw_type: None,
+            symbol: RirSymbol::new("LambdaEnum"),
+            display: RirSymbol::new("LambdaEnum"),
+            copyable: false,
+            variants: vec![RirVariant {
+                id: RirVariantId::from_index(0),
+                symbol: RirSymbol::new("Payload"),
+                display: RirSymbol::new("Payload"),
+                kind: RirVariantKind::Tuple,
+                raw_value: None,
+                fields: vec![RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("_0"),
+                    ty: lambda,
+                }],
+            }],
+        });
+        let lambda_key_map = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Map {
+            key: lambda_tuple,
+            value: int,
+        });
+        let lambda_value_map = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Map {
+            key: int,
+            value: lambda_tuple,
+        });
+        let nested_lambda_key_map_value = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Map {
+            key: int,
+            value: lambda_key_map,
+        });
         let policy = RustRepPolicy::new(&program);
 
         assert_eq!(policy.materialization(int), RustMaterialization::Copy);
@@ -2429,13 +2961,63 @@ mod tests {
         );
         assert_eq!(
             policy.materialization(lambda_tuple),
-            RustMaterialization::Gap
+            RustMaterialization::Share
         );
         assert!(policy.stored_payload_supported(list));
         assert!(policy.stored_payload_supported(map));
         assert!(policy.stored_payload_supported(node));
         assert!(!policy.stored_payload_supported(slice));
         assert!(!policy.stored_payload_supported(lambda));
+        assert_eq!(
+            policy.storage_supported(lambda, LambdaStorageFamily::StructField),
+            Ok(())
+        );
+        assert_eq!(
+            policy.storage_supported(lambda_tuple, LambdaStorageFamily::MapKey),
+            Err(LambdaStorageGap::MapKeyEqualityHash)
+        );
+        assert_eq!(
+            policy.storage_supported(lambda_enum, LambdaStorageFamily::MapKey),
+            Err(LambdaStorageGap::MapKeyEqualityHash)
+        );
+        assert_eq!(
+            policy.storage_supported(lambda_tuple, LambdaStorageFamily::MapValue),
+            Ok(())
+        );
+        assert_eq!(
+            policy.storage_supported(nested_lambda_key_map_value, LambdaStorageFamily::MapValue),
+            Err(LambdaStorageGap::MapKeyEqualityHash)
+        );
+        assert_eq!(
+            policy
+                .materialization_plan_for(
+                    lambda_tuple,
+                    RustMaterialSource::ExactGlobalRoot,
+                    RustMaterialIntent::Read,
+                )
+                .gap,
+            None
+        );
+        assert_eq!(
+            policy
+                .materialization_plan_for(
+                    lambda_key_map,
+                    RustMaterialSource::ExactGlobalRoot,
+                    RustMaterialIntent::Read,
+                )
+                .gap,
+            Some(RustMaterialGap::UnsupportedType)
+        );
+        assert_eq!(
+            policy
+                .materialization_plan_for(
+                    lambda_value_map,
+                    RustMaterialSource::ExactGlobalRoot,
+                    RustMaterialIntent::Read,
+                )
+                .gap,
+            None
+        );
     }
 
     #[test]
@@ -2536,17 +3118,14 @@ mod tests {
         let shape = policy.lambda_sig_storage_shape(sig_a);
         assert!(shape.heap_env);
         assert!(shape.lifetime);
-        assert_eq!(
-            policy.callable_ret_ty(lambda_a_ty),
-            "LambdaSig0<'static, 'cx>"
-        );
+        assert_eq!(policy.callable_ret_ty(lambda_a_ty), "LambdaSig0<'cx, 'cx>");
         assert_eq!(
             policy.callable_param_ty(lambda_a_ty, RirParamAbi::Value, RirParamEscape::NonEscaping),
             "LambdaSig0<'_, 'cx>"
         );
         assert_eq!(
             policy.callable_param_ty(lambda_a_ty, RirParamAbi::Value, RirParamEscape::Escaping),
-            "LambdaSig0<'static, 'cx>"
+            "LambdaSig0<'cx, 'cx>"
         );
         let lambda_field = RirLambdaEnvField {
             ty: lambda_a_ty,
@@ -2562,7 +3141,7 @@ mod tests {
         };
         assert_eq!(
             policy.lambda_env_field_ty(&lambda_field),
-            "LambdaSig0<'static, 'cx>"
+            "LambdaSig0<'cx, 'cx>"
         );
         assert!(policy.lambda_env_field_storage_supported(&lambda_field));
         assert!(policy.lambda_env_field_storage_supported(&lambda_cell_field));

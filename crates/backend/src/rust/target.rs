@@ -301,6 +301,10 @@ pub(super) fn trace_driver_ty() -> String {
     rt_path("TraceDriver")
 }
 
+pub(super) fn ctx_roots_ty() -> String {
+    rt_path("CtxRoots")
+}
+
 pub(super) fn visitor_ty(driver: &str) -> String {
     format!("{}<'cx, '_, {driver}>", rt_path("Visitor"))
 }
@@ -320,6 +324,18 @@ pub(super) fn trace_crate_attr(cx_dependent: bool) -> String {
     } else {
         format!("#[trace(crate = {RT})]")
     }
+}
+
+pub(super) fn trace_impl_header(impl_generics: &str, ty: &str) -> String {
+    format!("unsafe impl{impl_generics} {}<'cx> for {ty}", trace_ty())
+}
+
+pub(super) fn trace_fn_header() -> String {
+    format!(
+        "fn trace<D: {}<'cx>>(&self, visitor: &mut {})",
+        trace_driver_ty(),
+        visitor_ty("D")
+    )
 }
 
 pub(super) fn anv_string_from(expr: &str) -> String {
@@ -711,6 +727,10 @@ pub(super) fn runtime_ctx_new(heap: &str) -> String {
     format!("{}::new({heap})", rt_path("Ctx"))
 }
 
+pub(super) fn runtime_ctx_new_with_roots(heap: &str, roots: &str) -> String {
+    format!("{}::new_with_roots({heap}, {roots})", rt_path("Ctx"))
+}
+
 #[cfg(test)]
 pub(super) fn checked_index(index: &str, len: &str) -> String {
     format!("{}({index}, {len})", rt_path("checked_index"))
@@ -734,7 +754,7 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
-        checked_range, dataref_place_heap_type_access, dataref_place_heap_type_field,
+        checked_range, ctx_roots_ty, dataref_place_heap_type_access, dataref_place_heap_type_field,
         dataref_place_ops_ty, erased_handle_ty, generated_call, global_begin_projected_loan,
         global_set_or_replace_collection, heap_access_error, heap_register, heap_scope,
         heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
@@ -744,9 +764,9 @@ mod tests {
         mut_place_ty, optional_payload_ops_ctor, optional_payload_ops_ty, projection_ops_ty,
         result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
         rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
-        runtime_ctx_ty_with, runtime_param_name, scoped_mut_place_cell_new,
-        scoped_mut_place_cell_ty, stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr,
-        trace_derive, visitor_ty,
+        runtime_ctx_new_with_roots, runtime_ctx_ty_with, runtime_param_name,
+        scoped_mut_place_cell_new, scoped_mut_place_cell_ty, stack_lambda_cell_ctor,
+        stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
 
     #[test]
@@ -822,6 +842,7 @@ mod tests {
             anv_map_from_entries("rt", "types.map_storage1", "(k, v)"),
             "anvyx_runtime::AnvMap::from_entries(rt, types.map_storage1, [(k, v)])"
         );
+        assert_eq!(ctx_roots_ty(), "anvyx_runtime::CtxRoots");
         assert_eq!(visitor_ty("D"), "anvyx_runtime::Visitor<'cx, '_, D>");
         assert_eq!(
             generated_call("f", ["x".to_string()]),
@@ -944,5 +965,9 @@ mod tests {
         assert_eq!(mut_place_get_copy("place", "rt"), "place.get_copy(rt)?");
         assert_eq!(heap_scope(), "anvyx_runtime::Heap::scope");
         assert_eq!(runtime_ctx_new("heap"), "anvyx_runtime::Ctx::new(heap)");
+        assert_eq!(
+            runtime_ctx_new_with_roots("heap", "roots"),
+            "anvyx_runtime::Ctx::new_with_roots(heap, roots)"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use anvyx_frontend::air::{
     AirBlock, AirStmt, AirTail, CallArg, Callee, ExternId, FunctionId, FunctionKind, GlobalId,
     LambdaCaptureArg, Operand, ParamMode, Place, PlaceRoot, Program, RValue, TypeData, TypeId,
-    TypePassClass, TypePassClasses, VerifiedProgram,
+    TypePassClass, TypePassClasses, VariantShape, VerifiedProgram,
 };
 
 use super::vir::{VirCall, VirExtern, VirFunction, VirParam, VirProgram};
@@ -375,6 +375,33 @@ impl CompileCx<'_> {
                 self.type_contains_function(*key) || self.type_contains_function(*value)
             }
             TypeData::Tuple(elems) => elems.iter().any(|elem| self.type_contains_function(*elem)),
+            TypeData::Aggregate(id) | TypeData::DataRef(id) => self
+                .program
+                .aggregate(*id)
+                .fields
+                .iter()
+                .any(|field| self.type_contains_function(field.ty)),
+            TypeData::Enum(id) => {
+                self.program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .any(|variant| match &variant.shape {
+                        VariantShape::Unit => false,
+                        VariantShape::Tuple(fields) => fields
+                            .iter()
+                            .any(|field| self.type_contains_function(*field)),
+                        VariantShape::Struct(fields) => fields
+                            .iter()
+                            .any(|field| self.type_contains_function(field.ty)),
+                    })
+            }
+            TypeData::Extern(id) => self
+                .program
+                .extern_type(*id)
+                .fields
+                .iter()
+                .any(|field| self.type_contains_function(field.ty)),
             _ => false,
         }
     }

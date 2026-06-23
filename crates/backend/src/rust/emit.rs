@@ -2,7 +2,7 @@ use super::{
     analysis,
     dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
     place::RustPlaces,
-    rep_policy::{RustRepPolicy, RustTracePlan},
+    rep_policy::{LambdaTraceAction, RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirDataRefId,
@@ -157,11 +157,14 @@ impl EmitCx<'_> {
         heap_types.extend(self.program.collection_storages.iter().map(|storage| {
             let (storage_ty, register) = match storage.kind {
                 RirCollectionStorageKind::List { elem_ty } => (
-                    target::list_storage_ty(policy.rust_ty(elem_ty)),
+                    target::list_storage_ty(policy.rust_storage_ty(elem_ty)),
                     target::heap_register(policy.list_storage_tracked(elem_ty)),
                 ),
                 RirCollectionStorageKind::Map { key_ty, value_ty } => (
-                    target::map_storage_ty(policy.rust_ty(key_ty), policy.rust_ty(value_ty)),
+                    target::map_storage_ty(
+                        policy.rust_storage_ty(key_ty),
+                        policy.rust_storage_ty(value_ty),
+                    ),
                     target::heap_register(policy.map_storage_tracked(key_ty, value_ty)),
                 ),
             };
@@ -203,7 +206,7 @@ impl EmitCx<'_> {
         self.w.line(format_args!("struct {globals}<'cx> {{"));
         self.w.push_indent();
         for global in &self.program.globals {
-            let slot_ty = target::global_slot_ty(&self.ty(global.ty));
+            let slot_ty = target::global_slot_ty(&policy.rust_storage_ty(global.ty));
             self.w
                 .line(format_args!("{}: {slot_ty},", global.slot_symbol.as_str()));
         }
@@ -225,6 +228,48 @@ impl EmitCx<'_> {
                 });
             });
         });
+        let traced_globals = self
+            .program
+            .globals
+            .iter()
+            .filter(|global| policy.type_owns_heap_edges(global.ty))
+            .collect::<Vec<_>>();
+        if !traced_globals.is_empty() {
+            let ty = format!("{globals}<'cx>");
+            self.w.block(
+                format_args!("{}", target::trace_impl_header("<'cx>", &ty)),
+                |w| {
+                    w.line(format_args!("{} {{", target::trace_fn_header()));
+                    w.indented(|w| {
+                        for global in &traced_globals {
+                            w.line(format_args!(
+                                "{}::trace(&self.{}, visitor);",
+                                target::trace_ty(),
+                                global.slot_symbol.as_str()
+                            ));
+                        }
+                    });
+                    w.line("}");
+                },
+            );
+            self.w.block(
+                format_args!("impl<'cx> {}<'cx> for {ty}", target::ctx_roots_ty()),
+                |w| {
+                    w.block(
+                        format_args!("fn validate_roots(&self) -> {}", target::result_ty("()")),
+                        |w| {
+                            for global in &traced_globals {
+                                w.line(format_args!(
+                                    "self.{}.validate_trace()?;",
+                                    global.slot_symbol.as_str()
+                                ));
+                            }
+                            w.line("Ok(())");
+                        },
+                    );
+                },
+            );
+        }
         self.w.blank();
     }
 
@@ -242,11 +287,16 @@ impl EmitCx<'_> {
             w.line(format_args!("{}(|heap| {{", target::heap_scope()));
             w.indented(|w| {
                 w.line(format_args!("let types = {types_ty}::register(heap);"));
-                w.line(format_args!(
-                    "let mut rt = {};",
-                    target::runtime_ctx_new("heap")
-                ));
                 w.line(format_args!("let globals = {globals_ty}::new();"));
+                let rt =
+                    if self.program.globals.iter().any(|global| {
+                        RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty)
+                    }) {
+                        target::runtime_ctx_new_with_roots("heap", "&globals")
+                    } else {
+                        target::runtime_ctx_new("heap")
+                    };
+                w.line(format_args!("let mut rt = {rt};"));
                 w.line(format_args!(
                     "let _ = {symbol}(&mut rt, &types, &globals){};",
                     if fallible { "?" } else { "" }
@@ -474,10 +524,11 @@ impl EmitCx<'_> {
                 comma(derives.iter().map(|derive| (*derive).to_string()))
             ));
         }
+        let policy = RustRepPolicy::new(self.program);
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
         let fields = fields
             .iter()
-            .map(|field| (field.symbol.as_str(), self.ty(field.ty)))
+            .map(|field| (field.symbol.as_str(), policy.rust_storage_ty(field.ty)))
             .collect::<Vec<_>>();
         self.w
             .block(format_args!("struct {symbol}{lifetime}"), |w| {
@@ -519,14 +570,18 @@ impl EmitCx<'_> {
                     format!("{}{raw},", variant.symbol.as_str())
                 }
                 RirVariantKind::Tuple => {
-                    let fields = comma(variant.fields.iter().map(|field| self.ty(field.ty)));
+                    let fields = comma(
+                        variant
+                            .fields
+                            .iter()
+                            .map(|field| policy.rust_storage_ty(field.ty)),
+                    );
                     format!("{}({fields}),", variant.symbol.as_str())
                 }
                 RirVariantKind::Struct => {
-                    let fields = variant
-                        .fields
-                        .iter()
-                        .map(|field| field_init(field.symbol.as_str(), self.ty(field.ty)));
+                    let fields = variant.fields.iter().map(|field| {
+                        field_init(field.symbol.as_str(), policy.rust_storage_ty(field.ty))
+                    });
                     format!("{},", struct_lit(variant.symbol.as_str(), fields))
                 }
             })
@@ -688,23 +743,10 @@ impl EmitCx<'_> {
         };
         let arity = sig.params.len();
         let program = self.program;
-        let fallible_functions = &self.fallible_functions;
         let lifetime = policy.lambda_sig_impl_generics(sig.id);
 
         let trace = self.trace_plan.needs_lambda_sig_trace(sig.id);
-        if trace {
-            let derives = if policy.lambda_sig_copyable(sig.id) {
-                ["Clone", "Copy"].as_slice()
-            } else if policy.lambda_sig_cloneable(sig.id) {
-                ["Clone"].as_slice()
-            } else {
-                [].as_slice()
-            };
-            self.w.line(target::trace_derive(derives));
-            self.w.line(target::trace_crate_attr(
-                policy.lambda_sig_needs_ctx_lifetime(sig.id),
-            ));
-        } else if policy.lambda_sig_copyable(sig.id) {
+        if policy.lambda_sig_copyable(sig.id) {
             self.w.line("#[derive(Clone, Copy)]");
         } else if policy.lambda_sig_cloneable(sig.id) {
             self.w.line("#[derive(Clone)]");
@@ -740,6 +782,10 @@ impl EmitCx<'_> {
             }
         });
         self.w.blank();
+        if trace {
+            self.emit_lambda_sig_trace_impl(sig.id, &variants);
+        }
+        let fallible_functions = &self.fallible_functions;
         let body_call = |function: &RirFunction, capture_args: Vec<String>| {
             let call = target::generated_call(
                 function.symbol.as_str(),
@@ -832,6 +878,76 @@ impl EmitCx<'_> {
             .functions
             .iter()
             .any(|function| block_uses_scoped_lambda_sig(&function.body, sig))
+    }
+
+    fn emit_lambda_sig_trace_impl(
+        &mut self,
+        sig: RirLambdaSigId,
+        variants: &[(
+            RirLambdaId,
+            super::rir::RirFunctionId,
+            RirLambdaStorage,
+            &[RirLambdaCapture],
+        )],
+    ) {
+        let policy = RustRepPolicy::new(self.program);
+        let symbol = policy.lambda_sig_symbol(sig);
+        let lifetime = policy.lambda_sig_impl_generics(sig);
+        let ty = format!("{symbol}{lifetime}");
+        self.w.block(
+            format_args!("{}", target::trace_impl_header(lifetime, &ty)),
+            |w| {
+                w.line(format_args!("{} {{", target::trace_fn_header()));
+                w.indented(|w| {
+                    w.line("match self {");
+                    w.indented(|w| {
+                        for (lambda, _, storage, captures) in variants {
+                            let variant = lambda_variant(*lambda);
+                            match policy.lambda_trace_action(&self.program.lambdas[lambda.index()])
+                            {
+                                LambdaTraceAction::HeapEnv => {
+                                    debug_assert!(matches!(
+                                        storage,
+                                        RirLambdaStorage::HeapEnv { .. }
+                                    ));
+                                    w.line(format_args!(
+                                        "Self::{variant} {{ env }} => {}::trace(env, visitor),",
+                                        target::trace_ty()
+                                    ));
+                                }
+                                LambdaTraceAction::HeapCellCaptures(cells) => {
+                                    let fields = (0..captures.len())
+                                        .map(|index| format!("c{index}"))
+                                        .collect::<Vec<_>>();
+                                    w.line(format_args!(
+                                        "Self::{variant} {{ {} }} => {{",
+                                        comma(fields)
+                                    ));
+                                    w.indented(|w| {
+                                        for index in cells {
+                                            w.line(format_args!(
+                                                "{}::trace(c{index}, visitor);",
+                                                target::trace_ty()
+                                            ));
+                                        }
+                                    });
+                                    w.line("},");
+                                }
+                                LambdaTraceAction::Noop if captures.is_empty() => {
+                                    w.line(format_args!("Self::{variant} => {{}},"));
+                                }
+                                LambdaTraceAction::Noop => {
+                                    w.line(format_args!("Self::{variant} {{ .. }} => {{}},"));
+                                }
+                            }
+                        }
+                    });
+                    w.line("}");
+                });
+                w.line("}");
+            },
+        );
+        self.w.blank();
     }
 
     fn emit_scoped_lambda_thunk(&mut self, sig: &RirLambdaSig, fallible: bool) {

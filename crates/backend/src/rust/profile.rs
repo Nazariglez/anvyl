@@ -17,7 +17,10 @@ use super::{
     place_access::{
         PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
     },
-    rep_policy::{AirRustRepPolicy, RustMaterialIntent, RustMaterialSource, RustMaterialization},
+    rep_policy::{
+        AirRustRepPolicy, LambdaStorageFamily, LambdaStorageGap, RustMaterialIntent,
+        RustMaterialSource, RustMaterialization,
+    },
     rir,
 };
 
@@ -134,6 +137,19 @@ fn profile_gap_kind(kind: PlaceAccessGapKind) -> ProfileErrorKind {
     }
 }
 
+fn lambda_storage_gap_kind(gap: LambdaStorageGap) -> ProfileErrorKind {
+    match gap {
+        LambdaStorageGap::MapKeyEqualityHash => ProfileErrorKind::UnsupportedMapKey,
+        LambdaStorageGap::GlobalRooting => ProfileErrorKind::UnsupportedGlobalRooting,
+        LambdaStorageGap::ExternBoundary => ProfileErrorKind::UnsupportedLambdaExternBoundary,
+        LambdaStorageGap::StorageImplementation
+        | LambdaStorageGap::ProvenanceOrigin
+        | LambdaStorageGap::Lifetime
+        | LambdaStorageGap::Trace
+        | LambdaStorageGap::UnsupportedType => ProfileErrorKind::UnsupportedLambdaValue,
+    }
+}
+
 impl ProfileCx<'_> {
     fn check(&mut self) {
         self.check_entry();
@@ -195,10 +211,13 @@ impl ProfileCx<'_> {
     fn aggregate_decl_supported(&self, aggregate: AggregateId) -> bool {
         let decl = self.program.aggregate(aggregate);
         decl.kind == AggregateKind::Struct
-            && decl
-                .fields
-                .iter()
-                .all(|field| self.stored_payload_supported(field.ty))
+            && decl.fields.iter().all(|field| {
+                self.stored_payload_supported(field.ty)
+                    || self
+                        .policy()
+                        .storage_supported(field.ty, LambdaStorageFamily::StructField)
+                        .is_ok()
+            })
     }
 
     fn dataref_decl_supported(&self, aggregate: AggregateId) -> bool {
@@ -1433,14 +1452,30 @@ impl ProfileCx<'_> {
             TypeData::Extern(ext) => {
                 self.reject_function_container(site, ty) || self.extern_type_supported(*ext)
             }
-            TypeData::Array { elem, .. } | TypeData::Slice(elem) => {
+            TypeData::Array { elem, .. } => {
+                if self
+                    .policy()
+                    .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                    .is_err()
+                    && !self.reject_function_container(site, *elem)
+                {
+                    self.check_type_ref(site, *elem);
+                }
+                true
+            }
+            TypeData::Slice(elem) => {
                 if !self.reject_function_container(site, *elem) {
                     self.check_type_ref(site, *elem);
                 }
                 true
             }
             TypeData::List(elem) => {
-                if self.reject_function_container(site, *elem) {
+                if self
+                    .policy()
+                    .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                    .is_err()
+                    && self.reject_function_container(site, *elem)
+                {
                     true
                 } else {
                     self.check_type_ref(site, *elem);
@@ -1448,34 +1483,34 @@ impl ProfileCx<'_> {
                 }
             }
             TypeData::Map { key, value, .. } => {
-                let has_function = self.reject_function_container(site, *key)
-                    | self.reject_function_container(site, *value);
-                if has_function {
-                    true
-                } else {
-                    self.check_type_ref(site, *key);
-                    self.check_type_ref(site, *value);
-                    self.check_map_shape(site, *key, *value)
-                }
+                self.check_type_ref(site, *key);
+                self.check_type_ref(site, *value);
+                self.check_map_shape(site, *key, *value)
             }
             TypeData::Optional(inner) => {
-                if !self.reject_function_container(site, *inner) {
+                if self
+                    .policy()
+                    .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                    .is_err()
+                    && !self.reject_function_container(site, *inner)
+                {
                     self.check_type_ref(site, *inner);
                 }
                 true
             }
             TypeData::Tuple(elems) => {
-                if elems
-                    .iter()
-                    .any(|elem| self.reject_function_container(site, *elem))
-                {
-                    true
-                } else {
+                let supported = self
+                    .policy()
+                    .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+                    .is_ok();
+                if !supported {
                     for elem in elems {
-                        self.check_type_ref(site, *elem);
+                        if !self.reject_function_container(site, *elem) {
+                            self.check_type_ref(site, *elem);
+                        }
                     }
-                    true
                 }
+                true
             }
             TypeData::Function(sig) => {
                 for param in &sig.params {
@@ -1495,23 +1530,51 @@ impl ProfileCx<'_> {
     }
 
     fn check_map_shape(&mut self, site: ProfileSite, key: TypeId, value: TypeId) -> bool {
-        let key_ok = self.policy().map_key_supported(key);
-        let value_ok = self.policy().map_value_supported(value);
-        if !key_ok {
+        let key_gap = self
+            .policy()
+            .contains_function_payload(key)
+            .then(|| {
+                self.policy()
+                    .storage_supported(key, LambdaStorageFamily::MapKey)
+                    .err()
+            })
+            .flatten();
+        let value_gap = self
+            .policy()
+            .contains_function_payload(value)
+            .then(|| {
+                self.policy()
+                    .storage_supported(value, LambdaStorageFamily::MapValue)
+                    .err()
+            })
+            .flatten();
+        let key_ok = key_gap.is_none() && self.policy().map_key_supported(key);
+        let value_ok = value_gap.is_none() && self.policy().map_value_supported(value);
+        if let Some(gap) = key_gap {
+            self.push(site, lambda_storage_gap_kind(gap));
+        } else if !key_ok {
             self.push(site, ProfileErrorKind::UnsupportedMapKey);
         }
-        if !value_ok {
+        if let Some(gap) = value_gap {
+            self.push(site, lambda_storage_gap_kind(gap));
+        } else if !value_ok {
             self.push(site, ProfileErrorKind::UnsupportedMapValue);
         }
         key_ok && value_ok
     }
 
     fn reject_function_container(&mut self, site: ProfileSite, ty: TypeId) -> bool {
-        let contains = self.type_contains_function(ty);
-        if contains {
-            self.push(site, ProfileErrorKind::UnsupportedLambdaValue);
+        match self
+            .policy()
+            .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
+        {
+            Ok(()) => false,
+            Err(gap) if self.policy().contains_function_payload(ty) => {
+                self.push(site, lambda_storage_gap_kind(gap));
+                true
+            }
+            Err(_) => false,
         }
-        contains
     }
 
     fn check_const_ref(&mut self, site: ProfileSite, id: ConstId) {

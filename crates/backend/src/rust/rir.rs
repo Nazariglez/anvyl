@@ -11,7 +11,10 @@ use anvyx_runtime::{
 
 use super::{
     place_access::{CollectionLoanBase, CollectionLoanProjection, collection_loan_step_supported},
-    rep_policy::{RustMaterialIntent, RustMaterialSource, RustMaterialization, RustRepPolicy},
+    rep_policy::{
+        LambdaStorageFamily, RustMaterialIntent, RustMaterialSource, RustMaterialization,
+        RustRepPolicy,
+    },
 };
 
 macro_rules! rir_id {
@@ -2078,19 +2081,47 @@ impl VerifyCx<'_> {
                 RirType::DataRef(id) => self.check_dataref_id(site, *id),
                 RirType::Enum(id) => self.check_enum_id(site, *id),
                 RirType::Tuple(id) => self.check_tuple_id(site, *id),
-                RirType::Array { elem, .. } | RirType::List(elem) | RirType::Slice(elem) => {
+                RirType::Array { elem, .. } => {
+                    self.check_type_id(site, *elem);
+                    self.check_lambda_container_type_family(
+                        site,
+                        *elem,
+                        LambdaStorageFamily::FixedArrayElement,
+                    );
+                }
+                RirType::List(elem) => {
+                    self.check_type_id(site, *elem);
+                    self.check_lambda_container_type_family(
+                        site,
+                        *elem,
+                        LambdaStorageFamily::ListElement,
+                    );
+                }
+                RirType::Slice(elem) => {
                     self.check_type_id(site, *elem);
                     self.check_lambda_container_type(site, *elem);
                 }
                 RirType::Map { key, value } => {
                     self.check_type_id(site, *key);
                     self.check_type_id(site, *value);
-                    self.check_lambda_container_type(site, *key);
-                    self.check_lambda_container_type(site, *value);
+                    self.check_lambda_container_type_family(
+                        site,
+                        *key,
+                        LambdaStorageFamily::MapKey,
+                    );
+                    self.check_lambda_container_type_family(
+                        site,
+                        *value,
+                        LambdaStorageFamily::MapValue,
+                    );
                 }
                 RirType::Option(inner) => {
                     self.check_type_id(site, *inner);
-                    self.check_lambda_container_type(site, *inner);
+                    self.check_lambda_container_type_family(
+                        site,
+                        *inner,
+                        LambdaStorageFamily::OptionalPayload,
+                    );
                 }
                 RirType::Lambda(sig) => self.check_lambda_sig_id(site, *sig),
                 _ => {}
@@ -2184,6 +2215,7 @@ impl VerifyCx<'_> {
             RustMaterialization::Copy
                 | RustMaterialization::Share
                 | RustMaterialization::CloneHandle
+                | RustMaterialization::CloneLambda
         )
     }
 
@@ -2203,76 +2235,43 @@ impl VerifyCx<'_> {
     }
 
     fn check_stored_payload(&mut self, site: RirVerifySite, ty: RirTypeId) {
+        self.check_stored_payload_family(site, ty, LambdaStorageFamily::UnknownOrigin);
+    }
+
+    fn check_stored_payload_family(
+        &mut self,
+        site: RirVerifySite,
+        ty: RirTypeId,
+        family: LambdaStorageFamily,
+    ) {
         self.check_type_id(site, ty);
-        if self.ty(ty).is_some() && !self.stored_payload_supported(ty) {
+        if self.ty(ty).is_none() {
+            return;
+        }
+        let policy = RustRepPolicy::new(self.program);
+        let supported = if policy.contains_function_payload(ty) {
+            policy.storage_supported(ty, family).is_ok()
+        } else {
+            self.stored_payload_supported(ty)
+        };
+        if !supported {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
         }
     }
 
     fn check_lambda_container_type(&mut self, site: RirVerifySite, ty: RirTypeId) {
-        if self.type_contains_lambda(ty) {
+        self.check_lambda_container_type_family(site, ty, LambdaStorageFamily::UnknownOrigin);
+    }
+
+    fn check_lambda_container_type_family(
+        &mut self,
+        site: RirVerifySite,
+        ty: RirTypeId,
+        family: LambdaStorageFamily,
+    ) {
+        let policy = RustRepPolicy::new(self.program);
+        if policy.contains_function_payload(ty) && policy.storage_supported(ty, family).is_err() {
             self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-        }
-    }
-
-    fn type_contains_lambda(&self, ty: RirTypeId) -> bool {
-        self.type_contains_lambda_inner(ty, &mut Vec::new())
-    }
-
-    fn type_contains_lambda_inner(&self, ty: RirTypeId, visited: &mut Vec<RirTypeId>) -> bool {
-        if visited.contains(&ty) {
-            return false;
-        }
-        visited.push(ty);
-        match self.ty(ty) {
-            Some(RirType::Lambda(_)) => true,
-            Some(
-                RirType::Array { elem, .. }
-                | RirType::List(elem)
-                | RirType::Slice(elem)
-                | RirType::Option(elem),
-            ) => self.type_contains_lambda_inner(elem, visited),
-            Some(RirType::Map { key, value }) => {
-                self.type_contains_lambda_inner(key, visited)
-                    || self.type_contains_lambda_inner(value, visited)
-            }
-            Some(RirType::Struct(id)) => {
-                self.program.structs.get(id.index()).is_some_and(|strukt| {
-                    strukt
-                        .fields
-                        .iter()
-                        .any(|field| self.type_contains_lambda_inner(field.ty, visited))
-                })
-            }
-            Some(RirType::DataRef(id)) => {
-                self.program
-                    .datarefs
-                    .get(id.index())
-                    .is_some_and(|dataref| {
-                        dataref
-                            .fields
-                            .iter()
-                            .any(|field| self.type_contains_lambda_inner(field.ty, visited))
-                    })
-            }
-            Some(RirType::Enum(id)) => self.program.enums.get(id.index()).is_some_and(|enm| {
-                enm.variants.iter().any(|variant| {
-                    variant
-                        .fields
-                        .iter()
-                        .any(|field| self.type_contains_lambda_inner(field.ty, visited))
-                })
-            }),
-            Some(RirType::Tuple(id)) => self.program.tuples.get(id.index()).is_some_and(|tuple| {
-                tuple
-                    .fields
-                    .iter()
-                    .any(|field| self.type_contains_lambda_inner(field.ty, visited))
-            }),
-            Some(
-                RirType::Int | RirType::Float | RirType::Bool | RirType::String | RirType::Void,
-            )
-            | None => false,
         }
     }
 
@@ -2875,8 +2874,12 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_stored_payload(site, field.ty);
-                self.check_lambda_container_type(site, field.ty);
+                self.check_stored_payload_family(site, field.ty, LambdaStorageFamily::StructField);
+                self.check_lambda_container_type_family(
+                    site,
+                    field.ty,
+                    LambdaStorageFamily::StructField,
+                );
                 if strukt.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
@@ -3009,8 +3012,12 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_stored_payload(site, field.ty);
-                self.check_lambda_container_type(site, field.ty);
+                self.check_stored_payload_family(site, field.ty, LambdaStorageFamily::TupleField);
+                self.check_lambda_container_type_family(
+                    site,
+                    field.ty,
+                    LambdaStorageFamily::TupleField,
+                );
                 if tuple.copyable && !self.copyable_type(field.ty) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }

@@ -1,0 +1,32 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 1
+
+struct Holder {
+    f: fn() -> int,
+}
+
+fn one() -> int { 1 }
+
+fn apply(var x: int, cb: fn() -> int) {
+    cb();
+}
+
+fn touch(var x: int) {
+    let scoped = || {
+        apply(x, || {
+            x += 1;
+            x
+        });
+    };
+    scoped();
+}
+
+fn main() {
+    var n = 0;
+    touch(n);
+    let holder = Holder { f: one };
+    let f = holder.f;
+    println(f());
+}

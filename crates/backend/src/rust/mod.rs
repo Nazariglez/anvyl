@@ -329,6 +329,12 @@ struct PlanCx<'a> {
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
 }
 
+struct PlannedTypeIds {
+    structs: Vec<(TypeId, RirStructId)>,
+    enums: Vec<(TypeId, RirEnumId)>,
+    tuples: Vec<(TypeId, RirTupleId)>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct KnownLambdaValue {
     lambda: RirLambdaId,
@@ -534,7 +540,7 @@ impl<'a> PlanCx<'a> {
             ctx: RirCtxPlan::default(),
             ..RirProgram::default()
         };
-        self.plan_types(&mut program)?;
+        let type_ids = self.plan_types(&mut program)?;
         Self::plan_collection_storages(&mut program);
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
@@ -547,6 +553,12 @@ impl<'a> PlanCx<'a> {
         self.check_lambda_env_storage_support(&program)?;
         self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
+        self.finalize_copyable_flags(
+            &mut program,
+            &type_ids.structs,
+            &type_ids.enums,
+            &type_ids.tuples,
+        );
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
@@ -581,7 +593,7 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn plan_types(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+    fn plan_types(&mut self, program: &mut RirProgram) -> Result<PlannedTypeIds, RustPlanError> {
         for index in 0..self.air.type_arena.len() {
             self.type_map
                 .insert(TypeId::from_index(index), RirTypeId::from_index(index));
@@ -682,8 +694,18 @@ impl<'a> PlanCx<'a> {
             .iter()
             .map(|(type_id, _, enum_id)| (*type_id, *enum_id))
             .collect::<Vec<_>>();
-        self.finalize_copyable_flags(program, &struct_types, &enum_types, &tuple_types);
-        Ok(())
+        let type_ids = PlannedTypeIds {
+            structs: struct_types,
+            enums: enum_types,
+            tuples: tuple_types,
+        };
+        self.finalize_copyable_flags(
+            program,
+            &type_ids.structs,
+            &type_ids.enums,
+            &type_ids.tuples,
+        );
+        Ok(type_ids)
     }
 
     fn intern_lambda_sig(

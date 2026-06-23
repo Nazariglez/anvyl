@@ -1,0 +1,37 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 4
+// 5
+// 2
+// @match-end
+
+fn one() -> int { 1 }
+
+fn choose(flag: bool, a: (fn() -> int, int), b: (fn() -> int, int)) -> (fn() -> int, int) {
+    if flag { a } else { b }
+}
+
+fn main() {
+    let readonly = 2;
+    var state = 3;
+    let text = "hi";
+    let named = (one, 0);
+    let zero_env = (|| readonly, 0);
+    let heap_env = (|| text.len(), 0);
+    let heap_cell = (|| { state = state + 1; state }, 0);
+    let joined = choose(true, named, zero_env);
+
+    let a = joined.0;
+    let b = zero_env.0;
+    let c = heap_cell.0;
+    let d = heap_env.0;
+    println(a());
+    println(b());
+    println(c());
+    println(c());
+    println(d());
+}

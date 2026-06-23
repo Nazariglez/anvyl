@@ -1,0 +1,22 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn make_counter() -> fn() -> int {
+    var count = 0;
+    || {
+        count = count + 1;
+        count
+    }
+}
+
+lazy let next: fn() -> int = make_counter();
+
+fn main() {
+    println(next());
+    println(next());
+}
