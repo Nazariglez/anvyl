@@ -2,8 +2,9 @@ use anvyx_externs::ReceiverMode;
 
 use super::{
     CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, FunctionValueArgFact,
-    FunctionValueCallFact, FunctionValueKind, GenericArgs, GenericParams, MemberAccessKind,
-    MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker, TypeError, TypeSubst,
+    FunctionValueCallFact, FunctionValueKind, FunctionValueOrigin, GenericArgs, GenericParams,
+    MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker, TypeError,
+    TypeSubst,
     annotation::{AccessPolicyOutput, emit_access_policy},
     body::check_specialized_callable_body,
     check_arg_count, check_arg_range, check_expected_value_expr, check_expr_checked,
@@ -32,7 +33,7 @@ use crate::{
         ArrayLen, CallNode, ConstValue, EscapeMode, ExprId, ExprKind, ExprNode, FieldAccessNode,
         FuncParam, GenericArg, Ident, IndexNode, MethodReceiver, ReturnSpec, TupleIndexNode, Type,
     },
-    collection_effect::CollectionStructuralEffect,
+    collection_effect::{self, CollectionKind, CollectionStructuralEffect},
     externs::catalog::{
         ExternMethodRef, ExternStaticRef, ExternTypeId, FunctionKey, ResolvedExternSignature,
         ResolvedExternTy,
@@ -232,7 +233,7 @@ fn local_value_subject(
     tc.record_function_value_expr(
         expr.node.id,
         &value.checked.ty,
-        FunctionValueKind::LocalOrPlace,
+        FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal),
     );
     Subject::Value(value)
 }
@@ -315,6 +316,7 @@ pub(super) fn check_postfix_chain_place(
     tc.set_type(chain.base.node.id, subject_type(&subject), chain.base.span);
 
     let mut optional_chain = false;
+    let mut last_function_origin = None;
     for (i, step) in chain.steps.iter().enumerate() {
         let is_last_step = i + 1 == chain.steps.len();
         let next_is_call = matches!(chain.steps.get(i + 1), Some(PostfixStep::Call { .. }));
@@ -327,6 +329,7 @@ pub(super) fn check_postfix_chain_place(
                 let field_expected = (is_last_step && !next_is_call)
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
+                let origin = field_function_origin(&subject);
                 let subject = apply_field(
                     &subject,
                     node,
@@ -335,7 +338,9 @@ pub(super) fn check_postfix_chain_place(
                     field_expected.as_ref(),
                     tc,
                 );
-                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                let ty = set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                tc.record_function_value_expr(*id, &ty, FunctionValueKind::Storage(origin));
+                last_function_origin = Some(origin);
                 subject
             }
             PostfixStep::Call { node, id } => {
@@ -346,6 +351,18 @@ pub(super) fn check_postfix_chain_place(
                 let call_expected = is_last_step
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
+                if let Subject::Value(value) = &subject
+                    && !matches!(node.node.func.node.kind, ExprKind::Lambda(_))
+                    && !super::type_ops::type_has_unfinished_facts(&value.checked.ty)
+                {
+                    let origin = last_function_origin
+                        .unwrap_or_else(|| value_function_origin(node.node.func.node.id, value));
+                    tc.record_function_value_expr(
+                        node.node.func.node.id,
+                        &value.checked.ty,
+                        FunctionValueKind::Storage(origin),
+                    );
+                }
                 let value = apply_call(&subject, node, *id, call_expected, tc);
                 let returned_function = matches!(value.checked.ty, Type::Func { .. });
                 let next_subject = if matches!(subject, Subject::Error) {
@@ -355,7 +372,11 @@ pub(super) fn check_postfix_chain_place(
                 };
                 let ty = set_postfix_step_type(*id, &next_subject, optional_chain, node.span, tc);
                 if returned_function {
-                    tc.record_function_value_expr(*id, &ty, FunctionValueKind::EscapingValue);
+                    let origin = FunctionValueOrigin::CallReturn;
+                    if !super::type_ops::type_has_unfinished_facts(&ty) {
+                        tc.record_function_value_expr(*id, &ty, FunctionValueKind::Storage(origin));
+                    }
+                    last_function_origin = Some(origin);
                 }
                 next_subject
             }
@@ -364,13 +385,19 @@ pub(super) fn check_postfix_chain_place(
                     subject = safe_subject(&subject, node.node.target.node.id, node.span, tc);
                     optional_chain = true;
                 }
+                let origin = index_function_origin(&subject);
                 let subject = apply_index(&subject, node, *id, optional_chain, tc);
-                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                let ty = set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                tc.record_function_value_expr(*id, &ty, FunctionValueKind::Storage(origin));
+                last_function_origin = Some(origin);
                 subject
             }
             PostfixStep::TupleIndex { node, id } => {
+                let origin = FunctionValueOrigin::TupleField;
                 let subject = apply_tuple_index(&subject, node, *id, optional_chain, tc);
-                set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                let ty = set_postfix_step_type(*id, &subject, optional_chain, node.span, tc);
+                tc.record_function_value_expr(*id, &ty, FunctionValueKind::Storage(origin));
+                last_function_origin = Some(origin);
                 subject
             }
         };
@@ -441,10 +468,12 @@ pub(super) fn check_postfix_chain_place(
     } else {
         match subject {
             Subject::Value(mut value) => {
+                let origin = last_function_origin
+                    .unwrap_or_else(|| value_function_origin(expr.node.id, &value));
                 tc.record_function_value_expr(
                     expr.node.id,
                     &checked.ty,
-                    FunctionValueKind::LocalOrPlace,
+                    FunctionValueKind::Storage(origin),
                 );
                 value.checked = checked;
                 value
@@ -465,10 +494,51 @@ fn set_postfix_step_type(
 ) -> Type {
     let ty = chain_type(subject, optional_chain, span, tc);
     tc.set_type(id, ty.clone(), span);
-    if matches!(subject, Subject::Value(_)) {
-        tc.record_function_value_expr(id, &ty, FunctionValueKind::LocalOrPlace);
-    }
     ty
+}
+
+fn field_function_origin(subject: &Subject) -> FunctionValueOrigin {
+    let Subject::Value(value) = subject else {
+        return FunctionValueOrigin::UnknownProjection;
+    };
+    if matches!(&value.checked.ty, Type::Nominal(nominal) if nominal.kind == crate::ast::NominalKind::DataRef)
+    {
+        return FunctionValueOrigin::DataRefProjection;
+    }
+    if value.global.is_some() {
+        FunctionValueOrigin::GlobalProjection
+    } else {
+        FunctionValueOrigin::AggregateField
+    }
+}
+
+fn index_function_origin(subject: &Subject) -> FunctionValueOrigin {
+    let Subject::Value(value) = subject else {
+        return FunctionValueOrigin::UnknownProjection;
+    };
+    match &value.checked.ty {
+        Type::Array {
+            len: ArrayLen::Fixed(_),
+            ..
+        } => FunctionValueOrigin::FixedArrayElement,
+        Type::List { .. } => FunctionValueOrigin::ListElement,
+        Type::Map { .. } => FunctionValueOrigin::MapValue,
+        _ => FunctionValueOrigin::UnknownProjection,
+    }
+}
+
+fn value_function_origin(expr_id: ExprId, value: &PlaceValue) -> FunctionValueOrigin {
+    if let Some(global) = &value.global {
+        if global.root_expr_id == expr_id {
+            FunctionValueOrigin::GlobalRoot
+        } else {
+            FunctionValueOrigin::GlobalProjection
+        }
+    } else if value.root_local.is_some() {
+        FunctionValueOrigin::KnownLocal
+    } else {
+        FunctionValueOrigin::UnknownProjection
+    }
 }
 
 fn finish_chain(chain: &PostfixChain, expr: &ExprNode, tc: &mut TypeChecker) -> Type {
@@ -552,7 +622,16 @@ fn safe_subject(subject: &Subject, expr_id: ExprId, span: Span, tc: &mut TypeChe
         return Subject::Value(value.clone());
     }
     let inner = tc.optional_chain_inner_type(&value.checked.ty, span);
-    tc.record_function_value_expr(expr_id, &inner, FunctionValueKind::LocalOrPlace);
+    let origin = tc
+        .semantic_facts
+        .body(&tc.current_body())
+        .and_then(|facts| facts.function_values.get(&expr_id))
+        .and_then(|fact| match fact.kind {
+            FunctionValueKind::Storage(origin) => Some(origin),
+            _ => None,
+        })
+        .unwrap_or(FunctionValueOrigin::UnknownProjection);
+    tc.record_function_value_expr(expr_id, &inner, FunctionValueKind::Storage(origin));
     let mut checked = checked_type(inner, tc);
     checked.contains_extern_any = value.checked.contains_extern_any;
     Subject::Value(PlaceValue::not_place(checked))
@@ -652,6 +731,13 @@ fn apply_index(
     } else {
         PlaceValue::not_place(checked)
     };
+    if let Some(inner) = tc.decls.semantic_option_inner(&value.checked.ty) {
+        tc.record_function_value_expr(
+            id,
+            inner,
+            FunctionValueKind::Storage(index_function_origin(subject)),
+        );
+    }
     if !optional_chain {
         tc.record_expr_place(id, &value);
     }
@@ -2256,6 +2342,7 @@ fn check_callable_call(
         expected,
         tc,
     );
+    record_collection_storage_args(callee, &call.node.args, tc);
     if callee.def.sig.ret.is_infer() {
         let ret = callee.def.sig.ret.with_ty(checked.checked.ty.clone());
         tc.set_type(
@@ -2265,6 +2352,19 @@ fn check_callable_call(
         );
     }
     checked
+}
+
+fn record_collection_storage_args(callee: &CallableRef, args: &[ExprNode], tc: &mut TypeChecker) {
+    let kind = match callee.receiver_ty.as_ref() {
+        Some(Type::List { .. }) => CollectionKind::Sequence,
+        Some(Type::Map { .. }) => CollectionKind::Map,
+        _ => return,
+    };
+    for index in collection_effect::storage_value_arg_indices(kind, callee.def.id.name) {
+        if let Some(arg) = args.get(*index) {
+            tc.record_escaping_use(arg);
+        }
+    }
 }
 
 fn check_callable_call_with_args(
@@ -2819,6 +2919,11 @@ pub(super) fn check_index_access(
 pub(super) fn check_map_key(node: &IndexNode, key: &Type, tc: &mut TypeChecker) -> CheckedType {
     let key_handle = tc.type_handle(key);
     let index = check_value_expr_checked_with_hint(&node.node.index, Some(key_handle.clone()), tc);
+    tc.record_function_value_expr(
+        node.node.index.node.id,
+        key,
+        FunctionValueKind::Storage(FunctionValueOrigin::MapKey),
+    );
     tc.expect_assignable(node.node.index.span, index.handle.clone(), key_handle);
     tc.solve_constraints();
     index

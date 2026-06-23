@@ -3908,7 +3908,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     ty,
                 }
             }
-            FunctionValueKind::EscapingValue | FunctionValueKind::LocalOrPlace => return Ok(None),
+            FunctionValueKind::Storage(_) => return Ok(None),
         };
         Ok(Some(self.emit_typed_temp(ty, value)?))
     }
@@ -9871,7 +9871,7 @@ fn enqueue_function_values(
                     },
                 );
             }
-            FunctionValueKind::EscapingValue | FunctionValueKind::LocalOrPlace => {}
+            FunctionValueKind::Storage(_) => {}
         }
     }
     Ok(())

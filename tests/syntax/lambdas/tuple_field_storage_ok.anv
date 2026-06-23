@@ -1,0 +1,22 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn named() -> int { 1 }
+fn keep(f: escaping fn() -> int) {}
+
+fn choose(flag: bool, a: (fn() -> int, int), b: (fn() -> int, int)) -> (fn() -> int, int) {
+    if flag { a } else { b }
+}
+
+fn main() {
+    let readonly = 2;
+    var state = 3;
+    let a = (named, 10);
+    let b = (|| readonly, 20);
+    let c = (|| state, 30);
+    let d = choose(true, a, b);
+    keep(d.0);
+    let f = c.0;
+    keep(f);
+}

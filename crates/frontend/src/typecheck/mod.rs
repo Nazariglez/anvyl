@@ -2234,7 +2234,7 @@ impl TypeChecker {
         ty: &Type,
         kind: FunctionValueKind,
     ) {
-        if matches!(ty, Type::Func { .. }) {
+        if matches!(ty, Type::Func { .. }) && !type_has_unfinished_facts(ty) {
             self.closure
                 .record_function_value_origin(expr_id, &kind, |id| {
                     matches!(
@@ -2249,6 +2249,16 @@ impl TypeChecker {
                     ty: ty.clone(),
                     kind,
                 },
+            );
+        }
+    }
+
+    pub(super) fn record_call_return_function_value(&mut self, expr: &ExprNode, ty: &Type) {
+        if matches!(expr.node.kind, ExprKind::Call(_)) {
+            self.record_function_value_expr(
+                expr.node.id,
+                ty,
+                FunctionValueKind::Storage(FunctionValueOrigin::CallReturn),
             );
         }
     }
@@ -4001,7 +4011,6 @@ fn checked_from_checked(
 ) -> CheckedType {
     let handle = tc.set_type_from_handle(expr.node.id, expr.span, &checked.handle);
     let ty = tc.handle_type(&handle);
-    tc.record_function_value_expr(expr.node.id, &ty, FunctionValueKind::LocalOrPlace);
     checked.with_handle(ty, handle)
 }
 
@@ -4185,7 +4194,7 @@ fn check_expr_checked_with_hint(
                     tc.record_function_value_expr(
                         expr.node.id,
                         &checked.ty,
-                        FunctionValueKind::LocalOrPlace,
+                        FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal),
                     );
                     checked
                 }
@@ -4227,7 +4236,7 @@ fn check_expr_checked_with_hint(
                             tc.record_function_value_expr(
                                 expr.node.id,
                                 &value.checked.ty,
-                                FunctionValueKind::LocalOrPlace,
+                                FunctionValueKind::Storage(FunctionValueOrigin::GlobalRoot),
                             );
                             value.checked
                         }
@@ -5328,6 +5337,9 @@ fn check_simple_assignment(
     }
     let value = check_expected_value_expr(&assign.node.value, target.checked().handle.clone(), tc);
     let function_value = matches!(value.ty, Type::Func { .. });
+    if function_value {
+        tc.record_call_return_function_value(&assign.node.value, &target.checked().ty);
+    }
     if !target.accepts_extern_any() {
         tc.reject_extern_any_escape(&value, assign.node.value.span);
     }

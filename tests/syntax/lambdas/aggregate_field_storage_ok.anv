@@ -1,0 +1,27 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Holder {
+    f: fn() -> int,
+}
+
+fn named() -> int { 1 }
+
+fn choose(flag: bool, a: Holder, b: Holder) -> Holder {
+    if flag { a } else { b }
+}
+
+fn keep(f: escaping fn() -> int) {}
+
+fn main() {
+    let readonly = 2;
+    var state = 3;
+    let a = Holder { f: named };
+    let b = Holder { f: || readonly };
+    var c = Holder { f: || state };
+    c.f = named;
+    let d = choose(true, a, b);
+    keep(d.f);
+    keep(c.f);
+}

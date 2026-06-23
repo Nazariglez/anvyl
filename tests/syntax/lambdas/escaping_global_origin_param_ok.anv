@@ -1,6 +1,5 @@
 // @mode: check
-// @expect: error
-// @contains: function value with unknown storage origin cannot escape
+// @expect: success
 // @frontend: new
 
 lazy let stored: fn() -> int = || 1;

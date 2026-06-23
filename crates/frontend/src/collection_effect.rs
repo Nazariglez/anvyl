@@ -84,6 +84,13 @@ impl SequenceMethod {
             Self::Push | Self::ForEach => None,
         }
     }
+
+    fn storage_value_arg_indices(self) -> &'static [usize] {
+        match self {
+            Self::Push => &[0],
+            Self::ForEach | Self::Retain | Self::RemoveWhere => &[],
+        }
+    }
 }
 
 impl MapMethod {
@@ -101,6 +108,13 @@ impl MapMethod {
             Self::Retain => Some(false),
             Self::RemoveWhere => Some(true),
             Self::Insert | Self::Remove => None,
+        }
+    }
+
+    fn storage_value_arg_indices(self) -> &'static [usize] {
+        match self {
+            Self::Insert => &[1],
+            Self::Remove | Self::Retain | Self::RemoveWhere => &[],
         }
     }
 }
@@ -145,6 +159,17 @@ pub(crate) fn filter_remove_matches(kind: CollectionKind, name: Ident) -> Option
             classify_sequence_method(name).and_then(SequenceMethod::remove_matches)
         }
         CollectionKind::Map => classify_map_method(name).and_then(MapMethod::remove_matches),
+    }
+}
+
+pub(crate) fn storage_value_arg_indices(kind: CollectionKind, name: Ident) -> &'static [usize] {
+    match kind {
+        CollectionKind::Sequence => {
+            classify_sequence_method(name).map_or(&[], SequenceMethod::storage_value_arg_indices)
+        }
+        CollectionKind::Map => {
+            classify_map_method(name).map_or(&[], MapMethod::storage_value_arg_indices)
+        }
     }
 }
 

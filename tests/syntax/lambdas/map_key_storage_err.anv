@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: type 'fn() -> int' is not keyable and cannot be used as map key
+
+fn one() -> int { 1 }
+
+fn bad() {
+    let xs: [fn() -> int: int] = [one: 1];
+}

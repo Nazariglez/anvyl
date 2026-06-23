@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @skip: blocked on Lambda aggregate function-value storage/provenance
 // @frontend: new
 
 struct Holder {

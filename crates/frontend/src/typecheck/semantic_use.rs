@@ -987,8 +987,23 @@ pub(crate) struct FunctionValueFact {
 pub(crate) enum FunctionValueKind {
     Named(CallableInstanceKey),
     Lambda { lambda_expr: ExprId },
-    EscapingValue,
-    LocalOrPlace,
+    Storage(FunctionValueOrigin),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunctionValueOrigin {
+    KnownLocal,
+    AggregateField,
+    TupleField,
+    FixedArrayElement,
+    ListElement,
+    MapValue,
+    MapKey,
+    GlobalRoot,
+    GlobalProjection,
+    DataRefProjection,
+    CallReturn,
+    UnknownProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

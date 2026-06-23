@@ -6,9 +6,9 @@ use std::{
 
 use super::{
     BindingId, BindingMutability, BodyInstanceKey, CaptureAccess, CaptureCellRequirementFact,
-    CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueKind, LambdaBodyKey,
-    LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap, LocalBindingKind,
-    LocalValue, ReturnAccess, ReturnSpec, TypeChecker, TypeError, TypecheckFacts,
+    CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueKind, FunctionValueOrigin,
+    LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap,
+    LocalBindingKind, LocalValue, ReturnAccess, ReturnSpec, TypeChecker, TypeError, TypecheckFacts,
     body::{
         CallableBody, CallableParamBinding, check_callable_body_frame, with_callable_body_scope,
     },
@@ -588,20 +588,31 @@ impl ClosureClassifier {
         mut is_function_source: impl FnMut(SemanticLocalId) -> bool,
     ) {
         match kind {
-            FunctionValueKind::Named(_) => {
+            FunctionValueKind::Named(_)
+            | FunctionValueKind::Storage(
+                FunctionValueOrigin::AggregateField
+                | FunctionValueOrigin::TupleField
+                | FunctionValueOrigin::FixedArrayElement
+                | FunctionValueOrigin::ListElement
+                | FunctionValueOrigin::MapValue
+                | FunctionValueOrigin::GlobalRoot
+                | FunctionValueOrigin::GlobalProjection
+                | FunctionValueOrigin::CallReturn,
+            ) => {
                 self.expr_flows
                     .entry(expr)
                     .or_default()
                     .insert_known_function();
             }
-            FunctionValueKind::EscapingValue => {
-                let mut flow = EscapeFlow::default();
-                flow.insert_known_function();
-                self.expr_flows.insert(expr, flow);
-            }
             FunctionValueKind::Lambda { .. } => {}
-            FunctionValueKind::LocalOrPlace => {
+            FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal) => {
                 self.record_local_or_place_function_origin(expr, &mut is_function_source);
+            }
+            FunctionValueKind::Storage(_) => {
+                self.expr_flows
+                    .entry(expr)
+                    .or_default()
+                    .insert_unknown_function();
             }
         }
     }
@@ -1024,6 +1035,7 @@ impl EscapeFlow {
     }
 
     fn insert_known_function(&mut self) {
+        self.origins.remove(&FlowOrigin::UnknownFunction);
         self.origins.insert(FlowOrigin::KnownFunction);
     }
 

@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Holder {
+    f: fn(),
+}
+
+fn tick() {}
+fn keep(f: escaping fn()) {}
+
+lazy let global_holder: Holder = Holder { f: tick };
+
+fn main() {
+    let array: [fn(); 1] = [tick];
+    let list: [fn()] = [tick];
+    let map: [string: fn()] = ["tick": tick];
+    let holder = Holder { f: tick };
+
+    keep(array[0]);
+    keep(list[0]);
+    keep(map["tick"] ?? tick);
+    keep(holder.f);
+    keep(global_holder.f);
+}

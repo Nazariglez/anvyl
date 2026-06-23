@@ -2,8 +2,8 @@ use super::support::{check, check_named, generic_body};
 use crate::{
     ast::{ArrayLen, ConstValue, EscapeMode, Ident, Type},
     typecheck::{
-        BodyInstanceKey, FunctionValueKind, GenericArgs, LambdaBodyKey, LocalDefKind, LocalUseMode,
-        semantic_use::ConstValueMap,
+        BodyInstanceKey, FunctionValueKind, FunctionValueOrigin, GenericArgs, LambdaBodyKey,
+        LocalDefKind, LocalUseMode, semantic_use::ConstValueMap,
     },
 };
 
@@ -369,6 +369,68 @@ fn enum_variant_and_extern_literals_record_no_default_fields() {
 }
 
 #[test]
+fn function_value_origins_are_specific() {
+    let cases = [
+        (
+            "fn tick() {} fn main() { let f: fn() = tick; f(); }",
+            FunctionValueOrigin::KnownLocal,
+        ),
+        (
+            "struct Holder { f: fn() } fn main(h: Holder) { let f: fn() = h.f; }",
+            FunctionValueOrigin::AggregateField,
+        ),
+        (
+            "fn main(pair: (fn(), int)) { let f: fn() = pair.0; }",
+            FunctionValueOrigin::TupleField,
+        ),
+        (
+            "dataref Holder { f: fn() } fn main(h: Holder) { let f: fn() = h.f; }",
+            FunctionValueOrigin::DataRefProjection,
+        ),
+        (
+            "fn main(xs: [fn(); 2]) { let f: fn() = xs[0]; }",
+            FunctionValueOrigin::FixedArrayElement,
+        ),
+        (
+            "fn main(xs: [fn()]) { let f: fn() = xs[0]; }",
+            FunctionValueOrigin::ListElement,
+        ),
+        (
+            "fn main(xs: [string: fn()]) { xs[\"a\"]?(); }",
+            FunctionValueOrigin::MapValue,
+        ),
+        (
+            "fn main(f: fn()?) { f?(); }",
+            FunctionValueOrigin::UnknownProjection,
+        ),
+        (
+            "fn tick() {} lazy let f: fn() = tick; fn main() { let g: fn() = f; }",
+            FunctionValueOrigin::GlobalRoot,
+        ),
+        (
+            "struct Holder { f: fn() } fn tick() {} lazy let h: Holder = Holder { f: tick }; fn main() { let f: fn() = h.f; }",
+            FunctionValueOrigin::GlobalProjection,
+        ),
+        (
+            "fn tick() {} fn make() -> fn() { tick } fn main() { make()(); }",
+            FunctionValueOrigin::CallReturn,
+        ),
+    ];
+
+    for (source, origin) in cases {
+        let result = check(source).expect(source);
+        let body = result.expect_body(&result.function_body("main"));
+        assert!(
+            body.function_values
+                .values()
+                .any(|fact| fact.kind == FunctionValueKind::Storage(origin)),
+            "missing {origin:?} for {source}; facts: {:?}",
+            body.function_values
+        );
+    }
+}
+
+#[test]
 fn records_named_function_value_and_value_call() {
     let result =
         check("fn tick() {} fn main() { let f: fn() = tick; f(); }").expect("typecheck failed");
@@ -480,7 +542,7 @@ fn immediately_called_returned_function_has_callee_fact() {
     assert!(body.function_values.contains_key(&call.callee));
     assert!(matches!(
         body.function_values[&call.callee].kind,
-        FunctionValueKind::EscapingValue
+        FunctionValueKind::Storage(FunctionValueOrigin::CallReturn)
     ));
     assert!(!body.calls.contains_key(&call.expr));
 }
@@ -510,7 +572,7 @@ fn main(cond: bool) {
             .get(&call.callee)
             .expect("missing callee function-value fact")
             .kind,
-        FunctionValueKind::LocalOrPlace
+        FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal)
     ));
     assert!(!body.calls.contains_key(&call.expr));
 }
