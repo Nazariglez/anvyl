@@ -1,18 +1,19 @@
-use anvyx_runtime::{Ctx, function};
+use anvyx_runtime::{Ctx, RuntimeError, function};
 
 #[function(ctx)]
-pub fn collect_cycles(ctx: &mut Ctx<'_, '_>) {
-    ctx.heap().collect_all();
+pub fn collect_cycles(ctx: &mut Ctx<'_, '_>) -> Result<(), RuntimeError> {
+    ctx.collect_all()?;
+    Ok(())
 }
 
 #[function(ctx)]
 pub fn auto_collect(ctx: &mut Ctx<'_, '_>, enabled: bool) {
-    ctx.heap().set_collection_enabled(enabled);
+    ctx.set_collection_enabled(enabled);
 }
 
 #[function(ctx)]
 pub fn managed_count(ctx: &mut Ctx<'_, '_>) -> i64 {
-    ctx.heap().stats().live as i64
+    ctx.stats().live as i64
 }
 
 anvyx_runtime::builtin_module! {
