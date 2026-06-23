@@ -28,7 +28,7 @@ pub use anvyx_macros::{
 pub use check::{checked_index, checked_index_result, checked_range};
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};
-pub use ctx::Ctx;
+pub use ctx::{Ctx, CtxRoots};
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::{RuntimeError, heap_access_error};
 pub use global_slot::{

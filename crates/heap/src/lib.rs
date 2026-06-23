@@ -41,6 +41,19 @@ mod tests {
         value: i32,
     }
 
+    struct ExternalRoot<'cx> {
+        visits: Rc<Cell<usize>>,
+        handle: Handle<'cx, Node<'cx>>,
+    }
+
+    // SAFETY: `handle` is the only heap edge; `visits` owns none.
+    unsafe impl<'cx> Trace<'cx> for ExternalRoot<'cx> {
+        fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+            self.visits.set(self.visits.get() + 1);
+            visitor.edge(&self.handle);
+        }
+    }
+
     struct CountedNode<'cx> {
         stats: Rc<Cell<usize>>,
         callback: Option<Handle<'cx, CountedCallback<'cx>>>,
@@ -293,6 +306,36 @@ mod tests {
         }
 
         Heap::scope(run);
+    }
+
+    #[test]
+    fn external_trace_root_preserves_cycle_until_dropped() {
+        Heap::scope(|heap| {
+            let ty = heap.register_tracked::<Node<'_>>();
+            let node = heap.alloc(
+                ty,
+                Node {
+                    next: None,
+                    value: 1,
+                },
+            );
+            let next = node.clone();
+            heap.with_mut(&node, |node| node.next = Some(next));
+            let visits = Rc::new(Cell::new(0));
+            let root = ExternalRoot {
+                visits: visits.clone(),
+                handle: node.clone(),
+            };
+            drop(node);
+
+            heap.collect_all_with_roots(&root);
+
+            assert!(visits.get() > 0);
+            assert_eq!(heap.stats().live, 1);
+            drop(root);
+            heap.collect_all();
+            assert_eq!(heap.stats().live, 0);
+        });
     }
 
     #[test]

@@ -864,19 +864,34 @@ impl<'cx> Heap<'cx> {
 
     #[inline]
     pub fn collect(&mut self, cycle_work_hint: usize) -> CollectOutcome {
-        self.collect_impl(Some(cycle_work_hint), true, true)
+        self.collect_impl::<()>(Some(cycle_work_hint), true, true, None)
+    }
+
+    #[inline]
+    pub fn collect_with_roots<T: Trace<'cx>>(
+        &mut self,
+        cycle_work_hint: usize,
+        roots: &T,
+    ) -> CollectOutcome {
+        self.collect_impl(Some(cycle_work_hint), true, true, Some(roots))
     }
 
     #[inline]
     pub fn collect_all(&mut self) -> CollectOutcome {
-        self.collect_impl(None, false, true)
+        self.collect_impl::<()>(None, false, true, None)
     }
 
-    fn collect_impl(
+    #[inline]
+    pub fn collect_all_with_roots<T: Trace<'cx>>(&mut self, roots: &T) -> CollectOutcome {
+        self.collect_impl(None, false, true, Some(roots))
+    }
+
+    fn collect_impl<T: Trace<'cx>>(
         &mut self,
         cycle_work_hint: Option<usize>,
         apply_threshold: bool,
         respect_enabled: bool,
+        external_roots: Option<&T>,
     ) -> CollectOutcome {
         self.state.assert_not_poisoned();
         if respect_enabled && !self.collection.enabled {
@@ -907,7 +922,7 @@ impl<'cx> Heap<'cx> {
         let Some(remaining_work) =
             cycle_work_hint.map(|hint| Self::effective_work_budget(hint, pending))
         else {
-            outcome.cycle_roots = self.collect_all_pending();
+            outcome.cycle_roots = self.collect_all_pending(external_roots);
             outcome.pending_cycles = self.pending_cycle_candidates_internal();
             outcome.collected = self.state.metrics.collected.get() - collected_before;
             outcome.cycle_status = CycleStatus::Complete;
@@ -925,7 +940,7 @@ impl<'cx> Heap<'cx> {
             let root_limit = (remaining_work / ESTIMATED_ROOT_COST).clamp(1, MAX_ROOT_BATCH);
             self.take_suspects_up_to(root_limit);
             if !self.scratch.work_items.is_empty() {
-                let stats = self.collect_suspect_roots(remaining_work);
+                let stats = self.collect_suspect_roots(remaining_work, external_roots);
                 outcome.cycle_roots += stats.roots;
             }
         }
@@ -941,7 +956,7 @@ impl<'cx> Heap<'cx> {
         outcome
     }
 
-    fn collect_all_pending(&mut self) -> usize {
+    fn collect_all_pending<T: Trace<'cx>>(&mut self, external_roots: Option<&T>) -> usize {
         let mut roots = 0;
         loop {
             self.collect_zeroes();
@@ -950,7 +965,7 @@ impl<'cx> Heap<'cx> {
             }
             self.take_suspects_up_to(usize::MAX);
             if !self.scratch.work_items.is_empty() {
-                roots += self.collect_suspect_roots(usize::MAX).roots;
+                roots += self.collect_suspect_roots(usize::MAX, external_roots).roots;
             }
         }
     }
@@ -1006,7 +1021,11 @@ impl<'cx> Heap<'cx> {
             .take_all_into(&mut self.scratch.work_items);
     }
 
-    fn collect_suspect_roots(&mut self, remaining_budget: usize) -> CycleBatchStats {
+    fn collect_suspect_roots<T: Trace<'cx>>(
+        &mut self,
+        remaining_budget: usize,
+        external_roots: Option<&T>,
+    ) -> CycleBatchStats {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let mut stats = self.mark_gray_and_subtract_from_roots();
             self.state
@@ -1022,6 +1041,9 @@ impl<'cx> Heap<'cx> {
                 .stale_roots
                 .set(self.state.metrics.stale_roots.get() + stats.stale_roots);
             if !self.scratch.candidate.is_empty() {
+                if let Some(roots) = external_roots {
+                    self.scan_external_roots(roots, &mut stats);
+                }
                 if stats.candidate_strong_sum != stats.internal_edges {
                     self.scan_live_candidates(&mut stats);
                 }
@@ -1094,9 +1116,27 @@ impl<'cx> Heap<'cx> {
     }
 
     #[inline]
+    fn scan_external_roots<T: Trace<'cx>>(&mut self, roots: &T, stats: &mut CycleBatchStats) {
+        let epoch = self.current_epoch();
+        self.scratch.stack.clear();
+        let mut state = BlackTraceState {
+            scratch: &mut self.scratch,
+            epoch,
+            stats,
+        };
+        let mut visitor = Visitor::<BlackTrace>::new(self.state.heap_id, &mut state);
+        roots.trace(&mut visitor);
+        self.blacken_stack(epoch, stats);
+    }
+
+    #[inline]
     fn scan_black(&mut self, root: ObjPtr<'cx>, epoch: u64, stats: &mut CycleBatchStats) {
         self.scratch.stack.clear();
         self.scratch.stack.push(root);
+        self.blacken_stack(epoch, stats);
+    }
+
+    fn blacken_stack(&mut self, epoch: u64, stats: &mut CycleBatchStats) {
         while let Some(ptr) = self.scratch.stack.pop() {
             let header = ptr.header();
             if !header.is_live()
@@ -1367,7 +1407,7 @@ impl<'cx> Heap<'cx> {
 
     pub fn finalize(&mut self) -> Result<(), LeakReport> {
         self.state.assert_not_poisoned();
-        self.collect_impl(None, false, false);
+        self.collect_impl::<()>(None, false, false, None);
         let report = self.leak_report();
         if report.live == 0 {
             Ok(())

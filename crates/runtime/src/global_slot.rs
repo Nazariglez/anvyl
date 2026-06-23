@@ -5,7 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{RuntimeError, collection::ACTIVE_COLLECTION_LOAN_ERROR};
+use crate::{RuntimeError, Trace, TraceDriver, Visitor, collection::ACTIVE_COLLECTION_LOAN_ERROR};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalSlotState {
@@ -76,6 +76,20 @@ impl<T> std::fmt::Debug for GlobalSlot<T> {
     }
 }
 
+// SAFETY: a ready slot owns exactly one payload and delegates tracing to it once. Non-ready
+// states own no initialized payload. The runtime must only trace globals at safepoints without
+// active global borrows or projected loans.
+unsafe impl<'cx, T: Trace<'cx>> Trace<'cx> for GlobalSlot<T> {
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        self.validate_trace()
+            .expect("global slot traced outside a safepoint");
+        let state = self.state.borrow();
+        if let LazyState::Ready(value) = &*state {
+            value.trace(visitor);
+        }
+    }
+}
+
 impl<T> GlobalSlot<T> {
     pub fn new(name: &'static str) -> Self {
         Self {
@@ -96,6 +110,22 @@ impl<T> GlobalSlot<T> {
             LazyState::Ready(_) => GlobalSlotState::Ready,
             LazyState::Failed(_) => GlobalSlotState::Failed,
         }
+    }
+
+    pub fn validate_trace(&self) -> Result<(), RuntimeError> {
+        if self.projected_loans.get() != 0 {
+            return Err(RuntimeError::new(format!(
+                "cannot collect while global '{}' has an active projected loan",
+                self.name
+            )));
+        }
+        if self.state.try_borrow_mut().is_err() {
+            return Err(RuntimeError::new(format!(
+                "cannot collect while global '{}' has an active borrow",
+                self.name
+            )));
+        }
+        Ok(())
     }
 
     pub fn ensure(
@@ -478,6 +508,32 @@ mod tests {
 
         drop(slot);
         assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn validate_trace_rejects_active_borrow() {
+        let slot = GlobalSlot::<i64>::new("score");
+        let read = slot.read(|| Ok(7)).unwrap();
+
+        let error = slot.validate_trace().unwrap_err();
+
+        assert_eq!(*read, 7);
+        assert!(error.message().contains("active borrow"));
+        assert!(error.message().contains("score"));
+    }
+
+    #[test]
+    fn validate_trace_rejects_projected_loan() {
+        let slot = GlobalSlot::<i64>::new("score");
+        slot.set_without_init(7).unwrap();
+        let loan = slot.begin_projected_loan();
+
+        let error = slot.validate_trace().unwrap_err();
+
+        assert!(error.message().contains("active projected loan"));
+        assert!(error.message().contains("score"));
+        drop(loan);
+        slot.validate_trace().unwrap();
     }
 
     #[test]
