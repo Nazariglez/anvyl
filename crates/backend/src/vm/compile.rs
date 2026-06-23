@@ -1,10 +1,14 @@
+use std::collections::HashSet;
+
 use anvyx_frontend::air::{
     AirBlock, AirStmt, AirTail, CallArg, Callee, ExternId, FunctionId, FunctionKind, GlobalId,
     LambdaCaptureArg, Operand, ParamMode, Place, PlaceRoot, Program, RValue, TypeData, TypeId,
     TypePassClass, TypePassClasses, VariantShape, VerifiedProgram,
 };
 
-use super::vir::{VirCall, VirExtern, VirFunction, VirParam, VirProgram};
+use super::vir::{
+    VirCall, VirCallArg, VirCallTarget, VirExtern, VirFunction, VirParam, VirProgram,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmCompiler;
@@ -58,13 +62,29 @@ struct CompileCx<'a> {
     errors: Vec<VmCompileError>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmPlaceRootStatus {
+    Local,
+    LambdaCapture,
+    LambdaCellCapture,
+    ScopedBorrow,
+    CaptureCell,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmCaptureStatus {
+    NoRuntime,
+    Readonly,
+    ScopedLocal,
+    ScopedBorrow,
+    CaptureCell,
+}
+
 impl CompileCx<'_> {
     fn compile(&mut self) -> VirProgram {
         for index in 0..self.program.globals.len() {
-            self.push_global(
-                GlobalId::from_index(index),
-                VmCompileErrorKind::UnsupportedGlobal,
-            );
+            self.push_global_gap(GlobalId::from_index(index));
         }
         let functions = self
             .program
@@ -77,15 +97,13 @@ impl CompileCx<'_> {
                     FunctionKind::Lambda(_) => {
                         self.push_function(id, VmCompileErrorKind::UnsupportedLambdaValue);
                     }
-                    FunctionKind::GlobalInit(_) => {
-                        self.push_function(id, VmCompileErrorKind::UnsupportedGlobal);
-                    }
+                    FunctionKind::GlobalInit(_) => self.push_global_function_gap(id),
                     FunctionKind::Normal
                     | FunctionKind::Method
                     | FunctionKind::ExtendMethod
                     | FunctionKind::Helper => {}
                 }
-                if self.type_contains_function(function.signature.return_type()) {
+                if self.contains_function_payload(function.signature.return_type()) {
                     self.push_function(id, VmCompileErrorKind::UnsupportedLambdaType);
                 }
                 let params = function
@@ -93,7 +111,7 @@ impl CompileCx<'_> {
                     .params
                     .iter()
                     .map(|param| {
-                        if self.type_contains_function(param.ty) {
+                        if self.contains_function_payload(param.ty) {
                             self.push_function(id, VmCompileErrorKind::UnsupportedLambdaType);
                         }
                         if param.mode == ParamMode::Value && !self.is_cheap(param.ty) {
@@ -106,7 +124,7 @@ impl CompileCx<'_> {
                     })
                     .collect();
                 for local in &function.locals {
-                    if self.type_contains_function(local.ty) {
+                    if self.contains_function_payload(local.ty) {
                         self.push_function(id, VmCompileErrorKind::UnsupportedLambdaType);
                     }
                 }
@@ -128,8 +146,8 @@ impl CompileCx<'_> {
                 let id = ExternId::from_index(index);
                 if decl
                     .call_params()
-                    .any(|param| self.type_contains_function(param.ty))
-                    || self.type_contains_function(decl.return_type)
+                    .any(|param| self.contains_function_payload(param.ty))
+                    || self.contains_function_payload(decl.return_type)
                 {
                     self.push_extern(id, VmCompileErrorKind::UnsupportedLambdaExternBoundary);
                 }
@@ -147,27 +165,16 @@ impl CompileCx<'_> {
         for stmt in &block.stmts {
             match stmt {
                 AirStmt::Init { value, .. } | AirStmt::Eval(value) => {
-                    self.check_rvalue(function, value);
-                    if let Some(call) = self.compile_rvalue_call(function, value) {
-                        calls.push(call);
-                    }
+                    self.inspect_rvalue(function, value, calls);
                 }
                 AirStmt::Assign { dst, value } => {
                     self.check_place(function, dst);
-                    self.check_rvalue(function, value);
-                    if let Some(call) = self.compile_rvalue_call(function, value) {
-                        calls.push(call);
-                    }
+                    self.inspect_rvalue(function, value, calls);
                 }
-                AirStmt::GlobalEnsure { .. } => {
-                    self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
-                }
+                AirStmt::GlobalEnsure { .. } => self.push_global_function_gap(function),
                 AirStmt::GlobalSetRoot { value, .. } | AirStmt::GlobalUpdateRoot { value, .. } => {
-                    self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
-                    self.check_rvalue(function, value);
-                    if let Some(call) = self.compile_rvalue_call(function, value) {
-                        calls.push(call);
-                    }
+                    self.push_global_function_gap(function);
+                    self.inspect_rvalue(function, value, calls);
                 }
                 AirStmt::If(branch) => {
                     self.check_operand(function, &branch.cond);
@@ -178,12 +185,12 @@ impl CompileCx<'_> {
                 }
                 AirStmt::Loop(loop_) => self.check_block(function, &loop_.body, calls),
                 AirStmt::CollectionLoan(loan) => {
-                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.push_collection_gap(function);
                     self.check_place(function, &loan.root);
                     self.check_block(function, &loan.body, calls);
                 }
                 AirStmt::CollectionSlotScope(scope) => {
-                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.push_collection_gap(function);
                     self.check_place(function, &scope.root);
                     self.check_block(function, &scope.body, calls);
                 }
@@ -202,7 +209,7 @@ impl CompileCx<'_> {
                     self.check_block(function, &match_.none_block, calls);
                 }
                 AirStmt::MapEntryMatch(match_) => {
-                    self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+                    self.push_collection_gap(function);
                     self.check_place(function, &match_.map);
                     self.check_operand(function, &match_.key);
                     self.check_block(function, &match_.some_block, calls);
@@ -210,37 +217,35 @@ impl CompileCx<'_> {
                 }
             }
         }
-        if let AirTail::Return(Some(value)) = &block.tail {
-            self.check_operand(function, value);
+        match &block.tail {
+            AirTail::None
+            | AirTail::Return(None)
+            | AirTail::Break(_)
+            | AirTail::Continue(_)
+            | AirTail::Unreachable => {}
+            AirTail::Return(Some(value)) => self.check_operand(function, value),
         }
     }
 
     fn check_operand(&mut self, function: FunctionId, operand: &Operand) {
-        if let Operand::Place(place) = operand {
-            self.check_place(function, place);
+        match operand {
+            Operand::Place(place) => self.check_place(function, place),
+            Operand::Const(_) => {}
         }
     }
 
     fn check_place(&mut self, function: FunctionId, place: &Place) {
-        match place.root {
-            PlaceRoot::CaptureCell(_) => {
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
+        self.push_place_root_gap(function, self.place_root_status(function, place.root));
+    }
+
+    fn inspect_rvalue(&mut self, function: FunctionId, value: &RValue, calls: &mut Vec<VirCall>) {
+        match value {
+            RValue::Call { .. } => {
+                if let Some(call) = self.compile_rvalue_call(function, value) {
+                    calls.push(call);
+                }
             }
-            PlaceRoot::LambdaCapture(_)
-                if self
-                    .program
-                    .capture_cell_root(function, place.root)
-                    .is_some() =>
-            {
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
-            }
-            PlaceRoot::LambdaCapture(_) | PlaceRoot::ScopedBorrow(_) => {
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
-            }
-            PlaceRoot::Global(_) => {
-                self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
-            }
-            PlaceRoot::Local(_) => {}
+            _ => self.check_rvalue(function, value),
         }
     }
 
@@ -261,12 +266,7 @@ impl CompileCx<'_> {
                     self.check_operand(function, field);
                 }
             }
-            RValue::Call { callee, args } => {
-                self.check_callee(function, callee);
-                for arg in args {
-                    self.check_call_arg(function, arg);
-                }
-            }
+            RValue::Call { .. } => {}
             RValue::Len { source } | RValue::ListPop { list: source, .. } => {
                 self.check_place(function, source);
             }
@@ -304,83 +304,163 @@ impl CompileCx<'_> {
         }
     }
 
-    fn check_callee(&mut self, function: FunctionId, callee: &Callee) {
-        if let Callee::Lambda(operand) = callee {
-            self.check_operand(function, operand);
-            self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCall);
-        }
-    }
-
-    fn check_call_arg(&mut self, function: FunctionId, arg: &CallArg) {
-        match arg {
-            CallArg::Value(operand) => self.check_operand(function, operand),
-            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
-                self.check_place(function, place);
-            }
-            CallArg::SharedStringConst(_) => {}
-        }
-    }
-
     fn check_lambda_capture(&mut self, function: FunctionId, capture: &LambdaCaptureArg) {
         match capture {
-            LambdaCaptureArg::ReadonlyLocal { value } => {
-                self.check_operand(function, value);
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
-            }
-            LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
-                self.check_place(function, place);
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCapture);
-            }
-            LambdaCaptureArg::CaptureCell { .. } => {
-                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCell);
-            }
-            LambdaCaptureArg::NoRuntime => {}
+            LambdaCaptureArg::NoRuntime
+            | LambdaCaptureArg::ScopedLocal { .. }
+            | LambdaCaptureArg::ScopedBorrow { .. }
+            | LambdaCaptureArg::CaptureCell { .. } => {}
+            LambdaCaptureArg::ReadonlyLocal { value } => self.check_operand(function, value),
         }
+        self.push_capture_gap(function, self.capture_status(capture));
+    }
+
+    fn place_root_status(&self, function: FunctionId, root: PlaceRoot) -> VmPlaceRootStatus {
+        match root {
+            PlaceRoot::Local(_) => VmPlaceRootStatus::Local,
+            PlaceRoot::LambdaCapture(_) => {
+                if self.program.capture_cell_root(function, root).is_some() {
+                    VmPlaceRootStatus::LambdaCellCapture
+                } else {
+                    VmPlaceRootStatus::LambdaCapture
+                }
+            }
+            PlaceRoot::ScopedBorrow(_) => VmPlaceRootStatus::ScopedBorrow,
+            PlaceRoot::CaptureCell(_) => VmPlaceRootStatus::CaptureCell,
+            PlaceRoot::Global(_) => VmPlaceRootStatus::Global,
+        }
+    }
+
+    fn push_place_root_gap(&mut self, function: FunctionId, status: VmPlaceRootStatus) {
+        let kind = match status {
+            VmPlaceRootStatus::Local => return,
+            VmPlaceRootStatus::LambdaCapture | VmPlaceRootStatus::ScopedBorrow => {
+                VmCompileErrorKind::UnsupportedLambdaCapture
+            }
+            VmPlaceRootStatus::LambdaCellCapture | VmPlaceRootStatus::CaptureCell => {
+                VmCompileErrorKind::UnsupportedLambdaCell
+            }
+            VmPlaceRootStatus::Global => return self.push_global_function_gap(function),
+        };
+        self.push_function(function, kind);
+    }
+
+    fn push_global_function_gap(&mut self, function: FunctionId) {
+        self.push_function(function, VmCompileErrorKind::UnsupportedGlobal);
+    }
+
+    fn push_global_gap(&mut self, global: GlobalId) {
+        self.push_global(global, VmCompileErrorKind::UnsupportedGlobal);
+    }
+
+    fn push_collection_gap(&mut self, function: FunctionId) {
+        self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
+    }
+
+    fn capture_status(&self, capture: &LambdaCaptureArg) -> VmCaptureStatus {
+        match capture {
+            LambdaCaptureArg::NoRuntime => VmCaptureStatus::NoRuntime,
+            LambdaCaptureArg::ReadonlyLocal { .. } => VmCaptureStatus::Readonly,
+            LambdaCaptureArg::ScopedLocal { .. } => VmCaptureStatus::ScopedLocal,
+            LambdaCaptureArg::ScopedBorrow { .. } => VmCaptureStatus::ScopedBorrow,
+            LambdaCaptureArg::CaptureCell { .. } => VmCaptureStatus::CaptureCell,
+        }
+    }
+
+    fn push_capture_gap(&mut self, function: FunctionId, status: VmCaptureStatus) {
+        let kind = match status {
+            VmCaptureStatus::NoRuntime => return,
+            VmCaptureStatus::Readonly
+            | VmCaptureStatus::ScopedLocal
+            | VmCaptureStatus::ScopedBorrow => VmCompileErrorKind::UnsupportedLambdaCapture,
+            VmCaptureStatus::CaptureCell => VmCompileErrorKind::UnsupportedLambdaCell,
+        };
+        self.push_function(function, kind);
     }
 
     fn compile_rvalue_call(&mut self, function: FunctionId, value: &RValue) -> Option<VirCall> {
-        let RValue::Call { callee, args } = value else {
-            return None;
-        };
-        let args = args
-            .iter()
-            .map(|arg| {
-                if let CallArg::Value(operand) = arg
-                    && let Some(ty) = self.program.operand_ty(operand)
-                {
-                    if self.type_contains_function(ty) {
+        match value {
+            RValue::Call { callee, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.compile_call_arg(function, arg))
+                    .collect();
+                let target = self.supported_call_target(function, callee)?;
+                Some(VirCall { target, args })
+            }
+            _ => None,
+        }
+    }
+
+    fn compile_call_arg(&mut self, function: FunctionId, arg: &CallArg) -> VirCallArg {
+        match arg {
+            CallArg::Value(operand) => {
+                self.check_operand(function, operand);
+                if let Some(ty) = self.program.operand_ty(operand) {
+                    if self.contains_function_payload(ty) {
                         self.push_function(function, VmCompileErrorKind::UnsupportedLambdaValue);
                     }
                     if !self.is_cheap(ty) {
                         self.push_function(function, VmCompileErrorKind::NonCheapValueArg);
                     }
                 }
-                arg.clone()
-            })
-            .collect();
-        Some(VirCall {
-            callee: callee.clone(),
-            args,
-        })
+                VirCallArg::Value(operand.clone())
+            }
+            CallArg::SharedBorrow(place) => {
+                self.check_place(function, place);
+                VirCallArg::SharedBorrow(place.clone())
+            }
+            CallArg::SharedStringConst(id) => VirCallArg::SharedStringConst(*id),
+            CallArg::MutBorrow(place) => {
+                self.check_place(function, place);
+                VirCallArg::MutBorrow(place.clone())
+            }
+        }
     }
 
-    fn type_contains_function(&self, ty: TypeId) -> bool {
+    fn supported_call_target(
+        &mut self,
+        function: FunctionId,
+        callee: &Callee,
+    ) -> Option<VirCallTarget> {
+        match callee {
+            Callee::Function(id) => Some(VirCallTarget::Function(*id)),
+            Callee::Extern(id) => Some(VirCallTarget::Extern(*id)),
+            Callee::Lambda(operand) => {
+                self.check_operand(function, operand);
+                self.push_function(function, VmCompileErrorKind::UnsupportedLambdaCall);
+                None
+            }
+        }
+    }
+
+    fn contains_function_payload(&self, ty: TypeId) -> bool {
+        self.contains_function_payload_inner(ty, &mut HashSet::new())
+    }
+
+    fn contains_function_payload_inner(&self, ty: TypeId, visited: &mut HashSet<TypeId>) -> bool {
+        if !visited.insert(ty) {
+            return false;
+        }
         match self.program.type_arena.data(ty) {
             TypeData::Function(_) => true,
             TypeData::Optional(inner)
             | TypeData::Array { elem: inner, .. }
-            | TypeData::Slice(inner) => self.type_contains_function(*inner),
-            TypeData::List(elem) => self.type_contains_function(*elem),
+            | TypeData::Slice(inner)
+            | TypeData::List(inner) => self.contains_function_payload_inner(*inner, visited),
             TypeData::Map { key, value, .. } => {
-                self.type_contains_function(*key) || self.type_contains_function(*value)
+                self.contains_function_payload_inner(*key, visited)
+                    || self.contains_function_payload_inner(*value, visited)
             }
-            TypeData::Tuple(elems) => elems.iter().any(|elem| self.type_contains_function(*elem)),
+            TypeData::Tuple(elems) => elems
+                .iter()
+                .any(|elem| self.contains_function_payload_inner(*elem, visited)),
             TypeData::Aggregate(id) | TypeData::DataRef(id) => self
                 .program
                 .aggregate(*id)
                 .fields
                 .iter()
-                .any(|field| self.type_contains_function(field.ty)),
+                .any(|field| self.contains_function_payload_inner(field.ty, visited)),
             TypeData::Enum(id) => {
                 self.program
                     .enum_decl(*id)
@@ -390,10 +470,10 @@ impl CompileCx<'_> {
                         VariantShape::Unit => false,
                         VariantShape::Tuple(fields) => fields
                             .iter()
-                            .any(|field| self.type_contains_function(*field)),
+                            .any(|field| self.contains_function_payload_inner(*field, visited)),
                         VariantShape::Struct(fields) => fields
                             .iter()
-                            .any(|field| self.type_contains_function(field.ty)),
+                            .any(|field| self.contains_function_payload_inner(field.ty, visited)),
                     })
             }
             TypeData::Extern(id) => self
@@ -401,8 +481,14 @@ impl CompileCx<'_> {
                 .extern_type(*id)
                 .fields
                 .iter()
-                .any(|field| self.type_contains_function(field.ty)),
-            _ => false,
+                .any(|field| self.contains_function_payload_inner(field.ty, visited)),
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::Void
+            | TypeData::Any
+            | TypeData::Dyn(_) => false,
         }
     }
 

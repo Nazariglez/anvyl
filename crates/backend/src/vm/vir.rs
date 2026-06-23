@@ -1,4 +1,6 @@
-use anvyx_frontend::air::{CallArg, Callee, ExternId, FunctionId, LocalId, ParamType, TypeId};
+use anvyx_frontend::air::{
+    ConstId, ExternId, FunctionId, LocalId, Operand, ParamType, Place, TypeId,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirProgram {
@@ -20,10 +22,24 @@ pub struct VirFunction {
     pub calls: Vec<VirCall>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirCallTarget {
+    Function(FunctionId),
+    Extern(ExternId),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VirCallArg {
+    Value(Operand),
+    SharedBorrow(Place),
+    SharedStringConst(ConstId),
+    MutBorrow(Place),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirCall {
-    pub callee: Callee,
-    pub args: Vec<CallArg>,
+    pub target: VirCallTarget,
+    pub args: Vec<VirCallArg>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
