@@ -9,10 +9,10 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    classify_param, classify_return, conversion_tokens, flow_tokens, has_scoped_lambda, param_abi,
-    param_abi_tokens, return_abi_tokens, scoped_lambda_has_visible_borrow, signature_conversion,
-    type_expr_tokens, type_tokens_with_override, type_with_override, validate_callable_signature,
-    validate_ctx_param, validate_mut_place_ctx,
+    callback_wrapper_has_visible_borrow, classify_param, classify_return, conversion_tokens,
+    flow_tokens, has_callback_wrapper, param_abi, param_abi_tokens, param_escape_tokens,
+    return_abi, return_abi_tokens, signature_conversion, type_expr_tokens, type_with_override,
+    validate_callable_signature, validate_ctx_param, validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -125,30 +125,31 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .copied()
         .map(|param| classify_param(param, args.ctx))
         .collect::<syn::Result<Vec<_>>>()?;
-    let scoped_lambda = has_scoped_lambda(&params);
+    let callback_wrapper = has_callback_wrapper(&params);
     if let Some(ctx) = ctx_input {
         validate_mut_place_ctx(&func.sig, ctx, &params, "#[function(ctx)]")?;
-        if scoped_lambda {
+        if callback_wrapper {
             return Err(syn::Error::new_spanned(
                 ctx,
-                "#[function(ctx)] cannot be combined with ScopedLambda parameters",
+                "#[function(ctx)] cannot be combined with callback wrapper parameters",
             ));
         }
     }
-    if scoped_lambda_has_visible_borrow(&params) {
+    if callback_wrapper_has_visible_borrow(&params) {
         return Err(syn::Error::new_spanned(
             &func.sig,
-            "ScopedLambda parameters cannot be combined with borrowed or mutable-place provider parameters",
+            "callback wrapper parameters cannot be combined with borrowed or mutable-place provider parameters",
         ));
     }
     validate_overrides(&args, &params)?;
     let ret = classify_return(&func.sig.output)?;
-    let ret_ty = type_tokens_with_override(
+    let ret_ty = type_with_override(
         &ret.ty,
         args.ret.as_deref(),
         proc_macro2::Span::call_site(),
         "#[function(ret)] override does not match Rust return ABI",
     )?;
+    let ret_ty_tokens = type_expr_tokens(&ret_ty);
     let param_types = params
         .iter()
         .map(|param| {
@@ -171,12 +172,13 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
             let name = &param.name;
             let ty = type_expr_tokens(ty);
             let flow = flow_tokens(param.flow);
+            let escape = param_escape_tokens(param);
             quote! {
                 anvyx_runtime::ExternParam {
                     name: Some(#name.to_string()),
                     ty: #ty,
                     flow: #flow,
-                    escape: anvyx_runtime::CallbackEscape::NonEscaping,
+                    escape: #escape,
                 }
             }
         })
@@ -186,9 +188,9 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .zip(&param_types)
         .map(|(param, ty)| param_abi_tokens(&param_abi(ty, param.flow)))
         .collect::<Vec<_>>();
-    let ret_abi = return_abi_tokens(&ret.abi);
+    let ret_abi = return_abi_tokens(&return_abi(&ret_ty));
     let support = conversion_tokens(signature_conversion(&params, &ret));
-    let wrapper_ctx = if scoped_lambda {
+    let wrapper_ctx = if callback_wrapper {
         quote! { anvyx_runtime::RustWrapperCtx::None }
     } else {
         quote! { anvyx_runtime::RustWrapperCtx::HiddenRuntime }
@@ -200,7 +202,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         quote! { _ctx }
     };
     let native_inputs = visible_inputs.iter();
-    let wrapper_inputs = if scoped_lambda {
+    let wrapper_inputs = if callback_wrapper {
         quote! { #(#native_inputs),* }
     } else {
         quote! { #native_ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#native_inputs),* }
@@ -228,7 +230,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                     doc: #doc,
                     signature: anvyx_runtime::ExternSignature {
                         params: vec![#(#descriptor_params),*],
-                        ret: #ret_ty,
+                        ret: #ret_ty_tokens,
                     },
                     effects: anvyx_runtime::ExternEffects { fallible: #fallible },
                 },

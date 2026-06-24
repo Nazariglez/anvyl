@@ -44,6 +44,7 @@ pub enum CleanType {
 pub struct CleanCallback {
     pub params: Vec<CleanType>,
     pub ret: Box<CleanType>,
+    pub escape: CallbackEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub enum CleanParamAbi {
     Borrow(CleanType),
     MutPlace(CleanType),
     ScopedLambda(CleanCallback),
+    EscapingLambda(CleanCallback),
     Option(Box<CleanParamAbi>),
     List(Box<CleanParamAbi>),
 }
@@ -370,11 +372,11 @@ fn classify_path(path: &TypePath, position: Position) -> syn::Result<(CleanType,
             "qualified boundary types are not supported",
         ));
     }
-    if let Some(callback) = scoped_lambda_type(path)? {
+    if let Some(callback) = callback_wrapper_type(path)? {
         if position != Position::Param {
             return Err(syn::Error::new_spanned(
                 path,
-                "ScopedLambda is only supported in parameter position",
+                "callback wrappers are only supported in parameter position",
             ));
         }
         return Ok((CleanType::Callback(callback), CleanFlow::Value));
@@ -475,70 +477,87 @@ pub fn type_with_override(
     }
 }
 
-pub fn type_tokens_with_override(
-    inferred: &CleanType,
-    override_ty: Option<&str>,
-    span: proc_macro2::Span,
-    mismatch: impl Into<String>,
-) -> syn::Result<TokenStream> {
-    type_with_override(inferred, override_ty, span, mismatch).map(|ty| type_expr_tokens(&ty))
-}
-
 pub fn type_expr_tokens(ty: &CleanType) -> TokenStream {
-    match ty {
-        CleanType::Void => quote! { anvyx_runtime::ExternTypeExpr::Void },
-        CleanType::Bool => quote! { anvyx_runtime::ExternTypeExpr::Bool },
-        CleanType::Int => quote! { anvyx_runtime::ExternTypeExpr::Int },
-        CleanType::Float => quote! { anvyx_runtime::ExternTypeExpr::Float },
-        CleanType::String => quote! { anvyx_runtime::ExternTypeExpr::String },
-        CleanType::Named(name) => named_type_expr_tokens(name),
-        CleanType::Callback(callback) => callback_type_tokens(callback),
-        CleanType::Option(inner) => {
-            let inner = type_expr_tokens(inner);
-            quote! { anvyx_runtime::ExternTypeExpr::Option(Box::new(#inner)) }
-        }
-        CleanType::List(inner) => {
-            let inner = type_expr_tokens(inner);
-            quote! { anvyx_runtime::ExternTypeExpr::List(Box::new(#inner)) }
-        }
-    }
+    extern_type_expr_tokens(&extern_type_expr(ty))
 }
 
 pub fn named_type_expr_tokens(name: &str) -> TokenStream {
-    quote! {
-        anvyx_runtime::ExternTypeExpr::Named {
-            module: None,
-            name: #name.to_string(),
-            args: vec![],
+    extern_type_expr_tokens(&named_type_expr(name))
+}
+
+fn extern_type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
+    match ty {
+        ExternTypeExpr::Void => quote! { anvyx_runtime::ExternTypeExpr::Void },
+        ExternTypeExpr::Bool => quote! { anvyx_runtime::ExternTypeExpr::Bool },
+        ExternTypeExpr::Int => quote! { anvyx_runtime::ExternTypeExpr::Int },
+        ExternTypeExpr::Float => quote! { anvyx_runtime::ExternTypeExpr::Float },
+        ExternTypeExpr::String => quote! { anvyx_runtime::ExternTypeExpr::String },
+        ExternTypeExpr::Any => quote! { anvyx_runtime::ExternTypeExpr::Any },
+        ExternTypeExpr::Named { module, name, args } => {
+            let module = if let Some(module) = module {
+                let segments = module.segments.iter();
+                quote! { Some(anvyx_runtime::ModulePath { segments: vec![#(#segments.to_string()),*] }) }
+            } else {
+                quote! { None }
+            };
+            let args = args.iter().map(extern_type_expr_tokens);
+            quote! {
+                anvyx_runtime::ExternTypeExpr::Named {
+                    module: #module,
+                    name: #name.to_string(),
+                    args: vec![#(#args),*],
+                }
+            }
+        }
+        ExternTypeExpr::Callback(callback) => {
+            let signature = callback_signature_tokens(callback);
+            quote! { anvyx_runtime::ExternTypeExpr::Callback(#signature) }
+        }
+        ExternTypeExpr::Option(inner) => {
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::Option(Box::new(#inner)) }
+        }
+        ExternTypeExpr::List(inner) => {
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::List(Box::new(#inner)) }
+        }
+        ExternTypeExpr::Map(key, value) => {
+            let key = extern_type_expr_tokens(key);
+            let value = extern_type_expr_tokens(value);
+            quote! { anvyx_runtime::ExternTypeExpr::Map(Box::new(#key), Box::new(#value)) }
         }
     }
 }
 
-fn callback_type_tokens(callback: &CleanCallback) -> TokenStream {
-    let signature = callback_signature_tokens(callback);
-    quote! { anvyx_runtime::ExternTypeExpr::Callback(#signature) }
-}
-
-fn callback_signature_tokens(callback: &CleanCallback) -> TokenStream {
-    let params = callback.params.iter().map(|ty| {
-        let ty = type_expr_tokens(ty);
+fn callback_signature_tokens(callback: &ExternCallbackSignature) -> TokenStream {
+    let params = callback.params.iter().map(|param| {
+        let ty = extern_type_expr_tokens(&param.ty);
+        let escape = callback_escape_tokens(param.escape);
         quote! {
             anvyx_runtime::ExternCallbackParam {
                 ty: #ty,
-                escape: anvyx_runtime::CallbackEscape::NonEscaping,
+                escape: #escape,
             }
         }
     });
-    let ret = type_expr_tokens(&callback.ret);
+    let ret = extern_type_expr_tokens(&callback.ret);
+    let escape = callback_escape_tokens(callback.policy.escape);
     quote! {
         anvyx_runtime::ExternCallbackSignature {
             params: vec![#(#params),*],
             ret: Box::new(#ret),
             policy: anvyx_runtime::CallbackPolicy {
-                escape: anvyx_runtime::CallbackEscape::NonEscaping,
+                escape: #escape,
                 thread: anvyx_runtime::CallbackThread::SameThread,
             },
         }
+    }
+}
+
+fn callback_escape_tokens(escape: CallbackEscape) -> TokenStream {
+    match escape {
+        CallbackEscape::NonEscaping => quote! { anvyx_runtime::CallbackEscape::NonEscaping },
+        CallbackEscape::Escaping => quote! { anvyx_runtime::CallbackEscape::Escaping },
     }
 }
 
@@ -547,6 +566,13 @@ pub fn flow_tokens(flow: CleanFlow) -> TokenStream {
         CleanFlow::Value => quote! { anvyx_runtime::ParamFlow::Value },
         CleanFlow::Borrow => quote! { anvyx_runtime::ParamFlow::Borrow },
         CleanFlow::MutBorrow => quote! { anvyx_runtime::ParamFlow::MutBorrow },
+    }
+}
+
+pub fn param_escape_tokens(param: &CleanParam) -> TokenStream {
+    match &param.ty {
+        CleanType::Callback(callback) => callback_escape_tokens(callback.escape),
+        _ => callback_escape_tokens(CallbackEscape::NonEscaping),
     }
 }
 
@@ -565,8 +591,12 @@ pub fn param_abi_tokens(abi: &CleanParamAbi) -> TokenStream {
             quote! { anvyx_runtime::RustParamAbi::MutPlace(#ty) }
         }
         CleanParamAbi::ScopedLambda(callback) => {
-            let callback = callback_signature_tokens(callback);
+            let callback = callback_signature_tokens(&extern_callback_signature(callback));
             quote! { anvyx_runtime::RustParamAbi::ScopedLambda(#callback) }
+        }
+        CleanParamAbi::EscapingLambda(callback) => {
+            let callback = callback_signature_tokens(&extern_callback_signature(callback));
+            quote! { anvyx_runtime::RustParamAbi::EscapingLambda(#callback) }
         }
         CleanParamAbi::Option(inner) => {
             let inner = param_abi_tokens(inner);
@@ -605,7 +635,10 @@ pub fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
             CleanType::Option(inner) => {
                 CleanParamAbi::Option(Box::new(param_abi(inner, CleanFlow::Value)))
             }
-            CleanType::Callback(callback) => CleanParamAbi::ScopedLambda(callback.clone()),
+            CleanType::Callback(callback) => match callback.escape {
+                CallbackEscape::NonEscaping => CleanParamAbi::ScopedLambda(callback.clone()),
+                CallbackEscape::Escaping => CleanParamAbi::EscapingLambda(callback.clone()),
+            },
             CleanType::List(inner) => {
                 CleanParamAbi::List(Box::new(param_abi(inner, CleanFlow::Value)))
             }
@@ -614,7 +647,7 @@ pub fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
     }
 }
 
-fn return_abi(ty: &CleanType) -> CleanReturnAbi {
+pub fn return_abi(ty: &CleanType) -> CleanReturnAbi {
     match ty {
         CleanType::Void => CleanReturnAbi::Void,
         CleanType::Option(inner) => CleanReturnAbi::Option(Box::new(return_abi(inner))),
@@ -634,20 +667,14 @@ pub fn conversion_tokens(conversion: BoundaryConversion) -> TokenStream {
     }
 }
 
-pub fn has_scoped_lambda(params: &[CleanParam]) -> bool {
+pub fn has_callback_wrapper(params: &[CleanParam]) -> bool {
     params
         .iter()
         .any(|param| matches!(param.ty, CleanType::Callback(_)))
 }
 
-pub fn scoped_lambda_has_visible_borrow(params: &[CleanParam]) -> bool {
-    has_scoped_lambda(params)
-        && params.iter().any(|param| {
-            matches!(
-                param.abi,
-                CleanParamAbi::Borrow(_) | CleanParamAbi::MutPlace(_)
-            )
-        })
+pub fn callback_wrapper_has_visible_borrow(params: &[CleanParam]) -> bool {
+    has_callback_wrapper(params) && params.iter().any(|param| param.flow != CleanFlow::Value)
 }
 
 pub fn merge_conversions(
@@ -677,7 +704,7 @@ pub fn signature_conversion(params: &[CleanParam], ret: &CleanReturn) -> Boundar
             .map(|param| param.conversion)
             .chain(std::iter::once(ret.conversion)),
     );
-    if has_scoped_lambda(params) && signature_uses_collection_wrapper(params, ret) {
+    if has_callback_wrapper(params) && signature_uses_collection_wrapper(params, ret) {
         BoundaryConversion::Unsupported
     } else {
         conversion
@@ -797,6 +824,7 @@ fn reserved_named_boundary_type(ident: &Ident) -> bool {
             | "Result"
             | "String"
             | "ScopedLambda"
+            | "EscapingLambda"
             | "MutPlace"
             | "Ctx"
             | "RuntimeError"
@@ -813,59 +841,97 @@ fn path_is(path: &TypePath, segments: &[&str]) -> bool {
             .all(|(actual, expected)| actual.ident == expected)
 }
 
-fn scoped_lambda_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> {
-    if !path_is(path, &["ScopedLambda"]) && !path_is(path, &["anvyx_runtime", "ScopedLambda"]) {
-        return Ok(None);
-    }
+fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> {
+    let escape =
+        if path_is(path, &["ScopedLambda"]) || path_is(path, &["anvyx_runtime", "ScopedLambda"]) {
+            CallbackEscape::NonEscaping
+        } else if path_is(path, &["EscapingLambda"])
+            || path_is(path, &["anvyx_runtime", "EscapingLambda"])
+        {
+            CallbackEscape::Escaping
+        } else {
+            return Ok(None);
+        };
+
     let segment = path.path.segments.last().expect("matched path has segment");
-    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+    let PathArguments::AngleBracketed(generic_args) = &segment.arguments else {
         return Err(syn::Error::new_spanned(
             segment,
-            "ScopedLambda parameters must be `ScopedLambda<'_, '_, Args, Ret>`",
+            callback_wrapper_signature_error(escape),
         ));
     };
-    if args.args.len() != 4 {
-        return Err(syn::Error::new_spanned(
-            args,
-            "ScopedLambda parameters must be `ScopedLambda<'_, '_, Args, Ret>`",
-        ));
-    }
-    let mut args = args.args.iter();
-    for arg in [
-        args.next().expect("checked len"),
-        args.next().expect("checked len"),
-    ] {
-        if !valid_inferred_lifetime(arg) {
-            return Err(syn::Error::new_spanned(
-                arg,
-                "ScopedLambda lifetimes must be `'_`",
-            ));
+    let mut args = generic_args.args.iter();
+    let (args_ty, ret_ty) = match escape {
+        CallbackEscape::NonEscaping => {
+            if generic_args.args.len() != 4 {
+                return Err(syn::Error::new_spanned(
+                    generic_args,
+                    callback_wrapper_signature_error(escape),
+                ));
+            }
+            for arg in [
+                args.next().expect("checked len"),
+                args.next().expect("checked len"),
+            ] {
+                if !valid_inferred_lifetime(arg) {
+                    return Err(syn::Error::new_spanned(
+                        arg,
+                        "ScopedLambda lifetimes must be `'_`",
+                    ));
+                }
+            }
+            (
+                args.next().expect("checked len"),
+                args.next().expect("checked len"),
+            )
         }
-    }
-    let GenericArgument::Type(args_ty) = args.next().expect("checked len") else {
+        CallbackEscape::Escaping => {
+            if generic_args.args.len() != 2 {
+                return Err(syn::Error::new_spanned(
+                    generic_args,
+                    callback_wrapper_signature_error(escape),
+                ));
+            }
+            (
+                args.next().expect("checked len"),
+                args.next().expect("checked len"),
+            )
+        }
+    };
+    let GenericArgument::Type(args_ty) = args_ty else {
         return Err(syn::Error::new_spanned(
             segment,
-            "ScopedLambda args must be a tuple type",
+            "callback wrapper args must be a tuple type",
         ));
     };
     let params = scoped_lambda_params(args_ty)?;
-    let GenericArgument::Type(ret_ty) = args.next().expect("checked len") else {
+    let GenericArgument::Type(ret_ty) = ret_ty else {
         return Err(syn::Error::new_spanned(
             segment,
-            "ScopedLambda return must be a type",
+            "callback wrapper return must be a type",
         ));
     };
     let (ret, flow) = classify_type(ret_ty, Position::WrapperElement)?;
     if flow != CleanFlow::Value || !callback_return_supported(&ret) {
         return Err(syn::Error::new_spanned(
             ret_ty,
-            "unsupported ScopedLambda return type",
+            "unsupported callback wrapper return type",
         ));
     }
     Ok(Some(CleanCallback {
         params,
         ret: Box::new(ret),
+        escape,
     }))
+}
+
+fn callback_wrapper_signature_error(escape: CallbackEscape) -> &'static str {
+    match escape {
+        CallbackEscape::NonEscaping => {
+            "ScopedLambda parameters must be `ScopedLambda<'_, '_, Args, Ret>`"
+        }
+        CallbackEscape::Escaping => "EscapingLambda parameters must be `EscapingLambda<Args, Ret>`",
+    }
 }
 
 fn scoped_lambda_params(ty: &Type) -> syn::Result<Vec<CleanType>> {
@@ -922,7 +988,7 @@ fn extern_callback_signature(callback: &CleanCallback) -> ExternCallbackSignatur
             .collect(),
         ret: Box::new(extern_type_expr(&callback.ret)),
         policy: CallbackPolicy {
-            escape: CallbackEscape::NonEscaping,
+            escape: callback.escape,
             thread: CallbackThread::SameThread,
         },
     }
@@ -1044,6 +1110,7 @@ fn parse_descriptor_callback(input: ParseStream) -> syn::Result<CleanType> {
     Ok(CleanType::Callback(CleanCallback {
         params,
         ret: Box::new(ret),
+        escape: CallbackEscape::NonEscaping,
     }))
 }
 
@@ -1229,6 +1296,7 @@ mod tests {
 
     fn first_param_with_ctx(tokens: TokenStream, has_ctx: bool) -> syn::Result<CleanParam> {
         let func: ItemFn = syn::parse2(quote! { fn f(#tokens) {} }).unwrap();
+        std::hint::black_box(tokens);
         let Some(syn::FnArg::Typed(param)) = func.sig.inputs.first() else {
             unreachable!();
         };
@@ -1236,7 +1304,9 @@ mod tests {
     }
 
     fn ret(output: ReturnType) -> syn::Result<CleanReturn> {
-        classify_return(&output)
+        let ret = classify_return(&output);
+        std::hint::black_box(output);
+        ret
     }
 
     #[test]
@@ -1359,6 +1429,45 @@ mod tests {
     }
 
     #[test]
+    fn callback_wrapper_metadata_sets_escape() {
+        let CleanType::Callback(scoped) =
+            first_param(quote! { f: ScopedLambda<'_, '_, (i64,), ()> })
+                .unwrap()
+                .ty
+        else {
+            panic!("expected callback");
+        };
+        let CleanType::Callback(escaping) =
+            first_param(quote! { f: anvyx_runtime::EscapingLambda<(i64,), ()> })
+                .unwrap()
+                .ty
+        else {
+            panic!("expected callback");
+        };
+
+        assert_eq!(
+            extern_callback_signature(&scoped).policy.escape,
+            CallbackEscape::NonEscaping
+        );
+        assert_eq!(
+            extern_callback_signature(&escaping).policy.escape,
+            CallbackEscape::Escaping
+        );
+        assert_eq!(
+            extern_callback_signature(&escaping).params[0].escape,
+            CallbackEscape::NonEscaping
+        );
+        assert!(matches!(
+            param_abi(&CleanType::Callback(scoped), CleanFlow::Value),
+            CleanParamAbi::ScopedLambda(_)
+        ));
+        assert!(matches!(
+            param_abi(&CleanType::Callback(escaping), CleanFlow::Value),
+            CleanParamAbi::EscapingLambda(_)
+        ));
+    }
+
+    #[test]
     fn scoped_lambda_and_list_wrappers_are_not_mixed() {
         let callback = first_param(quote! { f: ScopedLambda<'_, '_, (i64,), ()> }).unwrap();
         let list = first_param(quote! { xs: Vec<i64> }).unwrap();
@@ -1399,7 +1508,7 @@ mod tests {
             first_param(quote! { f: ScopedLambda<'_, '_, (i64,), String> })
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported ScopedLambda return type")
+                .contains("unsupported callback wrapper return type")
         );
         assert!(
             parse_type_expr("fn(string) -> void")
@@ -1416,6 +1525,7 @@ mod tests {
             CleanType::Callback(CleanCallback {
                 params: vec![CleanType::Int],
                 ret: Box::new(CleanType::Void),
+                escape: CallbackEscape::NonEscaping,
             })
         );
     }
