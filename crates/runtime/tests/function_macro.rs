@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, CallbackEscape, CallbackThread, Ctx, ExternCallbackParam, ExternCallbackSignature,
-    ExternTypeExpr, Heap, MutPlace, ParamFlow, RuntimeError, RustAbiSupport, RustParamAbi,
-    RustWrapperCtx, ScopedLambda, function,
+    AnvyxInline, CallbackEscape, CallbackThread, Ctx, EscapingLambda, ExternCallbackParam,
+    ExternCallbackSignature, ExternTypeExpr, Heap, MutPlace, ParamFlow, RuntimeError,
+    RustAbiSupport, RustParamAbi, RustWrapperCtx, ScopedLambda, function,
 };
 
 /// Adds numbers.
@@ -79,12 +79,21 @@ fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Option<i64>
 
 #[function]
 fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
-    f.call(1)
+    let result = f.call(1);
+    let _ = std::hint::black_box(f);
+    result
 }
 
 #[function(params(f = "fn(int) -> bool"))]
 fn callback_override(f: ScopedLambda<'_, '_, (i64,), bool>) -> Result<(), RuntimeError> {
-    f.call(1).map(|_| ())
+    let result = f.call(1).map(|_| ());
+    let _ = std::hint::black_box(f);
+    result
+}
+
+#[function]
+fn retain_callback(f: EscapingLambda<(i64,), ()>) {
+    drop(f);
 }
 
 #[test]
@@ -225,6 +234,40 @@ fn scoped_lambda_param_infers_callback_descriptor_and_abi() {
     assert_eq!(
         export.rust.abi.params[0],
         RustParamAbi::ScopedLambda(expected)
+    );
+    assert_eq!(
+        export.rust.abi.support,
+        RustAbiSupport::NeedsWrapperConversion
+    );
+    assert_eq!(export.rust.abi.ctx, RustWrapperCtx::None);
+}
+
+#[test]
+fn escaping_lambda_param_infers_escaping_callback_descriptor_and_abi() {
+    let export = __anvyx_export_retain_callback();
+    let expected = ExternCallbackSignature {
+        params: vec![ExternCallbackParam {
+            ty: ExternTypeExpr::Int,
+            escape: CallbackEscape::NonEscaping,
+        }],
+        ret: Box::new(ExternTypeExpr::Void),
+        policy: anvyx_runtime::CallbackPolicy {
+            escape: CallbackEscape::Escaping,
+            thread: CallbackThread::SameThread,
+        },
+    };
+
+    assert_eq!(
+        export.descriptor.signature.params[0].escape,
+        CallbackEscape::Escaping
+    );
+    assert_eq!(
+        export.descriptor.signature.params[0].ty,
+        ExternTypeExpr::Callback(expected.clone())
+    );
+    assert_eq!(
+        export.rust.abi.params[0],
+        RustParamAbi::EscapingLambda(expected)
     );
     assert_eq!(
         export.rust.abi.support,

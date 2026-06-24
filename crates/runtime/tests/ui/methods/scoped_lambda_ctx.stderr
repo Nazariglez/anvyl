@@ -1,4 +1,4 @@
-error: #[anvyx(ctx)] cannot be combined with ScopedLambda parameters
+error: #[anvyx(ctx)] cannot be combined with callback wrapper parameters
   --> tests/ui/methods/scoped_lambda_ctx.rs:8:9
    |
  8 |       pub fn bad<'cx>(

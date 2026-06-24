@@ -7,8 +7,9 @@ pub trait CtxRoots<'cx>: Trace<'cx> {
 }
 
 pub struct Ctx<'cx, 'rt> {
-    heap: &'rt mut Heap<'cx>,
+    heap: NonNull<Heap<'cx>>,
     roots: Option<Roots<'rt, 'cx>>,
+    marker: PhantomData<&'rt ()>,
 }
 
 #[derive(Copy, Clone)]
@@ -22,10 +23,27 @@ struct Roots<'rt, 'cx> {
 
 impl<'cx, 'rt> Ctx<'cx, 'rt> {
     pub fn new(heap: &'rt mut Heap<'cx>) -> Self {
-        Self { heap, roots: None }
+        unsafe { Self::__anvyx_from_raw(NonNull::from(heap)) }
     }
 
     pub fn new_with_roots<T: CtxRoots<'cx>>(heap: &'rt mut Heap<'cx>, roots: &'rt T) -> Self {
+        unsafe { Self::__anvyx_from_raw_with_roots(NonNull::from(heap), roots) }
+    }
+
+    #[doc(hidden)]
+    pub unsafe fn __anvyx_from_raw(heap: NonNull<Heap<'cx>>) -> Self {
+        Self {
+            heap,
+            roots: None,
+            marker: PhantomData,
+        }
+    }
+
+    #[doc(hidden)]
+    pub unsafe fn __anvyx_from_raw_with_roots<T: CtxRoots<'cx>>(
+        heap: NonNull<Heap<'cx>>,
+        roots: &'rt T,
+    ) -> Self {
         Self {
             heap,
             roots: Some(Roots {
@@ -35,24 +53,25 @@ impl<'cx, 'rt> Ctx<'cx, 'rt> {
                 collect_all: collect_all_with_roots::<T>,
                 marker: PhantomData,
             }),
+            marker: PhantomData,
         }
     }
 
     pub fn heap(&mut self) -> &mut Heap<'cx> {
-        self.heap
+        unsafe { self.heap.as_mut() }
     }
 
     pub fn heap_ref(&self) -> &Heap<'cx> {
-        self.heap
+        unsafe { self.heap.as_ref() }
     }
 
     pub fn collect(&mut self, cycle_work_hint: usize) -> Result<CollectOutcome, RuntimeError> {
         match self.roots {
             Some(roots) => unsafe {
                 (roots.validate)(roots.ptr)?;
-                Ok((roots.collect)(self.heap, roots.ptr, cycle_work_hint))
+                Ok((roots.collect)(self.heap(), roots.ptr, cycle_work_hint))
             },
-            None => Ok(self.heap.collect(cycle_work_hint)),
+            None => Ok(self.heap().collect(cycle_work_hint)),
         }
     }
 
@@ -60,18 +79,18 @@ impl<'cx, 'rt> Ctx<'cx, 'rt> {
         match self.roots {
             Some(roots) => unsafe {
                 (roots.validate)(roots.ptr)?;
-                Ok((roots.collect_all)(self.heap, roots.ptr))
+                Ok((roots.collect_all)(self.heap(), roots.ptr))
             },
-            None => Ok(self.heap.collect_all()),
+            None => Ok(self.heap().collect_all()),
         }
     }
 
     pub fn set_collection_enabled(&mut self, enabled: bool) {
-        self.heap.set_collection_enabled(enabled);
+        self.heap().set_collection_enabled(enabled);
     }
 
     pub fn stats(&self) -> HeapStats {
-        self.heap.stats()
+        self.heap_ref().stats()
     }
 }
 

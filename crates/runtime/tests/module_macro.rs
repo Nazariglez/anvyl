@@ -70,7 +70,7 @@ mod package {
     pub mod window {
         use super::{AnvyxInline, function, methods};
 
-        #[derive(Clone, Copy, AnvyxInline)]
+        #[derive(Clone, AnvyxInline)]
         pub struct WindowConfig {
             #[anvyx(field)]
             pub width: i64,

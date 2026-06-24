@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, ExternBindingOp,
+    AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, EscapingLambda, ExternBindingOp,
     ExternMemberSelector, ExternOperator, ExternTypeExpr, Heap, ReceiverMode, RuntimeError,
     RustAbiSupport, RustParamAbi, RustWrapperCtx, ScopedLambda, methods,
 };
@@ -25,7 +25,13 @@ struct CallbackOps;
 #[methods]
 impl CallbackOps {
     pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
-        f.call(1)
+        let result = f.call(1);
+        let _ = std::hint::black_box(f);
+        result
+    }
+
+    pub fn retain(f: EscapingLambda<(i64,), ()>) {
+        drop(f);
     }
 }
 
@@ -45,7 +51,12 @@ impl CtxBox {
 #[test]
 fn scoped_lambda_method_uses_callback_descriptor_and_no_hidden_ctx() {
     let export = __anvyx_methods_callbackops();
-    let method = &export.descriptor.statics[0];
+    let method = export
+        .descriptor
+        .statics
+        .iter()
+        .find(|method| method.name == "each")
+        .unwrap();
     let ExternTypeExpr::Callback(callback) = &method.signature.params[0].ty else {
         panic!("expected callback descriptor");
     };
@@ -55,14 +66,52 @@ fn scoped_lambda_method_uses_callback_descriptor_and_no_hidden_ctx() {
     assert_eq!(*callback.ret, ExternTypeExpr::Void);
     assert_eq!(callback.policy.thread, CallbackThread::SameThread);
     assert_eq!(
-        export.bindings[0].abi.support,
+        export.bindings
+            .iter()
+            .find(|binding| matches!(&binding.selector, ExternMemberSelector::Static(name) if name == "each"))
+            .unwrap()
+            .abi
+            .support,
         RustAbiSupport::NeedsWrapperConversion
     );
-    assert_eq!(export.bindings[0].abi.ctx, RustWrapperCtx::None);
+    let binding = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Static(name) if name == "each"))
+        .unwrap();
+    assert_eq!(binding.abi.ctx, RustWrapperCtx::None);
     assert!(matches!(
-        export.bindings[0].abi.params[0],
+        binding.abi.params[0],
         RustParamAbi::ScopedLambda(_)
     ));
+}
+
+#[test]
+fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
+    let export = __anvyx_methods_callbackops();
+    let method = export
+        .descriptor
+        .statics
+        .iter()
+        .find(|method| method.name == "retain")
+        .unwrap();
+    let ExternTypeExpr::Callback(callback) = &method.signature.params[0].ty else {
+        panic!("expected callback descriptor");
+    };
+    let binding = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Static(name) if name == "retain"))
+        .unwrap();
+
+    assert_eq!(method.signature.params[0].escape, CallbackEscape::Escaping);
+    assert_eq!(callback.policy.escape, CallbackEscape::Escaping);
+    assert!(matches!(
+        binding.abi.params[0],
+        RustParamAbi::EscapingLambda(_)
+    ));
+    assert_eq!(binding.abi.support, RustAbiSupport::NeedsWrapperConversion);
+    assert_eq!(binding.abi.ctx, RustWrapperCtx::None);
 }
 
 #[test]

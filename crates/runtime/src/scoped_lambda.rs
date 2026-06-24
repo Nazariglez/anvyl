@@ -67,7 +67,9 @@ mod tests {
 
     unsafe fn add(state: NonNull<()>, args: (i64, i64)) -> Result<i64, RuntimeError> {
         let base = unsafe { *(state.as_ptr().cast::<i64>()) };
-        Ok(base + args.0 + args.1)
+        base.checked_add(args.0)
+            .and_then(|sum| sum.checked_add(args.1))
+            .ok_or_else(|| RuntimeError::new("callback overflow"))
     }
 
     unsafe fn fail(_: NonNull<()>, _: ()) -> Result<(), RuntimeError> {

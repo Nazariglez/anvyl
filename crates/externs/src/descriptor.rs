@@ -203,6 +203,26 @@ pub struct ExternCallbackParam {
     pub escape: CallbackEscape,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallbackEscapeMismatch {
+    pub param_escape: CallbackEscape,
+    pub policy_escape: CallbackEscape,
+}
+
+pub fn effective_callback_escape(
+    param_escape: CallbackEscape,
+    callback: &ExternCallbackSignature,
+) -> Result<CallbackEscape, CallbackEscapeMismatch> {
+    if callback.policy.escape == param_escape {
+        Ok(param_escape)
+    } else {
+        Err(CallbackEscapeMismatch {
+            param_escape,
+            policy_escape: callback.policy.escape,
+        })
+    }
+}
+
 impl ExternCallbackSignature {
     pub fn scoped_lambda_policy_supported(&self) -> bool {
         self.policy.escape == CallbackEscape::NonEscaping
@@ -239,19 +259,71 @@ impl ExternTypeExpr {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CallbackPolicy {
     pub escape: CallbackEscape,
     pub thread: CallbackThread,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallbackEscape {
+    #[default]
     NonEscaping,
     Escaping,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum CallbackThread {
+    #[default]
     SameThread,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn callback(escape: CallbackEscape) -> ExternCallbackSignature {
+        ExternCallbackSignature {
+            params: vec![],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape,
+                thread: CallbackThread::SameThread,
+            },
+        }
+    }
+
+    #[test]
+    fn effective_escape_accepts_matched_metadata() {
+        for escape in [CallbackEscape::NonEscaping, CallbackEscape::Escaping] {
+            assert_eq!(
+                effective_callback_escape(escape, &callback(escape)),
+                Ok(escape)
+            );
+        }
+    }
+
+    #[test]
+    fn effective_escape_rejects_mismatched_metadata() {
+        assert_eq!(
+            effective_callback_escape(
+                CallbackEscape::Escaping,
+                &callback(CallbackEscape::NonEscaping)
+            ),
+            Err(CallbackEscapeMismatch {
+                param_escape: CallbackEscape::Escaping,
+                policy_escape: CallbackEscape::NonEscaping,
+            })
+        );
+        assert_eq!(
+            effective_callback_escape(
+                CallbackEscape::NonEscaping,
+                &callback(CallbackEscape::Escaping)
+            ),
+            Err(CallbackEscapeMismatch {
+                param_escape: CallbackEscape::NonEscaping,
+                policy_escape: CallbackEscape::Escaping,
+            })
+        );
+    }
 }

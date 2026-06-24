@@ -542,12 +542,25 @@ impl Heap<'_> {
     }
 
     #[inline]
+    pub fn scope_owned<R>(f: impl for<'cx> FnOnce(Heap<'cx>) -> R) -> R {
+        Self::scope_owned_with_config(HeapConfig::default(), f)
+    }
+
+    #[inline]
     pub fn scope_with_config<R>(
         config: HeapConfig,
         f: impl for<'cx> FnOnce(&mut Heap<'cx>) -> R,
     ) -> R {
         let mut heap = Heap::new(config);
         f(&mut heap)
+    }
+
+    #[inline]
+    pub fn scope_owned_with_config<R>(
+        config: HeapConfig,
+        f: impl for<'cx> FnOnce(Heap<'cx>) -> R,
+    ) -> R {
+        f(Heap::new(config))
     }
 }
 

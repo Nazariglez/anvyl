@@ -1,0 +1,115 @@
+error[E0277]: the trait bound `anvyx_runtime::EscapingLambda<(), ()>: Clone` is not satisfied
+ --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:9:20
+  |
+9 |     assert_clone::<EscapingLambda<(), ()>>();
+  |                    ^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `anvyx_runtime::EscapingLambda<(), ()>`
+  |
+note: required by a bound in `assert_clone`
+ --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:3:20
+  |
+3 | fn assert_clone<T: Clone>() {}
+  |                    ^^^^^ required by this bound in `assert_clone`
+
+error[E0277]: the trait bound `anvyx_runtime::EscapingLambda<(), ()>: Copy` is not satisfied
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:10:19
+   |
+10 |     assert_copy::<EscapingLambda<(), ()>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ the trait `Copy` is not implemented for `anvyx_runtime::EscapingLambda<(), ()>`
+   |
+note: required by a bound in `assert_copy`
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:4:19
+   |
+ 4 | fn assert_copy<T: Copy>() {}
+   |                   ^^^^ required by this bound in `assert_copy`
+
+error[E0277]: `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>` cannot be sent between threads safely
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:11:19
+   |
+11 |     assert_send::<EscapingLambda<(), ()>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>` cannot be sent between threads safely
+   |
+   = help: within `anvyx_runtime::EscapingLambda<(), ()>`, the trait `Send` is not implemented for `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>`
+note: required because it appears within the type `RuntimeOwnerHandle`
+  --> src/runtime_owner.rs
+   |
+   | pub struct RuntimeOwnerHandle {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::EscapingLambda<(), ()>`
+  --> src/escaping_lambda.rs
+   |
+   | pub struct EscapingLambda<Args, Ret> {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:5:19
+   |
+ 5 | fn assert_send<T: Send>() {}
+   |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>` cannot be sent between threads safely
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:11:19
+   |
+11 |     assert_send::<EscapingLambda<(), ()>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>` cannot be sent between threads safely
+   |
+   = help: within `anvyx_runtime::EscapingLambda<(), ()>`, the trait `Send` is not implemented for `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>`
+note: required because it appears within the type `RuntimeOwnerHandle`
+  --> src/runtime_owner.rs
+   |
+   | pub struct RuntimeOwnerHandle {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::EscapingLambda<(), ()>`
+  --> src/escaping_lambda.rs
+   |
+   | pub struct EscapingLambda<Args, Ret> {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:5:19
+   |
+ 5 | fn assert_send<T: Send>() {}
+   |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>` cannot be shared between threads safely
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:12:19
+   |
+12 |     assert_sync::<EscapingLambda<(), ()>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>` cannot be shared between threads safely
+   |
+   = help: within `anvyx_runtime::EscapingLambda<(), ()>`, the trait `Sync` is not implemented for `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerToken>`
+note: required because it appears within the type `RuntimeOwnerHandle`
+  --> src/runtime_owner.rs
+   |
+   | pub struct RuntimeOwnerHandle {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::EscapingLambda<(), ()>`
+  --> src/escaping_lambda.rs
+   |
+   | pub struct EscapingLambda<Args, Ret> {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>` cannot be shared between threads safely
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:12:19
+   |
+12 |     assert_sync::<EscapingLambda<(), ()>>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^ `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>` cannot be shared between threads safely
+   |
+   = help: within `anvyx_runtime::EscapingLambda<(), ()>`, the trait `Sync` is not implemented for `Rc<anvyx_runtime::runtime_owner::RuntimeOwnerCore>`
+note: required because it appears within the type `RuntimeOwnerHandle`
+  --> src/runtime_owner.rs
+   |
+   | pub struct RuntimeOwnerHandle {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `anvyx_runtime::EscapingLambda<(), ()>`
+  --> src/escaping_lambda.rs
+   |
+   | pub struct EscapingLambda<Args, Ret> {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/escaping_lambda/not_clone_copy_send_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`

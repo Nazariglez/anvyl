@@ -1,3 +1,4 @@
+mod callback_registry;
 mod check;
 pub mod collection;
 mod collection_storage;
@@ -6,11 +7,13 @@ pub mod cow_storage;
 pub mod ctx;
 pub mod cycle_collector;
 pub mod error;
+mod escaping_lambda;
 mod global_slot;
 mod lambda_cell;
 pub mod managed_rc;
 mod mutable_place;
 pub mod provider;
+mod runtime_owner;
 mod scoped_lambda;
 pub mod suspect_buffer;
 pub mod type_registry;
@@ -25,12 +28,18 @@ pub use anvyx_heap::{
 pub use anvyx_macros::{
     AnvyxInline, AnvyxRef, builtin_module, function, methods, module, provider_package,
 };
+#[doc(hidden)]
+pub use callback_registry::{
+    CallbackCloseAction, CallbackCloseResult, CallbackInvocationGuard, CallbackSlot,
+    CallbackSlotMeta, CallbackSlotState,
+};
 pub use check::{checked_index, checked_index_result, checked_range};
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};
 pub use ctx::{Ctx, CtxRoots};
 pub use cycle_collector::{collect_cycles, set_auto_collect};
 pub use error::{RuntimeError, heap_access_error};
+pub use escaping_lambda::{CallbackKey, EscapingLambda, EscapingLambdaCall, EscapingLambdaClose};
 pub use global_slot::{
     GlobalProjectedLoanGuard, GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState,
 };
@@ -58,6 +67,7 @@ pub use provider::{
     RustWrapperCtx, TypeExport, TypeMemberExport, UnaryOp, merge_type_members,
     validate_rust_provider_support,
 };
+pub use runtime_owner::{RuntimeOwnerEntry, RuntimeOwnerHandle, RuntimeOwnerShutdownGuard};
 pub use scoped_lambda::ScopedLambda;
 pub use type_registry::{
     get_type_entry, is_cycle_capable, register_child_traverser, register_cycle_capable,

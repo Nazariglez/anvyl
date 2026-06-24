@@ -57,6 +57,11 @@ pub enum ExternDescriptorError {
     VoidType {
         context: TypeContext,
     },
+    CallbackEscapeMismatch {
+        param: Option<String>,
+        param_escape: CallbackEscape,
+        policy_escape: CallbackEscape,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -350,7 +355,26 @@ fn check_params(params: &[ExternParam], errors: &mut Vec<ExternDescriptorError>)
         if let Some(name) = &param.name {
             check_name(NameKind::Param, name, errors);
         }
+        check_callback_escape(param.name.as_deref(), param.escape, &param.ty, errors);
         check_type_expr(&param.ty, TypePosition::Param, errors);
+    }
+}
+
+fn check_callback_escape(
+    param: Option<&str>,
+    escape: CallbackEscape,
+    ty: &ExternTypeExpr,
+    errors: &mut Vec<ExternDescriptorError>,
+) {
+    let ExternTypeExpr::Callback(callback) = ty else {
+        return;
+    };
+    if let Err(mismatch) = effective_callback_escape(escape, callback) {
+        errors.push(ExternDescriptorError::CallbackEscapeMismatch {
+            param: param.map(str::to_string),
+            param_escape: mismatch.param_escape,
+            policy_escape: mismatch.policy_escape,
+        });
     }
 }
 
@@ -389,6 +413,7 @@ fn check_type_expr(
         ExternTypeExpr::Callback(callback) => {
             let param_position = position.callback_param_position();
             for param in &callback.params {
+                check_callback_escape(None, param.escape, &param.ty, errors);
                 check_type_expr(&param.ty, param_position, errors);
             }
             check_type_expr(&callback.ret, TypePosition::Return, errors);
@@ -993,6 +1018,13 @@ mod tests {
 
         let errors = validate(&provider).unwrap_err();
 
+        assert!(
+            errors.contains(&ExternDescriptorError::CallbackEscapeMismatch {
+                param: Some("f".to_string()),
+                param_escape: CallbackEscape::NonEscaping,
+                policy_escape: CallbackEscape::Escaping,
+            })
+        );
         assert!(errors.contains(&ExternDescriptorError::VoidType {
             context: TypeContext::Param,
         }));
