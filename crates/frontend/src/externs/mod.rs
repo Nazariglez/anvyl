@@ -304,6 +304,48 @@ mod tests {
         }
 
         #[test]
+        fn rejects_callback_escape_mismatch() {
+            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: vec![],
+                ret: Box::new(ExternTypeExpr::Void),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::Escaping,
+                    thread: CallbackThread::SameThread,
+                },
+            });
+            let providers = provider_inputs(vec![provider(
+                "math",
+                vec![ExternModuleDescriptor {
+                    path: module(&["math"]),
+                    types: vec![],
+                    functions: vec![ExternFunctionDescriptor {
+                        name: "register".to_string(),
+                        doc: None,
+                        signature: signature(
+                            vec![param("callback", callback)],
+                            ExternTypeExpr::Void,
+                        ),
+                        effects: ExternEffects::default(),
+                    }],
+                }],
+            )]);
+
+            let errors = ingest_providers(providers).unwrap_err();
+
+            assert!(matches!(
+                errors.as_slice(),
+                [ExternInputError::InvalidProviderDescriptor {
+                    error: ExternDescriptorError::CallbackEscapeMismatch {
+                        param: Some(param),
+                        param_escape: CallbackEscape::NonEscaping,
+                        policy_escape: CallbackEscape::Escaping,
+                    },
+                    ..
+                }] if param == "callback"
+            ));
+        }
+
+        #[test]
         fn rejects_duplicate_provider_modules_in_one_package() {
             let errors = ingest_providers(provider_inputs(vec![
                 provider(
@@ -745,7 +787,7 @@ mod tests {
             assert_eq!(
                 callback.policy,
                 CallbackPolicy {
-                    escape: CallbackEscape::NonEscaping,
+                    escape: CallbackEscape::Escaping,
                     thread: CallbackThread::SameThread,
                 }
             );
@@ -796,7 +838,7 @@ mod tests {
             };
             assert_eq!(callback.policy.escape, CallbackEscape::NonEscaping);
             assert_eq!(callback.params[0].escape, CallbackEscape::Escaping);
-            assert_eq!(nested.policy.escape, CallbackEscape::NonEscaping);
+            assert_eq!(nested.policy.escape, CallbackEscape::Escaping);
         }
 
         #[test]

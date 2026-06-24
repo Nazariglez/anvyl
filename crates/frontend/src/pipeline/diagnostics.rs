@@ -1,4 +1,4 @@
-use anvyx_externs::{ExternDescriptorError, ExternTypeKey};
+use anvyx_externs::{CallbackEscape, ExternDescriptorError, ExternTypeKey};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::{
@@ -1644,6 +1644,13 @@ fn render_extern_catalog_error(
     )
 }
 
+fn render_callback_escape(escape: CallbackEscape) -> &'static str {
+    match escape {
+        CallbackEscape::NonEscaping => "non-escaping",
+        CallbackEscape::Escaping => "escaping",
+    }
+}
+
 fn render_extern_item(context: &ExternCatalogContext) -> String {
     match &context.item {
         ExternContextItem::Function { name } => {
@@ -2108,6 +2115,21 @@ fn render_extern_descriptor_error(
         ),
         ExternDescriptorError::VoidType { context } => {
             format!("void type is not allowed in {context}")
+        }
+        ExternDescriptorError::CallbackEscapeMismatch {
+            param,
+            param_escape,
+            policy_escape,
+        } => {
+            let param = param.as_ref().map_or_else(
+                || "callback parameter".to_string(),
+                |param| format!("callback parameter '{param}'"),
+            );
+            format!(
+                "{param} has mismatched escape metadata: parameter is {}, callback policy is {}",
+                render_callback_escape(*param_escape),
+                render_callback_escape(*policy_escape),
+            )
         }
     }
 }

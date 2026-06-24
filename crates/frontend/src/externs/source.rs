@@ -322,12 +322,20 @@ fn lower_param(source: SourceId, param: &Param, span: Span) -> SourceResult<Exte
         ));
     }
 
+    let escape = callback_escape(param.escape);
     Ok(ExternParam {
         name: Some(param.name.to_string()),
-        ty: type_expr(source, &param.ty, span)?,
+        ty: callback_param_type(type_expr(source, &param.ty, span)?, escape),
         flow: ParamFlow::Value,
-        escape: callback_escape(param.escape),
+        escape,
     })
+}
+
+fn callback_param_type(mut ty: ExternTypeExpr, escape: CallbackEscape) -> ExternTypeExpr {
+    if let ExternTypeExpr::Callback(callback) = &mut ty {
+        callback.policy.escape = escape;
+    }
+    ty
 }
 
 fn unsupported_param(
@@ -395,9 +403,10 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
                 params: params
                     .iter()
                     .map(|param| {
+                        let escape = callback_escape(param.escape);
                         Ok(ExternCallbackParam {
-                            ty: type_expr(source, &param.ty, span)?,
-                            escape: callback_escape(param.escape),
+                            ty: callback_param_type(type_expr(source, &param.ty, span)?, escape),
+                            escape,
                         })
                     })
                     .collect::<SourceResult<Vec<_>>>()?,

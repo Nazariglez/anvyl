@@ -100,16 +100,10 @@ impl ResolvedExternSignature {
     }
 }
 
-fn callback_escape_mode(escape: CallbackEscape, ty: &ExternTypeExpr) -> EscapeMode {
-    let esc_from_param = matches!(escape, CallbackEscape::Escaping);
-    let esc_from_callback = match ty {
-        ExternTypeExpr::Callback(callback) => callback.policy.escape == CallbackEscape::Escaping,
-        _ => false,
-    };
-    if esc_from_param || esc_from_callback {
-        EscapeMode::Escaping
-    } else {
-        EscapeMode::NonEscaping
+fn callback_escape_mode(escape: CallbackEscape) -> EscapeMode {
+    match escape {
+        CallbackEscape::NonEscaping => EscapeMode::NonEscaping,
+        CallbackEscape::Escaping => EscapeMode::Escaping,
     }
 }
 
@@ -1231,7 +1225,7 @@ impl<'a> CatalogBuilder<'a> {
                 name: param.name.as_deref().map(Ident::new),
                 ty: self.resolve_ty(ctx, &param.ty),
                 flow: param.flow,
-                escape: callback_escape_mode(param.escape, &param.ty),
+                escape: callback_escape_mode(param.escape),
             })
             .collect()
     }
@@ -1282,7 +1276,7 @@ impl<'a> CatalogBuilder<'a> {
                             self.resolve_ty(ctx, &param.ty).ty,
                             false,
                             false,
-                            callback_escape_mode(param.escape, &param.ty),
+                            callback_escape_mode(param.escape),
                         )
                     })
                     .collect();
@@ -1758,7 +1752,7 @@ mod tests {
     use super::*;
     use crate::{
         ast::{ModuleOrigin, NominalKind},
-        externs::RawExternScope,
+        externs::{RawExternScope, raw::RawExternGroup},
         resolve::PackageId,
         test_support::{
             ident, module_path_segments, parse_program, resolved_modules, root_id, test_source_id,
@@ -2044,11 +2038,15 @@ mod tests {
     }
 
     fn ext_param(name: &str, ty: ExternTypeExpr) -> ExternParam {
+        ext_param_escape(name, ty, CallbackEscape::NonEscaping)
+    }
+
+    fn ext_param_escape(name: &str, ty: ExternTypeExpr, escape: CallbackEscape) -> ExternParam {
         ExternParam {
             name: Some(name.to_string()),
             ty,
             flow: ParamFlow::Value,
-            escape: CallbackEscape::NonEscaping,
+            escape,
         }
     }
 
@@ -2417,7 +2415,7 @@ mod tests {
         #[test]
         fn source_rejects_absolute_provider_path() {
             let raw = RawExterns {
-                groups: vec![crate::externs::raw::RawExternGroup {
+                groups: vec![RawExternGroup {
                     provenance: ExternProvenance::Source {
                         module: raw_root_scope(),
                     },
@@ -2580,7 +2578,7 @@ mod tests {
         }
 
         #[test]
-        fn provider_callback_policy_sets_param_escape() {
+        fn provider_callback_escape_matches_policy() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
                 params: vec![cb_param(
                     ExternTypeExpr::Callback(ExternCallbackSignature {
@@ -2606,7 +2604,11 @@ mod tests {
                     name: "use_cb".to_string(),
                     doc: None,
                     signature: ext_signature(
-                        vec![ext_param("callback", callback)],
+                        vec![ext_param_escape(
+                            "callback",
+                            callback,
+                            CallbackEscape::Escaping,
+                        )],
                         ExternTypeExpr::Void,
                     ),
                     effects: ExternEffects::default(),
@@ -3004,7 +3006,7 @@ mod tests {
                     signature: ext_signature(
                         vec![
                             ext_param("value", ExternTypeExpr::Any),
-                            ext_param("cb", callback),
+                            ext_param_escape("cb", callback, CallbackEscape::Escaping),
                         ],
                         ExternTypeExpr::Any,
                     ),
