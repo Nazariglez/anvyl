@@ -15,16 +15,20 @@ pub struct VmCompiler;
 
 impl VmCompiler {
     pub fn compile(program: VerifiedProgram<'_>) -> Result<VirProgram, Vec<VmCompileError>> {
+        let air = program.program();
         let mut cx = CompileCx {
-            program: program.program(),
-            classes: TypePassClasses::analyze(program.program()),
+            program: air,
+            classes: TypePassClasses::analyze(air),
             errors: vec![],
         };
         let vir = cx.compile();
-        if cx.errors.is_empty() {
+        let errors = std::mem::take(&mut cx.errors);
+        drop(cx);
+        std::hint::black_box(program);
+        if errors.is_empty() {
             Ok(vir)
         } else {
-            Err(cx.errors)
+            Err(errors)
         }
     }
 }
@@ -267,15 +271,15 @@ impl CompileCx<'_> {
                 }
             }
             RValue::Call { .. } => {}
-            RValue::Len { source } | RValue::ListPop { list: source, .. } => {
+            RValue::Len { source }
+            | RValue::ListPop { list: source, .. }
+            | RValue::RangeListCopy { source, .. }
+            | RValue::SliceView { source, .. } => {
                 self.check_place(function, source);
             }
             RValue::ListPush { list, value } => {
                 self.check_place(function, list);
                 self.check_operand(function, value);
-            }
-            RValue::RangeListCopy { source, .. } | RValue::SliceView { source, .. } => {
-                self.check_place(function, source);
             }
             RValue::MapGet { map, key, .. } | RValue::MapRemove { map, key, .. } => {
                 self.check_place(function, map);
@@ -312,7 +316,7 @@ impl CompileCx<'_> {
             | LambdaCaptureArg::CaptureCell { .. } => {}
             LambdaCaptureArg::ReadonlyLocal { value } => self.check_operand(function, value),
         }
-        self.push_capture_gap(function, self.capture_status(capture));
+        self.push_capture_gap(function, Self::capture_status(capture));
     }
 
     fn place_root_status(&self, function: FunctionId, root: PlaceRoot) -> VmPlaceRootStatus {
@@ -357,7 +361,7 @@ impl CompileCx<'_> {
         self.push_function(function, VmCompileErrorKind::UnsupportedCollectionLoan);
     }
 
-    fn capture_status(&self, capture: &LambdaCaptureArg) -> VmCaptureStatus {
+    fn capture_status(capture: &LambdaCaptureArg) -> VmCaptureStatus {
         match capture {
             LambdaCaptureArg::NoRuntime => VmCaptureStatus::NoRuntime,
             LambdaCaptureArg::ReadonlyLocal { .. } => VmCaptureStatus::Readonly,

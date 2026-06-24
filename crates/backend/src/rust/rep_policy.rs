@@ -119,11 +119,11 @@ impl LambdaStorageFamily {
         match self {
             LambdaStorageFamily::MapKey => LambdaStorageGap::MapKeyEqualityHash,
             LambdaStorageFamily::GlobalProjection => LambdaStorageGap::GlobalRooting,
-            LambdaStorageFamily::GlobalRoot => LambdaStorageGap::StorageImplementation,
             LambdaStorageFamily::NativeExternBoundary => LambdaStorageGap::ExternBoundary,
             LambdaStorageFamily::UnknownOrigin => LambdaStorageGap::ProvenanceOrigin,
             LambdaStorageFamily::SliceView => LambdaStorageGap::Lifetime,
-            LambdaStorageFamily::StructField
+            LambdaStorageFamily::GlobalRoot
+            | LambdaStorageFamily::StructField
             | LambdaStorageFamily::TupleField
             | LambdaStorageFamily::EnumPayload
             | LambdaStorageFamily::OptionalPayload
@@ -154,16 +154,17 @@ fn nested_storage_family(
 ) -> LambdaStorageFamily {
     match (outer, nested) {
         (
-            LambdaStorageFamily::GlobalRoot
-            | LambdaStorageFamily::GlobalProjection
-            | LambdaStorageFamily::NativeExternBoundary,
-            _,
-        ) => outer,
-        (
             LambdaStorageFamily::MapKey | LambdaStorageFamily::MapValue,
             LambdaStorageFamily::MapKey,
         ) => LambdaStorageFamily::MapKey,
-        (LambdaStorageFamily::MapKey | LambdaStorageFamily::MapValue, _) => outer,
+        (
+            LambdaStorageFamily::GlobalRoot
+            | LambdaStorageFamily::GlobalProjection
+            | LambdaStorageFamily::NativeExternBoundary
+            | LambdaStorageFamily::MapKey
+            | LambdaStorageFamily::MapValue,
+            _,
+        ) => outer,
         _ => nested,
     }
 }
@@ -422,11 +423,6 @@ impl<'a> AirRustRepPolicy<'a> {
 
     fn exact_root_global_materialization(self, ty: TypeId) -> RustMaterialization {
         match self.program.type_arena.data(ty) {
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Dyn(_) => RustMaterialization::Gap,
             TypeData::Function(_)
                 if self
                     .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
@@ -434,7 +430,12 @@ impl<'a> AirRustRepPolicy<'a> {
             {
                 self.materialization(ty)
             }
-            TypeData::Function(_) => RustMaterialization::Gap,
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
+            | TypeData::Dyn(_)
+            | TypeData::Function(_) => RustMaterialization::Gap,
             TypeData::List(elem) if !self.exact_root_global_field_supported(*elem) => {
                 RustMaterialization::Gap
             }
@@ -906,6 +907,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::MutBorrow => RirParamAbi::MutBorrow,
             RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
             RirParamSemantic::ScopedLambda => RirParamAbi::ScopedLambda,
+            RirParamSemantic::EscapingLambda => RirParamAbi::EscapingLambda,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
             RirParamSemantic::HeapCell => RirParamAbi::HeapCell,
             RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
@@ -1564,7 +1566,7 @@ impl<'a> RustRepPolicy<'a> {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
             }
-            RirParamAbi::ScopedLambda => self.scoped_lambda_ty(ty),
+            RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda => self.scoped_lambda_ty(ty),
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!(
@@ -1708,7 +1710,7 @@ impl<'a> RustRepPolicy<'a> {
             shape.heap_env |= matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. });
             shape.lifetime |= lambda.captures.iter().any(|capture| {
                 matches!(
-                    self.lambda_capture_layout_edge(lambda, capture),
+                    Self::lambda_capture_layout_edge(lambda, capture),
                     LambdaCaptureLayoutEdge::SharedBorrow
                         | LambdaCaptureLayoutEdge::MutBorrow
                         | LambdaCaptureLayoutEdge::StackCell
@@ -1738,7 +1740,7 @@ impl<'a> RustRepPolicy<'a> {
         let needs = self.lambda_sig_storage_shape(id).heap_env
             || self.program.lambdas_for_sig(id).any(|lambda| {
                 lambda.captures.iter().any(|capture| {
-                    let edge = self.lambda_capture_layout_edge(lambda, capture);
+                    let edge = Self::lambda_capture_layout_edge(lambda, capture);
                     self.value_type_cx_dependent(capture.ty, active)
                         || edge == LambdaCaptureLayoutEdge::HeapCell
                         || edge == LambdaCaptureLayoutEdge::ScopedPlaceCell
@@ -1758,7 +1760,7 @@ impl<'a> RustRepPolicy<'a> {
         for lambda in self.program.lambdas_for_sig(id) {
             has_cell |= lambda.captures.iter().any(|capture| {
                 matches!(
-                    self.lambda_capture_layout_edge(lambda, capture),
+                    Self::lambda_capture_layout_edge(lambda, capture),
                     LambdaCaptureLayoutEdge::StackCell
                         | LambdaCaptureLayoutEdge::HeapCell
                         | LambdaCaptureLayoutEdge::ScopedPlaceCell
@@ -1780,7 +1782,6 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     pub(super) fn lambda_capture_layout_edge(
-        self,
         lambda: &RirLambda,
         capture: &RirLambdaCapture,
     ) -> LambdaCaptureLayoutEdge {
@@ -1794,7 +1795,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamAbi::StackCell => LambdaCaptureLayoutEdge::StackCell,
             RirParamAbi::HeapCell => LambdaCaptureLayoutEdge::HeapCell,
             RirParamAbi::ScopedPlaceCell => LambdaCaptureLayoutEdge::ScopedPlaceCell,
-            RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => {
+            RirParamAbi::MutPlace | RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda => {
                 LambdaCaptureLayoutEdge::Unsupported
             }
         }
@@ -1805,7 +1806,7 @@ impl<'a> RustRepPolicy<'a> {
         lambda: &RirLambda,
         capture: &RirLambdaCapture,
     ) -> Option<RirLambdaSigId> {
-        if self.lambda_capture_layout_edge(lambda, capture) != LambdaCaptureLayoutEdge::InlineValue
+        if Self::lambda_capture_layout_edge(lambda, capture) != LambdaCaptureLayoutEdge::InlineValue
         {
             return None;
         }
@@ -1873,9 +1874,10 @@ impl<'a> RustRepPolicy<'a> {
                     | RirParamAbi::StackCell
                     | RirParamAbi::HeapCell
                     | RirParamAbi::ScopedPlaceCell => true,
-                    RirParamAbi::MutBorrow | RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => {
-                        false
-                    }
+                    RirParamAbi::MutBorrow
+                    | RirParamAbi::MutPlace
+                    | RirParamAbi::ScopedLambda
+                    | RirParamAbi::EscapingLambda => false,
                 })
             })
     }
@@ -1895,7 +1897,10 @@ impl<'a> RustRepPolicy<'a> {
                 | RirParamAbi::StackCell
                 | RirParamAbi::HeapCell
                 | RirParamAbi::ScopedPlaceCell => true,
-                RirParamAbi::MutBorrow | RirParamAbi::MutPlace | RirParamAbi::ScopedLambda => false,
+                RirParamAbi::MutBorrow
+                | RirParamAbi::MutPlace
+                | RirParamAbi::ScopedLambda
+                | RirParamAbi::EscapingLambda => false,
             })
         });
         active.remove(&id);
@@ -1966,19 +1971,19 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Array { elem, len } => {
                 format!("[{}; {len}]", self.rust_ty_inner(elem, storage))
             }
-            RirType::List(elem) => target::anv_list_ty(self.rust_ty_inner(elem, storage)),
+            RirType::List(elem) => target::anv_list_ty(&self.rust_ty_inner(elem, storage)),
             RirType::Map { key, value } => target::anv_map_ty(
-                self.rust_ty_inner(key, storage),
-                self.rust_ty_inner(value, storage),
+                &self.rust_ty_inner(key, storage),
+                &self.rust_ty_inner(value, storage),
             ),
             RirType::Option(inner) => format!("Option<{}>", self.rust_ty_inner(inner, storage)),
-            RirType::Slice(elem) => target::anv_slice_ty(self.rust_ty_inner(elem, storage)),
+            RirType::Slice(elem) => target::anv_slice_ty(&self.rust_ty_inner(elem, storage)),
             RirType::Lambda(id) if storage => self.lambda_sig_storage_ty(id),
             RirType::Lambda(id) => self.lambda_sig_ty(id),
         }
     }
 
-    fn lambda_sig_storage_ty(self, id: RirLambdaSigId) -> String {
+    pub fn lambda_sig_storage_ty(self, id: RirLambdaSigId) -> String {
         let generics = match (
             self.lambda_sig_needs_lifetime(id),
             self.lambda_sig_needs_ctx_lifetime(id),
@@ -2064,7 +2069,7 @@ impl<'a> RustRepPolicy<'a> {
             })
     }
 
-    pub(super) fn lambda_trace_action(self, lambda: &RirLambda) -> LambdaTraceAction {
+    pub(super) fn lambda_trace_action(lambda: &RirLambda) -> LambdaTraceAction {
         if matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. }) {
             return LambdaTraceAction::HeapEnv;
         }
@@ -2267,7 +2272,9 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
-            RirParamSemantic::ScopedLambda => matches!(ty, RirType::Lambda(_)),
+            RirParamSemantic::ScopedLambda | RirParamSemantic::EscapingLambda => {
+                matches!(ty, RirType::Lambda(_))
+            }
             RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
@@ -2418,13 +2425,13 @@ impl RustTracePlan {
             RirType::Lambda(id) if policy.lambda_sig_owns_heap_edges(id) => {
                 self.lambda_sigs.insert(id);
             }
-            RirType::Lambda(_) => {}
             RirType::Int
             | RirType::Float
             | RirType::Bool
             | RirType::String
             | RirType::Void
-            | RirType::DataRef(_) => {}
+            | RirType::DataRef(_)
+            | RirType::Lambda(_) => {}
         }
     }
 }

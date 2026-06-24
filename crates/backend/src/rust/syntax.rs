@@ -61,7 +61,7 @@ pub(super) fn match_expr(scrutinee: &str, arms: impl IntoIterator<Item = String>
     }
 }
 
-pub(super) fn field_init(name: &str, expr: String) -> String {
+pub(super) fn field_init(name: &str, expr: impl std::fmt::Display) -> String {
     format!("{name}: {expr}")
 }
 
@@ -96,8 +96,7 @@ pub(super) fn struct_variant_pattern(path: &str) -> String {
 pub(super) fn unary_op(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
-        UnaryOp::Not => "!",
-        UnaryOp::BitNot => "!",
+        UnaryOp::Not | UnaryOp::BitNot => "!",
     }
 }
 

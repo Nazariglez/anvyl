@@ -10,23 +10,23 @@ pub(super) fn anv_string_ty() -> String {
     rt_path("AnvString")
 }
 
-pub(super) fn anv_list_ty(elem: String) -> String {
+pub(super) fn anv_list_ty(elem: &str) -> String {
     format!("{}<'cx, {elem}>", rt_path("AnvList"))
 }
 
-pub(super) fn list_storage_ty(elem: String) -> String {
+pub(super) fn list_storage_ty(elem: &str) -> String {
     format!("{}<'cx, {elem}>", rt_path("ListStorage"))
 }
 
-pub(super) fn anv_slice_ty(elem: String) -> String {
+pub(super) fn anv_slice_ty(elem: &str) -> String {
     format!("{}<'cx, {elem}>", rt_path("AnvSlice"))
 }
 
-pub(super) fn anv_map_ty(key: String, value: String) -> String {
+pub(super) fn anv_map_ty(key: &str, value: &str) -> String {
     format!("{}<'cx, {key}, {value}>", rt_path("AnvMap"))
 }
 
-pub(super) fn map_storage_ty(key: String, value: String) -> String {
+pub(super) fn map_storage_ty(key: &str, value: &str) -> String {
     format!("{}<'cx, {key}, {value}>", rt_path("MapStorage"))
 }
 
@@ -50,11 +50,115 @@ pub(super) fn scoped_lambda_thunk() -> &'static str {
     "__anv_scoped_call"
 }
 
+pub(super) fn generated_runtime_symbol() -> &'static str {
+    "AnvRuntime"
+}
+
+pub(super) fn generated_runtime_inner_symbol() -> &'static str {
+    "AnvRuntimeInner"
+}
+
+pub(super) fn generated_callback_registry_symbol() -> &'static str {
+    "AnvCallbackRegistry"
+}
+
+pub(super) fn callback_record_symbol(sig: usize) -> String {
+    format!("CallbackRecordSig{sig}")
+}
+
+pub(super) fn callback_table_field(sig: usize) -> String {
+    format!("sig{sig}")
+}
+
+pub(super) fn callback_call_thunk_symbol(sig: usize) -> String {
+    format!("__anv_callback_call_sig{sig}")
+}
+
+pub(super) fn callback_close_thunk_symbol(sig: usize) -> String {
+    format!("__anv_callback_close_sig{sig}")
+}
+
+pub(super) fn escaping_lambda_ctor_ty(args: &str, ret: &str) -> String {
+    format!("{}::<{args}, {ret}>", rt_path("EscapingLambda"))
+}
+
+pub(super) fn callback_key_ty() -> String {
+    rt_path("CallbackKey")
+}
+
+pub(super) fn callback_slot_ty(root: &str) -> String {
+    format!("{}<{root}>", rt_path("CallbackSlot"))
+}
+
+pub(super) fn callback_slot_turbofish(root: &str) -> String {
+    format!("{}::<{root}>", rt_path("CallbackSlot"))
+}
+
+pub(super) fn root_id_ty(payload: &str) -> String {
+    format!("{}<'cx, {payload}>", rt_path("RootId"))
+}
+
+pub(super) fn pin_box_ty(payload: &str) -> String {
+    format!("std::pin::Pin<Box<{payload}>>")
+}
+
+pub(super) fn box_pin_struct_start(ty: &str) -> String {
+    format!("Box::pin({ty} {{")
+}
+
+pub(super) fn phantom_pinned_ty() -> &'static str {
+    "std::marker::PhantomPinned"
+}
+
+pub(super) fn phantom_pinned_value() -> &'static str {
+    "std::marker::PhantomPinned"
+}
+
+pub(super) fn runtime_owner_handle_ty() -> String {
+    rt_path("RuntimeOwnerHandle")
+}
+
+pub(super) fn runtime_owner_handle_new() -> String {
+    format!("{}::new()", runtime_owner_handle_ty())
+}
+
+pub(super) fn owner_attach(owner: &str, ptr: &str) -> String {
+    format!("{owner}.__anvyx_attach_owner_ptr({ptr})")
+}
+
+pub(super) fn owner_detach(owner: &str) -> String {
+    format!("{owner}.__anvyx_detach_owner_ptr()")
+}
+
+pub(super) fn owner_enter_current(owner: &str) -> String {
+    format!("{owner}.__anvyx_enter_current()")
+}
+
+pub(super) fn owner_entry_ptr(entry: &str) -> String {
+    format!("{entry}.owner_ptr()")
+}
+
+pub(super) fn non_null_cast_mut(ptr: &str, ty: &str) -> String {
+    format!("{ptr}.cast::<{ty}>().as_mut()")
+}
+
+pub(super) fn pin_get_unchecked_mut(value: &str) -> String {
+    format!("{value}.get_unchecked_mut()")
+}
+
 pub(super) fn non_null_unit_ty() -> &'static str {
     "std::ptr::NonNull<()>"
 }
 
+pub(super) fn non_null_ty(payload: &str) -> String {
+    format!("std::ptr::NonNull<{payload}>")
+}
+
 pub(super) fn non_null_from_mut(value: &str) -> String {
+    format!("std::ptr::NonNull::from({value})")
+}
+
+pub(super) fn non_null_from_ref(value: &str) -> String {
     format!("std::ptr::NonNull::from({value})")
 }
 
@@ -192,6 +296,14 @@ pub(super) fn globals_param_name() -> &'static str {
     "globals"
 }
 
+pub(super) fn owner_param_name() -> &'static str {
+    "owner"
+}
+
+pub(super) fn callbacks_param_name() -> &'static str {
+    "callbacks"
+}
+
 pub(super) fn runtime_param(used: bool) -> &'static str {
     if used { "rt" } else { "_rt" }
 }
@@ -214,6 +326,17 @@ pub(super) fn runtime_ctx_ref_ty() -> String {
 
 pub(super) fn runtime_ctx_ty_with(rt_lifetime: &str) -> String {
     format!("{}<'cx, {rt_lifetime}>", rt_path("Ctx"))
+}
+
+pub(super) fn runtime_ctx_from_raw(heap: &str) -> String {
+    format!("unsafe {{ {}::__anvyx_from_raw({heap}) }}", rt_path("Ctx"))
+}
+
+pub(super) fn runtime_ctx_from_raw_with_roots(heap: &str, roots: &str) -> String {
+    format!(
+        "unsafe {{ {}::__anvyx_from_raw_with_roots({heap}, {roots}) }}",
+        rt_path("Ctx")
+    )
 }
 
 pub(super) fn types_ref_ty(symbol: &str) -> String {
@@ -261,18 +384,43 @@ pub(super) fn global_begin_projected_loan(slot: &str) -> String {
 }
 
 pub(super) fn generated_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    [
+    generated_call_args_inner(false, args)
+}
+
+pub(super) fn retained_generated_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    generated_call_args_inner(true, args)
+}
+
+fn generated_call_args_inner(
+    retained_callbacks: bool,
+    args: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut context = vec![
         runtime_param_name().to_string(),
         types_param_name().to_string(),
         globals_param_name().to_string(),
-    ]
-    .into_iter()
-    .chain(args)
-    .collect()
+    ];
+    if retained_callbacks {
+        context.extend([
+            owner_param_name().to_string(),
+            callbacks_param_name().to_string(),
+        ]);
+    }
+    context.into_iter().chain(args).collect()
 }
 
 pub(super) fn generated_call(symbol: &str, args: impl IntoIterator<Item = String>) -> String {
     format!("{symbol}({})", syntax::comma(generated_call_args(args)))
+}
+
+pub(super) fn retained_generated_call(
+    symbol: &str,
+    args: impl IntoIterator<Item = String>,
+) -> String {
+    format!(
+        "{symbol}({})",
+        syntax::comma(retained_generated_call_args(args))
+    )
 }
 
 pub(super) fn native_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -719,16 +867,13 @@ fn mut_place_region(place: &str, op: &str, runtime: &str, slot: &str, body: &str
     format!("{place}.{op}({runtime}, |{slot}| {body})?")
 }
 
+#[cfg(test)]
 pub(super) fn heap_scope() -> String {
     rt_path("Heap::scope")
 }
 
-pub(super) fn runtime_ctx_new(heap: &str) -> String {
-    format!("{}::new({heap})", rt_path("Ctx"))
-}
-
-pub(super) fn runtime_ctx_new_with_roots(heap: &str, roots: &str) -> String {
-    format!("{}::new_with_roots({heap}, {roots})", rt_path("Ctx"))
+pub(super) fn heap_scope_owned() -> String {
+    rt_path("Heap::scope_owned")
 }
 
 #[cfg(test)]
@@ -753,30 +898,30 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, checked_index,
-        checked_range, ctx_roots_ty, dataref_place_heap_type_access, dataref_place_heap_type_field,
-        dataref_place_ops_ty, erased_handle_ty, generated_call, global_begin_projected_loan,
+        anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, box_pin_struct_start,
+        checked_index, checked_range, ctx_roots_ty, dataref_place_heap_type_access,
+        dataref_place_heap_type_field, dataref_place_ops_ty, erased_handle_ty, generated_call,
+        generated_runtime_inner_symbol, generated_runtime_symbol, global_begin_projected_loan,
         global_set_or_replace_collection, heap_access_error, heap_register, heap_scope,
-        heap_type_access, lambda_cell_ctor, map_heap_access_error, mut_place_access,
-        mut_place_dataref, mut_place_get_copy, mut_place_global, mut_place_heap_cell,
-        mut_place_local, mut_place_local_raw, mut_place_projected, mut_place_reborrow,
-        mut_place_replace_collection, mut_place_scoped_cell, mut_place_set, mut_place_stack_cell,
-        mut_place_ty, optional_payload_ops_ctor, optional_payload_ops_ty, projection_ops_ty,
-        result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
-        rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_new,
-        runtime_ctx_new_with_roots, runtime_ctx_ty_with, runtime_param_name,
+        heap_scope_owned, heap_type_access, lambda_cell_ctor, map_heap_access_error,
+        mut_place_access, mut_place_dataref, mut_place_get_copy, mut_place_global,
+        mut_place_heap_cell, mut_place_local, mut_place_local_raw, mut_place_projected,
+        mut_place_reborrow, mut_place_replace_collection, mut_place_scoped_cell, mut_place_set,
+        mut_place_stack_cell, mut_place_ty, non_null_cast_mut, optional_payload_ops_ctor,
+        optional_payload_ops_ty, owner_attach, owner_detach, owner_enter_current, owner_entry_ptr,
+        phantom_pinned_ty, phantom_pinned_value, pin_box_ty, pin_get_unchecked_mut,
+        projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
+        rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_ty_with,
+        runtime_owner_handle_new, runtime_owner_handle_ty, runtime_param_name,
         scoped_mut_place_cell_new, scoped_mut_place_cell_ty, stack_lambda_cell_ctor,
         stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
 
     #[test]
     fn renders_runtime_types() {
+        assert_eq!(anv_list_ty("i64"), "anvyx_runtime::AnvList<'cx, i64>");
         assert_eq!(
-            anv_list_ty("i64".to_string()),
-            "anvyx_runtime::AnvList<'cx, i64>"
-        );
-        assert_eq!(
-            anv_map_ty("i64".to_string(), "bool".to_string()),
+            anv_map_ty("i64", "bool"),
             "anvyx_runtime::AnvMap<'cx, i64, bool>"
         );
         assert_eq!(
@@ -802,6 +947,41 @@ mod tests {
             "anvyx_runtime::ScopedMutPlaceCell<'env, 'cx, i64>"
         );
         assert_eq!(runtime_ctx_ty_with("'_"), "anvyx_runtime::Ctx<'cx, '_>");
+        assert_eq!(generated_runtime_symbol(), "AnvRuntime");
+        assert_eq!(generated_runtime_inner_symbol(), "AnvRuntimeInner");
+        assert_eq!(
+            pin_box_ty("AnvRuntimeInner<'cx>"),
+            "std::pin::Pin<Box<AnvRuntimeInner<'cx>>>"
+        );
+        assert_eq!(box_pin_struct_start("Inner"), "Box::pin(Inner {");
+        assert_eq!(phantom_pinned_ty(), "std::marker::PhantomPinned");
+        assert_eq!(phantom_pinned_value(), "std::marker::PhantomPinned");
+        assert_eq!(
+            runtime_owner_handle_ty(),
+            "anvyx_runtime::RuntimeOwnerHandle"
+        );
+        assert_eq!(
+            runtime_owner_handle_new(),
+            "anvyx_runtime::RuntimeOwnerHandle::new()"
+        );
+        assert_eq!(
+            owner_attach("owner", "ptr"),
+            "owner.__anvyx_attach_owner_ptr(ptr)"
+        );
+        assert_eq!(owner_detach("owner"), "owner.__anvyx_detach_owner_ptr()");
+        assert_eq!(
+            owner_enter_current("owner"),
+            "owner.__anvyx_enter_current()"
+        );
+        assert_eq!(owner_entry_ptr("entry"), "entry.owner_ptr()");
+        assert_eq!(
+            non_null_cast_mut("ptr", "Inner<'cx>"),
+            "ptr.cast::<Inner<'cx>>().as_mut()"
+        );
+        assert_eq!(
+            pin_get_unchecked_mut("runtime.inner.as_mut()"),
+            "runtime.inner.as_mut().get_unchecked_mut()"
+        );
         assert_eq!(
             stack_lambda_cell_ctor("i64"),
             "anvyx_runtime::StackLambdaCell::<i64>"
@@ -964,10 +1144,6 @@ mod tests {
         );
         assert_eq!(mut_place_get_copy("place", "rt"), "place.get_copy(rt)?");
         assert_eq!(heap_scope(), "anvyx_runtime::Heap::scope");
-        assert_eq!(runtime_ctx_new("heap"), "anvyx_runtime::Ctx::new(heap)");
-        assert_eq!(
-            runtime_ctx_new_with_roots("heap", "roots"),
-            "anvyx_runtime::Ctx::new_with_roots(heap, roots)"
-        );
+        assert_eq!(heap_scope_owned(), "anvyx_runtime::Heap::scope_owned");
     }
 }

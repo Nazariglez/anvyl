@@ -3405,7 +3405,7 @@ impl<'a> PlanCx<'a> {
         self.plan_collection_access_from_plan(
             function,
             RustTargetGapSite::Function(function),
-            plan,
+            &plan,
             op,
             locals,
         )
@@ -3415,7 +3415,7 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         site: RustTargetGapSite,
-        plan: PlaceAccessPlan,
+        plan: &PlaceAccessPlan,
         op: CollectionAccessOp,
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedCollectionAccess, RustPlanError> {
@@ -3426,7 +3426,7 @@ impl<'a> PlanCx<'a> {
                     RustTargetGapKind::UnsupportedMutablePlaceDataRef,
                 ));
             }
-            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+            let planned = self.plan_mut_place_arg(function, plan, locals)?;
             return Ok(PlannedCollectionAccess {
                 stmts: planned.stmts,
                 access: RirCollectionAccess::MutPlace(planned.arg),
@@ -3465,7 +3465,7 @@ impl<'a> PlanCx<'a> {
                     | PlaceAccessRoot::ScopedPlaceCell(_)
             );
         if use_mut_place {
-            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+            let planned = self.plan_mut_place_arg(function, plan, locals)?;
             return Ok(PlannedCollectionAccess {
                 stmts: planned.stmts,
                 access: RirCollectionAccess::MutPlace(planned.arg),
@@ -3614,7 +3614,12 @@ impl<'a> PlanCx<'a> {
         lambda_values: &mut Vec<Option<KnownLambdaValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
-            CallArg::Value(operand) if expected == RirParamSemantic::ScopedLambda => {
+            CallArg::Value(operand)
+                if matches!(
+                    expected,
+                    RirParamSemantic::ScopedLambda | RirParamSemantic::EscapingLambda
+                ) =>
+            {
                 let air_ty = self.operand_ty(operand);
                 let TypeData::Function(_) = self.air.type_arena.data(air_ty) else {
                     return Err(Self::gap(
@@ -3623,12 +3628,21 @@ impl<'a> PlanCx<'a> {
                     ));
                 };
                 let planned = self.plan_operand_read(function, operand, locals);
+                let sig = self.lambda_sig_map[&air_ty];
+                let arg = match expected {
+                    RirParamSemantic::ScopedLambda => RirCallArg::ScopedLambda {
+                        callee: planned.operand,
+                        sig,
+                    },
+                    RirParamSemantic::EscapingLambda => RirCallArg::EscapingLambda {
+                        callee: planned.operand,
+                        sig,
+                    },
+                    _ => unreachable!("checked expected callback semantic"),
+                };
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
-                    arg: RirCallArg::ScopedLambda {
-                        callee: planned.operand,
-                        sig: self.lambda_sig_map[&air_ty],
-                    },
+                    arg,
                 })
             }
             CallArg::Value(operand) => {
@@ -3901,7 +3915,7 @@ impl<'a> PlanCx<'a> {
         let root = self.plan_collection_access_from_plan(
             function,
             site,
-            plan.place,
+            &plan.place,
             CollectionAccessOp::ShapeLoan,
             locals,
         )?;
@@ -3926,11 +3940,12 @@ impl<'a> PlanCx<'a> {
             PlaceAccessRoot::CaptureCell(cell) if place.projection.is_empty() => {
                 AssignTarget::CaptureCell(cell)
             }
-            PlaceAccessRoot::CaptureCell(_) => AssignTarget::ProjectedMutPlace,
             PlaceAccessRoot::ScopedPlaceCell(borrow) if place.projection.is_empty() => {
                 AssignTarget::ScopedPlaceCell(borrow)
             }
-            PlaceAccessRoot::ScopedPlaceCell(_) => AssignTarget::ProjectedMutPlace,
+            PlaceAccessRoot::CaptureCell(_) | PlaceAccessRoot::ScopedPlaceCell(_) => {
+                AssignTarget::ProjectedMutPlace
+            }
             PlaceAccessRoot::Global(global) if !place.projection.is_empty() => {
                 AssignTarget::ProjectedGlobal(global)
             }

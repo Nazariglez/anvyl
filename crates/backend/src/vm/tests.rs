@@ -1882,7 +1882,6 @@ impl CaptureCase {
 
     fn secondary_gap(self) -> Option<VmCompileErrorKind> {
         match self {
-            Self::SourceNamedFunctionValue => None,
             Self::SourceReadonlyCapture => Some(VmCompileErrorKind::UnsupportedLambdaCapture),
             Self::SourceMutableCapture => Some(VmCompileErrorKind::UnsupportedLambdaCell),
             _ => None,
@@ -2498,8 +2497,7 @@ fn named_function(program: &Program, name: &str) -> FunctionId {
         .functions
         .iter()
         .position(|function| function.name.as_str() == name)
-        .map(FunctionId::from_index)
-        .unwrap_or_else(|| panic!("missing function {name}"))
+        .map_or_else(|| panic!("missing function {name}"), FunctionId::from_index)
 }
 
 fn first_lambda_function(program: &Program) -> FunctionId {

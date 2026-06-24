@@ -53,6 +53,7 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
         dataref_places: DataRefPlaceDescriptors::build(program),
         trace_plan: RustTracePlan::build(program),
         fallible_functions: analysis::fallible_functions(program),
+        retained_callback_sigs: program.retained_callback_sigs(),
         w: RustWriter::default(),
         collection_loans: vec![],
     };
@@ -65,6 +66,7 @@ struct EmitCx<'a> {
     dataref_places: DataRefPlaceDescriptors,
     trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
+    retained_callback_sigs: Vec<RirLambdaSigId>,
     w: RustWriter,
     collection_loans: Vec<ActiveCollectionLoan>,
 }
@@ -107,6 +109,8 @@ impl EmitCx<'_> {
         for sig in &self.program.lambda_sigs {
             self.emit_lambda_sig(sig);
         }
+        self.emit_callback_registry();
+        self.emit_callback_thunks();
         for function in &self.program.functions {
             self.emit_function(function);
         }
@@ -119,6 +123,7 @@ impl EmitCx<'_> {
         let types = target::generated_types_symbol(&self.program.ctx);
         let globals = target::generated_globals_symbol(&self.program.ctx);
         let policy = RustRepPolicy::new(self.program);
+        let retained_sigs = &self.retained_callback_sigs;
         let mut heap_types = self
             .program
             .datarefs
@@ -157,18 +162,26 @@ impl EmitCx<'_> {
         heap_types.extend(self.program.collection_storages.iter().map(|storage| {
             let (storage_ty, register) = match storage.kind {
                 RirCollectionStorageKind::List { elem_ty } => (
-                    target::list_storage_ty(policy.rust_storage_ty(elem_ty)),
+                    target::list_storage_ty(&policy.rust_storage_ty(elem_ty)),
                     target::heap_register(policy.list_storage_tracked(elem_ty)),
                 ),
                 RirCollectionStorageKind::Map { key_ty, value_ty } => (
                     target::map_storage_ty(
-                        policy.rust_storage_ty(key_ty),
-                        policy.rust_storage_ty(value_ty),
+                        &policy.rust_storage_ty(key_ty),
+                        &policy.rust_storage_ty(value_ty),
                     ),
                     target::heap_register(policy.map_storage_tracked(key_ty, value_ty)),
                 ),
             };
             (storage.symbol.as_str().to_string(), storage_ty, register)
+        }));
+        heap_types.extend(retained_sigs.iter().map(|sig| {
+            let record = target::callback_record_symbol(sig.index());
+            (
+                format!("callback_record_sig{}", sig.index()),
+                format!("{record}<'cx>"),
+                target::heap_register(self.trace_plan.needs_lambda_sig_trace(*sig)),
+            )
         }));
 
         self.w.block(format_args!("struct {types}<'cx>"), |w| {
@@ -271,38 +284,454 @@ impl EmitCx<'_> {
             );
         }
         self.w.blank();
+        let runtime = target::generated_runtime_symbol();
+        let inner = target::generated_runtime_inner_symbol();
+        self.w.block(format_args!("struct {runtime}<'cx>"), |w| {
+            w.line(format_args!(
+                "owner: {},",
+                target::runtime_owner_handle_ty()
+            ));
+            w.line(format_args!(
+                "inner: {},",
+                target::pin_box_ty(&format!("{inner}<'cx>"))
+            ));
+        });
+        self.w.blank();
+        self.w.block(format_args!("struct {inner}<'cx>"), |w| {
+            w.line(format_args!("types: {types}<'cx>,"));
+            w.line(format_args!("globals: {globals}<'cx>,"));
+            if !retained_sigs.is_empty() {
+                w.line(format_args!(
+                    "callbacks: {}<'cx>,",
+                    target::generated_callback_registry_symbol()
+                ));
+            }
+            w.line(format_args!("heap: {},", target::heap_ty()));
+            w.line(format_args!("_pin: {},", target::phantom_pinned_ty()));
+        });
+        self.w.blank();
+        self.w
+            .block(format_args!("struct AnvEntry<'entry, 'cx>"), |w| {
+                w.line(format_args!(
+                    "heap: {},",
+                    target::non_null_ty(&target::heap_ty())
+                ));
+                w.line(format_args!("types: &'entry {types}<'cx>,"));
+                w.line(format_args!("globals: &'entry {globals}<'cx>,"));
+                if !retained_sigs.is_empty() {
+                    w.line(format_args!(
+                        "owner: &'entry {},",
+                        target::runtime_owner_handle_ty()
+                    ));
+                    w.line(format_args!(
+                        "callbacks: {},",
+                        target::non_null_ty(&format!(
+                            "{}<'cx>",
+                            target::generated_callback_registry_symbol()
+                        ))
+                    ));
+                }
+            });
+        self.w.blank();
+        self.w.block(format_args!("impl<'cx> {runtime}<'cx>"), |w| {
+            w.block(
+                format_args!("fn new(mut heap: {}) -> Self", target::heap_ty()),
+                |w| {
+                    w.line(format_args!(
+                        "let owner = {}.expect(\"runtime owner id overflow\");",
+                        target::runtime_owner_handle_new()
+                    ));
+                    w.line(format_args!("let types = {types}::register(&mut heap);"));
+                    w.line(format_args!("let globals = {globals}::new();"));
+                    if !retained_sigs.is_empty() {
+                        w.line(format_args!(
+                            "let callbacks = {}::default();",
+                            target::generated_callback_registry_symbol()
+                        ));
+                    }
+                    w.line("let mut runtime = Self {");
+                    w.indented(|w| {
+                        w.line("owner,");
+                        w.line(format_args!("inner: {}", target::box_pin_struct_start(inner)));
+                        w.indented(|w| {
+                            w.line("types,");
+                            w.line("globals,");
+                            if !retained_sigs.is_empty() {
+                                w.line("callbacks,");
+                            }
+                            w.line("heap,");
+                            w.line(format_args!("_pin: {},", target::phantom_pinned_value()));
+                        });
+                        w.line("}),");
+                    });
+                    w.line("};");
+                    w.block("unsafe", |w| {
+                        w.line(format_args!(
+                            "let inner = {};",
+                            target::pin_get_unchecked_mut("runtime.inner.as_mut()")
+                        ));
+                        w.line(format_args!(
+                            "{}.expect(\"runtime owner attach failed\");",
+                            target::owner_attach(
+                                "runtime.owner",
+                                &format!("{}.cast()", target::non_null_from_mut("inner"))
+                            )
+                        ));
+                    });
+                    w.line("runtime");
+                },
+            );
+            w.block(
+                format_args!(
+                    "fn with_entry<R>(&mut self, f: impl for<'entry> FnOnce(AnvEntry<'entry, 'cx>) -> {}) -> {}",
+                    target::result_ty("R"),
+                    target::result_ty("R")
+                ),
+                |w| {
+                    w.line(format_args!(
+                        "let owner_entry = {}?;",
+                        target::owner_enter_current("self.owner")
+                    ));
+                    w.line(format_args!(
+                        "let inner = unsafe {{ {} }};",
+                        target::non_null_cast_mut(
+                            &target::owner_entry_ptr("owner_entry"),
+                            &format!("{inner}<'cx>")
+                        )
+                    ));
+                    w.block("f(AnvEntry", |w| {
+                        w.line(format_args!(
+                            "heap: {},",
+                            target::non_null_from_mut("&mut inner.heap")
+                        ));
+                        w.line("types: &inner.types,");
+                        w.line("globals: &inner.globals,");
+                        if !retained_sigs.is_empty() {
+                            w.line("owner: &self.owner,");
+                            w.line(format_args!(
+                                "callbacks: {},",
+                                target::non_null_from_mut("&mut inner.callbacks")
+                            ));
+                        }
+                    });
+                    w.line(")");
+                },
+            );
+        });
+        self.w.blank();
+        self.w
+            .block(format_args!("impl<'cx> Drop for {runtime}<'cx>"), |w| {
+                w.block("fn drop(&mut self)", |w| {
+                    w.line(format_args!(
+                        "let _ = {};",
+                        target::owner_detach("self.owner")
+                    ));
+                });
+            });
+        self.w.blank();
+    }
+
+    fn has_retained_callbacks(&self) -> bool {
+        !self.retained_callback_sigs.is_empty()
+    }
+
+    fn emit_callback_registry(&mut self) {
+        if self.retained_callback_sigs.is_empty() {
+            return;
+        }
+        let sigs = self.retained_callback_sigs.clone();
+        let policy = RustRepPolicy::new(self.program);
+        for sig in &sigs {
+            let record = target::callback_record_symbol(sig.index());
+            let lambda = policy.lambda_sig_storage_ty(*sig);
+            self.w.block(format_args!("struct {record}<'cx>"), |w| {
+                w.line(format_args!("lambda: {lambda},"));
+                w.line("_brand: std::marker::PhantomData<&'cx ()>,");
+            });
+            self.w.blank();
+            if self.trace_plan.needs_lambda_sig_trace(*sig) {
+                let ty = format!("{record}<'cx>");
+                self.w.block(
+                    format_args!("{}", target::trace_impl_header("<'cx>", &ty)),
+                    |w| {
+                        w.line(format_args!("{} {{", target::trace_fn_header()));
+                        w.indented(|w| {
+                            w.line(format_args!(
+                                "{}::trace(&self.lambda, visitor);",
+                                target::trace_ty()
+                            ));
+                        });
+                        w.line("}");
+                    },
+                );
+                self.w.blank();
+            }
+        }
+        let registry = target::generated_callback_registry_symbol();
+        self.w.line("#[derive(Default)]");
+        self.w.block(format_args!("struct {registry}<'cx>"), |w| {
+            for sig in &sigs {
+                let field = target::callback_table_field(sig.index());
+                let record = target::callback_record_symbol(sig.index());
+                let root = target::root_id_ty(&format!("{record}<'cx>"));
+                w.line(format_args!(
+                    "{field}: Vec<{}>,",
+                    target::callback_slot_ty(&root)
+                ));
+            }
+            w.line("_brand: std::marker::PhantomData<&'cx ()>,");
+        });
+        self.w.blank();
+        self.w
+            .block(format_args!("impl<'cx> {registry}<'cx>"), |w| {
+                for sig in &sigs {
+                    let field = target::callback_table_field(sig.index());
+                    let record = target::callback_record_symbol(sig.index());
+                    let root = target::root_id_ty(&format!("{record}<'cx>"));
+                    w.block(
+                        format_args!(
+                            "fn insert_{field}(&mut self, root: {root}) -> (usize, std::num::NonZeroU64)"
+                        ),
+                        |w| {
+                            w.line(format_args!(
+                                "if let Some((index, slot)) = self.{field}.iter_mut().enumerate().find(|(_, slot)| slot.is_free()) {{"
+                            ));
+                            w.indented(|w| {
+                                w.line("let generation = slot.insert(root).expect(\"callback slot open failed\");");
+                                w.line("return (index, generation);");
+                            });
+                            w.line("}");
+                            w.line(format_args!("let index = self.{field}.len();"));
+                            w.line(format_args!(
+                                "let mut slot = {}::default();",
+                                target::callback_slot_turbofish(&root)
+                            ));
+                            w.line("let generation = slot.insert(root).expect(\"callback slot open failed\");");
+                            w.line(format_args!("self.{field}.push(slot);"));
+                            w.line("(index, generation)");
+                        },
+                    );
+                }
+            });
+        self.w.blank();
+    }
+
+    fn callback_args_ty(&self, sig: &RirLambdaSig) -> String {
+        let policy = RustRepPolicy::new(self.program);
+        match sig.params.as_slice() {
+            [] => "()".to_string(),
+            [param] => format!(
+                "({},)",
+                policy.callable_param_ty(param.ty, param.abi, param.escape)
+            ),
+            params => format!(
+                "({})",
+                comma(params.iter().map(|param| policy.callable_param_ty(
+                    param.ty,
+                    param.abi,
+                    param.escape
+                )))
+            ),
+        }
+    }
+
+    fn callback_ret_ty(&self, sig: &RirLambdaSig) -> String {
+        RustRepPolicy::new(self.program).callable_ret_ty(sig.ret)
+    }
+
+    fn emit_callback_thunks(&mut self) {
+        for sig_id in self.retained_callback_sigs.clone() {
+            let sig = &self.program.lambda_sigs[sig_id.index()];
+            let args_ty = self.callback_args_ty(sig);
+            let ret_ty = self.callback_ret_ty(sig);
+            let call_thunk = target::callback_call_thunk_symbol(sig_id.index());
+            let close_thunk = target::callback_close_thunk_symbol(sig_id.index());
+            let key_ty = target::callback_key_ty();
+            let owner_ty = target::runtime_owner_handle_ty();
+            let result_ret = target::result_ty(&ret_ty);
+            let inner = target::generated_runtime_inner_symbol();
+            let field = target::callback_table_field(sig_id.index());
+            let expected_table = sig_id.index() + 1;
+            let expected_signature = sig_id.index() + 1;
+            let key_check = format!(
+                "key.__anvyx_check_identity(std::num::NonZeroU64::new({expected_table}).unwrap(), std::num::NonZeroU64::new({expected_signature}).unwrap())?;"
+            );
+            let lambda_call_args = [
+                "&mut rt".to_string(),
+                "types".to_string(),
+                "globals".to_string(),
+                "owner".to_string(),
+                "callbacks".to_string(),
+            ]
+            .into_iter()
+            .chain((0..sig.params.len()).map(|index| format!("args.{index}")))
+            .collect::<Vec<_>>();
+            let lambda_fallible = self.lambda_sig_fallible(sig);
+            let trace_globals = self
+                .program
+                .globals
+                .iter()
+                .any(|global| RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty));
+            self.w.block(
+                format_args!(
+                    "unsafe fn {call_thunk}(owner: &{owner_ty}, key: {key_ty}, args: {args_ty}) -> {result_ret}"
+                ),
+                |w| {
+                    w.line(&key_check);
+                    w.line("let owner_entry = owner.__anvyx_enter(key.owner_id(), key.shutdown_generation())?;");
+                    w.line(format_args!(
+                        "let mut inner_ptr = {}.cast::<{inner}<'_>>();",
+                        target::owner_entry_ptr("owner_entry")
+                    ));
+                    w.line("let (lambda, guard) = {");
+                    w.indented(|w| {
+                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
+                        w.line(format_args!("let table = &mut inner.callbacks.{field};"));
+                        w.line("let Some(slot) = table.get_mut(key.index()) else {");
+                        w.indented(|w| {
+                            w.line(format_args!(
+                                "return Err({}::new(\"callback slot is closed\"));",
+                                target::runtime_error_ty()
+                            ));
+                        });
+                        w.line("};");
+                        w.line("let (root, guard) = slot.begin_invocation(owner, key)?;");
+                        w.line("let Some(lambda) = inner.heap.with_root(root, |record| record.lambda.clone()) else {");
+                        w.indented(|w| {
+                            w.line(format_args!(
+                                "return Err({}::new(\"callback root is missing\"));",
+                                target::runtime_error_ty()
+                            ));
+                        });
+                        w.line("};");
+                        w.line("(lambda, guard)");
+                    });
+                    w.line("};");
+                    w.line("let (heap, types, globals, callbacks) = {");
+                    w.indented(|w| {
+                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
+                        w.line("let heap = std::ptr::NonNull::from(&mut inner.heap);");
+                        w.line("let types = std::ptr::NonNull::from(&inner.types);");
+                        w.line("let globals = std::ptr::NonNull::from(&inner.globals);");
+                        w.line("let callbacks = std::ptr::NonNull::from(&mut inner.callbacks);");
+                        w.line("(heap, types, globals, callbacks)");
+                    });
+                    w.line("};");
+                    w.line("let types = unsafe { types.as_ref() };");
+                    w.line("let globals = unsafe { globals.as_ref() };");
+                    w.line(format_args!(
+                        "let mut rt = {};",
+                        if trace_globals {
+                            target::runtime_ctx_from_raw_with_roots("heap", "globals")
+                        } else {
+                            target::runtime_ctx_from_raw("heap")
+                        }
+                    ));
+                    let lambda_call = format!("lambda.call({})", comma(lambda_call_args));
+                    let result = if lambda_fallible {
+                        lambda_call
+                    } else {
+                        format!("Ok({lambda_call})")
+                    };
+                    w.line(format_args!("let __anv_callback_result = {result};"));
+                    w.line("let __anv_callback_action = guard.finish();");
+                    w.line("if __anv_callback_action == Ok(anvyx_runtime::CallbackCloseAction::RemoveRoot) {");
+                    w.indented(|w| {
+                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
+                        w.line(format_args!("let table = &mut inner.callbacks.{field};"));
+                        w.line("if let Some(slot) = table.get_mut(key.index()) {");
+                        w.indented(|w| {
+                            w.line("if let Some(root) = slot.take_closed_root(key) {");
+                            w.indented(|w| w.line("inner.heap.remove_root(&root);"));
+                            w.line("}");
+                        });
+                        w.line("}");
+                    });
+                    w.line("}");
+                    w.line("__anv_callback_action?;");
+                    w.line("__anv_callback_result");
+                },
+            );
+            self.w.blank();
+            self.w.block(
+                format_args!(
+                    "unsafe fn {close_thunk}(owner: &{owner_ty}, key: {key_ty}) -> {}",
+                    target::result_ty("bool")
+                ),
+                |w| {
+                    w.line(&key_check);
+                    w.line("let owner_entry = owner.__anvyx_enter(key.owner_id(), key.shutdown_generation())?;");
+                    w.line(format_args!(
+                        "let inner = unsafe {{ {} }};",
+                        target::non_null_cast_mut(
+                            &target::owner_entry_ptr("owner_entry"),
+                            &format!("{inner}<'_>")
+                        )
+                    ));
+                    w.line(format_args!("let table = &mut inner.callbacks.{field};"));
+                    w.line("let Some(slot) = table.get_mut(key.index()) else { return Ok(false); };");
+                    w.line("let (close, root) = slot.close(key);");
+                    w.line("if let Some(root) = root {");
+                    w.indented(|w| w.line("inner.heap.remove_root(&root);"));
+                    w.line("}");
+                    w.line("Ok(close.closed)");
+                },
+            );
+            self.w.blank();
+        }
     }
 
     fn emit_main(&mut self, entry: super::rir::RirFunctionId) {
         let symbol = self.program.functions[entry.index()].symbol.as_str();
         let fallible = self.fallible_functions[entry.index()];
+        let retained_callbacks = self.has_retained_callbacks();
         let ret = if fallible {
             format!(" -> {}", target::result_ty("()"))
         } else {
             String::new()
         };
-        let types_ty = target::generated_types_symbol(&self.program.ctx);
-        let globals_ty = target::generated_globals_symbol(&self.program.ctx);
         self.w.block(format_args!("fn main(){ret}"), |w| {
-            w.line(format_args!("{}(|heap| {{", target::heap_scope()));
+            w.line(format_args!("{}(|heap| {{", target::heap_scope_owned()));
             w.indented(|w| {
-                w.line(format_args!("let types = {types_ty}::register(heap);"));
-                w.line(format_args!("let globals = {globals_ty}::new();"));
-                let rt =
-                    if self.program.globals.iter().any(|global| {
+                w.line(format_args!(
+                    "let mut runtime = {}::new(heap);",
+                    target::generated_runtime_symbol()
+                ));
+                w.line("runtime.with_entry(|anv_entry| {");
+                w.indented(|w| {
+                    let rt = if self.program.globals.iter().any(|global| {
                         RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty)
                     }) {
-                        target::runtime_ctx_new_with_roots("heap", "&globals")
+                        target::runtime_ctx_from_raw_with_roots(
+                            "anv_entry.heap",
+                            "anv_entry.globals",
+                        )
                     } else {
-                        target::runtime_ctx_new("heap")
+                        target::runtime_ctx_from_raw("anv_entry.heap")
                     };
-                w.line(format_args!("let mut rt = {rt};"));
-                w.line(format_args!(
-                    "let _ = {symbol}(&mut rt, &types, &globals){};",
-                    if fallible { "?" } else { "" }
-                ));
-                if fallible {
+                    w.line(format_args!("let mut rt = {rt};"));
+                    let mut args = vec![
+                        "&mut rt".to_string(),
+                        "anv_entry.types".to_string(),
+                        "anv_entry.globals".to_string(),
+                    ];
+                    if retained_callbacks {
+                        args.extend([
+                            "anv_entry.owner".to_string(),
+                            "anv_entry.callbacks".to_string(),
+                        ]);
+                    }
+                    w.line(format_args!(
+                        "let _ = {symbol}({}){};",
+                        comma(args),
+                        if fallible { "?" } else { "" }
+                    ));
                     w.line("Ok(())");
+                });
+                if fallible {
+                    w.line("})");
+                } else {
+                    w.line("}).expect(\"runtime entry failed\");");
                 }
             });
             if fallible {
@@ -689,7 +1118,8 @@ impl EmitCx<'_> {
                 )
             })
             .collect::<Vec<_>>();
-        let params = [
+        let retained_callbacks = self.has_retained_callbacks();
+        let mut params = vec![
             format!("rt: {}", target::runtime_ctx_ref_ty()),
             format!(
                 "types: {}",
@@ -699,15 +1129,30 @@ impl EmitCx<'_> {
                 "globals: {}",
                 target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
             ),
-        ]
-        .into_iter()
-        .chain(sig.params.iter().enumerate().map(|(index, param)| {
+        ];
+        if retained_callbacks {
+            params.extend([
+                format!(
+                    "{}: &{}",
+                    target::owner_param_name(),
+                    target::runtime_owner_handle_ty()
+                ),
+                format!(
+                    "{}: {}",
+                    target::callbacks_param_name(),
+                    target::non_null_ty(&format!(
+                        "{}<'cx>",
+                        target::generated_callback_registry_symbol()
+                    ))
+                ),
+            ]);
+        }
+        params.extend(sig.params.iter().enumerate().map(|(index, param)| {
             format!(
                 "arg_{index}: {}",
                 policy.callable_param_ty(param.ty, param.abi, param.escape)
             )
-        }))
-        .collect::<Vec<_>>();
+        }));
         let fallible = variants
             .iter()
             .any(|(_, function, _, _)| self.fallible_functions[function.index()]);
@@ -787,12 +1232,14 @@ impl EmitCx<'_> {
         }
         let fallible_functions = &self.fallible_functions;
         let body_call = |function: &RirFunction, capture_args: Vec<String>| {
-            let call = target::generated_call(
-                function.symbol.as_str(),
-                capture_args
-                    .into_iter()
-                    .chain((0..arity).map(|index| format!("arg_{index}"))),
-            );
+            let args = capture_args
+                .into_iter()
+                .chain((0..arity).map(|index| format!("arg_{index}")));
+            let call = if retained_callbacks {
+                target::retained_generated_call(function.symbol.as_str(), args)
+            } else {
+                target::generated_call(function.symbol.as_str(), args)
+            };
             if fallible && !fallible_functions[function.id.index()] {
                 format!("Ok({call})")
             } else {
@@ -903,8 +1350,9 @@ impl EmitCx<'_> {
                     w.indented(|w| {
                         for (lambda, _, storage, captures) in variants {
                             let variant = lambda_variant(*lambda);
-                            match policy.lambda_trace_action(&self.program.lambdas[lambda.index()])
-                            {
+                            match RustRepPolicy::lambda_trace_action(
+                                &self.program.lambdas[lambda.index()],
+                            ) {
                                 LambdaTraceAction::HeapEnv => {
                                     debug_assert!(matches!(
                                         storage,
@@ -986,6 +1434,12 @@ impl EmitCx<'_> {
         };
         let thunk = target::scoped_lambda_thunk();
         let state_ty = target::non_null_unit_ty();
+        let retained_callbacks = self.has_retained_callbacks();
+        let state_tuple = if retained_callbacks {
+            format!("(Self, {state_ty}, {state_ty}, {state_ty}, {state_ty}, {state_ty})")
+        } else {
+            format!("(Self, {state_ty}, {state_ty}, {state_ty})")
+        };
         self.w
             .block(format_args!("impl{lifetime} {symbol}{lifetime}"), |w| {
                 w.block(
@@ -993,7 +1447,7 @@ impl EmitCx<'_> {
                         "unsafe fn {thunk}{thunk_generics}(state: {state_ty}, args: {args_ty}) -> {result_ty}"
                     ),
                     |w| {
-                        w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<(Self, {state_ty}, {state_ty}, {state_ty})>() }};"));
+                        w.line(format_args!("let state = unsafe {{ &mut *state.as_ptr().cast::<{state_tuple}>() }};"));
                         w.line(format_args!(
                             "let rt = unsafe {{ state.1.cast::<{rt_ty}>().as_mut() }};"
                         ));
@@ -1003,8 +1457,25 @@ impl EmitCx<'_> {
                         w.line(format_args!(
                             "let globals = unsafe {{ state.3.cast::<{globals_ty}>().as_ref() }};"
                         ));
+                        if retained_callbacks {
+                            let owner_ty = target::runtime_owner_handle_ty();
+                            let callbacks_ty = format!(
+                                "{}<{ctx_lifetime}>",
+                                target::generated_callback_registry_symbol()
+                            );
+                            w.line(format_args!(
+                                "let owner = unsafe {{ state.4.cast::<{owner_ty}>().as_ref() }};"
+                            ));
+                            w.line(format_args!(
+                                "let callbacks = state.5.cast::<{callbacks_ty}>();"
+                            ));
+                        }
                         w.line(destructure);
-                        let call_args = target::generated_call_args(args);
+                        let call_args = if retained_callbacks {
+                            target::retained_generated_call_args(args)
+                        } else {
+                            target::generated_call_args(args)
+                        };
                         let call = format!("state.0.call({})", comma(call_args));
                         if fallible {
                             w.line(call);
@@ -1040,6 +1511,7 @@ impl EmitCx<'_> {
     fn emit_function(&mut self, function: &RirFunction) {
         let ctx_use = analysis::function_context_use(self.program, function);
         let policy = RustRepPolicy::new(self.program);
+        let retained_callbacks = self.has_retained_callbacks();
         let mut params = vec![
             format!(
                 "{}: {}",
@@ -1057,6 +1529,23 @@ impl EmitCx<'_> {
                 target::globals_ref_ty(target::generated_globals_symbol(&self.program.ctx))
             ),
         ];
+        if retained_callbacks {
+            params.extend([
+                format!(
+                    "{}: &{}",
+                    target::owner_param_name(),
+                    target::runtime_owner_handle_ty()
+                ),
+                format!(
+                    "{}: {}",
+                    target::callbacks_param_name(),
+                    target::non_null_ty(&format!(
+                        "{}<'cx>",
+                        target::generated_callback_registry_symbol()
+                    ))
+                ),
+            ]);
+        }
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
             let mutability =
@@ -2124,7 +2613,7 @@ impl EmitCx<'_> {
             RirCollectionAccess::MutPlace(source) => self.mut_place_access_block(
                 function,
                 source,
-                format!("Ok({})", target::collection_len("value")),
+                &format!("Ok({})", target::collection_len("value")),
             ),
         }
     }
@@ -2321,7 +2810,7 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         collection: &RirMutPlaceArg,
-        body: String,
+        body: &str,
     ) -> String {
         let (prelude, place) = self.prepared_mut_place_arg(function, 0, collection);
         block_expr(
@@ -2329,7 +2818,7 @@ impl EmitCx<'_> {
             Some(target::mut_place_access_ctx(
                 &place,
                 target::runtime_param_name(),
-                &body,
+                body,
             )),
         )
     }
@@ -2338,7 +2827,7 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         collection: &RirMutPlaceArg,
-        body: String,
+        body: &str,
     ) -> String {
         let (prelude, place) = self.prepared_mut_place_arg(function, 0, collection);
         block_expr(
@@ -2346,7 +2835,7 @@ impl EmitCx<'_> {
             Some(target::mut_place_mutate_ctx(
                 &place,
                 target::runtime_param_name(),
-                &body,
+                body,
             )),
         )
     }
@@ -2367,7 +2856,7 @@ impl EmitCx<'_> {
             )],
             Some(format!("let elem = &value[index]; Ok({elem})")),
         );
-        self.mut_place_access_block(function, collection, body)
+        self.mut_place_access_block(function, collection, &body)
     }
 
     fn mut_place_array_slot_set(
@@ -2397,7 +2886,7 @@ impl EmitCx<'_> {
             ],
             Some(update),
         );
-        self.mut_place_mutate_block(function, collection, body)
+        self.mut_place_mutate_block(function, collection, &body)
     }
 
     fn mut_place_list_slot_at(
@@ -2429,7 +2918,7 @@ impl EmitCx<'_> {
                 )
             )),
         );
-        self.mut_place_access_block(function, collection, body)
+        self.mut_place_access_block(function, collection, &body)
     }
 
     fn mut_place_list_slot_set(
@@ -2463,7 +2952,7 @@ impl EmitCx<'_> {
                 )
             )),
         );
-        self.mut_place_mutate_block(function, collection, body)
+        self.mut_place_mutate_block(function, collection, &body)
     }
 
     fn mut_place_slice_slot_at(
@@ -2481,7 +2970,7 @@ impl EmitCx<'_> {
                 target::slice_elem_at_shared("value", target::runtime_param_name(), "index")
             )),
         );
-        self.mut_place_access_block(function, collection, body)
+        self.mut_place_access_block(function, collection, &body)
     }
 
     fn mut_place_slice_slot_set(
@@ -2507,7 +2996,7 @@ impl EmitCx<'_> {
                 )
             )),
         );
-        self.mut_place_mutate_block(function, collection, body)
+        self.mut_place_mutate_block(function, collection, &body)
     }
 
     fn sequence_slot_place(collection: &RirPlace, index: RirLocalId, ty: RirTypeId) -> RirPlace {
@@ -2649,7 +3138,7 @@ impl EmitCx<'_> {
                 )
             }
             RirCollectionAccess::MutPlace(map) => {
-                self.mut_place_access_block(function, map, format!("Ok({})", value("value")))
+                self.mut_place_access_block(function, map, &format!("Ok({})", value("value")))
             }
         }
     }
@@ -2690,7 +3179,7 @@ impl EmitCx<'_> {
                     )],
                     Some(format!("Ok({})", value("value", &version))),
                 );
-                self.mut_place_access_block(function, map, body)
+                self.mut_place_access_block(function, map, &body)
             }
         }
     }
@@ -2734,7 +3223,7 @@ impl EmitCx<'_> {
                     )],
                     Some(format!("{}?; Ok(())", update("value", &version))),
                 );
-                self.mut_place_mutate_block(function, map, body)
+                self.mut_place_mutate_block(function, map, &body)
             }
         }
     }
@@ -2993,7 +3482,12 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
         render: impl FnOnce(String) -> String,
     ) -> String {
-        self.prepared_call_expr(function, args, target::generated_call_args([]), render)
+        let rendered = if self.has_retained_callbacks() {
+            target::retained_generated_call_args([])
+        } else {
+            target::generated_call_args([])
+        };
+        self.prepared_call_expr(function, args, rendered, render)
     }
 
     fn prepared_call_expr(
@@ -3019,7 +3513,7 @@ impl EmitCx<'_> {
             let (mut stmts, mut expr) = self.prepared_call_arg(function, index, arg);
             prelude.append(&mut stmts);
             if let Some(abi) = abis.get(index) {
-                expr = self.native_arg_expr(abi, expr);
+                expr = Self::native_arg_expr(abi, expr);
             }
             rendered.push(expr);
         }
@@ -3031,7 +3525,7 @@ impl EmitCx<'_> {
         }
     }
 
-    fn native_arg_expr(&self, abi: &anvyx_runtime::RustParamAbi, expr: String) -> String {
+    fn native_arg_expr(abi: &anvyx_runtime::RustParamAbi, expr: String) -> String {
         let anvyx_runtime::RustParamAbi::List(inner) = abi else {
             return expr;
         };
@@ -3061,6 +3555,9 @@ impl EmitCx<'_> {
         let values = RustValues::new(self.program, function);
         if let RirCallArg::ScopedLambda { callee, sig } = arg {
             return self.prepared_scoped_lambda_call_arg(function, index, callee, *sig);
+        }
+        if let RirCallArg::EscapingLambda { callee, sig } = arg {
+            return self.prepared_escaping_lambda_call_arg(function, index, callee, *sig);
         }
         if let RirCallArg::Value(operand @ RirOperand::Place(place)) = arg {
             let places = RustPlaces::new(self.program, function);
@@ -3239,6 +3736,13 @@ impl EmitCx<'_> {
         let rt_ptr = target::non_null_from_mut("&mut *rt");
         let types_ptr = target::non_null_from_mut("types");
         let globals_ptr = target::non_null_from_mut("globals");
+        let retained_callbacks = self.has_retained_callbacks();
+        let retained_ptrs = retained_callbacks.then(|| {
+            format!(
+                ", {}.cast::<()>(), callbacks.cast::<()>()",
+                target::non_null_from_ref("owner")
+            )
+        });
         let ctor = target::scoped_lambda_ctor(&args_ty, &ret_ty);
         let thunk = format!(
             "{}::{}",
@@ -3247,9 +3751,61 @@ impl EmitCx<'_> {
         );
         (
             vec![format!(
-                "let mut {state} = ({lambda}, {rt_ptr}.cast::<()>(), {types_ptr}.cast::<()>(), {globals_ptr}.cast::<()>());"
+                "let mut {state} = ({lambda}, {rt_ptr}.cast::<()>(), {types_ptr}.cast::<()>(), {globals_ptr}.cast::<()>(){});",
+                retained_ptrs.as_deref().unwrap_or("")
             )],
             format!("unsafe {{ {ctor}::__anvyx_from_raw(&mut {state}, {thunk}) }}"),
+        )
+    }
+
+    fn prepared_escaping_lambda_call_arg(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        callee: &RirOperand,
+        sig: RirLambdaSigId,
+    ) -> (Vec<String>, String) {
+        let values = RustValues::new(self.program, function);
+        let lambda = values.value_operand(callee);
+        let sig_data = &self.program.lambda_sigs[sig.index()];
+        let args_ty = self.callback_args_ty(sig_data);
+        let ret_ty = self.callback_ret_ty(sig_data);
+        let record = target::callback_record_symbol(sig.index());
+        let field = target::callback_table_field(sig.index());
+        let callback_ctor = target::escaping_lambda_ctor_ty(&args_ty, &ret_ty);
+        let key = format!("__anv_callback_key_{index}");
+        let root = format!("__anv_callback_root_{index}");
+        let handle = format!("__anv_callback_handle_{index}");
+        let record_var = format!("__anv_callback_record_{index}");
+        let index_var = format!("__anv_callback_index_{index}");
+        let generation = format!("__anv_callback_generation_{index}");
+        let arg = format!("__anv_callback_arg_{index}");
+        let table_id = sig.index() + 1;
+        let signature_id = sig.index() + 1;
+        (
+            vec![
+                format!(
+                    "let {record_var} = {record} {{ lambda: {lambda}, _brand: std::marker::PhantomData }};"
+                ),
+                format!(
+                    "let {handle} = rt.heap().alloc(types.callback_record_sig{}, {record_var});",
+                    sig.index()
+                ),
+                format!("let {root} = rt.heap().root(&{handle});"),
+                format!(
+                    "let ({index_var}, {generation}) = unsafe {{ &mut *callbacks.as_ptr() }}.insert_{field}({root});"
+                ),
+                format!(
+                    "let {key} = {}::new(owner.owner_id(), owner.shutdown_generation(), std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap(), {index_var}, {generation});",
+                    target::callback_key_ty()
+                ),
+                format!(
+                    "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {key}, {}, {}) }};",
+                    target::callback_call_thunk_symbol(sig.index()),
+                    target::callback_close_thunk_symbol(sig.index())
+                ),
+            ],
+            arg,
         )
     }
 
@@ -3586,8 +4142,16 @@ impl EmitCx<'_> {
                 )
             }
         };
+        let suspend_entry = self.has_retained_callbacks();
         self.prepared_native_call_expr(function, args, param_abis, rendered, |rendered| {
             let call = format!("{symbol}({rendered})");
+            let call = if suspend_entry {
+                format!(
+                    "{{ let __anv_provider_entry = owner.__anvyx_suspend_entry_for_provider()?; let __anv_provider_result = {call}; drop(__anv_provider_entry); __anv_provider_result }}"
+                )
+            } else {
+                call
+            };
             let call = if fallible { format!("{call}?") } else { call };
             self.native_return_call(function, ext.ret, ret_abi, call)
         })
@@ -3765,7 +4329,11 @@ impl EmitCx<'_> {
             } => {
                 let symbol = self.program.functions[target.index()].symbol.as_str();
                 let arg = RustValues::new(self.program, function).stringify_arg(mode, value);
-                let call = target::generated_call(symbol, [arg]);
+                let call = if self.has_retained_callbacks() {
+                    target::retained_generated_call(symbol, [arg])
+                } else {
+                    target::generated_call(symbol, [arg])
+                };
                 if self.fallible_functions[target.index()] {
                     format!("{call}?")
                 } else {
@@ -3963,10 +4531,7 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
         RirRValue::ListPush { list, value } => {
             list.uses_local(local) || operand_uses_local(program, value, local)
         }
-        RirRValue::MapGet { map, key, .. } => {
-            map.uses_local(local) || operand_uses_local(program, key, local)
-        }
-        RirRValue::MapRemove { map, key, .. } => {
+        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
             map.uses_local(local) || operand_uses_local(program, key, local)
         }
         RirRValue::MapInsert {
@@ -4003,7 +4568,9 @@ fn call_arg_uses_local(program: &RirProgram, arg: &RirCallArg, local: RirLocalId
             place_uses_local(place, local)
         }
         RirCallArg::MutPlace(place) => mut_place_arg_uses_local(program, place, local),
-        RirCallArg::ScopedLambda { callee, .. } => operand_uses_local(program, callee, local),
+        RirCallArg::ScopedLambda { callee, .. } | RirCallArg::EscapingLambda { callee, .. } => {
+            operand_uses_local(program, callee, local)
+        }
         RirCallArg::SharedStringConst(_) => false,
     }
 }
@@ -4119,9 +4686,9 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
         | RirStmt::Eval(value) => rvalue_uses_scoped_lambda_sig(value, sig),
-        RirStmt::SequenceSlotSet { .. } => false,
         RirStmt::GlobalEnsure { .. }
         | RirStmt::DataRefSet { .. }
+        | RirStmt::SequenceSlotSet { .. }
         | RirStmt::MapValueSet { .. }
         | RirStmt::If(_)
         | RirStmt::Loop(_)
@@ -4148,6 +4715,10 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             callee: RirOperand::Place(place),
             ..
         }
+        | RirCallArg::EscapingLambda {
+            callee: RirOperand::Place(place),
+            ..
+        }
         | RirCallArg::SharedBorrow(place)
         | RirCallArg::MutBorrow(place) => {
             let RirPlaceRoot::Local(local) = place.root else {
@@ -4163,6 +4734,10 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
         },
         RirCallArg::Value(RirOperand::Const(_))
         | RirCallArg::ScopedLambda {
+            callee: RirOperand::Const(_),
+            ..
+        }
+        | RirCallArg::EscapingLambda {
             callee: RirOperand::Const(_),
             ..
         }
@@ -4225,6 +4800,7 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
             RirParamSemantic::MutPlace
             | RirParamSemantic::ScopedLambda
+            | RirParamSemantic::EscapingLambda
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),

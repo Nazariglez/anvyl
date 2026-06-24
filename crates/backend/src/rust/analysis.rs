@@ -63,7 +63,8 @@ fn stmt_calls_fallible(
         | RirStmt::CellSet { .. }
         | RirStmt::ScopedPlaceCellSet { .. }
         | RirStmt::SequenceSlotSet { .. }
-        | RirStmt::MapValueSet { .. } => true,
+        | RirStmt::MapValueSet { .. }
+        | RirStmt::MapEntryMatch(_) => true,
         RirStmt::Assign { dst, value } => {
             place_is_mut_place_param(function, dst)
                 || place_has_fallible_projection(program, function, dst)
@@ -88,7 +89,6 @@ fn stmt_calls_fallible(
                     block_calls_fallible(program, fallible, function, block)
                 })
         }
-        RirStmt::MapEntryMatch(_) => true,
         _ => stmt_child_blocks_any(stmt, |block| {
             block_calls_fallible(program, fallible, function, block)
         }),
@@ -140,7 +140,8 @@ fn rvalue_calls_fallible(
                         RirCallTarget::Function(id) => fallible[id.index()],
                         RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
                             RirExternKind::Native(native) => {
-                                native.abi.fallible
+                                program.has_retained_callbacks()
+                                    || native.abi.fallible
                                     || native_arg_conversion_fallible(&native.abi.params)
                             }
                         },
@@ -251,6 +252,9 @@ fn call_arg_has_fallible_place(
     match arg {
         RirCallArg::Value(operand)
         | RirCallArg::ScopedLambda {
+            callee: operand, ..
+        }
+        | RirCallArg::EscapingLambda {
             callee: operand, ..
         } => operand_has_fallible_place(program, function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
@@ -666,7 +670,7 @@ fn call_arg_context_use(
 ) -> ContextUse {
     match arg {
         RirCallArg::Value(operand) => operand_context_use(program, function, operand),
-        RirCallArg::ScopedLambda { callee, .. } => {
+        RirCallArg::ScopedLambda { callee, .. } | RirCallArg::EscapingLambda { callee, .. } => {
             ContextUse::generated_call().union(operand_context_use(program, function, callee))
         }
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
@@ -812,6 +816,9 @@ fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bo
         RirCallArg::Value(operand)
         | RirCallArg::ScopedLambda {
             callee: operand, ..
+        }
+        | RirCallArg::EscapingLambda {
+            callee: operand, ..
         } => operand_uses_mut_place_param(function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_is_mut_place_param(function, place)
@@ -916,11 +923,7 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
             collection_access_uses_mut_place_param(function, list)
                 || operand_uses_mut_place_param(function, value)
         }
-        RirRValue::MapGet { map, key, .. } => {
-            collection_access_uses_mut_place_param(function, map)
-                || operand_uses_mut_place_param(function, key)
-        }
-        RirRValue::MapRemove { map, key, .. } => {
+        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
             collection_access_uses_mut_place_param(function, map)
                 || operand_uses_mut_place_param(function, key)
         }

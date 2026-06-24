@@ -52,6 +52,9 @@ impl<'a> RustValues<'a> {
             RirCallArg::ScopedLambda { .. } => {
                 unreachable!("scoped lambda arguments must be prepared before rendering")
             }
+            RirCallArg::EscapingLambda { .. } => {
+                unreachable!("escaping lambda arguments must be prepared before rendering")
+            }
         }
     }
 
@@ -71,7 +74,12 @@ impl<'a> RustValues<'a> {
 
     pub(super) fn global_init_call(program: &RirProgram, global: RirGlobalId) -> String {
         let global = &program.globals[global.index()];
-        target::generated_call(program.functions[global.init.index()].symbol.as_str(), [])
+        let symbol = program.functions[global.init.index()].symbol.as_str();
+        if program.has_retained_callbacks() {
+            target::retained_generated_call(symbol, [])
+        } else {
+            target::generated_call(symbol, [])
+        }
     }
 
     pub(super) fn global_value_binding(&self, global: RirGlobalId, tmp: &str) -> String {
@@ -509,7 +517,7 @@ impl<'a> RustValues<'a> {
         ProjectedPlaceDescriptor {
             struct_decl,
             ctor: projected_ops_ctor(ops, &projection.inits),
-            impl_decl: self.mut_place_projection_ops_impl(
+            impl_decl: Self::mut_place_projection_ops_impl(
                 ops,
                 &root_ty,
                 &slot_ty,
@@ -519,7 +527,6 @@ impl<'a> RustValues<'a> {
     }
 
     fn mut_place_projection_ops_impl(
-        &self,
         ops: &str,
         root_ty: &str,
         slot_ty: &str,
@@ -780,6 +787,7 @@ impl<'a> RustValues<'a> {
             RirParamSemantic::MutBorrow
             | RirParamSemantic::MutPlace
             | RirParamSemantic::ScopedLambda
+            | RirParamSemantic::EscapingLambda
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),

@@ -401,8 +401,8 @@ pub fn execute_with_events_and_timeout(
                 return Ok(RustCargoOutput::CargoFailed(failure(
                     &layout,
                     cargo.status.code(),
-                    cargo.stdout,
-                    cargo.stderr,
+                    &cargo.stdout,
+                    &cargo.stderr,
                 )));
             }
 
@@ -415,8 +415,8 @@ pub fn execute_with_events_and_timeout(
                 RustCargoMode::Build => Ok(RustCargoOutput::Success(success(
                     &layout,
                     binary_path,
-                    cargo.stdout,
-                    cargo.stderr,
+                    &cargo.stdout,
+                    &cargo.stderr,
                 ))),
                 RustCargoMode::Run => {
                     let run_timeout = remaining_timeout(started, timeout)?;
@@ -426,15 +426,15 @@ pub fn execute_with_events_and_timeout(
                         return Ok(RustCargoOutput::RunFailed(failure(
                             &layout,
                             run.status.code(),
-                            run.stdout,
-                            run.stderr,
+                            &run.stdout,
+                            &run.stderr,
                         )));
                     }
                     Ok(RustCargoOutput::Success(success(
                         &layout,
                         binary_path,
-                        run.stdout,
-                        run.stderr,
+                        &run.stdout,
+                        &run.stderr,
                     )))
                 }
             }
@@ -463,8 +463,8 @@ pub fn execute_batch_with_timeout(
                 return Ok(RustCargoBatchOutput::CargoFailed(failure(
                     &layout,
                     cargo.status.code(),
-                    cargo.stdout,
-                    cargo.stderr,
+                    &cargo.stdout,
+                    &cargo.stderr,
                 )));
             }
 
@@ -795,32 +795,32 @@ fn join_output_reader(
 fn success(
     layout: &RustCargoLayout,
     binary_path: PathBuf,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: &[u8],
+    stderr: &[u8],
 ) -> RustCargoSuccess {
     RustCargoSuccess {
         manifest_path: layout.manifest_path(),
         source_path: layout.source_path(),
         target_dir: layout.target_dir(),
         binary_path,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: String::from_utf8_lossy(stdout).into_owned(),
+        stderr: String::from_utf8_lossy(stderr).into_owned(),
     }
 }
 
 fn failure(
     layout: &RustCargoLayout,
     status: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: &[u8],
+    stderr: &[u8],
 ) -> RustCargoFailure {
     RustCargoFailure {
         manifest_path: layout.manifest_path(),
         source_path: layout.source_path(),
         target_dir: layout.target_dir(),
         status,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: String::from_utf8_lossy(stdout).into_owned(),
+        stderr: String::from_utf8_lossy(stderr).into_owned(),
     }
 }
 

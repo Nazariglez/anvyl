@@ -4,9 +4,9 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, GlobalId, Local, LocalId,
-        LocalKind, Module, Mutability, Operand, Param, ParamMode, ParamRole, Place, PlaceRoot,
-        Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl, VariantShape,
-        VerifiedProgram,
+        LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
+        PlaceRoot, Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
+        VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
@@ -592,8 +592,13 @@ impl ProfileCx<'_> {
             RValue::Call { callee, args } => {
                 self.check_callee(site, callee);
                 let expected = self.callee_param_semantics(callee);
+                let reentry_boundary =
+                    matches!(callee, Callee::Extern(_)) && self.has_retained_callbacks();
                 for (index, arg) in args.iter().enumerate() {
                     self.check_call_arg(site, arg, expected.get(index).copied());
+                    if reentry_boundary && Self::call_arg_exposes_runtime_borrow(arg) {
+                        self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
+                    }
                 }
             }
             RValue::Cast { value, target } => {
@@ -1055,6 +1060,22 @@ impl ProfileCx<'_> {
             .unwrap_or_default()
     }
 
+    fn has_retained_callbacks(&self) -> bool {
+        self.program.externs.iter().any(|ext| {
+            ext.params.iter().any(|param| {
+                param.escape == ParamEscape::Escaping
+                    && matches!(
+                        self.program.type_arena.data(param.ty),
+                        TypeData::Function(_)
+                    )
+            })
+        })
+    }
+
+    fn call_arg_exposes_runtime_borrow(arg: &CallArg) -> bool {
+        matches!(arg, CallArg::SharedBorrow(_) | CallArg::MutBorrow(_))
+    }
+
     fn check_call_arg(
         &mut self,
         site: ProfileSite,
@@ -1141,6 +1162,7 @@ impl ProfileCx<'_> {
                     rir::RirParamSemantic::Value
                     | rir::RirParamSemantic::SharedBorrow
                     | rir::RirParamSemantic::ScopedLambda
+                    | rir::RirParamSemantic::EscapingLambda
                     | rir::RirParamSemantic::StackCell
                     | rir::RirParamSemantic::HeapCell
                     | rir::RirParamSemantic::ScopedPlaceCell => {
@@ -1369,10 +1391,18 @@ impl ProfileCx<'_> {
                 self.type_contains_function(param.ty)
                     && !(self.type_is_function(param.ty)
                         && native.is_some_and(|native| {
-                            param.escape == air::ParamEscape::NonEscaping
-                                && native.params.get(index).is_some_and(|native_param| {
-                                    native_param.semantic == rir::RirParamSemantic::ScopedLambda
-                                })
+                            native.params.get(index).is_some_and(|native_param| {
+                                matches!(
+                                    (param.escape, native_param.semantic),
+                                    (
+                                        ParamEscape::NonEscaping,
+                                        rir::RirParamSemantic::ScopedLambda
+                                    ) | (
+                                        ParamEscape::Escaping,
+                                        rir::RirParamSemantic::EscapingLambda
+                                    )
+                                )
+                            })
                         }))
             })
     }
@@ -1564,16 +1594,17 @@ impl ProfileCx<'_> {
     }
 
     fn reject_function_container(&mut self, site: ProfileSite, ty: TypeId) -> bool {
-        match self
+        let Err(gap) = self
             .policy()
             .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-        {
-            Ok(()) => false,
-            Err(gap) if self.policy().contains_function_payload(ty) => {
-                self.push(site, lambda_storage_gap_kind(gap));
-                true
-            }
-            Err(_) => false,
+        else {
+            return false;
+        };
+        if self.policy().contains_function_payload(ty) {
+            self.push(site, lambda_storage_gap_kind(gap));
+            true
+        } else {
+            false
         }
     }
 
