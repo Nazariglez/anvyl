@@ -1002,8 +1002,24 @@ pub(crate) enum FunctionValueOrigin {
     GlobalRoot,
     GlobalProjection,
     DataRefProjection,
+    SourceCallReturn,
     CallReturn,
     UnknownProjection,
+}
+
+impl FunctionValueOrigin {
+    pub(crate) fn can_carry_escaping_projection(self) -> bool {
+        matches!(
+            self,
+            Self::AggregateField
+                | Self::TupleField
+                | Self::FixedArrayElement
+                | Self::ListElement
+                | Self::GlobalRoot
+                | Self::GlobalProjection
+                | Self::SourceCallReturn
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

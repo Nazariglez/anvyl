@@ -1,4 +1,7 @@
-use super::{ids::*, types::ParamMode};
+use super::{
+    ids::*,
+    types::{FunctionValueCapability, ParamMode},
+};
 use crate::ast::{BinaryOp, FormatSpec, UnaryOp};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,6 +314,10 @@ pub enum MapWriteKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
+    FunctionValue {
+        value: Operand,
+        capability: FunctionValueCapability,
+    },
     Unary {
         op: UnaryOp,
         value: Operand,

@@ -12,12 +12,13 @@ use super::{
     ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
-    FunctionSpecialization, GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg,
-    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
-    LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
-    ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue,
-    ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType,
-    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
+    FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect,
+    LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId,
+    Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability,
+    Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program,
+    RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource,
+    Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
+    place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -36,7 +37,7 @@ use crate::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
         CallableParent, CaptureStorage, CaptureStorageOrigin, ConstTerm, DeclarationIndex,
         DefaultArgFact, DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
-        FunctionValueKind, GenericArgs, GlobalAccessFact, GlobalAccessMode,
+        FunctionValueKind, FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
         GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, LambdaBodyKey,
         LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
         LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
@@ -583,11 +584,13 @@ impl TypeLowerer {
                     .params
                     .iter()
                     .map(|param| {
-                        Ok(ExternParamDecl {
-                            ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
-                            mode: param_flow_mode(param.flow),
-                            escape: param.escape.into(),
-                        })
+                        let ty = self.lower_with_env(program, &param.ty.ty, env.reborrow())?;
+                        checked_extern_param(
+                            program,
+                            ty,
+                            param_flow_mode(param.flow),
+                            param.escape.into(),
+                        )
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
                 Ok(ExternMethodDecl {
@@ -618,11 +621,13 @@ impl TypeLowerer {
                     .params
                     .iter()
                     .map(|param| {
-                        Ok(ExternParamDecl {
-                            ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
-                            mode: param_flow_mode(param.flow),
-                            escape: param.escape.into(),
-                        })
+                        let ty = self.lower_with_env(program, &param.ty.ty, env.reborrow())?;
+                        checked_extern_param(
+                            program,
+                            ty,
+                            param_flow_mode(param.flow),
+                            param.escape.into(),
+                        )
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
                 Ok(ExternStaticDecl {
@@ -651,11 +656,13 @@ impl TypeLowerer {
                         .params
                         .first()
                         .map(|param| {
-                            Ok(ExternParamDecl {
-                                ty: self.lower_with_env(program, &param.ty.ty, env.reborrow())?,
-                                mode: param_flow_mode(param.flow),
-                                escape: param.escape.into(),
-                            })
+                            let ty = self.lower_with_env(program, &param.ty.ty, env.reborrow())?;
+                            checked_extern_param(
+                                program,
+                                ty,
+                                param_flow_mode(param.flow),
+                                param.escape.into(),
+                            )
                         })
                         .transpose()?,
                     return_type: self.lower_with_env(
@@ -1281,14 +1288,13 @@ impl LowerCx<'_> {
             .params
             .iter()
             .map(|param| {
-                if param.escape != ast::EscapeMode::NonEscaping {
-                    return Err(LowerError::UnsupportedExternSignature);
-                }
-                Ok(ExternParamDecl {
-                    ty: self.lower_ty(&param.ty.ty)?,
-                    mode: param_flow_mode(param.flow),
-                    escape: param.escape.into(),
-                })
+                let ty = self.lower_ty(&param.ty.ty)?;
+                checked_extern_param(
+                    &self.program,
+                    ty,
+                    param_flow_mode(param.flow),
+                    param.escape.into(),
+                )
             })
             .collect()
     }
@@ -3908,9 +3914,66 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     ty,
                 }
             }
-            FunctionValueKind::Storage(_) => return Ok(None),
+            FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal) => return Ok(None),
+            FunctionValueKind::Storage(FunctionValueOrigin::MapValue)
+                if self.is_map_index_expr(expr)? =>
+            {
+                return Ok(None);
+            }
+            FunctionValueKind::Storage(origin) => {
+                let Some(value) = self.lower_storage_function_value(expr)? else {
+                    return Ok(None);
+                };
+                RValue::FunctionValue {
+                    value,
+                    capability: Self::storage_function_value_capability(*origin),
+                }
+            }
         };
         Ok(Some(self.emit_typed_temp(ty, value)?))
+    }
+
+    fn is_map_index_expr(&self, expr: &ExprNode) -> Result<bool, LowerError> {
+        let ExprKind::Index(index) = &expr.node.kind else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.lower_expr_ty(index.node.target.node.id)?,
+            Type::Map { .. }
+        ))
+    }
+
+    fn lower_storage_function_value(
+        &mut self,
+        expr: &ExprNode,
+    ) -> Result<Option<Operand>, LowerError> {
+        if let ExprKind::Call(call) = &expr.node.kind {
+            return self.lower_call_value(expr, call).map(Some);
+        }
+        if let Some(fact) = self.global_access(expr.node.id).cloned()
+            && fact.mode == GlobalAccessMode::Read
+        {
+            return self
+                .lower_global_projected_place(expr, &fact)
+                .map(Operand::Place)
+                .map(Some);
+        }
+        match self.local_use(expr, LocalUseMode::Read) {
+            Ok(fact) => self.lower_place(expr, &fact).map(Operand::Place).map(Some),
+            Err(LowerError::MissingLocalUse { .. }) => self
+                .lower_projected_read_place(expr)
+                .map(Operand::Place)
+                .map(Some),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn storage_function_value_capability(origin: FunctionValueOrigin) -> FunctionValueCapability {
+        if origin.can_carry_escaping_projection() {
+            FunctionValueCapability::Escaping
+        } else {
+            FunctionValueCapability::Unknown
+        }
     }
 
     fn lower_lambda_capture_args(
@@ -8058,6 +8121,20 @@ fn param_flow_mode(flow: ParamFlow) -> ParamMode {
     }
 }
 
+fn checked_extern_param(
+    program: &Program,
+    ty: TypeId,
+    mode: ParamMode,
+    escape: ParamEscape,
+) -> Result<ExternParamDecl, LowerError> {
+    if escape == ParamEscape::Escaping
+        && (mode != ParamMode::Value || !matches!(program.type_data(ty), TypeData::Function(_)))
+    {
+        return Err(LowerError::UnsupportedExternSignature);
+    }
+    Ok(ExternParamDecl { ty, mode, escape })
+}
+
 pub(crate) fn lower_with_modules(
     root: &ast::Program,
     resolved: &ResolveResult,
@@ -10557,6 +10634,30 @@ mod tests {
     }
 
     #[test]
+    fn stored_function_value_lowers_with_escape_capability() {
+        let source = "fn tick() {} fn keep(f: escaping fn()) {} fn main() { let pair = (tick, tick); keep(pair.0); }";
+        let air = lower_root(source, "main").expect("lower failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("missing main");
+
+        assert!(function_statements(main).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionValue {
+                        capability: FunctionValueCapability::Escaping,
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
     fn lowers_function_param_escape_contracts() {
         let air = lower_root("fn main(cb: escaping fn()) {}", "main").expect("lower failed");
         let main = air
@@ -10635,18 +10736,28 @@ mod tests {
     }
 
     #[test]
-    fn escaping_extern_callback_param_remains_lowering_gap() {
-        let err = lower_root(
+    fn escaping_extern_callback_param_lowers() {
+        let air = lower_root(
             "extern fn retain(cb: escaping fn(int)); fn callback(x: int) {} fn main() { retain(callback); }",
             "main",
         )
-        .unwrap_err();
+        .expect("lower failed");
+        let retain = air
+            .externs
+            .iter()
+            .find(|decl| decl.name == Ident::new("retain"))
+            .expect("missing extern");
 
-        assert!(matches!(err, LowerError::UnsupportedExternSignature));
+        assert_eq!(retain.params[0].mode, ParamMode::Value);
+        assert_eq!(retain.params[0].escape, ParamEscape::Escaping);
+        assert!(matches!(
+            air.type_data(retain.params[0].ty),
+            TypeData::Function(_)
+        ));
     }
 
     #[test]
-    fn extern_callback_return_lowers_as_function_type_gap_input() {
+    fn extern_callback_return_lowers_as_unknown_function_value() {
         let air = lower_root(
             "extern fn native_make() -> fn(int) -> int; fn main() { let f = native_make(); }",
             "main",
@@ -10662,6 +10773,40 @@ mod tests {
             air.type_data(native.return_type),
             TypeData::Function(_)
         ));
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionValue {
+                        capability: FunctionValueCapability::Unknown,
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn source_callback_return_lowers_as_escaping_function_value() {
+        let air = lower_root(
+            "fn add(x: int) -> int { x + 1 } fn make() -> fn(int) -> int { add } fn main() { let f = make(); }",
+            "main",
+        )
+        .expect("lower failed");
+
+        assert!(program_statements(&air).any(|statement| {
+            matches!(
+                statement,
+                AirStmt::Init {
+                    value: RValue::FunctionValue {
+                        capability: FunctionValueCapability::Escaping,
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

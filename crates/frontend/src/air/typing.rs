@@ -292,7 +292,7 @@ pub(crate) fn rvalue_ty(
     value: &RValue,
 ) -> Option<TypeId> {
     match value {
-        RValue::Use(op) => operand_ty(program, op),
+        RValue::Use(op) | RValue::FunctionValue { value: op, .. } => operand_ty(program, op),
         RValue::Unary { ty, .. }
         | RValue::Binary { ty, .. }
         | RValue::Aggregate { ty, .. }

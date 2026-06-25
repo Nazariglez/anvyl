@@ -2253,13 +2253,23 @@ impl TypeChecker {
         }
     }
 
+    pub(super) fn call_return_function_value_origin(&self, expr_id: ExprId) -> FunctionValueOrigin {
+        self.semantic_facts
+            .body(&self.current_body())
+            .and_then(|facts| facts.calls.get(&expr_id))
+            .map_or(FunctionValueOrigin::CallReturn, |target| {
+                if matches!(target.id.kind, CallableKind::ExternFunction) {
+                    FunctionValueOrigin::CallReturn
+                } else {
+                    FunctionValueOrigin::SourceCallReturn
+                }
+            })
+    }
+
     pub(super) fn record_call_return_function_value(&mut self, expr: &ExprNode, ty: &Type) {
         if matches!(expr.node.kind, ExprKind::Call(_)) {
-            self.record_function_value_expr(
-                expr.node.id,
-                ty,
-                FunctionValueKind::Storage(FunctionValueOrigin::CallReturn),
-            );
+            let origin = self.call_return_function_value_origin(expr.node.id);
+            self.record_function_value_expr(expr.node.id, ty, FunctionValueKind::Storage(origin));
         }
     }
 

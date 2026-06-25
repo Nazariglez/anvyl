@@ -588,17 +588,7 @@ impl ClosureClassifier {
         mut is_function_source: impl FnMut(SemanticLocalId) -> bool,
     ) {
         match kind {
-            FunctionValueKind::Named(_)
-            | FunctionValueKind::Storage(
-                FunctionValueOrigin::AggregateField
-                | FunctionValueOrigin::TupleField
-                | FunctionValueOrigin::FixedArrayElement
-                | FunctionValueOrigin::ListElement
-                | FunctionValueOrigin::MapValue
-                | FunctionValueOrigin::GlobalRoot
-                | FunctionValueOrigin::GlobalProjection
-                | FunctionValueOrigin::CallReturn,
-            ) => {
+            FunctionValueKind::Named(_) => {
                 self.expr_flows
                     .entry(expr)
                     .or_default()
@@ -608,11 +598,13 @@ impl ClosureClassifier {
             FunctionValueKind::Storage(FunctionValueOrigin::KnownLocal) => {
                 self.record_local_or_place_function_origin(expr, &mut is_function_source);
             }
-            FunctionValueKind::Storage(_) => {
-                self.expr_flows
-                    .entry(expr)
-                    .or_default()
-                    .insert_unknown_function();
+            FunctionValueKind::Storage(origin) => {
+                let flow = self.expr_flows.entry(expr).or_default();
+                if origin.can_carry_escaping_projection() {
+                    flow.insert_known_function();
+                } else {
+                    flow.insert_unknown_function();
+                }
             }
         }
     }

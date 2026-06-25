@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: function value with unknown storage origin cannot escape
+
+extern fn native_make() -> fn();
+extern fn retain(cb: escaping fn());
+
+fn make() -> fn() {
+    native_make()
+}
+
+fn main() {
+    retain(make());
+}

@@ -6,7 +6,10 @@ use verify::{
 
 use super::{super::verify::verify_structured_body, *};
 use crate::{
-    air::{ExternBindingDecl, ExternTypeId, FunctionSpecialization, GlobalInitEffect},
+    air::{
+        ExternBindingDecl, ExternStaticDecl, ExternTypeId, FunctionSpecialization,
+        FunctionValueCapability, GlobalInitEffect,
+    },
     ast::Ident,
 };
 
@@ -815,6 +818,117 @@ fn extern_binding_with_invalid_owner_does_not_panic() {
             EK::BadReference(BadReference::InvalidExternType(id)) if id == ExternTypeId::from_index(99)
         )
     }));
+}
+
+#[test]
+fn escaping_extern_param_must_be_function() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let module = test_module(&mut builder);
+
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("retain"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: int_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::Escaping,
+        }],
+        return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadExtern(BadExtern::EscapingParamMustBeFunction(0))
+    )));
+}
+
+#[test]
+fn escaping_extern_param_must_be_by_value() {
+    let mut builder = ProgramBuilder::default();
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let callback_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![],
+        ReturnMode::Value(void_ty),
+    )));
+    let module = test_module(&mut builder);
+
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("retain"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: callback_ty,
+            mode: ParamMode::SharedBorrow,
+            escape: ParamEscape::Escaping,
+        }],
+        return_type: void_ty,
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadExtern(BadExtern::EscapingParamMustBeValue(0))
+    )));
+}
+
+#[test]
+fn escaping_extern_type_params_use_same_invariants() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let void_ty = builder.alloc_type(TypeData::Void);
+    let callback_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![],
+        ReturnMode::Value(void_ty),
+    )));
+    let module = test_module(&mut builder);
+
+    builder.alloc_extern_type(ExternTypeDecl {
+        name: Ident::new("Host"),
+        module,
+        binding: None,
+        type_args: vec![],
+        const_args: vec![],
+        rep: ExternRep::Shared,
+        has_init: false,
+        init_fields: vec![],
+        fields: vec![],
+        methods: vec![],
+        statics: vec![ExternStaticDecl {
+            name: Ident::new("retain"),
+            params: vec![
+                ExternParamDecl {
+                    ty: int_ty,
+                    mode: ParamMode::Value,
+                    escape: ParamEscape::Escaping,
+                },
+                ExternParamDecl {
+                    ty: callback_ty,
+                    mode: ParamMode::SharedBorrow,
+                    escape: ParamEscape::Escaping,
+                },
+            ],
+            return_type: void_ty,
+        }],
+        operators: vec![],
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadExtern(BadExtern::EscapingParamMustBeFunction(0))
+    )));
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadExtern(BadExtern::EscapingParamMustBeValue(1))
+    )));
 }
 
 #[test]
@@ -3251,6 +3365,87 @@ fn escaping_function_param_rejects_nonescaping_lambda_value() {
             index: 0,
             expected: ParamEscape::Escaping,
             found: ParamEscape::NonEscaping,
+        })
+    )));
+}
+
+#[test]
+fn function_value_proof_rejects_nonescaping_local_as_escaping() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig));
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let param = main.push_param("f", lambda_ty, ParamRole::Normal);
+    let temp = main.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_init(
+            temp,
+            RValue::FunctionValue {
+                value: op_place(param, lambda_ty),
+                capability: FunctionValueCapability::Escaping,
+            },
+        ),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::FunctionValueEscapeMismatch {
+            claimed: FunctionValueCapability::Escaping,
+            actual: FunctionValueCapability::NonEscaping,
+        })
+    )));
+}
+
+#[test]
+fn function_value_proof_rejects_unknown_projected_storage_as_escaping() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig));
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![lambda_ty]));
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let pair = main.push_param("pair", tuple_ty, ParamRole::Normal);
+    let temp = main.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_init(
+            temp,
+            RValue::FunctionValue {
+                value: Operand::Place(Place {
+                    root: PlaceRoot::Local(pair),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: lambda_ty,
+                }),
+                capability: FunctionValueCapability::Escaping,
+            },
+        ),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadRValue(BadRValue::FunctionValueEscapeMismatch {
+            claimed: FunctionValueCapability::Escaping,
+            actual: FunctionValueCapability::Unknown,
         })
     )));
 }

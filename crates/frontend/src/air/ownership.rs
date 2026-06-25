@@ -420,6 +420,7 @@ impl ParamUseAnalyzer<'_> {
     fn observe_rvalue(&mut self, value: &RValue, context: ValueContext) {
         match value {
             RValue::Use(operand) => self.observe_operand(operand, context),
+            RValue::FunctionValue { value, .. } => self.observe_operand(value, context),
             RValue::Unary { value, .. }
             | RValue::Cast { value, .. }
             | RValue::OptionalSome { value, .. }

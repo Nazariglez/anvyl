@@ -1,5 +1,8 @@
 use super::{super::verify::verify_structured_body, *};
-use crate::{air::MapWriteKind, ast::Ident};
+use crate::{
+    air::{FunctionValueCapability, MapWriteKind},
+    ast::Ident,
+};
 
 #[test]
 fn empty_program() {
@@ -26,6 +29,89 @@ fn local_root_reads_verify() {
     fb.push_block(term_return(op_place(local, int_ty)));
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
+fn explicit_function_value_capability_verifies_escaping_arg() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig));
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![lambda_ty]));
+
+    let callee = FunctionId::from_index(0);
+    let mut accept = FunctionBuilder::new("accept", module, FunctionKind::Normal, int_ty);
+    accept.push_param("f", lambda_ty, ParamRole::Normal);
+    accept.set_param_escape(0, ParamEscape::Escaping);
+    accept.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(accept.finish()), callee);
+
+    let target = FunctionId::from_index(1);
+    let mut callback = FunctionBuilder::new("callback", module, FunctionKind::Normal, int_ty);
+    callback.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    assert_eq!(builder.alloc_function(callback.finish()), target);
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let function = main.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::Temp);
+    let pair = main.push_local(None, tuple_ty, Mutability::Immutable, LocalKind::Temp);
+    let temp = main.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_init(
+            function,
+            RValue::FunctionRef {
+                function: target,
+                ty: lambda_ty,
+            },
+        ),
+    );
+    main.add_statement(
+        bb0,
+        stmt_init(
+            pair,
+            RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields: vec![op_place(function, lambda_ty)],
+                ty: tuple_ty,
+            },
+        ),
+    );
+    main.add_statement(
+        bb0,
+        stmt_init(
+            temp,
+            RValue::FunctionValue {
+                value: Operand::Place(Place {
+                    root: PlaceRoot::Local(pair),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: lambda_ty,
+                }),
+                capability: FunctionValueCapability::Escaping,
+            },
+        ),
+    );
+    main.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::Value(op_place(temp, lambda_ty))],
+        }),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
 
     expect_verified(&builder.finish());
 }

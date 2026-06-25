@@ -105,6 +105,24 @@ pub enum ParamEscape {
     Escaping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FunctionValueCapability {
+    NonFunction,
+    Escaping,
+    NonEscaping,
+    #[default]
+    Unknown,
+}
+
+impl FunctionValueCapability {
+    pub fn from_param_escape(escape: ParamEscape) -> Self {
+        match escape {
+            ParamEscape::Escaping => Self::Escaping,
+            ParamEscape::NonEscaping => Self::NonEscaping,
+        }
+    }
+}
+
 impl From<crate::ast::EscapeMode> for ParamEscape {
     fn from(value: crate::ast::EscapeMode) -> Self {
         match value {

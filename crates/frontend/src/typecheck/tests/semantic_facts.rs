@@ -413,6 +413,10 @@ fn function_value_origins_are_specific() {
         ),
         (
             "fn tick() {} fn make() -> fn() { tick } fn main() { make()(); }",
+            FunctionValueOrigin::SourceCallReturn,
+        ),
+        (
+            "extern fn make() -> fn(); fn main() { let f = make(); }",
             FunctionValueOrigin::CallReturn,
         ),
     ];
@@ -542,7 +546,7 @@ fn immediately_called_returned_function_has_callee_fact() {
     assert!(body.function_values.contains_key(&call.callee));
     assert!(matches!(
         body.function_values[&call.callee].kind,
-        FunctionValueKind::Storage(FunctionValueOrigin::CallReturn)
+        FunctionValueKind::Storage(FunctionValueOrigin::SourceCallReturn)
     ));
     assert!(!body.calls.contains_key(&call.expr));
 }

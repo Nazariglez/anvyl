@@ -372,7 +372,7 @@ pub(super) fn check_postfix_chain_place(
                 };
                 let ty = set_postfix_step_type(*id, &next_subject, optional_chain, node.span, tc);
                 if returned_function {
-                    let origin = FunctionValueOrigin::CallReturn;
+                    let origin = tc.call_return_function_value_origin(*id);
                     if !super::type_ops::type_has_unfinished_facts(&ty) {
                         tc.record_function_value_expr(*id, &ty, FunctionValueKind::Storage(origin));
                     }

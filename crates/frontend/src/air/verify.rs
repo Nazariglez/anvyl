@@ -6,9 +6,10 @@ use anvyx_externs::{
 pub use super::typing::PrimitiveKind;
 use super::{
     AggregateKind, CaptureCellLifetime, CaptureLocalSource, ConstValue, EnumRepr, ExternMember,
-    ExternRep, Function, FunctionKind, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local,
-    LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program, RawEnumValue,
-    ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData, VariantShape,
+    ExternRep, Function, FunctionKind, FunctionValueCapability, LambdaCaptureDecl, LambdaDecl,
+    LambdaEscape, Local, LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program,
+    RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData,
+    VariantShape,
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
@@ -89,6 +90,8 @@ pub enum BadExtern {
     OperatorOperandMismatch,
     MemberParamCountMismatch { expected: usize, found: usize },
     ReceiverModeMismatch,
+    EscapingParamMustBeValue(usize),
+    EscapingParamMustBeFunction(usize),
     BindingMismatch,
 }
 
@@ -178,6 +181,10 @@ pub enum BadRValue {
         found: TypeId,
     },
     FunctionValueMustBeFunction(TypeId),
+    FunctionValueEscapeMismatch {
+        claimed: FunctionValueCapability,
+        actual: FunctionValueCapability,
+    },
     FunctionRefMustBeNamed(FunctionId),
     MakeLambdaOwnerMismatch {
         lambda: LambdaId,
@@ -881,20 +888,100 @@ impl<'a> VerifyCx<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FunctionValueCapability {
-    NonFunction,
-    Escaping,
-    NonEscaping,
-    Unknown,
+#[derive(Clone, PartialEq, Eq)]
+enum FunctionValueState {
+    Scalar(FunctionValueCapability),
+    Fields(Vec<FunctionValueState>),
 }
 
-impl FunctionValueCapability {
-    fn from_param_escape(escape: ParamEscape) -> Self {
-        match escape {
-            ParamEscape::Escaping => Self::Escaping,
-            ParamEscape::NonEscaping => Self::NonEscaping,
+impl FunctionValueState {
+    fn unknown() -> Self {
+        Self::Scalar(FunctionValueCapability::Unknown)
+    }
+
+    fn non_function() -> Self {
+        Self::Scalar(FunctionValueCapability::NonFunction)
+    }
+
+    fn function(capability: FunctionValueCapability) -> Self {
+        Self::Scalar(capability)
+    }
+
+    fn join(left: Self, right: Self) -> Self {
+        match (left, right) {
+            (Self::Scalar(left), Self::Scalar(right)) => Self::Scalar(join_escape(left, right)),
+            (Self::Fields(left), Self::Fields(right)) if left.len() == right.len() => Self::Fields(
+                left.into_iter()
+                    .zip(right)
+                    .map(|(left, right)| Self::join(left, right))
+                    .collect(),
+            ),
+            _ => Self::unknown(),
         }
+    }
+
+    fn capability(&self) -> FunctionValueCapability {
+        match self {
+            Self::Scalar(capability) => *capability,
+            Self::Fields(_) => FunctionValueCapability::Unknown,
+        }
+    }
+
+    fn project(&self, projection: &Projection) -> Self {
+        let Self::Fields(fields) = self else {
+            return Self::unknown();
+        };
+        match projection {
+            Projection::Field(field) => fields
+                .get(field.index())
+                .cloned()
+                .unwrap_or_else(Self::unknown),
+            Projection::TupleField(field) => fields
+                .get(*field as usize)
+                .cloned()
+                .unwrap_or_else(Self::unknown),
+            Projection::VariantField { field, .. } => fields
+                .get(*field as usize)
+                .cloned()
+                .unwrap_or_else(Self::unknown),
+            Projection::Index(_) => fields
+                .iter()
+                .cloned()
+                .reduce(Self::join)
+                .unwrap_or_else(Self::unknown),
+        }
+    }
+
+    fn projection_mut(&mut self, projections: &[Projection]) -> Option<&mut Self> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Some(self);
+        };
+        let Self::Fields(fields) = self else {
+            return None;
+        };
+        let index = match first {
+            Projection::Field(field) => field.index(),
+            Projection::TupleField(field) => *field as usize,
+            Projection::VariantField { field, .. } => *field as usize,
+            Projection::Index(_) => return None,
+        };
+        fields.get_mut(index)?.projection_mut(rest)
+    }
+
+    fn assign_projection(&mut self, projections: &[Projection], value: Self) -> bool {
+        let Some(slot) = self.projection_mut(projections) else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    fn push_projection(&mut self, projections: &[Projection], value: Self) -> bool {
+        let Some(Self::Fields(fields)) = self.projection_mut(projections) else {
+            return false;
+        };
+        fields.push(value);
+        true
     }
 }
 
@@ -902,9 +989,10 @@ impl FunctionValueCapability {
 struct LocalInit {
     definite: Vec<bool>,
     possible: Vec<bool>,
-    local_escape: Vec<FunctionValueCapability>,
+    local_values: Vec<FunctionValueState>,
     cell_definite: Vec<bool>,
     global_definite: Vec<bool>,
+    global_values: Vec<FunctionValueState>,
 }
 
 impl LocalInit {
@@ -912,22 +1000,18 @@ impl LocalInit {
         let mut state = Self {
             definite: vec![false; function.locals.len()],
             possible: vec![false; function.locals.len()],
-            local_escape: function
+            local_values: function
                 .locals
                 .iter()
-                .map(|local| {
-                    if matches!(
-                        program.type_arena.get(local.ty),
-                        Some(TypeData::Function(_))
-                    ) {
-                        FunctionValueCapability::Unknown
-                    } else {
-                        FunctionValueCapability::NonFunction
-                    }
-                })
+                .map(|local| type_function_state(program, local.ty))
                 .collect(),
             cell_definite: vec![false; program.capture_cells.len()],
             global_definite: vec![false; program.globals.len()],
+            global_values: program
+                .globals
+                .iter()
+                .map(|global| type_function_state(program, global.ty))
+                .collect(),
         };
         for param in &function.signature.params {
             if param.local_id.index() < function.locals.len() {
@@ -937,8 +1021,9 @@ impl LocalInit {
                     program.type_arena.get(param.ty),
                     Some(TypeData::Function(_))
                 ) {
-                    state.local_escape[param.local_id.index()] =
-                        FunctionValueCapability::from_param_escape(param.escape);
+                    let escape = FunctionValueCapability::from_param_escape(param.escape);
+                    state.local_values[param.local_id.index()] =
+                        FunctionValueState::function(escape);
                 }
             }
         }
@@ -971,17 +1056,79 @@ impl LocalInit {
         }
     }
 
-    fn set_escape(&mut self, local: LocalId, escape: FunctionValueCapability) {
-        if local.index() < self.local_escape.len() {
-            self.local_escape[local.index()] = escape;
+    fn set_local_value(&mut self, local: LocalId, value: FunctionValueState) {
+        if local.index() < self.local_values.len() {
+            self.local_values[local.index()] = value;
         }
     }
 
+    fn clear_local_value(&mut self, local: LocalId) {
+        if local.index() < self.local_values.len() {
+            self.local_values[local.index()] = FunctionValueState::unknown();
+        }
+    }
+
+    fn set_place_value(&mut self, place: &Place, value: FunctionValueState) {
+        match place.root {
+            PlaceRoot::Local(local) if place.projection.is_empty() => {
+                self.set_local_value(local, value);
+            }
+            PlaceRoot::Local(local) if local.index() < self.local_values.len() => {
+                if !self.local_values[local.index()].assign_projection(&place.projection, value) {
+                    self.clear_local_value(local);
+                }
+            }
+            PlaceRoot::Global(global) if place.projection.is_empty() => {
+                self.set_global_value(global, value);
+            }
+            PlaceRoot::Global(global) if global.index() < self.global_values.len() => {
+                self.global_definite[global.index()] = true;
+                if !self.global_values[global.index()].assign_projection(&place.projection, value) {
+                    self.global_values[global.index()] = FunctionValueState::unknown();
+                }
+            }
+            PlaceRoot::Local(_)
+            | PlaceRoot::Global(_)
+            | PlaceRoot::LambdaCapture(_)
+            | PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::CaptureCell(_) => {}
+        }
+    }
+
+    fn push_place_value(&mut self, place: &Place, value: FunctionValueState) {
+        match place.root {
+            PlaceRoot::Local(local) if local.index() < self.local_values.len() => {
+                if !self.local_values[local.index()].push_projection(&place.projection, value) {
+                    self.clear_local_value(local);
+                }
+            }
+            PlaceRoot::Global(global) if global.index() < self.global_values.len() => {
+                self.global_definite[global.index()] = true;
+                if !self.global_values[global.index()].push_projection(&place.projection, value) {
+                    self.global_values[global.index()] = FunctionValueState::unknown();
+                }
+            }
+            PlaceRoot::Local(_)
+            | PlaceRoot::Global(_)
+            | PlaceRoot::LambdaCapture(_)
+            | PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::CaptureCell(_) => {}
+        }
+    }
+
+    fn clear_place_value(&mut self, place: &Place) {
+        self.set_place_value(place, FunctionValueState::unknown());
+    }
+
     fn escape(&self, local: LocalId) -> FunctionValueCapability {
-        self.local_escape
+        self.local_value(local).capability()
+    }
+
+    fn local_value(&self, local: LocalId) -> FunctionValueState {
+        self.local_values
             .get(local.index())
-            .copied()
-            .unwrap_or(FunctionValueCapability::Unknown)
+            .cloned()
+            .unwrap_or_else(FunctionValueState::unknown)
     }
 
     fn init_cell(&mut self, cell: CaptureCellId) {
@@ -997,9 +1144,17 @@ impl LocalInit {
             .unwrap_or(false)
     }
 
-    fn ensure_global(&mut self, global: GlobalId) {
+    fn ensure_global(&mut self, global: GlobalId, value: FunctionValueState) {
         if global.index() < self.global_definite.len() {
             self.global_definite[global.index()] = true;
+            self.global_values[global.index()] = value;
+        }
+    }
+
+    fn set_global_value(&mut self, global: GlobalId, value: FunctionValueState) {
+        if global.index() < self.global_values.len() {
+            self.global_definite[global.index()] = true;
+            self.global_values[global.index()] = value;
         }
     }
 
@@ -1010,10 +1165,18 @@ impl LocalInit {
             .unwrap_or(false)
     }
 
+    fn global_value(&self, global: GlobalId) -> FunctionValueState {
+        self.global_values
+            .get(global.index())
+            .cloned()
+            .unwrap_or_else(FunctionValueState::unknown)
+    }
+
     fn clear(&mut self, local: LocalId) {
         if local.index() < self.definite.len() {
             self.definite[local.index()] = false;
             self.possible[local.index()] = false;
+            self.local_values[local.index()] = FunctionValueState::unknown();
         }
     }
 
@@ -1027,14 +1190,17 @@ impl LocalInit {
             for (left, right) in joined.possible.iter_mut().zip(state.possible) {
                 *left |= right;
             }
-            for (left, right) in joined.local_escape.iter_mut().zip(state.local_escape) {
-                *left = join_escape(*left, right);
+            for (left, right) in joined.local_values.iter_mut().zip(state.local_values) {
+                *left = FunctionValueState::join(left.clone(), right);
             }
             for (left, right) in joined.cell_definite.iter_mut().zip(state.cell_definite) {
                 *left &= right;
             }
             for (left, right) in joined.global_definite.iter_mut().zip(state.global_definite) {
                 *left &= right;
+            }
+            for (left, right) in joined.global_values.iter_mut().zip(state.global_values) {
+                *left = FunctionValueState::join(left.clone(), right);
             }
         }
         Some(joined)
@@ -2099,6 +2265,7 @@ fn tail_uses_capture_cell(tail: &AirTail, cell: CaptureCellId) -> bool {
 fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
     match value {
         RValue::Use(operand)
+        | RValue::FunctionValue { value: operand, .. }
         | RValue::Unary { value: operand, .. }
         | RValue::OptionalSome { value: operand, .. }
         | RValue::Cast { value: operand, .. }
@@ -2598,14 +2765,14 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
         } else {
             cx.verify_type_ref(site.clone(), method.receiver.ty);
         }
-        for param in &method.params {
-            cx.verify_type_ref(site.clone(), param.ty);
+        for (index, param) in method.params.iter().enumerate() {
+            verify_extern_param(cx, site.clone(), index, param);
         }
         cx.verify_type_ref(site.clone(), method.return_type);
     }
     for static_ in &ty.statics {
-        for param in &static_.params {
-            cx.verify_type_ref(site.clone(), param.ty);
+        for (index, param) in static_.params.iter().enumerate() {
+            verify_extern_param(cx, site.clone(), index, param);
         }
         cx.verify_type_ref(site.clone(), static_.return_type);
     }
@@ -2631,9 +2798,33 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
             _ => {}
         }
         if let Some(operand) = &op.operand {
-            cx.verify_type_ref(site.clone(), operand.ty);
+            verify_extern_param(cx, site.clone(), 0, operand);
         }
         cx.verify_type_ref(site.clone(), op.return_type);
+    }
+}
+
+fn verify_extern_param(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    index: usize,
+    param: &super::ExternParamDecl,
+) {
+    cx.verify_type_ref(site.clone(), param.ty);
+    if param.escape != ParamEscape::Escaping {
+        return;
+    }
+    if param.mode != ParamMode::Value {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadExtern(BadExtern::EscapingParamMustBeValue(index)),
+        );
+    }
+    if !matches!(cx.type_data(param.ty), Some(TypeData::Function(_))) {
+        cx.push(
+            site,
+            VerifyErrorKind::BadExtern(BadExtern::EscapingParamMustBeFunction(index)),
+        );
     }
 }
 
@@ -2644,8 +2835,8 @@ fn verify_extern(cx: &mut VerifyCx<'_>, id: ExternId) {
     verify_decl_listed_once(cx, site.clone(), ext.module, id, |m| &m.externs);
     verify_extern_binding(cx, site.clone(), ext);
     verify_extern_member(cx, site.clone(), &ext.member, &ext.params);
-    for param in &ext.params {
-        cx.verify_type_ref(site.clone(), param.ty);
+    for (index, param) in ext.params.iter().enumerate() {
+        verify_extern_param(cx, site.clone(), index, param);
     }
     cx.verify_type_ref(site, ext.return_type);
 }
@@ -3056,6 +3247,26 @@ struct LoopCtx {
     breaks: Vec<LocalInit>,
 }
 
+fn clear_rvalue_write_state(
+    program: &Program,
+    function_id: FunctionId,
+    value: &RValue,
+    state: &mut LocalInit,
+) {
+    match value {
+        RValue::ListPush { list, value } => {
+            state.push_place_value(
+                list,
+                operand_function_state(program, function_id, value, state),
+            );
+        }
+        RValue::ListPop { list, .. }
+        | RValue::MapInsert { map: list, .. }
+        | RValue::MapRemove { map: list, .. } => state.clear_place_value(list),
+        _ => {}
+    }
+}
+
 fn verify_air_stmt(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -3070,6 +3281,7 @@ fn verify_air_stmt(
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_promoted_local_not_initialized(cx, function_id, block_id, index, *local);
             verify_init_stmt(cx, function_id, block_id, index, *local, value);
+            verify_function_value_escape_proof(cx, function_id, index, value, state);
             let function = cx.program.function(function_id);
             if let Some(local_decl) = function.locals.get(local.index()) {
                 if local_decl.mutability == Mutability::Immutable && state.is_possible(*local) {
@@ -3082,9 +3294,9 @@ fn verify_air_stmt(
                 }
                 let mut next = state.clone();
                 next.init(*local);
-                next.set_escape(
+                next.set_local_value(
                     *local,
-                    rvalue_function_escape(cx.program, function_id, &cx.primitives, value, state),
+                    rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
                 );
                 return Some(next);
             }
@@ -3094,33 +3306,26 @@ fn verify_air_stmt(
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_air_place_write(cx, function_id, index, dst, state);
             verify_assign_stmt(cx, function_id, block_id, index, dst, value);
+            verify_function_value_escape_proof(cx, function_id, index, value, state);
             let mut next = state.clone();
-            if dst.projection.is_empty() {
-                match dst.root {
-                    PlaceRoot::Local(local) => {
-                        next.set_escape(
-                            local,
-                            rvalue_function_escape(
-                                cx.program,
-                                function_id,
-                                &cx.primitives,
-                                value,
-                                state,
-                            ),
-                        );
-                    }
-                    PlaceRoot::CaptureCell(cell) => next.init_cell(cell),
-                    PlaceRoot::LambdaCapture(_)
-                    | PlaceRoot::ScopedBorrow(_)
-                    | PlaceRoot::Global(_) => {}
-                }
+            if let PlaceRoot::CaptureCell(cell) = dst.root
+                && dst.projection.is_empty()
+            {
+                next.init_cell(cell);
             }
+            next.set_place_value(
+                dst,
+                rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
+            );
             Some(next)
         }
         AirStmt::Eval(value) => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_rvalue(cx, function_id, block_id, Some(index), value);
-            Some(state.clone())
+            verify_function_value_escape_proof(cx, function_id, index, value, state);
+            let mut next = state.clone();
+            clear_rvalue_write_state(cx.program, function_id, value, &mut next);
+            Some(next)
         }
         AirStmt::GlobalEnsure { global } => {
             if !cx.has_global(*global) {
@@ -3130,7 +3335,10 @@ fn verify_air_stmt(
                 );
             }
             let mut next = state.clone();
-            next.ensure_global(*global);
+            if !next.global_is_definite(*global) {
+                let value = global_initializer_function_state(cx.program, *global);
+                next.ensure_global(*global, value);
+            }
             Some(next)
         }
         AirStmt::GlobalSetRoot {
@@ -3139,13 +3347,25 @@ fn verify_air_stmt(
             init,
         } => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_set_root_stmt(cx, function_id, block_id, index, *global, value, *init);
-            Some(state.clone())
+            let mut next = state.clone();
+            next.set_global_value(
+                *global,
+                rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
+            );
+            Some(next)
         }
         AirStmt::GlobalUpdateRoot { global, value } => {
             verify_air_rvalue_reads(cx, function_id, index, value, state);
+            verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_update_root_stmt(cx, function_id, block_id, index, *global, value, state);
-            Some(state.clone())
+            let mut next = state.clone();
+            next.set_global_value(
+                *global,
+                rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
+            );
+            Some(next)
         }
         AirStmt::If(branch) => verify_air_if(cx, function_id, index, branch, state, loops),
         AirStmt::Loop(loop_) => {
@@ -3802,6 +4022,7 @@ fn verify_collection_loan_contract_rvalue(
 ) {
     match value {
         RValue::Use(op)
+        | RValue::FunctionValue { value: op, .. }
         | RValue::Unary { value: op, .. }
         | RValue::Cast { value: op, .. }
         | RValue::OptionalSome { value: op, .. }
@@ -4716,6 +4937,7 @@ fn verify_air_rvalue_reads(
 ) {
     match value {
         RValue::Use(op)
+        | RValue::FunctionValue { value: op, .. }
         | RValue::Stringify { value: op, .. }
         | RValue::Unary { value: op, .. }
         | RValue::OptionalSome { value: op, .. }
@@ -5227,6 +5449,10 @@ fn verify_rvalue(
     match value {
         RValue::Use(op) => {
             verify_operand(cx, function_id, block_id, stmt_index, op);
+        }
+        RValue::FunctionValue { value, .. } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_function_value_operand_type(cx, site, value);
         }
         RValue::Stringify { value, source_ty } => {
             verify_stringify(
@@ -5856,6 +6082,18 @@ fn verify_lambda_value_type(cx: &mut VerifyCx<'_>, site: VerifySite, lambda: Lam
         .get(lambda.index())
         .map(|decl| &decl.signature);
     verify_function_type(cx, site, expected, ty);
+}
+
+fn verify_function_value_operand_type(cx: &mut VerifyCx<'_>, site: VerifySite, value: &Operand) {
+    let Some(ty) = typing::operand_ty(cx.program, value) else {
+        return;
+    };
+    if !matches!(cx.type_data(ty), Some(TypeData::Function(_))) {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::FunctionValueMustBeFunction(ty)),
+        );
+    }
 }
 
 fn verify_function_type(
@@ -7060,40 +7298,315 @@ fn lambda_capture_function_escape(
         })
 }
 
-fn rvalue_function_escape(
+fn global_initializer_function_state(program: &Program, global: GlobalId) -> FunctionValueState {
+    let mut visiting = std::collections::HashSet::new();
+    global_initializer_function_state_inner(program, global, false, &mut visiting)
+}
+
+fn immutable_global_initializer_function_state(
+    program: &Program,
+    global: GlobalId,
+) -> FunctionValueState {
+    let mut visiting = std::collections::HashSet::new();
+    global_initializer_function_state_inner(program, global, true, &mut visiting)
+}
+
+fn global_initializer_function_state_inner(
+    program: &Program,
+    global: GlobalId,
+    require_immutable: bool,
+    visiting: &mut std::collections::HashSet<GlobalId>,
+) -> FunctionValueState {
+    let Some(global_decl) = program.globals.get(global.index()) else {
+        return FunctionValueState::unknown();
+    };
+    if (require_immutable && global_decl.mutability != Mutability::Immutable)
+        || !visiting.insert(global)
+    {
+        return FunctionValueState::unknown();
+    }
+    let Some(function) = program.functions.get(global_decl.init.index()) else {
+        visiting.remove(&global);
+        return FunctionValueState::unknown();
+    };
+    let primitives = PrimitiveTypes::scan(program);
+    let mut state = LocalInit::new(program, function);
+    for stmt in &function.body.block.stmts {
+        match stmt {
+            AirStmt::Init { local, value } => {
+                let value = initializer_rvalue_function_state(
+                    program,
+                    global_decl.init,
+                    &primitives,
+                    value,
+                    &state,
+                );
+                state.init(*local);
+                state.set_local_value(*local, value);
+            }
+            AirStmt::Assign { dst, value } => {
+                let value = initializer_rvalue_function_state(
+                    program,
+                    global_decl.init,
+                    &primitives,
+                    value,
+                    &state,
+                );
+                state.set_place_value(dst, value);
+            }
+            AirStmt::GlobalSetRoot {
+                global: dst, value, ..
+            }
+            | AirStmt::GlobalUpdateRoot { global: dst, value }
+                if *dst == global =>
+            {
+                let result = initializer_rvalue_function_state(
+                    program,
+                    global_decl.init,
+                    &primitives,
+                    value,
+                    &state,
+                );
+                visiting.remove(&global);
+                return result;
+            }
+            AirStmt::Eval(value) => {
+                clear_rvalue_write_state(program, global_decl.init, value, &mut state);
+            }
+            _ => {}
+        }
+    }
+    let result = match &function.body.block.tail {
+        AirTail::Return(Some(value)) => {
+            initializer_operand_function_state(program, global_decl.init, value, &state)
+        }
+        AirTail::None
+        | AirTail::Return(None)
+        | AirTail::Break(_)
+        | AirTail::Continue(_)
+        | AirTail::Unreachable => FunctionValueState::unknown(),
+    };
+    visiting.remove(&global);
+    result
+}
+
+fn initializer_rvalue_function_state(
     program: &Program,
     function_id: FunctionId,
     primitives: &PrimitiveTypes,
     value: &RValue,
     state: &LocalInit,
-) -> FunctionValueCapability {
+) -> FunctionValueState {
+    rvalue_function_state_inner(program, function_id, primitives, value, state, false)
+}
+
+fn initializer_operand_function_state(
+    program: &Program,
+    function_id: FunctionId,
+    operand: &Operand,
+    state: &LocalInit,
+) -> FunctionValueState {
+    operand_function_state_inner(program, function_id, operand, state, false)
+}
+
+fn rvalue_function_state(
+    program: &Program,
+    function_id: FunctionId,
+    primitives: &PrimitiveTypes,
+    value: &RValue,
+    state: &LocalInit,
+) -> FunctionValueState {
+    rvalue_function_state_inner(program, function_id, primitives, value, state, true)
+}
+
+fn rvalue_function_state_inner(
+    program: &Program,
+    function_id: FunctionId,
+    primitives: &PrimitiveTypes,
+    value: &RValue,
+    state: &LocalInit,
+    global_init: bool,
+) -> FunctionValueState {
     match value {
-        RValue::Use(operand) => operand_function_escape(program, function_id, operand, state),
-        RValue::FunctionRef { .. } => FunctionValueCapability::Escaping,
+        RValue::Use(operand) => {
+            operand_function_state_inner(program, function_id, operand, state, global_init)
+        }
+        RValue::FunctionValue { capability, .. } => FunctionValueState::function(*capability),
+        RValue::FunctionRef { .. } => {
+            FunctionValueState::function(FunctionValueCapability::Escaping)
+        }
         RValue::MakeLambda { lambda, .. } => {
-            program
-                .lambdas
-                .get(lambda.index())
-                .map_or(FunctionValueCapability::Unknown, |decl| {
+            FunctionValueState::function(program.lambdas.get(lambda.index()).map_or(
+                FunctionValueCapability::Unknown,
+                |decl| {
                     if decl.escape == LambdaEscape::Escaping {
                         FunctionValueCapability::Escaping
                     } else {
                         FunctionValueCapability::NonEscaping
                     }
+                },
+            ))
+        }
+        RValue::Aggregate { kind, fields, .. } => aggregate_function_state(
+            kind,
+            fields
+                .iter()
+                .map(|field| {
+                    operand_function_state_inner(program, function_id, field, state, global_init)
+                })
+                .collect(),
+        ),
+        RValue::Call {
+            callee: Callee::Function(function),
+            ..
+        } if program
+            .functions
+            .get(function.index())
+            .is_some_and(|function| {
+                matches!(
+                    function.kind,
+                    FunctionKind::Normal | FunctionKind::Method | FunctionKind::ExtendMethod
+                )
+            }) =>
+        {
+            typing::rvalue_ty(program, primitives, value)
+                .map_or_else(FunctionValueState::unknown, |ty| {
+                    source_call_return_state(program, ty)
                 })
         }
-        RValue::Call { .. } => match typing::rvalue_ty(program, primitives, value) {
-            Some(ty) if matches!(program.type_arena.get(ty), Some(TypeData::Function(_))) => {
-                FunctionValueCapability::Escaping
-            }
-            Some(_) => FunctionValueCapability::NonFunction,
-            None => FunctionValueCapability::Unknown,
-        },
         _ => typing::rvalue_ty(program, primitives, value)
-            .map_or(FunctionValueCapability::Unknown, |ty| {
-                type_function_capability(program, ty)
+            .map_or_else(FunctionValueState::unknown, |ty| {
+                type_function_state(program, ty)
             }),
     }
+}
+
+fn aggregate_function_state(
+    kind: &AggregateCtor,
+    fields: Vec<FunctionValueState>,
+) -> FunctionValueState {
+    match kind {
+        AggregateCtor::Struct(_)
+        | AggregateCtor::Extern(_)
+        | AggregateCtor::Tuple
+        | AggregateCtor::EnumVariant { .. }
+        | AggregateCtor::Array
+        | AggregateCtor::List => FunctionValueState::Fields(fields),
+        AggregateCtor::Map => FunctionValueState::Fields(
+            fields
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, field)| (index % 2 == 1).then_some(field))
+                .collect(),
+        ),
+        AggregateCtor::DataRef(_) => FunctionValueState::unknown(),
+    }
+}
+
+fn operand_function_state(
+    program: &Program,
+    function_id: FunctionId,
+    operand: &Operand,
+    state: &LocalInit,
+) -> FunctionValueState {
+    operand_function_state_inner(program, function_id, operand, state, true)
+}
+
+fn operand_function_state_inner(
+    program: &Program,
+    function_id: FunctionId,
+    operand: &Operand,
+    state: &LocalInit,
+    global_init: bool,
+) -> FunctionValueState {
+    match operand {
+        Operand::Const(id) => program
+            .const_arena
+            .get_checked(*id)
+            .map_or_else(FunctionValueState::unknown, |konst| {
+                type_function_state(program, konst.ty)
+            }),
+        Operand::Place(place) => {
+            place_function_state(program, function_id, place, state, global_init)
+        }
+    }
+}
+
+fn place_function_state(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+    state: &LocalInit,
+    global_init: bool,
+) -> FunctionValueState {
+    let mut value = match place.root {
+        PlaceRoot::Local(local) => state.local_value(local),
+        PlaceRoot::Global(global) if state.global_is_definite(global) => state.global_value(global),
+        PlaceRoot::Global(global) if global_init => {
+            immutable_global_initializer_function_state(program, global)
+        }
+        PlaceRoot::Global(_)
+        | PlaceRoot::LambdaCapture(_)
+        | PlaceRoot::ScopedBorrow(_)
+        | PlaceRoot::CaptureCell(_) => type_function_state(program, place.ty),
+    };
+    if let PlaceRoot::LambdaCapture(slot) = place.root
+        && place.projection.is_empty()
+    {
+        value = FunctionValueState::function(lambda_capture_function_escape(
+            program,
+            function_id,
+            slot,
+        ));
+    }
+    for projection in &place.projection {
+        value = value.project(projection);
+    }
+    value
+}
+
+fn verify_function_value_escape_proof(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    value: &RValue,
+    state: &LocalInit,
+) {
+    let RValue::FunctionValue {
+        value, capability, ..
+    } = value
+    else {
+        return;
+    };
+    let actual = operand_function_state(cx.program, function_id, value, state).capability();
+    if function_value_escape_proof_conflicts(*capability, actual) {
+        cx.push(
+            VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
+            VerifyErrorKind::BadRValue(BadRValue::FunctionValueEscapeMismatch {
+                claimed: *capability,
+                actual,
+            }),
+        );
+    }
+}
+
+fn function_value_escape_proof_conflicts(
+    claimed: FunctionValueCapability,
+    actual: FunctionValueCapability,
+) -> bool {
+    matches!(claimed, FunctionValueCapability::NonFunction)
+        || matches!(
+            (claimed, actual),
+            (
+                FunctionValueCapability::Escaping,
+                FunctionValueCapability::NonEscaping
+                    | FunctionValueCapability::NonFunction
+                    | FunctionValueCapability::Unknown
+            ) | (
+                FunctionValueCapability::NonEscaping,
+                FunctionValueCapability::NonFunction
+            )
+        )
 }
 
 fn type_function_capability(program: &Program, ty: TypeId) -> FunctionValueCapability {
@@ -7101,6 +7614,47 @@ fn type_function_capability(program: &Program, ty: TypeId) -> FunctionValueCapab
         FunctionValueCapability::Unknown
     } else {
         FunctionValueCapability::NonFunction
+    }
+}
+
+fn type_function_state(program: &Program, ty: TypeId) -> FunctionValueState {
+    match program.type_arena.get(ty) {
+        Some(TypeData::Function(_)) => {
+            FunctionValueState::function(FunctionValueCapability::Unknown)
+        }
+        _ => FunctionValueState::non_function(),
+    }
+}
+
+fn source_call_return_state(program: &Program, ty: TypeId) -> FunctionValueState {
+    match program.type_arena.get(ty) {
+        Some(TypeData::Function(_)) => {
+            FunctionValueState::function(FunctionValueCapability::Escaping)
+        }
+        Some(TypeData::Tuple(fields)) => FunctionValueState::Fields(
+            fields
+                .iter()
+                .map(|field| source_call_return_state(program, *field))
+                .collect(),
+        ),
+        Some(TypeData::Aggregate(aggregate)) => program
+            .aggregates
+            .get(aggregate.index())
+            .map_or_else(FunctionValueState::unknown, |decl| {
+                FunctionValueState::Fields(
+                    decl.fields
+                        .iter()
+                        .map(|field| source_call_return_state(program, field.ty))
+                        .collect(),
+                )
+            }),
+        Some(TypeData::Array { elem, .. } | TypeData::List(elem)) => {
+            FunctionValueState::Fields(vec![source_call_return_state(program, *elem)])
+        }
+        Some(TypeData::Map { value, .. }) => {
+            FunctionValueState::Fields(vec![source_call_return_state(program, *value)])
+        }
+        _ => FunctionValueState::non_function(),
     }
 }
 
