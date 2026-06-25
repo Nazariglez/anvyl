@@ -1,6 +1,6 @@
 use anvyx_externs::{
-    CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam, ExternCallbackSignature,
-    ExternTypeExpr, SCOPED_LAMBDA_MAX_ARITY,
+    CALLBACK_WRAPPER_MAX_ARITY, CallbackEscape, CallbackPolicy, CallbackThread,
+    ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr,
 };
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -904,7 +904,7 @@ fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> 
             "callback wrapper args must be a tuple type",
         ));
     };
-    let params = scoped_lambda_params(args_ty)?;
+    let params = callback_wrapper_params(args_ty, escape)?;
     let GenericArgument::Type(ret_ty) = ret_ty else {
         return Err(syn::Error::new_spanned(
             segment,
@@ -934,15 +934,16 @@ fn callback_wrapper_signature_error(escape: CallbackEscape) -> &'static str {
     }
 }
 
-fn scoped_lambda_params(ty: &Type) -> syn::Result<Vec<CleanType>> {
+fn callback_wrapper_params(ty: &Type, escape: CallbackEscape) -> syn::Result<Vec<CleanType>> {
+    let label = callback_wrapper_label(escape);
     let Type::Tuple(tuple) = ty else {
         return Err(syn::Error::new_spanned(
             ty,
-            "ScopedLambda args must be a tuple type",
+            format!("{label} args must be a tuple type"),
         ));
     };
-    if tuple.elems.len() > SCOPED_LAMBDA_MAX_ARITY {
-        return Err(callback_arity_error(ty.span()));
+    if tuple.elems.len() > CALLBACK_WRAPPER_MAX_ARITY {
+        return Err(callback_arity_error(ty.span(), label));
     }
     tuple
         .elems
@@ -953,7 +954,7 @@ fn scoped_lambda_params(ty: &Type) -> syn::Result<Vec<CleanType>> {
             if !callback_param_supported(&ty) {
                 return Err(syn::Error::new_spanned(
                     arg,
-                    "unsupported ScopedLambda parameter type",
+                    format!("unsupported {label} parameter type"),
                 ));
             }
             Ok(ty)
@@ -961,19 +962,26 @@ fn scoped_lambda_params(ty: &Type) -> syn::Result<Vec<CleanType>> {
         .collect()
 }
 
-fn callback_arity_error(span: proc_macro2::Span) -> syn::Error {
+fn callback_arity_error(span: proc_macro2::Span, label: &'static str) -> syn::Error {
     syn::Error::new(
         span,
-        format!("ScopedLambda supports at most {SCOPED_LAMBDA_MAX_ARITY} parameters"),
+        format!("{label} supports at most {CALLBACK_WRAPPER_MAX_ARITY} parameters"),
     )
 }
 
+fn callback_wrapper_label(escape: CallbackEscape) -> &'static str {
+    match escape {
+        CallbackEscape::NonEscaping => "ScopedLambda",
+        CallbackEscape::Escaping => "EscapingLambda",
+    }
+}
+
 fn callback_param_supported(ty: &CleanType) -> bool {
-    extern_type_expr(ty).scoped_lambda_param_supported()
+    extern_type_expr(ty).callback_wrapper_param_supported()
 }
 
 fn callback_return_supported(ty: &CleanType) -> bool {
-    extern_type_expr(ty).scoped_lambda_return_supported()
+    extern_type_expr(ty).callback_wrapper_return_supported()
 }
 
 fn extern_callback_signature(callback: &CleanCallback) -> ExternCallbackSignature {
@@ -1092,8 +1100,8 @@ fn parse_descriptor_callback(input: ParseStream) -> syn::Result<CleanType> {
         }
         content.parse::<Token![,]>()?;
     }
-    if params.len() > SCOPED_LAMBDA_MAX_ARITY {
-        return Err(callback_arity_error(input.span()));
+    if params.len() > CALLBACK_WRAPPER_MAX_ARITY {
+        return Err(callback_arity_error(input.span(), "callback"));
     }
     let ret = if input.peek(Token![->]) {
         input.parse::<Token![->]>()?;
@@ -1497,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_string_scoped_lambda_elements() {
+    fn rejects_string_callback_wrapper_elements() {
         assert!(
             first_param(quote! { f: ScopedLambda<'_, '_, (String,), ()> })
                 .unwrap_err()
@@ -1509,6 +1517,12 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported callback wrapper return type")
+        );
+        assert!(
+            first_param(quote! { f: EscapingLambda<(String,), ()> })
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported EscapingLambda parameter type")
         );
         assert!(
             parse_type_expr("fn(string) -> void")

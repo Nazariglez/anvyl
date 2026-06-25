@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExternOperator, ModulePath, ProviderId};
 
-pub const SCOPED_LAMBDA_MAX_ARITY: usize = 8;
+pub const CALLBACK_WRAPPER_MAX_ARITY: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ProviderDescriptor {
@@ -229,33 +229,33 @@ impl ExternCallbackSignature {
             && self.policy.thread == CallbackThread::SameThread
     }
 
-    pub fn scoped_lambda_signature_supported(&self) -> bool {
-        self.params.len() <= SCOPED_LAMBDA_MAX_ARITY
+    pub fn callback_wrapper_signature_supported(&self) -> bool {
+        self.params.len() <= CALLBACK_WRAPPER_MAX_ARITY
             && self
                 .params
                 .iter()
-                .all(ExternCallbackParam::scoped_lambda_supported)
-            && self.ret.scoped_lambda_return_supported()
+                .all(ExternCallbackParam::callback_wrapper_supported)
+            && self.ret.callback_wrapper_return_supported()
     }
 
     pub fn scoped_lambda_supported(&self) -> bool {
-        self.scoped_lambda_policy_supported() && self.scoped_lambda_signature_supported()
+        self.scoped_lambda_policy_supported() && self.callback_wrapper_signature_supported()
     }
 }
 
 impl ExternCallbackParam {
-    pub fn scoped_lambda_supported(&self) -> bool {
-        self.escape == CallbackEscape::NonEscaping && self.ty.scoped_lambda_param_supported()
+    pub fn callback_wrapper_supported(&self) -> bool {
+        self.escape == CallbackEscape::NonEscaping && self.ty.callback_wrapper_param_supported()
     }
 }
 
 impl ExternTypeExpr {
-    pub fn scoped_lambda_param_supported(&self) -> bool {
+    pub fn callback_wrapper_param_supported(&self) -> bool {
         matches!(self, Self::Bool | Self::Int | Self::Float)
     }
 
-    pub fn scoped_lambda_return_supported(&self) -> bool {
-        matches!(self, Self::Void) || self.scoped_lambda_param_supported()
+    pub fn callback_wrapper_return_supported(&self) -> bool {
+        matches!(self, Self::Void) || self.callback_wrapper_param_supported()
     }
 }
 

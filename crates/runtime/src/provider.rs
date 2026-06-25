@@ -1085,7 +1085,7 @@ fn validate_callback_wrapper_abi(
             &format!("{label} ABI requires wrapper conversion"),
         ));
     }
-    if !callback.scoped_lambda_signature_supported() {
+    if !callback.callback_wrapper_signature_supported() {
         return Err(native_abi_error(
             descriptor,
             key,
@@ -1940,7 +1940,7 @@ mod tests {
 
     #[test]
     fn rejects_scoped_lambda_above_max_arity() {
-        let params = (0..=crate::SCOPED_LAMBDA_MAX_ARITY)
+        let params = (0..=crate::CALLBACK_WRAPPER_MAX_ARITY)
             .map(|_| ExternCallbackParam {
                 ty: ExternTypeExpr::Int,
                 escape: CallbackEscape::NonEscaping,

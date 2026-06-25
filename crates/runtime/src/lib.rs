@@ -19,7 +19,7 @@ pub mod suspect_buffer;
 pub mod type_registry;
 pub mod value;
 
-pub use anvyx_externs::{self, SCOPED_LAMBDA_MAX_ARITY};
+pub use anvyx_externs::{self, CALLBACK_WRAPPER_MAX_ARITY};
 pub use anvyx_heap::{
     AccessError, CollectOutcome, CycleStatus, ErasedHandle, Handle, Heap, HeapConfig, HeapStats,
     HeapType, HeapTypeId, LeakReport, LeakTypeReport, RootId, Trace, TraceDriver, TraceMode,
