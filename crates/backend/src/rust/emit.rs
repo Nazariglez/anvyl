@@ -2351,7 +2351,9 @@ impl EmitCx<'_> {
         let values = RustValues::new(self.program, function);
         let places = RustPlaces::new(self.program, function);
         match value {
-            RirRValue::Use(operand) => values.value_operand(operand),
+            RirRValue::Use(operand) | RirRValue::FunctionValue { value: operand, .. } => {
+                values.value_operand(operand)
+            }
             RirRValue::Struct { ty, fields } => self.struct_literal(function, *ty, fields),
             RirRValue::Tuple { ty, fields } => self.tuple_literal(function, *ty, fields),
             RirRValue::DataRefAlloc { ty, fields } => self.dataref_alloc(function, *ty, fields),
@@ -4471,6 +4473,7 @@ fn term_uses_local(program: &RirProgram, term: &RirTerm, local: RirLocalId) -> b
 fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId) -> bool {
     match value {
         RirRValue::Use(operand)
+        | RirRValue::FunctionValue { value: operand, .. }
         | RirRValue::Unary { value: operand, .. }
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }

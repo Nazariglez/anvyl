@@ -1,0 +1,56 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 42
+// 51
+// 42
+// 42
+// 41
+// 82
+// @match-end
+
+import pkg:host.host { retain, fire, close };
+
+struct Handler { cb: fn(int) -> int }
+
+fn add_one(x: int) -> int {
+    x + 1
+}
+
+fn add_ten(x: int) -> int {
+    x + 10
+}
+
+lazy let global_cb: fn(int) -> int = add_one;
+
+fn fire_once(cb: escaping fn(int) -> int) {
+    retain(cb);
+    fire();
+    close();
+}
+
+fn main() {
+    let handler = Handler { cb: add_one };
+    fire_once(handler.cb);
+
+    let pair = (add_ten, add_one);
+    fire_once(pair.0);
+
+    fire_once(global_cb);
+
+    var callbacks: [fn(int) -> int] = [add_one];
+    fire_once(callbacks[0]);
+
+    var total = 0;
+    let stateful = Handler {
+        cb: |x: int| {
+            total += x;
+            total
+        },
+    };
+    retain(stateful.cb);
+    fire();
+    fire();
+    close();
+}

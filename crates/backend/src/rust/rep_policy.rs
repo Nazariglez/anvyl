@@ -248,6 +248,20 @@ impl<'a> AirRustRepPolicy<'a> {
         )
     }
 
+    pub fn scoped_function_value_gap(
+        self,
+        ty: TypeId,
+        root: air::PlaceRoot,
+    ) -> Option<LambdaStorageGap> {
+        if matches!(self.program.type_arena.data(ty), TypeData::Function(_))
+            && matches!(root, air::PlaceRoot::ScopedBorrow(_))
+        {
+            Some(LambdaStorageGap::Lifetime)
+        } else {
+            None
+        }
+    }
+
     pub fn materialization_for(
         self,
         ty: TypeId,
@@ -3209,6 +3223,33 @@ mod tests {
         assert!(!policy.lambda_has_recursive_inline_value_capture(&same_sig_heap_env));
         assert!(policy.lambda_sig_reaches_inline_lambda_value(sig_b, sig_a));
         assert!(!policy.lambda_sig_reaches_inline_lambda_value(sig_a, sig_b));
+    }
+
+    #[test]
+    fn air_policy_rejects_scoped_function_value_by_value() {
+        let mut program = Program::default();
+        let void = program.alloc_type(TypeData::Void);
+        let lambda = program.alloc_type(TypeData::Function(air::SignatureType::new(
+            vec![],
+            air::ReturnMode::Value(void),
+        )));
+        let classes = TypePassClasses::analyze(&program);
+        let policy = AirRustRepPolicy::new(&program, &classes);
+
+        assert_eq!(
+            policy.scoped_function_value_gap(
+                lambda,
+                air::PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
+            ),
+            Some(LambdaStorageGap::Lifetime)
+        );
+        assert_eq!(
+            policy.scoped_function_value_gap(
+                lambda,
+                air::PlaceRoot::Local(air::LocalId::from_index(0)),
+            ),
+            None
+        );
     }
 
     #[test]

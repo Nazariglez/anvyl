@@ -752,6 +752,11 @@ pub enum RirOptionSubject {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RirRValue {
     Use(RirOperand),
+    FunctionValue {
+        value: RirOperand,
+        escape: Option<RirLambdaEscape>,
+        ty: RirTypeId,
+    },
     Struct {
         ty: RirTypeId,
         fields: Vec<RirOperand>,
@@ -1359,11 +1364,13 @@ pub fn verify(program: &RirProgram) -> Result<VerifiedRirProgram<'_>, Vec<RirVer
         possibly_initialized: vec![],
         payload_ref_owned: vec![],
         lambda_escapes: vec![],
+        lambda_values: vec![],
         loop_lambda_scopes: vec![],
         local_decl_scopes: vec![],
         initialized_cells: vec![],
         possibly_initialized_cells: vec![],
         global_initialized: vec![],
+        global_values: vec![],
         loops: vec![],
         scope_depth: 0,
         collection_loans: vec![],
@@ -1794,6 +1801,7 @@ pub enum RirVerifyErrorKind {
     },
     CallArgMode,
     CallArgEscape,
+    LambdaEscapeProofMismatch,
     DuplicateMatchArm,
     MatchNotExhaustive,
     OptionPayloadEscapeRequiresPayload,
@@ -1815,15 +1823,165 @@ impl fmt::Display for RirVerifyError {
 
 impl Error for RirVerifyError {}
 
-type RirBlockState = (
-    Vec<bool>,
-    Vec<bool>,
-    Vec<Option<RirLambdaEscape>>,
-    Vec<Option<usize>>,
-    Vec<bool>,
-    Vec<bool>,
-    Vec<bool>,
-);
+#[derive(Clone, PartialEq, Eq)]
+enum RirFunctionValueState {
+    Unknown,
+    NonFunction,
+    Lambda(Option<RirLambdaEscape>),
+    Fields(Vec<RirFunctionValueState>),
+}
+
+impl RirFunctionValueState {
+    fn join(left: Self, right: Self) -> Self {
+        match (left, right) {
+            (Self::Lambda(left), Self::Lambda(right)) if left == right => Self::Lambda(left),
+            (Self::NonFunction, Self::NonFunction) => Self::NonFunction,
+            (Self::Fields(left), Self::Fields(right)) if left.len() == right.len() => Self::Fields(
+                left.into_iter()
+                    .zip(right)
+                    .map(|(left, right)| Self::join(left, right))
+                    .collect(),
+            ),
+            _ => Self::Unknown,
+        }
+    }
+
+    fn escape(&self) -> Option<RirLambdaEscape> {
+        match self {
+            Self::Lambda(escape) => *escape,
+            Self::Unknown | Self::NonFunction | Self::Fields(_) => None,
+        }
+    }
+
+    fn project(&self, projection: RirProjection) -> Self {
+        let Self::Fields(fields) = self else {
+            return Self::Unknown;
+        };
+        match projection {
+            RirProjection::Field(field) | RirProjection::TupleField(field) => {
+                fields.get(field.index()).cloned().unwrap_or(Self::Unknown)
+            }
+            RirProjection::Index(_) => fields
+                .iter()
+                .cloned()
+                .reduce(Self::join)
+                .unwrap_or(Self::Unknown),
+        }
+    }
+
+    fn projection_mut(&mut self, projections: &[RirProjection]) -> Option<&mut Self> {
+        let Some((first, rest)) = projections.split_first() else {
+            return Some(self);
+        };
+        let Self::Fields(fields) = self else {
+            return None;
+        };
+        let index = match first {
+            RirProjection::Field(field) | RirProjection::TupleField(field) => field.index(),
+            RirProjection::Index(_) => return None,
+        };
+        fields.get_mut(index)?.projection_mut(rest)
+    }
+
+    fn assign_projection(&mut self, projections: &[RirProjection], value: Self) -> bool {
+        let Some(slot) = self.projection_mut(projections) else {
+            return false;
+        };
+        *slot = value;
+        true
+    }
+
+    fn push_projection(&mut self, projections: &[RirProjection], value: Self) -> bool {
+        let Some(Self::Fields(fields)) = self.projection_mut(projections) else {
+            return false;
+        };
+        fields.push(value);
+        true
+    }
+}
+
+#[derive(Clone)]
+struct RirBlockState {
+    definite: Vec<bool>,
+    possible: Vec<bool>,
+    lambda_escapes: Vec<Option<RirLambdaEscape>>,
+    lambda_values: Vec<RirFunctionValueState>,
+    loop_lambda_scopes: Vec<Option<usize>>,
+    cell_definite: Vec<bool>,
+    cell_possible: Vec<bool>,
+    globals: Vec<bool>,
+    global_values: Vec<RirFunctionValueState>,
+}
+
+impl RirBlockState {
+    fn merge_with(&mut self, next: Self) {
+        self.definite = self
+            .definite
+            .iter()
+            .zip(next.definite)
+            .map(|(lhs, rhs)| *lhs && rhs)
+            .collect();
+        self.possible = self
+            .possible
+            .iter()
+            .zip(next.possible)
+            .map(|(lhs, rhs)| *lhs || rhs)
+            .collect();
+        self.lambda_escapes = self
+            .lambda_escapes
+            .iter()
+            .zip(next.lambda_escapes)
+            .map(|(lhs, rhs)| if *lhs == rhs { rhs } else { None })
+            .collect();
+        self.lambda_values = self
+            .lambda_values
+            .drain(..)
+            .zip(next.lambda_values)
+            .map(|(lhs, rhs)| RirFunctionValueState::join(lhs, rhs))
+            .collect();
+        self.loop_lambda_scopes = self
+            .loop_lambda_scopes
+            .iter()
+            .zip(next.loop_lambda_scopes)
+            .map(|(lhs, rhs)| if *lhs == rhs { rhs } else { None })
+            .collect();
+        self.cell_definite = self
+            .cell_definite
+            .iter()
+            .zip(next.cell_definite)
+            .map(|(lhs, rhs)| *lhs && rhs)
+            .collect();
+        self.cell_possible = self
+            .cell_possible
+            .iter()
+            .zip(next.cell_possible)
+            .map(|(lhs, rhs)| *lhs || rhs)
+            .collect();
+        self.globals = self
+            .globals
+            .iter()
+            .zip(next.globals)
+            .map(|(lhs, rhs)| *lhs && rhs)
+            .collect();
+        self.global_values = self
+            .global_values
+            .drain(..)
+            .zip(next.global_values)
+            .map(|(lhs, rhs)| RirFunctionValueState::join(lhs, rhs))
+            .collect();
+    }
+}
+
+#[derive(Clone)]
+struct RirBlockEntryState {
+    definite: Vec<bool>,
+    possible: Vec<bool>,
+    lambda_escapes: Vec<Option<RirLambdaEscape>>,
+    lambda_values: Vec<RirFunctionValueState>,
+    loop_lambda_scopes: Vec<Option<usize>>,
+    global_initialized: Vec<bool>,
+    global_values: Vec<RirFunctionValueState>,
+}
 
 struct VerifyCx<'a> {
     program: &'a RirProgram,
@@ -1832,11 +1990,13 @@ struct VerifyCx<'a> {
     possibly_initialized: Vec<bool>,
     payload_ref_owned: Vec<bool>,
     lambda_escapes: Vec<Option<RirLambdaEscape>>,
+    lambda_values: Vec<RirFunctionValueState>,
     loop_lambda_scopes: Vec<Option<usize>>,
     local_decl_scopes: Vec<Option<usize>>,
     initialized_cells: Vec<bool>,
     possibly_initialized_cells: Vec<bool>,
     global_initialized: Vec<bool>,
+    global_values: Vec<RirFunctionValueState>,
     loops: Vec<RirLoopId>,
     scope_depth: usize,
     collection_loans: Vec<ActiveRirCollectionLoan>,
@@ -1957,7 +2117,7 @@ fn rir_type_matches_callback(
     callback: &ExternCallbackSignature,
 ) -> bool {
     if callback.policy.thread != CallbackThread::SameThread
-        || !callback.scoped_lambda_signature_supported()
+        || !callback.callback_wrapper_signature_supported()
     {
         return false;
     }
@@ -3345,11 +3505,13 @@ impl VerifyCx<'_> {
         let previous_possible = std::mem::take(&mut self.possibly_initialized);
         let previous_payload_ref_owned = std::mem::take(&mut self.payload_ref_owned);
         let previous_lambda_escapes = std::mem::take(&mut self.lambda_escapes);
+        let previous_lambda_values = std::mem::take(&mut self.lambda_values);
         let previous_loop_lambda_scopes = std::mem::take(&mut self.loop_lambda_scopes);
         let previous_local_decl_scopes = std::mem::take(&mut self.local_decl_scopes);
         let previous_initialized_cells = std::mem::take(&mut self.initialized_cells);
         let previous_possible_cells = std::mem::take(&mut self.possibly_initialized_cells);
         let previous_global_initialized = std::mem::take(&mut self.global_initialized);
+        let previous_global_values = std::mem::take(&mut self.global_values);
         let previous_scope_depth = self.scope_depth;
         self.initialized = function
             .locals
@@ -3359,6 +3521,11 @@ impl VerifyCx<'_> {
         self.possibly_initialized.clone_from(&self.initialized);
         self.payload_ref_owned = vec![false; function.locals.len()];
         self.lambda_escapes = vec![None; function.locals.len()];
+        self.lambda_values = function
+            .locals
+            .iter()
+            .map(|local| self.type_function_value_state(local.ty))
+            .collect();
         self.loop_lambda_scopes = vec![None; function.locals.len()];
         self.local_decl_scopes = function
             .locals
@@ -3368,6 +3535,12 @@ impl VerifyCx<'_> {
         self.initialized_cells = vec![false; self.program.cells.len()];
         self.possibly_initialized_cells = vec![false; self.program.cells.len()];
         self.global_initialized = vec![false; self.program.globals.len()];
+        self.global_values = self
+            .program
+            .globals
+            .iter()
+            .map(|global| self.type_function_value_state(global.ty))
+            .collect();
         self.scope_depth = 0;
         for lambda in self
             .program
@@ -3390,10 +3563,14 @@ impl VerifyCx<'_> {
             if let Some(possible) = self.possibly_initialized.get_mut(param.local.index()) {
                 *possible = true;
             }
-            if matches!(self.ty(param.ty), Some(RirType::Lambda(_)))
-                && let Some(escape) = self.lambda_escapes.get_mut(param.local.index())
-            {
-                *escape = Some(RirLambdaEscape::from_param_escape(param.escape));
+            if matches!(self.ty(param.ty), Some(RirType::Lambda(_))) {
+                let escape = Some(RirLambdaEscape::from_param_escape(param.escape));
+                if let Some(slot) = self.lambda_escapes.get_mut(param.local.index()) {
+                    *slot = escape;
+                }
+                if let Some(slot) = self.lambda_values.get_mut(param.local.index()) {
+                    *slot = RirFunctionValueState::Lambda(escape);
+                }
             }
         }
         for (stmt_index, stmt) in function.body.stmts.iter().enumerate() {
@@ -3426,11 +3603,13 @@ impl VerifyCx<'_> {
         self.possibly_initialized = previous_possible;
         self.payload_ref_owned = previous_payload_ref_owned;
         self.lambda_escapes = previous_lambda_escapes;
+        self.lambda_values = previous_lambda_values;
         self.loop_lambda_scopes = previous_loop_lambda_scopes;
         self.local_decl_scopes = previous_local_decl_scopes;
         self.initialized_cells = previous_initialized_cells;
         self.possibly_initialized_cells = previous_possible_cells;
         self.global_initialized = previous_global_initialized;
+        self.global_values = previous_global_values;
         self.scope_depth = previous_scope_depth;
     }
 
@@ -3468,6 +3647,10 @@ impl VerifyCx<'_> {
                 }
                 let escape = self.rvalue_lambda_escape(function, value);
                 self.set_local_lambda_escape(function, *local, escape);
+                self.set_local_lambda_value(
+                    *local,
+                    self.rvalue_function_value_state(function, value),
+                );
                 self.set_local_decl_scope(*local);
                 let loop_scope = self.rvalue_loop_lambda_scope(function, value);
                 self.set_local_loop_lambda_scope(function, *local, loop_scope);
@@ -3480,9 +3663,19 @@ impl VerifyCx<'_> {
             }
             RirStmt::GlobalEnsure { global } => {
                 if self.check_global_id(site, *global).is_some()
-                    && let Some(slot) = self.global_initialized.get_mut(global.index())
+                    && !self
+                        .global_initialized
+                        .get(global.index())
+                        .copied()
+                        .unwrap_or(false)
                 {
-                    *slot = true;
+                    if let Some(slot) = self.global_initialized.get_mut(global.index()) {
+                        *slot = true;
+                    }
+                    let value = self.global_initializer_function_value_state(*global);
+                    if let Some(slot) = self.global_values.get_mut(global.index()) {
+                        *slot = value;
+                    }
                 }
             }
             RirStmt::GlobalSetRoot { global, value }
@@ -3511,8 +3704,12 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(global_decl.ty));
+                let value_state = self.rvalue_function_value_state(function, value);
                 if let Some(slot) = self.global_initialized.get_mut(global.index()) {
                     *slot = true;
+                }
+                if let Some(slot) = self.global_values.get_mut(global.index()) {
+                    *slot = value_state;
                 }
             }
             RirStmt::MutPlaceSet { place, value } => {
@@ -3530,6 +3727,8 @@ impl VerifyCx<'_> {
                     MutPlaceUse::Write,
                 );
                 self.check_rvalue(function_id, function, index, value, Some(ty));
+                let value_state = self.rvalue_function_value_state(function, value);
+                self.set_mut_place_function_value(function, place, value_state);
             }
             RirStmt::Assign { dst, value } => {
                 self.check_place(site, function, dst);
@@ -3547,14 +3746,17 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                let value_state = self.rvalue_function_value_state(function, value);
                 let loop_scope = self.rvalue_loop_lambda_scope(function, value);
                 if dst.projections.is_empty() {
-                    let escape = self.rvalue_lambda_escape(function, value);
-                    self.set_local_lambda_escape(function, dst_local, escape);
+                    self.set_place_function_value(function, dst, value_state);
                     self.check_loop_lambda_assignment_scope(site, dst_local, loop_scope);
                     self.set_local_loop_lambda_scope(function, dst_local, loop_scope);
-                } else if loop_scope.is_some() {
-                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+                } else {
+                    self.set_place_function_value(function, dst, value_state);
+                    if loop_scope.is_some() {
+                        self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+                    }
                 }
             }
             RirStmt::CellInit { cell, value } => {
@@ -3641,6 +3843,7 @@ impl VerifyCx<'_> {
                 if let Some(value_ty) = value_ty {
                     self.check_value_operand_ty(site, function, value, value_ty);
                 }
+                self.clear_collection_function_value(function, collection);
             }
             RirStmt::MapValueSet { map, index, value } => {
                 if !self.collection_loan_root_mutable(function, map) {
@@ -3651,9 +3854,11 @@ impl VerifyCx<'_> {
                 {
                     self.check_value_operand_ty(site, function, value, value_ty);
                 }
+                self.clear_collection_function_value(function, map);
             }
             RirStmt::Eval(value) => {
                 self.check_rvalue(function_id, function, index, value, None);
+                self.clear_rvalue_function_writes(function, value);
             }
             RirStmt::If(branch) => {
                 if let Some(bool_ty) = self.type_id(RirType::Bool) {
@@ -3668,46 +3873,24 @@ impl VerifyCx<'_> {
                         );
                     }
                 }
-                let entry_definite = self.initialized.clone();
-                let entry_possible = self.possibly_initialized.clone();
-                let entry_lambda_escapes = self.lambda_escapes.clone();
-                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
-                let entry_globals = self.global_initialized.clone();
+                let entry = self.block_entry_state();
                 let then_state = self.check_structured_block(
                     function_id,
                     function,
                     &branch.then_block,
-                    entry_definite.clone(),
-                    entry_possible.clone(),
-                    entry_lambda_escapes.clone(),
-                    entry_loop_lambda_scopes.clone(),
-                    entry_globals.clone(),
+                    entry.clone(),
                     None,
                 );
-                let else_state = branch.else_block.as_ref().map_or(
-                    Some((
-                        entry_definite.clone(),
-                        entry_possible.clone(),
-                        entry_lambda_escapes.clone(),
-                        entry_loop_lambda_scopes.clone(),
-                        self.initialized_cells.clone(),
-                        self.possibly_initialized_cells.clone(),
-                        entry_globals.clone(),
-                    )),
-                    |else_block| {
-                        self.check_structured_block(
-                            function_id,
-                            function,
-                            else_block,
-                            entry_definite.clone(),
-                            entry_possible.clone(),
-                            entry_lambda_escapes.clone(),
-                            entry_loop_lambda_scopes.clone(),
-                            entry_globals.clone(),
-                            None,
-                        )
-                    },
-                );
+                let else_state = match &branch.else_block {
+                    Some(else_block) => self.check_structured_block(
+                        function_id,
+                        function,
+                        else_block,
+                        entry.clone(),
+                        None,
+                    ),
+                    None => Some(self.current_block_state()),
+                };
                 self.merge_structured_states([then_state, else_state]);
             }
             RirStmt::Loop(loop_) => {
@@ -3716,11 +3899,7 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     &loop_.body,
-                    self.initialized.clone(),
-                    self.possibly_initialized.clone(),
-                    self.lambda_escapes.clone(),
-                    self.loop_lambda_scopes.clone(),
-                    self.global_initialized.clone(),
+                    self.block_entry_state(),
                     None,
                 );
                 self.loops.pop();
@@ -3733,11 +3912,7 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     block,
-                    self.initialized.clone(),
-                    self.possibly_initialized.clone(),
-                    self.lambda_escapes.clone(),
-                    self.loop_lambda_scopes.clone(),
-                    self.global_initialized.clone(),
+                    self.block_entry_state(),
                     None,
                 );
                 self.merge_structured_states([state]);
@@ -3755,11 +3930,7 @@ impl VerifyCx<'_> {
                     .and_then(|id| self.program.enums.get(id.index()))
                     .map(|enm| enm.variants.len());
                 let mut seen = Vec::new();
-                let entry_definite = self.initialized.clone();
-                let entry_possible = self.possibly_initialized.clone();
-                let entry_lambda_escapes = self.lambda_escapes.clone();
-                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
-                let entry_globals = self.global_initialized.clone();
+                let entry = self.block_entry_state();
                 let mut states = vec![];
                 for arm in &match_.arms {
                     if variant_count.is_none_or(|len| arm.variant.index() >= len) {
@@ -3773,11 +3944,7 @@ impl VerifyCx<'_> {
                         function_id,
                         function,
                         &arm.block,
-                        entry_definite.clone(),
-                        entry_possible.clone(),
-                        entry_lambda_escapes.clone(),
-                        entry_loop_lambda_scopes.clone(),
-                        entry_globals.clone(),
+                        entry.clone(),
                         None,
                     ));
                 }
@@ -3786,11 +3953,7 @@ impl VerifyCx<'_> {
                         function_id,
                         function,
                         else_block,
-                        entry_definite.clone(),
-                        entry_possible.clone(),
-                        entry_lambda_escapes.clone(),
-                        entry_loop_lambda_scopes.clone(),
-                        entry_globals.clone(),
+                        entry.clone(),
                         None,
                     ));
                 } else if variant_count.is_some_and(|len| seen.len() < len) {
@@ -3818,22 +3981,16 @@ impl VerifyCx<'_> {
                 } else {
                     self.check_value_operand_ty(site, function, &match_.key, map_ty);
                 }
-                let entry_definite = self.initialized.clone();
-                let entry_possible = self.possibly_initialized.clone();
-                let entry_lambda_escapes = self.lambda_escapes.clone();
-                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
-                let entry_globals = self.global_initialized.clone();
-                let mut some_definite = entry_definite.clone();
-                let mut some_possible = entry_possible.clone();
-                let mut some_lambda_escapes = entry_lambda_escapes.clone();
-                let mut some_loop_lambda_scopes = entry_loop_lambda_scopes.clone();
+                let entry = self.block_entry_state();
+                let mut some_entry = entry.clone();
                 if match_.payload_escapes && match_.payload.is_none() {
                     self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
                 }
                 if let Some(payload) = match_.payload {
                     if let Some(local) = function.locals.get(payload.index()) {
                         if function.params.iter().any(|param| param.local == payload)
-                            || entry_possible
+                            || entry
+                                .possible
                                 .get(payload.index())
                                 .copied()
                                 .unwrap_or(false)
@@ -3857,16 +4014,19 @@ impl VerifyCx<'_> {
                                 },
                             );
                         }
-                        if let Some(slot) = some_definite.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.definite.get_mut(payload.index()) {
                             *slot = true;
                         }
-                        if let Some(slot) = some_possible.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.possible.get_mut(payload.index()) {
                             *slot = true;
                         }
-                        if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.lambda_escapes.get_mut(payload.index()) {
                             *slot = None;
                         }
-                        if let Some(slot) = some_loop_lambda_scopes.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.lambda_values.get_mut(payload.index()) {
+                            *slot = RirFunctionValueState::Unknown;
+                        }
+                        if let Some(slot) = some_entry.loop_lambda_scopes.get_mut(payload.index()) {
                             *slot = None;
                         }
                     } else {
@@ -3878,21 +4038,16 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     &match_.some_block,
-                    some_definite,
-                    some_possible,
-                    some_lambda_escapes,
-                    some_loop_lambda_scopes,
-                    entry_globals.clone(),
+                    some_entry,
                     escaping_payload,
                 );
                 if !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible, _, _, _, _, _))) =
-                        (match_.payload, &mut some_state)
+                    && let (Some(payload), Some(state)) = (match_.payload, &mut some_state)
                 {
-                    if let Some(slot) = definite.get_mut(payload.index()) {
+                    if let Some(slot) = state.definite.get_mut(payload.index()) {
                         *slot = false;
                     }
-                    if let Some(slot) = possible.get_mut(payload.index()) {
+                    if let Some(slot) = state.possible.get_mut(payload.index()) {
                         *slot = false;
                     }
                 }
@@ -3900,11 +4055,7 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     &match_.none_block,
-                    entry_definite,
-                    entry_possible,
-                    entry_lambda_escapes,
-                    entry_loop_lambda_scopes,
-                    entry_globals,
+                    entry,
                     None,
                 );
                 if match_.payload_escapes && none_state.is_some() {
@@ -3943,15 +4094,8 @@ impl VerifyCx<'_> {
                         None
                     }
                 };
-                let entry_definite = self.initialized.clone();
-                let entry_possible = self.possibly_initialized.clone();
-                let entry_lambda_escapes = self.lambda_escapes.clone();
-                let entry_loop_lambda_scopes = self.loop_lambda_scopes.clone();
-                let entry_globals = self.global_initialized.clone();
-                let mut some_definite = entry_definite.clone();
-                let mut some_possible = entry_possible.clone();
-                let mut some_lambda_escapes = entry_lambda_escapes.clone();
-                let mut some_loop_lambda_scopes = entry_loop_lambda_scopes.clone();
+                let entry = self.block_entry_state();
+                let mut some_entry = entry.clone();
                 if (match_.payload_ref || match_.payload_escapes) && match_.payload.is_none() {
                     self.push(site, RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload);
                 }
@@ -3971,7 +4115,8 @@ impl VerifyCx<'_> {
                         if function.params.iter().any(|param| param.local == payload) {
                             self.push(site, RirVerifyErrorKind::InitParamLocal);
                         }
-                        if entry_possible
+                        if entry
+                            .possible
                             .get(payload.index())
                             .copied()
                             .unwrap_or(false)
@@ -4000,16 +4145,19 @@ impl VerifyCx<'_> {
                                 },
                             );
                         }
-                        if let Some(slot) = some_definite.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.definite.get_mut(payload.index()) {
                             *slot = true;
                         }
-                        if let Some(slot) = some_possible.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.possible.get_mut(payload.index()) {
                             *slot = true;
                         }
-                        if let Some(slot) = some_lambda_escapes.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.lambda_escapes.get_mut(payload.index()) {
                             *slot = None;
                         }
-                        if let Some(slot) = some_loop_lambda_scopes.get_mut(payload.index()) {
+                        if let Some(slot) = some_entry.lambda_values.get_mut(payload.index()) {
+                            *slot = RirFunctionValueState::Unknown;
+                        }
+                        if let Some(slot) = some_entry.loop_lambda_scopes.get_mut(payload.index()) {
                             *slot = None;
                         }
                     } else {
@@ -4031,22 +4179,17 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     &match_.some_block,
-                    some_definite,
-                    some_possible,
-                    some_lambda_escapes,
-                    some_loop_lambda_scopes,
-                    entry_globals.clone(),
+                    some_entry,
                     escaping_payload,
                 );
                 if match_.payload_ref
                     && !match_.payload_escapes
-                    && let (Some(payload), Some((definite, possible, _, _, _, _, _))) =
-                        (match_.payload, &mut some_state)
+                    && let (Some(payload), Some(state)) = (match_.payload, &mut some_state)
                 {
-                    if let Some(slot) = definite.get_mut(payload.index()) {
+                    if let Some(slot) = state.definite.get_mut(payload.index()) {
                         *slot = false;
                     }
-                    if let Some(slot) = possible.get_mut(payload.index()) {
+                    if let Some(slot) = state.possible.get_mut(payload.index()) {
                         *slot = false;
                     }
                 }
@@ -4054,11 +4197,7 @@ impl VerifyCx<'_> {
                     function_id,
                     function,
                     &match_.none_block,
-                    entry_definite,
-                    entry_possible,
-                    entry_lambda_escapes,
-                    entry_loop_lambda_scopes,
-                    entry_globals,
+                    entry,
                     None,
                 );
                 if match_.payload_escapes && none_state.is_some() {
@@ -4081,6 +4220,195 @@ impl VerifyCx<'_> {
             .is_some_and(|local| matches!(self.ty(local.ty), Some(RirType::Lambda(_))));
         if let Some(slot) = self.lambda_escapes.get_mut(local.index()) {
             *slot = is_lambda.then_some(escape).flatten();
+        }
+    }
+
+    fn set_local_lambda_value(&mut self, local: RirLocalId, value: RirFunctionValueState) {
+        if let Some(slot) = self.lambda_values.get_mut(local.index()) {
+            *slot = value;
+        }
+    }
+
+    fn clear_local_lambda_value(&mut self, local: RirLocalId) {
+        if let Some(slot) = self.lambda_escapes.get_mut(local.index()) {
+            *slot = None;
+        }
+        if let Some(slot) = self.lambda_values.get_mut(local.index()) {
+            *slot = RirFunctionValueState::Unknown;
+        }
+    }
+
+    fn set_place_function_value(
+        &mut self,
+        function: &RirFunction,
+        place: &RirPlace,
+        value: RirFunctionValueState,
+    ) {
+        match place.root {
+            RirPlaceRoot::Local(local) if place.projections.is_empty() => {
+                self.set_local_lambda_escape(function, local, value.escape());
+                self.set_local_lambda_value(local, value);
+            }
+            RirPlaceRoot::Local(local) if local.index() < self.lambda_values.len() => {
+                if !self.lambda_values[local.index()].assign_projection(&place.projections, value) {
+                    self.clear_local_lambda_value(local);
+                }
+            }
+            RirPlaceRoot::Local(_) => {}
+            RirPlaceRoot::Global(global) if place.projections.is_empty() => {
+                if let Some(slot) = self.global_values.get_mut(global.index()) {
+                    *slot = value;
+                }
+            }
+            RirPlaceRoot::Global(global) if global.index() < self.global_values.len() => {
+                if !self.global_values[global.index()].assign_projection(&place.projections, value)
+                {
+                    self.global_values[global.index()] = RirFunctionValueState::Unknown;
+                }
+            }
+            RirPlaceRoot::Global(_) => {}
+        }
+    }
+
+    fn set_mut_place_function_value(
+        &mut self,
+        function: &RirFunction,
+        place: &RirMutPlaceArg,
+        value: RirFunctionValueState,
+    ) {
+        match &place.access {
+            RirMutPlaceAccess::Handle(
+                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+            ) if place.projections.is_empty() => {
+                self.set_local_lambda_escape(function, *local, value.escape());
+                self.set_local_lambda_value(*local, value);
+            }
+            RirMutPlaceAccess::Handle(
+                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+            ) if local.index() < self.lambda_values.len() => {
+                if !self.lambda_values[local.index()].assign_projection(&place.projections, value) {
+                    self.clear_local_lambda_value(*local);
+                }
+            }
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+                if place.projections.is_empty() =>
+            {
+                if let Some(slot) = self.global_values.get_mut(global.index()) {
+                    *slot = value;
+                }
+            }
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+                if global.index() < self.global_values.len() =>
+            {
+                if !self.global_values[global.index()].assign_projection(&place.projections, value)
+                {
+                    self.global_values[global.index()] = RirFunctionValueState::Unknown;
+                }
+            }
+            RirMutPlaceAccess::Handle(
+                RirMutPlaceHandle::Local { .. }
+                | RirMutPlaceHandle::Param { .. }
+                | RirMutPlaceHandle::Global { .. }
+                | RirMutPlaceHandle::StackCell { .. }
+                | RirMutPlaceHandle::HeapCell { .. }
+                | RirMutPlaceHandle::ScopedPlaceCell { .. },
+            )
+            | RirMutPlaceAccess::DataRef { .. } => {}
+        }
+    }
+
+    fn push_place_function_value(&mut self, place: &RirPlace, value: RirFunctionValueState) {
+        match place.root {
+            RirPlaceRoot::Local(local) if local.index() < self.lambda_values.len() => {
+                if !self.lambda_values[local.index()].push_projection(&place.projections, value) {
+                    self.clear_local_lambda_value(local);
+                }
+            }
+            RirPlaceRoot::Global(global) if global.index() < self.global_values.len() => {
+                if !self.global_values[global.index()].push_projection(&place.projections, value) {
+                    self.global_values[global.index()] = RirFunctionValueState::Unknown;
+                }
+            }
+            RirPlaceRoot::Local(_) | RirPlaceRoot::Global(_) => {}
+        }
+    }
+
+    fn push_mut_place_function_value(
+        &mut self,
+        place: &RirMutPlaceArg,
+        value: RirFunctionValueState,
+    ) {
+        match &place.access {
+            RirMutPlaceAccess::Handle(
+                RirMutPlaceHandle::Local { local, .. } | RirMutPlaceHandle::Param { local, .. },
+            ) if local.index() < self.lambda_values.len() => {
+                if !self.lambda_values[local.index()].push_projection(&place.projections, value) {
+                    self.clear_local_lambda_value(*local);
+                }
+            }
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { global, .. })
+                if global.index() < self.global_values.len() =>
+            {
+                if !self.global_values[global.index()].push_projection(&place.projections, value) {
+                    self.global_values[global.index()] = RirFunctionValueState::Unknown;
+                }
+            }
+            RirMutPlaceAccess::Handle(
+                RirMutPlaceHandle::Local { .. }
+                | RirMutPlaceHandle::Param { .. }
+                | RirMutPlaceHandle::Global { .. }
+                | RirMutPlaceHandle::StackCell { .. }
+                | RirMutPlaceHandle::HeapCell { .. }
+                | RirMutPlaceHandle::ScopedPlaceCell { .. },
+            )
+            | RirMutPlaceAccess::DataRef { .. } => {}
+        }
+    }
+
+    fn clear_place_function_value(&mut self, function: &RirFunction, place: &RirPlace) {
+        self.set_place_function_value(function, place, RirFunctionValueState::Unknown);
+    }
+
+    fn clear_mut_place_function_value(&mut self, function: &RirFunction, place: &RirMutPlaceArg) {
+        self.set_mut_place_function_value(function, place, RirFunctionValueState::Unknown);
+    }
+
+    fn clear_collection_function_value(
+        &mut self,
+        function: &RirFunction,
+        collection: &RirCollectionAccess,
+    ) {
+        match collection {
+            RirCollectionAccess::Direct(place) => self.clear_place_function_value(function, place),
+            RirCollectionAccess::MutPlace(place) => {
+                self.clear_mut_place_function_value(function, place);
+            }
+        }
+    }
+
+    fn push_collection_function_value(
+        &mut self,
+        collection: &RirCollectionAccess,
+        value: RirFunctionValueState,
+    ) {
+        match collection {
+            RirCollectionAccess::Direct(place) => self.push_place_function_value(place, value),
+            RirCollectionAccess::MutPlace(place) => {
+                self.push_mut_place_function_value(place, value);
+            }
+        }
+    }
+
+    fn clear_rvalue_function_writes(&mut self, function: &RirFunction, value: &RirRValue) {
+        match value {
+            RirRValue::ListPush { list, value } => {
+                let value = self.operand_function_value_state(function, value);
+                self.push_collection_function_value(list, value);
+            }
+            RirRValue::MapInsert { map, .. } | RirRValue::MapRemove { map, .. } => {
+                self.clear_collection_function_value(function, map);
+            }
+            _ => {}
         }
     }
 
@@ -4125,7 +4453,9 @@ impl VerifyCx<'_> {
                 .iter()
                 .any(|capture| self.lambda_capture_arg_uses_loop_cell(capture))
                 .then_some(self.scope_depth),
-            RirRValue::Use(operand) => self.operand_loop_lambda_scope(function, operand),
+            RirRValue::Use(operand) | RirRValue::FunctionValue { value: operand, .. } => {
+                self.operand_loop_lambda_scope(function, operand)
+            }
             _ => None,
         }
     }
@@ -4171,6 +4501,259 @@ impl VerifyCx<'_> {
             .is_some_and(|cell| matches!(cell.lifetime, RirCellLifetime::Loop { .. }))
     }
 
+    fn type_function_value_state(&self, ty: RirTypeId) -> RirFunctionValueState {
+        if matches!(self.ty(ty), Some(RirType::Lambda(_))) {
+            RirFunctionValueState::Lambda(None)
+        } else {
+            RirFunctionValueState::NonFunction
+        }
+    }
+
+    fn source_call_return_state(&self, ty: RirTypeId) -> RirFunctionValueState {
+        match self.ty(ty) {
+            Some(RirType::Lambda(_)) => {
+                RirFunctionValueState::Lambda(Some(RirLambdaEscape::Escaping))
+            }
+            Some(RirType::Tuple(tuple)) => self.program.tuples.get(tuple.index()).map_or(
+                RirFunctionValueState::Unknown,
+                |tuple| {
+                    RirFunctionValueState::Fields(
+                        tuple
+                            .fields
+                            .iter()
+                            .map(|field| self.source_call_return_state(field.ty))
+                            .collect(),
+                    )
+                },
+            ),
+            Some(RirType::Struct(strukt)) => self.program.structs.get(strukt.index()).map_or(
+                RirFunctionValueState::Unknown,
+                |strukt| {
+                    RirFunctionValueState::Fields(
+                        strukt
+                            .fields
+                            .iter()
+                            .map(|field| self.source_call_return_state(field.ty))
+                            .collect(),
+                    )
+                },
+            ),
+            Some(RirType::Array { elem, .. } | RirType::List(elem)) => {
+                RirFunctionValueState::Fields(vec![self.source_call_return_state(elem)])
+            }
+            Some(RirType::Map { value, .. }) => {
+                RirFunctionValueState::Fields(vec![self.source_call_return_state(value)])
+            }
+            _ => RirFunctionValueState::NonFunction,
+        }
+    }
+
+    fn global_initializer_function_value_state(
+        &mut self,
+        global: RirGlobalId,
+    ) -> RirFunctionValueState {
+        self.global_initializer_function_value_state_inner(global, false)
+    }
+
+    fn immutable_global_initializer_function_value_state(
+        &mut self,
+        global: RirGlobalId,
+    ) -> RirFunctionValueState {
+        self.global_initializer_function_value_state_inner(global, true)
+    }
+
+    fn global_initializer_function_value_state_inner(
+        &mut self,
+        global: RirGlobalId,
+        require_immutable: bool,
+    ) -> RirFunctionValueState {
+        let Some(global_decl) = self.program.globals.get(global.index()) else {
+            return RirFunctionValueState::Unknown;
+        };
+        if require_immutable && global_decl.mutable {
+            return RirFunctionValueState::Unknown;
+        }
+        let Some(function) = self.program.functions.get(global_decl.init.index()) else {
+            return RirFunctionValueState::Unknown;
+        };
+        let lambda_values = function
+            .locals
+            .iter()
+            .map(|local| self.type_function_value_state(local.ty))
+            .collect();
+        let outer_lambda_values = std::mem::replace(&mut self.lambda_values, lambda_values);
+        let mut result = RirFunctionValueState::Unknown;
+        for stmt in &function.body.stmts {
+            match stmt {
+                RirStmt::Init { local, value } => {
+                    let value = self.rvalue_function_value_state(function, value);
+                    self.set_local_lambda_value(*local, value);
+                }
+                RirStmt::Assign { dst, value } => {
+                    if let RirPlaceRoot::Local(local) = dst.root {
+                        if dst.projections.is_empty() {
+                            let value = self.rvalue_function_value_state(function, value);
+                            self.set_local_lambda_value(local, value);
+                        } else {
+                            self.clear_local_lambda_value(local);
+                        }
+                    }
+                }
+                RirStmt::GlobalSetRoot { global: dst, value }
+                | RirStmt::GlobalUpdateRoot { global: dst, value }
+                    if *dst == global =>
+                {
+                    result = self.rvalue_function_value_state(function, value);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if matches!(result, RirFunctionValueState::Unknown)
+            && let RirTerm::Return(Some(value)) = &function.body.term
+        {
+            result = self.operand_function_value_state(function, value);
+        }
+        self.lambda_values = outer_lambda_values;
+        result
+    }
+
+    fn global_initializer_operand_escape(
+        &mut self,
+        operand: &RirOperand,
+    ) -> Option<RirLambdaEscape> {
+        let RirOperand::Place(place) = operand else {
+            return None;
+        };
+        let RirPlaceRoot::Global(global) = place.root else {
+            return None;
+        };
+        if self
+            .global_initialized
+            .get(global.index())
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mut value = self.immutable_global_initializer_function_value_state(global);
+        for projection in &place.projections {
+            value = value.project(*projection);
+        }
+        value.escape()
+    }
+
+    fn rvalue_function_value_state(
+        &self,
+        function: &RirFunction,
+        value: &RirRValue,
+    ) -> RirFunctionValueState {
+        match value {
+            RirRValue::Use(operand) => self.operand_function_value_state(function, operand),
+            RirRValue::FunctionValue { escape, .. } => RirFunctionValueState::Lambda(*escape),
+            RirRValue::Lambda { lambda, .. } => RirFunctionValueState::Lambda(
+                self.program
+                    .lambdas
+                    .get(lambda.index())
+                    .map(|decl| decl.escape),
+            ),
+            RirRValue::Struct { fields, .. }
+            | RirRValue::Tuple { fields, .. }
+            | RirRValue::DataRefAlloc { fields, .. }
+            | RirRValue::EnumVariant { fields, .. } => RirFunctionValueState::Fields(
+                fields
+                    .iter()
+                    .map(|field| self.operand_function_value_state(function, field))
+                    .collect(),
+            ),
+            RirRValue::Array { elems, .. } | RirRValue::List { elems, .. } => {
+                RirFunctionValueState::Fields(
+                    elems
+                        .iter()
+                        .map(|elem| self.operand_function_value_state(function, elem))
+                        .collect(),
+                )
+            }
+            RirRValue::Map { entries, .. } => RirFunctionValueState::Fields(
+                entries
+                    .iter()
+                    .map(|(_, value)| self.operand_function_value_state(function, value))
+                    .collect(),
+            ),
+            RirRValue::Call {
+                callee: RirCallTarget::Function(callee),
+                ty,
+                ..
+            } if !self
+                .program
+                .globals
+                .iter()
+                .any(|global| global.init == *callee) =>
+            {
+                self.source_call_return_state(*ty)
+            }
+            _ => RirFunctionValueState::Unknown,
+        }
+    }
+
+    fn operand_function_value_state(
+        &self,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) -> RirFunctionValueState {
+        match operand {
+            RirOperand::Place(place) => self.place_function_value_state(function, place),
+            RirOperand::Const(id) => self
+                .program
+                .consts
+                .get(id.index())
+                .map_or(RirFunctionValueState::Unknown, |konst| {
+                    self.type_function_value_state(konst.ty)
+                }),
+        }
+    }
+
+    fn place_function_value_state(
+        &self,
+        _function: &RirFunction,
+        place: &RirPlace,
+    ) -> RirFunctionValueState {
+        let mut value = match place.root {
+            RirPlaceRoot::Local(local) => self
+                .lambda_values
+                .get(local.index())
+                .cloned()
+                .unwrap_or(RirFunctionValueState::Unknown),
+            RirPlaceRoot::Global(global) => self
+                .global_values
+                .get(global.index())
+                .cloned()
+                .unwrap_or(RirFunctionValueState::Unknown),
+        };
+        for projection in &place.projections {
+            value = value.project(*projection);
+        }
+        value
+    }
+
+    fn check_lambda_escape_proof(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        operand: &RirOperand,
+        claimed: Option<RirLambdaEscape>,
+    ) {
+        let actual = self
+            .operand_function_value_state(function, operand)
+            .escape()
+            .or_else(|| self.global_initializer_operand_escape(operand));
+        if let Some(claimed) = claimed
+            && actual != Some(claimed)
+        {
+            self.push(site, RirVerifyErrorKind::LambdaEscapeProofMismatch);
+        }
+    }
+
     fn rvalue_lambda_escape(
         &self,
         function: &RirFunction,
@@ -4182,9 +4765,8 @@ impl VerifyCx<'_> {
                 .lambdas
                 .get(lambda.index())
                 .map(|decl| decl.escape),
-            RirRValue::Call { ty, .. } if matches!(self.ty(*ty), Some(RirType::Lambda(_))) => {
-                Some(RirLambdaEscape::Escaping)
-            }
+            RirRValue::FunctionValue { escape, .. } => *escape,
+            RirRValue::Call { .. } => None,
             RirRValue::Use(operand) => self.operand_lambda_escape(function, operand),
             _ => None,
         }
@@ -4268,11 +4850,7 @@ impl VerifyCx<'_> {
             function_id,
             function,
             &scope.body,
-            self.initialized.clone(),
-            self.possibly_initialized.clone(),
-            self.lambda_escapes.clone(),
-            self.loop_lambda_scopes.clone(),
-            self.global_initialized.clone(),
+            self.block_entry_state(),
             None,
         );
         self.collection_loans.pop();
@@ -4552,24 +5130,50 @@ impl VerifyCx<'_> {
             .any(|loan| loan.root.replaced_by_place(dst))
     }
 
+    fn block_entry_state(&self) -> RirBlockEntryState {
+        RirBlockEntryState {
+            definite: self.initialized.clone(),
+            possible: self.possibly_initialized.clone(),
+            lambda_escapes: self.lambda_escapes.clone(),
+            lambda_values: self.lambda_values.clone(),
+            loop_lambda_scopes: self.loop_lambda_scopes.clone(),
+            global_initialized: self.global_initialized.clone(),
+            global_values: self.global_values.clone(),
+        }
+    }
+
+    fn current_block_state(&self) -> RirBlockState {
+        RirBlockState {
+            definite: self.initialized.clone(),
+            possible: self.possibly_initialized.clone(),
+            lambda_escapes: self.lambda_escapes.clone(),
+            lambda_values: self.lambda_values.clone(),
+            loop_lambda_scopes: self.loop_lambda_scopes.clone(),
+            cell_definite: self.initialized_cells.clone(),
+            cell_possible: self.possibly_initialized_cells.clone(),
+            globals: self.global_initialized.clone(),
+            global_values: self.global_values.clone(),
+        }
+    }
+
     fn check_structured_block(
         &mut self,
         function_id: RirFunctionId,
         function: &RirFunction,
         body: &RirStructuredBlock,
-        definite: Vec<bool>,
-        possible: Vec<bool>,
-        lambda_escapes: Vec<Option<RirLambdaEscape>>,
-        loop_lambda_scopes: Vec<Option<usize>>,
-        global_initialized: Vec<bool>,
+        entry: RirBlockEntryState,
         preserved_payload_ref: Option<RirLocalId>,
     ) -> Option<RirBlockState> {
-        let outer_definite = std::mem::replace(&mut self.initialized, definite);
-        let outer_possible = std::mem::replace(&mut self.possibly_initialized, possible);
-        let outer_lambda_escapes = std::mem::replace(&mut self.lambda_escapes, lambda_escapes);
+        let outer_definite = std::mem::replace(&mut self.initialized, entry.definite);
+        let outer_possible = std::mem::replace(&mut self.possibly_initialized, entry.possible);
+        let outer_lambda_escapes =
+            std::mem::replace(&mut self.lambda_escapes, entry.lambda_escapes);
+        let outer_lambda_values = std::mem::replace(&mut self.lambda_values, entry.lambda_values);
         let outer_loop_lambda_scopes =
-            std::mem::replace(&mut self.loop_lambda_scopes, loop_lambda_scopes);
-        let outer_globals = std::mem::replace(&mut self.global_initialized, global_initialized);
+            std::mem::replace(&mut self.loop_lambda_scopes, entry.loop_lambda_scopes);
+        let outer_globals =
+            std::mem::replace(&mut self.global_initialized, entry.global_initialized);
+        let outer_global_values = std::mem::replace(&mut self.global_values, entry.global_values);
         let outer_cell_definite = self.initialized_cells.clone();
         let outer_cell_possible = self.possibly_initialized_cells.clone();
         let outer_scope_depth = self.scope_depth;
@@ -4583,10 +5187,12 @@ impl VerifyCx<'_> {
             let mut definite = self.initialized.clone();
             let mut possible = self.possibly_initialized.clone();
             let lambda_escapes = self.lambda_escapes.clone();
+            let lambda_values = self.lambda_values.clone();
             let loop_lambda_scopes = self.loop_lambda_scopes.clone();
             let cell_definite = self.initialized_cells.clone();
             let cell_possible = self.possibly_initialized_cells.clone();
             let globals = self.global_initialized.clone();
+            let global_values = self.global_values.clone();
             for local in &function.locals {
                 let payload_ref_owned = self
                     .payload_ref_owned
@@ -4605,21 +5211,25 @@ impl VerifyCx<'_> {
                     }
                 }
             }
-            (
+            RirBlockState {
                 definite,
                 possible,
                 lambda_escapes,
+                lambda_values,
                 loop_lambda_scopes,
                 cell_definite,
                 cell_possible,
                 globals,
-            )
+                global_values,
+            }
         });
         self.initialized = outer_definite;
         self.possibly_initialized = outer_possible;
         self.lambda_escapes = outer_lambda_escapes;
+        self.lambda_values = outer_lambda_values;
         self.loop_lambda_scopes = outer_loop_lambda_scopes;
         self.global_initialized = outer_globals;
+        self.global_values = outer_global_values;
         self.initialized_cells = outer_cell_definite;
         self.possibly_initialized_cells = outer_cell_possible;
         self.scope_depth = outer_scope_depth;
@@ -4700,71 +5310,21 @@ impl VerifyCx<'_> {
 
     fn merge_structured_states(&mut self, states: impl IntoIterator<Item = Option<RirBlockState>>) {
         let mut states = states.into_iter().flatten();
-        let Some((
-            mut definite,
-            mut possible,
-            mut lambda_escapes,
-            mut loop_lambda_scopes,
-            mut cell_definite,
-            mut cell_possible,
-            mut globals,
-        )) = states.next()
-        else {
+        let Some(mut merged) = states.next() else {
             return;
         };
-        for (
-            next_definite,
-            next_possible,
-            next_lambda_escapes,
-            next_loop_lambda_scopes,
-            next_cell_definite,
-            next_cell_possible,
-            next_globals,
-        ) in states
-        {
-            definite = definite
-                .iter()
-                .zip(&next_definite)
-                .map(|(lhs, rhs)| *lhs && *rhs)
-                .collect();
-            possible = possible
-                .iter()
-                .zip(&next_possible)
-                .map(|(lhs, rhs)| *lhs || *rhs)
-                .collect();
-            lambda_escapes = lambda_escapes
-                .iter()
-                .zip(&next_lambda_escapes)
-                .map(|(lhs, rhs)| if lhs == rhs { *lhs } else { None })
-                .collect();
-            loop_lambda_scopes = loop_lambda_scopes
-                .iter()
-                .zip(&next_loop_lambda_scopes)
-                .map(|(lhs, rhs)| if lhs == rhs { *lhs } else { None })
-                .collect();
-            cell_definite = cell_definite
-                .iter()
-                .zip(&next_cell_definite)
-                .map(|(lhs, rhs)| *lhs && *rhs)
-                .collect();
-            cell_possible = cell_possible
-                .iter()
-                .zip(&next_cell_possible)
-                .map(|(lhs, rhs)| *lhs || *rhs)
-                .collect();
-            globals = globals
-                .iter()
-                .zip(&next_globals)
-                .map(|(lhs, rhs)| *lhs && *rhs)
-                .collect();
+        for state in states {
+            merged.merge_with(state);
         }
-        self.initialized = definite;
-        self.possibly_initialized = possible;
-        self.lambda_escapes = lambda_escapes;
-        self.loop_lambda_scopes = loop_lambda_scopes;
-        self.initialized_cells = cell_definite;
-        self.possibly_initialized_cells = cell_possible;
-        self.global_initialized = globals;
+        self.initialized = merged.definite;
+        self.possibly_initialized = merged.possible;
+        self.lambda_escapes = merged.lambda_escapes;
+        self.lambda_values = merged.lambda_values;
+        self.loop_lambda_scopes = merged.loop_lambda_scopes;
+        self.initialized_cells = merged.cell_definite;
+        self.possibly_initialized_cells = merged.cell_possible;
+        self.global_initialized = merged.globals;
+        self.global_values = merged.global_values;
     }
 
     fn check_lambda_capture_args(
@@ -4954,6 +5514,27 @@ impl VerifyCx<'_> {
         let site = RirVerifySite::RValue(function_id, index);
         let found = match value {
             RirRValue::Use(operand) => self.value_operand_ty(site, function, operand),
+            RirRValue::FunctionValue { value, escape, ty } => {
+                self.check_type_id(site, *ty);
+                self.check_lambda_escape_proof(site, function, value, *escape);
+                match (self.value_operand_ty(site, function, value), self.ty(*ty)) {
+                    (Some(found), Some(RirType::Lambda(_))) if found == *ty => Some(*ty),
+                    (Some(found), Some(RirType::Lambda(_))) => {
+                        self.push(
+                            site,
+                            RirVerifyErrorKind::TypeMismatch {
+                                expected: *ty,
+                                found,
+                            },
+                        );
+                        Some(*ty)
+                    }
+                    _ => {
+                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                        Some(*ty)
+                    }
+                }
+            }
             RirRValue::Struct { ty, fields } => {
                 self.check_type_id(site, *ty);
                 let Some(RirType::Struct(struct_id)) = self.ty(*ty) else {

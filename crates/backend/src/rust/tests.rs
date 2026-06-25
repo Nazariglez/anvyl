@@ -5,9 +5,10 @@ use anvyx_frontend::{
         CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstValue,
         DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl,
         ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionId, FunctionKind,
-        FunctionSpecialization, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand,
-        Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program, Projection, RValue,
-        RawEnumValue, Signature, TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
+        FunctionSpecialization, FunctionValueCapability, LambdaDecl, LambdaEscape, Local,
+        LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot,
+        Program, Projection, RValue, RawEnumValue, Signature, TypeData, TypePassClasses,
+        VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -483,7 +484,7 @@ fn native_escaping_lambda_coexists_with_global_init_calls() {
 }
 
 #[test]
-fn native_escaping_lambda_stored_tuple_origin_remains_air_gap() {
+fn native_escaping_lambda_stored_tuple_origin_without_air_proof_is_rejected() {
     let program = native_escaping_lambda_tuple_air(NativeLambdaArgKind::EscapingCaptureCell);
     let errors = air::verify(&program).expect_err("AIR accepted projected stored callback origin");
 
@@ -12760,6 +12761,131 @@ fn rir_verify_rejects_native_escaping_scoped_lambda_mismatch() {
 }
 
 #[test]
+fn rir_rejects_escaping_proof_over_nonescaping_lambda_param() {
+    let mut program = native_scoped_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let proven = RirLocalId::from_index(program.functions[0].locals.len());
+    program.functions[0].params.push(RirParam {
+        local: RirLocalId::from_index(0),
+        ty: lambda_ty,
+        semantic: RirParamSemantic::Value,
+        abi: RirParamAbi::ScopedLambda,
+        escape: RirParamEscape::NonEscaping,
+    });
+    program.functions[0].locals.push(RirLocal {
+        id: proven,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("proven"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[0].body.stmts = vec![RirStmt::Init {
+        local: proven,
+        value: RirRValue::FunctionValue {
+            value: RirOperand::Place(rir_place(RirLocalId::from_index(0), lambda_ty)),
+            escape: Some(RirLambdaEscape::Escaping),
+            ty: lambda_ty,
+        },
+    }];
+
+    assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
+}
+
+#[test]
+fn rir_rejects_escaping_proof_over_unknown_lambda_local() {
+    let mut program = native_scoped_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let proven = RirLocalId::from_index(program.functions[0].locals.len());
+    program.functions[0].locals.push(RirLocal {
+        id: proven,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("proven"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[0].body.stmts = vec![RirStmt::Init {
+        local: proven,
+        value: RirRValue::FunctionValue {
+            value: RirOperand::Place(rir_place(RirLocalId::from_index(0), lambda_ty)),
+            escape: Some(RirLambdaEscape::Escaping),
+            ty: lambda_ty,
+        },
+    }];
+
+    assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
+}
+
+fn native_escaping_lambda_tuple_operand() -> (RirProgram, RirTypeId, RirOperand) {
+    let mut program = native_escaping_lambda_rir();
+    let lambda_ty = RirTypeId::from_index(2);
+    let tuple = RirTupleId::from_index(0);
+    let tuple_ty = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::Tuple(tuple));
+    program.tuples.push(RirTuple {
+        id: tuple,
+        symbol: RirSymbol::new("TupleLambda"),
+        display: RirSymbol::new("(fn(i64) -> i64)"),
+        copyable: false,
+        fields: vec![RirField {
+            id: RirFieldId::from_index(0),
+            symbol: RirSymbol::new("_0"),
+            ty: lambda_ty,
+        }],
+    });
+    program.functions[0].locals[0].ty = tuple_ty;
+    let projection = RirOperand::Place(RirPlace::local(
+        RirLocalId::from_index(0),
+        vec![RirProjection::TupleField(RirFieldId::from_index(0))],
+        lambda_ty,
+    ));
+    (program, lambda_ty, projection)
+}
+
+#[test]
+fn projected_escaping_lambda_without_proof_rejected() {
+    let (mut program, _, projection) = native_escaping_lambda_tuple_operand();
+    let RirStmt::Eval(RirRValue::Call { args, .. }) = &mut program.functions[0].body.stmts[0]
+    else {
+        unreachable!()
+    };
+    let RirCallArg::EscapingLambda { callee, .. } = &mut args[0] else {
+        unreachable!()
+    };
+    *callee = projection;
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
+}
+
+#[test]
+fn projected_escaping_lambda_forged_proof_rejected() {
+    let (mut program, lambda_ty, projection) = native_escaping_lambda_tuple_operand();
+    let proven = RirLocalId::from_index(program.functions[0].locals.len());
+    program.functions[0].locals.push(RirLocal {
+        id: proven,
+        ty: lambda_ty,
+        mutable: false,
+        symbol: RirSymbol::new("proven"),
+        initialized: false,
+        payload_ref: false,
+    });
+    program.functions[0].body.stmts.insert(
+        0,
+        RirStmt::Init {
+            local: proven,
+            value: RirRValue::FunctionValue {
+                value: projection,
+                escape: Some(RirLambdaEscape::Escaping),
+                ty: lambda_ty,
+            },
+        },
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
+}
+
+#[test]
 fn rir_verify_rejects_native_escaping_lambda_signature_mismatch() {
     let mut program = native_escaping_lambda_rir();
     let sig = RirLambdaSigId::from_index(1);
@@ -12824,7 +12950,7 @@ fn rir_verify_rejects_native_scoped_lambda_signature_mismatch() {
 fn rir_verify_rejects_native_scoped_lambda_above_max_arity() {
     let mut program = native_scoped_lambda_rir();
     let int = RirTypeId::from_index(1);
-    program.lambda_sigs[0].params = (0..=anvyx_runtime::SCOPED_LAMBDA_MAX_ARITY)
+    program.lambda_sigs[0].params = (0..=anvyx_runtime::CALLBACK_WRAPPER_MAX_ARITY)
         .map(|_| RirLambdaParam {
             ty: int,
             semantic: RirParamSemantic::Value,
@@ -12833,7 +12959,7 @@ fn rir_verify_rejects_native_scoped_lambda_above_max_arity() {
         })
         .collect();
     let mut callback = native_callback_sig();
-    callback.params = (0..=anvyx_runtime::SCOPED_LAMBDA_MAX_ARITY)
+    callback.params = (0..=anvyx_runtime::CALLBACK_WRAPPER_MAX_ARITY)
         .map(|_| anvyx_runtime::ExternCallbackParam {
             ty: anvyx_runtime::ExternTypeExpr::Int,
             escape: anvyx_runtime::CallbackEscape::NonEscaping,
@@ -19683,14 +19809,21 @@ fn native_escaping_lambda_tuple_air(kind: NativeLambdaArgKind) -> Program {
             continue;
         };
         if args.len() == 1 {
-            args[0] = CallArg::Value(Operand::Place(Place {
-                root: PlaceRoot::Local(tuple_local),
-                projection: vec![Projection::TupleField(0)],
-                ty: lambda_ty,
-            }));
+            args[0] = CallArg::Value(Operand::Place(tuple_lambda_projection(
+                tuple_local,
+                lambda_ty,
+            )));
         }
     }
     program
+}
+
+fn tuple_lambda_projection(local: air::LocalId, ty: air::TypeId) -> Place {
+    Place {
+        root: PlaceRoot::Local(local),
+        projection: vec![Projection::TupleField(0)],
+        ty,
+    }
 }
 
 fn make_lambda_add_readonly_capture(program: &mut Program) {

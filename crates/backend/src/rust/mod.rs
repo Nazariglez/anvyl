@@ -24,9 +24,10 @@ use std::{
 
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId, GlobalId,
-        LocalId, LocalKind, MapWriteKind, Mutability, Operand, ParamEscape, ParamMode, Place,
-        Projection, RValue, TypeData, TypeId, TypePassClasses, VerifiedProgram,
+        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId,
+        FunctionValueCapability, GlobalId, LocalId, LocalKind, MapWriteKind, Mutability, Operand,
+        ParamEscape, ParamMode, Place, Projection, RValue, TypeData, TypeId, TypePassClasses,
+        VerifiedProgram,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -336,18 +337,22 @@ struct PlannedTypeIds {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct KnownLambdaValue {
+struct ZeroEnvFunctionValue {
     lambda: RirLambdaId,
     ty: RirTypeId,
 }
 
-impl KnownLambdaValue {
+impl ZeroEnvFunctionValue {
     fn rvalue(self) -> RirRValue {
         RirRValue::Lambda {
             lambda: self.lambda,
             captures: vec![],
             ty: self.ty,
         }
+    }
+
+    fn ty(self) -> RirTypeId {
+        self.ty
     }
 }
 
@@ -1649,15 +1654,15 @@ impl<'a> PlanCx<'a> {
         match capture {
             air::LambdaCaptureDecl::NoRuntime { .. } => Ok(None),
             air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
-                if !self.rust_shareable_air_type(*ty) {
+                let function_ty = matches!(self.air.type_data(*ty), TypeData::Function(_));
+                if !function_ty && !self.rust_shareable_air_type(*ty) {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(owner),
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
                 }
                 let by_value = escape == air::LambdaEscape::Escaping
-                    || (!matches!(self.air.type_data(*ty), TypeData::Function(_))
-                        && self.rust_copyable_air_type(*ty));
+                    || (!function_ty && self.rust_copyable_air_type(*ty));
                 let semantic = if by_value {
                     RirParamSemantic::Value
                 } else {
@@ -1849,7 +1854,7 @@ impl<'a> PlanCx<'a> {
                 escape: rir_param_escape(param.escape),
             }
         }));
-        let mut lambda_values = vec![None; locals.len()];
+        let mut zero_env_function_values = vec![None; locals.len()];
         let mut initialized_cells = vec![false; self.air.capture_cells.len()];
         let mut possible_cells = vec![false; self.air.capture_cells.len()];
         if let air::FunctionKind::Lambda(lambda) = function.kind {
@@ -1864,7 +1869,7 @@ impl<'a> PlanCx<'a> {
             air_id,
             &function.body.block,
             &mut locals,
-            &mut lambda_values,
+            &mut zero_env_function_values,
             &mut initialized_cells,
             &mut possible_cells,
             false,
@@ -1894,7 +1899,7 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         block: &air::AirBlock,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         initialized_cells: &mut [bool],
         possible_cells: &mut [bool],
         in_loop: bool,
@@ -1906,7 +1911,7 @@ impl<'a> PlanCx<'a> {
                 index,
                 stmt,
                 locals,
-                lambda_values,
+                zero_env_function_values,
                 initialized_cells,
                 possible_cells,
                 in_loop,
@@ -1923,9 +1928,9 @@ impl<'a> PlanCx<'a> {
         global: GlobalId,
         value: &RValue,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<(Vec<RirStmt>, RirRValue), RustPlanError> {
-        let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+        let planned = self.plan_rvalue(function, value, locals, zero_env_function_values)?;
         let mut stmts = planned.stmts;
         let value = RirRValue::Use(self.rvalue_short_region_operand(
             function,
@@ -1943,32 +1948,38 @@ impl<'a> PlanCx<'a> {
         index: usize,
         stmt: &air::AirStmt,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         initialized_cells: &mut [bool],
         possible_cells: &mut [bool],
         in_loop: bool,
     ) -> Result<Vec<RirStmt>, RustPlanError> {
         match stmt {
             air::AirStmt::Init { local, value } => {
-                let mut planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let mut planned =
+                    self.plan_rvalue(function, value, locals, zero_env_function_values)?;
                 if locals[local.index()].mutable
                     && let RirRValue::SliceView { mutable, .. } = &mut planned.value
                 {
                     *mutable = true;
                 }
-                let known = Self::known_lambda_rvalue(&planned.value);
+                let state = Self::zero_env_function_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Init {
                     local: RirLocalId::from_index(local.index()),
                     value: planned.value,
                 });
                 stmts.extend(planned.post_stmts);
-                Self::set_known_lambda(lambda_values, RirLocalId::from_index(local.index()), known);
+                Self::set_zero_env_function(
+                    zero_env_function_values,
+                    RirLocalId::from_index(local.index()),
+                    state,
+                );
                 Ok(stmts)
             }
             air::AirStmt::Assign { dst, value } => {
-                let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
-                let known = Self::known_lambda_rvalue(&planned.value);
+                let planned =
+                    self.plan_rvalue(function, value, locals, zero_env_function_values)?;
+                let state = Self::zero_env_function_rvalue(&planned.value);
                 let mut stmts = planned.stmts;
                 self.lower_place_write(
                     function,
@@ -1981,11 +1992,12 @@ impl<'a> PlanCx<'a> {
                     in_loop,
                 )?;
                 stmts.extend(planned.post_stmts);
-                Self::set_place_known_lambda(lambda_values, dst, known);
+                Self::set_place_zero_env_function(zero_env_function_values, dst, state);
                 Ok(stmts)
             }
             air::AirStmt::Eval(value) => {
-                let planned = self.plan_rvalue(function, value, locals, lambda_values)?;
+                let planned =
+                    self.plan_rvalue(function, value, locals, zero_env_function_values)?;
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Eval(planned.value));
                 stmts.extend(planned.post_stmts);
@@ -2005,8 +2017,13 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedGlobalRooting,
                     ));
                 }
-                let (mut stmts, value) =
-                    self.plan_global_root_value(function, *global, value, locals, lambda_values)?;
+                let (mut stmts, value) = self.plan_global_root_value(
+                    function,
+                    *global,
+                    value,
+                    locals,
+                    zero_env_function_values,
+                )?;
                 stmts.push(RirStmt::GlobalSetRoot {
                     global: self.global_map[global],
                     value,
@@ -2014,8 +2031,13 @@ impl<'a> PlanCx<'a> {
                 Ok(stmts)
             }
             air::AirStmt::GlobalUpdateRoot { global, value } => {
-                let (mut stmts, value) =
-                    self.plan_global_root_value(function, *global, value, locals, lambda_values)?;
+                let (mut stmts, value) = self.plan_global_root_value(
+                    function,
+                    *global,
+                    value,
+                    locals,
+                    zero_env_function_values,
+                )?;
                 let global_decl = &self.air.globals[global.index()];
                 if matches!(
                     self.air.type_arena.data(global_decl.ty),
@@ -2038,44 +2060,44 @@ impl<'a> PlanCx<'a> {
             }
             air::AirStmt::If(branch) => {
                 let cond = self.plan_operand_read(function, &branch.cond, locals);
-                let entry_lambdas = lambda_values.clone();
+                let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
-                let mut then_lambdas = entry_lambdas.clone();
+                let mut then_functions = entry_functions.clone();
                 let mut then_cells = entry_cells.clone();
                 let mut then_possible = entry_possible.clone();
                 let then_block = self.plan_air_block(
                     function,
                     &branch.then_block,
                     locals,
-                    &mut then_lambdas,
+                    &mut then_functions,
                     &mut then_cells,
                     &mut then_possible,
                     in_loop,
                 )?;
-                let (else_block, else_lambdas, else_cells, else_possible) = match &branch.else_block
-                {
-                    Some(block) => {
-                        let mut else_lambdas = entry_lambdas.clone();
-                        let mut else_cells = entry_cells.clone();
-                        let mut else_possible = entry_possible.clone();
-                        let block = self.plan_air_block(
-                            function,
-                            block,
-                            locals,
-                            &mut else_lambdas,
-                            &mut else_cells,
-                            &mut else_possible,
-                            in_loop,
-                        )?;
-                        (Some(block), else_lambdas, else_cells, else_possible)
-                    }
-                    None => (None, entry_lambdas, entry_cells, entry_possible),
-                };
-                Self::merge_known_lambdas(
-                    lambda_values,
+                let (else_block, else_functions, else_cells, else_possible) =
+                    match &branch.else_block {
+                        Some(block) => {
+                            let mut else_functions = entry_functions.clone();
+                            let mut else_cells = entry_cells.clone();
+                            let mut else_possible = entry_possible.clone();
+                            let block = self.plan_air_block(
+                                function,
+                                block,
+                                locals,
+                                &mut else_functions,
+                                &mut else_cells,
+                                &mut else_possible,
+                                in_loop,
+                            )?;
+                            (Some(block), else_functions, else_cells, else_possible)
+                        }
+                        None => (None, entry_functions, entry_cells, entry_possible),
+                    };
+                Self::merge_zero_env_function_values(
+                    zero_env_function_values,
                     locals.len(),
-                    [&then_lambdas, &else_lambdas],
+                    [&then_functions, &else_functions],
                 );
                 for (dst, (then, else_)) in initialized_cells
                     .iter_mut()
@@ -2098,25 +2120,25 @@ impl<'a> PlanCx<'a> {
                 Ok(stmts)
             }
             air::AirStmt::Loop(loop_) => {
-                let entry_lambdas = lambda_values.clone();
+                let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
-                let mut body_lambdas = entry_lambdas.clone();
+                let mut body_functions = entry_functions.clone();
                 let mut body_cells = entry_cells.clone();
                 let mut body_possible = entry_possible.clone();
                 let body = self.plan_air_block(
                     function,
                     &loop_.body,
                     locals,
-                    &mut body_lambdas,
+                    &mut body_functions,
                     &mut body_cells,
                     &mut body_possible,
                     true,
                 )?;
-                Self::merge_known_lambdas(
-                    lambda_values,
+                Self::merge_zero_env_function_values(
+                    zero_env_function_values,
                     locals.len(),
-                    [&entry_lambdas, &body_lambdas],
+                    [&entry_functions, &body_functions],
                 );
                 for (dst, (entry, body)) in initialized_cells
                     .iter_mut()
@@ -2150,7 +2172,7 @@ impl<'a> PlanCx<'a> {
                     function,
                     &loan.body,
                     locals,
-                    lambda_values,
+                    zero_env_function_values,
                     initialized_cells,
                     possible_cells,
                     in_loop,
@@ -2166,7 +2188,7 @@ impl<'a> PlanCx<'a> {
                 function,
                 scope,
                 locals,
-                lambda_values,
+                zero_env_function_values,
                 initialized_cells,
                 possible_cells,
                 in_loop,
@@ -2177,7 +2199,7 @@ impl<'a> PlanCx<'a> {
                     unreachable!("place read returns a place operand")
                 };
                 let mut stmts = discr.stmts;
-                let entry_lambdas = lambda_values.clone();
+                let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
                 let mut states = vec![];
@@ -2187,19 +2209,19 @@ impl<'a> PlanCx<'a> {
                     .arms
                     .iter()
                     .map(|arm| {
-                        let mut arm_lambdas = entry_lambdas.clone();
+                        let mut arm_functions = entry_functions.clone();
                         let mut arm_cells = entry_cells.clone();
                         let mut arm_possible = entry_possible.clone();
                         let block = self.plan_air_block(
                             function,
                             &arm.block,
                             locals,
-                            &mut arm_lambdas,
+                            &mut arm_functions,
                             &mut arm_cells,
                             &mut arm_possible,
                             in_loop,
                         )?;
-                        states.push(arm_lambdas);
+                        states.push(arm_functions);
                         cell_states.push(arm_cells);
                         possible_states.push(arm_possible);
                         Ok(RirEnumMatchArm {
@@ -2210,19 +2232,19 @@ impl<'a> PlanCx<'a> {
                     .collect::<Result<Vec<_>, RustPlanError>>()?;
                 let else_block = match &match_.else_block {
                     Some(block) => {
-                        let mut else_lambdas = entry_lambdas.clone();
+                        let mut else_functions = entry_functions.clone();
                         let mut else_cells = entry_cells.clone();
                         let mut else_possible = entry_possible.clone();
                         let block = self.plan_air_block(
                             function,
                             block,
                             locals,
-                            &mut else_lambdas,
+                            &mut else_functions,
                             &mut else_cells,
                             &mut else_possible,
                             in_loop,
                         )?;
-                        states.push(else_lambdas);
+                        states.push(else_functions);
                         cell_states.push(else_cells);
                         possible_states.push(else_possible);
                         Some(block)
@@ -2230,7 +2252,11 @@ impl<'a> PlanCx<'a> {
                     None => None,
                 };
                 if !states.is_empty() {
-                    Self::merge_known_lambdas(lambda_values, locals.len(), states.iter());
+                    Self::merge_zero_env_function_values(
+                        zero_env_function_values,
+                        locals.len(),
+                        states.iter(),
+                    );
                     for index in 0..initialized_cells.len() {
                         initialized_cells[index] = cell_states.iter().all(|state| state[index]);
                         possible_cells[index] = possible_states.iter().any(|state| state[index]);
@@ -2254,37 +2280,37 @@ impl<'a> PlanCx<'a> {
                 {
                     local.payload_ref = true;
                 }
-                let entry_lambdas = lambda_values.clone();
+                let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
-                let mut some_lambdas = entry_lambdas.clone();
+                let mut some_functions = entry_functions.clone();
                 let mut some_cells = entry_cells.clone();
                 let mut some_possible = entry_possible.clone();
                 let some_block = self.plan_air_block(
                     function,
                     &match_.some_block,
                     locals,
-                    &mut some_lambdas,
+                    &mut some_functions,
                     &mut some_cells,
                     &mut some_possible,
                     in_loop,
                 )?;
-                let mut none_lambdas = entry_lambdas;
+                let mut none_functions = entry_functions;
                 let mut none_cells = entry_cells;
                 let mut none_possible = entry_possible;
                 let none_block = self.plan_air_block(
                     function,
                     &match_.none_block,
                     locals,
-                    &mut none_lambdas,
+                    &mut none_functions,
                     &mut none_cells,
                     &mut none_possible,
                     in_loop,
                 )?;
-                Self::merge_known_lambdas(
-                    lambda_values,
+                Self::merge_zero_env_function_values(
+                    zero_env_function_values,
                     locals.len(),
-                    [&some_lambdas, &none_lambdas],
+                    [&some_functions, &none_functions],
                 );
                 for (dst, (some, none)) in initialized_cells
                     .iter_mut()
@@ -2318,37 +2344,37 @@ impl<'a> PlanCx<'a> {
                 {
                     local.payload_ref = true;
                 }
-                let entry_lambdas = lambda_values.clone();
+                let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
-                let mut some_lambdas = entry_lambdas.clone();
+                let mut some_functions = entry_functions.clone();
                 let mut some_cells = entry_cells.clone();
                 let mut some_possible = entry_possible.clone();
                 let some_block = self.plan_air_block(
                     function,
                     &match_.some_block,
                     locals,
-                    &mut some_lambdas,
+                    &mut some_functions,
                     &mut some_cells,
                     &mut some_possible,
                     in_loop,
                 )?;
-                let mut none_lambdas = entry_lambdas;
+                let mut none_functions = entry_functions;
                 let mut none_cells = entry_cells;
                 let mut none_possible = entry_possible;
                 let none_block = self.plan_air_block(
                     function,
                     &match_.none_block,
                     locals,
-                    &mut none_lambdas,
+                    &mut none_functions,
                     &mut none_cells,
                     &mut none_possible,
                     in_loop,
                 )?;
-                Self::merge_known_lambdas(
-                    lambda_values,
+                Self::merge_zero_env_function_values(
+                    zero_env_function_values,
                     locals.len(),
-                    [&some_lambdas, &none_lambdas],
+                    [&some_functions, &none_functions],
                 );
                 for (dst, (some, none)) in initialized_cells
                     .iter_mut()
@@ -2422,44 +2448,44 @@ impl<'a> PlanCx<'a> {
             .is_some_and(|local| local.payload_ref)
     }
 
-    fn set_known_lambda(
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+    fn set_zero_env_function(
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         local: RirLocalId,
-        known: Option<KnownLambdaValue>,
+        known: Option<ZeroEnvFunctionValue>,
     ) {
-        if lambda_values.len() <= local.index() {
-            lambda_values.resize(local.index() + 1, None);
+        if zero_env_function_values.len() <= local.index() {
+            zero_env_function_values.resize(local.index() + 1, None);
         }
-        lambda_values[local.index()] = known;
+        zero_env_function_values[local.index()] = known;
     }
 
-    fn set_place_known_lambda(
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+    fn set_place_zero_env_function(
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         place: &Place,
-        known: Option<KnownLambdaValue>,
+        known: Option<ZeroEnvFunctionValue>,
     ) {
         let Some(local) = place.root.local() else {
             return;
         };
-        Self::set_known_lambda(
-            lambda_values,
+        Self::set_zero_env_function(
+            zero_env_function_values,
             RirLocalId::from_index(local.index()),
             place.projection.is_empty().then_some(known).flatten(),
         );
     }
 
-    fn merge_known_lambdas<'b>(
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+    fn merge_zero_env_function_values<'b>(
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         len: usize,
-        states: impl IntoIterator<Item = &'b Vec<Option<KnownLambdaValue>>>,
+        states: impl IntoIterator<Item = &'b Vec<Option<ZeroEnvFunctionValue>>>,
     ) {
         let states = states.into_iter().collect::<Vec<_>>();
-        lambda_values.clear();
-        lambda_values.resize(len, None);
+        zero_env_function_values.clear();
+        zero_env_function_values.resize(len, None);
         let Some(first_state) = states.first() else {
             return;
         };
-        for (index, slot) in lambda_values.iter_mut().enumerate() {
+        for (index, slot) in zero_env_function_values.iter_mut().enumerate() {
             let first = first_state.get(index).copied().flatten();
             if states
                 .iter()
@@ -2496,10 +2522,28 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         value: &RValue,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let planned = match value {
-            RValue::Use(operand) => return self.plan_use(function, operand, locals, lambda_values),
+            RValue::Use(operand) => {
+                return self.plan_use(function, operand, locals, zero_env_function_values);
+            }
+            RValue::FunctionValue { value, capability } => {
+                let ty = self
+                    .air
+                    .operand_ty(value)
+                    .expect("verified function value operand has type");
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::FunctionValue {
+                        value: value.operand,
+                        escape: rir_function_value_escape(*capability),
+                        ty: self.type_map[&ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
             RValue::Unary { op, value, ty } => {
                 let value = self.plan_operand_read(function, value, locals);
                 PlannedRValue {
@@ -2566,7 +2610,7 @@ impl<'a> PlanCx<'a> {
                 }
             }
             RValue::Call { callee, args } => {
-                self.plan_call(function, callee, args, locals, lambda_values)?
+                self.plan_call(function, callee, args, locals, zero_env_function_values)?
             }
             RValue::Stringify { value, source_ty } => {
                 let value = self.plan_operand_read(function, value, locals);
@@ -2853,7 +2897,7 @@ impl<'a> PlanCx<'a> {
         self.rust_copyable_air_type(ty) || self.rust_shareable_air_type(ty)
     }
 
-    fn known_lambda_rvalue(value: &RirRValue) -> Option<KnownLambdaValue> {
+    fn zero_env_function_rvalue(value: &RirRValue) -> Option<ZeroEnvFunctionValue> {
         let RirRValue::Lambda {
             lambda,
             captures,
@@ -2862,22 +2906,25 @@ impl<'a> PlanCx<'a> {
         else {
             return None;
         };
-        captures.is_empty().then_some(KnownLambdaValue {
+        captures.is_empty().then_some(ZeroEnvFunctionValue {
             lambda: *lambda,
             ty: *ty,
         })
     }
 
-    fn known_lambda_place(
+    fn zero_env_function_place(
         &self,
         place: &Place,
-        lambda_values: &[Option<KnownLambdaValue>],
-    ) -> Option<KnownLambdaValue> {
+        zero_env_function_values: &[Option<ZeroEnvFunctionValue>],
+    ) -> Option<ZeroEnvFunctionValue> {
         if place.projection.is_empty()
             && matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
             && let Some(local) = place.root.local()
         {
-            return lambda_values.get(local.index()).copied().flatten();
+            return zero_env_function_values
+                .get(local.index())
+                .copied()
+                .flatten();
         }
         None
     }
@@ -2901,7 +2948,7 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         operand: &Operand,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &[Option<KnownLambdaValue>],
+        zero_env_function_values: &[Option<ZeroEnvFunctionValue>],
     ) -> Result<PlannedRValue, RustPlanError> {
         let Operand::Place(place) = operand else {
             return Ok(PlannedRValue::from_value(RirRValue::Use(
@@ -2922,6 +2969,12 @@ impl<'a> PlanCx<'a> {
                 }));
             }
         }
+        if self.unsupported_function_capture_value(place) {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function),
+                RustTargetGapKind::UnsupportedLambdaCapture,
+            ));
+        }
         let read_plan = self
             .access()
             .plan(function, PlaceAccessIntent::ReadValue, place)
@@ -2938,8 +2991,8 @@ impl<'a> PlanCx<'a> {
             return Ok(value);
         }
         if !self.air_place_value_readable(place.ty) {
-            if let Some(known) = self.known_lambda_place(place, lambda_values) {
-                return Ok(PlannedRValue::from_value(known.rvalue()));
+            if let Some(state) = self.zero_env_function_place(place, zero_env_function_values) {
+                return Ok(PlannedRValue::from_value(state.rvalue()));
             }
             if !self.unbound_lambda_temp_place(function, place) {
                 return Err(Self::gap(
@@ -3085,7 +3138,7 @@ impl<'a> PlanCx<'a> {
         callee: &Callee,
         args: &[CallArg],
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let (target, ty, callee_stmts, expected_args) = match callee {
             Callee::Function(id) => {
@@ -3146,7 +3199,8 @@ impl<'a> PlanCx<'a> {
             ));
         }
         for (arg, expected) in args.iter().zip(expected_args) {
-            let planned = self.plan_arg(function_id, arg, expected, locals, lambda_values)?;
+            let planned =
+                self.plan_arg(function_id, arg, expected, locals, zero_env_function_values)?;
             stmts.extend(planned.stmts);
             planned_args.push(planned.arg);
         }
@@ -3166,7 +3220,7 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
         initialized_cells: &mut [bool],
         possible_cells: &mut [bool],
         in_loop: bool,
@@ -3176,7 +3230,7 @@ impl<'a> PlanCx<'a> {
             function,
             &scope.body,
             locals,
-            lambda_values,
+            zero_env_function_values,
             initialized_cells,
             possible_cells,
             in_loop,
@@ -3592,6 +3646,12 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn unsupported_function_capture_value(&self, place: &Place) -> bool {
+        self.air_policy()
+            .scoped_function_value_gap(place.ty, place.root)
+            .is_some()
+    }
+
     fn moves_bound_noncopy_lambda(&self, function: FunctionId, operand: &Operand) -> bool {
         let Operand::Place(place) = operand else {
             return false;
@@ -3611,7 +3671,7 @@ impl<'a> PlanCx<'a> {
         arg: &CallArg,
         expected: RirParamSemantic,
         locals: &mut Vec<RirLocal>,
-        lambda_values: &mut Vec<Option<KnownLambdaValue>>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
             CallArg::Value(operand)
@@ -3627,6 +3687,14 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedLambdaExternBoundary,
                     ));
                 };
+                if let Operand::Place(place) = operand
+                    && self.unsupported_function_capture_value(place)
+                {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
                 let planned = self.plan_operand_read(function, operand, locals);
                 let sig = self.lambda_sig_map[&air_ty];
                 let arg = match expected {
@@ -3647,20 +3715,29 @@ impl<'a> PlanCx<'a> {
             }
             CallArg::Value(operand) => {
                 if let Operand::Place(place) = operand
+                    && self.unsupported_function_capture_value(place)
+                {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedLambdaCapture,
+                    ));
+                }
+                if let Operand::Place(place) = operand
                     && !self.air_place_value_readable(place.ty)
-                    && let Some(known) = self.known_lambda_place(place, lambda_values)
+                    && let Some(state) =
+                        self.zero_env_function_place(place, zero_env_function_values)
                 {
                     let local = self.alloc_temp(locals, place.ty);
-                    Self::set_known_lambda(lambda_values, local, Some(known));
+                    Self::set_zero_env_function(zero_env_function_values, local, Some(state));
                     return Ok(PlannedCallArg {
                         stmts: vec![RirStmt::Init {
                             local,
-                            value: known.rvalue(),
+                            value: state.rvalue(),
                         }],
                         arg: RirCallArg::Value(RirOperand::Place(RirPlace::local(
                             local,
                             vec![],
-                            known.ty,
+                            state.ty(),
                         ))),
                     });
                 }
@@ -4615,6 +4692,14 @@ fn rir_param_escape(escape: ParamEscape) -> RirParamEscape {
     match escape {
         ParamEscape::NonEscaping => RirParamEscape::NonEscaping,
         ParamEscape::Escaping => RirParamEscape::Escaping,
+    }
+}
+
+fn rir_function_value_escape(capability: FunctionValueCapability) -> Option<RirLambdaEscape> {
+    match capability {
+        FunctionValueCapability::Escaping => Some(RirLambdaEscape::Escaping),
+        FunctionValueCapability::NonEscaping => Some(RirLambdaEscape::NonEscaping),
+        FunctionValueCapability::NonFunction | FunctionValueCapability::Unknown => None,
     }
 }
 

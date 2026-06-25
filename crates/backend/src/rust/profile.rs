@@ -574,7 +574,7 @@ impl ProfileCx<'_> {
     fn check_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         match value {
             RValue::FunctionRef { .. } => {}
-            RValue::Use(operand) => {
+            RValue::Use(operand) | RValue::FunctionValue { value: operand, .. } => {
                 self.check_operand(site, operand);
                 if self.non_shareable_value_operand(operand) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);

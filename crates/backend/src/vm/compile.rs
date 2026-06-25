@@ -256,6 +256,7 @@ impl CompileCx<'_> {
     fn check_rvalue(&mut self, function: FunctionId, value: &RValue) {
         match value {
             RValue::Use(operand)
+            | RValue::FunctionValue { value: operand, .. }
             | RValue::Unary { value: operand, .. }
             | RValue::OptionalSome { value: operand, .. }
             | RValue::Cast { value: operand, .. }

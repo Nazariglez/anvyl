@@ -164,6 +164,7 @@ fn rvalue_uses_fallible_place(
 ) -> bool {
     match value {
         RirRValue::Use(operand)
+        | RirRValue::FunctionValue { value: operand, .. }
         | RirRValue::Unary { value: operand, .. }
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }
@@ -546,6 +547,7 @@ fn rvalue_operand_context_use(
 ) -> ContextUse {
     match value {
         RirRValue::Use(operand)
+        | RirRValue::FunctionValue { value: operand, .. }
         | RirRValue::Unary { value: operand, .. }
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }
@@ -880,6 +882,7 @@ fn collection_access_uses_mut_place_param(
 fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> bool {
     match value {
         RirRValue::Use(operand)
+        | RirRValue::FunctionValue { value: operand, .. }
         | RirRValue::Unary { value: operand, .. }
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }

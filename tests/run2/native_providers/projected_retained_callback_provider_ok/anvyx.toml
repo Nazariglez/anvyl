@@ -1,0 +1,6 @@
+[project]
+name = "projected_retained_callback_provider_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "../retained_callback_provider_ok/provider" }

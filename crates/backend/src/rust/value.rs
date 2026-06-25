@@ -224,12 +224,21 @@ impl<'a> RustValues<'a> {
             RustMaterialSource::Value,
             RustMaterialIntent::Read,
         ) {
+            RustMaterialization::Copy
+                if self.places.shared_borrow_root_param(place)
+                    && matches!(self.program.types[place.ty.index()], RirType::Lambda(_)) =>
+            {
+                format!("(*{place_expr})")
+            }
             RustMaterialization::Copy => self.operand(operand),
             RustMaterialization::Share
                 if self.places.shared_borrow_root_param(place)
                     && matches!(self.program.types[place.ty.index()], RirType::String) =>
             {
                 target::anv_string_from(&place_expr)
+            }
+            RustMaterialization::CloneLambda if self.places.shared_borrow_root_param(place) => {
+                format!("(*{place_expr}).clone()")
             }
             RustMaterialization::Share
             | RustMaterialization::CloneHandle
