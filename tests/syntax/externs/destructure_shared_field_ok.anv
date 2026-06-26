@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Texture rep shared {
+    computed width: int;
+    computed height: int;
+}
+
+fn main(texture: Texture) {
+    let Texture { width } = texture;
+}

@@ -851,26 +851,6 @@ impl ProfileCx<'_> {
                 let expected = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
                 self.check_value_fields(site, fields, expected);
             }
-            AggregateCtor::Extern(ext) => {
-                if !matches!(self.program.type_arena.data(ty), TypeData::Extern(id) if id == ext) {
-                    self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    return;
-                }
-                let decl = self.program.extern_type(*ext);
-                if decl.rep != air::ExternRep::Inline {
-                    self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    return;
-                }
-                let Some(expected) = decl.constructor_fields() else {
-                    self.push(site, ProfileErrorKind::UnsupportedRValue);
-                    return;
-                };
-                let expected = expected.map(|(_, field)| field.ty).collect::<Vec<_>>();
-                if expected.len() != fields.len() {
-                    self.push(site, ProfileErrorKind::UnsupportedRValue);
-                }
-                self.check_value_fields(site, fields, expected);
-            }
             AggregateCtor::EnumVariant { enum_id, variant } => {
                 if !matches!(self.program.type_arena.data(ty), TypeData::Enum(id) if id == enum_id)
                 {

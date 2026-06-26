@@ -4,7 +4,6 @@
 // @contains: does not support struct literal construction
 
 extern type Handle rep shared {
-    init;
     id: int;
 }
 

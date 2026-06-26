@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     ast::{Ident, Type},
-    externs::catalog::ExternType,
+    externs::catalog::{ExternField, ExternType},
     span::Span,
 };
 
@@ -38,8 +38,22 @@ pub(super) enum FieldOwner {
 }
 
 pub(super) fn extern_field_schema(ty: &ExternType) -> NamedSchemas<FieldSchema> {
+    extern_fields(ty, |_| true)
+}
+
+pub(super) fn extern_readable_field_schema(ty: &ExternType) -> NamedSchemas<FieldSchema> {
+    extern_fields(ty, |field| field.readable)
+}
+
+fn extern_fields(
+    ty: &ExternType,
+    include: impl Fn(&ExternField) -> bool,
+) -> NamedSchemas<FieldSchema> {
     let mut schema = NamedSchemas::default();
     for field in &ty.fields {
+        if !include(field) {
+            continue;
+        }
         schema
             .insert(
                 field.name,

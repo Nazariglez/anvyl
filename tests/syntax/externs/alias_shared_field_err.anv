@@ -3,11 +3,11 @@
 // @contains: var pattern requires a mutable place
 // @frontend: new
 
-extern type Point rep inline {
+extern type Point rep shared {
     x: float;
-    y: float;
 }
 
-fn main(p: Point) {
+fn main(var p: Point) {
     var Point { x } = p;
+    x = 1.0;
 }

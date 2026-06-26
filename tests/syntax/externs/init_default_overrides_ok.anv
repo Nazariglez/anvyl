@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Camera rep shared {
+    init;
+    computed fov: float;
+    computed near: float;
+    computed far: float;
+}
+
+fn main() {
+    let a = Camera {};
+    let b = Camera { fov: 70.0 };
+    let c = Camera { near: 0.1, far: 1000.0 };
+}

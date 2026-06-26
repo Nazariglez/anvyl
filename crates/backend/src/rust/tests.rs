@@ -3,11 +3,12 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
         CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstValue,
-        DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternMember, ExternParamDecl,
-        ExternRep, ExternTypeDecl, FieldDecl, Function, FunctionId, FunctionKind,
-        FunctionSpecialization, LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand,
-        Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program, Projection, RValue,
-        RawEnumValue, Signature, TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
+        DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternMember,
+        ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeBindingDecl, ExternTypeDecl,
+        FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl,
+        LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode,
+        ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature,
+        TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -9979,6 +9980,113 @@ fn profile_accepts_bound_extern_members_but_rejects_missing_binding() {
 }
 
 #[test]
+fn plan_maps_inline_extern_field_ids_to_storage_fields() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(air_module(&["host"]));
+    let ext_id = air::ExternTypeId::from_index(0);
+    let ext_ty = program.alloc_type(TypeData::Extern(ext_id));
+    let module_path = anvyx_runtime::ModulePath {
+        segments: vec!["host".to_string()],
+    };
+    let type_key = anvyx_runtime::ExternTypeKey {
+        module: module_path.clone(),
+        name: "Host".to_string(),
+    };
+    let receiver = |mode| ExternReceiverDecl { ty: ext_ty, mode };
+    let field = |name, computed| ExternFieldDecl {
+        name: Ident::new(name),
+        ty: int,
+        abi: anvyx_runtime::ExternTypeExpr::Int,
+        get_receiver: receiver(ParamMode::SharedBorrow),
+        set_receiver: receiver(ParamMode::MutBorrow),
+        computed,
+        readable: true,
+        writable: true,
+    };
+
+    assert_eq!(
+        program.alloc_extern_type(ExternTypeDecl {
+            name: Ident::new("Host"),
+            module,
+            binding: Some(ExternTypeBindingDecl {
+                package: anvyx_frontend::resolve::PackageId::core(),
+                provider: anvyx_runtime::ProviderId {
+                    name: "host".to_string(),
+                },
+                key: type_key.clone(),
+            }),
+            type_args: vec![],
+            const_args: vec![],
+            rep: ExternRep::Inline,
+            has_init: false,
+            init_fields: vec![],
+            fields: vec![field("computed", true), field("direct", false)],
+            variants: vec![],
+            variant_abis: vec![],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        }),
+        ext_id
+    );
+    program.module_mut(module).extern_types.push(ext_id);
+
+    let arg = air::LocalId::from_index(0);
+    let function = program.alloc_function(Function {
+        name: Ident::new("read"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("value", ext_ty, ParamMode::Value, arg)], int),
+        locals: vec![local(ext_ty, LocalKind::Arg)],
+        body: structured_body(
+            vec![],
+            air::AirTail::Return(Some(Operand::Place(Place {
+                root: PlaceRoot::Local(arg),
+                projection: vec![Projection::Field(air::FieldId::from_index(1))],
+                ty: int,
+            }))),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let config = RustPlanConfig {
+        symbol_prefix: "anv".into(),
+        native_providers: vec![anvyx_runtime::RustProviderSupport {
+            package: "<core>".to_string(),
+            provider: anvyx_runtime::ProviderId {
+                name: "host".to_string(),
+            },
+            cargo: anvyx_runtime::RustProviderCargo::default(),
+            modules: vec![anvyx_runtime::RustModuleSupport {
+                module: module_path,
+                types: vec![anvyx_runtime::RustTypeBinding {
+                    key: type_key,
+                    path: anvyx_runtime::RustPath {
+                        crate_name: "host".to_string(),
+                        segments: vec!["host".to_string(), "Host".to_string()],
+                    },
+                }],
+                bindings: vec![],
+            }],
+        }],
+    };
+    let plan = plan(&verified, config).expect("plan failed");
+
+    let RirTerm::Return(Some(RirOperand::Place(place))) = &plan.program().functions[0].body.term
+    else {
+        panic!("expected returned field place");
+    };
+    assert_eq!(
+        place.projections,
+        [RirProjection::Field(RirFieldId::from_index(0))]
+    );
+}
+
+#[test]
 fn plan_maps_structured_air_branch_to_structured_rir() {
     let program = scalar_branch_program();
     let verified = air::verify(&program).expect("AIR verify failed");
@@ -11002,6 +11110,15 @@ fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
 
 #[test]
 fn profile_and_plan_accept_direct_local_to_native_mut_borrow() {
+    assert_local_kind_to_native_mut_borrow(LocalKind::User);
+}
+
+#[test]
+fn profile_accepts_temp_to_native_mut_borrow() {
+    assert_local_kind_to_native_mut_borrow(LocalKind::Temp);
+}
+
+fn assert_local_kind_to_native_mut_borrow(kind: LocalKind) {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -11013,7 +11130,7 @@ fn profile_and_plan_accept_direct_local_to_native_mut_borrow() {
         &mut program,
         module,
         Signature::new(vec![], void),
-        vec![mut_local(int, LocalKind::User)],
+        vec![mut_local(int, kind)],
         vec![
             Statement::Init {
                 local: x,
@@ -11025,40 +11142,11 @@ fn profile_and_plan_accept_direct_local_to_native_mut_borrow() {
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = rust_plan_config();
     RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
-        .expect("profile rejected direct native mut borrow");
+        .expect("profile rejected native mut borrow");
 
     let plan = plan(&verified, config).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), caller);
     assert!(matches!(only_call_arg(caller), RirCallArg::MutBorrow(_)));
-}
-
-#[test]
-fn profile_rejects_temp_to_native_mut_borrow() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let void = program.alloc_type(TypeData::Void);
-    let ext = host_mut_extern(&mut program, int, void, "touch");
-    let module = program.alloc_module(root_module());
-    let x = air::LocalId::from_index(0);
-    let one = int_const(&mut program, int, 1);
-    caller_function(
-        &mut program,
-        module,
-        Signature::new(vec![], void),
-        vec![mut_local(int, LocalKind::Temp)],
-        vec![
-            Statement::Init {
-                local: x,
-                value: RValue::Use(Operand::Const(one)),
-            },
-            call_mut_ext(ext, place(x, int)),
-        ],
-    );
-
-    expect_reject(
-        program,
-        ProfileErrorKind::UnsupportedMutablePlaceNativeBoundary,
-    );
 }
 
 #[test]

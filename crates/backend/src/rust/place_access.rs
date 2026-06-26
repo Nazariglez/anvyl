@@ -210,7 +210,7 @@ pub struct PlaceProjection {
 pub enum PlaceProjectionKind {
     Field(air::FieldId),
     DataRefField(air::FieldId),
-    ExternField,
+    ExternField(air::FieldId),
     TupleField(u32),
     VariantField,
     ArrayIndex(LocalId),
@@ -868,7 +868,9 @@ fn convert_projection(step: &air_place::ProjectionStep) -> PlaceProjection {
             air_place::ProjectionKind::DataRefField(field) => {
                 PlaceProjectionKind::DataRefField(field)
             }
-            air_place::ProjectionKind::ExternField(_) => PlaceProjectionKind::ExternField,
+            air_place::ProjectionKind::ExternField(field) => {
+                PlaceProjectionKind::ExternField(field)
+            }
             air_place::ProjectionKind::TupleField(index) => PlaceProjectionKind::TupleField(index),
             air_place::ProjectionKind::VariantField { .. } => PlaceProjectionKind::VariantField,
             air_place::ProjectionKind::ArrayIndex(local) => PlaceProjectionKind::ArrayIndex(local),

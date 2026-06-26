@@ -4,7 +4,7 @@
 // @contains: Missing field 'y'
 
 extern type Point rep inline {
-    init;
+    init(x: float, y: float);
     x: float;
     y: float;
 }

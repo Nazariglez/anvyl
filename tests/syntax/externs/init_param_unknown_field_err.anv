@@ -1,13 +1,12 @@
 // @mode: check
 // @expect: error
-// @contains: var pattern requires a mutable place
 // @frontend: new
+// @contains: references unknown field 'z'
 
 extern type Point rep inline {
+    init(z: float);
     x: float;
     y: float;
 }
 
-fn main(p: Point) {
-    var Point { x } = p;
-}
+fn main() {}

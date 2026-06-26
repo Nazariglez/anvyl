@@ -50,9 +50,20 @@ pub enum ExternDescriptorError {
         ty: ExternTypeKey,
         name: String,
     },
-    UnsupportedInitParams {
+    UnnamedInitParam {
         ty: ExternTypeKey,
-        count: usize,
+        index: usize,
+    },
+    InitParamFieldCountMismatch {
+        ty: ExternTypeKey,
+        params: usize,
+        field_init: usize,
+    },
+    InitParamFieldMismatch {
+        ty: ExternTypeKey,
+        index: usize,
+        param: String,
+        field: String,
     },
     MixedVariantFields {
         ty: ExternTypeKey,
@@ -262,12 +273,6 @@ fn check_type(
     }
 
     if let Some(init) = &ty.init {
-        if mode == ValidationMode::SourceModule && !init.params.is_empty() {
-            errors.push(ExternDescriptorError::UnsupportedInitParams {
-                ty: key.clone(),
-                count: init.params.len(),
-            });
-        }
         check_signature(
             &ExternSignature {
                 params: init.params.clone(),
@@ -288,6 +293,32 @@ fn check_type(
                     name,
                 },
             );
+        }
+        if init.params.len() != init.field_init.len() {
+            errors.push(ExternDescriptorError::InitParamFieldCountMismatch {
+                ty: key.clone(),
+                params: init.params.len(),
+                field_init: init.field_init.len(),
+            });
+        }
+        for (index, param) in init.params.iter().enumerate() {
+            let Some(param_name) = &param.name else {
+                errors.push(ExternDescriptorError::UnnamedInitParam {
+                    ty: key.clone(),
+                    index,
+                });
+                continue;
+            };
+            if let Some(field_name) = init.field_init.get(index)
+                && param_name != field_name
+            {
+                errors.push(ExternDescriptorError::InitParamFieldMismatch {
+                    ty: key.clone(),
+                    index,
+                    param: param_name.clone(),
+                    field: field_name.clone(),
+                });
+            }
         }
     }
 
@@ -602,7 +633,12 @@ mod tests {
                     }],
                     variants: vec![],
                     init: Some(ExternInitDescriptor {
-                        params: vec![],
+                        params: vec![ExternParam {
+                            name: Some("x".to_string()),
+                            ty: ExternTypeExpr::Float,
+                            flow: ParamFlow::Value,
+                            escape: CallbackEscape::NonEscaping,
+                        }],
                         field_init: vec!["x".to_string()],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
@@ -885,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_source_module_init_params() {
+    fn accepts_source_module_init_params() {
         let mut provider = valid_provider();
         provider.modules[0].types[0].init.as_mut().unwrap().params = vec![ExternParam {
             name: Some("x".to_string()),
@@ -893,16 +929,68 @@ mod tests {
             flow: ParamFlow::Value,
             escape: CallbackEscape::NonEscaping,
         }];
+        provider.modules[0].types[0]
+            .init
+            .as_mut()
+            .unwrap()
+            .field_init = vec!["x".to_string()];
 
-        let errors = validate_module_contents(&provider.modules[0]).unwrap_err();
+        assert!(validate_module_contents(&provider.modules[0]).is_ok());
+        assert!(validate(&provider).is_ok());
+    }
+
+    #[test]
+    fn rejects_init_param_field_shape_mismatch() {
+        let mut provider = valid_provider();
+        provider.modules[0].types[0]
+            .init
+            .as_mut()
+            .unwrap()
+            .field_init = vec![];
+
+        let errors = validate(&provider).unwrap_err();
 
         assert!(
-            errors.contains(&ExternDescriptorError::UnsupportedInitParams {
+            errors.contains(&ExternDescriptorError::InitParamFieldCountMismatch {
                 ty: ty(module(&["math"]), "Vec2"),
-                count: 1,
+                params: 1,
+                field_init: 0,
             })
         );
-        assert!(validate(&provider).is_ok());
+    }
+
+    #[test]
+    fn rejects_unnamed_init_param() {
+        let mut provider = valid_provider();
+        provider.modules[0].types[0].init.as_mut().unwrap().params[0].name = None;
+
+        let errors = validate(&provider).unwrap_err();
+
+        assert!(errors.contains(&ExternDescriptorError::UnnamedInitParam {
+            ty: ty(module(&["math"]), "Vec2"),
+            index: 0,
+        }));
+    }
+
+    #[test]
+    fn rejects_init_param_field_name_mismatch() {
+        let mut provider = valid_provider();
+        provider.modules[0].types[0]
+            .init
+            .as_mut()
+            .unwrap()
+            .field_init[0] = "y".to_string();
+
+        let errors = validate(&provider).unwrap_err();
+
+        assert!(
+            errors.contains(&ExternDescriptorError::InitParamFieldMismatch {
+                ty: ty(module(&["math"]), "Vec2"),
+                index: 0,
+                param: "x".to_string(),
+                field: "y".to_string(),
+            })
+        );
     }
 
     #[test]

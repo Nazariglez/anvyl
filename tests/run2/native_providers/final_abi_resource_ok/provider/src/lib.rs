@@ -3,14 +3,24 @@ use anvyx_runtime::{function, methods, AnvRef, AnvRefType, AnvyxRef, Ctx};
 #[derive(AnvyxRef)]
 #[anvyx(name = "Counter")]
 pub struct Counter {
-    #[anvyx(field)]
     value: i64,
 }
 
 #[methods]
 impl Counter {
+    #[anvyx(init)]
+    pub fn new(value: i64) -> Self {
+        Self { value }
+    }
+
+    #[anvyx(getter)]
     pub fn value(&self) -> i64 {
         self.value
+    }
+
+    #[anvyx(setter)]
+    pub fn set_value(&mut self, value: i64) {
+        self.value = value;
     }
 
     pub fn bump(&mut self, delta: i64) {

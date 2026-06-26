@@ -1,3 +1,5 @@
+use anvyx_externs::ExternRep;
+
 use super::{
     ActiveMutAliasRoot, CheckedType, MUT_ALIAS_ROOT_MESSAGE, MUT_DOWNCAST_ROOT_MESSAGE,
     TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint, check_expected_value_expr,
@@ -950,7 +952,8 @@ impl<'tc> PatternChecker<'tc> {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
                     return PatternCheckResult::empty(PatternOutcome::error());
                 };
-                let field_schema = field_check::extern_field_schema(self.tc.extern_type(owner));
+                let field_schema =
+                    field_check::extern_readable_field_schema(self.tc.extern_type(owner));
                 self.check_struct_fields(fields, nominal_type(&key), &field_schema, input)
             }
             NominalKind::Enum => PatternCheckResult::empty(self.unsupported_named("Struct", span)),
@@ -1039,13 +1042,17 @@ impl<'tc> PatternChecker<'tc> {
         receiver_access: PlaceAccess,
     ) -> PlaceAccess {
         if let Some(owner) = self.tc.extern_type_id(owner_ty) {
-            let Some((_, decl)) = self.tc.extern_field(owner, field_name) else {
+            let ty = self.tc.extern_type(owner);
+            let Some((_, field)) = self.tc.extern_field(owner, field_name) else {
                 return PlaceAccess::NotPlace;
             };
-            if !decl.readable {
+            if !field.readable
+                || matches!(self.mode, PatternBindMode::Alias)
+                    && (ty.rep != ExternRep::Inline || field.computed)
+            {
                 return PlaceAccess::NotPlace;
             }
-            return place::extern_field_access(receiver_access, decl.computed, decl.writable);
+            return place::extern_field_access(receiver_access, field.computed, field.writable);
         }
 
         if self.tc.decls.key_for_type(owner_ty).is_some() {

@@ -46,7 +46,7 @@ pub(super) fn native_ref_borrow(resource: &str, arg: &str, mutable: bool, body: 
 
 pub(super) fn native_ref_adopt(native: &str, value: &str) -> String {
     format!(
-        "{}::<{native}>::register_untracked({}.heap()).alloc_in({}, {value})",
+        "{{ let __anv_native_ret = {value}; {}::<{native}>::register_untracked({}.heap()).alloc_in({}, __anv_native_ret) }}",
         rt_path("AnvRefType"),
         runtime_param_name(),
         runtime_param_name(),

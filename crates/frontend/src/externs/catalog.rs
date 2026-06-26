@@ -665,11 +665,33 @@ impl ExternType {
     pub(crate) fn constructor_fields(
         &self,
     ) -> Option<impl Iterator<Item = (usize, &ExternField)> + '_> {
-        Some(self.init.as_ref()?.fields.iter().map(|id| {
-            let index = id.0;
-            (index, &self.fields[index])
-        }))
+        let init = self.init.as_ref()?;
+        init.backs_literal(&self.nominal).then(|| {
+            init.fields.iter().map(|id| {
+                let index = id.0;
+                (index, &self.fields[index])
+            })
+        })
     }
+}
+
+impl ExternInit {
+    fn backs_literal(&self, owner: &NominalKey) -> bool {
+        init_backs_literal(&self.signature, self.effects, owner)
+    }
+}
+
+fn init_backs_literal(
+    signature: &ResolvedExternSignature,
+    effects: ExternEffects,
+    owner: &NominalKey,
+) -> bool {
+    signature.ret.ty == nominal_type(owner)
+        && !effects.fallible
+        && signature
+            .params
+            .iter()
+            .all(|param| param.flow == ParamFlow::Value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -830,12 +852,13 @@ pub(crate) enum ExternCatalogError {
         field: Ident,
         site: RawExternSite,
     },
-    ComputedInitField {
+    InitFieldTypeMismatch {
         context: ExternCatalogContext,
         field: Ident,
+        expected: Type,
+        found: Type,
         site: RawExternSite,
     },
-
     InvalidOperatorReturn {
         context: ExternCatalogContext,
         found: Type,
@@ -854,7 +877,7 @@ impl ExternCatalogError {
             | Self::InvalidType { context, .. }
             | Self::InvalidAbiType { context, .. }
             | Self::UnknownInitField { context, .. }
-            | Self::ComputedInitField { context, .. }
+            | Self::InitFieldTypeMismatch { context, .. }
             | Self::InvalidOperatorReturn { context, .. } => context,
         }
     }
@@ -868,7 +891,7 @@ impl ExternCatalogError {
             | Self::InvalidType { site, .. }
             | Self::InvalidAbiType { site, .. }
             | Self::UnknownInitField { site, .. }
-            | Self::ComputedInitField { site, .. }
+            | Self::InitFieldTypeMismatch { site, .. }
             | Self::InvalidOperatorReturn { site, .. } => site.span,
         }
     }
@@ -1152,12 +1175,17 @@ impl<'a> CatalogBuilder<'a> {
 
         if let Some(raw_init) = &raw.init {
             let context = self.catalog.types[type_id.0].context.init();
-            let fields = self.resolve_init_fields(type_id, raw_init, &context);
             let signature = self.resolve_init_signature(
                 ResolveCtx::new(scope, &context, Some(&owner), raw_init.site),
                 raw_init,
                 &owner,
             );
+            let backs_literal = init_backs_literal(&signature, raw_init.decl.effects, &owner);
+            let fields = if backs_literal {
+                self.resolve_init_fields(type_id, raw_init, &signature, &context)
+            } else {
+                vec![]
+            };
             self.catalog.types[type_id.0].init = Some(ExternInit {
                 fields,
                 signature,
@@ -1218,20 +1246,12 @@ impl<'a> CatalogBuilder<'a> {
         &mut self,
         type_id: ExternTypeId,
         raw_init: &RawExternInit,
+        signature: &ResolvedExternSignature,
         context: &ExternCatalogContext,
     ) -> Vec<ExternFieldId> {
         let ty = &self.catalog.types[type_id.0];
-        if raw_init.decl.field_init.is_empty() {
-            return ty
-                .fields
-                .iter()
-                .filter(|field| !field.computed)
-                .map(|field| field.id)
-                .collect();
-        }
-
         let mut fields = vec![];
-        for raw_name in &raw_init.decl.field_init {
+        for (index, raw_name) in raw_init.decl.field_init.iter().enumerate() {
             let name = Ident::new(raw_name);
             let Some(id) = ty.fields_by_name.get(&name).copied() else {
                 self.errors.push(ExternCatalogError::UnknownInitField {
@@ -1241,15 +1261,19 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 continue;
             };
-            if ty.fields[id.0].computed {
-                self.errors.push(ExternCatalogError::ComputedInitField {
-                    context: context.clone(),
-                    field: name,
-                    site: raw_init.site,
-                });
-            } else {
-                fields.push(id);
+            if let Some(param) = signature.params.get(index) {
+                let field_ty = &ty.fields[id.0].ty.ty;
+                if param.ty.ty != *field_ty {
+                    self.errors.push(ExternCatalogError::InitFieldTypeMismatch {
+                        context: context.clone(),
+                        field: name,
+                        expected: field_ty.clone(),
+                        found: param.ty.ty.clone(),
+                        site: raw_init.site,
+                    });
+                }
             }
+            fields.push(id);
         }
         fields
     }
@@ -3012,7 +3036,7 @@ mod tests {
                 types: vec![ExternTypeDescriptor {
                     variants: vec![],
                     init: Some(ExternInitDescriptor {
-                        params: vec![],
+                        params: vec![ext_param("missing", ExternTypeExpr::Int)],
                         field_init: vec!["missing".to_string()],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
@@ -3038,7 +3062,7 @@ mod tests {
         }
 
         #[test]
-        fn init_computed_field_fails() {
+        fn init_computed_field_succeeds() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![ExternTypeDescriptor {
@@ -3054,7 +3078,7 @@ mod tests {
                     }],
                     variants: vec![],
                     init: Some(ExternInitDescriptor {
-                        params: vec![],
+                        params: vec![ext_param("x", ExternTypeExpr::Int)],
                         field_init: vec!["x".to_string()],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
@@ -3064,19 +3088,8 @@ mod tests {
                 functions: vec![],
             });
             let decls = decls("", &[], &raw);
-            let errors = build(raw, &decls).unwrap_err();
 
-            assert!(matches!(
-                errors.first(),
-                Some(ExternCatalogError::ComputedInitField {
-                    context: ExternCatalogContext {
-                        item: ExternContextItem::Init { ty, .. },
-                        ..
-                    },
-                    field,
-                    ..
-                }) if *ty == ident("Handle") && *field == ident("x")
-            ));
+            assert!(build(raw, &decls).is_ok());
         }
 
         #[test]
@@ -3096,7 +3109,7 @@ mod tests {
                     }],
                     variants: vec![],
                     init: Some(ExternInitDescriptor {
-                        params: vec![],
+                        params: vec![ext_param("x", ExternTypeExpr::Int)],
                         field_init: vec!["x".to_string()],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
@@ -3108,6 +3121,37 @@ mod tests {
             let decls = decls("", &[], &raw);
 
             assert!(build(raw, &decls).is_ok());
+        }
+
+        #[test]
+        fn nonliteral_init_keeps_signature_without_constructor_fields() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    variants: vec![],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![ext_param("ok", ExternTypeExpr::Bool)],
+                        field_init: vec!["ok".to_string()],
+                        ret: ExternTypeExpr::Result(
+                            Box::new(named("Handle")),
+                            Box::new(ExternTypeExpr::String),
+                        ),
+                        effects: ExternEffects::default(),
+                    }),
+                    ..descriptor_type("Handle")
+                }],
+                functions: vec![],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build(raw, &decls).expect("nonliteral init should import");
+            let owner = catalog
+                .type_by_key(&type_key(provider_scope("host"), "Handle"))
+                .expect("extern type");
+            let init = catalog.ty(owner).init.as_ref().expect("init metadata");
+
+            assert!(init.fields.is_empty());
+            assert_eq!(init.signature.params.len(), 1);
+            assert!(catalog.ty(owner).constructor_fields().is_none());
         }
 
         #[test]

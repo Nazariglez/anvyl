@@ -133,24 +133,26 @@ fn normalize_type(
         }
     }
 
-    let init = ty.node.init.as_ref().and_then(|init| {
-        if init.params.is_empty() {
-            Some(RawExternInit {
-                decl: ExternInitDescriptor {
-                    params: vec![],
-                    field_init: vec![],
-                    ret: ExternTypeExpr::Void,
-                    effects: ExternEffects::default(),
-                },
-                site: site(source, span),
-            })
-        } else {
-            errors.extend(
-                init.params
-                    .iter()
-                    .map(|param| *unsupported_init_param(source, param)),
-            );
-            None
+    let init = ty.node.init.as_ref().map(|init| {
+        let mut params = vec![];
+        let mut field_init = vec![];
+        for param in &init.params {
+            match lower_param(source, param, span) {
+                Ok(param) => {
+                    field_init.push(param.name.clone().expect("source params are named"));
+                    params.push(param);
+                }
+                Err(error) => errors.push(*error),
+            }
+        }
+        RawExternInit {
+            decl: ExternInitDescriptor {
+                params,
+                field_init,
+                ret: ExternTypeExpr::Void,
+                effects: ExternEffects::default(),
+            },
+            site: site(source, span),
         }
     });
 
@@ -364,16 +366,6 @@ fn unsupported_param(
         kind: UnsupportedSourceKind::Param {
             name: param.name.to_string(),
             reason,
-        },
-    })
-}
-
-fn unsupported_init_param(source: SourceId, param: &Param) -> SourceError {
-    Box::new(ExternInputError::UnsupportedSource {
-        span: SourceSpan::from_byte_span(source, param.ty_span),
-        kind: UnsupportedSourceKind::InitParam {
-            name: param.name.to_string(),
-            reason: UnsupportedSourceParamReason::Unsupported,
         },
     })
 }

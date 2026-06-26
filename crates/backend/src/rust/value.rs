@@ -268,6 +268,12 @@ impl<'a> RustValues<'a> {
                     return value;
                 }
                 match self.program.types[place.ty.index()] {
+                    RirType::Struct(id)
+                        if self.program.structs[id.index()].copyable
+                            && self.program.structs[id.index()].native_path.is_some() =>
+                    {
+                        self.place(place)
+                    }
                     RirType::Struct(id) if self.program.structs[id.index()].copyable => {
                         self.copy_struct_place(place)
                     }

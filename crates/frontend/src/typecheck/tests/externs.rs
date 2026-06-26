@@ -831,6 +831,36 @@ mod fields {
     }
 
     #[test]
+    fn provider_rejects_unreadable_destructure_field() {
+        let Err(errors) = check_with_provider(
+            r"
+            import ext:host { Point };
+            fn read(p: Point) { let Point { x } = p; }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![ExternFieldDescriptor {
+                        readable: false,
+                        ..computed_field("x", ExternTypeExpr::Float)
+                    }],
+                    ..extern_type("Point")
+                }],
+                functions: vec![],
+            }),
+        ) else {
+            panic!("unreadable destructure field should fail");
+        };
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, TypeError::UnknownMember { .. })),
+            "unexpected errors: {errors:?}"
+        );
+    }
+
+    #[test]
     fn provider_write_mut_receiver() {
         let result = check_with_provider(
             r"
@@ -945,11 +975,11 @@ mod fields {
     }
 
     #[test]
-    fn provider_rejects_unwritable_field_write() {
+    fn provider_rejects_unwritable_literal_override() {
         let Err(errors) = check_with_provider(
             r"
             import ext:host { Point };
-            fn write(var p: Point) { p.x = 2.0; }
+            fn make() -> Point { Point { x: 2.0 } }
             ",
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
@@ -958,12 +988,18 @@ mod fields {
                         writable: false,
                         ..computed_field("x", ExternTypeExpr::Float)
                     }],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![],
+                        field_init: vec![],
+                        ret: named("Point"),
+                        effects: ExternEffects::default(),
+                    }),
                     ..extern_type("Point")
                 }],
                 functions: vec![],
             }),
         ) else {
-            panic!("unwritable field write should fail");
+            panic!("unwritable literal override should fail");
         };
 
         assert!(
@@ -996,21 +1032,20 @@ mod struct_literals {
     use super::*;
 
     #[test]
-    fn records_init() {
+    fn records_init_and_override_write() {
         let result = check(
             r"
-            extern type Point rep inline { init; x: float; y: float; }
+            extern type Point rep inline { init(x: float); x: float; computed y: float; }
             fn make() -> Point { Point { x: 1.0, y: 2.0 } }
             ",
         )
         .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Point"))
-            .expect("extern type");
+        let owner = catalog_type(&result, ModuleScope::Root, "Point");
+        let y = catalog_field(&result, owner, "y");
 
         assert_use(&result, ExternUseTarget::Init(owner));
-        assert_use_total(&result, 1);
+        assert_use(&result, ExternUseTarget::FieldWrite(y));
+        assert_use_total(&result, 2);
         assert_typecheck_closed(&result);
     }
 }
@@ -1487,7 +1522,7 @@ mod compound {
         let result = check(
             r"
             struct Wrapper { pair: (int, int) }
-            extern type Holder { wrapper: Wrapper; }
+            extern type Holder rep inline { wrapper: Wrapper; }
             fn write(var holder: Holder) {
                 var Holder { wrapper: Wrapper { pair: (x, _) } } = holder;
                 x = 3;
@@ -1507,7 +1542,7 @@ mod compound {
         let result = check(
             r"
             struct Point { x: int, y: int }
-            extern type Holder { point: Point; }
+            extern type Holder rep inline { point: Point; }
             fn write(var holder: Holder) {
                 var Holder { point: Point { x } } = holder;
                 x = 3;
@@ -1546,66 +1581,6 @@ mod compound {
         )
         .expect("typecheck failed");
         assert_compound_assignment_uses(&result);
-    }
-
-    #[test]
-    fn records_computed_alias_write() {
-        let result = check(
-            r"
-            extern type Point { computed x: float; }
-            fn write(var p: Point) {
-                var Point { x } = p;
-                x = 1.0;
-            }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Point"))
-            .expect("extern type");
-        let (field, _) = result
-            .externs()
-            .field(owner, Ident::new("x"))
-            .expect("extern field");
-
-        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
-        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
-    }
-
-    #[test]
-    fn records_nested_computed_alias_write_prefix() {
-        let result = check(
-            r"
-            extern type Inner { computed x: float; }
-            extern type Outer { inner: Inner; }
-            fn write(var o: Outer) {
-                var Outer { inner: Inner { x } } = o;
-                x = 1.0;
-            }
-            ",
-        )
-        .expect("typecheck failed");
-        let outer = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Outer"))
-            .expect("extern type");
-        let inner = result
-            .externs()
-            .type_by_key(&type_key(ModuleScope::Root, "Inner"))
-            .expect("extern type");
-        let (inner_field, _) = result
-            .externs()
-            .field(outer, Ident::new("inner"))
-            .expect("extern field");
-        let (x_field, _) = result
-            .externs()
-            .field(inner, Ident::new("x"))
-            .expect("extern field");
-
-        assert_use_count(&result, ExternUseTarget::FieldRead(inner_field), 2);
-        assert_use_count(&result, ExternUseTarget::FieldRead(x_field), 1);
-        assert_use_count(&result, ExternUseTarget::FieldWrite(x_field), 1);
     }
 
     fn assert_compound_assignment_uses(result: &TypecheckTestResult) {
@@ -1826,8 +1801,11 @@ mod provider_imports {
                     ],
                     variants: vec![],
                     init: Some(ExternInitDescriptor {
-                        params: vec![],
-                        field_init: vec![],
+                        params: vec![
+                            param("x", ExternTypeExpr::Float),
+                            param("y", ExternTypeExpr::Float),
+                        ],
+                        field_init: vec!["x".to_string(), "y".to_string()],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),
@@ -1855,34 +1833,17 @@ mod provider_imports {
             }),
         )
         .expect("typecheck failed");
-        let owner = result
-            .externs()
-            .type_by_key(&type_key(provider_scope(&["host"]), "Point"))
-            .expect("extern type");
-        let (x_field, _) = result
-            .externs()
-            .field(owner, Ident::new("x"))
-            .expect("extern field");
-        let (y_field, _) = result
-            .externs()
-            .field(owner, Ident::new("y"))
-            .expect("extern field");
-        let (method, _) = result
-            .externs()
-            .method(owner, Ident::new("move_by"))
-            .expect("extern method");
-        let (static_method, _) = result
-            .externs()
-            .static_method(owner, Ident::new("origin"))
-            .expect("extern static");
-        let (unary, _) = result
+        let owner = catalog_type(&result, provider_scope(&["host"]), "Point");
+        let x_field = catalog_field(&result, owner, "x");
+        let y_field = catalog_field(&result, owner, "y");
+        let method = catalog_method(&result, owner, "move_by");
+        let static_method = catalog_static(&result, owner, "origin");
+        let unary = result
             .externs()
             .unary_operator(owner, UnaryOp::Neg)
-            .expect("extern unary");
-        let (binary, _) = result
-            .externs()
-            .binary_operator(owner, ExternBinaryOp::Add, false)
-            .expect("extern binary");
+            .expect("extern unary")
+            .0;
+        let binary = catalog_binary_operator(&result, owner, ExternBinaryOp::Add);
 
         assert_use(&result, ExternUseTarget::Init(owner));
         assert_use(&result, ExternUseTarget::FieldRead(y_field));
@@ -2273,7 +2234,7 @@ mod named_modules {
                 r"
                 extern fn tick(p: Point);
                 pub extern type Point rep inline {
-                    init;
+                    init(x: float);
                     x: float;
                     fn shift(var self, delta: Point);
                     fn origin() -> Self;

@@ -2989,6 +2989,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         value: Operand,
         alias: bool,
     ) -> Result<(), LowerError> {
+        self.lower_for_pattern_binding_at(pattern, value, alias, None)
+    }
+
+    fn lower_for_pattern_binding_at(
+        &mut self,
+        pattern: &ast::PatternNode,
+        value: Operand,
+        alias: bool,
+        extern_site: Option<ExprId>,
+    ) -> Result<(), LowerError> {
         match &pattern.node {
             Pattern::Wildcard => Ok(()),
             Pattern::Ident(_) if alias => self.lower_pattern_alias_binding(pattern, value),
@@ -3011,29 +3021,50 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         .projection
                         .push(crate::air::Projection::TupleField(index as u32));
                     field.ty = types[index];
-                    self.lower_for_pattern_binding(item, Operand::Place(field), alias)?;
+                    self.lower_for_pattern_binding_at(
+                        item,
+                        Operand::Place(field),
+                        alias,
+                        extern_site,
+                    )?;
                 }
                 Ok(())
             }
             Pattern::Struct { fields, .. } => {
                 let place = self.pattern_operand_place(value)?;
                 for (name, item) in fields {
-                    let Some((field, ty)) =
-                        typing::field_by_name(&self.cx.program, place.ty, *name)
-                    else {
-                        return Err(unsupported_pattern_stmt(pattern));
-                    };
-                    let mut field_place = place.clone();
-                    field_place
-                        .projection
-                        .push(crate::air::Projection::Field(field));
-                    field_place.ty = ty;
-                    self.lower_for_pattern_binding(item, Operand::Place(field_place), alias)?;
+                    if alias && matches!(item.node, Pattern::Wildcard) {
+                        continue;
+                    }
+                    let value =
+                        self.lower_pattern_field(pattern, extern_site, place.clone(), *name)?;
+                    self.lower_for_pattern_binding_at(item, value, alias, extern_site)?;
                 }
                 Ok(())
             }
             _ => Err(unsupported_pattern_stmt(pattern)),
         }
+    }
+
+    fn lower_pattern_field(
+        &mut self,
+        pattern: &ast::PatternNode,
+        extern_site: Option<ExprId>,
+        place: Place,
+        name: Ident,
+    ) -> Result<Operand, LowerError> {
+        if let TypeData::Extern(owner) = self.cx.program.type_data(place.ty) {
+            return self.lower_extern_pattern_field(pattern, extern_site, place, *owner, name);
+        }
+        let Some((field, ty)) = typing::field_by_name(&self.cx.program, place.ty, name) else {
+            return Err(unsupported_pattern_stmt(pattern));
+        };
+        let mut field_place = place;
+        field_place
+            .projection
+            .push(crate::air::Projection::Field(field));
+        field_place.ty = ty;
+        Ok(Operand::Place(field_place))
     }
 
     fn pattern_operand_place(&mut self, value: Operand) -> Result<Place, LowerError> {
@@ -3290,6 +3321,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     .lower_place_arg(&binding.node.value, true)
                     .map_err(|_| unsupported_pattern_stmt(&binding.node.pattern))?;
                 self.lower_for_pattern_binding(&binding.node.pattern, Operand::Place(place), true)
+            }
+            Pattern::Tuple(_) | Pattern::Struct { .. } => {
+                let value = Operand::Place(self.lower_place_or_temp(&binding.node.value, false)?);
+                self.lower_for_pattern_binding_at(
+                    &binding.node.pattern,
+                    value,
+                    false,
+                    Some(binding.node.value.node.id),
+                )
             }
             Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
                 self.lower_effect(&binding.node.value)
@@ -3895,14 +3935,76 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         ) {
             return Err(unsupported_expr(expr));
         }
-        let args = self.lower_exact_call_args(
-            expr.node.id,
-            &Callee::Extern(callee),
-            [field.node.target.as_ref()].into_iter(),
-        )?;
+        let params = self.callee_params(&Callee::Extern(callee))?;
+        let Some(receiver_param) = params.get(&self.cx.program, 0) else {
+            return Err(unsupported_expr(expr));
+        };
+        let receiver = self.lower_extern_receiver_arg(&field.node.target, receiver_param)?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
-            args,
+            args: vec![receiver],
+        })
+    }
+
+    fn lower_extern_receiver_arg(
+        &mut self,
+        expr: &ExprNode,
+        param: ParamType,
+    ) -> Result<CallArg, LowerError> {
+        match param.mode {
+            ParamMode::Value => Ok(CallArg::Value(self.lower_value_to(expr, param.ty, expr)?)),
+            ParamMode::SharedBorrow => Ok(CallArg::SharedBorrow(
+                self.lower_place_or_temp(expr, false)?,
+            )),
+            ParamMode::MutBorrow => Ok(CallArg::MutBorrow(self.lower_place_or_temp(expr, true)?)),
+        }
+    }
+
+    fn lower_extern_field_read_operand(
+        &mut self,
+        expr_id: ExprId,
+        pattern: &ast::PatternNode,
+        receiver: Place,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        self.lower_extern_field_read_from_place(expr_id, receiver, target)
+            .map_err(|err| match err {
+                LowerError::UnsupportedExternUse { .. } => unsupported_pattern_stmt(pattern),
+                err => err,
+            })
+    }
+
+    fn lower_extern_field_read_from_place(
+        &mut self,
+        expr_id: ExprId,
+        receiver: Place,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let callee = self.extern_callee(expr_id, target)?;
+        if !matches!(
+            self.cx.program.extern_decl(callee).member,
+            ExternMember::FieldGetter { .. }
+        ) {
+            return Err(LowerError::UnsupportedExternUse {
+                expr_id,
+                kind: unsupported_extern_kind(target),
+            });
+        }
+        let params = self.callee_params(&Callee::Extern(callee))?;
+        let Some(receiver_param) = params.get(&self.cx.program, 0) else {
+            return Err(LowerError::UnsupportedExternUse {
+                expr_id,
+                kind: unsupported_extern_kind(target),
+            });
+        };
+        let receiver = match receiver_param.mode {
+            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
+            ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
+            ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
+        };
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args: vec![receiver],
         })
     }
 
@@ -3930,6 +4032,197 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
             args,
+        })
+    }
+
+    fn lower_extern_literal_init(
+        &mut self,
+        expr: &ExprNode,
+        required: &[(Ident, TypeId)],
+        lowered: &[(Ident, Operand)],
+    ) -> Result<RValue, LowerError> {
+        let target = self
+            .select_extern_target(expr.node.id, |target| {
+                matches!(target, ExternUseTarget::Init(_))
+                    && self.cx.maps.externs.contains_key(&target)
+            })
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let callee = self.extern_callee(expr.node.id, target)?;
+        let params = self.callee_params(&Callee::Extern(callee))?;
+        if params.len(&self.cx.program) != Some(required.len()) {
+            return Err(unsupported_expr(expr));
+        }
+        let mut args = vec![];
+        for (index, (name, _)) in required.iter().enumerate() {
+            let Some(param) = params.get(&self.cx.program, index) else {
+                return Err(unsupported_expr(expr));
+            };
+            if param.mode != ParamMode::Value {
+                return Err(unsupported_expr(expr));
+            }
+            let value = lowered
+                .iter()
+                .find_map(|(field, value)| (field == name).then(|| value.clone()))
+                .ok_or_else(|| unsupported_expr(expr))?;
+            args.push(CallArg::Value(value));
+        }
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args,
+        })
+    }
+
+    fn extern_field_write_target(&self, expr_id: ExprId, name: Ident) -> Option<ExternUseTarget> {
+        let externs = self.cx.externs.as_ref()?;
+        self.facts
+            .extern_uses
+            .get(&expr_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|target| match target {
+                ExternUseTarget::FieldWrite(field) => externs.field_ref(*field).1.name == name,
+                _ => false,
+            })
+            .filter(|target| self.cx.maps.externs.contains_key(target))
+    }
+
+    fn extern_field_read_target(
+        &self,
+        expr_id: ExprId,
+        owner: crate::air::ExternTypeId,
+        name: Ident,
+    ) -> Option<ExternUseTarget> {
+        let externs = self.cx.externs.as_ref()?;
+        self.facts
+            .extern_uses
+            .get(&expr_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|target| match target {
+                ExternUseTarget::FieldRead(field) => {
+                    let Some(callee) = self.cx.maps.externs.get(target) else {
+                        return false;
+                    };
+                    matches!(
+                        self.cx.program.extern_decl(*callee).member,
+                        ExternMember::FieldGetter { owner: field_owner, .. } if field_owner == owner
+                    ) && externs.field_ref(*field).1.name == name
+                }
+                _ => false,
+            })
+    }
+
+    fn lower_extern_pattern_field(
+        &mut self,
+        pattern: &ast::PatternNode,
+        extern_site: Option<ExprId>,
+        place: Place,
+        owner: crate::air::ExternTypeId,
+        name: Ident,
+    ) -> Result<Operand, LowerError> {
+        if let Some((site, target)) = extern_site.and_then(|site| {
+            self.extern_field_read_target(site, owner, name)
+                .map(|target| (site, target))
+        }) {
+            let value = self.lower_extern_field_read_operand(site, pattern, place, target)?;
+            return self.emit_temp(value);
+        }
+        let field = self.extern_direct_read_field_place(pattern, owner, place, name)?;
+        Ok(Operand::Place(field))
+    }
+
+    fn extern_direct_read_field_place(
+        &self,
+        pattern: &ast::PatternNode,
+        extern_id: crate::air::ExternTypeId,
+        mut place: Place,
+        name: Ident,
+    ) -> Result<Place, LowerError> {
+        let decl = self.cx.program.extern_type(extern_id);
+        if decl.rep != ExternRep::Inline {
+            return Err(unsupported_pattern_stmt(pattern));
+        }
+        let Some((index, field)) = decl
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == name)
+        else {
+            return Err(unsupported_pattern_stmt(pattern));
+        };
+        if field.computed || !field.readable {
+            return Err(unsupported_pattern_stmt(pattern));
+        }
+        place
+            .projection
+            .push(crate::air::Projection::Field(FieldId::from_index(index)));
+        place.ty = field.ty;
+        Ok(place)
+    }
+
+    fn extern_direct_field_place(
+        &self,
+        expr: &ExprNode,
+        extern_id: crate::air::ExternTypeId,
+        mut place: Place,
+        name: Ident,
+    ) -> Result<Place, LowerError> {
+        let decl = self.cx.program.extern_type(extern_id);
+        if decl.rep != ExternRep::Inline {
+            return Err(unsupported_expr(expr));
+        }
+        let Some((index, field)) = decl
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == name)
+        else {
+            return Err(unsupported_expr(expr));
+        };
+        if field.computed || !field.writable {
+            return Err(unsupported_expr(expr));
+        }
+        place
+            .projection
+            .push(crate::air::Projection::Field(FieldId::from_index(index)));
+        place.ty = field.ty;
+        Ok(place)
+    }
+
+    fn lower_extern_field_write_operand(
+        &mut self,
+        expr: &ExprNode,
+        receiver: Place,
+        value: Operand,
+        target: ExternUseTarget,
+    ) -> Result<RValue, LowerError> {
+        let callee = self.extern_callee(expr.node.id, target)?;
+        if !matches!(
+            &self.cx.program.extern_decl(callee).member,
+            ExternMember::FieldSetter { .. }
+        ) {
+            return Err(unsupported_expr(expr));
+        }
+        let params = self.callee_params(&Callee::Extern(callee))?;
+        let Some(receiver_param) = params.get(&self.cx.program, 0) else {
+            return Err(unsupported_expr(expr));
+        };
+        let Some(value_param) = params.get(&self.cx.program, 1) else {
+            return Err(unsupported_expr(expr));
+        };
+        let receiver = match receiver_param.mode {
+            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
+            ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
+            ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
+        };
+        if value_param.mode != ParamMode::Value {
+            return Err(unsupported_expr(expr));
+        }
+        Ok(RValue::Call {
+            callee: Callee::Extern(callee),
+            args: vec![receiver, CallArg::Value(value)],
         })
     }
 
@@ -4402,9 +4695,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                                 payload, call_expr, call, call_rest, site, mode,
                             );
                         }
-                        let place = this.place_from_operand(payload, expr)?;
-                        let place = this.project_field(expr, place, node.node.field)?;
-                        this.lower_field_chain_steps(Operand::Place(place), rest, site, mode)
+                        let value = this.lower_field_read_step(payload, expr, node.node.field)?;
+                        this.lower_field_chain_steps(value, rest, site, mode)
                     },
                     |this| this.skip_field_chain(site, mode),
                 )
@@ -4434,9 +4726,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 )
             }
             ChainStep::Field { expr, node } => {
-                let place = self.place_from_operand(current, expr)?;
-                let place = self.project_field(expr, place, node.node.field)?;
-                self.lower_field_chain_steps(Operand::Place(place), rest, site, mode)
+                let value = self.lower_field_read_step(current, expr, node.node.field)?;
+                self.lower_field_chain_steps(value, rest, site, mode)
             }
             ChainStep::Index { expr, node } => {
                 let value = self.lower_index_step(current, expr, node)?;
@@ -4450,6 +4741,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 self.lower_field_chain_call(expr, node, rest, site, mode)
             }
         }
+    }
+
+    fn lower_field_read_step(
+        &mut self,
+        current: Operand,
+        expr: &ExprNode,
+        field: Ident,
+    ) -> Result<Operand, LowerError> {
+        let place = self.place_from_operand(current, expr)?;
+        if let TypeData::Extern(owner) = self.cx.program.type_data(place.ty)
+            && let Some(target) = self.extern_field_read_target(expr.node.id, *owner, field)
+        {
+            let value = self.lower_extern_field_read_from_place(expr.node.id, place, target)?;
+            return self.emit_temp(value);
+        }
+        self.project_field(expr, place, field).map(Operand::Place)
     }
 
     fn lower_field_chain_call(
@@ -5433,22 +5740,58 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         ty_id: TypeId,
     ) -> Result<Operand, LowerError> {
         let decl = self.cx.program.extern_type(extern_id);
-        if decl.rep != ExternRep::Inline {
-            return Err(unsupported_expr(expr));
-        }
-        let Some(expected) = decl.constructor_fields() else {
+        let Some(required) = decl.constructor_fields() else {
             return Err(unsupported_expr(expr));
         };
-        let expected = expected.map(|(_, field)| (field.name, field.ty)).collect();
-        let fields = self.lower_ordered_fields(expr, &literal.node.fields, expected)?;
-        self.emit_typed_temp(
-            ty_id,
-            RValue::Aggregate {
-                kind: AggregateCtor::Extern(extern_id),
-                fields,
-                ty: ty_id,
-            },
-        )
+        let required = required
+            .map(|(_, field)| (field.name, field.ty))
+            .collect::<Vec<_>>();
+        let field_types = literal
+            .node
+            .fields
+            .iter()
+            .map(|(name, field_expr)| {
+                let field = decl
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .ok_or_else(|| unsupported_expr(field_expr))?;
+                Ok((*name, field.ty, field_expr))
+            })
+            .collect::<Result<Vec<_>, LowerError>>()?;
+
+        let mut lowered = vec![];
+        for (name, field_ty, field_expr) in field_types {
+            let value = self.lower_value_to(field_expr, field_ty, field_expr)?;
+            let value = self.emit_typed_temp(field_ty, RValue::Use(value))?;
+            lowered.push((name, value));
+        }
+
+        let init = self.lower_extern_literal_init(expr, &required, &lowered)?;
+        let has_overrides = lowered
+            .iter()
+            .any(|(name, _)| !required.iter().any(|(required, _)| required == name));
+        if !has_overrides {
+            return self.emit_typed_temp(ty_id, init);
+        }
+
+        let local = self.push_local(None, None, ty_id, AirMutability::Mutable, LocalKind::Temp);
+        self.emit_init(local, init)?;
+        let place = self.local_place(local);
+        for (name, value) in lowered {
+            if required.iter().any(|(required, _)| *required == name) {
+                continue;
+            }
+            if let Some(target) = self.extern_field_write_target(expr.node.id, name) {
+                let write =
+                    self.lower_extern_field_write_operand(expr, place.clone(), value, target)?;
+                self.emit_eval(write)?;
+            } else {
+                let dst = self.extern_direct_field_place(expr, extern_id, place.clone(), name)?;
+                self.emit_assign(dst, RValue::Use(value))?;
+            }
+        }
+        Ok(Operand::Place(place))
     }
 
     fn lower_struct_enum_literal(
@@ -8192,10 +8535,10 @@ fn extern_use_requires_decl(externs: &ExternCatalog, target: ExternUseTarget) ->
         ExternUseTarget::FieldRead(field) | ExternUseTarget::FieldWrite(field) => {
             externs.field_ref(field).1.computed
         }
-        ExternUseTarget::Init(_) => false,
         ExternUseTarget::Function(_)
         | ExternUseTarget::Method(_)
         | ExternUseTarget::Static(_)
+        | ExternUseTarget::Init(_)
         | ExternUseTarget::UnaryOperator(_)
         | ExternUseTarget::BinaryOperator(_) => true,
     }

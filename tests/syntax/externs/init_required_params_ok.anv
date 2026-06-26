@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Sprite rep shared {
+    init(texture: Texture);
+    computed texture: Texture;
+    computed position: Vec2;
+    computed visible: bool;
+}
+
+extern type Texture;
+
+extern type Vec2 rep inline {
+    init(x: float, y: float);
+    x: float;
+    y: float;
+}
+
+fn main(tex: Texture) {
+    let sprite = Sprite {
+        texture: tex,
+        position: Vec2 { x: 0.0, y: 0.0 },
+        visible: true,
+    };
+}

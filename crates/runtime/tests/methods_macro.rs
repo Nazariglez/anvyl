@@ -60,6 +60,16 @@ enum InitError {
     Bad,
 }
 
+struct DefaultInit;
+
+#[methods]
+impl DefaultInit {
+    #[anvyx(init)]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 struct FallibleInit;
 
 #[methods]
@@ -152,9 +162,15 @@ fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
 
 #[test]
 fn init_supports_visible_result_and_trap_metadata() {
+    let default = __anvyx_methods_defaultinit();
+    let default_init = default.descriptor.init.as_ref().unwrap();
+    assert!(default_init.params.is_empty());
+    assert!(default_init.field_init.is_empty());
+
     let visible = __anvyx_methods_fallibleinit();
     let visible_init = visible.descriptor.init.as_ref().unwrap();
     assert_eq!(visible_init.params.len(), 1);
+    assert_eq!(visible_init.field_init, ["ok"]);
     assert!(!visible_init.effects.fallible);
     assert!(matches!(visible_init.ret, ExternTypeExpr::Result(_, _)));
     assert!(matches!(
@@ -178,6 +194,7 @@ fn init_supports_visible_result_and_trap_metadata() {
             args: vec![],
         }
     );
+    assert_eq!(trap_init.field_init, ["ok"]);
     assert!(trap_init.effects.fallible);
     let trap_binding = trap
         .bindings
@@ -284,8 +301,10 @@ fn methods_merge_into_derive_owned_type_descriptor() {
     assert_eq!(export.descriptor.fields[0].name, "x");
     assert_eq!(export.descriptor.methods[0].name, "x");
     assert_eq!(export.descriptor.rep, anvyx_runtime::ExternRep::Inline);
+    let descriptor_init = export.descriptor.init.as_ref().unwrap();
+    assert_eq!(descriptor_init.field_init, ["x"]);
     assert!(matches!(
-        &export.descriptor.init.as_ref().unwrap().ret,
+        &descriptor_init.ret,
         ExternTypeExpr::Named { name, .. } if name == "Vector2"
     ));
     let init = export
@@ -351,7 +370,9 @@ fn methods_descriptor_covers_member_roles() {
     assert_eq!(export.descriptor.methods[0].receiver, ReceiverMode::Shared);
     assert_eq!(export.descriptor.methods[1].receiver, ReceiverMode::Mutable);
     assert_eq!(export.descriptor.statics[0].name, "unit");
-    assert_eq!(export.descriptor.init.as_ref().unwrap().params.len(), 2);
+    let init = export.descriptor.init.as_ref().unwrap();
+    assert_eq!(init.params.len(), 2);
+    assert_eq!(init.field_init, ["x", "y"]);
     assert_eq!(export.descriptor.fields.len(), 1);
     assert!(export.descriptor.fields.iter().all(|field| field.computed));
     assert!(export.descriptor.fields[0].readable);

@@ -24,10 +24,10 @@ use std::{
 
 use anvyx_frontend::{
     air::{
-        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FunctionId,
+        self, AggregateCtor, CallArg, Callee, ConstId, ConstValue, ExternId, FieldId, FunctionId,
         FunctionValueCapability, GlobalId, LocalId, LocalKind, MapWriteKind, Mutability, Operand,
-        ParamEscape, ParamMode, Place, Projection, RValue, TypeData, TypeId, TypePassClasses,
-        VerifiedProgram,
+        ParamEscape, ParamMode, Place, RValue, TypeData, TypeId, TypePassClasses, VerifiedProgram,
+        place_model,
     },
     ast::{FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -966,15 +966,10 @@ impl<'a> PlanCx<'a> {
             program.structs[struct_id.index()].fields = vec![];
             return Ok(());
         }
-        let fields = match decl.constructor_fields() {
-            Some(fields) => fields.map(|(_, field)| field).collect::<Vec<_>>(),
-            None => decl.fields.iter().filter(|field| !field.computed).collect(),
-        };
         let mut seen = vec![];
-        let fields = fields
-            .into_iter()
-            .enumerate()
-            .map(|(index, field)| {
+        let fields = self
+            .inline_extern_storage_fields(ext)
+            .map(|(_, field, id)| {
                 let Some(&ty) = self.type_map.get(&field.ty) else {
                     return Err(Self::gap(
                         RustTargetGapSite::Type(field.ty),
@@ -982,7 +977,7 @@ impl<'a> PlanCx<'a> {
                     ));
                 };
                 Ok(RirField {
-                    id: RirFieldId::from_index(index),
+                    id,
                     symbol: scoped_symbol(field.name.as_str(), &mut seen),
                     ty,
                 })
@@ -3149,7 +3144,7 @@ impl<'a> PlanCx<'a> {
                     let mut field_place = place.clone();
                     field_place
                         .projection
-                        .push(Projection::Field(air::FieldId::from_index(index)));
+                        .push(air::Projection::Field(FieldId::from_index(index)));
                     field_place.ty = field.ty;
                     RirOperand::Place(self.plan_place_in_function(function, &field_place))
                 })
@@ -3212,7 +3207,7 @@ impl<'a> PlanCx<'a> {
     ) -> Result<PlannedRValue, RustPlanError> {
         let fields = self.plan_operands_read(function, fields, locals);
         let value = match kind {
-            AggregateCtor::Struct(_) | AggregateCtor::Extern(_) => RirRValue::Struct {
+            AggregateCtor::Struct(_) => RirRValue::Struct {
                 ty: self.type_map[&ty],
                 fields: fields.operands,
             },
@@ -3661,7 +3656,7 @@ impl<'a> PlanCx<'a> {
                 projections: plan
                     .projection
                     .iter()
-                    .map(Self::rir_place_projection)
+                    .map(|projection| self.rir_place_projection(projection))
                     .collect(),
                 ty: self.type_map[&plan.ty],
             }),
@@ -3670,7 +3665,7 @@ impl<'a> PlanCx<'a> {
                 projections: plan
                     .projection
                     .iter()
-                    .map(Self::rir_place_projection)
+                    .map(|projection| self.rir_place_projection(projection))
                     .collect(),
                 ty: self.type_map[&plan.ty],
             }),
@@ -3985,6 +3980,7 @@ impl<'a> PlanCx<'a> {
                     }
                     let root_ty = self.air.capture_cells[cell.index()].ty;
                     return self.lower_temp_root_read(
+                        function,
                         RirRValue::CellGetCopy {
                             cell: self.capture_cell_ref(function, cell),
                             ty: self.type_map[&root_ty],
@@ -4013,6 +4009,7 @@ impl<'a> PlanCx<'a> {
                     }
                     let root_ty = self.air.scoped_borrows[borrow.index()].ty;
                     return self.lower_temp_root_read(
+                        function,
                         RirRValue::ScopedPlaceCellGet {
                             cell: self.scoped_place_cell_ref(function, borrow),
                             ty: self.type_map[&root_ty],
@@ -4069,7 +4066,7 @@ impl<'a> PlanCx<'a> {
         for projection in &dataref.remaining {
             current_place
                 .projections
-                .push(Self::rir_place_projection(projection));
+                .push(self.rir_place_projection(projection));
             current_place.ty = self.type_map[&projection.ty];
         }
         PlannedOperand {
@@ -4080,6 +4077,7 @@ impl<'a> PlanCx<'a> {
 
     fn lower_temp_root_read(
         &self,
+        function: FunctionId,
         value: RirRValue,
         root_ty: TypeId,
         place: &Place,
@@ -4098,7 +4096,7 @@ impl<'a> PlanCx<'a> {
             stmts,
             operand: RirOperand::Place(RirPlace::local(
                 root_local,
-                place.projection.iter().map(Self::rir_projection).collect(),
+                self.rir_place_projections(function, place),
                 self.type_map[&place.ty],
             )),
         }
@@ -4189,7 +4187,7 @@ impl<'a> PlanCx<'a> {
                         local: RirLocalId::from_index(local.index()),
                         ty: root.ty,
                     },
-                    place.projection.iter().map(Self::rir_projection).collect(),
+                    self.rir_place_projections(function, place),
                     self.type_map[&place.ty],
                 ),
                 value,
@@ -4233,7 +4231,7 @@ impl<'a> PlanCx<'a> {
                             global: self.global_map[&global],
                             ty: self.type_map[&global_decl.ty],
                         },
-                        place.projection.iter().map(Self::rir_projection).collect(),
+                        self.rir_place_projections(function, place),
                         self.type_map[&place.ty],
                     ),
                     value,
@@ -4482,7 +4480,7 @@ impl<'a> PlanCx<'a> {
         for projection in &dataref.object_prefix {
             current_place
                 .projections
-                .push(Self::rir_place_projection(projection));
+                .push(self.rir_place_projection(projection));
             current_place.ty = self.type_map[&projection.ty];
         }
         current_place
@@ -4502,7 +4500,7 @@ impl<'a> PlanCx<'a> {
             projections: segment
                 .storage
                 .iter()
-                .map(Self::rir_place_projection)
+                .map(|projection| self.rir_place_projection(projection))
                 .collect(),
             ty: segment.storage_ty,
         }
@@ -4722,11 +4720,15 @@ impl<'a> PlanCx<'a> {
         id
     }
 
-    fn rir_place_projection(projection: &PlaceProjection) -> RirProjection {
+    fn rir_place_projection(&self, projection: &PlaceProjection) -> RirProjection {
         match projection.kind {
             PlaceProjectionKind::Field(field) | PlaceProjectionKind::DataRefField(field) => {
                 RirProjection::Field(RirFieldId::from_index(field.index()))
             }
+            PlaceProjectionKind::ExternField(field) => RirProjection::Field(
+                self.extern_storage_field(projection.source_ty, field)
+                    .expect("profile rejects unsupported extern field projection"),
+            ),
             PlaceProjectionKind::TupleField(index) => {
                 RirProjection::TupleField(RirFieldId::from_index(index as usize))
             }
@@ -4735,23 +4737,74 @@ impl<'a> PlanCx<'a> {
             | PlaceProjectionKind::SliceIndex(local) => {
                 RirProjection::Index(RirLocalId::from_index(local.index()))
             }
-            PlaceProjectionKind::ExternField | PlaceProjectionKind::VariantField => {
+            PlaceProjectionKind::VariantField => {
                 unreachable!("profile rejects unsupported projection")
             }
         }
     }
 
-    fn rir_projection(projection: &Projection) -> RirProjection {
-        match projection {
-            Projection::Field(field) => RirProjection::Field(RirFieldId::from_index(field.index())),
-            Projection::Index(local) => RirProjection::Index(RirLocalId::from_index(local.index())),
-            Projection::TupleField(index) => {
-                RirProjection::TupleField(RirFieldId::from_index(*index as usize))
+    fn rir_place_projections(&self, function: FunctionId, place: &Place) -> Vec<RirProjection> {
+        let path = place_model::walk_place(self.air, function, place)
+            .expect("profile rejects unsupported place projection");
+        path.steps()
+            .iter()
+            .map(|step| self.rir_projection_step(step))
+            .collect()
+    }
+
+    fn rir_projection_step(&self, step: &place_model::ProjectionStep) -> RirProjection {
+        match step.kind() {
+            place_model::ProjectionKind::Field(field)
+            | place_model::ProjectionKind::DataRefField(field) => {
+                RirProjection::Field(RirFieldId::from_index(field.index()))
             }
-            Projection::VariantField { .. } => {
+            place_model::ProjectionKind::ExternField(field) => RirProjection::Field(
+                self.extern_storage_field(step.source_ty(), field)
+                    .expect("profile rejects unsupported extern field projection"),
+            ),
+            place_model::ProjectionKind::TupleField(index) => {
+                RirProjection::TupleField(RirFieldId::from_index(index as usize))
+            }
+            place_model::ProjectionKind::ArrayIndex(local)
+            | place_model::ProjectionKind::ListIndex(local)
+            | place_model::ProjectionKind::SliceIndex(local) => {
+                RirProjection::Index(RirLocalId::from_index(local.index()))
+            }
+            place_model::ProjectionKind::VariantField { .. } => {
                 unreachable!("profile rejects unsupported projection")
             }
         }
+    }
+
+    fn inline_extern_storage_fields(
+        &self,
+        ext: air::ExternTypeId,
+    ) -> impl Iterator<Item = (FieldId, &air::ExternFieldDecl, RirFieldId)> + '_ {
+        self.air
+            .extern_type(ext)
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !field.computed)
+            .enumerate()
+            .map(|(storage, (field, decl))| {
+                (
+                    FieldId::from_index(field),
+                    decl,
+                    RirFieldId::from_index(storage),
+                )
+            })
+    }
+
+    fn extern_storage_field(&self, source_ty: TypeId, field_id: FieldId) -> Option<RirFieldId> {
+        let TypeData::Extern(extern_id) = self.air.type_arena.data(source_ty) else {
+            return None;
+        };
+        if self.air.extern_type(*extern_id).rep != air::ExternRep::Inline {
+            return None;
+        }
+        self.inline_extern_storage_fields(*extern_id)
+            .find_map(|(field, _, storage)| (field == field_id).then_some(storage))
     }
 
     fn operand_ty(&self, operand: &Operand) -> TypeId {
@@ -4803,7 +4856,7 @@ impl<'a> PlanCx<'a> {
         };
         RirPlace {
             root,
-            projections: place.projection.iter().map(Self::rir_projection).collect(),
+            projections: self.rir_place_projections(function, place),
             ty: self.type_map[&place.ty],
         }
     }

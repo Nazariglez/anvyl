@@ -1,8 +1,9 @@
 // @mode: check
-// @expect: success
+// @expect: error
+// @contains: var pattern requires a mutable place
 // @frontend: new
 
-extern type Point {
+extern type Point rep inline {
     computed x: float;
 }
 

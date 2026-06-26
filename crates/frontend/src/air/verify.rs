@@ -7,10 +7,9 @@ use anvyx_externs::{
 pub use super::typing::PrimitiveKind;
 use super::{
     AggregateKind, CaptureCellLifetime, CaptureLocalSource, ConstValue, EnumRepr, ExternMember,
-    ExternRep, Function, FunctionKind, FunctionValueCapability, LambdaCaptureDecl, LambdaDecl,
-    LambdaEscape, Local, LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program,
-    RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData,
-    VariantShape,
+    Function, FunctionKind, FunctionValueCapability, LambdaCaptureDecl, LambdaDecl, LambdaEscape,
+    Local, LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program, RawEnumValue,
+    ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
@@ -252,24 +251,6 @@ pub enum BadRValue {
     },
     CollectionCtorFieldTypeMismatch {
         ctor: AggregateCtor,
-        field: usize,
-        expected: TypeId,
-        found: TypeId,
-    },
-    ExternCtorResultTypeMismatch {
-        extern_id: ExternTypeId,
-        found: TypeId,
-    },
-    ExternCtorUnavailable {
-        extern_id: ExternTypeId,
-    },
-    ExternCtorFieldCountMismatch {
-        extern_id: ExternTypeId,
-        expected: usize,
-        found: usize,
-    },
-    ExternCtorFieldTypeMismatch {
-        extern_id: ExternTypeId,
         field: usize,
         expected: TypeId,
         found: TypeId,
@@ -2790,10 +2771,7 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
     for init_field in &ty.init_fields {
         let invalid = !ty.has_init
             || !init_fields.insert(*init_field)
-            || ty
-                .fields
-                .get(init_field.index())
-                .is_none_or(|field| field.computed);
+            || ty.fields.get(init_field.index()).is_none();
         if invalid {
             cx.push(
                 site.clone(),
@@ -5736,9 +5714,6 @@ fn verify_rvalue(
                     *ty,
                     fields,
                 ),
-                AggregateCtor::Extern(id) => {
-                    verify_extern_ctor(cx, site.clone(), *id, *ty, fields);
-                }
                 AggregateCtor::EnumVariant { enum_id, variant } => {
                     verify_enum_ctor(cx, site.clone(), *enum_id, *variant, *ty, fields);
                 }
@@ -7083,69 +7058,6 @@ fn verify_aggregate_ctor(
     );
 }
 
-fn verify_extern_ctor(
-    cx: &mut VerifyCx<'_>,
-    site: VerifySite,
-    extern_id: ExternTypeId,
-    ty: TypeId,
-    fields: &[Operand],
-) {
-    let Some(decl) = cx.program.extern_types.get(extern_id.index()) else {
-        cx.push(
-            site,
-            VerifyErrorKind::BadReference(BadReference::InvalidExternType(extern_id)),
-        );
-        return;
-    };
-    if cx.type_data(ty) != Some(&TypeData::Extern(extern_id)) {
-        cx.push(
-            site.clone(),
-            VerifyErrorKind::BadRValue(BadRValue::ExternCtorResultTypeMismatch {
-                extern_id,
-                found: ty,
-            }),
-        );
-    }
-    if decl.rep != ExternRep::Inline {
-        cx.push(
-            site,
-            VerifyErrorKind::BadRValue(BadRValue::ExternCtorUnavailable { extern_id }),
-        );
-        return;
-    }
-    let Some(expected_fields) = decl.constructor_fields() else {
-        cx.push(
-            site,
-            VerifyErrorKind::BadRValue(BadRValue::ExternCtorUnavailable { extern_id }),
-        );
-        return;
-    };
-    let expected_fields = expected_fields
-        .map(|(_, field)| field.ty)
-        .collect::<Vec<_>>();
-    verify_ordered_fields(
-        cx,
-        &site,
-        fields,
-        &expected_fields,
-        |expected, found| {
-            VerifyErrorKind::BadRValue(BadRValue::ExternCtorFieldCountMismatch {
-                extern_id,
-                expected,
-                found,
-            })
-        },
-        |field, expected, found| {
-            VerifyErrorKind::BadRValue(BadRValue::ExternCtorFieldTypeMismatch {
-                extern_id,
-                field,
-                expected,
-                found,
-            })
-        },
-    );
-}
-
 fn verify_enum_ctor(
     cx: &mut VerifyCx<'_>,
     site: VerifySite,
@@ -7630,7 +7542,6 @@ fn aggregate_function_state(
 ) -> FunctionValueState {
     match kind {
         AggregateCtor::Struct(_)
-        | AggregateCtor::Extern(_)
         | AggregateCtor::Tuple
         | AggregateCtor::EnumVariant { .. }
         | AggregateCtor::Array

@@ -1136,7 +1136,7 @@ mod tests {
             let mut ty = extern_type("T");
             ty.init = Some(ExternInitDescriptor {
                 params: vec![param("x", ExternTypeExpr::Int)],
-                field_init: vec![],
+                field_init: vec!["x".to_string()],
                 ret: ExternTypeExpr::Void,
                 effects: ExternEffects::default(),
             });
@@ -1226,7 +1226,7 @@ mod tests {
                         }],
                         variants: vec![],
                         init: Some(ExternInitDescriptor {
-                            params: vec![],
+                            params: vec![param("x", ExternTypeExpr::Float)],
                             field_init: vec!["x".to_string()],
                             ret: ExternTypeExpr::Void,
                             effects: ExternEffects::default(),

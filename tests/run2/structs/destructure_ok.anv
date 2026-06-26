@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match: 7
+
+struct Point { x: int, y: int }
+
+fn main() {
+    let point = Point { x: 3, y: 4 };
+    let Point { x, y } = point;
+    println(x + y);
+}

@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match: 7
+
+fn main() {
+    let pair = (3, 4);
+    let (x, y) = pair;
+    println(x + y);
+}

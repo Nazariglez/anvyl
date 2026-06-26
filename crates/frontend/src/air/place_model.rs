@@ -246,10 +246,14 @@ fn field_step(
             ProjectionKind::DataRefField(field),
             typing::field_by_id(program, source_ty, field)?,
         )),
-        TypeData::Extern(_) => Some((
-            ProjectionKind::ExternField(field),
-            typing::field_by_id(program, source_ty, field)?,
-        )),
+        TypeData::Extern(extern_id) => {
+            let decl = program.extern_type(*extern_id);
+            let field_decl = decl.fields.get(field.index())?;
+            if decl.rep != crate::air::ExternRep::Inline || field_decl.computed {
+                return None;
+            }
+            Some((ProjectionKind::ExternField(field), field_decl.ty))
+        }
         _ => None,
     }
 }

@@ -293,7 +293,6 @@ fn unsupported_source_label(kind: &UnsupportedSourceKind) -> &'static str {
         UnsupportedSourceKind::CallbackReturn => "callback return used here",
         UnsupportedSourceKind::Operator(_) => "unsupported source extern operator here",
         UnsupportedSourceKind::Param { .. } => "unsupported source extern parameter here",
-        UnsupportedSourceKind::InitParam { .. } => "unsupported source extern init parameter here",
         UnsupportedSourceKind::CallbackParam { .. } => {
             "unsupported source extern callback parameter here"
         }
@@ -316,10 +315,6 @@ fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
         UnsupportedSourceKind::Param { name, reason } => {
             render_unsupported_param(Some(name), *reason, false)
         }
-        UnsupportedSourceKind::InitParam { name, reason } => format!(
-            "extern init parameters are not supported: parameter '{name}' is {}",
-            render_unsupported_param_reason(*reason),
-        ),
         UnsupportedSourceKind::CallbackParam { reason } => {
             render_unsupported_param(None, *reason, true)
         }
@@ -357,7 +352,6 @@ fn render_unsupported_param_reason(reason: UnsupportedSourceParamReason) -> &'st
         UnsupportedSourceParamReason::Mutable => "mutable",
         UnsupportedSourceParamReason::CastAccept => "cast-accepting",
         UnsupportedSourceParamReason::Default => "default",
-        UnsupportedSourceParamReason::Unsupported => "unsupported",
     }
 }
 
@@ -1653,11 +1647,17 @@ fn render_extern_catalog_error(
             "{} references unknown field '{field}'",
             render_extern_item(context)
         ),
-        ExternCatalogError::ComputedInitField { field, .. } => format!(
-            "{} cannot initialize computed field '{field}'",
-            render_extern_item(context)
+        ExternCatalogError::InitFieldTypeMismatch {
+            field,
+            expected,
+            found,
+            ..
+        } => format!(
+            "{} init field '{field}' has type '{}', but the init parameter has type '{}'",
+            render_extern_item(context),
+            render_surface_type(expected, type_ctx),
+            render_surface_type(found, type_ctx)
         ),
-
         ExternCatalogError::InvalidOperatorReturn {
             found, expected, ..
         } => format!(
@@ -2166,8 +2166,25 @@ fn render_extern_descriptor_error(
             "duplicate init field '{name}' on extern type '{}'",
             render_extern_type_key(ty, raw_scope)
         ),
-        ExternDescriptorError::UnsupportedInitParams { ty, count } => format!(
-            "extern init parameters are not supported on type '{}': found {count} parameter(s)",
+        ExternDescriptorError::UnnamedInitParam { ty, index } => format!(
+            "extern init parameter {index} on type '{}' has no source-visible name",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::InitParamFieldCountMismatch {
+            ty,
+            params,
+            field_init,
+        } => format!(
+            "extern init on type '{}' has {params} parameter(s) but {field_init} field initializer(s)",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::InitParamFieldMismatch {
+            ty,
+            index,
+            param,
+            field,
+        } => format!(
+            "extern init parameter {index} ('{param}') on type '{}' does not match field initializer '{field}'",
             render_extern_type_key(ty, raw_scope)
         ),
         ExternDescriptorError::MixedVariantFields { ty, variant } => format!(

@@ -24,7 +24,7 @@ pub(super) fn direct_native_mut_borrow_supported(
     let Some(local) = function.locals.get(local_id.index()) else {
         return false;
     };
-    local.kind == LocalKind::User
+    matches!(local.kind, LocalKind::User | LocalKind::Temp)
         && local.mutability == Mutability::Mutable
         && !function
             .signature
@@ -92,7 +92,7 @@ impl PlanCx<'_> {
         let projections = plan
             .projection
             .iter()
-            .map(Self::rir_place_projection)
+            .map(|projection| self.rir_place_projection(projection))
             .collect();
         self.plan_handle_mut_place_arg(function, plan.root, root_ty, projections, plan.ty)
     }

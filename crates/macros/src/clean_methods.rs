@@ -645,6 +645,10 @@ fn init_descriptor(
 ) -> syn::Result<TokenStream> {
     let init = init_return(method, export, owner, export_name)?;
     let params = params_with_overrides(method, Some(export), params)?;
+    let field_init = params.iter().map(|param| {
+        let name = &param.name;
+        quote! { #name.to_string() }
+    });
     let params = params.iter().map(|param| {
         let name = &param.name;
         let ty = type_expr_tokens(&param.ty);
@@ -664,7 +668,7 @@ fn init_descriptor(
     Ok(quote! {
         anvyx_runtime::ExternInitDescriptor {
             params: vec![#(#params),*],
-            field_init: vec![],
+            field_init: vec![#(#field_init),*],
             ret: #ret,
             effects: anvyx_runtime::ExternEffects { fallible: #fallible },
         }

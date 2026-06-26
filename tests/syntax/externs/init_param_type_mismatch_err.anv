@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: init field 'x' has type 'int', but the init parameter has type 'float'
+
+extern type Point rep inline {
+    init(x: float);
+    x: int;
+}
+
+fn main() {}

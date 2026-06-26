@@ -1,4 +1,4 @@
-use anvyx_externs::{ExternRep, ParamFlow};
+use anvyx_externs::ParamFlow;
 
 use super::{
     ArityError, CheckedType, ExternUseTarget, NominalKey, TypeChecker, TypeError, check_arg_count,
@@ -212,9 +212,7 @@ pub(super) fn check_extern_lit(
     }
 
     let extern_type = tc.extern_type(owner);
-    let supports_literal =
-        extern_type.constructor_fields().is_some() && extern_type.rep == ExternRep::Inline;
-    if !supports_literal {
+    if extern_type.constructor_fields().is_none() {
         tc.push_error(TypeError::InvalidStructLiteral {
             name: key.name,
             kind: "extern".to_string(),
@@ -273,23 +271,28 @@ fn check_extern_literal_fields(
 
     for checked_field in shape.fields {
         let (name, value) = &fields[checked_field.index];
-        let Some((_, field)) = tc.extern_field(owner, *name) else {
+        let Some((field_ref, field)) = tc.extern_field(owner, *name) else {
             continue;
         };
+        let writable = field.writable;
         let field_ty = field.ty.clone();
-        let allowed = required.contains(name);
-        if !allowed {
-            tc.push_error(TypeError::ImmutableAssignment {
-                name: *name,
-                span: tc.error_span(value.span),
-            });
-            failed = true;
+        let is_init_field = required.contains(name);
+        match (is_init_field, writable) {
+            (true, _) => {}
+            (false, true) => {
+                tc.record_extern_use(aggregate, ExternUseTarget::FieldWrite(field_ref));
+            }
+            (false, false) => {
+                tc.push_error(TypeError::ImmutableAssignment {
+                    name: *name,
+                    span: tc.error_span(value.span),
+                });
+                failed = true;
+            }
         }
         let hint = tc.type_handle(&field_ty.ty);
         let checked = check_expr_checked_with_hint(value, Some(hint), tc);
-        if allowed {
-            tc.record_aggregate_elem_flow(aggregate, value);
-        }
+        tc.record_aggregate_elem_flow(aggregate, value);
         failed |= !check_checked_value(value, &checked, &field_ty, tc);
     }
     failed
