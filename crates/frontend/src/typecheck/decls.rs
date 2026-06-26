@@ -3939,6 +3939,11 @@ impl DeclarationIndex {
         self.core_enum_key("result", "Result")
     }
 
+    pub(crate) fn core_result_of(&self, ok: Type, err: Type) -> Option<Type> {
+        let key = self.core_result_key()?;
+        Some(nominal_type_with_args(&key, &[ok, err], &[]))
+    }
+
     pub(crate) fn core_option_of(&self, inner: Type) -> Option<Type> {
         let key = self.core_option_key()?;
         Some(nominal_type_with_args(&key, &[inner], &[]))
@@ -3961,6 +3966,23 @@ impl DeclarationIndex {
         let key = self.core_option_key()?;
         let inner = Self::single_nominal_type_arg(ty, &key)?;
         Some((key, inner))
+    }
+
+    pub(crate) fn semantic_result_parts<'a>(
+        &self,
+        ty: &'a Type,
+    ) -> Option<(NominalKey, &'a Type, &'a Type)> {
+        let key = self.core_result_key()?;
+        let Type::Nominal(nominal) = ty else {
+            return None;
+        };
+        if nominal_key_for_type(ty)? != key || !nominal.const_args.is_empty() {
+            return None;
+        }
+        let [ok, err] = nominal.type_args.as_slice() else {
+            return None;
+        };
+        Some((key, ok, err))
     }
 
     pub(crate) fn semantic_option_key(&self, ty: &Type) -> Option<NominalKey> {
@@ -3999,7 +4021,7 @@ impl DeclarationIndex {
     }
 
     fn map_key_error_inner(&self, ty: &Type, seen: &mut HashSet<Type>) -> Option<MapKeyError> {
-        if self.semantic_option_inner(ty).is_some() {
+        if self.semantic_option_inner(ty).is_some() || self.semantic_result_parts(ty).is_some() {
             return Some(MapKeyError {
                 ty: ty.clone(),
                 field: None,
@@ -4941,6 +4963,7 @@ mod tests {
             doc: None,
             rep: ExternRep::Shared,
             fields: vec![],
+            variants: vec![],
             init: None,
             methods: vec![],
             statics: vec![],

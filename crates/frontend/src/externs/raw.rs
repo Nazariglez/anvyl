@@ -87,6 +87,7 @@ pub(crate) struct RawExternType {
     pub exported: bool,
     pub rep: ExternRep,
     pub fields: Vec<RawExternField>,
+    pub variants: Vec<anvyx_externs::ExternEnumVariantDescriptor>,
     pub init: Option<RawExternInit>,
     pub methods: Vec<RawExternMethod>,
     pub statics: Vec<RawExternStatic>,
@@ -171,8 +172,14 @@ pub(crate) enum RawExternIdentityKey {
 pub(crate) enum UnsupportedSourceKind {
     Type(String),
     InferReturn,
+    ReturnPlace,
+    CallbackReturn,
     Operator(String),
     Param {
+        name: String,
+        reason: UnsupportedSourceParamReason,
+    },
+    InitParam {
         name: String,
         reason: UnsupportedSourceParamReason,
     },
@@ -186,6 +193,7 @@ pub(crate) enum UnsupportedSourceParamReason {
     Mutable,
     CastAccept,
     Default,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

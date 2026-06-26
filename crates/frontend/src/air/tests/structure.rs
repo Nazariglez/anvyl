@@ -327,6 +327,8 @@ fn program_accessors() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![],
         operators: vec![],
@@ -342,6 +344,7 @@ fn program_accessors() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: int_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });

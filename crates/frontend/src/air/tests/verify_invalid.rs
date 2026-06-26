@@ -694,6 +694,8 @@ fn extern_member_receiver_mode_mismatch() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![],
         operators: vec![],
@@ -712,6 +714,7 @@ fn extern_member_receiver_mode_mismatch() {
         },
         params: vec![],
         return_type: int_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -721,6 +724,42 @@ fn extern_member_receiver_mode_mismatch() {
             .iter()
             .any(|e| matches!(e.kind, EK::BadExtern(BadExtern::ReceiverModeMismatch)))
     );
+}
+
+#[test]
+fn extern_rejects_return_only_abi_in_param() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    builder.alloc_extern(ExternDecl {
+        name: Ident::new("bad"),
+        module,
+        member: ExternMember::FreeFunction,
+        params: vec![ExternParamDecl {
+            ty: int_ty,
+            mode: ParamMode::Value,
+            escape: ParamEscape::NonEscaping,
+        }],
+        return_type: void_ty,
+        abi: crate::air::ExternAbi {
+            params: vec![anvyx_externs::ExternTypeExpr::Void],
+            ret: anvyx_externs::ExternTypeExpr::Void,
+        },
+        binding: None,
+        effects: anvyx_externs::ExternEffects::default(),
+    });
+
+    let errors = verify_void_entry(builder, "main", module, void_ty, |_, _| {});
+    assert!(errors.iter().any(|e| {
+        matches!(
+            e.kind,
+            EK::BadExtern(BadExtern::InvalidAbi {
+                reason: anvyx_externs::AbiTypeError::VoidOutsideReturn,
+                ..
+            })
+        )
+    }));
 }
 
 #[test]
@@ -739,6 +778,7 @@ fn extern_binding_must_match_decl_identity() {
         member: ExternMember::FreeFunction,
         params: vec![],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: Some(ExternBindingDecl {
             package: crate::resolve::PackageId::synthetic_root(),
             provider: ProviderId {
@@ -790,6 +830,7 @@ fn extern_binding_with_invalid_owner_does_not_panic() {
         },
         params: vec![],
         return_type: int_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: Some(ExternBindingDecl {
             package: crate::resolve::PackageId::synthetic_root(),
             provider: ProviderId {
@@ -837,6 +878,7 @@ fn escaping_extern_param_must_be_function() {
             escape: ParamEscape::Escaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -868,6 +910,7 @@ fn escaping_extern_param_must_be_by_value() {
             escape: ParamEscape::Escaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -900,6 +943,8 @@ fn escaping_extern_type_params_use_same_invariants() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![ExternStaticDecl {
             name: Ident::new("retain"),
@@ -916,6 +961,7 @@ fn escaping_extern_type_params_use_same_invariants() {
                 },
             ],
             return_type: void_ty,
+            abi: crate::air::ExternAbi::default(),
         }],
         operators: vec![],
     });
@@ -955,6 +1001,7 @@ fn call_arity_mismatch() {
             },
         ],
         return_type: int_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -1031,6 +1078,7 @@ fn shared_string_const_invalid_id_does_not_panic() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -1079,6 +1127,7 @@ fn call_arg_type_mismatch() {
             },
         ],
         return_type: int_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -1143,6 +1192,7 @@ fn call_arg_function_escape_mismatch() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -1213,6 +1263,7 @@ fn non_local_call_arg_alias_is_conservative() {
             },
         ],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -1455,6 +1506,7 @@ fn immutable_non_local_mut_borrow_rejected() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -4557,6 +4609,8 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![],
         operators: vec![],
@@ -4567,6 +4621,7 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         member: ExternMember::FreeFunction,
         params: vec![],
         return_type: void_ty,
+        abi: crate::air::ExternAbi::default(),
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });
@@ -5583,6 +5638,7 @@ fn extern_ctor_requires_inline_init() {
             fields: vec![ExternFieldDecl {
                 name: Ident::new("id"),
                 ty: int_ty,
+                abi: anvyx_externs::ExternTypeExpr::Int,
                 get_receiver: ExternReceiverDecl {
                     ty: ext_ty,
                     mode: ParamMode::SharedBorrow,
@@ -5595,6 +5651,8 @@ fn extern_ctor_requires_inline_init() {
                 readable: true,
                 writable: true,
             }],
+            variants: vec![],
+            variant_abis: vec![],
             methods: vec![],
             statics: vec![],
             operators: vec![],

@@ -133,20 +133,25 @@ fn normalize_type(
         }
     }
 
-    let init = ty.node.init.as_ref().map(|init| RawExternInit {
-        decl: ExternInitDescriptor {
-            params: vec![
-                ExternParam {
-                    name: None,
-                    ty: ExternTypeExpr::Int,
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                };
-                init.params.len()
-            ],
-            field_init: vec![],
-        },
-        site: site(source, span),
+    let init = ty.node.init.as_ref().and_then(|init| {
+        if init.params.is_empty() {
+            Some(RawExternInit {
+                decl: ExternInitDescriptor {
+                    params: vec![],
+                    field_init: vec![],
+                    ret: ExternTypeExpr::Void,
+                    effects: ExternEffects::default(),
+                },
+                site: site(source, span),
+            })
+        } else {
+            errors.extend(
+                init.params
+                    .iter()
+                    .map(|param| *unsupported_init_param(source, param)),
+            );
+            None
+        }
     });
 
     if !errors.is_empty() {
@@ -162,6 +167,7 @@ fn normalize_type(
             ExternTypeRep::Inline => ExternRep::Inline,
         },
         fields,
+        variants: vec![],
         init,
         methods,
         statics,
@@ -191,7 +197,7 @@ fn normalize_member(
         } => Ok(RawSourceMember::Field(RawExternField {
             decl: ExternFieldDescriptor {
                 name: name.to_string(),
-                ty: type_expr(source, ty, span)?,
+                ty: type_expr(source, ty, span, SourceTypePosition::Field)?,
                 computed: *computed,
                 readable: true,
                 writable: true,
@@ -250,11 +256,11 @@ fn normalize_member(
                 signature: ExternSignature {
                     params: vec![ExternParam {
                         name: None,
-                        ty: type_expr(source, other_ty, span)?,
+                        ty: type_expr(source, other_ty, span, SourceTypePosition::Param)?,
                         flow: ParamFlow::Value,
                         escape: CallbackEscape::NonEscaping,
                     }],
-                    ret: type_expr(source, ret, span)?,
+                    ret: type_expr(source, ret, span, SourceTypePosition::Return)?,
                 },
                 effects: ExternEffects::default(),
             },
@@ -267,7 +273,7 @@ fn normalize_member(
                     receiver: ReceiverMode::Shared,
                     signature: ExternSignature {
                         params: vec![],
-                        ret: type_expr(source, ret, span)?,
+                        ret: type_expr(source, ret, span, SourceTypePosition::Return)?,
                     },
                     effects: ExternEffects::default(),
                 },
@@ -283,9 +289,15 @@ fn signature(
     ret: &ReturnSpec,
     span: Span,
 ) -> SourceResult<ExternSignature> {
+    if ret.is_place() {
+        return Err(Box::new(ExternInputError::UnsupportedSource {
+            span: SourceSpan::from_byte_span(source, span),
+            kind: UnsupportedSourceKind::ReturnPlace,
+        }));
+    }
     Ok(ExternSignature {
         params: param_list(source, params, span)?,
-        ret: type_expr(source, &ret.ty, span)?,
+        ret: type_expr(source, &ret.ty, span, SourceTypePosition::Return)?,
     })
 }
 
@@ -325,7 +337,10 @@ fn lower_param(source: SourceId, param: &Param, span: Span) -> SourceResult<Exte
     let escape = callback_escape(param.escape);
     Ok(ExternParam {
         name: Some(param.name.to_string()),
-        ty: callback_param_type(type_expr(source, &param.ty, span)?, escape),
+        ty: callback_param_type(
+            type_expr(source, &param.ty, span, SourceTypePosition::Param)?,
+            escape,
+        ),
         flow: ParamFlow::Value,
         escape,
     })
@@ -353,6 +368,16 @@ fn unsupported_param(
     })
 }
 
+fn unsupported_init_param(source: SourceId, param: &Param) -> SourceError {
+    Box::new(ExternInputError::UnsupportedSource {
+        span: SourceSpan::from_byte_span(source, param.ty_span),
+        kind: UnsupportedSourceKind::InitParam {
+            name: param.name.to_string(),
+            reason: UnsupportedSourceParamReason::Unsupported,
+        },
+    })
+}
+
 fn callback_escape(escape: EscapeMode) -> CallbackEscape {
     match escape {
         EscapeMode::NonEscaping => CallbackEscape::NonEscaping,
@@ -360,7 +385,32 @@ fn callback_escape(escape: EscapeMode) -> CallbackEscape {
     }
 }
 
-fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternTypeExpr> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceTypePosition {
+    Param,
+    Return,
+    CallbackParam,
+    CallbackReturn,
+    Field,
+    Nested,
+}
+
+impl SourceTypePosition {
+    fn allows_slice(self) -> bool {
+        matches!(self, Self::Param | Self::CallbackParam)
+    }
+
+    fn allows_callback(self) -> bool {
+        matches!(self, Self::Param | Self::CallbackParam)
+    }
+}
+
+fn type_expr(
+    source: SourceId,
+    ty: &Type,
+    span: Span,
+    position: SourceTypePosition,
+) -> SourceResult<ExternTypeExpr> {
     match ty {
         Type::InferReturn => Err(Box::new(ExternInputError::UnsupportedSource {
             span: SourceSpan::from_byte_span(source, span),
@@ -372,17 +422,61 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
         Type::Float => Ok(ExternTypeExpr::Float),
         Type::String => Ok(ExternTypeExpr::String),
         Type::Any => Ok(ExternTypeExpr::Any),
-        Type::Optional { inner } => Ok(ExternTypeExpr::Option(Box::new(type_expr(
-            source, inner, span,
-        )?))),
-        Type::List { elem } => Ok(ExternTypeExpr::List(Box::new(type_expr(
-            source, elem, span,
-        )?))),
-        Type::Map { key, value } => Ok(ExternTypeExpr::Map(
-            Box::new(type_expr(source, key, span)?),
-            Box::new(type_expr(source, value, span)?),
+        Type::Tuple(fields) if fields.is_empty() => Ok(ExternTypeExpr::Unit),
+        Type::Tuple(fields) => fields
+            .iter()
+            .map(|field| type_expr(source, field, span, SourceTypePosition::Nested))
+            .collect::<SourceResult<Vec<_>>>()
+            .map(ExternTypeExpr::Tuple),
+        Type::Array { elem, len } => match len {
+            ast::ArrayLen::Fixed(len) => Ok(ExternTypeExpr::array(
+                type_expr(source, elem, span, SourceTypePosition::Nested)?,
+                *len as u64,
+            )),
+            ast::ArrayLen::Infer | ast::ArrayLen::Named(_) | ast::ArrayLen::Param(_) => {
+                Err(unsupported_type(source, ty, span))
+            }
+        },
+        Type::Slice { elem } => {
+            if !position.allows_slice() {
+                return Err(unsupported_type(source, ty, span));
+            }
+            Ok(ExternTypeExpr::slice(type_expr(
+                source,
+                elem,
+                span,
+                SourceTypePosition::Nested,
+            )?))
+        }
+        Type::Optional { inner } => Ok(ExternTypeExpr::option(type_expr(
+            source,
+            inner,
+            span,
+            SourceTypePosition::Nested,
+        )?)),
+        Type::List { elem } => Ok(ExternTypeExpr::list(type_expr(
+            source,
+            elem,
+            span,
+            SourceTypePosition::Nested,
+        )?)),
+        Type::Map { key, value } => Ok(ExternTypeExpr::map(
+            type_expr(source, key, span, SourceTypePosition::Nested)?,
+            type_expr(source, value, span, SourceTypePosition::Nested)?,
         )),
         Type::Func { params, ret } => {
+            if matches!(
+                position,
+                SourceTypePosition::Return | SourceTypePosition::CallbackReturn
+            ) {
+                return Err(Box::new(ExternInputError::UnsupportedSource {
+                    span: SourceSpan::from_byte_span(source, span),
+                    kind: UnsupportedSourceKind::CallbackReturn,
+                }));
+            }
+            if !position.allows_callback() {
+                return Err(unsupported_type(source, ty, span));
+            }
             if ret.is_place() {
                 return Err(Box::new(ExternInputError::UnsupportedSource {
                     span: SourceSpan::from_byte_span(source, span),
@@ -405,12 +499,25 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
                     .map(|param| {
                         let escape = callback_escape(param.escape);
                         Ok(ExternCallbackParam {
-                            ty: callback_param_type(type_expr(source, &param.ty, span)?, escape),
+                            ty: callback_param_type(
+                                type_expr(
+                                    source,
+                                    &param.ty,
+                                    span,
+                                    SourceTypePosition::CallbackParam,
+                                )?,
+                                escape,
+                            ),
                             escape,
                         })
                     })
                     .collect::<SourceResult<Vec<_>>>()?,
-                ret: Box::new(type_expr(source, &ret.ty, span)?),
+                ret: Box::new(type_expr(
+                    source,
+                    &ret.ty,
+                    span,
+                    SourceTypePosition::CallbackReturn,
+                )?),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::NonEscaping,
                     thread: CallbackThread::SameThread,
@@ -440,7 +547,7 @@ fn type_expr(source: SourceId, ty: &Type, span: Span) -> SourceResult<ExternType
             args: nominal
                 .type_args
                 .iter()
-                .map(|arg| type_expr(source, arg, span))
+                .map(|arg| type_expr(source, arg, span, SourceTypePosition::Nested))
                 .collect::<SourceResult<Vec<_>>>()?,
         }),
         _ => Err(unsupported_type(source, ty, span)),
@@ -454,7 +561,7 @@ fn type_args(
 ) -> SourceResult<Vec<ExternTypeExpr>> {
     args.iter()
         .map(|arg| match arg {
-            GenericArg::Type(ty) => type_expr(source, ty, span),
+            GenericArg::Type(ty) => type_expr(source, ty, span, SourceTypePosition::Nested),
             GenericArg::Const(_) => Err(unsupported_type(
                 source,
                 &Type::UnresolvedNominal {

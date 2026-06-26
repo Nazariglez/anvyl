@@ -971,8 +971,7 @@ anvyx_runtime::builtin_module! {{
             .into_string();
 
         assert!(source.contains("str_substring"));
-        assert!(source.contains("Some(value)"));
-        assert!(source.contains("None =>"));
+        assert!(source.contains(".map(|value|"));
     }
 
     #[test]

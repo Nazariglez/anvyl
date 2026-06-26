@@ -1,4 +1,6 @@
-use anvyx_externs::{CallbackEscape, ExternDescriptorError, ExternTypeKey};
+use anvyx_externs::{
+    AbiPosition, AbiTypeError, CallbackEscape, ExternDescriptorError, ExternTypeKey,
+};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::{
@@ -287,8 +289,11 @@ fn unsupported_source_label(kind: &UnsupportedSourceKind) -> &'static str {
     match kind {
         UnsupportedSourceKind::Type(_) => "unsupported source extern type here",
         UnsupportedSourceKind::InferReturn => "inferred return type used here",
+        UnsupportedSourceKind::ReturnPlace => "mutable place return used here",
+        UnsupportedSourceKind::CallbackReturn => "callback return used here",
         UnsupportedSourceKind::Operator(_) => "unsupported source extern operator here",
         UnsupportedSourceKind::Param { .. } => "unsupported source extern parameter here",
+        UnsupportedSourceKind::InitParam { .. } => "unsupported source extern init parameter here",
         UnsupportedSourceKind::CallbackParam { .. } => {
             "unsupported source extern callback parameter here"
         }
@@ -301,10 +306,20 @@ fn render_unsupported_source(kind: &UnsupportedSourceKind) -> String {
         UnsupportedSourceKind::InferReturn => {
             "inferred return type is not allowed in extern declarations".to_string()
         }
+        UnsupportedSourceKind::ReturnPlace => {
+            "extern functions cannot return mutable places".to_string()
+        }
+        UnsupportedSourceKind::CallbackReturn => {
+            "extern functions cannot return callbacks".to_string()
+        }
         UnsupportedSourceKind::Operator(op) => format!("unsupported source extern operator '{op}'"),
         UnsupportedSourceKind::Param { name, reason } => {
             render_unsupported_param(Some(name), *reason, false)
         }
+        UnsupportedSourceKind::InitParam { name, reason } => format!(
+            "extern init parameters are not supported: parameter '{name}' is {}",
+            render_unsupported_param_reason(*reason),
+        ),
         UnsupportedSourceKind::CallbackParam { reason } => {
             render_unsupported_param(None, *reason, true)
         }
@@ -316,11 +331,7 @@ fn render_unsupported_param(
     reason: UnsupportedSourceParamReason,
     callback: bool,
 ) -> String {
-    let prefix = match reason {
-        UnsupportedSourceParamReason::Mutable => "mutable",
-        UnsupportedSourceParamReason::CastAccept => "cast-accepting",
-        UnsupportedSourceParamReason::Default => "default",
-    };
+    let prefix = render_unsupported_param_reason(reason);
     let subject = if callback {
         "callback parameter"
     } else {
@@ -338,6 +349,15 @@ fn render_unsupported_param(
         None => format!(
             "unsupported source extern {subject}: {prefix} {plural} are not supported in source extern declarations"
         ),
+    }
+}
+
+fn render_unsupported_param_reason(reason: UnsupportedSourceParamReason) -> &'static str {
+    match reason {
+        UnsupportedSourceParamReason::Mutable => "mutable",
+        UnsupportedSourceParamReason::CastAccept => "cast-accepting",
+        UnsupportedSourceParamReason::Default => "default",
+        UnsupportedSourceParamReason::Unsupported => "unsupported",
     }
 }
 
@@ -1603,10 +1623,6 @@ fn render_extern_catalog_error(
                     "extern type '{}' contains inference in {item}",
                     render_surface_type(ty, type_ctx)
                 ),
-                InvalidExternTypeReason::Void => format!(
-                    "void type is not allowed in extern type position '{}' in {item}",
-                    render_surface_type(ty, type_ctx)
-                ),
                 InvalidExternTypeReason::UnresolvedConst => format!(
                     "extern type '{}' contains an unresolved const argument in {item}",
                     render_surface_type(ty, type_ctx)
@@ -1615,8 +1631,24 @@ fn render_extern_catalog_error(
                     "extern type '{}' requires the core Option type in {item}",
                     render_surface_type(ty, type_ctx)
                 ),
+                InvalidExternTypeReason::MissingCoreResult => format!(
+                    "extern type '{}' requires the core Result type in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
+                InvalidExternTypeReason::NonKeyableMapKey => format!(
+                    "extern map key type '{}' is not keyable in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
             }
         }
+        ExternCatalogError::InvalidAbiType {
+            position, reason, ..
+        } => format!(
+            "invalid native ABI type in {} for {}: {}",
+            render_abi_position(*position),
+            render_extern_item(context),
+            render_abi_type_error(*reason),
+        ),
         ExternCatalogError::UnknownInitField { field, .. } => format!(
             "{} references unknown field '{field}'",
             render_extern_item(context)
@@ -1625,10 +1657,7 @@ fn render_extern_catalog_error(
             "{} cannot initialize computed field '{field}'",
             render_extern_item(context)
         ),
-        ExternCatalogError::UnsupportedInitParams { count, .. } => format!(
-            "{} does not support parameters: found {count} parameter(s)",
-            render_extern_item(context)
-        ),
+
         ExternCatalogError::InvalidOperatorReturn {
             found, expected, ..
         } => format!(
@@ -1648,6 +1677,34 @@ fn render_callback_escape(escape: CallbackEscape) -> &'static str {
     match escape {
         CallbackEscape::NonEscaping => "non-escaping",
         CallbackEscape::Escaping => "escaping",
+    }
+}
+
+fn render_abi_position(position: AbiPosition) -> &'static str {
+    match position {
+        AbiPosition::Return => "return position",
+        AbiPosition::ParamValue => "value parameter position",
+        AbiPosition::ParamBorrow => "borrowed parameter position",
+        AbiPosition::ParamMutBorrow => "mutable parameter position",
+        AbiPosition::CallbackParam => "callback parameter position",
+        AbiPosition::CallbackReturn => "callback return position",
+        AbiPosition::Field => "field position",
+        AbiPosition::Nested => "nested type position",
+    }
+}
+
+fn render_abi_type_error(error: AbiTypeError) -> &'static str {
+    match error {
+        AbiTypeError::VoidOutsideReturn => "void is only valid as a callable return",
+        AbiTypeError::SliceOutsideParam => "slice views are parameter-only",
+        AbiTypeError::SliceNested => "slice views cannot be nested",
+        AbiTypeError::CallbackOutsideParam => "callbacks are parameter-only",
+        AbiTypeError::CallbackNested => "callbacks cannot be nested",
+        AbiTypeError::CallbackReturnUnsupported => "callbacks cannot be returned from callbacks",
+        AbiTypeError::CallbackThreadUnsupported => "callbacks must use the same runtime thread",
+        AbiTypeError::GenericNamedArgsUnsupported => {
+            "named provider ABI types must be closed and non-generic"
+        }
     }
 }
 
@@ -2113,9 +2170,18 @@ fn render_extern_descriptor_error(
             "extern init parameters are not supported on type '{}': found {count} parameter(s)",
             render_extern_type_key(ty, raw_scope)
         ),
+        ExternDescriptorError::MixedVariantFields { ty, variant } => format!(
+            "extern enum variant '{}.{variant}' cannot mix named and unnamed fields",
+            render_extern_type_key(ty, raw_scope)
+        ),
         ExternDescriptorError::VoidType { context } => {
             format!("void type is not allowed in {context}")
         }
+        ExternDescriptorError::InvalidAbiType { position, reason } => format!(
+            "invalid native ABI type in {}: {}",
+            render_abi_position(*position),
+            render_abi_type_error(*reason),
+        ),
         ExternDescriptorError::CallbackEscapeMismatch {
             param,
             param_escape,

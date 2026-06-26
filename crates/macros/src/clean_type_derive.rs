@@ -8,6 +8,7 @@ use crate::clean_type_map::{classify_field_type, type_expr_tokens};
 pub enum TypeDeriveKind {
     Inline,
     Ref,
+    Enum,
 }
 
 impl TypeDeriveKind {
@@ -15,6 +16,7 @@ impl TypeDeriveKind {
         match self {
             Self::Inline => "AnvyxInline",
             Self::Ref => "AnvyxRef",
+            Self::Enum => "AnvyxEnum",
         }
     }
 
@@ -22,12 +24,13 @@ impl TypeDeriveKind {
         match self {
             Self::Inline => quote! { anvyx_runtime::AnvyxInlineExport },
             Self::Ref => quote! { anvyx_runtime::AnvyxRefExport },
+            Self::Enum => quote! { anvyx_runtime::AnvyxEnumExport },
         }
     }
 
     fn rep(self) -> TokenStream {
         match self {
-            Self::Inline => quote! { anvyx_runtime::ExternRep::Inline },
+            Self::Inline | Self::Enum => quote! { anvyx_runtime::ExternRep::Inline },
             Self::Ref => quote! { anvyx_runtime::ExternRep::Shared },
         }
     }
@@ -45,20 +48,45 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     if !item.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
             item.generics,
-            format!("{} does not support generic structs yet", kind.macro_name()),
+            format!("{} does not support generic types yet", kind.macro_name()),
         ));
     }
-    let Data::Struct(strukt) = &item.data else {
-        return Err(syn::Error::new_spanned(
-            item.ident,
-            format!("{} can only be derived for structs", kind.macro_name()),
-        ));
-    };
-    let Fields::Named(fields) = &strukt.fields else {
-        return Err(syn::Error::new_spanned(
-            strukt.fields.clone(),
-            format!("{} requires a named-field struct", kind.macro_name()),
-        ));
+    let (fields, variants) = match (&item.data, kind) {
+        (Data::Struct(strukt), TypeDeriveKind::Inline | TypeDeriveKind::Ref) => {
+            let Fields::Named(fields) = &strukt.fields else {
+                return Err(syn::Error::new_spanned(
+                    strukt.fields.clone(),
+                    format!("{} requires a named-field struct", kind.macro_name()),
+                ));
+            };
+            (
+                fields
+                    .named
+                    .iter()
+                    .filter_map(field_descriptor)
+                    .collect::<syn::Result<Vec<_>>>()?,
+                vec![],
+            )
+        }
+        (Data::Enum(enm), TypeDeriveKind::Enum) => (
+            vec![],
+            enm.variants
+                .iter()
+                .map(variant_descriptor)
+                .collect::<syn::Result<Vec<_>>>()?,
+        ),
+        (_, TypeDeriveKind::Enum) => {
+            return Err(syn::Error::new_spanned(
+                item.ident,
+                "AnvyxEnum can only be derived for enums",
+            ));
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                item.ident,
+                format!("{} can only be derived for structs", kind.macro_name()),
+            ));
+        }
     };
 
     let ident = &item.ident;
@@ -67,11 +95,6 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     let native_mod = crate::naming::native_export_module_ident(ident);
     let doc = crate::codegen::extract_doc(&item.attrs)
         .map_or_else(|| quote! { None }, |doc| quote! { Some(#doc.to_string()) });
-    let fields = fields
-        .named
-        .iter()
-        .filter_map(field_descriptor)
-        .collect::<syn::Result<Vec<_>>>()?;
     let marker_trait = kind.marker_trait();
     let rep = kind.rep();
 
@@ -89,6 +112,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                     doc: #doc,
                     rep: #rep,
                     fields: vec![#(#fields),*],
+                    variants: vec![#(#variants),*],
                     init: None,
                     methods: vec![],
                     statics: vec![],
@@ -100,6 +124,48 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
 
         #[doc(hidden)]
         pub mod #native_mod {}
+    })
+}
+
+fn variant_descriptor(variant: &syn::Variant) -> syn::Result<TokenStream> {
+    let name = variant.ident.to_string();
+    let fields = match &variant.fields {
+        Fields::Unit => vec![],
+        Fields::Unnamed(fields) => fields
+            .unnamed
+            .iter()
+            .map(|field| variant_field_descriptor(None, field))
+            .collect::<syn::Result<Vec<_>>>()?,
+        Fields::Named(fields) => fields
+            .named
+            .iter()
+            .map(|field| {
+                variant_field_descriptor(field.ident.as_ref().map(ToString::to_string), field)
+            })
+            .collect::<syn::Result<Vec<_>>>()?,
+    };
+    let doc = crate::codegen::extract_doc(&variant.attrs)
+        .map_or_else(|| quote! { None }, |doc| quote! { Some(#doc.to_string()) });
+    Ok(quote! {
+        anvyx_runtime::ExternEnumVariantDescriptor {
+            name: #name.to_string(),
+            fields: vec![#(#fields),*],
+            doc: #doc,
+        }
+    })
+}
+
+fn variant_field_descriptor(name: Option<String>, field: &syn::Field) -> syn::Result<TokenStream> {
+    let ty = field_type_tokens(&field.ty)?;
+    let name = name.map_or_else(
+        || quote! { None },
+        |name| quote! { Some(#name.to_string()) },
+    );
+    Ok(quote! {
+        anvyx_runtime::ExternEnumVariantFieldDescriptor {
+            name: #name,
+            ty: #ty,
+        }
     })
 }
 

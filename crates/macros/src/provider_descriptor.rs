@@ -154,6 +154,7 @@ fn function_tokens(function: &Function) -> TokenStream {
 fn type_tokens(ty: &CleanType) -> TokenStream {
     match ty {
         CleanType::Void => quote! { anvyx_externs::ExternTypeExpr::Void },
+        CleanType::Unit => quote! { anvyx_externs::ExternTypeExpr::Unit },
         CleanType::Bool => quote! { anvyx_externs::ExternTypeExpr::Bool },
         CleanType::Int => quote! { anvyx_externs::ExternTypeExpr::Int },
         CleanType::Float => quote! { anvyx_externs::ExternTypeExpr::Float },
@@ -168,13 +169,35 @@ fn type_tokens(ty: &CleanType) -> TokenStream {
             }
         }
         CleanType::Callback(callback) => callback_tokens(callback),
-        CleanType::List(item) => {
-            let item = type_tokens(item);
-            quote! { anvyx_externs::ExternTypeExpr::List(Box::new(#item)) }
-        }
         CleanType::Option(item) => {
             let item = type_tokens(item);
             quote! { anvyx_externs::ExternTypeExpr::Option(Box::new(#item)) }
+        }
+        CleanType::Result(ok, err) => {
+            let ok = type_tokens(ok);
+            let err = type_tokens(err);
+            quote! { anvyx_externs::ExternTypeExpr::Result(Box::new(#ok), Box::new(#err)) }
+        }
+        CleanType::Tuple(fields) => {
+            let fields = fields.iter().map(type_tokens);
+            quote! { anvyx_externs::ExternTypeExpr::Tuple(vec![#(#fields),*]) }
+        }
+        CleanType::Array { elem, len } => {
+            let elem = type_tokens(elem);
+            quote! { anvyx_externs::ExternTypeExpr::Array { elem: Box::new(#elem), len: #len } }
+        }
+        CleanType::VecList(item) | CleanType::List(item) => {
+            let item = type_tokens(item);
+            quote! { anvyx_externs::ExternTypeExpr::List(Box::new(#item)) }
+        }
+        CleanType::Map(key, value) => {
+            let key = type_tokens(key);
+            let value = type_tokens(value);
+            quote! { anvyx_externs::ExternTypeExpr::Map(Box::new(#key), Box::new(#value)) }
+        }
+        CleanType::Slice(item) => {
+            let item = type_tokens(item);
+            quote! { anvyx_externs::ExternTypeExpr::Slice(Box::new(#item)) }
         }
     }
 }

@@ -1,5 +1,5 @@
 // exports body type used in Function
-use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeKey, ProviderId};
+use anvyx_externs::{ExternBindingKey, ExternEffects, ExternTypeExpr, ExternTypeKey, ProviderId};
 
 pub use super::body::AirBody;
 use super::{
@@ -313,6 +313,7 @@ impl EnumDecl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreEnumKind {
     Option,
+    Result,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,8 +337,24 @@ pub struct ExternDecl {
     pub member: ExternMember,
     pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
+    pub abi: ExternAbi,
     pub binding: Option<ExternBindingDecl>,
     pub effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternAbi {
+    pub params: Vec<ExternTypeExpr>,
+    pub ret: ExternTypeExpr,
+}
+
+impl Default for ExternAbi {
+    fn default() -> Self {
+        Self {
+            params: vec![],
+            ret: ExternTypeExpr::Void,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,9 +483,16 @@ pub struct ExternTypeDecl {
     pub has_init: bool,
     pub init_fields: Vec<FieldId>,
     pub fields: Vec<ExternFieldDecl>,
+    pub variants: Vec<VariantDecl>,
+    pub variant_abis: Vec<ExternVariantAbiDecl>,
     pub methods: Vec<ExternMethodDecl>,
     pub statics: Vec<ExternStaticDecl>,
     pub operators: Vec<ExternOpDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternVariantAbiDecl {
+    pub fields: Vec<ExternTypeExpr>,
 }
 
 impl ExternTypeDecl {
@@ -491,6 +515,7 @@ pub enum ExternRep {
 pub struct ExternFieldDecl {
     pub name: Ident,
     pub ty: TypeId,
+    pub abi: ExternTypeExpr,
     pub get_receiver: ExternReceiverDecl,
     pub set_receiver: ExternReceiverDecl,
     pub computed: bool,
@@ -504,6 +529,7 @@ pub struct ExternMethodDecl {
     pub receiver: ExternReceiverDecl,
     pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
+    pub abi: ExternAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,6 +537,7 @@ pub struct ExternStaticDecl {
     pub name: Ident,
     pub params: Vec<ExternParamDecl>,
     pub return_type: TypeId,
+    pub abi: ExternAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +546,7 @@ pub struct ExternOpDecl {
     pub receiver: ExternReceiverDecl,
     pub operand: Option<ExternParamDecl>,
     pub return_type: TypeId,
+    pub abi: ExternAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

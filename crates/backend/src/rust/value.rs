@@ -769,21 +769,6 @@ impl<'a> RustValues<'a> {
         }
     }
 
-    pub(super) fn native_return_call(
-        &self,
-        ret: RirTypeId,
-        abi: &anvyx_runtime::RustReturnAbi,
-        call: String,
-    ) -> String {
-        match abi {
-            anvyx_runtime::RustReturnAbi::Value(ty) => Self::native_value_return(ty, &call),
-            anvyx_runtime::RustReturnAbi::Option(inner) => {
-                self.option_return_call(ret, inner, &call)
-            }
-            _ => call,
-        }
-    }
-
     pub(super) fn stringify_arg(&self, mode: RirParamSemantic, value: &RirOperand) -> String {
         match mode {
             RirParamSemantic::Value => self.operand(value),
@@ -838,35 +823,6 @@ impl<'a> RustValues<'a> {
             RirConstValue::Bool(value) => value.to_string(),
             RirConstValue::String(value) => target::anv_string_from(&rust_string(value)),
             RirConstValue::Nil => "None".into(),
-        }
-    }
-
-    fn option_return_call(
-        &self,
-        ret: RirTypeId,
-        inner: &anvyx_runtime::RustReturnAbi,
-        call: &str,
-    ) -> String {
-        let RirType::Option(_) = self.program.types[ret.index()] else {
-            unreachable!("verified native option return type")
-        };
-        let value = match inner {
-            anvyx_runtime::RustReturnAbi::Value(ty) => Self::native_value_return(ty, "value"),
-            _ => unreachable!("verified native option return inner"),
-        };
-        match_expr(
-            call,
-            [
-                format!("Some(value) => Some({value})"),
-                "None => None".to_string(),
-            ],
-        )
-    }
-
-    fn native_value_return(ty: &anvyx_runtime::ExternTypeExpr, expr: &str) -> String {
-        match ty {
-            anvyx_runtime::ExternTypeExpr::String => target::anv_string_from(expr),
-            _ => expr.to_string(),
         }
     }
 
@@ -1051,6 +1007,7 @@ mod tests {
         program.datarefs.push(crate::rust::rir::RirDataRef {
             id: crate::rust::rir::RirDataRefId::from_index(0),
             air_id: anvyx_frontend::air::AggregateId::from_index(0),
+            native_key: None,
             symbol: RirSymbol::new("Node"),
             display: RirSymbol::new("Node"),
             cycle_capable: true,
@@ -1066,6 +1023,7 @@ mod tests {
             symbol: RirSymbol::new("Label"),
             display: RirSymbol::new("Label"),
             native_path: None,
+            native_ref: false,
             native_key: None,
             copyable: false,
             fields: vec![field(0, "text", string)],

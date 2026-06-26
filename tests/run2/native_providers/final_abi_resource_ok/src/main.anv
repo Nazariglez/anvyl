@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match-begin
+// 42
+// 43
+// 43
+// @match-end
+
+import pkg:host.host { Counter, make_counter, counter_value };
+
+fn main() {
+    var counter = make_counter(42);
+    println(counter.value());
+    counter.bump(1);
+    println(counter.value());
+    println(counter_value(counter));
+}

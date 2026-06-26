@@ -3,4 +3,4 @@
 // @frontend: new
 // @contains: extern functions cannot return mutable places
 
-extern fn borrowed(x: int) -> var int;
+extern fn next() -> var int;

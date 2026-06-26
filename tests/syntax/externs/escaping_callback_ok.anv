@@ -3,4 +3,3 @@
 // @frontend: new
 
 extern fn on_click(callback: escaping fn()) -> void;
-extern fn higher(callback: fn(escaping fn()) -> void) -> void;

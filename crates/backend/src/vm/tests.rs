@@ -320,6 +320,10 @@ fn compiler_records_extern_metadata_from_call_params() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void,
+        abi: air::ExternAbi {
+            params: vec![anvyx_runtime::ExternTypeExpr::Int],
+            ret: anvyx_runtime::ExternTypeExpr::Void,
+        },
         binding: None,
         effects: anvyx_runtime::ExternEffects::default(),
     });
@@ -372,6 +376,8 @@ fn compiler_records_member_extern_receiver_metadata() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![],
         operators: vec![],
@@ -394,6 +400,17 @@ fn compiler_records_member_extern_receiver_metadata() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void,
+        abi: air::ExternAbi {
+            params: vec![
+                anvyx_runtime::ExternTypeExpr::Named {
+                    module: None,
+                    name: "Thing".to_string(),
+                    args: vec![],
+                },
+                anvyx_runtime::ExternTypeExpr::Int,
+            ],
+            ret: anvyx_runtime::ExternTypeExpr::Void,
+        },
         binding: None,
         effects: anvyx_runtime::ExternEffects::default(),
     });
@@ -1819,6 +1836,7 @@ impl StorageFamilyCase {
                     fields: vec![ExternFieldDecl {
                         name: Ident::new("f"),
                         ty: function,
+                        abi: anvyx_runtime::ExternTypeExpr::Int,
                         get_receiver: ExternReceiverDecl {
                             ty: TypeId::from_index(0),
                             mode: ParamMode::SharedBorrow,
@@ -1831,6 +1849,8 @@ impl StorageFamilyCase {
                         readable: true,
                         writable: true,
                     }],
+                    variants: vec![],
+                    variant_abis: vec![],
                     methods: vec![],
                     statics: vec![],
                     operators: vec![],
@@ -1973,12 +1993,26 @@ impl NativeExternBoundaryCase {
             ),
             Self::Return => ("returns_lambda", vec![], function_ty),
         };
+        let callback =
+            anvyx_runtime::ExternTypeExpr::Callback(anvyx_runtime::ExternCallbackSignature {
+                params: vec![],
+                ret: Box::new(anvyx_runtime::ExternTypeExpr::Void),
+                policy: anvyx_runtime::CallbackPolicy {
+                    escape: anvyx_runtime::CallbackEscape::NonEscaping,
+                    thread: anvyx_runtime::CallbackThread::SameThread,
+                },
+            });
+        let abi = air::ExternAbi {
+            params: params.iter().map(|_| callback.clone()).collect(),
+            ret: anvyx_runtime::ExternTypeExpr::Void,
+        };
         let ext = program.alloc_extern(ExternDecl {
             name: Ident::new(name),
             module,
             member: ExternMember::FreeFunction,
             params,
             return_type,
+            abi,
             binding: None,
             effects: anvyx_runtime::ExternEffects::default(),
         });

@@ -1,4 +1,4 @@
-error: expected `name`, `ret`, `params`, or `ctx`
+error: expected `name`, `ret`, `params`, `ctx`, or `trap`
  --> tests/ui/function/unknown_key.rs:3:12
   |
 3 | #[function(foo = "bar")]

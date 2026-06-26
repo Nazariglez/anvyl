@@ -159,6 +159,7 @@ fn extern_type(name: &str) -> ExternTypeDescriptor {
         doc: None,
         rep: ExternRep::Shared,
         fields: vec![],
+        variants: vec![],
         init: None,
         methods: vec![],
         statics: vec![],
@@ -1101,9 +1102,12 @@ mod methods {
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
                 types: vec![ExternTypeDescriptor {
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec![],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     statics: vec![static_method(
                         "new",
@@ -1820,9 +1824,12 @@ mod provider_imports {
                         field("x", ExternTypeExpr::Float),
                         field("y", ExternTypeExpr::Float),
                     ],
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec![],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     methods: vec![method(
                         "move_by",

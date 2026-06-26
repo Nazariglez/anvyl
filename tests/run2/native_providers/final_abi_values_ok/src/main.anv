@@ -1,0 +1,50 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @lint: unused=allow
+// @match-begin
+// 46
+// 9
+// hi
+// 3
+// 1
+// 1
+// 5
+// 7
+// bad
+// enum
+// 21
+// @match-end
+
+import pkg:host.host {
+    HostError,
+    maybe_add,
+    swap_pair,
+    counted_pair,
+    first_array,
+    visible_result,
+    visible_enum_result,
+    describe_result,
+    describe_enum_result,
+    unit_result,
+    describe_unit_result,
+};
+
+fn main() {
+    println(maybe_add(41, 5) ?? 0);
+    println(maybe_add(nil, 5) ?? 9);
+
+    let pair = swap_pair((3, "hi"));
+    println(pair.0);
+    println(pair.1);
+
+    let counted = counted_pair();
+    println(counted.0);
+    println(counted.1);
+
+    println(first_array([5, 6, 7]));
+    println(describe_result(visible_result(true)));
+    println(describe_result(visible_result(false)));
+    println(describe_enum_result(visible_enum_result(false)));
+    println(describe_unit_result(unit_result()));
+}

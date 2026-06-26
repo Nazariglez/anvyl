@@ -171,6 +171,7 @@ mod tests {
             doc: None,
             rep: ExternRep::Shared,
             fields: vec![],
+            variants: vec![],
             init: None,
             methods: vec![],
             statics: vec![],
@@ -223,6 +224,7 @@ mod tests {
                         doc: Some("vector".to_string()),
                         rep: ExternRep::Inline,
                         fields: vec![],
+                        variants: vec![],
                         init: None,
                         methods: vec![],
                         statics: vec![],
@@ -843,12 +845,10 @@ mod tests {
 
         #[test]
         fn rejects_unsupported_source_extern_types() {
-            let tuple = parse("extern fn f(x: (int, int)) -> void;");
-            let array = parse("extern fn f(x: [int; 2]) -> void;");
-            let slice = parse("extern fn f(x: [int; _]) -> void;");
+            let array_infer = parse("extern fn f(x: [int; _]) -> void;");
             let const_generic = parse("extern fn f(x: Vec<4>) -> void;");
 
-            for program in [tuple, array, slice, const_generic] {
+            for program in [array_infer, const_generic] {
                 assert!(matches!(
                     collect_source_externs(&program, &empty_resolved()).unwrap_err()[0],
                     ExternInputError::UnsupportedSource {
@@ -1087,6 +1087,8 @@ mod tests {
             first.init = Some(ExternInitDescriptor {
                 params: vec![],
                 field_init: vec![],
+                ret: ExternTypeExpr::Void,
+                effects: ExternEffects::default(),
             });
             let mut duplicate = extern_type("T");
             duplicate.init = first.init.clone();
@@ -1109,6 +1111,8 @@ mod tests {
             ty.init = Some(ExternInitDescriptor {
                 params: vec![],
                 field_init: vec!["x".to_string(), "x".to_string()],
+                ret: ExternTypeExpr::Void,
+                effects: ExternEffects::default(),
             });
             let raw = raw_provider_types(vec![ty]);
 
@@ -1128,23 +1132,17 @@ mod tests {
         use super::*;
 
         #[test]
-        fn rejects_provider_init_params() {
+        fn accepts_provider_init_params() {
             let mut ty = extern_type("T");
             ty.init = Some(ExternInitDescriptor {
                 params: vec![param("x", ExternTypeExpr::Int)],
                 field_init: vec![],
+                ret: ExternTypeExpr::Void,
+                effects: ExternEffects::default(),
             });
             let raw = raw_provider_types(vec![ty]);
 
-            let errors = validate_raw_shapes(&raw).unwrap_err();
-
-            assert!(matches!(
-                errors[0],
-                ExternInputError::InvalidRawDescriptor {
-                    error: ExternDescriptorError::UnsupportedInitParams { count: 1, .. },
-                    ..
-                }
-            ));
+            validate_raw_shapes(&raw).unwrap();
         }
 
         #[test]
@@ -1203,7 +1201,7 @@ mod tests {
                 params: vec![cb_param(ExternTypeExpr::Int, CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Float),
                 policy: CallbackPolicy {
-                    escape: CallbackEscape::Escaping,
+                    escape: CallbackEscape::NonEscaping,
                     thread: CallbackThread::SameThread,
                 },
             });
@@ -1226,9 +1224,12 @@ mod tests {
                             set_receiver: ReceiverMode::Mutable,
                             doc: Some("x pos".to_string()),
                         }],
+                        variants: vec![],
                         init: Some(ExternInitDescriptor {
                             params: vec![],
                             field_init: vec!["x".to_string()],
+                            ret: ExternTypeExpr::Void,
+                            effects: ExternEffects::default(),
                         }),
                         methods: vec![ExternMethodDescriptor {
                             name: "move".to_string(),
@@ -1249,8 +1250,11 @@ mod tests {
                             name: "load".to_string(),
                             doc: Some("load sprite".to_string()),
                             signature: signature(
-                                vec![param("path", ExternTypeExpr::String)],
-                                callback,
+                                vec![
+                                    param("path", ExternTypeExpr::String),
+                                    param("callback", callback),
+                                ],
+                                ExternTypeExpr::Void,
                             ),
                             effects: ExternEffects { fallible: true },
                         }],
@@ -1292,7 +1296,7 @@ mod tests {
                 }
             );
             assert!(matches!(
-                ty.statics[0].decl.signature.ret,
+                ty.statics[0].decl.signature.params[1].ty,
                 ExternTypeExpr::Callback(_)
             ));
         }

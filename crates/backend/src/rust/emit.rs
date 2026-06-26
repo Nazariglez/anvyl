@@ -5,16 +5,17 @@ use super::{
     rep_policy::{LambdaTraceAction, RustRepPolicy, RustTracePlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
-        RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirDataRefId,
-        RirEnum, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign, RirFormatKind,
-        RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture, RirLambdaCaptureArg,
-        RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
-        RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop,
-        RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
-        RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi, RirParamSemantic, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRawEnumValue, RirScopedPlaceCellRef,
-        RirStmt, RirStructuredBlock, RirTerm, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram, stmt_child_blocks_any,
+        RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirCoreEnumKind,
+        RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign,
+        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
+        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
+        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi,
+        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
+        RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirTupleId,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        stmt_child_blocks_any,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -907,11 +908,18 @@ impl EmitCx<'_> {
 
     fn emit_struct(&mut self, strukt: &super::rir::RirStruct) {
         if let Some(path) = &strukt.native_path {
-            self.w.line(format_args!(
-                "type {} = {};",
-                strukt.symbol.as_str(),
-                path.join("::")
-            ));
+            if strukt.native_ref {
+                self.w.line(target::anv_ref_alias(
+                    strukt.symbol.as_str(),
+                    &path.join("::"),
+                ));
+            } else {
+                self.w.line(format_args!(
+                    "type {} = {};",
+                    strukt.symbol.as_str(),
+                    path.join("::")
+                ));
+            }
             self.w.blank();
             return;
         }
@@ -3499,7 +3507,7 @@ impl EmitCx<'_> {
         rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
-        self.prepared_native_call_expr(function, args, &[], rendered, render)
+        self.prepared_native_call_expr(function, args, &[], &[], rendered, render)
     }
 
     fn prepared_native_call_expr(
@@ -3507,19 +3515,30 @@ impl EmitCx<'_> {
         function: &RirFunction,
         args: &[RirCallArg],
         abis: &[anvyx_runtime::RustParamAbi],
+        tys: &[RirTypeId],
         mut rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
         let mut prelude = vec![];
+        let mut resource_borrows = vec![];
         for (index, arg) in args.iter().enumerate() {
             let (mut stmts, mut expr) = self.prepared_call_arg(function, index, arg);
             prelude.append(&mut stmts);
-            if let Some(abi) = abis.get(index) {
-                expr = Self::native_arg_expr(abi, expr);
+            if let (Some(abi), Some(ty)) = (abis.get(index), tys.get(index)) {
+                if let Some(mutable) = self.native_ref_borrow_arg(abi, *ty) {
+                    let arg = format!("__anv_ref_arg_{index}");
+                    resource_borrows.push((expr, arg.clone(), mutable));
+                    expr = arg;
+                } else {
+                    expr = self.native_arg_expr(abi, *ty, expr);
+                }
             }
             rendered.push(expr);
         }
-        let call = render(comma(rendered));
+        let mut call = render(comma(rendered));
+        for (resource, arg, mutable) in resource_borrows.into_iter().rev() {
+            call = target::native_ref_borrow(&resource, &arg, mutable, &call);
+        }
         if prelude.is_empty() {
             call
         } else {
@@ -3527,17 +3546,293 @@ impl EmitCx<'_> {
         }
     }
 
-    fn native_arg_expr(abi: &anvyx_runtime::RustParamAbi, expr: String) -> String {
-        let anvyx_runtime::RustParamAbi::List(inner) = abi else {
-            return expr;
+    fn native_ref_borrow_arg(
+        &self,
+        abi: &anvyx_runtime::RustParamAbi,
+        ty: RirTypeId,
+    ) -> Option<bool> {
+        let native_ref = matches!(
+            self.program.types[ty.index()],
+            RirType::Struct(id) if self.program.structs[id.index()].native_ref
+        );
+        match (native_ref, abi) {
+            (true, anvyx_runtime::RustParamAbi::Borrow(_)) => Some(false),
+            (true, anvyx_runtime::RustParamAbi::MutBorrow(_)) => Some(true),
+            _ => None,
+        }
+    }
+
+    fn native_arg_expr(
+        &self,
+        abi: &anvyx_runtime::RustParamAbi,
+        ty: RirTypeId,
+        expr: String,
+    ) -> String {
+        match abi {
+            anvyx_runtime::RustParamAbi::Value(native_ty) => {
+                self.native_value_arg_expr(native_ty, ty, expr)
+            }
+            anvyx_runtime::RustParamAbi::Option(inner) => {
+                let RirType::Option(inner_ty) = self.program.types[ty.index()] else {
+                    unreachable!("verified native option param type")
+                };
+                target::rust_option_map(
+                    &expr,
+                    &self.native_arg_expr(inner, inner_ty, "value".to_string()),
+                )
+            }
+            anvyx_runtime::RustParamAbi::Result(ok, err) => {
+                self.native_result_arg_expr(ty, ok, err, expr)
+            }
+            anvyx_runtime::RustParamAbi::List(inner) => self.native_list_arg_expr(inner, expr),
+            anvyx_runtime::RustParamAbi::Slice(_) => expr,
+            anvyx_runtime::RustParamAbi::Borrow(_)
+            | anvyx_runtime::RustParamAbi::MutBorrow(_)
+            | anvyx_runtime::RustParamAbi::MutPlace(_)
+            | anvyx_runtime::RustParamAbi::ScopedLambda(_)
+            | anvyx_runtime::RustParamAbi::EscapingLambda(_) => expr,
+        }
+    }
+
+    fn native_value_arg_expr(
+        &self,
+        abi: &anvyx_runtime::ExternTypeExpr,
+        ty: RirTypeId,
+        expr: String,
+    ) -> String {
+        match abi {
+            anvyx_runtime::ExternTypeExpr::Unit => target::rust_unit(),
+            anvyx_runtime::ExternTypeExpr::String => target::rust_string_from_anv(&expr),
+            anvyx_runtime::ExternTypeExpr::Option(inner) => {
+                let RirType::Option(inner_ty) = self.program.types[ty.index()] else {
+                    unreachable!("verified native option param type")
+                };
+                target::rust_option_map(
+                    &expr,
+                    &self.native_value_arg_expr(inner, inner_ty, "value".to_string()),
+                )
+            }
+            anvyx_runtime::ExternTypeExpr::Result(ok, err) => {
+                self.native_result_value_arg_expr(ty, ok, err, expr)
+            }
+            anvyx_runtime::ExternTypeExpr::Tuple(fields) => {
+                self.native_tuple_arg_expr(ty, fields, expr)
+            }
+            anvyx_runtime::ExternTypeExpr::Array { elem, .. } => {
+                let RirType::Array { elem: elem_ty, .. } = self.program.types[ty.index()] else {
+                    unreachable!("verified native array param type")
+                };
+                target::rust_option_map(
+                    &expr,
+                    &self.native_value_arg_expr(elem, elem_ty, "value".to_string()),
+                )
+            }
+            anvyx_runtime::ExternTypeExpr::Named { .. } => self.native_named_arg_expr(ty, expr),
+            _ => expr,
+        }
+    }
+
+    fn native_named_arg_expr(&self, ty: RirTypeId, expr: String) -> String {
+        match self.program.types[ty.index()] {
+            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
+                self.native_enum_arg_expr(enum_id, expr)
+            }
+            _ => expr,
+        }
+    }
+
+    fn native_enum_arg_expr(&self, enum_id: RirEnumId, expr: String) -> String {
+        let enm = &self.program.enums[enum_id.index()];
+        let native = enm
+            .native_path
+            .as_ref()
+            .expect("verified native enum type")
+            .join("::");
+        let arms = enm.variants.iter().map(|variant| {
+            let generated_path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
+            let native_path = variant_path(&native, variant.symbol.as_str());
+            match variant.kind {
+                RirVariantKind::Unit => format!("{generated_path} => {native_path}"),
+                RirVariantKind::Tuple => {
+                    let bindings = (0..variant.fields.len())
+                        .map(|index| format!("value{index}"))
+                        .collect::<Vec<_>>();
+                    let fields = variant
+                        .fields
+                        .iter()
+                        .zip(&bindings)
+                        .map(|(field, binding)| self.native_rir_arg_expr(field.ty, binding.clone()))
+                        .collect::<Vec<_>>();
+                    format!(
+                        "{} => {}",
+                        tuple_variant(&generated_path, bindings.iter().cloned()),
+                        tuple_variant(&native_path, fields)
+                    )
+                }
+                RirVariantKind::Struct => {
+                    let bindings = variant
+                        .fields
+                        .iter()
+                        .map(|field| field.symbol.as_str().to_string())
+                        .collect::<Vec<_>>();
+                    let fields = variant
+                        .fields
+                        .iter()
+                        .zip(&bindings)
+                        .map(|(field, binding)| {
+                            field_init(
+                                field.symbol.as_str(),
+                                self.native_rir_arg_expr(field.ty, binding.clone()),
+                            )
+                        });
+                    format!(
+                        "{} => {}",
+                        struct_variant(&generated_path, bindings.iter().cloned()),
+                        struct_variant(&native_path, fields)
+                    )
+                }
+            }
+        });
+        match_expr(&expr, arms)
+    }
+
+    fn native_rir_arg_expr(&self, ty: RirTypeId, expr: String) -> String {
+        match self.program.types[ty.index()] {
+            RirType::String => target::rust_string_from_anv(&expr),
+            RirType::Option(inner) => target::rust_option_map(
+                &expr,
+                &self.native_rir_arg_expr(inner, "value".to_string()),
+            ),
+            RirType::Array { elem, .. } => {
+                target::rust_option_map(&expr, &self.native_rir_arg_expr(elem, "value".to_string()))
+            }
+            RirType::Tuple(tuple_id) => self.native_rir_tuple_arg_expr(tuple_id, expr),
+            RirType::Enum(enum_id)
+                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
+            {
+                self.native_rir_result_arg_expr(enum_id, expr)
+            }
+            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
+                self.native_enum_arg_expr(enum_id, expr)
+            }
+            _ => expr,
+        }
+    }
+
+    fn native_rir_tuple_arg_expr(&self, tuple_id: RirTupleId, expr: String) -> String {
+        let tuple = &self.program.tuples[tuple_id.index()];
+        target::rust_tuple(tuple.fields.iter().map(|field| {
+            self.native_rir_arg_expr(field.ty, format!("{expr}.{}", field.symbol.as_str()))
+        }))
+    }
+
+    fn native_rir_result_arg_expr(&self, enum_id: RirEnumId, expr: String) -> String {
+        let enm = &self.program.enums[enum_id.index()];
+        let [ok, err] = enm.variants.as_slice() else {
+            unreachable!("verified result enum variants")
         };
-        let anvyx_runtime::RustParamAbi::Value(ty) = inner.as_ref() else {
+        target::rust_result_match(
+            &expr,
+            &format!(
+                "{}(value) => {}",
+                variant_path(enm.symbol.as_str(), ok.symbol.as_str()),
+                target::rust_ok(&self.native_rir_arg_expr(ok.fields[0].ty, "value".to_string()))
+            ),
+            &format!(
+                "{}(value) => {}",
+                variant_path(enm.symbol.as_str(), err.symbol.as_str()),
+                target::rust_err(&self.native_rir_arg_expr(err.fields[0].ty, "value".to_string()))
+            ),
+        )
+    }
+
+    fn native_tuple_arg_expr(
+        &self,
+        ty: RirTypeId,
+        fields: &[anvyx_runtime::ExternTypeExpr],
+        expr: String,
+    ) -> String {
+        let RirType::Tuple(tuple_id) = self.program.types[ty.index()] else {
+            unreachable!("verified native tuple param type")
+        };
+        let tuple = &self.program.tuples[tuple_id.index()];
+        let fields = tuple.fields.iter().zip(fields).map(|(field, abi)| {
+            self.native_value_arg_expr(abi, field.ty, format!("{expr}.{}", field.symbol.as_str()))
+        });
+        target::rust_tuple(fields)
+    }
+
+    fn native_result_value_arg_expr(
+        &self,
+        ty: RirTypeId,
+        ok: &anvyx_runtime::ExternTypeExpr,
+        err: &anvyx_runtime::ExternTypeExpr,
+        expr: String,
+    ) -> String {
+        let (enm, ok_variant, err_variant) = self.result_enum(ty);
+        let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
+        let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
+        target::rust_result_match(
+            &expr,
+            &format!(
+                "{ok_path}(value) => {}",
+                target::rust_ok(&self.native_value_arg_expr(
+                    ok,
+                    ok_variant.fields[0].ty,
+                    "value".to_string()
+                ))
+            ),
+            &format!(
+                "{err_path}(value) => {}",
+                target::rust_err(&self.native_value_arg_expr(
+                    err,
+                    err_variant.fields[0].ty,
+                    "value".to_string()
+                ))
+            ),
+        )
+    }
+
+    fn native_result_arg_expr(
+        &self,
+        ty: RirTypeId,
+        ok: &anvyx_runtime::RustParamAbi,
+        err: &anvyx_runtime::RustParamAbi,
+        expr: String,
+    ) -> String {
+        let (enm, ok_variant, err_variant) = self.result_enum(ty);
+        let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
+        let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
+        target::rust_result_match(
+            &expr,
+            &format!(
+                "{ok_path}(value) => {}",
+                target::rust_ok(&self.native_arg_expr(
+                    ok,
+                    ok_variant.fields[0].ty,
+                    "value".to_string()
+                ))
+            ),
+            &format!(
+                "{err_path}(value) => {}",
+                target::rust_err(&self.native_arg_expr(
+                    err,
+                    err_variant.fields[0].ty,
+                    "value".to_string()
+                ))
+            ),
+        )
+    }
+
+    fn native_list_arg_expr(&self, abi: &anvyx_runtime::RustParamAbi, expr: String) -> String {
+        let anvyx_runtime::RustParamAbi::Value(ty) = abi else {
             unreachable!("verified scalar native list param ABI");
         };
         match ty {
             anvyx_runtime::ExternTypeExpr::String => format!(
-                "({expr}).to_vec({})?.into_iter().map(|value| value.as_str().to_string()).collect::<Vec<_>>()",
-                target::runtime_param_name()
+                "({expr}).to_vec({})?.into_iter().map(|value| {}).collect::<Vec<_>>()",
+                target::runtime_param_name(),
+                target::rust_string_from_anv("value")
             ),
             anvyx_runtime::ExternTypeExpr::Bool
             | anvyx_runtime::ExternTypeExpr::Int
@@ -4100,17 +4395,47 @@ impl EmitCx<'_> {
 
     fn native_return_call(
         &self,
-        function: &RirFunction,
+        _function: &RirFunction,
         ret: RirTypeId,
         abi: &anvyx_runtime::RustReturnAbi,
         call: String,
+        adopt_resource: bool,
     ) -> String {
-        let anvyx_runtime::RustReturnAbi::List(inner) = abi else {
-            return RustValues::new(self.program, function).native_return_call(ret, abi, call);
+        let call = if adopt_resource {
+            self.native_ref_adopt_return(ret, &call)
+        } else {
+            call
         };
+        match abi {
+            anvyx_runtime::RustReturnAbi::Void => call,
+            anvyx_runtime::RustReturnAbi::List(inner) => {
+                self.native_list_return_call(ret, inner, call)
+            }
+            _ => self.native_return_expr(ret, abi, &call),
+        }
+    }
+
+    fn native_ref_adopt_return(&self, ret: RirTypeId, expr: &str) -> String {
+        let RirType::Struct(id) = self.program.types[ret.index()] else {
+            unreachable!("verified native resource return type")
+        };
+        let native = self.program.structs[id.index()]
+            .native_path
+            .as_ref()
+            .expect("verified native resource path")
+            .join("::");
+        target::native_ref_adopt(&native, expr)
+    }
+
+    fn native_list_return_call(
+        &self,
+        ret: RirTypeId,
+        inner: &anvyx_runtime::RustReturnAbi,
+        call: String,
+    ) -> String {
         let storage_ty = self.collection_storage_heap_type(ret);
         let tmp = "__anv_native_ret";
-        let elems = match inner.as_ref() {
+        let elems = match inner {
             anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String) => {
                 let value = target::anv_string_from("value");
                 format!("{tmp}.into_iter().map(|value| {value})")
@@ -4122,6 +4447,287 @@ impl EmitCx<'_> {
         format!("{{ let {tmp} = {call}; {list} }}")
     }
 
+    fn native_return_expr(
+        &self,
+        ret: RirTypeId,
+        abi: &anvyx_runtime::RustReturnAbi,
+        expr: &str,
+    ) -> String {
+        match abi {
+            anvyx_runtime::RustReturnAbi::Value(ty) => self.native_value_return_expr(ret, ty, expr),
+            anvyx_runtime::RustReturnAbi::Option(inner) => {
+                let RirType::Option(inner_ty) = self.program.types[ret.index()] else {
+                    unreachable!("verified native option return type")
+                };
+                target::rust_option_map(expr, &self.native_return_expr(inner_ty, inner, "value"))
+            }
+            anvyx_runtime::RustReturnAbi::Result(ok, err) => {
+                let (enm, ok_variant, err_variant) = self.result_enum(ret);
+                let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
+                let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
+                target::rust_result_match(
+                    expr,
+                    &format!(
+                        "Ok(value) => {ok_path}({})",
+                        self.native_return_expr(ok_variant.fields[0].ty, ok, "value")
+                    ),
+                    &format!(
+                        "Err(value) => {err_path}({})",
+                        self.native_return_expr(err_variant.fields[0].ty, err, "value")
+                    ),
+                )
+            }
+            anvyx_runtime::RustReturnAbi::Void | anvyx_runtime::RustReturnAbi::List(_) => {
+                unreachable!("verified native result payload ABI")
+            }
+        }
+    }
+
+    fn native_value_return_expr(
+        &self,
+        ret: RirTypeId,
+        abi: &anvyx_runtime::ExternTypeExpr,
+        expr: &str,
+    ) -> String {
+        match abi {
+            anvyx_runtime::ExternTypeExpr::Unit => self.native_empty_tuple_return_expr(ret, expr),
+            anvyx_runtime::ExternTypeExpr::String => target::anv_string_from(expr),
+            anvyx_runtime::ExternTypeExpr::Option(inner) => {
+                let RirType::Option(inner_ty) = self.program.types[ret.index()] else {
+                    unreachable!("verified native option return type")
+                };
+                target::rust_option_map(
+                    expr,
+                    &self.native_value_return_expr(inner_ty, inner, "value"),
+                )
+            }
+            anvyx_runtime::ExternTypeExpr::Result(ok, err) => {
+                self.native_value_result_return_expr(ret, ok, err, expr)
+            }
+            anvyx_runtime::ExternTypeExpr::Tuple(fields) => {
+                self.native_tuple_return_expr(ret, fields, expr)
+            }
+            anvyx_runtime::ExternTypeExpr::Array { elem, .. } => {
+                let RirType::Array { elem: elem_ty, .. } = self.program.types[ret.index()] else {
+                    unreachable!("verified native array return type")
+                };
+                target::rust_option_map(
+                    expr,
+                    &self.native_value_return_expr(elem_ty, elem, "value"),
+                )
+            }
+            anvyx_runtime::ExternTypeExpr::Named { .. } => self.native_named_return_expr(ret, expr),
+            _ => expr.to_string(),
+        }
+    }
+
+    fn native_named_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
+        match self.program.types[ret.index()] {
+            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
+                self.native_enum_return_expr(enum_id, expr)
+            }
+            _ => expr.to_string(),
+        }
+    }
+
+    fn native_enum_return_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
+        let enm = &self.program.enums[enum_id.index()];
+        let native = enm
+            .native_path
+            .as_ref()
+            .expect("verified native enum type")
+            .join("::");
+        let arms = enm.variants.iter().map(|variant| {
+            let generated_path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
+            let native_path = variant_path(&native, variant.symbol.as_str());
+            match variant.kind {
+                RirVariantKind::Unit => format!("{native_path} => {generated_path}"),
+                RirVariantKind::Tuple => {
+                    let bindings = (0..variant.fields.len())
+                        .map(|index| format!("value{index}"))
+                        .collect::<Vec<_>>();
+                    let fields = variant
+                        .fields
+                        .iter()
+                        .zip(&bindings)
+                        .map(|(field, binding)| self.native_rir_return_expr(field.ty, binding))
+                        .collect::<Vec<_>>();
+                    format!(
+                        "{} => {}",
+                        tuple_variant(&native_path, bindings.iter().cloned()),
+                        tuple_variant(&generated_path, fields)
+                    )
+                }
+                RirVariantKind::Struct => {
+                    let bindings = variant
+                        .fields
+                        .iter()
+                        .map(|field| field.symbol.as_str().to_string())
+                        .collect::<Vec<_>>();
+                    let fields = variant
+                        .fields
+                        .iter()
+                        .zip(&bindings)
+                        .map(|(field, binding)| {
+                            field_init(
+                                field.symbol.as_str(),
+                                self.native_rir_return_expr(field.ty, binding),
+                            )
+                        });
+                    format!(
+                        "{} => {}",
+                        struct_variant(&native_path, bindings.iter().cloned()),
+                        struct_variant(&generated_path, fields)
+                    )
+                }
+            }
+        });
+        match_expr(expr, arms)
+    }
+
+    fn native_rir_return_expr(&self, ty: RirTypeId, expr: &str) -> String {
+        match self.program.types[ty.index()] {
+            RirType::String => target::anv_string_from(expr),
+            RirType::Option(inner) => {
+                target::rust_option_map(expr, &self.native_rir_return_expr(inner, "value"))
+            }
+            RirType::Array { elem, .. } => {
+                target::rust_option_map(expr, &self.native_rir_return_expr(elem, "value"))
+            }
+            RirType::Tuple(tuple_id) => self.native_rir_tuple_return_expr(tuple_id, expr),
+            RirType::Enum(enum_id)
+                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
+            {
+                self.native_rir_result_return_expr(enum_id, expr)
+            }
+            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
+                self.native_enum_return_expr(enum_id, expr)
+            }
+            _ => expr.to_string(),
+        }
+    }
+
+    fn native_rir_tuple_return_expr(&self, tuple_id: RirTupleId, expr: &str) -> String {
+        let tuple = &self.program.tuples[tuple_id.index()];
+        if tuple.fields.is_empty() {
+            return target::rust_eval_then(
+                expr,
+                &struct_lit(tuple.symbol.as_str(), Vec::<String>::new()),
+            );
+        }
+        let tmp = "__anv_native_payload";
+        let fields = tuple.fields.iter().enumerate().map(|(index, field)| {
+            field_init(
+                field.symbol.as_str(),
+                self.native_rir_return_expr(field.ty, &target::rust_tuple_field(tmp, index)),
+            )
+        });
+        format!(
+            "{{ let {tmp} = {expr}; {} }}",
+            struct_lit(tuple.symbol.as_str(), fields)
+        )
+    }
+
+    fn native_rir_result_return_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
+        let enm = &self.program.enums[enum_id.index()];
+        let [ok, err] = enm.variants.as_slice() else {
+            unreachable!("verified result enum variants")
+        };
+        target::rust_result_match(
+            expr,
+            &format!(
+                "Ok(value) => {}({})",
+                variant_path(enm.symbol.as_str(), ok.symbol.as_str()),
+                self.native_rir_return_expr(ok.fields[0].ty, "value")
+            ),
+            &format!(
+                "Err(value) => {}({})",
+                variant_path(enm.symbol.as_str(), err.symbol.as_str()),
+                self.native_rir_return_expr(err.fields[0].ty, "value")
+            ),
+        )
+    }
+
+    fn native_tuple_return_expr(
+        &self,
+        ret: RirTypeId,
+        fields: &[anvyx_runtime::ExternTypeExpr],
+        expr: &str,
+    ) -> String {
+        if fields.is_empty() {
+            return self.native_empty_tuple_return_expr(ret, expr);
+        }
+        let RirType::Tuple(tuple_id) = self.program.types[ret.index()] else {
+            unreachable!("verified native tuple return type")
+        };
+        let tuple = &self.program.tuples[tuple_id.index()];
+        let tmp = "__anv_native_ret";
+        let fields = tuple
+            .fields
+            .iter()
+            .zip(fields)
+            .enumerate()
+            .map(|(index, (field, abi))| {
+                field_init(
+                    field.symbol.as_str(),
+                    self.native_value_return_expr(
+                        field.ty,
+                        abi,
+                        &target::rust_tuple_field(tmp, index),
+                    ),
+                )
+            });
+        format!(
+            "{{ let {tmp} = {expr}; {} }}",
+            struct_lit(tuple.symbol.as_str(), fields)
+        )
+    }
+
+    fn native_empty_tuple_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
+        let RirType::Tuple(tuple_id) = self.program.types[ret.index()] else {
+            unreachable!("verified native unit return type")
+        };
+        let tuple = &self.program.tuples[tuple_id.index()];
+        target::rust_eval_then(
+            expr,
+            &struct_lit(tuple.symbol.as_str(), Vec::<String>::new()),
+        )
+    }
+
+    fn native_value_result_return_expr(
+        &self,
+        ret: RirTypeId,
+        ok: &anvyx_runtime::ExternTypeExpr,
+        err: &anvyx_runtime::ExternTypeExpr,
+        expr: &str,
+    ) -> String {
+        let (enm, ok_variant, err_variant) = self.result_enum(ret);
+        let ok_path = variant_path(enm.symbol.as_str(), ok_variant.symbol.as_str());
+        let err_path = variant_path(enm.symbol.as_str(), err_variant.symbol.as_str());
+        target::rust_result_match(
+            expr,
+            &format!(
+                "Ok(value) => {ok_path}({})",
+                self.native_value_return_expr(ok_variant.fields[0].ty, ok, "value")
+            ),
+            &format!(
+                "Err(value) => {err_path}({})",
+                self.native_value_return_expr(err_variant.fields[0].ty, err, "value")
+            ),
+        )
+    }
+
+    fn result_enum(&self, ty: RirTypeId) -> (&RirEnum, &RirVariant, &RirVariant) {
+        let RirType::Enum(enum_id) = self.program.types[ty.index()] else {
+            unreachable!("verified native result type")
+        };
+        let enm = &self.program.enums[enum_id.index()];
+        let [ok, err] = enm.variants.as_slice() else {
+            unreachable!("verified native result variants")
+        };
+        (enm, ok, err)
+    }
+
     fn extern_call(
         &self,
         function: &RirFunction,
@@ -4129,7 +4735,7 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
     ) -> String {
         let ext = &self.program.externs[id.index()];
-        let (symbol, rendered, fallible, ret_abi, param_abis) = match &ext.kind {
+        let (symbol, rendered, fallible, ret_abi, param_abis, adopt_resource) = match &ext.kind {
             RirExternKind::Native(native) => {
                 let rendered = match native.abi.ctx {
                     anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
@@ -4141,11 +4747,13 @@ impl EmitCx<'_> {
                     native.abi.fallible,
                     &native.abi.ret,
                     native.abi.params.as_slice(),
+                    native.adopt_resource_return,
                 )
             }
         };
         let suspend_entry = self.has_retained_callbacks();
-        self.prepared_native_call_expr(function, args, param_abis, rendered, |rendered| {
+        let param_tys = ext.params.iter().map(|param| param.ty).collect::<Vec<_>>();
+        self.prepared_native_call_expr(function, args, param_abis, &param_tys, rendered, |rendered| {
             let call = format!("{symbol}({rendered})");
             let call = if suspend_entry {
                 format!(
@@ -4155,7 +4763,7 @@ impl EmitCx<'_> {
                 call
             };
             let call = if fallible { format!("{call}?") } else { call };
-            self.native_return_call(function, ext.ret, ret_abi, call)
+            self.native_return_call(function, ext.ret, ret_abi, call, adopt_resource)
         })
     }
 

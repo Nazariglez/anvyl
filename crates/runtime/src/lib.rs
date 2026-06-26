@@ -13,6 +13,7 @@ mod lambda_cell;
 pub mod managed_rc;
 mod mutable_place;
 pub mod provider;
+mod resource;
 mod runtime_owner;
 mod scoped_lambda;
 pub mod suspect_buffer;
@@ -26,7 +27,7 @@ pub use anvyx_heap::{
     Visitor,
 };
 pub use anvyx_macros::{
-    AnvyxInline, AnvyxRef, builtin_module, function, methods, module, provider_package,
+    AnvyxEnum, AnvyxInline, AnvyxRef, builtin_module, function, methods, module, provider_package,
 };
 #[doc(hidden)]
 pub use callback_registry::{
@@ -56,7 +57,8 @@ pub use mutable_place::{
 pub use provider::{
     AnvyxEnumExport, AnvyxInlineExport, AnvyxRefExport, BinaryOp, CallbackEscape, CallbackPolicy,
     CallbackThread, ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternCallbackParam,
-    ExternCallbackSignature, ExternEffects, ExternFieldDescriptor, ExternFunctionDescriptor,
+    ExternCallbackSignature, ExternEffects, ExternEnumVariantDescriptor,
+    ExternEnumVariantFieldDescriptor, ExternFieldDescriptor, ExternFunctionDescriptor,
     ExternFunctionKey, ExternInitDescriptor, ExternMemberKey, ExternMemberSelector,
     ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
     ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
@@ -67,6 +69,7 @@ pub use provider::{
     RustWrapperCtx, TypeExport, TypeMemberExport, UnaryOp, merge_type_members,
     validate_rust_provider_support,
 };
+pub use resource::{AnvRef, AnvRefType};
 pub use runtime_owner::{RuntimeOwnerEntry, RuntimeOwnerHandle, RuntimeOwnerShutdownGuard};
 pub use scoped_lambda::ScopedLambda;
 pub use type_registry::{

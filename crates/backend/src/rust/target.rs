@@ -26,6 +26,33 @@ pub(super) fn anv_map_ty(key: &str, value: &str) -> String {
     format!("{}<'cx, {key}, {value}>", rt_path("AnvMap"))
 }
 
+pub(super) fn anv_ref_alias(alias: &str, native: &str) -> String {
+    format!("type {alias}<'cx> = {}<'cx, {native}>;", rt_path("AnvRef"))
+}
+
+pub(super) fn native_ref_borrow(resource: &str, arg: &str, mutable: bool, body: &str) -> String {
+    let access = if mutable { "with_mut" } else { "with" };
+    let heap = if mutable {
+        format!("{}.heap()", runtime_param_name())
+    } else {
+        format!("{}.heap_ref()", runtime_param_name())
+    };
+    format!(
+        "({resource}).{access}({heap}, |{arg}| -> Result<_, {}> {{ Ok({body}) }}).map_err({})??",
+        runtime_error_ty(),
+        heap_access_error(),
+    )
+}
+
+pub(super) fn native_ref_adopt(native: &str, value: &str) -> String {
+    format!(
+        "{}::<{native}>::register_untracked({}.heap()).alloc_in({}, {value})",
+        rt_path("AnvRefType"),
+        runtime_param_name(),
+        runtime_param_name(),
+    )
+}
+
 pub(super) fn map_storage_ty(key: &str, value: &str) -> String {
     format!("{}<'cx, {key}, {value}>", rt_path("MapStorage"))
 }
@@ -488,6 +515,47 @@ pub(super) fn trace_fn_header() -> String {
 
 pub(super) fn anv_string_from(expr: &str) -> String {
     format!("{}::from({expr})", anv_string_ty())
+}
+
+pub(super) fn rust_string_from_anv(value: &str) -> String {
+    format!("({value}).as_str().to_string()")
+}
+
+pub(super) fn rust_option_map(option: &str, body: &str) -> String {
+    format!("({option}).map(|value| {body})")
+}
+
+pub(super) fn rust_result_match(value: &str, ok: &str, err: &str) -> String {
+    format!("match {value} {{ {ok}, {err} }}")
+}
+
+pub(super) fn rust_ok(value: &str) -> String {
+    format!("Ok({value})")
+}
+
+pub(super) fn rust_err(value: &str) -> String {
+    format!("Err({value})")
+}
+
+pub(super) fn rust_tuple(fields: impl IntoIterator<Item = String>) -> String {
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    match fields.as_slice() {
+        [] => rust_unit(),
+        [field] => format!("({field},)"),
+        _ => format!("({})", fields.join(", ")),
+    }
+}
+
+pub(super) fn rust_unit() -> String {
+    "()".to_string()
+}
+
+pub(super) fn rust_eval_then(eval: &str, tail: &str) -> String {
+    format!("{{ let _ = {eval}; {tail} }}")
+}
+
+pub(super) fn rust_tuple_field(value: &str, index: usize) -> String {
+    format!("{value}.{index}")
 }
 
 pub(super) fn anv_string_format(fmt: &str, arg: &str) -> String {

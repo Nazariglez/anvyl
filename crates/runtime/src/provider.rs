@@ -1,8 +1,9 @@
 use std::{collections::HashSet, fmt::Debug, path::PathBuf};
 
 pub use anvyx_externs::{
-    BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternBindingKey, ExternBindingOp,
-    ExternBindingTarget, ExternCallbackParam, ExternCallbackSignature, ExternEffects,
+    AbiPosition, BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternBindingKey,
+    ExternBindingOp, ExternBindingTarget, ExternCallbackParam, ExternCallbackSignature,
+    ExternEffects, ExternEnumVariantDescriptor, ExternEnumVariantFieldDescriptor,
     ExternFieldDescriptor, ExternFunctionDescriptor, ExternFunctionKey, ExternInitDescriptor,
     ExternMemberKey, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
     ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
@@ -68,6 +69,17 @@ fn retarget_members(members: &mut TypeExport, target_name: &str) {
     for field in &mut members.descriptor.fields {
         retarget_type(&mut field.ty, &source_name, target_name);
     }
+    for variant in &mut members.descriptor.variants {
+        for field in &mut variant.fields {
+            retarget_type(&mut field.ty, &source_name, target_name);
+        }
+    }
+    if let Some(init) = &mut members.descriptor.init {
+        for param in &mut init.params {
+            retarget_type(&mut param.ty, &source_name, target_name);
+        }
+        retarget_type(&mut init.ret, &source_name, target_name);
+    }
     for method in &mut members.descriptor.methods {
         retarget_signature(&mut method.signature, &source_name, target_name);
     }
@@ -107,8 +119,12 @@ fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &s
         RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
             retarget_callback(callback, source_name, target_name);
         }
-        RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
+        RustParamAbi::Option(inner) | RustParamAbi::List(inner) | RustParamAbi::Slice(inner) => {
             retarget_param_abi(inner, source_name, target_name);
+        }
+        RustParamAbi::Result(ok, err) => {
+            retarget_param_abi(ok, source_name, target_name);
+            retarget_param_abi(err, source_name, target_name);
         }
     }
 }
@@ -126,6 +142,10 @@ fn retarget_return_abi(abi: &mut RustReturnAbi, source_name: &str, target_name: 
         RustReturnAbi::Value(ty) => retarget_type(ty, source_name, target_name),
         RustReturnAbi::Option(inner) | RustReturnAbi::List(inner) => {
             retarget_return_abi(inner, source_name, target_name);
+        }
+        RustReturnAbi::Result(ok, err) => {
+            retarget_return_abi(ok, source_name, target_name);
+            retarget_return_abi(err, source_name, target_name);
         }
     }
 }
@@ -155,8 +175,12 @@ fn qualify_param_abi_owner(abi: &mut RustParamAbi, owner: &ExternTypeKey) {
         RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
             qualify_callback_owner(callback, owner);
         }
-        RustParamAbi::Option(inner) | RustParamAbi::List(inner) => {
+        RustParamAbi::Option(inner) | RustParamAbi::List(inner) | RustParamAbi::Slice(inner) => {
             qualify_param_abi_owner(inner, owner);
+        }
+        RustParamAbi::Result(ok, err) => {
+            qualify_param_abi_owner(ok, owner);
+            qualify_param_abi_owner(err, owner);
         }
     }
 }
@@ -195,12 +219,20 @@ fn rewrite_type_names(
                 rewrite_type_names(arg, rewrite);
             }
         }
-        ExternTypeExpr::List(inner) | ExternTypeExpr::Option(inner) => {
+        ExternTypeExpr::List(inner)
+        | ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::Array { elem: inner, .. }
+        | ExternTypeExpr::Slice(inner) => {
             rewrite_type_names(inner, rewrite);
         }
-        ExternTypeExpr::Map(key, value) => {
+        ExternTypeExpr::Map(key, value) | ExternTypeExpr::Result(key, value) => {
             rewrite_type_names(key, rewrite);
             rewrite_type_names(value, rewrite);
+        }
+        ExternTypeExpr::Tuple(fields) => {
+            for field in fields {
+                rewrite_type_names(field, rewrite);
+            }
         }
         ExternTypeExpr::Callback(callback) => {
             for param in &mut callback.params {
@@ -209,6 +241,7 @@ fn rewrite_type_names(
             rewrite_type_names(&mut callback.ret, rewrite);
         }
         ExternTypeExpr::Void
+        | ExternTypeExpr::Unit
         | ExternTypeExpr::Bool
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
@@ -466,7 +499,9 @@ pub enum RustParamAbi {
     ScopedLambda(ExternCallbackSignature),
     EscapingLambda(ExternCallbackSignature),
     Option(Box<RustParamAbi>),
+    Result(Box<RustParamAbi>, Box<RustParamAbi>),
     List(Box<RustParamAbi>),
+    Slice(Box<RustParamAbi>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -474,76 +509,113 @@ pub enum RustReturnAbi {
     Void,
     Value(ExternTypeExpr),
     Option(Box<RustReturnAbi>),
+    Result(Box<RustReturnAbi>, Box<RustReturnAbi>),
     List(Box<RustReturnAbi>),
 }
 
 impl RustExternAbi {
     pub fn has_callback_wrapper(&self) -> bool {
-        self.params.iter().any(RustParamAbi::is_callback_wrapper)
+        self.params
+            .iter()
+            .any(|param| param.class() == RustAbiClass::CallbackWrapper)
     }
 
     pub fn has_collection_wrapper(&self) -> bool {
         self.params
             .iter()
-            .any(RustParamAbi::contains_collection_wrapper)
-            || self.ret.contains_collection_wrapper()
+            .any(|param| param.class() == RustAbiClass::CollectionWrapper)
+            || self.ret.class() == RustAbiClass::CollectionWrapper
     }
 
     pub fn supported_callback_wrapper(&self) -> bool {
         self.ctx == RustWrapperCtx::None
             && self.has_callback_wrapper()
-            && !self.params.iter().any(|param| {
+            && self.params.iter().all(|param| {
                 matches!(
-                    param,
-                    RustParamAbi::Borrow(_)
-                        | RustParamAbi::MutBorrow(_)
-                        | RustParamAbi::MutPlace(_)
-                ) || param.contains_collection_wrapper()
-                    || param.direct_collection_abi()
+                    param.class(),
+                    RustAbiClass::Direct | RustAbiClass::CallbackWrapper
+                ) && !param.is_borrowed_provider_param()
+                    && !param.contains_direct_collection()
             })
-            && !self.ret.contains_collection_wrapper()
-            && !self.ret.direct_collection_abi()
+            && self.ret.class() == RustAbiClass::Direct
+            && !self.ret.contains_direct_collection()
     }
 
     pub fn supported_collection_wrapper(&self) -> bool {
         self.ctx == RustWrapperCtx::HiddenRuntime
             && !self.has_callback_wrapper()
             && self.has_collection_wrapper()
-            && self.params.iter().all(|param| match param {
-                RustParamAbi::List(_) => param.supported_collection_wrapper(),
-                RustParamAbi::Value(_)
-                | RustParamAbi::Borrow(_)
-                | RustParamAbi::MutBorrow(_)
-                | RustParamAbi::MutPlace(_) => !param.direct_collection_abi(),
-                RustParamAbi::Option(_)
-                | RustParamAbi::ScopedLambda(_)
-                | RustParamAbi::EscapingLambda(_) => false,
+            && self.params.iter().all(|param| match param.class() {
+                RustAbiClass::Direct => true,
+                RustAbiClass::CollectionWrapper => param.supported_collection_wrapper(),
+                RustAbiClass::CallbackWrapper | RustAbiClass::BackendUnsupported => false,
             })
-            && match &self.ret {
-                RustReturnAbi::List(_) => self.ret.supported_collection_wrapper(),
-                RustReturnAbi::Void | RustReturnAbi::Value(_) | RustReturnAbi::Option(_) => {
-                    !self.ret.contains_collection_wrapper() && !self.ret.direct_collection_abi()
-                }
+            && match self.ret.class() {
+                RustAbiClass::Direct => true,
+                RustAbiClass::CollectionWrapper => self.ret.supported_collection_wrapper(),
+                RustAbiClass::CallbackWrapper | RustAbiClass::BackendUnsupported => false,
             }
+    }
+
+    pub fn backend_supported(&self) -> bool {
+        match self.support {
+            RustAbiSupport::Direct => {
+                self.direct_ctx_supported()
+                    && self.params.iter().all(|param| {
+                        param.class() == RustAbiClass::Direct && !param.direct_mut_collection_abi()
+                    })
+                    && self.ret.class() == RustAbiClass::Direct
+            }
+            RustAbiSupport::NeedsWrapperConversion => {
+                self.supported_callback_wrapper() || self.supported_collection_wrapper()
+            }
+            RustAbiSupport::Unsupported => false,
+        }
+    }
+
+    fn validation_supported(&self) -> bool {
+        self.backend_supported()
+    }
+
+    pub fn direct_ctx_supported(&self) -> bool {
+        match self.ctx {
+            RustWrapperCtx::HiddenRuntime => true,
+            RustWrapperCtx::None => {
+                !self
+                    .params
+                    .iter()
+                    .any(RustParamAbi::requires_hidden_runtime_arg)
+                    && !self.ret.requires_hidden_runtime_arg()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustAbiClass {
+    Direct,
+    CollectionWrapper,
+    CallbackWrapper,
+    BackendUnsupported,
+}
+
+impl RustAbiClass {
+    fn merge(self, other: Self) -> Self {
+        if self == Self::Direct && other == Self::Direct {
+            Self::Direct
+        } else {
+            Self::BackendUnsupported
+        }
     }
 }
 
 impl RustParamAbi {
     pub fn is_callback_wrapper(&self) -> bool {
-        matches!(self, Self::ScopedLambda(_) | Self::EscapingLambda(_))
+        self.class() == RustAbiClass::CallbackWrapper
     }
 
     pub fn contains_collection_wrapper(&self) -> bool {
-        match self {
-            Self::List(_) => true,
-            Self::Option(inner) => inner.contains_collection_wrapper(),
-            Self::Value(_)
-            | Self::Borrow(_)
-            | Self::MutBorrow(_)
-            | Self::MutPlace(_)
-            | Self::ScopedLambda(_)
-            | Self::EscapingLambda(_) => false,
-        }
+        self.class() == RustAbiClass::CollectionWrapper
     }
 
     pub fn supported_collection_wrapper(&self) -> bool {
@@ -551,17 +623,57 @@ impl RustParamAbi {
     }
 
     pub fn direct_collection_abi(&self) -> bool {
-        match self {
-            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
-                type_contains_collection(ty)
-            }
-            Self::Option(inner) => inner.direct_collection_abi(),
-            Self::ScopedLambda(_) | Self::EscapingLambda(_) | Self::List(_) => false,
-        }
+        matches!(self.class(), RustAbiClass::BackendUnsupported)
+            && self.contains_direct_collection()
     }
 
     pub fn direct_mut_collection_abi(&self) -> bool {
         matches!(self, Self::MutBorrow(ty) | Self::MutPlace(ty) if type_contains_collection(ty))
+    }
+
+    fn class(&self) -> RustAbiClass {
+        match self {
+            Self::ScopedLambda(_) | Self::EscapingLambda(_) => RustAbiClass::CallbackWrapper,
+            Self::List(_) => RustAbiClass::CollectionWrapper,
+            Self::Option(inner) | Self::Slice(inner) => inner.direct_class(),
+            Self::Result(ok, err) => ok.direct_class().merge(err.direct_class()),
+            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
+                if direct_rust_type_supported(ty) {
+                    RustAbiClass::Direct
+                } else {
+                    RustAbiClass::BackendUnsupported
+                }
+            }
+        }
+    }
+
+    fn direct_class(&self) -> RustAbiClass {
+        match self.class() {
+            RustAbiClass::Direct => RustAbiClass::Direct,
+            _ => RustAbiClass::BackendUnsupported,
+        }
+    }
+
+    fn is_borrowed_provider_param(&self) -> bool {
+        matches!(
+            self,
+            Self::Borrow(_) | Self::MutBorrow(_) | Self::MutPlace(_)
+        )
+    }
+
+    fn contains_direct_collection(&self) -> bool {
+        match self {
+            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
+                type_contains_collection(ty)
+            }
+            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+                inner.contains_direct_collection()
+            }
+            Self::Result(ok, err) => {
+                ok.contains_direct_collection() || err.contains_direct_collection()
+            }
+            Self::ScopedLambda(_) | Self::EscapingLambda(_) => false,
+        }
     }
 
     fn contains_callback(&self) -> bool {
@@ -570,18 +682,34 @@ impl RustParamAbi {
                 type_contains_callback(ty)
             }
             Self::ScopedLambda(_) | Self::EscapingLambda(_) => true,
-            Self::Option(inner) | Self::List(inner) => inner.contains_callback(),
+            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+                inner.contains_callback()
+            }
+            Self::Result(ok, err) => ok.contains_callback() || err.contains_callback(),
+        }
+    }
+
+    fn requires_hidden_runtime_arg(&self) -> bool {
+        match self {
+            Self::MutPlace(_) => true,
+            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+                inner.requires_hidden_runtime_arg()
+            }
+            Self::Result(ok, err) => {
+                ok.requires_hidden_runtime_arg() || err.requires_hidden_runtime_arg()
+            }
+            Self::Value(_)
+            | Self::Borrow(_)
+            | Self::MutBorrow(_)
+            | Self::ScopedLambda(_)
+            | Self::EscapingLambda(_) => false,
         }
     }
 }
 
 impl RustReturnAbi {
     pub fn contains_collection_wrapper(&self) -> bool {
-        match self {
-            Self::List(_) => true,
-            Self::Option(inner) => inner.contains_collection_wrapper(),
-            Self::Void | Self::Value(_) => false,
-        }
+        self.class() == RustAbiClass::CollectionWrapper
     }
 
     pub fn supported_collection_wrapper(&self) -> bool {
@@ -589,10 +717,48 @@ impl RustReturnAbi {
     }
 
     pub fn direct_collection_abi(&self) -> bool {
+        matches!(self.class(), RustAbiClass::BackendUnsupported)
+            && self.contains_direct_collection()
+    }
+
+    fn class(&self) -> RustAbiClass {
+        match self {
+            Self::List(_) => RustAbiClass::CollectionWrapper,
+            _ if self.backend_direct_supported() => RustAbiClass::Direct,
+            _ => RustAbiClass::BackendUnsupported,
+        }
+    }
+
+    fn backend_direct_supported(&self) -> bool {
+        match self {
+            Self::Void => true,
+            Self::Value(ty) => direct_rust_type_supported(ty),
+            Self::Option(inner) => inner.backend_direct_supported(),
+            Self::Result(ok, err) => {
+                ok.backend_direct_supported() && err.backend_direct_supported()
+            }
+            Self::List(_) => false,
+        }
+    }
+
+    fn contains_direct_collection(&self) -> bool {
         match self {
             Self::Value(ty) => type_contains_collection(ty),
-            Self::Option(inner) => inner.direct_collection_abi(),
-            Self::Void | Self::List(_) => false,
+            Self::Option(inner) | Self::List(inner) => inner.contains_direct_collection(),
+            Self::Result(ok, err) => {
+                ok.contains_direct_collection() || err.contains_direct_collection()
+            }
+            Self::Void => false,
+        }
+    }
+
+    fn requires_hidden_runtime_arg(&self) -> bool {
+        match self {
+            Self::Option(inner) | Self::List(inner) => inner.requires_hidden_runtime_arg(),
+            Self::Result(ok, err) => {
+                ok.requires_hidden_runtime_arg() || err.requires_hidden_runtime_arg()
+            }
+            Self::Void | Self::Value(_) => false,
         }
     }
 }
@@ -602,6 +768,28 @@ fn scalar_collection_wrapper_leaf(ty: &ExternTypeExpr) -> bool {
         ty,
         ExternTypeExpr::Bool | ExternTypeExpr::Int | ExternTypeExpr::Float | ExternTypeExpr::String
     )
+}
+
+fn direct_rust_type_supported(ty: &ExternTypeExpr) -> bool {
+    match ty {
+        ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::String
+        | ExternTypeExpr::Unit => true,
+        ExternTypeExpr::Named { args, .. } => args.is_empty(),
+        ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::List(inner)
+        | ExternTypeExpr::Array { elem: inner, .. } => direct_rust_type_supported(inner),
+        ExternTypeExpr::Result(ok, err) | ExternTypeExpr::Map(ok, err) => {
+            direct_rust_type_supported(ok) && direct_rust_type_supported(err)
+        }
+        ExternTypeExpr::Tuple(fields) => fields.iter().all(direct_rust_type_supported),
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Any
+        | ExternTypeExpr::Slice(_)
+        | ExternTypeExpr::Callback(_) => false,
+    }
 }
 
 #[derive(Clone)]
@@ -758,9 +946,9 @@ fn native_binding_signature(
                     Some(NativeSignature {
                         signature: ExternSignature {
                             params: init.params.clone(),
-                            ret: ExternTypeExpr::Void,
+                            ret: init.ret.clone(),
                         },
-                        effects: ExternEffects::default(),
+                        effects: init.effects,
                     })
                 }
                 (ExternMemberSelector::Operator(op), ExternBindingOp::Call) => {
@@ -847,6 +1035,7 @@ fn validate_native_abi(
     signature: &NativeSignature,
     abi: &RustExternAbi,
 ) -> Result<(), String> {
+    validate_signature_abi(descriptor, key, &signature.signature)?;
     if abi.fallible != signature.effects.fallible {
         return Err(native_abi_error(descriptor, key, "fallible flag mismatch"));
     }
@@ -904,10 +1093,54 @@ fn validate_native_abi(
         return Err(native_abi_error(
             descriptor,
             key,
-            "direct collection ABI is unsupported",
+            "unsupported native ABI metadata",
         ));
     }
     validate_wrapper_conversion_abi(descriptor, key, abi)?;
+    if !abi.validation_supported() {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "unsupported native ABI metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_signature_abi(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    signature: &ExternSignature,
+) -> Result<(), String> {
+    for (index, param) in signature.params.iter().enumerate() {
+        let position = match param.flow {
+            ParamFlow::Value => AbiPosition::ParamValue,
+            ParamFlow::Borrow => AbiPosition::ParamBorrow,
+            ParamFlow::MutBorrow => AbiPosition::ParamMutBorrow,
+        };
+        if let Err(violations) = param.ty.classify_abi(position) {
+            let violation = violations[0];
+            return Err(native_abi_error(
+                descriptor,
+                key,
+                &format!(
+                    "parameter {index} descriptor ABI violation: {:?} at {:?}",
+                    violation.reason, violation.position
+                ),
+            ));
+        }
+    }
+    if let Err(violations) = signature.ret.classify_abi(AbiPosition::Return) {
+        let violation = violations[0];
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            &format!(
+                "return descriptor ABI violation: {:?} at {:?}",
+                violation.reason, violation.position
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -917,12 +1150,14 @@ fn validate_wrapper_ctx(
     abi: &RustExternAbi,
     has_callback_wrapper: bool,
 ) -> Result<(), String> {
-    let expected = if has_callback_wrapper {
-        RustWrapperCtx::None
+    let valid = if has_callback_wrapper {
+        abi.ctx == RustWrapperCtx::None
+    } else if abi.support == RustAbiSupport::Direct {
+        abi.direct_ctx_supported()
     } else {
-        RustWrapperCtx::HiddenRuntime
+        abi.ctx == RustWrapperCtx::HiddenRuntime
     };
-    if abi.ctx == expected {
+    if valid {
         Ok(())
     } else {
         Err(native_abi_error(
@@ -939,7 +1174,12 @@ fn validate_wrapper_conversion_abi(
     abi: &RustExternAbi,
 ) -> Result<(), String> {
     match abi.support {
-        RustAbiSupport::Direct | RustAbiSupport::Unsupported => Ok(()),
+        RustAbiSupport::Direct => Ok(()),
+        RustAbiSupport::Unsupported => Err(native_abi_error(
+            descriptor,
+            key,
+            "unsupported native ABI metadata",
+        )),
         RustAbiSupport::NeedsWrapperConversion
             if abi.supported_callback_wrapper() || abi.supported_collection_wrapper() =>
         {
@@ -1102,13 +1342,16 @@ fn param_contains_callback(param: &ExternParam) -> bool {
 fn type_contains_callback(ty: &ExternTypeExpr) -> bool {
     match ty {
         ExternTypeExpr::Callback(_) => true,
-        ExternTypeExpr::List(inner) | ExternTypeExpr::Option(inner) => {
-            type_contains_callback(inner)
-        }
-        ExternTypeExpr::Map(key, value) => {
+        ExternTypeExpr::List(inner)
+        | ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::Array { elem: inner, .. }
+        | ExternTypeExpr::Slice(inner) => type_contains_callback(inner),
+        ExternTypeExpr::Map(key, value) | ExternTypeExpr::Result(key, value) => {
             type_contains_callback(key) || type_contains_callback(value)
         }
+        ExternTypeExpr::Tuple(fields) => fields.iter().any(type_contains_callback),
         ExternTypeExpr::Void
+        | ExternTypeExpr::Unit
         | ExternTypeExpr::Bool
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
@@ -1121,7 +1364,13 @@ fn type_contains_callback(ty: &ExternTypeExpr) -> bool {
 fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
     match ty {
         ExternTypeExpr::List(_) | ExternTypeExpr::Map(_, _) => true,
-        ExternTypeExpr::Option(inner) => type_contains_collection(inner),
+        ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::Array { elem: inner, .. }
+        | ExternTypeExpr::Slice(inner) => type_contains_collection(inner),
+        ExternTypeExpr::Result(ok, err) => {
+            type_contains_collection(ok) || type_contains_collection(err)
+        }
+        ExternTypeExpr::Tuple(fields) => fields.iter().any(type_contains_collection),
         ExternTypeExpr::Callback(callback) => {
             callback
                 .params
@@ -1130,6 +1379,7 @@ fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
                 || type_contains_collection(&callback.ret)
         }
         ExternTypeExpr::Void
+        | ExternTypeExpr::Unit
         | ExternTypeExpr::Bool
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
@@ -1142,16 +1392,25 @@ fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
 fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
     match (&param.ty, param.flow, abi) {
         (ExternTypeExpr::Option(inner), ParamFlow::Value, RustParamAbi::Option(abi))
-        | (ExternTypeExpr::List(inner), ParamFlow::Value, RustParamAbi::List(abi)) => {
+        | (ExternTypeExpr::List(inner), ParamFlow::Value, RustParamAbi::List(abi))
+        | (ExternTypeExpr::Slice(inner), ParamFlow::Value, RustParamAbi::Slice(abi)) => {
             param_abi_matches(&value_param((**inner).clone()), abi)
+        }
+        (
+            ExternTypeExpr::Result(ok, err),
+            ParamFlow::Value,
+            RustParamAbi::Result(abi_ok, abi_err),
+        ) => {
+            param_abi_matches(&value_param((**ok).clone()), abi_ok)
+                && param_abi_matches(&value_param((**err).clone()), abi_err)
         }
         (
             ExternTypeExpr::Callback(callback),
             ParamFlow::Value,
             RustParamAbi::ScopedLambda(abi) | RustParamAbi::EscapingLambda(abi),
         ) => callback == abi,
-        (ty, ParamFlow::Value, RustParamAbi::Value(abi_ty))
-        | (ty, ParamFlow::Borrow, RustParamAbi::Borrow(abi_ty))
+        (ty, ParamFlow::Value, RustParamAbi::Value(abi_ty)) => bare_rust_value_matches(ty, abi_ty),
+        (ty, ParamFlow::Borrow, RustParamAbi::Borrow(abi_ty))
         | (
             ty,
             ParamFlow::MutBorrow,
@@ -1161,14 +1420,27 @@ fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
     }
 }
 
+fn bare_rust_value_matches(expected: &ExternTypeExpr, found: &ExternTypeExpr) -> bool {
+    !matches!(
+        expected,
+        ExternTypeExpr::Void
+            | ExternTypeExpr::Option(_)
+            | ExternTypeExpr::Result(_, _)
+            | ExternTypeExpr::Slice(_)
+    ) && expected == found
+}
+
 fn return_abi_matches(ret: &ExternTypeExpr, abi: &RustReturnAbi) -> bool {
     match (ret, abi) {
         (ExternTypeExpr::Void, RustReturnAbi::Void) => true,
         (ExternTypeExpr::Option(inner), RustReturnAbi::Option(abi)) => {
             return_abi_matches(inner, abi)
         }
+        (ExternTypeExpr::Result(ok, err), RustReturnAbi::Result(abi_ok, abi_err)) => {
+            return_abi_matches(ok, abi_ok) && return_abi_matches(err, abi_err)
+        }
         (ExternTypeExpr::List(inner), RustReturnAbi::List(abi)) => return_abi_matches(inner, abi),
-        (ty, RustReturnAbi::Value(abi_ty)) => ty == abi_ty,
+        (ty, RustReturnAbi::Value(abi_ty)) => bare_rust_value_matches(ty, abi_ty),
         _ => false,
     }
 }
@@ -1315,22 +1587,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_direct_collection_value_and_return_abis() {
+    fn accepts_canonical_collection_carrier_abis() {
         fn int_list() -> ExternTypeExpr {
             ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
         }
 
-        fn list_param_abi() -> RustParamAbi {
-            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)))
-        }
-
-        fn list_return_abi() -> RustReturnAbi {
-            RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)))
-        }
-
-        fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
-            binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
-            binding
+        fn string_int_map() -> ExternTypeExpr {
+            ExternTypeExpr::Map(
+                Box::new(ExternTypeExpr::String),
+                Box::new(ExternTypeExpr::Int),
+            )
         }
 
         for (descriptor, binding) in [
@@ -1357,41 +1623,103 @@ mod tests {
             ),
             (
                 param_descriptor(
-                    "take_list",
-                    int_list(),
+                    "take_map",
+                    string_int_map(),
                     ParamFlow::Value,
                     ExternTypeExpr::Void,
                 ),
-                void_binding("take_list", list_param_abi()),
+                void_binding("take_map", RustParamAbi::Value(string_int_map())),
             ),
             (
                 param_descriptor(
-                    "make_list",
+                    "make_map",
                     ExternTypeExpr::Void,
                     ParamFlow::Value,
-                    int_list(),
+                    string_int_map(),
                 ),
                 binding_with_abi(
-                    "make_list",
+                    "make_map",
                     RustParamAbi::Value(ExternTypeExpr::Void),
-                    list_return_abi(),
-                ),
-            ),
-            (
-                param_descriptor(
-                    "maybe_make",
-                    ExternTypeExpr::Void,
-                    ParamFlow::Value,
-                    ExternTypeExpr::Option(Box::new(int_list())),
-                ),
-                binding_with_abi(
-                    "maybe_make",
-                    RustParamAbi::Value(ExternTypeExpr::Void),
-                    RustReturnAbi::Option(Box::new(RustReturnAbi::Value(int_list()))),
+                    RustReturnAbi::Value(string_int_map()),
                 ),
             ),
         ] {
-            assert_abi_error(descriptor, binding, "direct collection ABI is unsupported");
+            assert_abi_ok(descriptor, binding);
+        }
+    }
+
+    #[test]
+    fn accepts_recursive_direct_collection_carriers() {
+        fn int_list() -> ExternTypeExpr {
+            ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
+        }
+
+        assert_abi_ok(
+            param_descriptor(
+                "visible_result_list",
+                ExternTypeExpr::List(Box::new(ExternTypeExpr::Result(
+                    Box::new(ExternTypeExpr::Int),
+                    Box::new(ExternTypeExpr::String),
+                ))),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            void_binding(
+                "visible_result_list",
+                RustParamAbi::Value(ExternTypeExpr::List(Box::new(ExternTypeExpr::Result(
+                    Box::new(ExternTypeExpr::Int),
+                    Box::new(ExternTypeExpr::String),
+                )))),
+            ),
+        );
+
+        assert_abi_ok(
+            param_descriptor(
+                "maybe_make",
+                ExternTypeExpr::Void,
+                ParamFlow::Value,
+                ExternTypeExpr::Option(Box::new(int_list())),
+            ),
+            binding_with_abi(
+                "maybe_make",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::Option(Box::new(RustReturnAbi::Value(int_list()))),
+            ),
+        );
+
+        let direct_wrapper = void_binding(
+            "take_list",
+            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+        );
+        assert_abi_error(
+            param_descriptor(
+                "take_list",
+                int_list(),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            direct_wrapper,
+            "unsupported native ABI metadata",
+        );
+    }
+
+    #[test]
+    fn accepts_scalar_list_copy_wrappers() {
+        fn int_list() -> ExternTypeExpr {
+            ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
+        }
+
+        fn list_param_abi() -> RustParamAbi {
+            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)))
+        }
+
+        fn list_return_abi() -> RustReturnAbi {
+            RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)))
+        }
+
+        fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
+            binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
+            binding
         }
 
         assert_abi_ok(
@@ -1490,6 +1818,149 @@ mod tests {
     }
 
     #[test]
+    fn rejects_descriptor_abi_position_violations() {
+        assert_abi_error(
+            param_descriptor(
+                "make_slice",
+                ExternTypeExpr::Void,
+                ParamFlow::Value,
+                ExternTypeExpr::Slice(Box::new(ExternTypeExpr::Int)),
+            ),
+            binding_with_abi(
+                "make_slice",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::Value(ExternTypeExpr::Slice(Box::new(ExternTypeExpr::Int))),
+            ),
+            "return descriptor ABI violation: SliceOutsideParam",
+        );
+
+        let nested = ExternCallbackSignature {
+            params: vec![],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        };
+        let callback = ExternCallbackSignature {
+            params: vec![ExternCallbackParam {
+                ty: ExternTypeExpr::Callback(nested.clone()),
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        };
+        assert_abi_error(
+            callback_descriptor(
+                "with_callback",
+                callback.clone(),
+                CallbackEscape::NonEscaping,
+            ),
+            scoped_lambda_binding("with_callback", callback),
+            "CallbackNested",
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_abi_metadata() {
+        let result = ExternTypeExpr::Result(
+            Box::new(ExternTypeExpr::Int),
+            Box::new(ExternTypeExpr::String),
+        );
+        let result_param = RustParamAbi::Result(
+            Box::new(RustParamAbi::Value(ExternTypeExpr::Int)),
+            Box::new(RustParamAbi::Value(ExternTypeExpr::String)),
+        );
+        let result_ret = RustReturnAbi::Result(
+            Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)),
+            Box::new(RustReturnAbi::Value(ExternTypeExpr::String)),
+        );
+        let mut result_binding = binding_with_abi("visible_result", result_param, result_ret);
+        result_binding.abi.support = RustAbiSupport::Unsupported;
+        assert_abi_error(
+            param_descriptor(
+                "visible_result",
+                result,
+                ParamFlow::Value,
+                ExternTypeExpr::Result(
+                    Box::new(ExternTypeExpr::Int),
+                    Box::new(ExternTypeExpr::String),
+                ),
+            ),
+            result_binding,
+            "unsupported native ABI metadata",
+        );
+    }
+
+    #[test]
+    fn accepts_direct_option_result_and_slice_metadata() {
+        assert_abi_ok(
+            param_descriptor(
+                "maybe",
+                ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            void_binding(
+                "maybe",
+                RustParamAbi::Option(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+            ),
+        );
+
+        assert_abi_ok(
+            param_descriptor(
+                "visible_result",
+                ExternTypeExpr::Result(
+                    Box::new(ExternTypeExpr::Int),
+                    Box::new(ExternTypeExpr::String),
+                ),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            void_binding(
+                "visible_result",
+                RustParamAbi::Result(
+                    Box::new(RustParamAbi::Value(ExternTypeExpr::Int)),
+                    Box::new(RustParamAbi::Value(ExternTypeExpr::String)),
+                ),
+            ),
+        );
+
+        assert_abi_ok(
+            param_descriptor(
+                "slice",
+                ExternTypeExpr::Slice(Box::new(ExternTypeExpr::Int)),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            void_binding(
+                "slice",
+                RustParamAbi::Slice(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+            ),
+        );
+    }
+
+    #[test]
+    fn rejects_wrapped_values_as_bare_rust_values() {
+        assert_abi_error(
+            param_descriptor(
+                "maybe",
+                ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)),
+                ParamFlow::Value,
+                ExternTypeExpr::Void,
+            ),
+            void_binding(
+                "maybe",
+                RustParamAbi::Value(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))),
+            ),
+            "parameter 0 ABI mismatch",
+        );
+    }
+
+    #[test]
     fn accepts_scoped_lambda_abi() {
         let callback = callback_signature(
             vec![ExternCallbackParam {
@@ -1542,6 +2013,7 @@ mod tests {
                     doc: None,
                     rep: ExternRep::Shared,
                     fields: vec![],
+                    variants: vec![],
                     init: None,
                     methods: vec![],
                     statics: vec![ExternStaticDescriptor {
@@ -1644,9 +2116,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_hidden_ctx_without_scoped_lambda() {
+    fn accepts_direct_binding_without_hidden_ctx() {
         let descriptor = descriptor();
         let mut binding = binding("ping");
+        binding.abi.ctx = RustWrapperCtx::None;
+
+        assert_abi_ok(descriptor, binding);
+    }
+
+    #[test]
+    fn rejects_mut_place_without_hidden_ctx() {
+        let descriptor = mutable_descriptor("bump", ExternTypeExpr::Int);
+        let mut binding = void_binding("bump", RustParamAbi::MutPlace(ExternTypeExpr::Int));
         binding.abi.ctx = RustWrapperCtx::None;
 
         assert_abi_error(descriptor, binding, "wrapper ctx mode mismatch");
@@ -1804,6 +2285,7 @@ mod tests {
                     doc: None,
                     rep: ExternRep::Shared,
                     fields: vec![],
+                    variants: vec![],
                     init: None,
                     methods: vec![ExternMethodDescriptor {
                         name: "mixed".to_string(),
@@ -1911,7 +2393,7 @@ mod tests {
         assert_abi_error(
             descriptor,
             binding,
-            "native callback return ABI is unsupported",
+            "return descriptor ABI violation: CallbackOutsideParam",
         );
     }
 
@@ -2020,7 +2502,7 @@ mod tests {
 
         let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
 
-        assert!(error.contains("direct callback ABI is unsupported"));
+        assert!(error.contains("CallbackNested"));
     }
 
     fn callback_signature(
@@ -2112,6 +2594,9 @@ mod tests {
         flow: ParamFlow,
         ret: ExternTypeExpr,
     ) -> ProviderDescriptor {
+        if ty == ExternTypeExpr::Void && flow == ParamFlow::Value {
+            return descriptor_with_params(name, vec![], ret);
+        }
         descriptor_with_param(
             name,
             ExternParam {
@@ -2139,7 +2624,11 @@ mod tests {
 
     fn binding_with_abi(name: &str, abi: RustParamAbi, ret: RustReturnAbi) -> RustExternBinding {
         let mut binding = binding(name);
-        binding.abi.params = vec![abi];
+        binding.abi.params = if abi == RustParamAbi::Value(ExternTypeExpr::Void) {
+            vec![]
+        } else {
+            vec![abi]
+        };
         binding.abi.ret = ret;
         binding
     }

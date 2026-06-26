@@ -8,17 +8,17 @@ use super::{
     AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
     AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg,
     Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData,
-    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternBindingDecl,
-    ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
-    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
-    ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind, FunctionOwner,
-    FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect,
-    LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId,
-    Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability,
-    Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program,
-    RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource,
-    Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership,
-    place_model,
+    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi,
+    ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl,
+    ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
+    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function,
+    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, FunctionValueCapability,
+    GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg, LambdaCaptureDecl,
+    LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind,
+    MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape,
+    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode,
+    ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData,
+    TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -546,6 +546,8 @@ impl TypeLowerer {
             has_init: source.constructor_fields().is_some(),
             init_fields: vec![],
             fields: vec![],
+            variants: vec![],
+            variant_abis: vec![],
             methods: vec![],
             statics: vec![],
             operators: vec![],
@@ -561,6 +563,7 @@ impl TypeLowerer {
                 Ok(ExternFieldDecl {
                     name: field.name,
                     ty: self.lower_with_env(program, &field.ty.ty, env.reborrow())?,
+                    abi: field.ty.abi.clone(),
                     get_receiver: ExternReceiverDecl {
                         ty: id,
                         mode: receiver_mode(field.get_receiver),
@@ -575,6 +578,49 @@ impl TypeLowerer {
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
+        let variant_data = source
+            .variants
+            .iter()
+            .map(|variant| {
+                let fields = variant
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        Ok((
+                            field.name,
+                            self.lower_with_env(program, &field.ty.ty, env.reborrow())?,
+                            field.ty.abi.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, LowerError>>()?;
+                let shape = match fields.as_slice() {
+                    [] => VariantShape::Unit,
+                    fields if fields.iter().all(|(name, _, _)| name.is_none()) => {
+                        VariantShape::Tuple(fields.iter().map(|(_, ty, _)| *ty).collect())
+                    }
+                    fields => VariantShape::Struct(
+                        fields
+                            .iter()
+                            .map(|(name, ty, _)| FieldDecl {
+                                name: name.expect("validated named extern variant field"),
+                                ty: *ty,
+                            })
+                            .collect(),
+                    ),
+                };
+                Ok((
+                    VariantDecl {
+                        name: variant.name,
+                        shape,
+                        raw_value: None,
+                    },
+                    ExternVariantAbiDecl {
+                        fields: fields.into_iter().map(|(_, _, abi)| abi).collect(),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, LowerError>>()?;
+        let (variants, variant_abis) = variant_data.into_iter().unzip();
         let methods = source
             .methods
             .iter()
@@ -609,6 +655,10 @@ impl TypeLowerer {
                         &method.signature.ret.ty,
                         env.reborrow(),
                     )?,
+                    abi: extern_receiver_signature_abi(
+                        &source.key,
+                        extern_signature_abi(&method.signature),
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
@@ -638,6 +688,7 @@ impl TypeLowerer {
                         &static_method.signature.ret.ty,
                         env.reborrow(),
                     )?,
+                    abi: extern_signature_abi(&static_method.signature),
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
@@ -670,6 +721,10 @@ impl TypeLowerer {
                         &operator.signature.ret.ty,
                         env.reborrow(),
                     )?,
+                    abi: extern_receiver_signature_abi(
+                        &source.key,
+                        extern_signature_abi(&operator.signature),
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
@@ -683,6 +738,8 @@ impl TypeLowerer {
             .unwrap_or_default();
         let decl = program.extern_type_mut(extern_id);
         decl.fields = fields;
+        decl.variants = variants;
+        decl.variant_abis = variant_abis;
         decl.init_fields = init_fields;
         decl.methods = methods;
         decl.statics = statics;
@@ -707,6 +764,58 @@ impl TypeLowerer {
             })
             .transpose()?
             .unwrap_or_default())
+    }
+}
+
+fn extern_signature_abi(signature: &crate::externs::catalog::ResolvedExternSignature) -> ExternAbi {
+    ExternAbi {
+        params: signature
+            .params
+            .iter()
+            .map(|param| param.ty.abi.clone())
+            .collect(),
+        ret: signature.ret.abi.clone(),
+    }
+}
+
+fn extern_receiver_abi(
+    owner: &crate::externs::catalog::TypeKey,
+    ret: anvyx_externs::ExternTypeExpr,
+) -> ExternAbi {
+    extern_receiver_signature_abi(
+        owner,
+        ExternAbi {
+            params: vec![],
+            ret,
+        },
+    )
+}
+
+fn extern_receiver_signature_abi(
+    owner: &crate::externs::catalog::TypeKey,
+    mut abi: ExternAbi,
+) -> ExternAbi {
+    abi.params.insert(
+        0,
+        anvyx_externs::ExternTypeExpr::Named {
+            module: extern_receiver_module(&owner.module),
+            name: owner.name.as_str().to_string(),
+            args: vec![],
+        },
+    );
+    abi
+}
+
+fn extern_receiver_module(module: &ModuleScope) -> Option<anvyx_externs::ModulePath> {
+    match module {
+        ModuleScope::Named(path) => Some(path.to_extern_path()),
+        ModuleScope::Package(module) => match module.path() {
+            PackageModulePath::Named(path) | PackageModulePath::Provider(path) => {
+                Some(path.to_extern_path())
+            }
+            PackageModulePath::Root | PackageModulePath::Source(_) => None,
+        },
+        ModuleScope::Root => None,
     }
 }
 
@@ -1041,6 +1150,7 @@ impl LowerCx<'_> {
         member: ExternMember,
         params: Vec<ExternParamDecl>,
         return_type: TypeId,
+        abi: ExternAbi,
         info: ExternLoweringInfo,
     ) -> ExternId {
         let module = self.ensure_module(scope);
@@ -1061,6 +1171,7 @@ impl LowerCx<'_> {
             member,
             params,
             return_type,
+            abi,
             binding,
             effects,
         });
@@ -1124,6 +1235,7 @@ impl LowerCx<'_> {
                     },
                     params,
                     return_type,
+                    extern_receiver_abi(&ty.key, field_decl.ty.abi.clone()),
                     externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Get),
                 ))
             }
@@ -1150,6 +1262,13 @@ impl LowerCx<'_> {
                     },
                     params,
                     return_type,
+                    extern_receiver_signature_abi(
+                        &ty.key,
+                        ExternAbi {
+                            params: vec![field_decl.ty.abi.clone()],
+                            ret: anvyx_externs::ExternTypeExpr::Void,
+                        },
+                    ),
                     externs.field_lowering_info(field, anvyx_externs::ExternBindingOp::Set),
                 ))
             }
@@ -1172,6 +1291,7 @@ impl LowerCx<'_> {
                     },
                     params,
                     return_type,
+                    extern_receiver_signature_abi(&ty.key, extern_signature_abi(&method.signature)),
                     externs.method_lowering_info(method_ref),
                 ))
             }
@@ -1187,20 +1307,28 @@ impl LowerCx<'_> {
                     ExternMember::StaticMethod { owner },
                     params,
                     return_type,
+                    extern_signature_abi(&static_method.signature),
                     externs.static_lowering_info(static_ref),
                 ))
             }
             ExternUseTarget::Init(owner_id) => {
                 let ty = externs.ty(owner_id);
                 let owner = self.lower_extern_owner(&ty.nominal)?;
-                let return_type = self.extern_owner_type(owner);
+                let signature = ty
+                    .init
+                    .as_ref()
+                    .map(|init| &init.signature)
+                    .expect("extern init target has descriptor");
+                let params = self.lower_extern_signature_params(signature)?;
+                let return_type = self.lower_ty(&signature.ret.ty)?;
                 Ok(self.alloc_extern_in_module(
                     &ty.key.module,
                     target,
                     ty.key.name,
                     ExternMember::Init { owner },
-                    vec![],
+                    params,
                     return_type,
+                    extern_signature_abi(signature),
                     externs.init_lowering_info(owner_id),
                 ))
             }
@@ -1227,6 +1355,10 @@ impl LowerCx<'_> {
                     },
                     vec![],
                     return_type,
+                    extern_receiver_signature_abi(
+                        &ty.key,
+                        extern_signature_abi(&operator.signature),
+                    ),
                     externs.operator_lowering_info(operator_ref),
                 ))
             }
@@ -1255,6 +1387,10 @@ impl LowerCx<'_> {
                     },
                     params,
                     return_type,
+                    extern_receiver_signature_abi(
+                        &ty.key,
+                        extern_signature_abi(&operator.signature),
+                    ),
                     externs.operator_lowering_info(operator_ref),
                 ))
             }
@@ -1276,6 +1412,7 @@ impl LowerCx<'_> {
             ExternMember::FreeFunction,
             params,
             return_type,
+            extern_signature_abi(&function.signature),
             externs.function_lowering_info(id),
         ))
     }
@@ -6172,6 +6309,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         capture_dataref_roots: bool,
     ) -> Result<CallArg, LowerError> {
         match param.mode {
+            ParamMode::Value
+                if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) =>
+            {
+                Ok(CallArg::Value(Operand::Place(
+                    self.lower_shared_slice_call_arg(expr, param.ty)?,
+                )))
+            }
             ParamMode::Value => Ok(CallArg::Value(
                 self.lower_expected_value(expr, param.ty, expr)?,
             )),
@@ -8022,7 +8166,13 @@ fn lower_raw_enum_value(value: &TcRawEnumValue) -> RawEnumValue {
 }
 
 fn enum_core_kind(decls: &DeclarationIndex, key: &NominalKey) -> Option<CoreEnumKind> {
-    (decls.core_option_key().as_ref() == Some(key)).then_some(CoreEnumKind::Option)
+    if decls.core_option_key().as_ref() == Some(key) {
+        Some(CoreEnumKind::Option)
+    } else if decls.core_result_key().as_ref() == Some(key) {
+        Some(CoreEnumKind::Result)
+    } else {
+        None
+    }
 }
 
 fn source_param_mode(mutable: bool) -> ParamMode {
@@ -10757,37 +10907,6 @@ mod tests {
     }
 
     #[test]
-    fn extern_callback_return_lowers_as_unknown_function_value() {
-        let air = lower_root(
-            "extern fn native_make() -> fn(int) -> int; fn main() { let f = native_make(); }",
-            "main",
-        )
-        .expect("lower failed");
-        let native = air
-            .externs
-            .iter()
-            .find(|decl| decl.name == Ident::new("native_make"))
-            .expect("missing extern");
-
-        assert!(matches!(
-            air.type_data(native.return_type),
-            TypeData::Function(_)
-        ));
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::FunctionValue {
-                        capability: FunctionValueCapability::Unknown,
-                        ..
-                    },
-                    ..
-                }
-            )
-        }));
-    }
-
-    #[test]
     fn source_callback_return_lowers_as_escaping_function_value() {
         let air = lower_root(
             "fn add(x: int) -> int { x + 1 } fn make() -> fn(int) -> int { add } fn main() { let f = make(); }",
@@ -13124,6 +13243,7 @@ mod tests {
                         set_receiver: anvyx_externs::ReceiverMode::Mutable,
                         doc: None,
                     }],
+                    variants: vec![],
                     init: None,
                     methods: vec![anvyx_externs::ExternMethodDescriptor {
                         name: "move".to_string(),

@@ -1,12 +1,30 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{AnvyxRef, ExternRep, ExternTypeExpr};
+use std::{cell::Cell, rc::Rc};
+
+use anvyx_runtime::{
+    AnvRef, AnvRefType, AnvyxRef, ExternRep, ExternTypeExpr, Heap, Trace, TraceDriver, Visitor,
+};
 
 #[derive(AnvyxRef)]
 #[anvyx(name = "Counter")]
 struct HostCounter {
     #[anvyx(field)]
     count: i64,
+}
+
+struct HostNode<'cx> {
+    child: Option<AnvRef<'cx, HostNode<'cx>>>,
+    traces: Rc<Cell<usize>>,
+}
+
+impl anvyx_runtime::AnvyxRefExport for HostNode<'_> {}
+
+unsafe impl<'cx> Trace<'cx> for HostNode<'cx> {
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        self.traces.set(self.traces.get() + 1);
+        self.child.trace(visitor);
+    }
 }
 
 fn assert_ref<T: anvyx_runtime::AnvyxRefExport>() {}
@@ -23,4 +41,64 @@ fn ref_descriptor_contains_exported_fields_and_name() {
     assert_eq!(export.descriptor.fields[0].name, "count");
     assert_eq!(export.descriptor.fields[0].ty, ExternTypeExpr::Int);
     assert!(export.bindings.is_empty());
+}
+
+#[test]
+fn ref_value_allocates_and_borrows_managed_resource() {
+    Heap::scope(|heap| {
+        let counter_ty = AnvRefType::<HostCounter>::register_untracked(heap);
+        let counter = counter_ty.alloc(heap, HostCounter { count: 1 });
+        let alias = counter.clone();
+
+        assert!(counter.ptr_eq(&alias));
+        assert_eq!(counter.with(heap, |counter| counter.count).unwrap(), 1);
+        counter
+            .with_mut(heap, |counter| counter.count += 1)
+            .unwrap();
+        assert_eq!(alias.with(heap, |counter| counter.count).unwrap(), 2);
+
+        let erased = counter.erase(heap).unwrap();
+        assert_eq!(
+            counter_ty
+                .with_erased(heap, &erased, |counter| counter.count)
+                .unwrap(),
+            2
+        );
+        counter_ty
+            .with_erased_mut(heap, &erased, |counter| counter.count += 3)
+            .unwrap();
+        assert_eq!(counter.with(heap, |counter| counter.count).unwrap(), 5);
+    });
+}
+
+#[test]
+fn ref_value_traces_native_resource_edges() {
+    Heap::scope(|heap| {
+        let traces = Rc::new(Cell::new(0));
+        let node_ty = AnvRefType::<HostNode<'_>>::register_tracked(heap);
+        let child = node_ty.alloc(
+            heap,
+            HostNode {
+                child: None,
+                traces: Rc::clone(&traces),
+            },
+        );
+        let parent = node_ty.alloc(
+            heap,
+            HostNode {
+                child: Some(child.clone()),
+                traces: Rc::clone(&traces),
+            },
+        );
+        child
+            .with_mut(heap, |child| child.child = Some(parent.clone()))
+            .unwrap();
+
+        drop(child);
+        drop(parent);
+        heap.collect_all();
+
+        assert!(traces.get() > 0);
+        assert_eq!(heap.stats().live, 0);
+    });
 }

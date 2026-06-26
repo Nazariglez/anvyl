@@ -30,6 +30,7 @@ pub struct CleanReturn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanType {
     Void,
+    Unit,
     Bool,
     Int,
     Float,
@@ -37,7 +38,13 @@ pub enum CleanType {
     Named(String),
     Callback(CleanCallback),
     Option(Box<CleanType>),
+    Result(Box<CleanType>, Box<CleanType>),
+    Tuple(Vec<CleanType>),
+    Array { elem: Box<CleanType>, len: u64 },
+    VecList(Box<CleanType>),
     List(Box<CleanType>),
+    Map(Box<CleanType>, Box<CleanType>),
+    Slice(Box<CleanType>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +69,9 @@ pub enum CleanParamAbi {
     ScopedLambda(CleanCallback),
     EscapingLambda(CleanCallback),
     Option(Box<CleanParamAbi>),
+    Result(Box<CleanParamAbi>, Box<CleanParamAbi>),
     List(Box<CleanParamAbi>),
+    Slice(Box<CleanParamAbi>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +79,7 @@ pub enum CleanReturnAbi {
     Void,
     Value(CleanType),
     Option(Box<CleanReturnAbi>),
+    Result(Box<CleanReturnAbi>, Box<CleanReturnAbi>),
     List(Box<CleanReturnAbi>),
 }
 
@@ -281,34 +291,67 @@ pub fn classify_param(pat_ty: &syn::PatType, has_ctx: bool) -> syn::Result<Clean
 }
 
 pub fn classify_return(output: &ReturnType) -> syn::Result<CleanReturn> {
+    classify_return_with_trap(output, false)
+}
+
+pub fn classify_return_with_trap(output: &ReturnType, trap: bool) -> syn::Result<CleanReturn> {
     match output {
+        ReturnType::Default if trap => Err(syn::Error::new_spanned(
+            output,
+            "#[function(trap)] requires Result<T, RuntimeError>",
+        )),
         ReturnType::Default => Ok(CleanReturn {
             ty: CleanType::Void,
             abi: CleanReturnAbi::Void,
             fallible: false,
             conversion: BoundaryConversion::Direct,
         }),
-        ReturnType::Type(_, ty) => classify_return_type(ty),
+        ReturnType::Type(_, ty) => classify_return_type(ty, trap),
     }
 }
 
-fn classify_return_type(ty: &Type) -> syn::Result<CleanReturn> {
+fn classify_return_type(ty: &Type, trap: bool) -> syn::Result<CleanReturn> {
     if let Some((ok, err)) = result_args(ty)? {
-        if !is_runtime_error(err) {
+        if trap {
+            if !is_runtime_error(err) {
+                return Err(syn::Error::new_spanned(
+                    err,
+                    "#[function(trap)] only supports Result<T, RuntimeError>",
+                ));
+            }
+            let (ty, _) = classify_type(ok, Position::Return)?;
+            let abi = return_abi(&ty);
+            let conversion = return_conversion_for_type(&ty);
+            return Ok(CleanReturn {
+                ty,
+                abi,
+                fallible: true,
+                conversion,
+            });
+        }
+        if is_runtime_error(err) {
             return Err(syn::Error::new_spanned(
                 err,
-                "#[function] only supports Result<T, RuntimeError>",
+                "Result<T, RuntimeError> requires #[function(trap)]",
             ));
         }
-        let (ty, _) = classify_type(ok, Position::Return)?;
-        let abi = return_abi(&ty);
-        let conversion = return_conversion_for_type(&ty);
+        let (ok, ok_flow) = classify_type(ok, Position::WrapperElement)?;
+        reject_wrapper_element(ty, &ok, ok_flow)?;
+        let (err, err_flow) = classify_type(err, Position::WrapperElement)?;
+        reject_wrapper_element(ty, &err, err_flow)?;
+        let ty = CleanType::Result(Box::new(ok), Box::new(err));
         return Ok(CleanReturn {
+            abi: return_abi(&ty),
+            conversion: return_conversion_for_type(&ty),
             ty,
-            abi,
-            fallible: true,
-            conversion,
+            fallible: false,
         });
+    }
+    if trap {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "#[function(trap)] requires Result<T, RuntimeError>",
+        ));
     }
     let (ty, _) = classify_type(ty, Position::Return)?;
     let abi = return_abi(&ty);
@@ -333,9 +376,44 @@ pub fn classify_field_type(source: &Type) -> syn::Result<CleanType> {
     Ok(ty)
 }
 
-fn classify_type(ty: &Type, position: Position) -> syn::Result<(CleanType, CleanFlow)> {
+pub(crate) fn classify_type(ty: &Type, position: Position) -> syn::Result<(CleanType, CleanFlow)> {
     match ty {
-        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok((CleanType::Void, CleanFlow::Value)),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok((CleanType::Unit, CleanFlow::Value)),
+        Type::Tuple(tuple) => {
+            let fields = tuple
+                .elems
+                .iter()
+                .map(|field| {
+                    let (ty, flow) = classify_type(field, Position::WrapperElement)?;
+                    reject_wrapper_element(field, &ty, flow)?;
+                    Ok(ty)
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            Ok((CleanType::Tuple(fields), CleanFlow::Value))
+        }
+        Type::Array(array) => {
+            let syn::Expr::Lit(len) = &array.len else {
+                return Err(syn::Error::new_spanned(
+                    &array.len,
+                    "array ABI lengths must be integer literals",
+                ));
+            };
+            let syn::Lit::Int(len) = &len.lit else {
+                return Err(syn::Error::new_spanned(
+                    &array.len,
+                    "array ABI lengths must be integer literals",
+                ));
+            };
+            let (elem, flow) = classify_type(&array.elem, Position::WrapperElement)?;
+            reject_wrapper_element(&array.elem, &elem, flow)?;
+            Ok((
+                CleanType::Array {
+                    elem: Box::new(elem),
+                    len: len.base10_parse()?,
+                },
+                CleanFlow::Value,
+            ))
+        }
         Type::Reference(reference) => {
             if position != Position::Param {
                 return Err(syn::Error::new_spanned(
@@ -401,7 +479,11 @@ fn classify_path(path: &TypePath, position: Position) -> syn::Result<(CleanType,
     if path_is(path, &["f64"]) {
         return Ok((CleanType::Float, CleanFlow::Value));
     }
-    if path_is(path, &["String"]) || path_is(path, &["std", "string", "String"]) {
+    if path_is(path, &["String"])
+        || path_is(path, &["std", "string", "String"])
+        || path_is(path, &["AnvString"])
+        || path_is(path, &["anvyx_runtime", "AnvString"])
+    {
         return Ok((CleanType::String, CleanFlow::Value));
     }
     for rejected in [
@@ -419,17 +501,63 @@ fn classify_path(path: &TypePath, position: Position) -> syn::Result<(CleanType,
         reject_wrapper_element(inner, &ty, flow)?;
         return Ok((CleanType::Option(Box::new(ty)), CleanFlow::Value));
     }
+    if let Some((ok_ty, err_ty)) = result_type_args(path)? {
+        let (ok, ok_flow) = classify_type(ok_ty, Position::WrapperElement)?;
+        reject_wrapper_element(ok_ty, &ok, ok_flow)?;
+        let (err, err_flow) = classify_type(err_ty, Position::WrapperElement)?;
+        reject_wrapper_element(err_ty, &err, err_flow)?;
+        return Ok((
+            CleanType::Result(Box::new(ok), Box::new(err)),
+            CleanFlow::Value,
+        ));
+    }
     if let Some(inner) = one_type_arg(path, &[&["Vec"], &["std", "vec", "Vec"]])? {
+        let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
+        reject_wrapper_element(inner, &ty, flow)?;
+        return Ok((CleanType::VecList(Box::new(ty)), CleanFlow::Value));
+    }
+    if let Some(args) =
+        runtime_cx_type_args(path, &[&["AnvList"], &["anvyx_runtime", "AnvList"]], 1)?
+    {
+        let inner = args[0];
         let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
         reject_wrapper_element(inner, &ty, flow)?;
         return Ok((CleanType::List(Box::new(ty)), CleanFlow::Value));
     }
-    if position == Position::Param && path.path.segments.len() == 1 {
+    if let Some(args) = runtime_cx_type_args(path, &[&["AnvMap"], &["anvyx_runtime", "AnvMap"]], 2)?
+    {
+        let (key, key_flow) = classify_type(args[0], Position::WrapperElement)?;
+        reject_wrapper_element(args[0], &key, key_flow)?;
+        let (value, value_flow) = classify_type(args[1], Position::WrapperElement)?;
+        reject_wrapper_element(args[1], &value, value_flow)?;
+        return Ok((
+            CleanType::Map(Box::new(key), Box::new(value)),
+            CleanFlow::Value,
+        ));
+    }
+    if let Some(args) =
+        runtime_cx_type_args(path, &[&["AnvSlice"], &["anvyx_runtime", "AnvSlice"]], 1)?
+    {
+        if position != Position::Param {
+            return Err(syn::Error::new_spanned(
+                path,
+                "AnvSlice is only supported in parameter position",
+            ));
+        }
+        let inner = args[0];
+        let (ty, flow) = classify_type(inner, Position::WrapperElement)?;
+        reject_wrapper_element(inner, &ty, flow)?;
+        return Ok((CleanType::Slice(Box::new(ty)), CleanFlow::Value));
+    }
+    if let Some(resource) = anv_ref_type_arg(path)? {
+        return Ok((CleanType::Named(resource), CleanFlow::Value));
+    }
+    if path.path.segments.len() == 1 {
         let segment = path.path.segments.first().expect("checked len");
         if segment.ident == "Self" {
             return Err(syn::Error::new_spanned(
                 path,
-                "Self is not supported in #[function] parameters",
+                "Self is not supported in #[function] boundaries",
             ));
         }
         if reserved_named_boundary_type(&segment.ident) {
@@ -488,6 +616,7 @@ pub fn named_type_expr_tokens(name: &str) -> TokenStream {
 fn extern_type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
     match ty {
         ExternTypeExpr::Void => quote! { anvyx_runtime::ExternTypeExpr::Void },
+        ExternTypeExpr::Unit => quote! { anvyx_runtime::ExternTypeExpr::Unit },
         ExternTypeExpr::Bool => quote! { anvyx_runtime::ExternTypeExpr::Bool },
         ExternTypeExpr::Int => quote! { anvyx_runtime::ExternTypeExpr::Int },
         ExternTypeExpr::Float => quote! { anvyx_runtime::ExternTypeExpr::Float },
@@ -517,6 +646,19 @@ fn extern_type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
             let inner = extern_type_expr_tokens(inner);
             quote! { anvyx_runtime::ExternTypeExpr::Option(Box::new(#inner)) }
         }
+        ExternTypeExpr::Result(ok, err) => {
+            let ok = extern_type_expr_tokens(ok);
+            let err = extern_type_expr_tokens(err);
+            quote! { anvyx_runtime::ExternTypeExpr::Result(Box::new(#ok), Box::new(#err)) }
+        }
+        ExternTypeExpr::Tuple(fields) => {
+            let fields = fields.iter().map(extern_type_expr_tokens);
+            quote! { anvyx_runtime::ExternTypeExpr::Tuple(vec![#(#fields),*]) }
+        }
+        ExternTypeExpr::Array { elem, len } => {
+            let elem = extern_type_expr_tokens(elem);
+            quote! { anvyx_runtime::ExternTypeExpr::Array { elem: Box::new(#elem), len: #len } }
+        }
         ExternTypeExpr::List(inner) => {
             let inner = extern_type_expr_tokens(inner);
             quote! { anvyx_runtime::ExternTypeExpr::List(Box::new(#inner)) }
@@ -525,6 +667,10 @@ fn extern_type_expr_tokens(ty: &ExternTypeExpr) -> TokenStream {
             let key = extern_type_expr_tokens(key);
             let value = extern_type_expr_tokens(value);
             quote! { anvyx_runtime::ExternTypeExpr::Map(Box::new(#key), Box::new(#value)) }
+        }
+        ExternTypeExpr::Slice(inner) => {
+            let inner = extern_type_expr_tokens(inner);
+            quote! { anvyx_runtime::ExternTypeExpr::Slice(Box::new(#inner)) }
         }
     }
 }
@@ -602,9 +748,18 @@ pub fn param_abi_tokens(abi: &CleanParamAbi) -> TokenStream {
             let inner = param_abi_tokens(inner);
             quote! { anvyx_runtime::RustParamAbi::Option(Box::new(#inner)) }
         }
+        CleanParamAbi::Result(ok, err) => {
+            let ok = param_abi_tokens(ok);
+            let err = param_abi_tokens(err);
+            quote! { anvyx_runtime::RustParamAbi::Result(Box::new(#ok), Box::new(#err)) }
+        }
         CleanParamAbi::List(inner) => {
             let inner = param_abi_tokens(inner);
             quote! { anvyx_runtime::RustParamAbi::List(Box::new(#inner)) }
+        }
+        CleanParamAbi::Slice(inner) => {
+            let inner = param_abi_tokens(inner);
+            quote! { anvyx_runtime::RustParamAbi::Slice(Box::new(#inner)) }
         }
     }
 }
@@ -619,6 +774,11 @@ pub fn return_abi_tokens(abi: &CleanReturnAbi) -> TokenStream {
         CleanReturnAbi::Option(inner) => {
             let inner = return_abi_tokens(inner);
             quote! { anvyx_runtime::RustReturnAbi::Option(Box::new(#inner)) }
+        }
+        CleanReturnAbi::Result(ok, err) => {
+            let ok = return_abi_tokens(ok);
+            let err = return_abi_tokens(err);
+            quote! { anvyx_runtime::RustReturnAbi::Result(Box::new(#ok), Box::new(#err)) }
         }
         CleanReturnAbi::List(inner) => {
             let inner = return_abi_tokens(inner);
@@ -635,12 +795,19 @@ pub fn param_abi(ty: &CleanType, flow: CleanFlow) -> CleanParamAbi {
             CleanType::Option(inner) => {
                 CleanParamAbi::Option(Box::new(param_abi(inner, CleanFlow::Value)))
             }
+            CleanType::Result(ok, err) => CleanParamAbi::Result(
+                Box::new(param_abi(ok, CleanFlow::Value)),
+                Box::new(param_abi(err, CleanFlow::Value)),
+            ),
             CleanType::Callback(callback) => match callback.escape {
                 CallbackEscape::NonEscaping => CleanParamAbi::ScopedLambda(callback.clone()),
                 CallbackEscape::Escaping => CleanParamAbi::EscapingLambda(callback.clone()),
             },
-            CleanType::List(inner) => {
+            CleanType::VecList(inner) => {
                 CleanParamAbi::List(Box::new(param_abi(inner, CleanFlow::Value)))
+            }
+            CleanType::Slice(inner) => {
+                CleanParamAbi::Slice(Box::new(param_abi(inner, CleanFlow::Value)))
             }
             _ => CleanParamAbi::Value(ty.clone()),
         },
@@ -651,8 +818,13 @@ pub fn return_abi(ty: &CleanType) -> CleanReturnAbi {
     match ty {
         CleanType::Void => CleanReturnAbi::Void,
         CleanType::Option(inner) => CleanReturnAbi::Option(Box::new(return_abi(inner))),
-        CleanType::List(inner) => CleanReturnAbi::List(Box::new(return_abi(inner))),
-        CleanType::Callback(_) => unreachable!("callbacks are rejected in return position"),
+        CleanType::Result(ok, err) => {
+            CleanReturnAbi::Result(Box::new(return_abi(ok)), Box::new(return_abi(err)))
+        }
+        CleanType::VecList(inner) => CleanReturnAbi::List(Box::new(return_abi(inner))),
+        CleanType::Callback(_) | CleanType::Slice(_) => {
+            unreachable!("callbacks and slices are rejected in return position")
+        }
         _ => CleanReturnAbi::Value(ty.clone()),
     }
 }
@@ -714,8 +886,8 @@ pub fn signature_conversion(params: &[CleanParam], ret: &CleanReturn) -> Boundar
 fn signature_uses_collection_wrapper(params: &[CleanParam], ret: &CleanReturn) -> bool {
     params
         .iter()
-        .any(|param| matches!(param.ty, CleanType::List(_)))
-        || matches!(ret.ty, CleanType::List(_))
+        .any(|param| matches!(param.ty, CleanType::VecList(_)))
+        || matches!(ret.ty, CleanType::VecList(_))
 }
 
 fn mut_place_macro_payload_supported(ty: &CleanType) -> bool {
@@ -723,10 +895,17 @@ fn mut_place_macro_payload_supported(ty: &CleanType) -> bool {
         CleanType::Bool | CleanType::Int | CleanType::Float => true,
         CleanType::Option(inner) => mut_place_macro_payload_supported(inner),
         CleanType::Void
+        | CleanType::Unit
         | CleanType::String
         | CleanType::Named(_)
         | CleanType::Callback(_)
-        | CleanType::List(_) => false,
+        | CleanType::Result(_, _)
+        | CleanType::Tuple(_)
+        | CleanType::Array { .. }
+        | CleanType::VecList(_)
+        | CleanType::List(_)
+        | CleanType::Map(_, _)
+        | CleanType::Slice(_) => false,
     }
 }
 
@@ -743,41 +922,58 @@ fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
     }
     match ty {
         CleanType::Callback(_) => BoundaryConversion::NeedsWrapper,
-        CleanType::List(inner) if scalar_list_wrapper_supported(inner) => {
+        CleanType::VecList(inner) if scalar_list_wrapper_supported(inner) => {
             BoundaryConversion::NeedsWrapper
         }
-        CleanType::Option(_) | CleanType::List(_) => BoundaryConversion::Unsupported,
-        _ => BoundaryConversion::Direct,
+        CleanType::VecList(_) => BoundaryConversion::Unsupported,
+        _ if direct_abi_supported(ty) => BoundaryConversion::Direct,
+        _ => BoundaryConversion::Unsupported,
     }
 }
 
-fn return_conversion_for_type(ty: &CleanType) -> BoundaryConversion {
+pub fn return_conversion_for_type(ty: &CleanType) -> BoundaryConversion {
     match ty {
-        CleanType::Option(inner) if return_option_inner_supported(inner) => {
-            BoundaryConversion::Direct
-        }
-        CleanType::List(inner) if scalar_list_wrapper_supported(inner) => {
+        CleanType::VecList(inner) if scalar_list_wrapper_supported(inner) => {
             BoundaryConversion::NeedsWrapper
         }
-        CleanType::Callback(_) | CleanType::Option(_) | CleanType::List(_) => {
+        CleanType::VecList(_) | CleanType::Callback(_) | CleanType::Slice(_) => {
             BoundaryConversion::Unsupported
         }
-        _ => BoundaryConversion::Direct,
+        _ if direct_abi_supported(ty) => BoundaryConversion::Direct,
+        _ => BoundaryConversion::Unsupported,
     }
 }
 
-fn return_option_inner_supported(ty: &CleanType) -> bool {
-    matches!(
-        ty,
-        CleanType::Bool | CleanType::Int | CleanType::Float | CleanType::String
-    )
+fn direct_abi_supported(ty: &CleanType) -> bool {
+    match ty {
+        CleanType::Void
+        | CleanType::Unit
+        | CleanType::Bool
+        | CleanType::Int
+        | CleanType::Float
+        | CleanType::String
+        | CleanType::Named(_)
+        | CleanType::List(_) => true,
+        CleanType::Option(inner)
+        | CleanType::Array { elem: inner, .. }
+        | CleanType::Slice(inner) => direct_abi_supported(inner),
+        CleanType::Result(ok, err) | CleanType::Map(ok, err) => {
+            direct_abi_supported(ok) && direct_abi_supported(err)
+        }
+        CleanType::Tuple(fields) => fields.iter().all(direct_abi_supported),
+        CleanType::Callback(_) | CleanType::VecList(_) => false,
+    }
 }
 
-fn reject_wrapper_element(ty: &Type, classified: &CleanType, flow: CleanFlow) -> syn::Result<()> {
-    if *classified == CleanType::Void {
+pub(crate) fn reject_wrapper_element(
+    ty: &Type,
+    classified: &CleanType,
+    flow: CleanFlow,
+) -> syn::Result<()> {
+    if matches!(classified, CleanType::Void | CleanType::Slice(_)) {
         return Err(syn::Error::new_spanned(
             ty,
-            "wrapper element types cannot be void",
+            "unsupported wrapper element type",
         ));
     }
     if flow != CleanFlow::Value {
@@ -786,17 +982,11 @@ fn reject_wrapper_element(ty: &Type, classified: &CleanType, flow: CleanFlow) ->
             "wrapper element types cannot be borrowed",
         ));
     }
-    if matches!(classified, CleanType::Named(_)) {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "named types are not supported in wrapper positions",
-        ));
-    }
     Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Position {
+pub(crate) enum Position {
     Param,
     Return,
     WrapperElement,
@@ -821,6 +1011,9 @@ fn reserved_named_boundary_type(ident: &Ident) -> bool {
             | "u128"
             | "Option"
             | "Vec"
+            | "AnvList"
+            | "AnvMap"
+            | "AnvSlice"
             | "Result"
             | "String"
             | "ScopedLambda"
@@ -911,7 +1104,10 @@ fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> 
             "callback wrapper return must be a type",
         ));
     };
-    let (ret, flow) = classify_type(ret_ty, Position::WrapperElement)?;
+    let (mut ret, flow) = classify_type(ret_ty, Position::WrapperElement)?;
+    if ret == CleanType::Unit {
+        ret = CleanType::Void;
+    }
     if flow != CleanFlow::Value || !callback_return_supported(&ret) {
         return Err(syn::Error::new_spanned(
             ret_ty,
@@ -1013,6 +1209,7 @@ fn named_type_expr(name: &str) -> ExternTypeExpr {
 fn extern_type_expr(ty: &CleanType) -> ExternTypeExpr {
     match ty {
         CleanType::Void => ExternTypeExpr::Void,
+        CleanType::Unit => ExternTypeExpr::Unit,
         CleanType::Bool => ExternTypeExpr::Bool,
         CleanType::Int => ExternTypeExpr::Int,
         CleanType::Float => ExternTypeExpr::Float,
@@ -1022,7 +1219,25 @@ fn extern_type_expr(ty: &CleanType) -> ExternTypeExpr {
             ExternTypeExpr::Callback(extern_callback_signature(callback))
         }
         CleanType::Option(inner) => ExternTypeExpr::Option(Box::new(extern_type_expr(inner))),
-        CleanType::List(inner) => ExternTypeExpr::List(Box::new(extern_type_expr(inner))),
+        CleanType::Result(ok, err) => ExternTypeExpr::Result(
+            Box::new(extern_type_expr(ok)),
+            Box::new(extern_type_expr(err)),
+        ),
+        CleanType::Tuple(fields) => {
+            ExternTypeExpr::Tuple(fields.iter().map(extern_type_expr).collect())
+        }
+        CleanType::Array { elem, len } => ExternTypeExpr::Array {
+            elem: Box::new(extern_type_expr(elem)),
+            len: *len,
+        },
+        CleanType::VecList(inner) | CleanType::List(inner) => {
+            ExternTypeExpr::List(Box::new(extern_type_expr(inner)))
+        }
+        CleanType::Map(key, value) => ExternTypeExpr::Map(
+            Box::new(extern_type_expr(key)),
+            Box::new(extern_type_expr(value)),
+        ),
+        CleanType::Slice(inner) => ExternTypeExpr::Slice(Box::new(extern_type_expr(inner))),
     }
 }
 
@@ -1041,7 +1256,14 @@ pub fn parse_descriptor_type_expr(
     } else if input.peek(syn::token::Bracket) {
         let content;
         bracketed!(content in input);
-        CleanType::List(Box::new(parse_descriptor_type_expr(&content, false)?))
+        let inner = parse_descriptor_type_expr(&content, false)?;
+        if !content.is_empty() {
+            return Err(syn::Error::new(
+                content.span(),
+                "unsupported descriptor type",
+            ));
+        }
+        CleanType::List(Box::new(inner))
     } else if input.peek(syn::token::Paren) {
         let content;
         syn::parenthesized!(content in input);
@@ -1051,7 +1273,7 @@ pub fn parse_descriptor_type_expr(
                 "unsupported descriptor type",
             ));
         }
-        CleanType::Void
+        CleanType::Unit
     } else {
         let ident: Ident = input.parse()?;
         match ident.to_string().as_str() {
@@ -1109,6 +1331,11 @@ fn parse_descriptor_callback(input: ParseStream) -> syn::Result<CleanType> {
     } else {
         CleanType::Void
     };
+    let ret = if ret == CleanType::Unit {
+        CleanType::Void
+    } else {
+        ret
+    };
     if !callback_return_supported(&ret) {
         return Err(syn::Error::new(
             input.span(),
@@ -1120,6 +1347,46 @@ fn parse_descriptor_callback(input: ParseStream) -> syn::Result<CleanType> {
         ret: Box::new(ret),
         escape: CallbackEscape::NonEscaping,
     }))
+}
+
+fn anv_ref_type_arg(path: &TypePath) -> syn::Result<Option<String>> {
+    if !path_is(path, &["AnvRef"]) && !path_is(path, &["anvyx_runtime", "AnvRef"]) {
+        return Ok(None);
+    }
+    let segment = path.path.segments.last().expect("matched path has segment");
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            segment,
+            "AnvRef requires a `'cx` lifetime and a type argument",
+        ));
+    };
+    if args.args.len() != 2 {
+        return Err(syn::Error::new_spanned(
+            args,
+            "AnvRef parameters must be `AnvRef<'cx, T>`",
+        ));
+    }
+    let mut args = args.args.iter();
+    let cx = args.next().expect("checked len");
+    if !matches!(cx, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx") {
+        return Err(syn::Error::new_spanned(cx, "AnvRef lifetime must be `'cx`"));
+    }
+    let GenericArgument::Type(Type::Path(ty)) = args.next().expect("checked len") else {
+        return Err(syn::Error::new_spanned(
+            segment,
+            "AnvRef requires a concrete type argument",
+        ));
+    };
+    if ty.qself.is_none()
+        && ty.path.segments.len() == 1
+        && matches!(ty.path.segments[0].arguments, PathArguments::None)
+    {
+        return Ok(Some(ty.path.segments[0].ident.to_string()));
+    }
+    Err(syn::Error::new_spanned(
+        ty,
+        "AnvRef resource type must be a concrete non-generic type name",
+    ))
 }
 
 fn mut_place_type_arg(path: &TypePath) -> syn::Result<Option<&Type>> {
@@ -1189,10 +1456,14 @@ fn one_type_arg<'a>(path: &'a TypePath, names: &[&[&str]]) -> syn::Result<Option
     }
 }
 
-fn result_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
+pub(crate) fn result_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
     let Type::Path(path) = ty else {
         return Ok(None);
     };
+    result_type_args(path)
+}
+
+fn result_type_args(path: &TypePath) -> syn::Result<Option<(&Type, &Type)>> {
     if !path_is(path, &["Result"]) && !path_is(path, &["std", "result", "Result"]) {
         return Ok(None);
     }
@@ -1223,6 +1494,46 @@ fn result_args(ty: &Type) -> syn::Result<Option<(&Type, &Type)>> {
         ));
     };
     Ok(Some((ok, err)))
+}
+
+fn runtime_cx_type_args<'a>(
+    path: &'a TypePath,
+    names: &[&[&str]],
+    type_count: usize,
+) -> syn::Result<Option<Vec<&'a Type>>> {
+    if !names.iter().any(|name| path_is(path, name)) {
+        return Ok(None);
+    }
+    let segment = path.path.segments.last().expect("matched path has segment");
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            segment,
+            "runtime ABI type requires a `'cx` lifetime and type argument(s)",
+        ));
+    };
+    if args.args.len() != type_count + 1 {
+        return Err(syn::Error::new_spanned(
+            args,
+            format!("runtime ABI type requires a `'cx` lifetime and {type_count} type argument(s)"),
+        ));
+    }
+    let mut args = args.args.iter();
+    let cx = args.next().expect("checked len");
+    if !matches!(cx, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx") {
+        return Err(syn::Error::new_spanned(
+            cx,
+            "runtime ABI lifetime must be `'cx`",
+        ));
+    }
+    args.map(|arg| match arg {
+        GenericArgument::Type(ty) => Ok(ty),
+        _ => Err(syn::Error::new_spanned(
+            arg,
+            "runtime ABI argument must be a type",
+        )),
+    })
+    .collect::<syn::Result<Vec<_>>>()
+    .map(Some)
 }
 
 pub fn parse_type_expr(text: &str) -> syn::Result<CleanType> {
@@ -1284,7 +1595,7 @@ fn parse_descriptor_type_text(text: &str, allow_callback: bool) -> syn::Result<C
     .parse_str(text)
 }
 
-fn is_runtime_error(ty: &Type) -> bool {
+pub(crate) fn is_runtime_error(ty: &Type) -> bool {
     let Type::Path(path) = ty else {
         return false;
     };
@@ -1418,7 +1729,7 @@ mod tests {
             CleanType::Option(Box::new(CleanType::Int))
         );
         let param = first_param(quote! { x: Vec<String> }).unwrap();
-        assert_eq!(param.ty, CleanType::List(Box::new(CleanType::String)));
+        assert_eq!(param.ty, CleanType::VecList(Box::new(CleanType::String)));
         assert_eq!(param.conversion, BoundaryConversion::NeedsWrapper);
         assert_eq!(
             param.abi,
@@ -1433,6 +1744,75 @@ mod tests {
                 .unwrap()
                 .conversion,
             BoundaryConversion::Unsupported
+        );
+    }
+
+    #[test]
+    fn maps_final_abi_shapes() {
+        assert_eq!(first_param(quote! { x: () }).unwrap().ty, CleanType::Unit);
+        assert_eq!(
+            first_param(quote! { x: (i64, f64) }).unwrap().ty,
+            CleanType::Tuple(vec![CleanType::Int, CleanType::Float])
+        );
+        assert_eq!(
+            first_param(quote! { x: [i64; 4] }).unwrap().ty,
+            CleanType::Array {
+                elem: Box::new(CleanType::Int),
+                len: 4,
+            }
+        );
+        assert_eq!(
+            first_param(quote! { x: Result<i64, String> }).unwrap().abi,
+            CleanParamAbi::Result(
+                Box::new(CleanParamAbi::Value(CleanType::Int)),
+                Box::new(CleanParamAbi::Value(CleanType::String)),
+            )
+        );
+        assert_eq!(
+            first_param(quote! { x: anvyx_runtime::AnvList<'cx, i64> })
+                .unwrap()
+                .abi,
+            CleanParamAbi::Value(CleanType::List(Box::new(CleanType::Int)))
+        );
+        assert_eq!(
+            first_param(quote! { x: anvyx_runtime::AnvMap<'cx, String, i64> })
+                .unwrap()
+                .ty,
+            CleanType::Map(Box::new(CleanType::String), Box::new(CleanType::Int))
+        );
+        assert_eq!(
+            first_param(quote! { x: anvyx_runtime::AnvSlice<'cx, i64> })
+                .unwrap()
+                .abi,
+            CleanParamAbi::Slice(Box::new(CleanParamAbi::Value(CleanType::Int)))
+        );
+        assert_eq!(
+            first_param(quote! { x: anvyx_runtime::AnvRef<'cx, Counter> })
+                .unwrap()
+                .abi,
+            CleanParamAbi::Value(CleanType::Named("Counter".to_string()))
+        );
+        assert_eq!(
+            ret(parse_quote! { -> anvyx_runtime::AnvRef<'cx, Counter> })
+                .unwrap()
+                .abi,
+            CleanReturnAbi::Value(CleanType::Named("Counter".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_anv_ref_resource_types() {
+        assert!(
+            first_param(quote! { x: anvyx_runtime::AnvRef<'_, Counter> })
+                .unwrap_err()
+                .to_string()
+                .contains("'cx")
+        );
+        assert!(
+            first_param(quote! { x: anvyx_runtime::AnvRef<'cx, Box<Counter>> })
+                .unwrap_err()
+                .to_string()
+                .contains("non-generic")
         );
     }
 
@@ -1499,9 +1879,16 @@ mod tests {
             ret(parse_quote! { -> f64 }).unwrap().abi,
             CleanReturnAbi::Value(CleanType::Float)
         );
-        let result = ret(parse_quote! { -> Result<i64, RuntimeError> }).unwrap();
-        assert!(result.fallible);
-        assert_eq!(result.ty, CleanType::Int);
+        let visible = ret(parse_quote! { -> Result<i64, String> }).unwrap();
+        assert!(!visible.fallible);
+        assert_eq!(
+            visible.ty,
+            CleanType::Result(Box::new(CleanType::Int), Box::new(CleanType::String))
+        );
+        let trap = classify_return_with_trap(&parse_quote! { -> Result<i64, RuntimeError> }, true)
+            .unwrap();
+        assert!(trap.fallible);
+        assert_eq!(trap.ty, CleanType::Int);
     }
 
     #[test]
@@ -1576,16 +1963,19 @@ mod tests {
         assert!(first_param(quote! { x: char }).is_err());
         assert!(first_param(quote! { x: str }).is_err());
         assert!(first_param(quote! { x: &i64 }).is_err());
-        assert!(first_param(quote! { x: () }).is_err());
-        assert!(first_param(quote! { x: Option<()> }).is_err());
+        assert_eq!(first_param(quote! { x: () }).unwrap().ty, CleanType::Unit);
+        assert_eq!(
+            first_param(quote! { x: Option<()> }).unwrap().ty,
+            CleanType::Option(Box::new(CleanType::Unit))
+        );
         assert!(first_param(quote! { x: Option<&str> }).is_err());
         assert!(first_param(quote! { x: my_crate::Option<i64> }).is_err());
         assert!(first_param(quote! { x: my_crate::WindowConfig }).is_err());
         assert!(first_param(quote! { x: WindowConfig<i64> }).is_err());
-        assert!(first_param(quote! { x: Vec<WindowConfig> }).is_err());
-        assert!(first_param(quote! { x: Option<WindowConfig> }).is_err());
+        assert!(first_param(quote! { x: Vec<WindowConfig> }).is_ok());
+        assert!(first_param(quote! { x: Option<WindowConfig> }).is_ok());
         assert!(ret(parse_quote! { -> &str }).is_err());
-        assert!(ret(parse_quote! { -> Result<i64, String> }).is_err());
+        assert!(ret(parse_quote! { -> Result<i64, RuntimeError> }).is_err());
         assert!(ret(parse_quote! { -> foo::Result<i64, RuntimeError> }).is_err());
     }
 }

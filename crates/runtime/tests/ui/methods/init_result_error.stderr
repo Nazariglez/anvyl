@@ -1,0 +1,5 @@
+error: Result<Self, RuntimeError> requires #[anvyx(trap)]
+ --> tests/ui/methods/init_result_error.rs:8:34
+  |
+8 |     pub fn new() -> Result<Self, anvyx_runtime::RuntimeError> { Ok(Self) }
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^

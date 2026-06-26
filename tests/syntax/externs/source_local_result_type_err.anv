@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: conflicts with a locally defined type
+
+struct Result<T, E> { value: T }
+extern fn load() -> Result<int, string>;

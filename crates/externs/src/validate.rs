@@ -54,8 +54,16 @@ pub enum ExternDescriptorError {
         ty: ExternTypeKey,
         count: usize,
     },
+    MixedVariantFields {
+        ty: ExternTypeKey,
+        variant: String,
+    },
     VoidType {
         context: TypeContext,
+    },
+    InvalidAbiType {
+        position: AbiPosition,
+        reason: AbiTypeError,
     },
     CallbackEscapeMismatch {
         param: Option<String>,
@@ -82,6 +90,12 @@ pub enum NameKind {
 pub enum TypeContext {
     Param,
     Nested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationMode {
+    Provider,
+    SourceModule,
 }
 
 impl fmt::Display for NameKind {
@@ -112,24 +126,19 @@ impl fmt::Display for TypeContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypePosition {
-    Param,
+    Param(ParamFlow),
     Return,
-    Nested,
+    Field,
 }
 
 impl TypePosition {
-    fn void_context(self) -> Option<TypeContext> {
+    fn abi_position(self) -> AbiPosition {
         match self {
-            TypePosition::Param => Some(TypeContext::Param),
-            TypePosition::Return => None,
-            TypePosition::Nested => Some(TypeContext::Nested),
-        }
-    }
-
-    fn callback_param_position(self) -> Self {
-        match self {
-            TypePosition::Nested => TypePosition::Nested,
-            TypePosition::Param | TypePosition::Return => TypePosition::Param,
+            TypePosition::Param(ParamFlow::Value) => AbiPosition::ParamValue,
+            TypePosition::Param(ParamFlow::Borrow) => AbiPosition::ParamBorrow,
+            TypePosition::Param(ParamFlow::MutBorrow) => AbiPosition::ParamMutBorrow,
+            TypePosition::Return => AbiPosition::Return,
+            TypePosition::Field => AbiPosition::Field,
         }
     }
 }
@@ -142,7 +151,7 @@ pub fn validate(provider: &ProviderDescriptor) -> Result<(), Vec<ExternDescripto
     for module in &provider.modules {
         check_module_path(&module.path, &mut errors);
         check_unique_module(&mut modules, &module.path, &mut errors);
-        check_module(module, &mut errors);
+        check_module(module, ValidationMode::Provider, &mut errors);
     }
 
     if errors.is_empty() {
@@ -156,7 +165,7 @@ pub fn validate_module_contents(
     module: &ExternModuleDescriptor,
 ) -> Result<(), Vec<ExternDescriptorError>> {
     let mut errors = vec![];
-    check_module(module, &mut errors);
+    check_module(module, ValidationMode::SourceModule, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -164,7 +173,11 @@ pub fn validate_module_contents(
     }
 }
 
-fn check_module(module: &ExternModuleDescriptor, errors: &mut Vec<ExternDescriptorError>) {
+fn check_module(
+    module: &ExternModuleDescriptor,
+    mode: ValidationMode,
+    errors: &mut Vec<ExternDescriptorError>,
+) {
     let mut types = HashSet::new();
     for ty in &module.types {
         check_unique_name(NameKind::Type, &mut types, &ty.name, errors, |name| {
@@ -173,7 +186,7 @@ fn check_module(module: &ExternModuleDescriptor, errors: &mut Vec<ExternDescript
                 name,
             }
         });
-        check_type(module, ty, errors);
+        check_type(module, ty, mode, errors);
     }
 
     let mut functions = HashSet::new();
@@ -188,13 +201,14 @@ fn check_module(module: &ExternModuleDescriptor, errors: &mut Vec<ExternDescript
                 name,
             },
         );
-        check_signature(&function.signature, errors);
+        check_signature(&function.signature, mode, errors);
     }
 }
 
 fn check_type(
     module: &ExternModuleDescriptor,
     ty: &ExternTypeDescriptor,
+    mode: ValidationMode,
     errors: &mut Vec<ExternDescriptorError>,
 ) {
     let key = ExternTypeKey {
@@ -210,16 +224,58 @@ fn check_type(
                 name,
             }
         });
-        check_type_expr(&field.ty, TypePosition::Param, errors);
+        check_type_expr(&field.ty, TypePosition::Field, mode, errors);
+    }
+
+    let mut variants = HashSet::new();
+    for variant in &ty.variants {
+        check_unique_name(
+            NameKind::Field,
+            &mut variants,
+            &variant.name,
+            errors,
+            |name| ExternDescriptorError::DuplicateField {
+                ty: key.clone(),
+                name,
+            },
+        );
+        let mut fields = HashSet::new();
+        let has_named = variant.fields.iter().any(|field| field.name.is_some());
+        let has_unnamed = variant.fields.iter().any(|field| field.name.is_none());
+        if has_named && has_unnamed {
+            errors.push(ExternDescriptorError::MixedVariantFields {
+                ty: key.clone(),
+                variant: variant.name.clone(),
+            });
+        }
+        for field in &variant.fields {
+            if let Some(name) = &field.name {
+                check_unique_name(NameKind::Field, &mut fields, name, errors, |name| {
+                    ExternDescriptorError::DuplicateField {
+                        ty: key.clone(),
+                        name,
+                    }
+                });
+            }
+            check_type_expr(&field.ty, TypePosition::Field, mode, errors);
+        }
     }
 
     if let Some(init) = &ty.init {
-        if !init.params.is_empty() {
+        if mode == ValidationMode::SourceModule && !init.params.is_empty() {
             errors.push(ExternDescriptorError::UnsupportedInitParams {
                 ty: key.clone(),
                 count: init.params.len(),
             });
         }
+        check_signature(
+            &ExternSignature {
+                params: init.params.clone(),
+                ret: init.ret.clone(),
+            },
+            mode,
+            errors,
+        );
         let mut field_inits = HashSet::new();
         for field in &init.field_init {
             check_unique_name(
@@ -247,7 +303,7 @@ fn check_type(
                 name,
             },
         );
-        check_signature(&method.signature, errors);
+        check_signature(&method.signature, mode, errors);
     }
 
     let mut statics = HashSet::new();
@@ -262,13 +318,13 @@ fn check_type(
                 name,
             },
         );
-        check_signature(&static_method.signature, errors);
+        check_signature(&static_method.signature, mode, errors);
     }
 
     let mut operators = HashSet::new();
     for operator in &ty.operators {
         check_unique_operator(&mut operators, &key, operator.op, errors);
-        check_operator_signature(&key, operator, errors);
+        check_operator_signature(&key, operator, mode, errors);
     }
 }
 
@@ -309,9 +365,10 @@ fn check_unique_operator(
 fn check_operator_signature(
     ty: &ExternTypeKey,
     operator: &ExternOperatorDescriptor,
+    mode: ValidationMode,
     errors: &mut Vec<ExternDescriptorError>,
 ) {
-    check_signature(&operator.signature, errors);
+    check_signature(&operator.signature, mode, errors);
 
     let expected_params = match operator.op {
         ExternOperator::Unary(_) => 0,
@@ -345,18 +402,26 @@ fn operator_return_matches(expected: OperatorReturn, actual: &ExternTypeExpr) ->
     }
 }
 
-fn check_signature(signature: &ExternSignature, errors: &mut Vec<ExternDescriptorError>) {
-    check_params(&signature.params, errors);
-    check_type_expr(&signature.ret, TypePosition::Return, errors);
+fn check_signature(
+    signature: &ExternSignature,
+    mode: ValidationMode,
+    errors: &mut Vec<ExternDescriptorError>,
+) {
+    check_params(&signature.params, mode, errors);
+    check_type_expr(&signature.ret, TypePosition::Return, mode, errors);
 }
 
-fn check_params(params: &[ExternParam], errors: &mut Vec<ExternDescriptorError>) {
+fn check_params(
+    params: &[ExternParam],
+    mode: ValidationMode,
+    errors: &mut Vec<ExternDescriptorError>,
+) {
     for param in params {
         if let Some(name) = &param.name {
             check_name(NameKind::Param, name, errors);
         }
         check_callback_escape(param.name.as_deref(), param.escape, &param.ty, errors);
-        check_type_expr(&param.ty, TypePosition::Param, errors);
+        check_type_expr(&param.ty, TypePosition::Param(param.flow), mode, errors);
     }
 }
 
@@ -381,25 +446,69 @@ fn check_callback_escape(
 fn check_type_expr(
     ty: &ExternTypeExpr,
     position: TypePosition,
+    mode: ValidationMode,
     errors: &mut Vec<ExternDescriptorError>,
 ) {
-    match ty {
-        ExternTypeExpr::Void => {
-            if let Some(context) = position.void_context() {
-                errors.push(ExternDescriptorError::VoidType { context });
+    if let Err(violations) = ty.classify_abi(position.abi_position()) {
+        for violation in violations {
+            if mode == ValidationMode::SourceModule
+                && violation.reason == AbiTypeError::GenericNamedArgsUnsupported
+            {
+                continue;
             }
+            push_abi_violation(violation, errors);
         }
-        ExternTypeExpr::Bool
+    }
+    check_type_names(ty, errors);
+}
+
+fn push_abi_violation(violation: AbiTypeViolation, errors: &mut Vec<ExternDescriptorError>) {
+    if violation.reason == AbiTypeError::VoidOutsideReturn {
+        errors.push(ExternDescriptorError::VoidType {
+            context: void_type_context(violation.position),
+        });
+    } else {
+        errors.push(ExternDescriptorError::InvalidAbiType {
+            position: violation.position,
+            reason: violation.reason,
+        });
+    }
+}
+
+fn void_type_context(position: AbiPosition) -> TypeContext {
+    match position {
+        AbiPosition::ParamValue
+        | AbiPosition::ParamBorrow
+        | AbiPosition::ParamMutBorrow
+        | AbiPosition::CallbackParam => TypeContext::Param,
+        AbiPosition::Return
+        | AbiPosition::CallbackReturn
+        | AbiPosition::Field
+        | AbiPosition::Nested => TypeContext::Nested,
+    }
+}
+
+fn check_type_names(ty: &ExternTypeExpr, errors: &mut Vec<ExternDescriptorError>) {
+    match ty {
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Unit
+        | ExternTypeExpr::Bool
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
         | ExternTypeExpr::Any => {}
-        ExternTypeExpr::List(item) | ExternTypeExpr::Option(item) => {
-            check_type_expr(item, TypePosition::Nested, errors);
+        ExternTypeExpr::List(item)
+        | ExternTypeExpr::Option(item)
+        | ExternTypeExpr::Array { elem: item, .. }
+        | ExternTypeExpr::Slice(item) => check_type_names(item, errors),
+        ExternTypeExpr::Map(key, value) | ExternTypeExpr::Result(key, value) => {
+            check_type_names(key, errors);
+            check_type_names(value, errors);
         }
-        ExternTypeExpr::Map(key, value) => {
-            check_type_expr(key, TypePosition::Nested, errors);
-            check_type_expr(value, TypePosition::Nested, errors);
+        ExternTypeExpr::Tuple(fields) => {
+            for field in fields {
+                check_type_names(field, errors);
+            }
         }
         ExternTypeExpr::Named { module, name, args } => {
             if let Some(module) = module {
@@ -407,16 +516,15 @@ fn check_type_expr(
             }
             check_name(NameKind::NamedType, name, errors);
             for arg in args {
-                check_type_expr(arg, TypePosition::Nested, errors);
+                check_type_names(arg, errors);
             }
         }
         ExternTypeExpr::Callback(callback) => {
-            let param_position = position.callback_param_position();
             for param in &callback.params {
                 check_callback_escape(None, param.escape, &param.ty, errors);
-                check_type_expr(&param.ty, param_position, errors);
+                check_type_names(&param.ty, errors);
             }
-            check_type_expr(&callback.ret, TypePosition::Return, errors);
+            check_type_names(&callback.ret, errors);
         }
     }
 }
@@ -492,9 +600,12 @@ mod tests {
                         set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec!["x".to_string()],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     methods: vec![ExternMethodDescriptor {
                         name: "len".to_string(),
@@ -561,9 +672,159 @@ mod tests {
         }
     }
 
+    fn param(ty: ExternTypeExpr) -> ExternParam {
+        ExternParam {
+            name: None,
+            ty,
+            flow: ParamFlow::Value,
+            escape: CallbackEscape::NonEscaping,
+        }
+    }
+
+    fn function_with_signature(
+        params: Vec<ExternTypeExpr>,
+        ret: ExternTypeExpr,
+    ) -> Result<(), Vec<ExternDescriptorError>> {
+        let mut provider = valid_provider();
+        provider.modules[0].functions[0].signature = ExternSignature {
+            params: params.into_iter().map(param).collect(),
+            ret,
+        };
+        validate(&provider)
+    }
+
+    fn same_thread_callback(ret: ExternTypeExpr) -> ExternTypeExpr {
+        ExternTypeExpr::Callback(ExternCallbackSignature {
+            params: vec![ExternCallbackParam {
+                ty: ExternTypeExpr::Int,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ret: Box::new(ret),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        })
+    }
+
     #[test]
     fn valid_descriptor_passes_validation() {
         assert_eq!(validate(&valid_provider()), Ok(()));
+    }
+
+    #[test]
+    fn accepts_final_abi_matrix() {
+        let cases = [
+            (
+                vec![
+                    ExternTypeExpr::Unit,
+                    ExternTypeExpr::Bool,
+                    ExternTypeExpr::Int,
+                    ExternTypeExpr::Float,
+                    ExternTypeExpr::String,
+                    ExternTypeExpr::Any,
+                ],
+                ExternTypeExpr::Unit,
+            ),
+            (
+                vec![ExternTypeExpr::option(ExternTypeExpr::result(
+                    ExternTypeExpr::Unit,
+                    ExternTypeExpr::named(None, "LoadError"),
+                ))],
+                ExternTypeExpr::result(
+                    ExternTypeExpr::list(ExternTypeExpr::Int),
+                    ExternTypeExpr::named(None, "LoadError"),
+                ),
+            ),
+            (
+                vec![ExternTypeExpr::Tuple(vec![
+                    ExternTypeExpr::array(ExternTypeExpr::Float, 4),
+                    ExternTypeExpr::list(ExternTypeExpr::String),
+                    ExternTypeExpr::map(ExternTypeExpr::String, ExternTypeExpr::Int),
+                ])],
+                ExternTypeExpr::Tuple(vec![ExternTypeExpr::Int, ExternTypeExpr::Bool]),
+            ),
+            (
+                vec![ExternTypeExpr::slice(ExternTypeExpr::Int)],
+                ExternTypeExpr::Void,
+            ),
+            (
+                vec![same_thread_callback(ExternTypeExpr::Int)],
+                ExternTypeExpr::Void,
+            ),
+        ];
+
+        for (params, ret) in cases {
+            assert_eq!(function_with_signature(params, ret), Ok(()));
+        }
+    }
+
+    #[test]
+    fn rejects_final_abi_matrix() {
+        let callback = same_thread_callback(ExternTypeExpr::Void);
+        let cases = [
+            (
+                vec![],
+                ExternTypeExpr::slice(ExternTypeExpr::Int),
+                ExternDescriptorError::InvalidAbiType {
+                    position: AbiPosition::Return,
+                    reason: AbiTypeError::SliceOutsideParam,
+                },
+            ),
+            (
+                vec![ExternTypeExpr::list(ExternTypeExpr::slice(
+                    ExternTypeExpr::Int,
+                ))],
+                ExternTypeExpr::Void,
+                ExternDescriptorError::InvalidAbiType {
+                    position: AbiPosition::Nested,
+                    reason: AbiTypeError::SliceNested,
+                },
+            ),
+            (
+                vec![],
+                callback.clone(),
+                ExternDescriptorError::InvalidAbiType {
+                    position: AbiPosition::Return,
+                    reason: AbiTypeError::CallbackOutsideParam,
+                },
+            ),
+            (
+                vec![ExternTypeExpr::list(callback)],
+                ExternTypeExpr::Void,
+                ExternDescriptorError::InvalidAbiType {
+                    position: AbiPosition::Nested,
+                    reason: AbiTypeError::CallbackNested,
+                },
+            ),
+            (
+                vec![ExternTypeExpr::Named {
+                    module: None,
+                    name: "Box".to_string(),
+                    args: vec![ExternTypeExpr::Int],
+                }],
+                ExternTypeExpr::Void,
+                ExternDescriptorError::InvalidAbiType {
+                    position: AbiPosition::ParamValue,
+                    reason: AbiTypeError::GenericNamedArgsUnsupported,
+                },
+            ),
+            (
+                vec![ExternTypeExpr::Void],
+                ExternTypeExpr::Void,
+                ExternDescriptorError::VoidType {
+                    context: TypeContext::Param,
+                },
+            ),
+        ];
+
+        for (params, ret, expected) in cases {
+            let errors = function_with_signature(params, ret).unwrap_err();
+            assert!(
+                errors.contains(&expected),
+                "missing {expected:?} in {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -624,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_init_params() {
+    fn rejects_source_module_init_params() {
         let mut provider = valid_provider();
         provider.modules[0].types[0].init.as_mut().unwrap().params = vec![ExternParam {
             name: Some("x".to_string()),
@@ -633,7 +894,7 @@ mod tests {
             escape: CallbackEscape::NonEscaping,
         }];
 
-        let errors = validate(&provider).unwrap_err();
+        let errors = validate_module_contents(&provider.modules[0]).unwrap_err();
 
         assert!(
             errors.contains(&ExternDescriptorError::UnsupportedInitParams {
@@ -641,6 +902,7 @@ mod tests {
                 count: 1,
             })
         );
+        assert!(validate(&provider).is_ok());
     }
 
     #[test]
@@ -976,6 +1238,79 @@ mod tests {
         }));
         assert!(errors.contains(&ExternDescriptorError::VoidType {
             context: TypeContext::Nested,
+        }));
+    }
+
+    #[test]
+    fn rejects_invalid_final_abi_positions() {
+        let mut provider = valid_provider();
+        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
+            params: vec![],
+            ret: Box::new(ExternTypeExpr::Void),
+            policy: CallbackPolicy {
+                escape: CallbackEscape::NonEscaping,
+                thread: CallbackThread::SameThread,
+            },
+        });
+        provider.modules[0].functions[0].signature = ExternSignature {
+            params: vec![
+                ExternParam {
+                    name: Some("nested".to_string()),
+                    ty: ExternTypeExpr::Tuple(vec![
+                        ExternTypeExpr::slice(ExternTypeExpr::Int),
+                        callback.clone(),
+                    ]),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("returns_callback".to_string()),
+                    ty: ExternTypeExpr::Callback(ExternCallbackSignature {
+                        params: vec![],
+                        ret: Box::new(callback.clone()),
+                        policy: CallbackPolicy {
+                            escape: CallbackEscape::NonEscaping,
+                            thread: CallbackThread::SameThread,
+                        },
+                    }),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                ExternParam {
+                    name: Some("generic".to_string()),
+                    ty: ExternTypeExpr::Named {
+                        module: None,
+                        name: "Box".to_string(),
+                        args: vec![ExternTypeExpr::Int],
+                    },
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+            ],
+            ret: ExternTypeExpr::slice(ExternTypeExpr::Int),
+        };
+
+        let errors = validate(&provider).unwrap_err();
+
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::Nested,
+            reason: AbiTypeError::SliceNested,
+        }));
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::Nested,
+            reason: AbiTypeError::CallbackNested,
+        }));
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::CallbackReturn,
+            reason: AbiTypeError::CallbackReturnUnsupported,
+        }));
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::ParamValue,
+            reason: AbiTypeError::GenericNamedArgsUnsupported,
+        }));
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::Return,
+            reason: AbiTypeError::SliceOutsideParam,
         }));
     }
 

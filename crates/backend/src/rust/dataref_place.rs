@@ -255,6 +255,7 @@ mod tests {
                 symbol: RirSymbol::new("Payload"),
                 display: RirSymbol::new("Payload"),
                 native_path: None,
+                native_ref: false,
                 native_key: None,
                 copyable: true,
                 fields: vec![field(0, "inner", ty(0))],
@@ -262,6 +263,7 @@ mod tests {
             datarefs: vec![RirDataRef {
                 id: dataref,
                 air_id: anvyx_frontend::air::AggregateId::from_index(0),
+                native_key: None,
                 symbol: RirSymbol::new("Box"),
                 display: RirSymbol::new("Box"),
                 cycle_capable: false,

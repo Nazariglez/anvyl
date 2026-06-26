@@ -101,6 +101,7 @@ pub(super) fn normalize_type(ty: ExternTypeDescriptor) -> RawExternType {
         exported: true,
         rep: ty.rep,
         fields: ty.fields.into_iter().map(normalize_field).collect(),
+        variants: ty.variants,
         init: ty.init.map(normalize_init),
         methods: ty.methods.into_iter().map(normalize_method).collect(),
         statics: ty.statics.into_iter().map(normalize_static).collect(),

@@ -1225,6 +1225,7 @@ fn inline_extern_field_projection_is_valid() {
             fields: vec![ExternFieldDecl {
                 name: Ident::new("x"),
                 ty: int_ty,
+                abi: anvyx_externs::ExternTypeExpr::Int,
                 get_receiver: ExternReceiverDecl {
                     ty: ext_ty,
                     mode: ParamMode::SharedBorrow,
@@ -1237,6 +1238,8 @@ fn inline_extern_field_projection_is_valid() {
                 readable: true,
                 writable: true,
             }],
+            variants: vec![],
+            variant_abis: vec![],
             methods: vec![],
             statics: vec![],
             operators: vec![],
@@ -1796,6 +1799,8 @@ fn extern_call() {
         has_init: false,
         init_fields: vec![],
         fields: vec![],
+        variants: vec![],
+        variant_abis: vec![],
         methods: vec![],
         statics: vec![],
         operators: vec![],
@@ -1811,6 +1816,10 @@ fn extern_call() {
             escape: ParamEscape::NonEscaping,
         }],
         return_type: void_ty,
+        abi: crate::air::ExternAbi {
+            params: vec![anvyx_externs::ExternTypeExpr::Int],
+            ret: anvyx_externs::ExternTypeExpr::Void,
+        },
         binding: None,
         effects: anvyx_externs::ExternEffects::default(),
     });

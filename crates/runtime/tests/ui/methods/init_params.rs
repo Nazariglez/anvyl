@@ -4,7 +4,7 @@ struct Point { x: i64 }
 
 #[methods]
 impl Point {
-    #[anvyx(init)]
+    #[anvyx(init, ret = "int")]
     pub fn new(x: i64) -> Self { Self { x } }
 }
 

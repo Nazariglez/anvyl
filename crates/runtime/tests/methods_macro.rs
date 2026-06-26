@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, EscapingLambda, ExternBindingOp,
-    ExternMemberSelector, ExternOperator, ExternTypeExpr, Heap, ReceiverMode, RuntimeError,
-    RustAbiSupport, RustParamAbi, RustWrapperCtx, ScopedLambda, methods,
+    AnvyxEnum, AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, EscapingLambda,
+    ExternBindingOp, ExternMemberSelector, ExternOperator, ExternTypeExpr, Heap, ReceiverMode,
+    RuntimeError, RustAbiSupport, RustParamAbi, RustReturnAbi, RustWrapperCtx, ScopedLambda,
+    methods,
 };
 
 #[derive(AnvyxInline)]
@@ -15,6 +16,11 @@ struct DerivedVec2 {
 
 #[methods(name = "Vector2")]
 impl DerivedVec2 {
+    #[anvyx(init)]
+    pub fn new(x: f64) -> Self {
+        Self { x }
+    }
+
     pub fn x(&self) -> f64 {
         self.x
     }
@@ -24,6 +30,7 @@ struct CallbackOps;
 
 #[methods]
 impl CallbackOps {
+    #[anvyx(trap)]
     pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
         let result = f.call(1);
         let _ = std::hint::black_box(f);
@@ -45,6 +52,35 @@ impl CtxBox {
     pub fn add(&self, ctx: &mut Ctx<'_, '_>, value: i64) -> i64 {
         let _ = ctx.heap();
         self.value + value
+    }
+}
+
+#[derive(AnvyxEnum)]
+enum InitError {
+    Bad,
+}
+
+struct FallibleInit;
+
+#[methods]
+impl FallibleInit {
+    #[anvyx(init)]
+    pub fn try_new(ok: bool) -> Result<Self, InitError> {
+        ok.then_some(Self).ok_or(InitError::Bad)
+    }
+}
+
+struct TrapInit;
+
+#[methods]
+impl TrapInit {
+    #[anvyx(init, trap)]
+    pub fn try_new(ok: bool) -> Result<Self, RuntimeError> {
+        if ok {
+            Ok(Self)
+        } else {
+            Err(RuntimeError::new("bad init"))
+        }
     }
 }
 
@@ -115,6 +151,44 @@ fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
 }
 
 #[test]
+fn init_supports_visible_result_and_trap_metadata() {
+    let visible = __anvyx_methods_fallibleinit();
+    let visible_init = visible.descriptor.init.as_ref().unwrap();
+    assert_eq!(visible_init.params.len(), 1);
+    assert!(!visible_init.effects.fallible);
+    assert!(matches!(visible_init.ret, ExternTypeExpr::Result(_, _)));
+    assert!(matches!(
+        visible
+            .bindings
+            .iter()
+            .find(|binding| matches!(binding.selector, ExternMemberSelector::Init))
+            .unwrap()
+            .abi
+            .ret,
+        RustReturnAbi::Result(_, _)
+    ));
+
+    let trap = __anvyx_methods_trapinit();
+    let trap_init = trap.descriptor.init.as_ref().unwrap();
+    assert_eq!(
+        trap_init.ret,
+        ExternTypeExpr::Named {
+            module: None,
+            name: "TrapInit".to_string(),
+            args: vec![],
+        }
+    );
+    assert!(trap_init.effects.fallible);
+    let trap_binding = trap
+        .bindings
+        .iter()
+        .find(|binding| matches!(binding.selector, ExternMemberSelector::Init))
+        .unwrap();
+    assert!(trap_binding.abi.fallible);
+    assert!(matches!(trap_binding.abi.ret, RustReturnAbi::Value(_)));
+}
+
+#[test]
 fn ctx_method_hides_ctx_from_metadata_and_wrapper_uses_ctx_first() {
     let export = __anvyx_methods_ctxbox();
 
@@ -168,8 +242,8 @@ impl Vec2 {
     }
 
     #[anvyx(init)]
-    pub fn new() -> Self {
-        Self { x: 0.0, y: 0.0 }
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
     }
 
     #[anvyx(getter)]
@@ -210,6 +284,19 @@ fn methods_merge_into_derive_owned_type_descriptor() {
     assert_eq!(export.descriptor.fields[0].name, "x");
     assert_eq!(export.descriptor.methods[0].name, "x");
     assert_eq!(export.descriptor.rep, anvyx_runtime::ExternRep::Inline);
+    assert!(matches!(
+        &export.descriptor.init.as_ref().unwrap().ret,
+        ExternTypeExpr::Named { name, .. } if name == "Vector2"
+    ));
+    let init = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(binding.selector, ExternMemberSelector::Init))
+        .unwrap();
+    assert!(matches!(
+        &init.abi.ret,
+        RustReturnAbi::Value(ExternTypeExpr::Named { name, .. }) if name == "Vector2"
+    ));
 }
 
 #[derive(AnvyxInline)]
@@ -264,7 +351,7 @@ fn methods_descriptor_covers_member_roles() {
     assert_eq!(export.descriptor.methods[0].receiver, ReceiverMode::Shared);
     assert_eq!(export.descriptor.methods[1].receiver, ReceiverMode::Mutable);
     assert_eq!(export.descriptor.statics[0].name, "unit");
-    assert!(export.descriptor.init.is_some());
+    assert_eq!(export.descriptor.init.as_ref().unwrap().params.len(), 2);
     assert_eq!(export.descriptor.fields.len(), 1);
     assert!(export.descriptor.fields.iter().all(|field| field.computed));
     assert!(export.descriptor.fields[0].readable);

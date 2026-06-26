@@ -34,6 +34,11 @@ pub fn derive_anvyx_ref(item: TokenStream) -> TokenStream {
     clean_ref::expand(item.into()).into()
 }
 
+#[proc_macro_derive(AnvyxEnum, attributes(anvyx))]
+pub fn derive_anvyx_enum(item: TokenStream) -> TokenStream {
+    clean_type_derive::expand(item.into(), clean_type_derive::TypeDeriveKind::Enum).into()
+}
+
 #[proc_macro_attribute]
 pub fn methods(attr: TokenStream, item: TokenStream) -> TokenStream {
     clean_methods::expand(attr.into(), item.into()).into()

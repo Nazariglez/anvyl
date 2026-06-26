@@ -6,10 +6,11 @@ use anvyx_frontend::{
 };
 use anvyx_runtime::{
     CallbackEscape, CallbackThread, ExternCallbackSignature, ExternTypeExpr, ExternTypeKey,
-    RustExternAbi, RustParamAbi, RustReturnAbi,
+    RustExternAbi, RustParamAbi,
 };
 
 use super::{
+    native,
     place_access::{CollectionLoanBase, CollectionLoanProjection, collection_loan_step_supported},
     rep_policy::{
         LambdaStorageFamily, RustMaterialIntent, RustMaterialSource, RustMaterialization,
@@ -166,6 +167,7 @@ pub struct RirStruct {
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub native_path: Option<Vec<String>>,
+    pub native_ref: bool,
     pub native_key: Option<ExternTypeKey>,
     pub copyable: bool,
     pub fields: Vec<RirField>,
@@ -191,6 +193,7 @@ pub struct RirTuple {
 pub struct RirDataRef {
     pub id: RirDataRefId,
     pub air_id: air::AggregateId,
+    pub native_key: Option<ExternTypeKey>,
     pub symbol: RirSymbol,
     pub display: RirSymbol,
     pub cycle_capable: bool,
@@ -211,6 +214,8 @@ impl RirDataRef {
 pub struct RirEnum {
     pub id: RirEnumId,
     pub air_id: Option<air::EnumId>,
+    pub native_path: Option<Vec<String>>,
+    pub native_key: Option<ExternTypeKey>,
     pub core: Option<RirCoreEnumKind>,
     pub repr: RirEnumRepr,
     pub raw_type: Option<RirTypeId>,
@@ -244,6 +249,7 @@ pub enum RirRawEnumValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirCoreEnumKind {
     Option,
+    Result,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1324,6 +1330,7 @@ pub struct RirExtern {
     pub kind: RirExternKind,
     pub params: Vec<RirExternParam>,
     pub ret: RirTypeId,
+    pub abi: air::ExternAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1335,6 +1342,7 @@ pub enum RirExternKind {
 pub struct RirNativeExtern {
     pub path: Vec<String>,
     pub abi: RustExternAbi,
+    pub adopt_resource_return: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2024,31 +2032,102 @@ fn native_extern_signature_ok(
         && native.path.iter().all(|segment| !segment.is_empty())
         && rust_extern_abi_supported(&native.abi)
         && native.abi.params.len() == ext.params.len()
+        && ext.abi.params.len() == ext.params.len()
+        && native::rust_abi_matches_air(&native.abi.params, &native.abi.ret, &ext.abi)
         && native
             .abi
             .params
             .iter()
             .zip(&ext.params)
-            .all(|(abi, param)| native_param_abi_ok(program, abi, *param))
-        && native_return_abi_ok(program, &native.abi.ret, ext.ret, void)
+            .all(|(abi, param)| native_param_abi_ok(abi, *param))
+        && native_hidden_ctx_borrows_ok(program, &native.abi, ext)
+        && ext
+            .abi
+            .params
+            .iter()
+            .zip(&ext.params)
+            .all(|(abi, param)| extern_param_abi_ok(program, abi, *param))
+        && extern_return_abi_ok(program, &ext.abi.ret, ext.ret, void)
+}
+
+fn native_hidden_ctx_borrows_ok(
+    program: &RirProgram,
+    abi: &RustExternAbi,
+    ext: &RirExtern,
+) -> bool {
+    abi.ctx != anvyx_runtime::RustWrapperCtx::HiddenRuntime
+        || abi.params.iter().zip(&ext.params).all(|(abi, param)| {
+            !matches!(abi, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_))
+                || !matches!(
+                    program.types[param.ty.index()],
+                    RirType::Struct(id) if program.structs[id.index()].native_ref
+                )
+        })
 }
 
 pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
     match abi.support {
         anvyx_runtime::RustAbiSupport::Direct => {
-            abi.ctx == anvyx_runtime::RustWrapperCtx::HiddenRuntime
-                && !abi.params.iter().any(|param| {
-                    param.is_callback_wrapper()
-                        || param.contains_collection_wrapper()
-                        || param.direct_collection_abi()
-                })
-                && !abi.ret.contains_collection_wrapper()
-                && !abi.ret.direct_collection_abi()
+            abi.backend_supported()
+                && abi.params.iter().all(rust_param_supported)
+                && rust_return_supported(&abi.ret)
         }
         anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
             abi.supported_callback_wrapper() || abi.supported_collection_wrapper()
         }
         anvyx_runtime::RustAbiSupport::Unsupported => false,
+    }
+}
+
+fn rust_param_supported(abi: &RustParamAbi) -> bool {
+    !abi.direct_mut_collection_abi()
+        && match abi {
+            RustParamAbi::Value(ty)
+            | RustParamAbi::Borrow(ty)
+            | RustParamAbi::MutBorrow(ty)
+            | RustParamAbi::MutPlace(ty) => extern_value_supported(ty),
+            RustParamAbi::Option(inner) | RustParamAbi::Slice(inner) => rust_param_supported(inner),
+            RustParamAbi::Result(ok, err) => rust_param_supported(ok) && rust_param_supported(err),
+            RustParamAbi::List(_)
+            | RustParamAbi::ScopedLambda(_)
+            | RustParamAbi::EscapingLambda(_) => false,
+        }
+}
+
+fn rust_return_supported(abi: &anvyx_runtime::RustReturnAbi) -> bool {
+    match abi {
+        anvyx_runtime::RustReturnAbi::Void => true,
+        anvyx_runtime::RustReturnAbi::Value(ty) => extern_value_supported(ty),
+        anvyx_runtime::RustReturnAbi::Option(inner) => rust_return_supported(inner),
+        anvyx_runtime::RustReturnAbi::Result(ok, err) => {
+            rust_return_supported(ok) && rust_return_supported(err)
+        }
+        anvyx_runtime::RustReturnAbi::List(_) => false,
+    }
+}
+
+fn extern_value_supported(ty: &ExternTypeExpr) -> bool {
+    match ty {
+        ExternTypeExpr::Unit
+        | ExternTypeExpr::Bool
+        | ExternTypeExpr::Int
+        | ExternTypeExpr::Float
+        | ExternTypeExpr::String => true,
+        ExternTypeExpr::Named { args, .. } => args.is_empty(),
+        ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::List(inner)
+        | ExternTypeExpr::Array { elem: inner, .. } => extern_value_supported(inner),
+        ExternTypeExpr::Result(ok, err) => {
+            extern_value_supported(ok) && extern_value_supported(err)
+        }
+        ExternTypeExpr::Tuple(fields) => fields.iter().all(extern_value_supported),
+        ExternTypeExpr::Map(key, value) => {
+            extern_value_supported(key) && extern_value_supported(value)
+        }
+        ExternTypeExpr::Void
+        | ExternTypeExpr::Any
+        | ExternTypeExpr::Slice(_)
+        | ExternTypeExpr::Callback(_) => false,
     }
 }
 
@@ -2058,11 +2137,13 @@ pub(super) struct NativeParamAbi {
     pub abi: RirParamAbi,
 }
 
-pub(super) fn rust_param_abi(abi: &RustParamAbi) -> Option<NativeParamAbi> {
+pub(super) fn rust_param_abi(abi: &RustParamAbi) -> NativeParamAbi {
     let (semantic, abi) = match abi {
-        RustParamAbi::Value(_) | RustParamAbi::List(_) => {
-            (RirParamSemantic::Value, RirParamAbi::Value)
-        }
+        RustParamAbi::Value(_)
+        | RustParamAbi::Option(_)
+        | RustParamAbi::Result(_, _)
+        | RustParamAbi::List(_)
+        | RustParamAbi::Slice(_) => (RirParamSemantic::Value, RirParamAbi::Value),
         RustParamAbi::Borrow(_) => (RirParamSemantic::SharedBorrow, RirParamAbi::SharedBorrow),
         RustParamAbi::MutBorrow(_) => (RirParamSemantic::MutBorrow, RirParamAbi::MutBorrow),
         RustParamAbi::MutPlace(_) => (RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
@@ -2073,40 +2154,35 @@ pub(super) fn rust_param_abi(abi: &RustParamAbi) -> Option<NativeParamAbi> {
             RirParamSemantic::EscapingLambda,
             RirParamAbi::EscapingLambda,
         ),
-        RustParamAbi::Option(_) => return None,
     };
-    Some(NativeParamAbi { semantic, abi })
+    NativeParamAbi { semantic, abi }
 }
 
-fn native_param_abi_ok(program: &RirProgram, abi: &RustParamAbi, param: RirExternParam) -> bool {
-    let Some(native) = rust_param_abi(abi) else {
-        return false;
-    };
+fn native_param_abi_ok(abi: &RustParamAbi, param: RirExternParam) -> bool {
+    let native = rust_param_abi(abi);
     param.semantic == native.semantic
         && param.abi == native.abi
         && param.escape == native_param_escape(abi)
-        && match abi {
-            RustParamAbi::Value(ty)
-            | RustParamAbi::Borrow(ty)
-            | RustParamAbi::MutBorrow(ty)
-            | RustParamAbi::MutPlace(ty) => {
-                !extern_type_contains_collection(ty)
-                    && rir_type_matches_extern(program, param.ty, ty)
-            }
-            RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
-                rir_type_matches_callback(program, param.ty, callback)
-            }
-            RustParamAbi::List(inner) => {
-                abi.supported_collection_wrapper()
-                    && rir_type_matches_list_wrapper_param(program, param.ty, inner)
-            }
-            RustParamAbi::Option(_) => false,
-        }
 }
 
 fn native_param_escape(abi: &RustParamAbi) -> RirParamEscape {
     match abi {
         RustParamAbi::EscapingLambda(_) => RirParamEscape::Escaping,
+        _ => RirParamEscape::NonEscaping,
+    }
+}
+
+fn extern_param_abi_ok(program: &RirProgram, abi: &ExternTypeExpr, param: RirExternParam) -> bool {
+    param.escape == extern_param_escape(abi) && rir_type_matches_extern(program, param.ty, abi)
+}
+
+fn extern_param_escape(abi: &ExternTypeExpr) -> RirParamEscape {
+    match abi {
+        ExternTypeExpr::Callback(callback)
+            if callback.policy.escape == CallbackEscape::Escaping =>
+        {
+            RirParamEscape::Escaping
+        }
         _ => RirParamEscape::NonEscaping,
     }
 }
@@ -2138,56 +2214,56 @@ fn rir_type_matches_callback(
         && rir_type_matches_extern(program, sig.ret, &callback.ret)
 }
 
-fn native_return_abi_ok(
+fn extern_return_abi_ok(
     program: &RirProgram,
-    abi: &RustReturnAbi,
+    abi: &ExternTypeExpr,
     ret: RirTypeId,
     void: Option<RirTypeId>,
 ) -> bool {
     match abi {
-        RustReturnAbi::Void => Some(ret) == void,
-        RustReturnAbi::Value(ty) => {
-            !extern_type_contains_collection(ty) && rir_type_matches_extern(program, ret, ty)
-        }
-        RustReturnAbi::Option(inner) => rir_type_matches_option(program, ret, inner),
-        RustReturnAbi::List(inner) => {
-            abi.supported_collection_wrapper()
-                && rir_type_matches_list_wrapper_return(program, ret, inner)
-        }
+        ExternTypeExpr::Void => Some(ret) == void,
+        ExternTypeExpr::Slice(_) | ExternTypeExpr::Callback(_) => false,
+        _ => rir_type_matches_extern(program, ret, abi),
     }
 }
 
-fn rir_type_matches_list_wrapper_param(
-    program: &RirProgram,
-    id: RirTypeId,
-    inner: &RustParamAbi,
+fn native_key_matches(
+    key: Option<&ExternTypeKey>,
+    module: Option<&anvyx_runtime::ModulePath>,
+    name: &str,
 ) -> bool {
-    let RustParamAbi::Value(expected) = inner else {
-        return false;
-    };
-    rir_type_matches_list_wrapper(program, id, expected)
+    key.is_some_and(|key| module.is_none_or(|module| key.module == *module) && key.name == name)
 }
 
-fn rir_type_matches_list_wrapper_return(
+fn rir_type_matches_result(
     program: &RirProgram,
-    id: RirTypeId,
-    inner: &RustReturnAbi,
+    id: RirEnumId,
+    ok: &ExternTypeExpr,
+    err: &ExternTypeExpr,
 ) -> bool {
-    let RustReturnAbi::Value(expected) = inner else {
+    let enm = &program.enums[id.index()];
+    if enm.core != Some(RirCoreEnumKind::Result) {
+        return false;
+    }
+    let [ok_variant, err_variant] = enm.variants.as_slice() else {
         return false;
     };
-    rir_type_matches_list_wrapper(program, id, expected)
+    rir_result_variant_matches(program, ok_variant, "Ok", ok)
+        && rir_result_variant_matches(program, err_variant, "Err", err)
 }
 
-fn rir_type_matches_list_wrapper(
+fn rir_result_variant_matches(
     program: &RirProgram,
-    id: RirTypeId,
+    variant: &RirVariant,
+    name: &str,
     expected: &ExternTypeExpr,
 ) -> bool {
-    let Some(RirType::List(elem)) = program.types.get(id.index()) else {
+    let [field] = variant.fields.as_slice() else {
         return false;
     };
-    rir_type_matches_extern(program, *elem, expected)
+    variant.display.as_str() == name
+        && variant.kind == RirVariantKind::Tuple
+        && rir_type_matches_extern(program, field.ty, expected)
 }
 
 fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &ExternTypeExpr) -> bool {
@@ -2200,55 +2276,64 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
         | (RirType::Int, ExternTypeExpr::Int)
         | (RirType::Float, ExternTypeExpr::Float)
         | (RirType::String, ExternTypeExpr::String) => true,
+        (RirType::Tuple(tuple), ExternTypeExpr::Unit) => {
+            program.tuples[tuple.index()].fields.is_empty()
+        }
         (RirType::Struct(struct_id), ExternTypeExpr::Named { module, name, args }) => {
-            let strukt = &program.structs[struct_id.index()];
             args.is_empty()
-                && strukt.native_key.as_ref().is_some_and(|key| {
-                    module.as_ref().is_none_or(|module| key.module == *module) && key.name == *name
-                })
+                && native_key_matches(
+                    program.structs[struct_id.index()].native_key.as_ref(),
+                    module.as_ref(),
+                    name,
+                )
+        }
+        (RirType::DataRef(dataref_id), ExternTypeExpr::Named { module, name, args }) => {
+            args.is_empty()
+                && native_key_matches(
+                    program.datarefs[dataref_id.index()].native_key.as_ref(),
+                    module.as_ref(),
+                    name,
+                )
+        }
+        (RirType::Enum(enum_id), ExternTypeExpr::Named { module, name, args }) => {
+            args.is_empty()
+                && native_key_matches(
+                    program.enums[enum_id.index()].native_key.as_ref(),
+                    module.as_ref(),
+                    name,
+                )
+        }
+        (RirType::Enum(enum_id), ExternTypeExpr::Result(ok, err)) => {
+            rir_type_matches_result(program, *enum_id, ok, err)
         }
         (RirType::List(elem), ExternTypeExpr::List(expected))
-        | (RirType::Option(elem), ExternTypeExpr::Option(expected)) => {
+        | (RirType::Option(elem), ExternTypeExpr::Option(expected))
+        | (RirType::Slice(elem), ExternTypeExpr::Slice(expected)) => {
             rir_type_matches_extern(program, *elem, expected)
         }
+        (
+            RirType::Array { elem, len },
+            ExternTypeExpr::Array {
+                elem: expected,
+                len: expected_len,
+            },
+        ) => len == expected_len && rir_type_matches_extern(program, *elem, expected),
         (RirType::Map { key, value }, ExternTypeExpr::Map(expected_key, expected_value)) => {
             rir_type_matches_extern(program, *key, expected_key)
                 && rir_type_matches_extern(program, *value, expected_value)
         }
+        (RirType::Lambda(_), ExternTypeExpr::Callback(callback)) => {
+            rir_type_matches_callback(program, id, callback)
+        }
+        (RirType::Tuple(tuple), ExternTypeExpr::Tuple(expected)) => {
+            let fields = &program.tuples[tuple.index()].fields;
+            fields.len() == expected.len()
+                && fields
+                    .iter()
+                    .zip(expected)
+                    .all(|(field, expected)| rir_type_matches_extern(program, field.ty, expected))
+        }
         _ => false,
-    }
-}
-
-fn rir_type_matches_option(program: &RirProgram, id: RirTypeId, inner: &RustReturnAbi) -> bool {
-    let Some(RirType::Option(payload)) = program.types.get(id.index()) else {
-        return false;
-    };
-    match inner {
-        RustReturnAbi::Value(ty) => {
-            !extern_type_contains_collection(ty) && rir_type_matches_extern(program, *payload, ty)
-        }
-        RustReturnAbi::Void | RustReturnAbi::Option(_) | RustReturnAbi::List(_) => false,
-    }
-}
-
-fn extern_type_contains_collection(ty: &ExternTypeExpr) -> bool {
-    match ty {
-        ExternTypeExpr::List(_) | ExternTypeExpr::Map(_, _) => true,
-        ExternTypeExpr::Option(inner) => extern_type_contains_collection(inner),
-        ExternTypeExpr::Callback(callback) => {
-            callback
-                .params
-                .iter()
-                .any(|param| extern_type_contains_collection(&param.ty))
-                || extern_type_contains_collection(&callback.ret)
-        }
-        ExternTypeExpr::Void
-        | ExternTypeExpr::Bool
-        | ExternTypeExpr::Int
-        | ExternTypeExpr::Float
-        | ExternTypeExpr::String
-        | ExternTypeExpr::Any
-        | ExternTypeExpr::Named { .. } => false,
     }
 }
 
@@ -7647,6 +7732,7 @@ mod tests {
             datarefs: vec![RirDataRef {
                 id: RirDataRefId::from_index(0),
                 air_id: air::AggregateId::from_index(0),
+                native_key: None,
                 symbol: RirSymbol::new("D"),
                 display: RirSymbol::new("D"),
                 cycle_capable: false,

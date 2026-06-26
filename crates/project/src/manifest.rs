@@ -1407,6 +1407,7 @@ mod tests {
                     doc: None,
                     rep: anvyx_runtime::ExternRep::Shared,
                     fields: vec![],
+                    variants: vec![],
                     init: None,
                     methods: vec![],
                     statics: vec![],

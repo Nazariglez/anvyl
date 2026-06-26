@@ -1,5 +1,6 @@
 use anvyx_externs::{
-    ExternDescriptorError, ExternModuleDescriptor, ModulePath, validate_module_contents,
+    ExternDescriptorError, ExternModuleDescriptor, ModulePath, ProviderDescriptor, validate,
+    validate_module_contents,
 };
 
 use super::raw::*;
@@ -10,7 +11,14 @@ pub(crate) fn validate_raw_shapes(raw: &RawExterns) -> Result<(), Vec<ExternInpu
     for group in &raw.groups {
         for module in &group.modules {
             let descriptor = module_descriptor(module);
-            let Err(module_errors) = validate_module_contents(&descriptor) else {
+            let validation = match &group.provenance {
+                ExternProvenance::Provider { provider, .. } => validate(&ProviderDescriptor {
+                    provider: provider.clone(),
+                    modules: vec![descriptor],
+                }),
+                ExternProvenance::Source { .. } => validate_module_contents(&descriptor),
+            };
+            let Err(module_errors) = validation else {
                 continue;
             };
             let decl = RawExternDecl {
@@ -65,6 +73,7 @@ fn type_descriptor(ty: &RawExternType) -> anvyx_externs::ExternTypeDescriptor {
         doc: ty.doc.clone(),
         rep: ty.rep,
         fields: ty.fields.iter().map(|field| field.decl.clone()).collect(),
+        variants: ty.variants.clone(),
         init: ty.init.as_ref().map(|init| init.decl.clone()),
         methods: ty
             .methods

@@ -239,13 +239,19 @@ impl ProfileCx<'_> {
 
     fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {
         let decl = self.program.extern_type(ext);
-        decl.rep == air::ExternRep::Inline
-            && decl.fields.iter().all(|field| {
-                matches!(
-                    self.program.type_arena.data(field.ty),
-                    TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
-                )
-            })
+        match decl.rep {
+            air::ExternRep::Shared => true,
+            air::ExternRep::Inline => {
+                decl.fields.iter().all(|field| {
+                    matches!(
+                        self.program.type_arena.data(field.ty),
+                        TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
+                    )
+                }) && decl.variants.iter().all(|variant| {
+                    variant_field_tys(variant).all(|ty| self.stored_payload_supported(ty))
+                })
+            }
+        }
     }
 
     fn check_const(&mut self, id: ConstId) {
@@ -1457,12 +1463,16 @@ impl ProfileCx<'_> {
             TypeData::Enum(enm) => self.program.enum_decl(*enm).variants.iter().any(|variant| {
                 variant_field_tys(variant).any(|ty| self.type_contains_inner(ty, visited, target))
             }),
-            TypeData::Extern(ext) => self
-                .program
-                .extern_type(*ext)
-                .fields
-                .iter()
-                .any(|field| self.type_contains_inner(field.ty, visited, target)),
+            TypeData::Extern(ext) => {
+                let decl = self.program.extern_type(*ext);
+                decl.fields
+                    .iter()
+                    .any(|field| self.type_contains_inner(field.ty, visited, target))
+                    || decl.variants.iter().any(|variant| {
+                        variant_field_tys(variant)
+                            .any(|ty| self.type_contains_inner(ty, visited, target))
+                    })
+            }
             _ => false,
         }
     }

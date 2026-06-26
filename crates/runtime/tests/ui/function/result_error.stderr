@@ -1,5 +1,5 @@
-error: #[function] only supports Result<T, RuntimeError>
+error: Result<T, RuntimeError> requires #[function(trap)]
  --> tests/ui/function/result_error.rs:4:35
   |
-4 | fn bad(value: i64) -> Result<i64, String> { Ok(value) }
-  |                                   ^^^^^^
+4 | fn bad(value: i64) -> Result<i64, RuntimeError> { Ok(value) }
+  |                                   ^^^^^^^^^^^^

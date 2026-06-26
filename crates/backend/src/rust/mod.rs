@@ -606,6 +606,7 @@ impl<'a> PlanCx<'a> {
 
         let mut aggregate_types = vec![];
         let mut extern_types = vec![];
+        let mut extern_enum_types = vec![];
         let mut enum_types = vec![];
         let mut dataref_types = vec![];
         let mut tuple_types = vec![];
@@ -634,9 +635,16 @@ impl<'a> PlanCx<'a> {
                     RirType::DataRef(dataref_id)
                 }
                 TypeData::Extern(ext) => {
-                    let struct_id = self.reserve_extern_struct(program, type_id, *ext)?;
-                    extern_types.push((type_id, *ext, struct_id));
-                    RirType::Struct(struct_id)
+                    let decl = self.air.extern_type(*ext);
+                    if decl.variants.is_empty() {
+                        let struct_id = self.reserve_extern_struct(program, type_id, *ext)?;
+                        extern_types.push((type_id, *ext, struct_id));
+                        RirType::Struct(struct_id)
+                    } else {
+                        let enum_id = self.reserve_extern_enum(program, type_id, *ext)?;
+                        extern_enum_types.push((type_id, *ext, enum_id));
+                        RirType::Enum(enum_id)
+                    }
                 }
                 TypeData::Array { elem, len } => RirType::Array {
                     elem: self.type_map[elem],
@@ -680,6 +688,9 @@ impl<'a> PlanCx<'a> {
         for &(type_id, ext, struct_id) in &extern_types {
             self.fill_extern_struct(program, type_id, ext, struct_id)?;
         }
+        for &(type_id, ext, enum_id) in &extern_enum_types {
+            self.fill_extern_enum(program, type_id, ext, enum_id)?;
+        }
         for &(_, aggregate, dataref_id) in &dataref_types {
             self.fill_dataref(program, aggregate, dataref_id)?;
         }
@@ -698,6 +709,11 @@ impl<'a> PlanCx<'a> {
         let enum_types = enum_types
             .iter()
             .map(|(type_id, _, enum_id)| (*type_id, *enum_id))
+            .chain(
+                extern_enum_types
+                    .iter()
+                    .map(|(type_id, _, enum_id)| (*type_id, *enum_id)),
+            )
             .collect::<Vec<_>>();
         let type_ids = PlannedTypeIds {
             structs: struct_types,
@@ -803,6 +819,7 @@ impl<'a> PlanCx<'a> {
             )),
             display: RirSymbol::new(decl.name.as_str()),
             native_path: None,
+            native_ref: false,
             native_key: None,
             copyable: true,
             fields: vec![],
@@ -867,6 +884,7 @@ impl<'a> PlanCx<'a> {
         program.datarefs.push(RirDataRef {
             id,
             air_id: aggregate,
+            native_key: None,
             symbol: RirSymbol::new(&base),
             display: RirSymbol::new(decl.name.as_str()),
             cycle_capable: decl.cycle_capable,
@@ -908,7 +926,7 @@ impl<'a> PlanCx<'a> {
         ext: air::ExternTypeId,
     ) -> Result<RirStructId, RustPlanError> {
         let decl = self.air.extern_type(ext);
-        if decl.rep != air::ExternRep::Inline {
+        if !matches!(decl.rep, air::ExternRep::Inline | air::ExternRep::Shared) {
             return Err(Self::gap(
                 RustTargetGapSite::Type(type_id),
                 RustTargetGapKind::UnsupportedType,
@@ -916,6 +934,7 @@ impl<'a> PlanCx<'a> {
         }
         let id = RirStructId::from_index(program.structs.len());
         let native = self.native_type_binding(type_id, decl)?;
+        let native_ref = decl.rep == air::ExternRep::Shared;
         program.structs.push(RirStruct {
             id,
             air_id: None,
@@ -927,8 +946,9 @@ impl<'a> PlanCx<'a> {
             )),
             display: RirSymbol::new(decl.name.as_str()),
             native_path: Some(native_path(&native.path)),
+            native_ref,
             native_key: Some(native.key.clone()),
-            copyable: true,
+            copyable: !native_ref,
             fields: vec![],
         });
         Ok(id)
@@ -942,6 +962,10 @@ impl<'a> PlanCx<'a> {
         struct_id: RirStructId,
     ) -> Result<(), RustPlanError> {
         let decl = self.air.extern_type(ext);
+        if decl.rep == air::ExternRep::Shared {
+            program.structs[struct_id.index()].fields = vec![];
+            return Ok(());
+        }
         let fields = match decl.constructor_fields() {
             Some(fields) => fields.map(|(_, field)| field).collect::<Vec<_>>(),
             None => decl.fields.iter().filter(|field| !field.computed).collect(),
@@ -968,6 +992,91 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
+    fn reserve_extern_enum(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        ext: air::ExternTypeId,
+    ) -> Result<RirEnumId, RustPlanError> {
+        let decl = self.air.extern_type(ext);
+        if decl.rep != air::ExternRep::Inline {
+            return Err(Self::gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedType,
+            ));
+        }
+        let id = RirEnumId::from_index(program.enums.len());
+        let native = self.native_type_binding(type_id, decl)?;
+        program.enums.push(RirEnum {
+            id,
+            air_id: None,
+            native_path: Some(native_path(&native.path)),
+            native_key: Some(native.key.clone()),
+            core: None,
+            repr: RirEnumRepr::Adt,
+            raw_type: None,
+            symbol: RirSymbol::new(format!(
+                "{}T{}_{}",
+                self.config.symbol_prefix,
+                type_id.index(),
+                sanitize(decl.name.as_str())
+            )),
+            display: RirSymbol::new(decl.name.as_str()),
+            copyable: true,
+            variants: vec![],
+        });
+        Ok(id)
+    }
+
+    fn fill_extern_enum(
+        &self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        ext: air::ExternTypeId,
+        enum_id: RirEnumId,
+    ) -> Result<(), RustPlanError> {
+        let decl = self.air.extern_type(ext);
+        let mut seen_variants = vec![];
+        let mut variants = vec![];
+        for (variant_index, variant) in decl.variants.iter().enumerate() {
+            let (kind, fields) = match &variant.shape {
+                air::VariantShape::Unit => (RirVariantKind::Unit, vec![]),
+                air::VariantShape::Tuple(types) => {
+                    let fields = types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, ty)| self.enum_field(type_id, *ty, index))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (RirVariantKind::Tuple, fields)
+                }
+                air::VariantShape::Struct(fields) => {
+                    let mut seen_fields = vec![];
+                    let fields = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| {
+                            self.enum_field(type_id, field.ty, index).map(|mut rir| {
+                                rir.symbol = scoped_symbol(field.name.as_str(), &mut seen_fields);
+                                rir
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (RirVariantKind::Struct, fields)
+                }
+            };
+            variants.push(RirVariant {
+                id: RirVariantId::from_index(variant_index),
+                symbol: scoped_symbol(variant.name.as_str(), &mut seen_variants),
+                display: RirSymbol::new(variant.name.as_str()),
+                kind,
+                raw_value: None,
+                fields,
+            });
+        }
+        program.enums[enum_id.index()].variants = variants;
+        Ok(())
+    }
+
     fn reserve_enum(
         &mut self,
         program: &mut RirProgram,
@@ -980,6 +1089,8 @@ impl<'a> PlanCx<'a> {
         program.enums.push(RirEnum {
             id,
             air_id: Some(enm),
+            native_path: None,
+            native_key: None,
             core: decl.core.map(rir_core_enum_kind),
             repr: rir_enum_repr(decl.repr),
             raw_type: decl.raw_type.map(|ty| self.type_map[&ty]),
@@ -1267,7 +1378,8 @@ impl<'a> PlanCx<'a> {
             let id = RirExternId::from_index(program.externs.len());
             let native = self.native_extern(air_id, decl)?;
             let params = self.extern_params(decl, &native);
-            let kind = Self::extern_kind(&native);
+            let ret = self.type_map[&decl.return_type];
+            let kind = Self::extern_kind(program, decl, &native, ret);
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -1277,7 +1389,8 @@ impl<'a> PlanCx<'a> {
                 )),
                 kind,
                 params,
-                ret: self.type_map[&decl.return_type],
+                ret,
+                abi: decl.abi.clone(),
             });
             self.extern_map.insert(air_id, id);
         }
@@ -1300,11 +1413,25 @@ impl<'a> PlanCx<'a> {
             .collect()
     }
 
-    fn extern_kind(native: &native::ResolvedExtern<'_>) -> RirExternKind {
+    fn extern_kind(
+        program: &RirProgram,
+        decl: &air::ExternDecl,
+        native: &native::ResolvedExtern<'_>,
+        ret: RirTypeId,
+    ) -> RirExternKind {
         RirExternKind::Native(RirNativeExtern {
             path: native_path(&native.binding.path),
             abi: native.binding.abi.clone(),
+            adopt_resource_return: matches!(decl.member, air::ExternMember::Init { .. })
+                && Self::rir_type_is_native_ref(program, ret),
         })
+    }
+
+    fn rir_type_is_native_ref(program: &RirProgram, ty: RirTypeId) -> bool {
+        matches!(
+            program.types[ty.index()],
+            RirType::Struct(id) if program.structs[id.index()].native_ref
+        )
     }
 
     fn native_type_binding(
@@ -4768,6 +4895,7 @@ fn rir_format_spec(spec: FormatSpec) -> RirFormatSpec {
 fn rir_core_enum_kind(kind: air::CoreEnumKind) -> RirCoreEnumKind {
     match kind {
         air::CoreEnumKind::Option => RirCoreEnumKind::Option,
+        air::CoreEnumKind::Result => RirCoreEnumKind::Result,
     }
 }
 

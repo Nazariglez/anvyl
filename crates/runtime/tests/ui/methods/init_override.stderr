@@ -1,4 +1,4 @@
-error: #[anvyx(init)] does not support ret/params overrides
+error: #[anvyx(init)] does not support ret overrides
  --> tests/ui/methods/init_override.rs:8:9
   |
 8 |     pub fn new() -> Self { Self }

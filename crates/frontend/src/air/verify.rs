@@ -1,6 +1,7 @@
 use anvyx_externs::{
-    BinaryOp as ExternBinaryOp, ExternBindingOp, ExternBindingTarget, ExternMemberSelector,
-    ExternOperator, ExternTypeKey, ModulePath as ExternModulePath, UnaryOp as ExternUnaryOp,
+    AbiPosition, AbiTypeError, BinaryOp as ExternBinaryOp, ExternBindingOp, ExternBindingTarget,
+    ExternMemberSelector, ExternOperator, ExternTypeExpr, ExternTypeKey,
+    ModulePath as ExternModulePath, UnaryOp as ExternUnaryOp,
 };
 
 pub use super::typing::PrimitiveKind;
@@ -85,13 +86,35 @@ pub enum VerifyErrorKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadExtern {
-    ReceiverTypeMismatch { expected: TypeId, found: TypeId },
+    ReceiverTypeMismatch {
+        expected: TypeId,
+        found: TypeId,
+    },
     InvalidInitField(FieldId),
     OperatorOperandMismatch,
-    MemberParamCountMismatch { expected: usize, found: usize },
+    MemberParamCountMismatch {
+        expected: usize,
+        found: usize,
+    },
+    AbiParamCountMismatch {
+        expected: usize,
+        found: usize,
+    },
+    VariantAbiCountMismatch {
+        expected: usize,
+        found: usize,
+    },
+    VariantFieldAbiCountMismatch {
+        expected: usize,
+        found: usize,
+    },
     ReceiverModeMismatch,
     EscapingParamMustBeValue(usize),
     EscapingParamMustBeFunction(usize),
+    InvalidAbi {
+        position: AbiPosition,
+        reason: AbiTypeError,
+    },
     BindingMismatch,
 }
 
@@ -2716,6 +2739,47 @@ fn verify_receiver(cx: &mut VerifyCx<'_>, site: VerifySite, owner_ty: TypeId, re
     }
 }
 
+fn verify_extern_variants(cx: &mut VerifyCx<'_>, site: &VerifySite, ty: &super::ExternTypeDecl) {
+    if ty.variants.len() != ty.variant_abis.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadExtern(BadExtern::VariantAbiCountMismatch {
+                expected: ty.variants.len(),
+                found: ty.variant_abis.len(),
+            }),
+        );
+    }
+    for (variant, abi) in ty.variants.iter().zip(&ty.variant_abis) {
+        let field_count = match &variant.shape {
+            VariantShape::Unit => 0,
+            VariantShape::Tuple(types) => {
+                for ty in types {
+                    cx.verify_type_ref(site.clone(), *ty);
+                }
+                types.len()
+            }
+            VariantShape::Struct(fields) => {
+                for field in fields {
+                    cx.verify_type_ref(site.clone(), field.ty);
+                }
+                fields.len()
+            }
+        };
+        if field_count != abi.fields.len() {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadExtern(BadExtern::VariantFieldAbiCountMismatch {
+                    expected: field_count,
+                    found: abi.fields.len(),
+                }),
+            );
+        }
+        for field_abi in &abi.fields {
+            verify_extern_abi(cx, site, field_abi, AbiPosition::Field);
+        }
+    }
+}
+
 fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
     let ty = cx.program.extern_type(id);
     let site = VerifySite::ExternType(id);
@@ -2739,6 +2803,7 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
     }
     for field in &ty.fields {
         cx.verify_type_ref(site.clone(), field.ty);
+        verify_extern_abi(cx, &site, &field.abi, AbiPosition::Field);
         if let Some(owner_ty) = owner_ty {
             verify_receiver(cx, site.clone(), owner_ty, field.get_receiver.ty);
             verify_receiver(cx, site.clone(), owner_ty, field.set_receiver.ty);
@@ -2759,6 +2824,7 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
             );
         }
     }
+    verify_extern_variants(cx, &site, ty);
     for method in &ty.methods {
         if let Some(owner_ty) = owner_ty {
             verify_receiver(cx, site.clone(), owner_ty, method.receiver.ty);
@@ -2768,13 +2834,28 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
         for (index, param) in method.params.iter().enumerate() {
             verify_extern_param(cx, site.clone(), index, param);
         }
+        verify_extern_abi_signature(
+            cx,
+            &site,
+            &method.abi,
+            std::iter::once(method.receiver.mode)
+                .chain(method.params.iter().map(|param| param.mode)),
+        );
         cx.verify_type_ref(site.clone(), method.return_type);
+        verify_extern_abi(cx, &site, &method.abi.ret, AbiPosition::Return);
     }
     for static_ in &ty.statics {
         for (index, param) in static_.params.iter().enumerate() {
             verify_extern_param(cx, site.clone(), index, param);
         }
+        verify_extern_abi_signature(
+            cx,
+            &site,
+            &static_.abi,
+            static_.params.iter().map(|param| param.mode),
+        );
         cx.verify_type_ref(site.clone(), static_.return_type);
+        verify_extern_abi(cx, &site, &static_.abi.ret, AbiPosition::Return);
     }
     for op in &ty.operators {
         if let Some(owner_ty) = owner_ty {
@@ -2800,7 +2881,14 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
         if let Some(operand) = &op.operand {
             verify_extern_param(cx, site.clone(), 0, operand);
         }
+        verify_extern_abi_signature(
+            cx,
+            &site,
+            &op.abi,
+            std::iter::once(op.receiver.mode).chain(op.operand.iter().map(|param| param.mode)),
+        );
         cx.verify_type_ref(site.clone(), op.return_type);
+        verify_extern_abi(cx, &site, &op.abi.ret, AbiPosition::Return);
     }
 }
 
@@ -2838,7 +2926,62 @@ fn verify_extern(cx: &mut VerifyCx<'_>, id: ExternId) {
     for (index, param) in ext.params.iter().enumerate() {
         verify_extern_param(cx, site.clone(), index, param);
     }
-    cx.verify_type_ref(site, ext.return_type);
+    verify_extern_abi_signature(
+        cx,
+        &site,
+        &ext.abi,
+        ext.call_params().map(|param| param.mode),
+    );
+    cx.verify_type_ref(site.clone(), ext.return_type);
+    verify_extern_abi(cx, &site, &ext.abi.ret, AbiPosition::Return);
+}
+
+fn verify_extern_abi_signature(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    abi: &super::ExternAbi,
+    modes: impl IntoIterator<Item = ParamMode>,
+) {
+    let modes = modes.into_iter().collect::<Vec<_>>();
+    if abi.params.len() != modes.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadExtern(BadExtern::AbiParamCountMismatch {
+                expected: modes.len(),
+                found: abi.params.len(),
+            }),
+        );
+    }
+    for (param_abi, mode) in abi.params.iter().zip(modes) {
+        verify_extern_abi(cx, site, param_abi, abi_position_for_param(mode));
+    }
+}
+
+fn abi_position_for_param(mode: ParamMode) -> AbiPosition {
+    match mode {
+        ParamMode::Value => AbiPosition::ParamValue,
+        ParamMode::SharedBorrow => AbiPosition::ParamBorrow,
+        ParamMode::MutBorrow => AbiPosition::ParamMutBorrow,
+    }
+}
+
+fn verify_extern_abi(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    abi: &ExternTypeExpr,
+    position: AbiPosition,
+) {
+    if let Err(violations) = abi.classify_abi(position) {
+        for violation in violations {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadExtern(BadExtern::InvalidAbi {
+                    position: violation.position,
+                    reason: violation.reason,
+                }),
+            );
+        }
+    }
 }
 
 fn verify_extern_binding(cx: &mut VerifyCx<'_>, site: VerifySite, ext: &super::ExternDecl) {

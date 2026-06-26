@@ -418,13 +418,18 @@ impl<'a> AirRustRepPolicy<'a> {
                     .iter()
                     .flat_map(Self::variant_field_tys),
             ),
-            TypeData::Extern(id) => self.composite_materialization(
-                self.program
-                    .extern_type(*id)
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
-            ),
+            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared => {
+                RustMaterialization::CloneHandle
+            }
+            TypeData::Extern(id) => {
+                let decl = self.program.extern_type(*id);
+                self.composite_materialization(
+                    decl.fields
+                        .iter()
+                        .map(|field| field.ty)
+                        .chain(decl.variants.iter().flat_map(Self::variant_field_tys)),
+                )
+            }
             TypeData::Int
             | TypeData::Float
             | TypeData::Bool
@@ -562,12 +567,16 @@ impl<'a> AirRustRepPolicy<'a> {
                 Self::variant_field_tys(variant)
                     .any(|ty| self.contains_function_payload_inner(ty, active))
             }),
-            TypeData::Extern(id) => self
-                .program
-                .extern_type(*id)
-                .fields
-                .iter()
-                .any(|field| self.contains_function_payload_inner(field.ty, active)),
+            TypeData::Extern(id) => {
+                let decl = self.program.extern_type(*id);
+                decl.fields
+                    .iter()
+                    .any(|field| self.contains_function_payload_inner(field.ty, active))
+                    || decl.variants.iter().any(|variant| {
+                        Self::variant_field_tys(variant)
+                            .any(|ty| self.contains_function_payload_inner(ty, active))
+                    })
+            }
             TypeData::Int
             | TypeData::Float
             | TypeData::Bool
@@ -694,7 +703,24 @@ impl<'a> AirRustRepPolicy<'a> {
             TypeData::Function(_) if family.allows_function_payload() => Ok(()),
             TypeData::Function(_) => Err(family.lambda_gap()),
             TypeData::Slice(_) => Err(LambdaStorageGap::Lifetime),
-            TypeData::Extern(_) => Err(LambdaStorageGap::ExternBoundary),
+            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared => {
+                Ok(())
+            }
+            TypeData::Extern(id) => {
+                let decl = self.program.extern_type(*id);
+                decl.fields
+                    .iter()
+                    .map(|field| field.ty)
+                    .chain(decl.variants.iter().flat_map(Self::variant_field_tys))
+                    .try_for_each(|ty| {
+                        self.storage_supported_inner(
+                            ty,
+                            nested_storage_family(family, LambdaStorageFamily::StructField),
+                            cycle_broken,
+                            active,
+                        )
+                    })
+            }
             TypeData::Void | TypeData::Any | TypeData::Dyn(_) => {
                 Err(LambdaStorageGap::UnsupportedType)
             }
@@ -728,6 +754,9 @@ impl<'a> AirRustRepPolicy<'a> {
                 .iter()
                 .all(|field| self.embedded_air_shareable_value(field.ty)),
             TypeData::Enum(id) => self.enum_shareable(*id),
+            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared => {
+                true
+            }
             _ => false,
         }
     }
@@ -1130,6 +1159,9 @@ impl<'a> RustRepPolicy<'a> {
             RirType::Option(inner) => self.composite_materialization([inner]),
             RirType::Array { elem, .. } => self
                 .composite_storage_materialization([elem], LambdaStorageFamily::FixedArrayElement),
+            RirType::Struct(id) if self.program.structs[id.index()].native_ref => {
+                RustMaterialization::CloneHandle
+            }
             RirType::Struct(id) => self.composite_storage_materialization(
                 self.program.structs[id.index()]
                     .fields
@@ -2133,6 +2165,7 @@ impl<'a> RustRepPolicy<'a> {
                 (storage && self.lambda_sig_needs_lifetime(sig))
                     || self.lambda_sig_needs_ctx_lifetime_inner(sig, active_sigs)
             }
+            RirType::Struct(id) if self.program.structs[id.index()].native_ref => true,
             RirType::Struct(id) => self.program.structs[id.index()].fields.iter().any(|field| {
                 self.type_cx_dependent_inner(field.ty, storage, active_tys, active_sigs)
             }),
@@ -2180,6 +2213,7 @@ impl<'a> RustRepPolicy<'a> {
                 self.type_has_heap_shape_inner(inner, lambda_has_shape, active)
             }
             RirType::Lambda(sig) => lambda_has_shape(self, sig),
+            RirType::Struct(id) if self.program.structs[id.index()].native_ref => true,
             RirType::Struct(id) => self.program.structs[id.index()]
                 .fields
                 .iter()
@@ -2673,6 +2707,7 @@ mod tests {
             symbol: RirSymbol::new("Label"),
             display: RirSymbol::new("Label"),
             native_path: None,
+            native_ref: false,
             native_key: None,
             copyable: false,
             fields: vec![RirField {
@@ -2708,6 +2743,7 @@ mod tests {
                 symbol: RirSymbol::new(symbol),
                 display: RirSymbol::new(symbol),
                 native_path: None,
+                native_ref: false,
                 native_key: None,
                 copyable: false,
                 fields,
@@ -2741,6 +2777,8 @@ mod tests {
             enums: vec![RirEnum {
                 id: RirEnumId::from_index(0),
                 air_id: None,
+                native_path: None,
+                native_key: None,
                 core: None,
                 repr: RirEnumRepr::Adt,
                 raw_type: None,
@@ -2788,6 +2826,7 @@ mod tests {
         program.datarefs.push(RirDataRef {
             id: RirDataRefId::from_index(0),
             air_id: air::AggregateId::from_index(0),
+            native_key: None,
             symbol: RirSymbol::new("Node"),
             display: RirSymbol::new("Node"),
             cycle_capable: true,
@@ -2835,6 +2874,7 @@ mod tests {
         program.datarefs.push(RirDataRef {
             id: RirDataRefId::from_index(0),
             air_id: air::AggregateId::from_index(0),
+            native_key: None,
             symbol: RirSymbol::new("Node"),
             display: RirSymbol::new("Node"),
             cycle_capable: true,
@@ -2922,6 +2962,8 @@ mod tests {
         program.enums.push(RirEnum {
             id: RirEnumId::from_index(0),
             air_id: None,
+            native_path: None,
+            native_key: None,
             core: None,
             repr: RirEnumRepr::Adt,
             raw_type: None,
@@ -3339,6 +3381,7 @@ mod tests {
             symbol: RirSymbol::new("A"),
             display: RirSymbol::new("A"),
             native_path: None,
+            native_ref: false,
             native_key: None,
             copyable: false,
             fields: vec![RirField {
@@ -3353,6 +3396,7 @@ mod tests {
             symbol: RirSymbol::new("B"),
             display: RirSymbol::new("B"),
             native_path: None,
+            native_ref: false,
             native_key: None,
             copyable: false,
             fields: vec![RirField {

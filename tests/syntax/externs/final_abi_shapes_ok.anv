@@ -1,0 +1,24 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @lint: unused=allow
+
+struct HostBox { value: int }
+
+enum HostError { Bad(string) }
+
+extern fn maybe_add(value: int?, delta: int) -> int?;
+extern fn swap_pair(pair: (int, string)) -> (string, int);
+extern fn first_array(values: [int; 3]) -> int;
+extern fn visible_result(ok: bool) -> Result<int, HostError>;
+extern fn nested(value: Result<(int, string?), HostError>) -> Result<int?, HostError>;
+extern fn source_named(value: HostBox) -> HostBox;
+
+fn main() {
+    let value = maybe_add(1, 2) ?? 0;
+    let pair = swap_pair((value, "x"));
+    let first = first_array([1, 2, 3]);
+    let result = visible_result(true);
+    let nested_result = nested(Result.Ok((first, Option.Some(pair.0))));
+    let box = source_named(HostBox { value: first });
+}

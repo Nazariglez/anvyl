@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use anvyx_externs::{
-    BinaryOp, CallbackEscape, ExternBindingKey, ExternBindingOp, ExternBindingTarget,
-    ExternEffects, ExternFunctionKey, ExternMemberKey, ExternMemberSelector, ExternOperator,
-    ExternParam, ExternRep, ExternSignature, ExternTypeExpr, ExternTypeKey, OperatorReturn,
-    ParamFlow, ProviderId, ReceiverMode, UnaryOp,
+    AbiPosition, AbiTypeError, BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread,
+    ExternBindingKey, ExternBindingOp, ExternBindingTarget, ExternCallbackParam,
+    ExternCallbackSignature, ExternEffects, ExternFunctionKey, ExternMemberKey,
+    ExternMemberSelector, ExternOperator, ExternParam, ExternRep, ExternSignature, ExternTypeExpr,
+    ExternTypeKey, OperatorReturn, ParamFlow, ProviderId, ReceiverMode, UnaryOp,
 };
 
 use crate::{
-    ast::{EscapeMode, FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
+    ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -21,7 +22,7 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
-        TypeRefResolver, type_closure_facts,
+        TypeRefResolver, nominal_type, type_closure_facts,
     },
 };
 
@@ -129,6 +130,7 @@ impl ResolvedExternParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedExternTy {
     pub(crate) ty: Type,
+    pub(crate) abi: ExternTypeExpr,
 }
 
 impl ResolvedExternTy {
@@ -139,7 +141,10 @@ impl ResolvedExternTy {
 
 impl Default for ResolvedExternTy {
     fn default() -> Self {
-        Self { ty: Type::Void }
+        Self {
+            ty: Type::Void,
+            abi: ExternTypeExpr::Void,
+        }
     }
 }
 
@@ -179,7 +184,7 @@ enum ExternCatalogVisit<'a> {
     Ty {
         context: ExternCatalogContext,
         ty: &'a ResolvedExternTy,
-        position: TypePosition,
+        position: AbiPosition,
         site: RawExternSite,
     },
     OperatorReturn {
@@ -236,7 +241,7 @@ impl ExternCatalog {
                 visit(ExternCatalogVisit::Ty {
                     context: ty.context.field(field.name),
                     ty: &field.ty,
-                    position: TypePosition::Param,
+                    position: AbiPosition::Field,
                     site: field.site,
                 });
             }
@@ -255,6 +260,24 @@ impl ExternCatalog {
                     static_method.site,
                     visit,
                 );
+            }
+            if let Some(init) = &ty.init {
+                visit_extern_signature_with_context(
+                    ty.context.init(),
+                    &init.signature,
+                    ty.site,
+                    visit,
+                );
+            }
+            for variant in &ty.variants {
+                for field in &variant.fields {
+                    visit(ExternCatalogVisit::Ty {
+                        context: ty.context.clone(),
+                        ty: &field.ty,
+                        position: AbiPosition::Field,
+                        site: ty.site,
+                    });
+                }
             }
             for operator in &ty.operators {
                 let context = ty.context.operator(operator.op);
@@ -369,7 +392,9 @@ impl ExternCatalog {
             ty,
             ExternMemberSelector::Init,
             ExternBindingOp::Call,
-            ExternEffects::default(),
+            ty.init
+                .as_ref()
+                .map_or_else(ExternEffects::default, |init| init.effects),
         )
     }
 
@@ -591,7 +616,8 @@ pub(crate) struct ExternType {
     pub(crate) doc: Option<String>,
     pub(crate) rep: ExternRep,
     pub(crate) fields: Vec<ExternField>,
-    pub(crate) init: Option<Vec<ExternFieldId>>,
+    pub(crate) variants: Vec<ExternEnumVariant>,
+    pub(crate) init: Option<ExternInit>,
     pub(crate) methods: Vec<ExternMethod>,
     pub(crate) statics: Vec<ExternStatic>,
     pub(crate) operators: Vec<ExternOperatorDecl>,
@@ -599,6 +625,26 @@ pub(crate) struct ExternType {
     methods_by_name: HashMap<Ident, ExternMethodId>,
     statics_by_name: HashMap<Ident, ExternStaticId>,
     operators_by_op: HashMap<ExternOperator, ExternOperatorId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternInit {
+    pub(crate) fields: Vec<ExternFieldId>,
+    pub(crate) signature: ResolvedExternSignature,
+    pub(crate) effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternEnumVariant {
+    pub(crate) name: Ident,
+    pub(crate) fields: Vec<ExternEnumVariantField>,
+    pub(crate) doc: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternEnumVariantField {
+    pub(crate) name: Option<Ident>,
+    pub(crate) ty: ResolvedExternTy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,7 +665,7 @@ impl ExternType {
     pub(crate) fn constructor_fields(
         &self,
     ) -> Option<impl Iterator<Item = (usize, &ExternField)> + '_> {
-        Some(self.init.as_ref()?.iter().map(|id| {
+        Some(self.init.as_ref()?.fields.iter().map(|id| {
             let index = id.0;
             (index, &self.fields[index])
         }))
@@ -773,6 +819,12 @@ pub(crate) enum ExternCatalogError {
         reason: InvalidExternTypeReason,
         site: RawExternSite,
     },
+    InvalidAbiType {
+        context: ExternCatalogContext,
+        position: AbiPosition,
+        reason: AbiTypeError,
+        site: RawExternSite,
+    },
     UnknownInitField {
         context: ExternCatalogContext,
         field: Ident,
@@ -783,11 +835,7 @@ pub(crate) enum ExternCatalogError {
         field: Ident,
         site: RawExternSite,
     },
-    UnsupportedInitParams {
-        context: ExternCatalogContext,
-        count: usize,
-        site: RawExternSite,
-    },
+
     InvalidOperatorReturn {
         context: ExternCatalogContext,
         found: Type,
@@ -804,9 +852,9 @@ impl ExternCatalogError {
             | Self::GenericArity { context, .. }
             | Self::GenericArgKindMismatch { context, .. }
             | Self::InvalidType { context, .. }
+            | Self::InvalidAbiType { context, .. }
             | Self::UnknownInitField { context, .. }
             | Self::ComputedInitField { context, .. }
-            | Self::UnsupportedInitParams { context, .. }
             | Self::InvalidOperatorReturn { context, .. } => context,
         }
     }
@@ -818,9 +866,9 @@ impl ExternCatalogError {
             | Self::GenericArity { site, .. }
             | Self::GenericArgKindMismatch { site, .. }
             | Self::InvalidType { site, .. }
+            | Self::InvalidAbiType { site, .. }
             | Self::UnknownInitField { site, .. }
             | Self::ComputedInitField { site, .. }
-            | Self::UnsupportedInitParams { site, .. }
             | Self::InvalidOperatorReturn { site, .. } => site.span,
         }
     }
@@ -830,9 +878,10 @@ impl ExternCatalogError {
 pub(crate) enum InvalidExternTypeReason {
     Unresolved,
     Infer,
-    Void,
     UnresolvedConst,
     MissingCoreOption,
+    MissingCoreResult,
+    NonKeyableMapKey,
 }
 
 fn visit_extern_signature_with_context<'a>(
@@ -845,16 +894,24 @@ fn visit_extern_signature_with_context<'a>(
         visit(ExternCatalogVisit::Ty {
             context: context.clone(),
             ty: &param.ty,
-            position: TypePosition::Param,
+            position: abi_param_position(param.flow),
             site,
         });
     }
     visit(ExternCatalogVisit::Ty {
         context,
         ty: &signature.ret,
-        position: TypePosition::Return,
+        position: AbiPosition::Return,
         site,
     });
+}
+
+fn abi_param_position(flow: ParamFlow) -> AbiPosition {
+    match flow {
+        ParamFlow::Value => AbiPosition::ParamValue,
+        ParamFlow::Borrow => AbiPosition::ParamBorrow,
+        ParamFlow::MutBorrow => AbiPosition::ParamMutBorrow,
+    }
 }
 
 pub(crate) fn build_catalog(
@@ -920,7 +977,7 @@ impl<'a> CatalogBuilder<'a> {
             return Err(self.errors);
         }
 
-        validate_catalog(&self.catalog)?;
+        validate_catalog(&self.catalog, self.decls)?;
         debug_assert_consistent(&self.catalog);
         Ok(self.catalog)
     }
@@ -954,6 +1011,7 @@ impl<'a> CatalogBuilder<'a> {
                 doc: raw_ty.doc.clone(),
                 rep: raw_ty.rep,
                 fields: vec![],
+                variants: vec![],
                 init: None,
                 methods: vec![],
                 statics: vec![],
@@ -1070,17 +1128,41 @@ impl<'a> CatalogBuilder<'a> {
             });
         }
 
+        let variant_context = self.catalog.types[type_id.0].context.clone();
+        let variants = raw
+            .variants
+            .iter()
+            .map(|variant| ExternEnumVariant {
+                name: Ident::new(&variant.name),
+                fields: variant
+                    .fields
+                    .iter()
+                    .map(|field| ExternEnumVariantField {
+                        name: field.name.as_deref().map(Ident::new),
+                        ty: self.resolve_ty(
+                            ResolveCtx::new(scope, &variant_context, Some(&owner), raw.site),
+                            &field.ty,
+                        ),
+                    })
+                    .collect(),
+                doc: variant.doc.clone(),
+            })
+            .collect();
+        self.catalog.types[type_id.0].variants = variants;
+
         if let Some(raw_init) = &raw.init {
             let context = self.catalog.types[type_id.0].context.init();
-            if !raw_init.decl.params.is_empty() {
-                self.errors.push(ExternCatalogError::UnsupportedInitParams {
-                    context: context.clone(),
-                    count: raw_init.decl.params.len(),
-                    site: raw_init.site,
-                });
-            }
             let fields = self.resolve_init_fields(type_id, raw_init, &context);
-            self.catalog.types[type_id.0].init = Some(fields);
+            let signature = self.resolve_init_signature(
+                ResolveCtx::new(scope, &context, Some(&owner), raw_init.site),
+                raw_init,
+                &owner,
+            );
+            self.catalog.types[type_id.0].init = Some(ExternInit {
+                fields,
+                signature,
+                effects: raw_init.decl.effects,
+            });
         }
 
         for raw_method in &raw.methods {
@@ -1109,6 +1191,26 @@ impl<'a> CatalogBuilder<'a> {
         }
         for raw_operator in &raw.operators {
             self.resolve_operator(type_id, scope, &owner, raw_operator);
+        }
+    }
+
+    fn resolve_init_signature(
+        &mut self,
+        ctx: ResolveCtx<'_>,
+        raw_init: &RawExternInit,
+        owner: &NominalKey,
+    ) -> ResolvedExternSignature {
+        let ret = if raw_init.decl.ret == ExternTypeExpr::Void {
+            ResolvedExternTy {
+                ty: nominal_type(owner),
+                abi: ExternTypeExpr::named(None, owner.name.to_string()),
+            }
+        } else {
+            self.resolve_ty(ctx, &raw_init.decl.ret)
+        };
+        ResolvedExternSignature {
+            params: self.resolve_params(ctx, &raw_init.decl.params),
+            ret,
         }
     }
 
@@ -1221,24 +1323,115 @@ impl<'a> CatalogBuilder<'a> {
     ) -> Vec<ResolvedExternParam> {
         params
             .iter()
-            .map(|param| ResolvedExternParam {
-                name: param.name.as_deref().map(Ident::new),
-                ty: self.resolve_ty(ctx, &param.ty),
-                flow: param.flow,
-                escape: callback_escape_mode(param.escape),
+            .map(|param| {
+                let mut ty = self.resolve_ty(ctx, &param.ty);
+                if let ExternTypeExpr::Callback(callback) = &mut ty.abi {
+                    callback.policy.escape = param.escape;
+                }
+                ResolvedExternParam {
+                    name: param.name.as_deref().map(Ident::new),
+                    ty,
+                    flow: param.flow,
+                    escape: callback_escape_mode(param.escape),
+                }
             })
             .collect()
     }
 
     fn resolve_ty(&mut self, ctx: ResolveCtx<'_>, ty: &ExternTypeExpr) -> ResolvedExternTy {
-        ResolvedExternTy {
-            ty: self.resolve_ty_inner(ctx, ty),
+        let resolved = self.resolve_ty_inner(ctx, ty);
+        let abi = if matches!(ctx.context.provenance, ExternProvenance::Source { .. }) {
+            self.abi_from_resolved_ty(&resolved)
+                .unwrap_or_else(|| ty.clone())
+        } else {
+            ty.clone()
+        };
+        ResolvedExternTy { ty: resolved, abi }
+    }
+
+    fn abi_from_resolved_ty(&self, ty: &Type) -> Option<ExternTypeExpr> {
+        if let Some((_, inner)) = self.decls.semantic_option_parts(ty) {
+            return Some(ExternTypeExpr::option(self.abi_from_resolved_ty(inner)?));
+        }
+        if let Some((_, ok, err)) = self.decls.semantic_result_parts(ty) {
+            return Some(ExternTypeExpr::result(
+                self.abi_from_resolved_ty(ok)?,
+                self.abi_from_resolved_ty(err)?,
+            ));
+        }
+        match ty {
+            Type::Void => Some(ExternTypeExpr::Void),
+            Type::Tuple(fields) if fields.is_empty() => Some(ExternTypeExpr::Unit),
+            Type::Bool => Some(ExternTypeExpr::Bool),
+            Type::Int => Some(ExternTypeExpr::Int),
+            Type::Float => Some(ExternTypeExpr::Float),
+            Type::String => Some(ExternTypeExpr::String),
+            Type::Any => Some(ExternTypeExpr::Any),
+            Type::List { elem } => Some(ExternTypeExpr::list(self.abi_from_resolved_ty(elem)?)),
+            Type::Map { key, value } => Some(ExternTypeExpr::map(
+                self.abi_from_resolved_ty(key)?,
+                self.abi_from_resolved_ty(value)?,
+            )),
+            Type::Optional { inner } => {
+                Some(ExternTypeExpr::option(self.abi_from_resolved_ty(inner)?))
+            }
+            Type::Slice { elem } => Some(ExternTypeExpr::slice(self.abi_from_resolved_ty(elem)?)),
+            Type::Tuple(fields) => fields
+                .iter()
+                .map(|field| self.abi_from_resolved_ty(field))
+                .collect::<Option<Vec<_>>>()
+                .map(ExternTypeExpr::Tuple),
+            Type::Array {
+                elem,
+                len: ArrayLen::Fixed(len),
+            } => Some(ExternTypeExpr::array(
+                self.abi_from_resolved_ty(elem)?,
+                *len as u64,
+            )),
+            Type::Func { params, ret } => Some(ExternTypeExpr::Callback(ExternCallbackSignature {
+                params: params
+                    .iter()
+                    .map(|param| {
+                        Some(ExternCallbackParam {
+                            ty: self.abi_from_resolved_ty(&param.ty)?,
+                            escape: match param.escape {
+                                EscapeMode::NonEscaping => CallbackEscape::NonEscaping,
+                                EscapeMode::Escaping => CallbackEscape::Escaping,
+                            },
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                ret: Box::new(self.abi_from_resolved_ty(&ret.ty)?),
+                policy: CallbackPolicy {
+                    escape: CallbackEscape::NonEscaping,
+                    thread: CallbackThread::SameThread,
+                },
+            })),
+            Type::Nominal(nominal) if nominal.const_args.is_empty() => {
+                Some(ExternTypeExpr::Named {
+                    module: nominal
+                        .origin
+                        .as_ref()
+                        .and_then(crate::ast::ModuleOrigin::module_path)
+                        .map(|path| anvyx_externs::ModulePath {
+                            segments: path.to_vec(),
+                        }),
+                    name: nominal.name.to_string(),
+                    args: nominal
+                        .type_args
+                        .iter()
+                        .map(|arg| self.abi_from_resolved_ty(arg))
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            }
+            _ => None,
         }
     }
 
     fn resolve_ty_inner(&mut self, ctx: ResolveCtx<'_>, ty: &ExternTypeExpr) -> Type {
         match ty {
             ExternTypeExpr::Void => Type::Void,
+            ExternTypeExpr::Unit => Type::Tuple(vec![]),
             ExternTypeExpr::Bool => Type::Bool,
             ExternTypeExpr::Int => Type::Int,
             ExternTypeExpr::Float => Type::Float,
@@ -1267,6 +1460,40 @@ impl<'a> CatalogBuilder<'a> {
                     }
                 }
             }
+            ExternTypeExpr::Result(ok, err) => {
+                let ok = self.resolve_ty(ctx, ok).ty;
+                let err = self.resolve_ty(ctx, err).ty;
+                match self.decls.core_result_of(ok.clone(), err.clone()) {
+                    Some(ty) => ty,
+                    None => {
+                        let ty = Type::UnresolvedNominal {
+                            qualifier: None,
+                            name: Ident::new("Result"),
+                            generic_args: vec![GenericArg::Type(ok), GenericArg::Type(err)],
+                        };
+                        self.errors.push(invalid_type(
+                            ctx.context,
+                            &ty,
+                            InvalidExternTypeReason::MissingCoreResult,
+                            ctx.site,
+                        ));
+                        ty
+                    }
+                }
+            }
+            ExternTypeExpr::Tuple(fields) => Type::Tuple(
+                fields
+                    .iter()
+                    .map(|field| self.resolve_ty(ctx, field).ty)
+                    .collect(),
+            ),
+            ExternTypeExpr::Array { elem, len } => Type::Array {
+                elem: Box::new(self.resolve_ty(ctx, elem).ty),
+                len: ArrayLen::Fixed(usize::try_from(*len).unwrap_or(usize::MAX)),
+            },
+            ExternTypeExpr::Slice(elem) => Type::Slice {
+                elem: Box::new(self.resolve_ty(ctx, elem).ty),
+            },
             ExternTypeExpr::Callback(callback) => {
                 let params = callback
                     .params
@@ -1388,15 +1615,8 @@ impl<'a> CatalogBuilder<'a> {
         match module {
             Some(module) => self
                 .decls
-                .exported_nominal_type(&provider_module_scope(scope, module), name)
-                .or_else(|| {
-                    self.decls
-                        .exported_nominal_type(&provider_source_module_scope(scope, module), name)
-                }),
-            None => self.decls.local_nominal_type(scope, name).or_else(|| {
-                self.decls
-                    .local_nominal_type(&provider_source_current_scope(scope)?, name)
-            }),
+                .exported_nominal_type(&provider_module_scope(scope, module), name),
+            None => self.decls.local_nominal_type(scope, name),
         }
     }
 
@@ -1531,31 +1751,10 @@ fn provider_module_scope(scope: &ModuleScope, module: &anvyx_externs::ModulePath
     }
 }
 
-fn provider_source_module_scope(
-    scope: &ModuleScope,
-    module: &anvyx_externs::ModulePath,
-) -> ModuleScope {
-    let path = extern_module_path(module);
-    match scope {
-        ModuleScope::Package(current) => {
-            ModuleScope::from_module_id(&ModuleId::named(current.package().clone(), path))
-        }
-        ModuleScope::Root | ModuleScope::Named(_) => ModuleScope::Named(path),
-    }
-}
-
-fn provider_source_current_scope(scope: &ModuleScope) -> Option<ModuleScope> {
-    let ModuleScope::Package(current) = scope else {
-        return None;
-    };
-    let path = current.provider_path()?.clone();
-    Some(ModuleScope::from_module_id(&ModuleId::named(
-        current.package().clone(),
-        path,
-    )))
-}
-
-fn validate_catalog(catalog: &ExternCatalog) -> Result<(), Vec<ExternCatalogError>> {
+fn validate_catalog(
+    catalog: &ExternCatalog,
+    decls: &DeclarationIndex,
+) -> Result<(), Vec<ExternCatalogError>> {
     let mut errors = vec![];
     let mut validate = |item| match item {
         ExternCatalogVisit::Ty {
@@ -1563,7 +1762,7 @@ fn validate_catalog(catalog: &ExternCatalog) -> Result<(), Vec<ExternCatalogErro
             ty,
             position,
             site,
-        } => validate_ty(&context, ty, position, site, &mut errors),
+        } => validate_ty(&context, ty, position, site, decls, &mut errors),
         ExternCatalogVisit::OperatorReturn { context, operator } => {
             validate_operator_return(&context, operator, &mut errors);
         }
@@ -1598,35 +1797,38 @@ fn validate_operator_return(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypePosition {
-    Param,
-    Return,
-    Nested,
-}
-
-impl TypePosition {
-    fn allows_void(self) -> bool {
-        matches!(self, TypePosition::Return)
-    }
-
-    fn callback_param_position(self) -> Self {
-        match self {
-            TypePosition::Nested => TypePosition::Nested,
-            TypePosition::Param | TypePosition::Return => TypePosition::Param,
-        }
-    }
-}
-
 fn validate_ty(
     context: &ExternCatalogContext,
     ty: &ResolvedExternTy,
-    position: TypePosition,
+    position: AbiPosition,
     site: RawExternSite,
+    decls: &DeclarationIndex,
     errors: &mut Vec<ExternCatalogError>,
 ) {
     validate_type_facts(context, &ty.ty, site, errors);
-    validate_void_positions(context, &ty.ty, position, site, errors);
+    validate_abi_type(context, &ty.abi, position, site, errors);
+    validate_map_keys(context, &ty.ty, site, decls, errors);
+}
+
+fn validate_abi_type(
+    context: &ExternCatalogContext,
+    ty: &ExternTypeExpr,
+    position: AbiPosition,
+    site: RawExternSite,
+    errors: &mut Vec<ExternCatalogError>,
+) {
+    if let Err(violations) = ty.classify_abi(position) {
+        errors.extend(violations.into_iter().filter_map(|violation| {
+            let source_generic = matches!(context.provenance, ExternProvenance::Source { .. })
+                && violation.reason == AbiTypeError::GenericNamedArgsUnsupported;
+            (!source_generic).then(|| ExternCatalogError::InvalidAbiType {
+                context: context.clone(),
+                position: violation.position,
+                reason: violation.reason,
+                site,
+            })
+        }));
+    }
 }
 
 fn validate_type_facts(
@@ -1662,52 +1864,43 @@ fn validate_type_facts(
     }
 }
 
-fn validate_void_positions(
+fn validate_map_keys(
     context: &ExternCatalogContext,
     ty: &Type,
-    position: TypePosition,
     site: RawExternSite,
+    decls: &DeclarationIndex,
     errors: &mut Vec<ExternCatalogError>,
 ) {
     match ty {
-        Type::Void if !position.allows_void() => {
-            errors.push(invalid_type(
-                context,
-                ty,
-                InvalidExternTypeReason::Void,
-                site,
-            ));
+        Type::Map { key, value } => {
+            if decls.map_key_error(key).is_some() {
+                errors.push(invalid_type(
+                    context,
+                    key,
+                    InvalidExternTypeReason::NonKeyableMapKey,
+                    site,
+                ));
+            }
+            validate_map_keys(context, value, site, decls, errors);
         }
         Type::Func { params, ret } => {
             for param in params {
-                validate_void_positions(
-                    context,
-                    &param.ty,
-                    position.callback_param_position(),
-                    site,
-                    errors,
-                );
+                validate_map_keys(context, &param.ty, site, decls, errors);
             }
-            validate_void_positions(context, &ret.ty, TypePosition::Return, site, errors);
+            validate_map_keys(context, &ret.ty, site, decls, errors);
         }
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
-            validate_void_positions(context, elem, TypePosition::Nested, site, errors);
+            validate_map_keys(context, elem, site, decls, errors);
         }
-        Type::Optional { inner } => {
-            validate_void_positions(context, inner, TypePosition::Nested, site, errors);
-        }
-        Type::Map { key, value } => {
-            validate_void_positions(context, key, TypePosition::Nested, site, errors);
-            validate_void_positions(context, value, TypePosition::Nested, site, errors);
-        }
+        Type::Optional { inner } => validate_map_keys(context, inner, site, decls, errors),
         Type::Tuple(elems) => {
             for elem in elems {
-                validate_void_positions(context, elem, TypePosition::Nested, site, errors);
+                validate_map_keys(context, elem, site, decls, errors);
             }
         }
         Type::Nominal(nominal) => {
             for arg in &nominal.type_args {
-                validate_void_positions(context, arg, TypePosition::Nested, site, errors);
+                validate_map_keys(context, arg, site, decls, errors);
             }
         }
         Type::Void
@@ -1742,11 +1935,11 @@ fn invalid_type(
 #[cfg(test)]
 mod tests {
     use anvyx_externs::{
-        BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam,
-        ExternCallbackSignature, ExternFieldDescriptor, ExternFunctionDescriptor,
-        ExternInitDescriptor, ExternModuleDescriptor, ExternOperator, ExternParam, ExternSignature,
-        ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath, ProviderDescriptor,
-        ProviderId, UnaryOp,
+        AbiTypeError, BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread,
+        ExternCallbackParam, ExternCallbackSignature, ExternDescriptorError, ExternFieldDescriptor,
+        ExternFunctionDescriptor, ExternInitDescriptor, ExternModuleDescriptor, ExternOperator,
+        ExternParam, ExternSignature, ExternTypeDescriptor, ExternTypeExpr,
+        ModulePath as ExternModulePath, ProviderDescriptor, ProviderId, UnaryOp,
     };
 
     use super::*;
@@ -1829,6 +2022,7 @@ mod tests {
                 doc: None,
                 rep: ExternRep::Shared,
                 fields: vec![],
+                variants: vec![],
                 init: None,
                 methods: vec![],
                 statics: vec![],
@@ -1867,7 +2061,14 @@ mod tests {
         fn init(&mut self, owner: ExternTypeId, fields: Vec<ExternFieldId>) {
             let ty = &mut self.catalog.types[owner.0];
             assert!(ty.init.is_none());
-            ty.init = Some(fields);
+            ty.init = Some(ExternInit {
+                fields,
+                signature: ResolvedExternSignature {
+                    params: vec![],
+                    ret: resolved_ty(nominal_type(&ty.nominal)),
+                },
+                effects: ExternEffects::default(),
+            });
         }
 
         fn method(&mut self, owner: ExternTypeId, name: Ident) -> ExternMethodId {
@@ -1924,7 +2125,10 @@ mod tests {
     }
 
     fn resolved_ty(ty: Type) -> ResolvedExternTy {
-        ResolvedExternTy { ty }
+        ResolvedExternTy {
+            ty,
+            abi: ExternTypeExpr::Void,
+        }
     }
 
     fn unresolved_ty(name: &str) -> ResolvedExternTy {
@@ -1991,14 +2195,21 @@ mod tests {
         let root = parse_program(root);
         let mut resolved = resolved_modules(&root, modules);
         let option_module = ModuleId::named(PackageId::core(), module_path_segments(&["option"]));
+        let result_module = ModuleId::named(PackageId::core(), module_path_segments(&["result"]));
         resolved.import_edges.insert(option_module.clone(), vec![]);
-        resolved
-            .module_groups
-            .push(vec![crate::resolve::ResolvedModule {
+        resolved.import_edges.insert(result_module.clone(), vec![]);
+        resolved.module_groups.push(vec![
+            crate::resolve::ResolvedModule {
                 key: option_module,
                 source: test_source_id(),
                 program: parse_program("pub enum Option<T> { None, Some(T) }"),
-            }]);
+            },
+            crate::resolve::ResolvedModule {
+                key: result_module,
+                source: test_source_id(),
+                program: parse_program("pub enum Result<T, E> { Ok(T), Err(E) }"),
+            },
+        ]);
         DeclarationIndex::from_root_and_modules(&root, &resolved, raw)
     }
 
@@ -2080,6 +2291,7 @@ mod tests {
             doc: None,
             rep: ExternRep::Shared,
             fields: vec![],
+            variants: vec![],
             init: None,
             methods: vec![],
             statics: vec![],
@@ -2321,7 +2533,7 @@ mod tests {
         }
 
         #[test]
-        fn provider_absolute_type_uses_source_export() {
+        fn provider_absolute_type_rejects_source_export() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![],
@@ -2333,23 +2545,12 @@ mod tests {
                 }],
             });
             let decls = decls("", &[("geom", "pub struct Point { x: int }")], &raw);
-            let catalog = build(raw, &decls).unwrap();
-            let function = catalog.function(
-                catalog
-                    .function_by_key(&function_key(provider_scope("host"), "make"))
-                    .unwrap(),
-            );
+            let errors = build(raw, &decls).unwrap_err();
 
-            assert_eq!(
-                function.signature.ret.ty,
-                Type::nominal(
-                    NominalKind::Struct,
-                    ident("Point"),
-                    vec![],
-                    vec![],
-                    Some(vec!["geom".to_string()].into())
-                )
-            );
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Point")
+            ));
         }
 
         #[test]
@@ -2381,7 +2582,7 @@ mod tests {
         }
 
         #[test]
-        fn provider_local_uses_merged_source() {
+        fn provider_local_rejects_merged_source() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![],
@@ -2393,23 +2594,12 @@ mod tests {
                 }],
             });
             let decls = decls("", &[("host", "pub struct Local { x: int }")], &raw);
-            let catalog = build(raw, &decls).unwrap();
-            let function = catalog.function(
-                catalog
-                    .function_by_key(&function_key(provider_scope("host"), "make"))
-                    .unwrap(),
-            );
+            let errors = build(raw, &decls).unwrap_err();
 
-            assert_eq!(
-                function.signature.ret.ty,
-                Type::nominal(
-                    NominalKind::Struct,
-                    ident("Local"),
-                    vec![],
-                    vec![],
-                    Some(vec!["host".to_string()].into())
-                )
-            );
+            assert!(matches!(
+                errors.first(),
+                Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Local")
+            ));
         }
 
         #[test]
@@ -2475,6 +2665,39 @@ mod tests {
                     vec![],
                     None,
                 )
+            );
+        }
+
+        #[test]
+        fn descriptor_result_resolves_core_result() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                functions: vec![ExternFunctionDescriptor {
+                    name: "load".to_string(),
+                    doc: None,
+                    signature: ext_signature(
+                        vec![],
+                        ExternTypeExpr::result(ExternTypeExpr::Int, ExternTypeExpr::String),
+                    ),
+                    effects: ExternEffects::default(),
+                }],
+                types: vec![],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build(raw, &decls).unwrap();
+            let function = catalog.function(
+                catalog
+                    .function_by_key(&function_key(provider_scope("host"), "load"))
+                    .unwrap(),
+            );
+
+            assert_eq!(
+                function.signature.ret.ty,
+                decls.core_result_of(Type::Int, Type::String).unwrap()
+            );
+            assert_eq!(
+                function.signature.ret.abi,
+                ExternTypeExpr::result(ExternTypeExpr::Int, ExternTypeExpr::String)
             );
         }
 
@@ -2580,17 +2803,7 @@ mod tests {
         #[test]
         fn provider_callback_escape_matches_policy() {
             let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![cb_param(
-                    ExternTypeExpr::Callback(ExternCallbackSignature {
-                        params: vec![],
-                        ret: Box::new(ExternTypeExpr::Void),
-                        policy: CallbackPolicy {
-                            escape: CallbackEscape::NonEscaping,
-                            thread: CallbackThread::SameThread,
-                        },
-                    }),
-                    CallbackEscape::NonEscaping,
-                )],
+                params: vec![cb_param(ExternTypeExpr::Int, CallbackEscape::NonEscaping)],
                 ret: Box::new(ExternTypeExpr::Void),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::Escaping,
@@ -2633,26 +2846,18 @@ mod tests {
 
         #[test]
         fn recursive_containers_and_any_resolve() {
-            let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-                params: vec![cb_param(ExternTypeExpr::Any, CallbackEscape::NonEscaping)],
-                ret: Box::new(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int))),
-                policy: CallbackPolicy {
-                    escape: CallbackEscape::Escaping,
-                    thread: CallbackThread::SameThread,
-                },
-            });
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![],
                 functions: vec![ExternFunctionDescriptor {
-                    name: "use_cb".to_string(),
+                    name: "use_map".to_string(),
                     doc: None,
                     signature: ext_signature(
                         vec![ext_param(
-                            "callbacks",
+                            "items",
                             ExternTypeExpr::List(Box::new(ExternTypeExpr::Map(
                                 Box::new(ExternTypeExpr::String),
-                                Box::new(callback),
+                                Box::new(ExternTypeExpr::Option(Box::new(ExternTypeExpr::Any))),
                             ))),
                         )],
                         ExternTypeExpr::Void,
@@ -2665,7 +2870,7 @@ mod tests {
             let param = &catalog
                 .function(
                     catalog
-                        .function_by_key(&function_key(provider_scope("host"), "use_cb"))
+                        .function_by_key(&function_key(provider_scope("host"), "use_map"))
                         .unwrap(),
                 )
                 .signature
@@ -2679,12 +2884,7 @@ mod tests {
             let Type::Map { value, .. } = elem.as_ref() else {
                 panic!("expected map");
             };
-            let Type::Func { params, ret } = value.as_ref() else {
-                panic!("expected callback");
-            };
-            assert_eq!(params.len(), 1);
-            assert_eq!(params[0].ty, Type::Any);
-            assert_eq!(ret.ty, decls.core_option_of(Type::Int).unwrap());
+            assert_eq!(value.as_ref(), &decls.core_option_of(Type::Any).unwrap());
         }
     }
 
@@ -2713,21 +2913,14 @@ mod tests {
         }
 
         #[test]
-        fn wrong_generic_arity_fails_catalog_build() {
+        fn provider_descriptor_does_not_resolve_source_generic_type() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![],
                 functions: vec![ExternFunctionDescriptor {
                     name: "bad".to_string(),
                     doc: None,
-                    signature: ext_signature(
-                        vec![],
-                        ExternTypeExpr::Named {
-                            module: None,
-                            name: "Box".to_string(),
-                            args: vec![],
-                        },
-                    ),
+                    signature: ext_signature(vec![], named("Box")),
                     effects: ExternEffects::default(),
                 }],
             });
@@ -2736,13 +2929,12 @@ mod tests {
 
             assert!(matches!(
                 errors.first(),
-                Some(ExternCatalogError::GenericArity { name, expected: 1, found: 0, .. })
-                    if *name == ident("Box")
+                Some(ExternCatalogError::UnknownType { name, .. }) if *name == ident("Box")
             ));
         }
 
         #[test]
-        fn rejects_type_const_arg() {
+        fn non_keyable_map_key_fails_catalog_build() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![],
@@ -2751,26 +2943,65 @@ mod tests {
                     doc: None,
                     signature: ext_signature(
                         vec![],
-                        ExternTypeExpr::Named {
-                            module: None,
-                            name: "ArrayBox".to_string(),
-                            args: vec![ExternTypeExpr::Int],
-                        },
+                        ExternTypeExpr::map(ExternTypeExpr::Float, ExternTypeExpr::Int),
                     ),
                     effects: ExternEffects::default(),
                 }],
             });
-            let decls = decls(
-                "",
-                &[("host", "pub struct ArrayBox<N: int> { value: [int; N] }")],
-                &raw,
-            );
+            let decls = decls("", &[], &raw);
             let errors = build(raw, &decls).unwrap_err();
 
             assert!(matches!(
                 errors.first(),
-                Some(ExternCatalogError::GenericArgKindMismatch { name, expected: "const", .. })
-                    if *name == ident("ArrayBox")
+                Some(ExternCatalogError::InvalidType {
+                    reason: InvalidExternTypeReason::NonKeyableMapKey,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn provider_descriptor_rejects_generic_named_args() {
+            let inputs = crate::externs::ExternInputs {
+                packages: vec![crate::externs::PackageExternInputs {
+                    package: PackageId::synthetic_root(),
+                    providers: vec![ProviderDescriptor {
+                        provider: ProviderId {
+                            name: "host".to_string(),
+                        },
+                        modules: vec![ExternModuleDescriptor {
+                            path: extern_module(&["host"]),
+                            types: vec![],
+                            functions: vec![ExternFunctionDescriptor {
+                                name: "bad".to_string(),
+                                doc: None,
+                                signature: ext_signature(
+                                    vec![],
+                                    ExternTypeExpr::Named {
+                                        module: None,
+                                        name: "ArrayBox".to_string(),
+                                        args: vec![ExternTypeExpr::Int],
+                                    },
+                                ),
+                                effects: ExternEffects::default(),
+                            }],
+                        }],
+                    }],
+                }],
+            };
+            let errors = crate::externs::ingest_providers(inputs).unwrap_err();
+
+            assert!(matches!(
+                errors.first(),
+                Some(
+                    crate::externs::ExternInputError::InvalidProviderDescriptor {
+                        error: ExternDescriptorError::InvalidAbiType {
+                            reason: AbiTypeError::GenericNamedArgsUnsupported,
+                            ..
+                        },
+                        ..
+                    }
+                )
             ));
         }
 
@@ -2779,9 +3010,12 @@ mod tests {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
                 types: vec![ExternTypeDescriptor {
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec!["missing".to_string()],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     ..descriptor_type("Handle")
                 }],
@@ -2818,9 +3052,12 @@ mod tests {
                         set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec!["x".to_string()],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     ..descriptor_type("Handle")
                 }],
@@ -2857,9 +3094,12 @@ mod tests {
                         set_receiver: ReceiverMode::Mutable,
                         doc: None,
                     }],
+                    variants: vec![],
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec!["x".to_string()],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
                     }),
                     ..descriptor_type("Handle")
                 }],
@@ -2887,7 +3127,9 @@ mod tests {
                 },
             );
             builder.operator_ret(ty, op, Type::Int);
-            let errors = validate_catalog(&builder.finish()).unwrap_err();
+            let errors =
+                validate_catalog(&builder.finish(), &decls("", &[], &RawExterns::default()))
+                    .unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2913,7 +3155,9 @@ mod tests {
             );
             let op = builder.operator(ty, ExternOperator::Unary(UnaryOp::Neg));
             builder.operator_ret(ty, op, Type::Void);
-            let errors = validate_catalog(&builder.finish()).unwrap_err();
+            let errors =
+                validate_catalog(&builder.finish(), &decls("", &[], &RawExterns::default()))
+                    .unwrap_err();
 
             assert!(matches!(
                 errors.first(),
@@ -2964,7 +3208,9 @@ mod tests {
             );
             let field = builder.field(ty, ident("x"));
             builder.field_ty(ty, field, Type::UnresolvedName(ident("Missing")));
-            let errors = validate_catalog(&builder.finish()).unwrap_err();
+            let errors =
+                validate_catalog(&builder.finish(), &decls("", &[], &RawExterns::default()))
+                    .unwrap_err();
 
             assert!(matches!(
                 errors.first(),

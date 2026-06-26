@@ -13,7 +13,7 @@ pub fn retain(cb: EscapingLambda<(i64,), i64>) {
     });
 }
 
-#[function(ctx)]
+#[function(ctx, trap)]
 pub fn fire<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<(), RuntimeError> {
     ctx.collect(0)?;
     let callback = CALLBACK.with(|slot| {
@@ -32,7 +32,7 @@ pub fn fire<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-#[function(ctx)]
+#[function(ctx, trap)]
 pub fn close<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<bool, RuntimeError> {
     ctx.collect(0)?;
     CALLBACK.with(|slot| {

@@ -143,6 +143,7 @@ fn rvalue_calls_fallible(
                                 program.has_retained_callbacks()
                                     || native.abi.fallible
                                     || native_arg_conversion_fallible(&native.abi.params)
+                                    || native_ref_borrow_conversion_fallible(program, *id, args)
                             }
                         },
                         RirCallTarget::LambdaValue { sig, .. } => program
@@ -501,7 +502,8 @@ fn rvalue_context_use(
                 RirCallTarget::Function(_) | RirCallTarget::LambdaValue { .. } => {
                     ContextUse::generated_call()
                 }
-                RirCallTarget::Extern(id) => extern_context_use(program, *id),
+                RirCallTarget::Extern(id) => extern_context_use(program, *id)
+                    .union(native_ref_borrow_context_use(program, *id, args)),
             });
             for arg in args {
                 uses = uses.union(call_arg_context_use(program, function, arg));
@@ -637,6 +639,11 @@ fn extern_context_use(program: &RirProgram, id: super::rir::RirExternId) -> Cont
                 anvyx_runtime::RustWrapperCtx::HiddenRuntime => ContextUse::rt(),
                 anvyx_runtime::RustWrapperCtx::None => ContextUse::default(),
             };
+            let base = if native.adopt_resource_return {
+                base.union(ContextUse::rt())
+            } else {
+                base
+            };
             if native_return_needs_types(&native.abi.ret) {
                 base.union(ContextUse::rt_types())
             } else {
@@ -653,6 +660,36 @@ fn native_return_needs_types(ret: &anvyx_runtime::RustReturnAbi) -> bool {
 fn native_arg_conversion_fallible(abis: &[anvyx_runtime::RustParamAbi]) -> bool {
     abis.iter()
         .any(anvyx_runtime::RustParamAbi::supported_collection_wrapper)
+}
+
+fn native_ref_borrow_context_use(
+    program: &RirProgram,
+    ext: super::rir::RirExternId,
+    args: &[RirCallArg],
+) -> ContextUse {
+    if native_ref_borrow_conversion_fallible(program, ext, args) {
+        ContextUse::rt()
+    } else {
+        ContextUse::default()
+    }
+}
+
+fn native_ref_borrow_conversion_fallible(
+    program: &RirProgram,
+    ext: super::rir::RirExternId,
+    args: &[RirCallArg],
+) -> bool {
+    program.externs[ext.index()]
+        .params
+        .iter()
+        .zip(args)
+        .any(|(param, arg)| {
+            matches!(arg, RirCallArg::SharedBorrow(_) | RirCallArg::MutBorrow(_))
+                && matches!(
+                    program.types[param.ty.index()],
+                    RirType::Struct(id) if program.structs[id.index()].native_ref
+                )
+        })
 }
 
 fn stringify_context_use(program: &RirProgram, ty: RirTypeId) -> ContextUse {

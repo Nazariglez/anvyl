@@ -1,13 +1,12 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: function value with unknown storage origin cannot escape
+// @contains: extern functions cannot return callbacks
 
-extern fn native_make() -> fn();
-extern fn retain(cb: escaping fn());
+extern fn make() -> fn();
 
-fn make() -> fn() {
-    native_make()
+fn retain(f: escaping fn()) {
+    f();
 }
 
 fn main() {

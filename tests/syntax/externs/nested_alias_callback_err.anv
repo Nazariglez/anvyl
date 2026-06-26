@@ -1,6 +1,7 @@
 // @mode: check
-// @expect: success
+// @expect: error
 // @frontend: new
+// @contains: callbacks cannot be nested
 
 type Handler = fn();
 extern fn higher(callback: fn(escaping Handler) -> void) -> void;

@@ -415,10 +415,6 @@ fn function_value_origins_are_specific() {
             "fn tick() {} fn make() -> fn() { tick } fn main() { make()(); }",
             FunctionValueOrigin::SourceCallReturn,
         ),
-        (
-            "extern fn make() -> fn(); fn main() { let f = make(); }",
-            FunctionValueOrigin::CallReturn,
-        ),
     ];
 
     for (source, origin) in cases {

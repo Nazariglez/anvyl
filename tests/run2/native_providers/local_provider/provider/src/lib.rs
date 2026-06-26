@@ -10,7 +10,7 @@ pub fn host_len(text: &str) -> i64 {
     text.len() as i64
 }
 
-#[function(ctx)]
+#[function(ctx, trap)]
 pub fn host_bump<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     mut value: MutPlace<'_, 'cx, i64>,
@@ -18,17 +18,17 @@ pub fn host_bump<'cx>(
     value.update_copy(ctx, |n| n + 1)
 }
 
-#[function]
+#[function(trap)]
 pub fn host_apply(f: ScopedLambda<'_, '_, (i64,), i64>) -> Result<i64, RuntimeError> {
     f.call(41)
 }
 
-#[function]
+#[function(trap)]
 pub fn host_call0(f: ScopedLambda<'_, '_, (), i64>) -> Result<i64, RuntimeError> {
     f.call()
 }
 
-#[function]
+#[function(trap)]
 pub fn host_each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
     f.call(1)?;
     f.call(2)
