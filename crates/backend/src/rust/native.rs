@@ -53,17 +53,16 @@ pub(super) fn rust_abi_matches_air(
 fn param_abi_matches(param: &RustParamAbi, expected: &ExternTypeExpr) -> bool {
     match param {
         RustParamAbi::Value(ty)
+        | RustParamAbi::OwnedNamed(ty)
         | RustParamAbi::Borrow(ty)
         | RustParamAbi::MutBorrow(ty)
         | RustParamAbi::MutPlace(ty) => expected != &ExternTypeExpr::Void && ty == expected,
+        RustParamAbi::InitField(inner) => param_abi_matches(inner, expected),
         RustParamAbi::Option(inner) => {
             matches!(expected, ExternTypeExpr::Option(expected) if param_abi_matches(inner, expected))
         }
         RustParamAbi::Result(ok, err) => {
             matches!(expected, ExternTypeExpr::Result(expected_ok, expected_err) if param_abi_matches(ok, expected_ok) && param_abi_matches(err, expected_err))
-        }
-        RustParamAbi::List(inner) => {
-            matches!(expected, ExternTypeExpr::List(expected) if param_abi_matches(inner, expected))
         }
         RustParamAbi::Slice(inner) => {
             matches!(expected, ExternTypeExpr::Slice(expected) if param_abi_matches(inner, expected))
@@ -84,15 +83,14 @@ fn callback_shape_matches(
 fn return_abi_matches(ret: &RustReturnAbi, expected: &ExternTypeExpr) -> bool {
     match ret {
         RustReturnAbi::Void => expected == &ExternTypeExpr::Void,
-        RustReturnAbi::Value(ty) => expected != &ExternTypeExpr::Void && ty == expected,
+        RustReturnAbi::Value(ty) | RustReturnAbi::OwnedNamed(ty) => {
+            expected != &ExternTypeExpr::Void && ty == expected
+        }
         RustReturnAbi::Option(inner) => {
             matches!(expected, ExternTypeExpr::Option(expected) if return_abi_matches(inner, expected))
         }
         RustReturnAbi::Result(ok, err) => {
             matches!(expected, ExternTypeExpr::Result(expected_ok, expected_err) if return_abi_matches(ok, expected_ok) && return_abi_matches(err, expected_err))
-        }
-        RustReturnAbi::List(inner) => {
-            matches!(expected, ExternTypeExpr::List(expected) if return_abi_matches(inner, expected))
         }
     }
 }

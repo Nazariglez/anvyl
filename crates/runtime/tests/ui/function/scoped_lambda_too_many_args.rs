@@ -1,9 +1,9 @@
-use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+use anvyx_runtime::{function, RuntimeResult, ScopedLambda};
 
 #[function]
 fn bad(
     f: ScopedLambda<'_, '_, (i64, i64, i64, i64, i64, i64, i64, i64, i64), ()>,
-) -> Result<(), RuntimeError> {
+) -> RuntimeResult<()> {
     let _ = f;
     Ok(())
 }

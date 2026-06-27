@@ -1,7 +1,7 @@
-use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+use anvyx_runtime::{function, RuntimeResult, ScopedLambda};
 
 #[function]
-fn bad(f: ScopedLambda<'static, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+fn bad(f: ScopedLambda<'static, '_, (i64,), ()>) -> RuntimeResult<()> {
     f.call(1)
 }
 

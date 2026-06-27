@@ -6,7 +6,7 @@ use super::{
         RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
         RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirStmt,
         RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
-        stmt_child_blocks_any,
+        native_return_adopts_resource, stmt_child_blocks_any,
     },
 };
 
@@ -142,7 +142,6 @@ fn rvalue_calls_fallible(
                             RirExternKind::Native(native) => {
                                 program.has_retained_callbacks()
                                     || native.abi.fallible
-                                    || native_arg_conversion_fallible(&native.abi.params)
                                     || native_ref_borrow_conversion_fallible(program, *id, args)
                             }
                         },
@@ -253,6 +252,7 @@ fn call_arg_has_fallible_place(
 ) -> bool {
     match arg {
         RirCallArg::Value(operand)
+        | RirCallArg::InitFieldProvided(operand)
         | RirCallArg::ScopedLambda {
             callee: operand, ..
         }
@@ -262,7 +262,9 @@ fn call_arg_has_fallible_place(
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_has_fallible_projection(program, function, place)
         }
-        RirCallArg::SharedStringConst(_) | RirCallArg::MutPlace(_) => false,
+        RirCallArg::SharedStringConst(_)
+        | RirCallArg::MutPlace(_)
+        | RirCallArg::InitFieldOmitted => false,
     }
 }
 
@@ -639,27 +641,17 @@ fn extern_context_use(program: &RirProgram, id: super::rir::RirExternId) -> Cont
                 anvyx_runtime::RustWrapperCtx::HiddenRuntime => ContextUse::rt(),
                 anvyx_runtime::RustWrapperCtx::None => ContextUse::default(),
             };
-            let base = if native.adopt_resource_return {
+            if native_return_adopts_resource(
+                program,
+                program.externs[id.index()].ret,
+                &native.abi.ret,
+            ) {
                 base.union(ContextUse::rt())
-            } else {
-                base
-            };
-            if native_return_needs_types(&native.abi.ret) {
-                base.union(ContextUse::rt_types())
             } else {
                 base
             }
         }
     }
-}
-
-fn native_return_needs_types(ret: &anvyx_runtime::RustReturnAbi) -> bool {
-    ret.supported_collection_wrapper()
-}
-
-fn native_arg_conversion_fallible(abis: &[anvyx_runtime::RustParamAbi]) -> bool {
-    abis.iter()
-        .any(anvyx_runtime::RustParamAbi::supported_collection_wrapper)
 }
 
 fn native_ref_borrow_context_use(
@@ -708,14 +700,16 @@ fn call_arg_context_use(
     arg: &RirCallArg,
 ) -> ContextUse {
     match arg {
-        RirCallArg::Value(operand) => operand_context_use(program, function, operand),
+        RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
+            operand_context_use(program, function, operand)
+        }
         RirCallArg::ScopedLambda { callee, .. } | RirCallArg::EscapingLambda { callee, .. } => {
             ContextUse::generated_call().union(operand_context_use(program, function, callee))
         }
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_context_use(program, function, place)
         }
-        RirCallArg::SharedStringConst(_) => ContextUse::default(),
+        RirCallArg::SharedStringConst(_) | RirCallArg::InitFieldOmitted => ContextUse::default(),
         RirCallArg::MutPlace(arg) => mut_place_context_use(program, function, arg),
     }
 }
@@ -853,6 +847,7 @@ fn mut_place_uses_mut_place_param(function: &RirFunction, arg: &RirMutPlaceArg) 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {
     match arg {
         RirCallArg::Value(operand)
+        | RirCallArg::InitFieldProvided(operand)
         | RirCallArg::ScopedLambda {
             callee: operand, ..
         }
@@ -862,7 +857,9 @@ fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bo
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_is_mut_place_param(function, place)
         }
-        RirCallArg::SharedStringConst(_) | RirCallArg::MutPlace(_) => false,
+        RirCallArg::SharedStringConst(_)
+        | RirCallArg::MutPlace(_)
+        | RirCallArg::InitFieldOmitted => false,
     }
 }
 

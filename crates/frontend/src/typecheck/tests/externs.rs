@@ -991,6 +991,7 @@ mod fields {
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec![],
+                        presence_init: vec![],
                         ret: named("Point"),
                         effects: ExternEffects::default(),
                     }),
@@ -1047,6 +1048,81 @@ mod struct_literals {
         assert_use(&result, ExternUseTarget::FieldWrite(y));
         assert_use_total(&result, 2);
         assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn provider_presence_init_omitted_is_valid() {
+        check_with_provider(
+            r"
+            import ext:host { Point };
+            fn make() -> Point { Point { x: 1.0 } }
+            ",
+            presence_provider(),
+        )
+        .expect("typecheck failed");
+    }
+
+    #[test]
+    fn provider_presence_init_provided_is_not_an_override() {
+        let result = check_with_provider(
+            r"
+            import ext:host { Point };
+            fn make() -> Point { Point { x: 1.0, y: 2.0 } }
+            ",
+            presence_provider(),
+        )
+        .expect("typecheck failed");
+        let owner = catalog_type(&result, provider_scope(&["host"]), "Point");
+
+        assert_use(&result, ExternUseTarget::Init(owner));
+        assert_use_total(&result, 1);
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
+    fn provider_presence_init_type_mismatch_fails() {
+        let Err(errors) = check_with_provider(
+            r#"
+            import ext:host { Point };
+            fn make() -> Point { Point { x: 1.0, y: "bad" } }
+            "#,
+            presence_provider(),
+        ) else {
+            panic!("presence field type mismatch should fail");
+        };
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, TypeError::TypeMismatch { .. }))
+        );
+    }
+
+    fn presence_provider() -> ProviderDescriptor {
+        provider(ExternModuleDescriptor {
+            path: extern_path(&["host"]),
+            types: vec![ExternTypeDescriptor {
+                fields: vec![
+                    field("x", ExternTypeExpr::Float),
+                    ExternFieldDescriptor {
+                        writable: false,
+                        ..field("y", ExternTypeExpr::Float)
+                    },
+                ],
+                init: Some(ExternInitDescriptor {
+                    params: vec![
+                        param("x", ExternTypeExpr::Float),
+                        param("y", ExternTypeExpr::Float),
+                    ],
+                    field_init: vec!["x".to_string()],
+                    presence_init: vec!["y".to_string()],
+                    ret: named("Point"),
+                    effects: ExternEffects::default(),
+                }),
+                ..extern_type("Point")
+            }],
+            functions: vec![],
+        })
     }
 }
 
@@ -1141,6 +1217,7 @@ mod methods {
                     init: Some(ExternInitDescriptor {
                         params: vec![],
                         field_init: vec![],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),
@@ -1806,6 +1883,7 @@ mod provider_imports {
                             param("y", ExternTypeExpr::Float),
                         ],
                         field_init: vec!["x".to_string(), "y".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),

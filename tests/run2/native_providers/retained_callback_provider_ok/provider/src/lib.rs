@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use anvyx_runtime::{Ctx, EscapingLambda, RuntimeError, function};
+use anvyx_runtime::{Ctx, EscapingLambda, RuntimeError, RuntimeResult, function};
 
 thread_local! {
     static CALLBACK: RefCell<Option<EscapingLambda<(i64,), i64>>> = const { RefCell::new(None) };
@@ -13,8 +13,8 @@ pub fn retain(cb: EscapingLambda<(i64,), i64>) {
     });
 }
 
-#[function(ctx, trap)]
-pub fn fire<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<(), RuntimeError> {
+#[function(ctx)]
+pub fn fire<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<()> {
     ctx.collect(0)?;
     let callback = CALLBACK.with(|slot| {
         slot.borrow_mut()
@@ -32,8 +32,8 @@ pub fn fire<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-#[function(ctx, trap)]
-pub fn close<'cx>(ctx: &mut Ctx<'cx, '_>) -> Result<bool, RuntimeError> {
+#[function(ctx)]
+pub fn close<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<bool> {
     ctx.collect(0)?;
     CALLBACK.with(|slot| {
         let Some(mut callback) = slot.borrow_mut().take() else {

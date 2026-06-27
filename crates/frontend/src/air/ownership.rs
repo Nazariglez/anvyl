@@ -501,24 +501,32 @@ impl ParamUseAnalyzer<'_> {
             .unwrap_or_else(|| arg.mode())
         {
             ParamMode::Value => match arg {
-                CallArg::Value(operand) => self.observe_operand(operand, ValueContext::CallValue),
+                CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+                    self.observe_operand(operand, ValueContext::CallValue);
+                }
                 CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                     self.observe_place(place, ParamUse::ValueRequired);
                 }
-                CallArg::SharedStringConst(_) => {}
+                CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
             },
             ParamMode::SharedBorrow => match arg {
-                CallArg::Value(operand) => self.observe_operand(operand, ValueContext::Read),
+                CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+                    self.observe_operand(operand, ValueContext::Read);
+                }
                 CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                     self.observe_place(place, ParamUse::ReadOnly);
                 }
-                CallArg::SharedStringConst(_) => {}
+                CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
             },
             ParamMode::MutBorrow => match arg {
                 CallArg::Value(Operand::Place(place))
+                | CallArg::InitFieldProvided(Operand::Place(place))
                 | CallArg::SharedBorrow(place)
                 | CallArg::MutBorrow(place) => self.observe_place(place, ParamUse::ReborrowMut),
-                CallArg::Value(Operand::Const(_)) | CallArg::SharedStringConst(_) => {}
+                CallArg::Value(Operand::Const(_))
+                | CallArg::InitFieldProvided(Operand::Const(_))
+                | CallArg::InitFieldOmitted
+                | CallArg::SharedStringConst(_) => {}
             },
         }
     }
@@ -2113,7 +2121,7 @@ mod tests {
             const_args: vec![],
             rep: ExternRep::Shared,
             has_init: false,
-            init_fields: vec![],
+            init_args: vec![],
             fields: vec![],
             variants: vec![],
             variant_abis: vec![],
@@ -2129,7 +2137,7 @@ mod tests {
             const_args: vec![],
             rep: ExternRep::Inline,
             has_init: false,
-            init_fields: vec![],
+            init_args: vec![],
             fields: vec![],
             variants: vec![],
             variant_abis: vec![],

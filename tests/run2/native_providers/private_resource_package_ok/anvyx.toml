@@ -1,0 +1,6 @@
+[project]
+name = "private_resource_package_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

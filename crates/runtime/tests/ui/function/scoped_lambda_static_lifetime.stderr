@@ -1,5 +1,5 @@
 error: ScopedLambda lifetimes must be `'_`
  --> tests/ui/function/scoped_lambda_static_lifetime.rs:4:24
   |
-4 | fn bad(f: ScopedLambda<'static, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+4 | fn bad(f: ScopedLambda<'static, '_, (i64,), ()>) -> RuntimeResult<()> {
   |                        ^^^^^^^

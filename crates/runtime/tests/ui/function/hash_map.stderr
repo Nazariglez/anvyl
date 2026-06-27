@@ -1,0 +1,5 @@
+error: std maps are not provider boundary carriers; use AnvMap<'cx, K, V> or explicit runtime copy helpers
+ --> tests/ui/function/hash_map.rs:6:16
+  |
+6 | fn bad(values: HashMap<i64, i64>) { drop(values); }
+  |                ^^^^^^^^^^^^^^^^^

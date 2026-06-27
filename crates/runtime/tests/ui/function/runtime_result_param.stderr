@@ -1,0 +1,5 @@
+error: RuntimeResult<T> is only supported as a provider return type
+ --> tests/ui/function/runtime_result_param.rs:4:15
+  |
+4 | fn bad(value: RuntimeResult<i64>) -> i64 { value.unwrap_or_default() }
+  |               ^^^^^^^^^^^^^^^^^^

@@ -180,23 +180,6 @@ fn native_scoped_lambda_provider_abi_rejects_visible_borrows() {
 }
 
 #[test]
-fn native_scoped_lambda_provider_abi_rejects_collection_wrappers() {
-    let callback = native_callback_sig();
-    let list = anvyx_runtime::RustParamAbi::List(Box::new(anvyx_runtime::RustParamAbi::Value(
-        anvyx_runtime::ExternTypeExpr::Int,
-    )));
-    let abi = anvyx_runtime::RustExternAbi {
-        params: vec![list, anvyx_runtime::RustParamAbi::ScopedLambda(callback)],
-        ret: anvyx_runtime::RustReturnAbi::Void,
-        fallible: false,
-        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
-        ctx: anvyx_runtime::RustWrapperCtx::None,
-    };
-
-    assert!(!rir::rust_extern_abi_supported(&abi));
-}
-
-#[test]
 fn native_direct_provider_abi_accepts_canonical_collection_carriers() {
     use anvyx_runtime::{
         ExternTypeExpr, RustAbiSupport, RustExternAbi, RustParamAbi, RustReturnAbi, RustWrapperCtx,
@@ -231,22 +214,14 @@ fn native_direct_provider_abi_accepts_canonical_collection_carriers() {
 }
 
 #[test]
-fn native_direct_provider_abi_rejects_collection_wrappers_mutable_collections_and_ctxless_mut_place()
- {
+fn native_direct_provider_abi_rejects_mutable_collections_and_ctxless_mut_place() {
     use anvyx_runtime::{
         ExternTypeExpr, RustAbiSupport, RustExternAbi, RustParamAbi, RustReturnAbi, RustWrapperCtx,
     };
 
     let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
-    let wrapper_param = RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)));
-    let wrapper_ret = RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)));
 
     for (params, ret, ctx) in [
-        (
-            vec![wrapper_param],
-            wrapper_ret,
-            RustWrapperCtx::HiddenRuntime,
-        ),
         (
             vec![RustParamAbi::MutBorrow(list.clone())],
             RustReturnAbi::Void,
@@ -273,40 +248,6 @@ fn native_direct_provider_abi_rejects_collection_wrappers_mutable_collections_an
 
         assert!(!rir::rust_extern_abi_supported(&abi));
     }
-}
-
-#[test]
-fn native_collection_wrapper_provider_abi_accepts_scalar_lists() {
-    let abi = anvyx_runtime::RustExternAbi {
-        params: vec![anvyx_runtime::RustParamAbi::List(Box::new(
-            anvyx_runtime::RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::String),
-        ))],
-        ret: anvyx_runtime::RustReturnAbi::List(Box::new(anvyx_runtime::RustReturnAbi::Value(
-            anvyx_runtime::ExternTypeExpr::Int,
-        ))),
-        fallible: false,
-        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
-        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
-    };
-
-    assert!(rir::rust_extern_abi_supported(&abi));
-}
-
-#[test]
-fn native_collection_wrapper_provider_abi_rejects_nested_lists() {
-    let abi = anvyx_runtime::RustExternAbi {
-        params: vec![anvyx_runtime::RustParamAbi::List(Box::new(
-            anvyx_runtime::RustParamAbi::List(Box::new(anvyx_runtime::RustParamAbi::Value(
-                anvyx_runtime::ExternTypeExpr::Int,
-            ))),
-        ))],
-        ret: anvyx_runtime::RustReturnAbi::Void,
-        fallible: false,
-        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
-        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
-    };
-
-    assert!(!rir::rust_extern_abi_supported(&abi));
 }
 
 #[test]
@@ -663,25 +604,10 @@ fn analysis_treats_visible_native_result_as_value() {
 }
 
 #[test]
-fn analysis_marks_only_fallible_native_arg_preparation() {
+fn analysis_marks_native_slice_arg_preparation_nonfallible() {
     let int = RirTypeId::from_index(1);
-    let list = RirTypeId::from_index(2);
-    let int_list =
-        anvyx_runtime::ExternTypeExpr::List(Box::new(anvyx_runtime::ExternTypeExpr::Int));
     let int_slice =
         anvyx_runtime::ExternTypeExpr::Slice(Box::new(anvyx_runtime::ExternTypeExpr::Int));
-
-    let mut list_program = native_arg_analysis_program(
-        RirType::List(int),
-        anvyx_runtime::RustParamAbi::List(Box::new(anvyx_runtime::RustParamAbi::Value(
-            anvyx_runtime::ExternTypeExpr::Int,
-        ))),
-        int_list,
-    );
-    list_program
-        .collection_storages
-        .push(rir_list_storage(list, int));
-    assert!(super::analysis::fallible_functions(&list_program)[0]);
 
     let slice_program = native_arg_analysis_program(
         RirType::Slice(int),
@@ -713,7 +639,7 @@ fn native_arg_analysis_program(
             params: vec![rust_abi],
             ret: anvyx_runtime::RustReturnAbi::Void,
             fallible: false,
-            support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+            support: anvyx_runtime::RustAbiSupport::Direct,
             ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
         },
         rir_abi(vec![abi], anvyx_runtime::ExternTypeExpr::Void),
@@ -2317,7 +2243,6 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
                     support: anvyx_runtime::RustAbiSupport::Direct,
                     ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
                 },
-                adopt_resource_return: false,
             }),
             params: vec![RirExternParam {
                 ty: int,
@@ -2486,7 +2411,7 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
         const_args: vec![],
         rep: ExternRep::Inline,
         has_init: false,
-        init_fields: vec![],
+        init_args: vec![],
         fields: vec![],
         variants: vec![],
         variant_abis: vec![],
@@ -6335,7 +6260,6 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(1),
@@ -9954,7 +9878,7 @@ fn profile_accepts_bound_extern_members_but_rejects_missing_binding() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
-        init_fields: vec![],
+        init_args: vec![],
         fields: vec![],
         variants: vec![],
         variant_abis: vec![],
@@ -10020,7 +9944,7 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
             const_args: vec![],
             rep: ExternRep::Inline,
             has_init: false,
-            init_fields: vec![],
+            init_args: vec![],
             fields: vec![field("computed", true), field("direct", false)],
             variants: vec![],
             variant_abis: vec![],
@@ -11705,57 +11629,28 @@ fn source_job_compiles_and_runs_string_concat_program() {
 }
 
 #[test]
-fn emit_wraps_native_string_returns() {
+fn emit_passes_native_string_returns() {
     let source =
         emit::emit(&rir::verify(&native_string_return_program()).expect("RIR verify failed"))
             .into_string();
 
-    assert!(source.contains("anvyx_runtime::AnvString::from(host::string(rt))"));
+    assert!(source.contains("host::string(rt)"));
+    assert!(!source.contains("anvyx_runtime::AnvString::from(host::string(rt))"));
 }
 
 #[test]
-fn emit_wraps_native_option_string_returns() {
+fn emit_passes_native_option_string_returns() {
     let mut program = native_option_return_program(Some(RirCoreEnumKind::Option));
     let option = RirTypeId::from_index(1);
-    program.functions.push(RirFunction {
-        id: RirFunctionId::from_index(0),
-        air_id: None,
-        symbol: RirSymbol::new("f"),
-        params: vec![],
-        ret: RirReturn { ty: option },
-        locals: vec![RirLocal {
-            id: RirLocalId::from_index(0),
-            ty: option,
-            mutable: false,
-            symbol: RirSymbol::new("v0"),
-            initialized: false,
-            payload_ref: false,
-        }],
-        body: RirStructuredBlock {
-            stmts: vec![RirStmt::Init {
-                local: RirLocalId::from_index(0),
-                value: RirRValue::Call {
-                    callee: RirCallTarget::Extern(RirExternId::from_index(0)),
-                    args: vec![],
-                    ty: option,
-                },
-            }],
-            term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
-                RirLocalId::from_index(0),
-                vec![],
-                option,
-            )))),
-        },
-    });
-
+    program.functions.push(return_extern_function(option));
     program.entry = Some(RirFunctionId::from_index(0));
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
-    assert!(text.contains(".map(|value| anvyx_runtime::AnvString::from(value))"));
+    assert!(!text.contains(".map(|value| anvyx_runtime::AnvString::from(value))"));
 
     let source = emit::RustSource::new(format!(
-        "mod host {{ pub fn substring<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>) -> Option<String> {{ Some(\"ok\".to_string()) }} }}\n{}",
+        "mod host {{ pub fn substring<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>) -> Option<anvyx_runtime::AnvString> {{ Some(anvyx_runtime::AnvString::from(\"ok\")) }} }}\n{}",
         source.into_string()
     ));
     let output = run_source(source);
@@ -11764,7 +11659,108 @@ fn emit_wraps_native_option_string_returns() {
 }
 
 #[test]
-fn emit_wraps_native_result_string_returns() {
+fn emit_uses_array_map_for_native_array_returns() {
+    let string = RirTypeId::from_index(0);
+    let option = RirTypeId::from_index(1);
+    let array = RirTypeId::from_index(2);
+    let array_abi = anvyx_runtime::ExternTypeExpr::Array {
+        elem: Box::new(anvyx_runtime::ExternTypeExpr::Option(Box::new(
+            anvyx_runtime::ExternTypeExpr::String,
+        ))),
+        len: 2,
+    };
+    let mut program = native_extern_rir(
+        vec![
+            RirType::String,
+            RirType::Option(string),
+            RirType::Array {
+                elem: option,
+                len: 2,
+            },
+        ],
+        vec![],
+        array,
+        direct_rust_abi(
+            vec![],
+            anvyx_runtime::RustReturnAbi::Value(array_abi.clone()),
+        ),
+        rir_abi(vec![], array_abi),
+    );
+    program.functions.push(return_extern_function(array));
+    program.entry = Some(RirFunctionId::from_index(0));
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains(".map(|value| { (value).map(|value| value) })"));
+}
+
+#[test]
+fn emit_uses_array_map_for_native_array_params() {
+    let string = RirTypeId::from_index(0);
+    let option = RirTypeId::from_index(1);
+    let array = RirTypeId::from_index(2);
+    let void = RirTypeId::from_index(3);
+    let array_abi = anvyx_runtime::ExternTypeExpr::Array {
+        elem: Box::new(anvyx_runtime::ExternTypeExpr::Option(Box::new(
+            anvyx_runtime::ExternTypeExpr::String,
+        ))),
+        len: 2,
+    };
+    let mut program = native_extern_rir(
+        vec![
+            RirType::String,
+            RirType::Option(string),
+            RirType::Array {
+                elem: option,
+                len: 2,
+            },
+            RirType::Void,
+        ],
+        vec![RirExternParam {
+            ty: array,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        void,
+        direct_rust_abi(
+            vec![anvyx_runtime::RustParamAbi::Value(array_abi.clone())],
+            anvyx_runtime::RustReturnAbi::Void,
+        ),
+        rir_abi(vec![array_abi], anvyx_runtime::ExternTypeExpr::Void),
+    );
+    program.functions.push(call_extern_function(
+        void,
+        vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
+            RirLocalId::from_index(0),
+            vec![],
+            array,
+        )))],
+    ));
+    program.functions[0].params.push(RirParam {
+        local: RirLocalId::from_index(0),
+        ty: array,
+        semantic: RirParamSemantic::Value,
+        abi: RirParamAbi::Value,
+        escape: RirParamEscape::NonEscaping,
+    });
+    program.functions[0].locals.push(RirLocal {
+        id: RirLocalId::from_index(0),
+        ty: array,
+        mutable: false,
+        symbol: RirSymbol::new("v0"),
+        initialized: true,
+        payload_ref: false,
+    });
+    program.entry = Some(RirFunctionId::from_index(0));
+
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains(".map(|value| { (value).map(|value| value) })"));
+}
+
+#[test]
+fn emit_passes_native_result_string_returns() {
     let string = RirTypeId::from_index(0);
     let result = RirTypeId::from_index(1);
     let mut program = native_extern_rir(
@@ -11796,13 +11792,13 @@ fn emit_wraps_native_result_string_returns() {
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
-    assert!(source.contains("Ok(value) => Result::Ok(anvyx_runtime::AnvString::from(value))"));
-    assert!(source.contains("Err(value) => Result::Err(anvyx_runtime::AnvString::from(value))"));
+    assert!(source.contains("Ok(value) => Result::Ok(value)"));
+    assert!(source.contains("Err(value) => Result::Err(value)"));
     assert!(!source.contains("host::native(rt)?"));
 }
 
 #[test]
-fn emit_converts_native_result_string_params() {
+fn emit_passes_native_result_string_params() {
     let string = RirTypeId::from_index(0);
     let result = RirTypeId::from_index(1);
     let void = RirTypeId::from_index(2);
@@ -11866,8 +11862,27 @@ fn emit_converts_native_result_string_params() {
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
-    assert!(source.contains("Result::Ok(value) => Ok((value).as_str().to_string())"));
-    assert!(source.contains("Result::Err(value) => Err((value).as_str().to_string())"));
+    assert!(source.contains("Result::Ok(value) => Ok(value)"));
+    assert!(source.contains("Result::Err(value) => Err(value)"));
+}
+
+#[test]
+fn emit_adopts_owned_native_resource_returns() {
+    let source =
+        emit::emit(&rir::verify(&native_resource_return_program(true)).expect("RIR verify failed"))
+            .into_string();
+
+    assert!(source.contains("AnvRefType::<host::Window>::register_untracked"));
+}
+
+#[test]
+fn emit_does_not_adopt_explicit_native_resource_refs() {
+    let source = emit::emit(
+        &rir::verify(&native_resource_return_program(false)).expect("RIR verify failed"),
+    )
+    .into_string();
+
+    assert!(!source.contains("register_untracked"));
 }
 
 #[test]
@@ -13041,7 +13056,6 @@ fn rir_verify_rejects_bad_extern_signature() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
@@ -13077,7 +13091,6 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
@@ -13551,7 +13564,6 @@ fn rir_verify_accepts_direct_native_collection_carriers() {
                 kind: RirExternKind::Native(rir::RirNativeExtern {
                     path: vec!["host".to_string(), symbol.to_string()],
                     abi,
-                    adopt_resource_return: false,
                 }),
                 params,
                 ret,
@@ -13619,7 +13631,6 @@ fn rir_verify_rejects_backend_unsupported_native_collection_shapes() {
                 kind: RirExternKind::Native(rir::RirNativeExtern {
                     path: vec!["host".to_string(), "bad".to_string()],
                     abi,
-                    adopt_resource_return: false,
                 }),
                 params: vec![RirExternParam {
                     ty: list,
@@ -13712,7 +13723,6 @@ fn rir_verify_rejects_native_extern_return_type_mismatch() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![],
         ret: RirTypeId::from_index(0),
@@ -13814,6 +13824,49 @@ fn rir_verify_rejects_slice_return_abi() {
             anvyx_runtime::RustReturnAbi::Value(int_slice.clone()),
         ),
         rir_abi(vec![], int_slice),
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_non_named_owned_return_abi() {
+    let list = anvyx_runtime::ExternTypeExpr::List(Box::new(anvyx_runtime::ExternTypeExpr::Int));
+    let program = native_extern_rir(
+        vec![RirType::Int, RirType::List(RirTypeId::from_index(0))],
+        vec![],
+        RirTypeId::from_index(1),
+        direct_rust_abi(
+            vec![],
+            anvyx_runtime::RustReturnAbi::OwnedNamed(list.clone()),
+        ),
+        rir_abi(vec![], list),
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_non_named_owned_param_abi() {
+    let list = anvyx_runtime::ExternTypeExpr::List(Box::new(anvyx_runtime::ExternTypeExpr::Int));
+    let program = native_extern_rir(
+        vec![
+            RirType::Int,
+            RirType::List(RirTypeId::from_index(0)),
+            RirType::Void,
+        ],
+        vec![RirExternParam {
+            ty: RirTypeId::from_index(1),
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        RirTypeId::from_index(2),
+        direct_rust_abi(
+            vec![anvyx_runtime::RustParamAbi::OwnedNamed(list.clone())],
+            anvyx_runtime::RustReturnAbi::Void,
+        ),
+        rir_abi(vec![list], anvyx_runtime::ExternTypeExpr::Void),
     );
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
@@ -16093,7 +16146,10 @@ fn rir_struct(id: usize, symbol: &str, fields: Vec<RirField>) -> RirStruct {
         display: RirSymbol::new(symbol),
         native_path: None,
         native_ref: false,
-        native_key: None,
+        native_key: Some(anvyx_runtime::ExternTypeKey {
+            module: anvyx_runtime::ModulePath { segments: vec![] },
+            name: "Window".to_string(),
+        }),
         copyable: false,
         fields,
     }
@@ -20369,7 +20425,6 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![],
         ret: option,
@@ -20396,7 +20451,6 @@ fn native_string_return_program() -> RirProgram {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-            adopt_resource_return: false,
         }),
         params: vec![],
         ret: RirTypeId::from_index(0),
@@ -21081,7 +21135,6 @@ fn native_scoped_lambda_rir() -> RirProgram {
                     support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
                     ctx: anvyx_runtime::RustWrapperCtx::None,
                 },
-                adopt_resource_return: false,
             }),
             params: vec![RirExternParam {
                 ty: lambda_ty,
@@ -22838,7 +22891,6 @@ fn native_extern_rir(
             kind: RirExternKind::Native(rir::RirNativeExtern {
                 path: vec!["host".to_string(), "native".to_string()],
                 abi: rust_abi,
-                adopt_resource_return: false,
             }),
             params,
             ret,
@@ -22846,6 +22898,44 @@ fn native_extern_rir(
         }],
         ..RirProgram::default()
     }
+}
+
+fn native_resource_return_program(owned: bool) -> RirProgram {
+    let resource = RirTypeId::from_index(0);
+    let resource_abi = anvyx_runtime::ExternTypeExpr::Named {
+        module: None,
+        name: "Window".to_string(),
+        args: vec![],
+    };
+    let ret_abi = if owned {
+        anvyx_runtime::RustReturnAbi::OwnedNamed(resource_abi.clone())
+    } else {
+        anvyx_runtime::RustReturnAbi::Value(resource_abi.clone())
+    };
+    let mut program = native_extern_rir(
+        vec![RirType::Struct(RirStructId::from_index(0))],
+        vec![],
+        resource,
+        direct_rust_abi(vec![], ret_abi),
+        rir_abi(vec![], resource_abi),
+    );
+    program.structs.push(RirStruct {
+        id: RirStructId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("Window"),
+        display: RirSymbol::new("Window"),
+        native_path: Some(vec!["host".to_string(), "Window".to_string()]),
+        native_ref: true,
+        native_key: Some(anvyx_runtime::ExternTypeKey {
+            module: anvyx_runtime::ModulePath { segments: vec![] },
+            name: "Window".to_string(),
+        }),
+        copyable: false,
+        fields: vec![],
+    });
+    program.functions.push(return_extern_function(resource));
+    program.entry = Some(RirFunctionId::from_index(0));
+    program
 }
 
 fn return_extern_function(ret: RirTypeId) -> RirFunction {

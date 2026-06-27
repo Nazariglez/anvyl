@@ -1,9 +1,9 @@
-use anvyx_runtime::{function, AnvyxEnum};
+use anvyx_runtime::{AnvString, AnvyxEnum, function};
 
 #[derive(Clone, AnvyxEnum)]
 #[anvyx(name = "HostError")]
 pub enum HostError {
-    Bad(String),
+    Bad(AnvString),
 }
 
 #[function]
@@ -12,7 +12,7 @@ pub fn maybe_add(value: Option<i64>, delta: i64) -> Option<i64> {
 }
 
 #[function]
-pub fn swap_pair(pair: (i64, String)) -> (String, i64) {
+pub fn swap_pair(pair: (i64, AnvString)) -> (AnvString, i64) {
     (pair.1, pair.0)
 }
 
@@ -27,8 +27,8 @@ pub fn first_array(values: [i64; 3]) -> i64 {
 }
 
 #[function]
-pub fn visible_result(ok: bool) -> Result<i64, String> {
-    if ok { Ok(7) } else { Err("bad".to_string()) }
+pub fn visible_result(ok: bool) -> Result<i64, AnvString> {
+    if ok { Ok(7) } else { Err(AnvString::from("bad")) }
 }
 
 #[function]
@@ -36,33 +36,33 @@ pub fn visible_enum_result(ok: bool) -> Result<i64, HostError> {
     if ok {
         Ok(11)
     } else {
-        Err(HostError::Bad("enum".to_string()))
+        Err(HostError::Bad(AnvString::from("enum")))
     }
 }
 
 #[function]
-pub fn describe_result(value: Result<i64, String>) -> String {
+pub fn describe_result(value: Result<i64, AnvString>) -> AnvString {
     match value {
-        Ok(value) => value.to_string(),
+        Ok(value) => AnvString::from(value.to_string()),
         Err(message) => message,
     }
 }
 
 #[function]
-pub fn describe_enum_result(value: Result<i64, HostError>) -> String {
+pub fn describe_enum_result(value: Result<i64, HostError>) -> AnvString {
     match value {
-        Ok(value) => value.to_string(),
+        Ok(value) => AnvString::from(value.to_string()),
         Err(HostError::Bad(message)) => message,
     }
 }
 
 #[function]
-pub fn unit_result() -> Result<(), String> {
+pub fn unit_result() -> Result<(), AnvString> {
     Ok(())
 }
 
 #[function]
-pub fn describe_unit_result(value: Result<(), String>) -> i64 {
+pub fn describe_unit_result(value: Result<(), AnvString>) -> i64 {
     match value {
         Ok(()) => 21,
         Err(_) => 0,

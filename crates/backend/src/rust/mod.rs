@@ -1374,7 +1374,7 @@ impl<'a> PlanCx<'a> {
             let native = self.native_extern(air_id, decl)?;
             let params = self.extern_params(decl, &native);
             let ret = self.type_map[&decl.return_type];
-            let kind = Self::extern_kind(program, decl, &native, ret);
+            let kind = Self::extern_kind(&native);
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -1408,25 +1408,11 @@ impl<'a> PlanCx<'a> {
             .collect()
     }
 
-    fn extern_kind(
-        program: &RirProgram,
-        decl: &air::ExternDecl,
-        native: &native::ResolvedExtern<'_>,
-        ret: RirTypeId,
-    ) -> RirExternKind {
+    fn extern_kind(native: &native::ResolvedExtern<'_>) -> RirExternKind {
         RirExternKind::Native(RirNativeExtern {
             path: native_path(&native.binding.path),
             abi: native.binding.abi.clone(),
-            adopt_resource_return: matches!(decl.member, air::ExternMember::Init { .. })
-                && Self::rir_type_is_native_ref(program, ret),
         })
-    }
-
-    fn rir_type_is_native_ref(program: &RirProgram, ty: RirTypeId) -> bool {
-        matches!(
-            program.types[ty.index()],
-            RirType::Struct(id) if program.structs[id.index()].native_ref
-        )
     }
 
     fn native_type_binding(
@@ -3835,7 +3821,8 @@ impl<'a> PlanCx<'a> {
                     arg,
                 })
             }
-            CallArg::Value(operand) => {
+            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+                let init_field = matches!(arg, CallArg::InitFieldProvided(_));
                 if let Operand::Place(place) = operand
                     && self.unsupported_function_capture_value(place)
                 {
@@ -3851,16 +3838,17 @@ impl<'a> PlanCx<'a> {
                 {
                     let local = self.alloc_temp(locals, place.ty);
                     Self::set_zero_env_function(zero_env_function_values, local, Some(state));
+                    let operand = RirOperand::Place(RirPlace::local(local, vec![], state.ty()));
                     return Ok(PlannedCallArg {
                         stmts: vec![RirStmt::Init {
                             local,
                             value: state.rvalue(),
                         }],
-                        arg: RirCallArg::Value(RirOperand::Place(RirPlace::local(
-                            local,
-                            vec![],
-                            state.ty(),
-                        ))),
+                        arg: if init_field {
+                            RirCallArg::InitFieldProvided(operand)
+                        } else {
+                            RirCallArg::Value(operand)
+                        },
                     });
                 }
                 if self.moves_bound_noncopy_lambda(function, operand) {
@@ -3872,9 +3860,14 @@ impl<'a> PlanCx<'a> {
                 let planned = self.plan_operand_read(function, operand, locals);
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
-                    arg: RirCallArg::Value(planned.operand),
+                    arg: if init_field {
+                        RirCallArg::InitFieldProvided(planned.operand)
+                    } else {
+                        RirCallArg::Value(planned.operand)
+                    },
                 })
             }
+            CallArg::InitFieldOmitted => Ok(PlannedCallArg::from_arg(RirCallArg::InitFieldOmitted)),
             CallArg::SharedBorrow(place) => {
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(place) = planned.operand else {

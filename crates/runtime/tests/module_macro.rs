@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxInline, Ctx, ExternBindingOp, ExternBindingTarget, Heap, function, methods,
+    AnvyxInline, AnvyxRef, Ctx, ExternBindingOp, ExternBindingTarget, ExternMemberSelector, Heap,
+    function, methods,
 };
 
 mod root_module {
@@ -128,6 +129,45 @@ mod package {
     }
 
     anvyx_runtime::provider_package! { modules: [window, gpu, platform::input] }
+}
+
+mod private_resource_package {
+    use super::{AnvyxRef, function, methods};
+
+    mod win {
+        use super::{AnvyxRef, function, methods};
+
+        #[derive(AnvyxRef)]
+        pub struct WWin {
+            #[anvyx(field)]
+            value: i64,
+        }
+
+        #[methods]
+        impl WWin {
+            #[anvyx(init)]
+            pub fn new(value: i64) -> WWin {
+                WWin { value }
+            }
+
+            pub fn duplicate(&self) -> WWin {
+                WWin { value: self.value }
+            }
+        }
+
+        #[function]
+        pub fn make_win(value: i64) -> WWin {
+            WWin { value }
+        }
+
+        anvyx_runtime::builtin_module! {
+            name: "win",
+            source: "",
+            exports: [WWin, make_win],
+        }
+    }
+
+    anvyx_runtime::provider_package! { modules: [win] }
 }
 
 #[test]
@@ -275,4 +315,61 @@ fn provider_package_aggregates_child_descriptors_and_prefixes_native_paths() {
                 "doubled",
             ]
     }));
+}
+
+#[test]
+fn provider_package_retargets_private_resource_paths() {
+    let supports = private_resource_package::rust_module_supports();
+    assert_eq!(supports.len(), 1);
+    let support = &supports[0];
+    assert_eq!(support.types[0].path.crate_name, "crate");
+    assert_eq!(
+        support.types[0].path.segments,
+        [
+            "private_resource_package",
+            "__anvyx_native_package",
+            "win",
+            "WWin",
+        ]
+    );
+    assert!(support.bindings.iter().any(|binding| {
+        binding.path.segments
+            == [
+                "private_resource_package",
+                "__anvyx_native_package",
+                "win",
+                "__anvyx_native",
+                "make_win",
+            ]
+    }));
+    assert!(support.bindings.iter().any(|binding| {
+        binding.path.segments
+            == [
+                "private_resource_package",
+                "__anvyx_native_package",
+                "win",
+                "__anvyx_methods_native_wwin",
+                "duplicate",
+            ]
+    }));
+
+    let init = support
+        .bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                binding.key.target,
+                ExternBindingTarget::Member(ref member)
+                    if member.selector == ExternMemberSelector::Init
+            )
+        })
+        .expect("init binding");
+    assert_eq!(
+        init.abi.ret,
+        anvyx_runtime::RustReturnAbi::OwnedNamed(anvyx_runtime::ExternTypeExpr::Named {
+            module: None,
+            name: "WWin".to_string(),
+            args: vec![],
+        })
+    );
 }

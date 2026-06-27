@@ -75,6 +75,8 @@ pub struct ExternInitDescriptor {
     pub params: Vec<ExternParam>,
     pub field_init: Vec<String>,
     #[serde(default)]
+    pub presence_init: Vec<String>,
+    #[serde(default)]
     pub ret: ExternTypeExpr,
     #[serde(default)]
     pub effects: ExternEffects,

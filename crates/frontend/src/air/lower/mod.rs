@@ -9,16 +9,16 @@ use super::{
     AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg,
     Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData,
     ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi,
-    ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternMember, ExternMethodDecl,
-    ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
-    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function,
-    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, FunctionValueCapability,
-    GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg, LambdaCaptureDecl,
-    LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind,
-    MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape,
-    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode,
-    ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData,
-    TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
+    ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember,
+    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
+    ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl,
+    FieldId, Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization,
+    FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg,
+    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
+    LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
+    ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue,
+    ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType,
+    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -544,7 +544,7 @@ impl TypeLowerer {
                 anvyx_externs::ExternRep::Inline => ExternRep::Inline,
             },
             has_init: source.constructor_fields().is_some(),
-            init_fields: vec![],
+            init_args: vec![],
             fields: vec![],
             variants: vec![],
             variant_abis: vec![],
@@ -728,19 +728,32 @@ impl TypeLowerer {
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
-        let init_fields = source
-            .constructor_fields()
-            .map(|fields| {
-                fields
-                    .map(|(index, _)| FieldId::from_index(index))
-                    .collect()
+        let init_args = source
+            .required_init_fields()
+            .into_iter()
+            .flatten()
+            .map(|(init, _)| ExternInitArgDecl {
+                field: FieldId::from_index(init.field.index()),
+                param: init.param,
+                presence: false,
             })
-            .unwrap_or_default();
+            .chain(
+                source
+                    .presence_init_fields()
+                    .into_iter()
+                    .flatten()
+                    .map(|(init, _)| ExternInitArgDecl {
+                        field: FieldId::from_index(init.field.index()),
+                        param: init.param,
+                        presence: true,
+                    }),
+            )
+            .collect();
         let decl = program.extern_type_mut(extern_id);
         decl.fields = fields;
         decl.variants = variants;
         decl.variant_abis = variant_abis;
-        decl.init_fields = init_fields;
+        decl.init_args = init_args;
         decl.methods = methods;
         decl.statics = statics;
         decl.operators = operators;
@@ -3935,29 +3948,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         ) {
             return Err(unsupported_expr(expr));
         }
-        let params = self.callee_params(&Callee::Extern(callee))?;
-        let Some(receiver_param) = params.get(&self.cx.program, 0) else {
-            return Err(unsupported_expr(expr));
-        };
-        let receiver = self.lower_extern_receiver_arg(&field.node.target, receiver_param)?;
-        Ok(RValue::Call {
-            callee: Callee::Extern(callee),
-            args: vec![receiver],
-        })
-    }
-
-    fn lower_extern_receiver_arg(
-        &mut self,
-        expr: &ExprNode,
-        param: ParamType,
-    ) -> Result<CallArg, LowerError> {
-        match param.mode {
-            ParamMode::Value => Ok(CallArg::Value(self.lower_value_to(expr, param.ty, expr)?)),
-            ParamMode::SharedBorrow => Ok(CallArg::SharedBorrow(
-                self.lower_place_or_temp(expr, false)?,
-            )),
-            ParamMode::MutBorrow => Ok(CallArg::MutBorrow(self.lower_place_or_temp(expr, true)?)),
-        }
+        let callee = Callee::Extern(callee);
+        let args = self.lower_exact_call_args(
+            expr.node.id,
+            &callee,
+            std::iter::once(field.node.target.as_ref()),
+        )?;
+        Ok(RValue::Call { callee, args })
     }
 
     fn lower_extern_field_read_operand(
@@ -3967,7 +3964,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         receiver: Place,
         target: ExternUseTarget,
     ) -> Result<RValue, LowerError> {
-        self.lower_extern_field_read_from_place(expr_id, receiver, target)
+        self.lower_extern_field_read_from_place(expr_id, None, receiver, target)
             .map_err(|err| match err {
                 LowerError::UnsupportedExternUse { .. } => unsupported_pattern_stmt(pattern),
                 err => err,
@@ -3977,6 +3974,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_extern_field_read_from_place(
         &mut self,
         expr_id: ExprId,
+        site: Option<&ExprNode>,
         receiver: Place,
         target: ExternUseTarget,
     ) -> Result<RValue, LowerError> {
@@ -3997,11 +3995,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 kind: unsupported_extern_kind(target),
             });
         };
-        let receiver = match receiver_param.mode {
-            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
-            ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
-            ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
-        };
+        let receiver = self.lower_place_receiver_call_arg(receiver, receiver_param, site)?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
             args: vec![receiver],
@@ -4038,7 +4032,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn lower_extern_literal_init(
         &mut self,
         expr: &ExprNode,
-        required: &[(Ident, TypeId)],
+        init_args: &[(Ident, usize, bool)],
         lowered: &[(Ident, Operand)],
     ) -> Result<RValue, LowerError> {
         let target = self
@@ -4049,12 +4043,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .ok_or_else(|| unsupported_expr(expr))?;
         let callee = self.extern_callee(expr.node.id, target)?;
         let params = self.callee_params(&Callee::Extern(callee))?;
-        if params.len(&self.cx.program) != Some(required.len()) {
+        if params.len(&self.cx.program) != Some(init_args.len()) {
             return Err(unsupported_expr(expr));
         }
         let mut args = vec![];
-        for (index, (name, _)) in required.iter().enumerate() {
-            let Some(param) = params.get(&self.cx.program, index) else {
+        let mut init_args = init_args.iter().collect::<Vec<_>>();
+        init_args.sort_by_key(|(_, param, _)| *param);
+        for (name, param_index, presence) in init_args {
+            let Some(param) = params.get(&self.cx.program, *param_index) else {
                 return Err(unsupported_expr(expr));
             };
             if param.mode != ParamMode::Value {
@@ -4062,9 +4058,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             let value = lowered
                 .iter()
-                .find_map(|(field, value)| (field == name).then(|| value.clone()))
-                .ok_or_else(|| unsupported_expr(expr))?;
-            args.push(CallArg::Value(value));
+                .find_map(|(field, value)| (field == name).then(|| value.clone()));
+            let arg = match (*presence, value) {
+                (false, Some(value)) => CallArg::Value(value),
+                (true, Some(value)) => CallArg::InitFieldProvided(value),
+                (true, None) => CallArg::InitFieldOmitted,
+                (false, None) => return Err(unsupported_expr(expr)),
+            };
+            args.push(arg);
         }
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
@@ -4212,17 +4213,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let Some(value_param) = params.get(&self.cx.program, 1) else {
             return Err(unsupported_expr(expr));
         };
-        let receiver = match receiver_param.mode {
-            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
-            ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
-            ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
-        };
-        if value_param.mode != ParamMode::Value {
-            return Err(unsupported_expr(expr));
-        }
+        let receiver = self.lower_place_receiver_call_arg(receiver, receiver_param, Some(expr))?;
+        let value = self.lower_operand_call_arg(value, value_param, expr)?;
         Ok(RValue::Call {
             callee: Callee::Extern(callee),
-            args: vec![receiver, CallArg::Value(value)],
+            args: vec![receiver, value],
         })
     }
 
@@ -4753,7 +4748,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let TypeData::Extern(owner) = self.cx.program.type_data(place.ty)
             && let Some(target) = self.extern_field_read_target(expr.node.id, *owner, field)
         {
-            let value = self.lower_extern_field_read_from_place(expr.node.id, place, target)?;
+            let value =
+                self.lower_extern_field_read_from_place(expr.node.id, Some(expr), place, target)?;
             return self.emit_temp(value);
         }
         self.project_field(expr, place, field).map(Operand::Place)
@@ -5740,11 +5736,21 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         ty_id: TypeId,
     ) -> Result<Operand, LowerError> {
         let decl = self.cx.program.extern_type(extern_id);
-        let Some(required) = decl.constructor_fields() else {
+        if decl.required_init_fields().is_none() {
             return Err(unsupported_expr(expr));
-        };
-        let required = required
-            .map(|(_, field)| (field.name, field.ty))
+        }
+        let init_args = decl
+            .init_args
+            .iter()
+            .filter_map(|arg| {
+                decl.fields
+                    .get(arg.field.index())
+                    .map(|field| (field.name, arg.param, arg.presence))
+            })
+            .collect::<Vec<_>>();
+        let init_field_names = init_args
+            .iter()
+            .map(|(name, _, _)| *name)
             .collect::<Vec<_>>();
         let field_types = literal
             .node
@@ -5767,10 +5773,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             lowered.push((name, value));
         }
 
-        let init = self.lower_extern_literal_init(expr, &required, &lowered)?;
+        let init = self.lower_extern_literal_init(expr, &init_args, &lowered)?;
         let has_overrides = lowered
             .iter()
-            .any(|(name, _)| !required.iter().any(|(required, _)| required == name));
+            .any(|(name, _)| !init_field_names.iter().any(|init| init == name));
         if !has_overrides {
             return self.emit_typed_temp(ty_id, init);
         }
@@ -5779,7 +5785,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.emit_init(local, init)?;
         let place = self.local_place(local);
         for (name, value) in lowered {
-            if required.iter().any(|(required, _)| *required == name) {
+            if init_field_names.contains(&name) {
                 continue;
             }
             if let Some(target) = self.extern_field_write_target(expr.node.id, name) {
@@ -6680,6 +6686,22 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 Ok(CallArg::MutBorrow(place))
             }
         }
+    }
+
+    fn lower_place_receiver_call_arg(
+        &mut self,
+        receiver: Place,
+        param: ParamType,
+        site: Option<&ExprNode>,
+    ) -> Result<CallArg, LowerError> {
+        if let Some(site) = site {
+            return self.lower_operand_call_arg(Operand::Place(receiver), param, site);
+        }
+        Ok(match param.mode {
+            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
+            ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
+            ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
+        })
     }
 
     fn lower_operand_call_arg(
@@ -13785,6 +13807,88 @@ fn f() {
                 }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_)), CallArg::MutBorrow(_)])
             )
         }));
+    }
+
+    #[test]
+    fn extern_computed_getter_uses_method_receiver_call_arg() {
+        let provider = ProviderDescriptor {
+            provider: ProviderId {
+                name: "gfx".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: anvyx_externs::ModulePath {
+                    segments: vec!["gfx".to_string()],
+                },
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![],
+                        ret: ExternTypeExpr::Named {
+                            module: None,
+                            name: "Sprite".to_string(),
+                            args: vec![],
+                        },
+                    },
+                    effects: ExternEffects::default(),
+                }],
+                types: vec![anvyx_externs::ExternTypeDescriptor {
+                    name: "Sprite".to_string(),
+                    doc: None,
+                    rep: anvyx_externs::ExternRep::Shared,
+                    fields: vec![anvyx_externs::ExternFieldDescriptor {
+                        name: "score".to_string(),
+                        ty: ExternTypeExpr::Int,
+                        computed: true,
+                        readable: true,
+                        writable: false,
+                        get_receiver: anvyx_externs::ReceiverMode::Shared,
+                        set_receiver: anvyx_externs::ReceiverMode::Mutable,
+                        doc: None,
+                    }],
+                    variants: vec![],
+                    init: None,
+                    methods: vec![anvyx_externs::ExternMethodDescriptor {
+                        name: "score_value".to_string(),
+                        doc: None,
+                        receiver: anvyx_externs::ReceiverMode::Shared,
+                        signature: ExternSignature {
+                            params: vec![],
+                            ret: ExternTypeExpr::Int,
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+            }],
+        };
+        let (root, resolved, semantic) = checked_with_provider(
+            "import ext:gfx { Sprite, make }; fn f() { let sprite = make(); let a = sprite.score; let b = sprite.score_value(); }",
+            provider,
+        );
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
+        let calls = program_statements(&air)
+            .filter_map(|statement| match statement {
+                AirStmt::Init {
+                    value:
+                        RValue::Call {
+                            callee: Callee::Extern(_),
+                            args,
+                        },
+                    ..
+                } if !args.is_empty() => Some(matches!(
+                    args.as_slice(),
+                    [CallArg::SharedBorrow(Place {
+                        root: PlaceRoot::Local(_),
+                        ..
+                    })]
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls, [true, true]);
     }
 
     #[test]

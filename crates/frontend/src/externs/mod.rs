@@ -1087,6 +1087,7 @@ mod tests {
             first.init = Some(ExternInitDescriptor {
                 params: vec![],
                 field_init: vec![],
+                presence_init: vec![],
                 ret: ExternTypeExpr::Void,
                 effects: ExternEffects::default(),
             });
@@ -1111,6 +1112,7 @@ mod tests {
             ty.init = Some(ExternInitDescriptor {
                 params: vec![],
                 field_init: vec!["x".to_string(), "x".to_string()],
+                presence_init: vec![],
                 ret: ExternTypeExpr::Void,
                 effects: ExternEffects::default(),
             });
@@ -1137,6 +1139,7 @@ mod tests {
             ty.init = Some(ExternInitDescriptor {
                 params: vec![param("x", ExternTypeExpr::Int)],
                 field_init: vec!["x".to_string()],
+                presence_init: vec![],
                 ret: ExternTypeExpr::Void,
                 effects: ExternEffects::default(),
             });
@@ -1228,6 +1231,7 @@ mod tests {
                         init: Some(ExternInitDescriptor {
                             params: vec![param("x", ExternTypeExpr::Float)],
                             field_init: vec!["x".to_string()],
+                            presence_init: vec![],
                             ret: ExternTypeExpr::Void,
                             effects: ExternEffects::default(),
                         }),

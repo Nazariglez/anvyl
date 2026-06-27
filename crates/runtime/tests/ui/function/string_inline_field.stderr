@@ -1,0 +1,5 @@
+error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
+ --> tests/ui/function/string_inline_field.rs:6:12
+  |
+6 |     value: String,
+  |            ^^^^^^

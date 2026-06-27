@@ -253,6 +253,7 @@ fn check_extern_literal_fields(
     let owner_ty = nominal_type(&tc.extern_type(owner).nominal);
     let schema = field_check::extern_field_schema(tc.extern_type(owner));
     let required = required_extern_literal_fields(owner, tc);
+    let presence = presence_extern_literal_fields(owner, tc);
     let field_owner = field_check::FieldOwner::Nominal(owner_ty);
     let shape = field_check::check_named(
         fields,
@@ -276,7 +277,7 @@ fn check_extern_literal_fields(
         };
         let writable = field.writable;
         let field_ty = field.ty.clone();
-        let is_init_field = required.contains(name);
+        let is_init_field = required.contains(name) || presence.contains(name);
         match (is_init_field, writable) {
             (true, _) => {}
             (false, true) => {
@@ -300,7 +301,14 @@ fn check_extern_literal_fields(
 
 fn required_extern_literal_fields(owner: ExternTypeId, tc: &TypeChecker) -> Vec<Ident> {
     tc.extern_type(owner)
-        .constructor_fields()
+        .required_init_fields()
+        .map(|fields| fields.map(|(_, field)| field.name).collect())
+        .unwrap_or_default()
+}
+
+fn presence_extern_literal_fields(owner: ExternTypeId, tc: &TypeChecker) -> Vec<Ident> {
+    tc.extern_type(owner)
+        .presence_init_fields()
         .map(|fields| fields.map(|(_, field)| field.name).collect())
         .unwrap_or_default()
 }

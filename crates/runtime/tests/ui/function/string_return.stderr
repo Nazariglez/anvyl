@@ -1,0 +1,5 @@
+error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
+ --> tests/ui/function/string_return.rs:4:13
+  |
+4 | fn bad() -> String { String::new() }
+  |             ^^^^^^

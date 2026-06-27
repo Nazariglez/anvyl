@@ -361,6 +361,116 @@ fn compiler_records_extern_metadata_from_call_params() {
 }
 
 #[test]
+fn compiler_rejects_native_init_field_args() {
+    fn program_with_arg(provided: bool) -> (Program, FunctionId) {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let void = program.alloc_type(TypeData::Void);
+        let module = program.alloc_module(root_module());
+        let owner = program.alloc_extern_type(ExternTypeDecl {
+            name: Ident::new("Thing"),
+            module,
+            binding: None,
+            type_args: vec![],
+            const_args: vec![],
+            rep: ExternRep::Shared,
+            has_init: true,
+            init_args: vec![air::ExternInitArgDecl {
+                field: air::FieldId::from_index(0),
+                param: 0,
+                presence: true,
+            }],
+            fields: vec![ExternFieldDecl {
+                name: Ident::new("value"),
+                ty: int,
+                abi: anvyx_runtime::ExternTypeExpr::Int,
+                get_receiver: ExternReceiverDecl {
+                    ty: TypeId::from_index(0),
+                    mode: ParamMode::SharedBorrow,
+                },
+                set_receiver: ExternReceiverDecl {
+                    ty: TypeId::from_index(0),
+                    mode: ParamMode::MutBorrow,
+                },
+                computed: false,
+                readable: true,
+                writable: true,
+            }],
+            variants: vec![],
+            variant_abis: vec![],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        });
+        program.module_mut(module).extern_types.push(owner);
+        let owner_ty = program.alloc_type(TypeData::Extern(owner));
+        let extern_ty = program.extern_type_mut(owner);
+        extern_ty.fields[0].get_receiver.ty = owner_ty;
+        extern_ty.fields[0].set_receiver.ty = owner_ty;
+        let init = program.alloc_extern(ExternDecl {
+            name: Ident::new("new"),
+            module,
+            member: ExternMember::Init { owner },
+            params: vec![ExternParamDecl {
+                ty: int,
+                mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
+            }],
+            return_type: owner_ty,
+            abi: air::ExternAbi {
+                params: vec![anvyx_runtime::ExternTypeExpr::Int],
+                ret: anvyx_runtime::ExternTypeExpr::Named {
+                    module: None,
+                    name: "Thing".to_string(),
+                    args: vec![],
+                },
+            },
+            binding: None,
+            effects: anvyx_runtime::ExternEffects::default(),
+        });
+        program.module_mut(module).externs.push(init);
+        let konst = program.alloc_const(air::ConstData {
+            ty: int,
+            value: air::ConstValue::Int(1),
+        });
+        let arg = if provided {
+            CallArg::InitFieldProvided(Operand::Const(konst))
+        } else {
+            CallArg::InitFieldOmitted
+        };
+        let caller = program.alloc_function(Function {
+            name: Ident::new("caller"),
+            module,
+            kind: FunctionKind::Normal,
+            owner: None,
+            specialization: None,
+            signature: Signature::new(vec![], void),
+            locals: vec![],
+            body: structured_body(
+                vec![Statement::Eval(RValue::Call {
+                    callee: Callee::Extern(init),
+                    args: vec![arg],
+                })],
+                air::AirTail::Return(None),
+            ),
+        });
+        program.module_mut(module).functions.push(caller);
+        (program, caller)
+    }
+
+    for provided in [false, true] {
+        let (program, caller) = program_with_arg(provided);
+        let errors = compile_errors(&program);
+
+        assert!(has_compile_error(
+            &errors,
+            caller,
+            VmCompileErrorKind::UnsupportedNativeInitField,
+        ));
+    }
+}
+
+#[test]
 fn compiler_records_member_extern_receiver_metadata() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -374,7 +484,7 @@ fn compiler_records_member_extern_receiver_metadata() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
-        init_fields: vec![],
+        init_args: vec![],
         fields: vec![],
         variants: vec![],
         variant_abis: vec![],
@@ -1832,7 +1942,7 @@ impl StorageFamilyCase {
                     const_args: vec![],
                     rep: ExternRep::Shared,
                     has_init: false,
-                    init_fields: vec![],
+                    init_args: vec![],
                     fields: vec![ExternFieldDecl {
                         name: Ident::new("f"),
                         ty: function,

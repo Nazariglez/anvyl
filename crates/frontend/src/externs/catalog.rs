@@ -38,6 +38,12 @@ pub(crate) struct ExternFunctionId(usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExternFieldId(usize);
 
+impl ExternFieldId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExternMethodId(usize);
 
@@ -629,9 +635,21 @@ pub(crate) struct ExternType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternInit {
-    pub(crate) fields: Vec<ExternFieldId>,
+    pub(crate) fields: ExternInitFields,
     pub(crate) signature: ResolvedExternSignature,
     pub(crate) effects: ExternEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ExternInitFields {
+    pub(crate) required: Vec<ExternInitField>,
+    pub(crate) presence: Vec<ExternInitField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExternInitField {
+    pub(crate) field: ExternFieldId,
+    pub(crate) param: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,16 +680,34 @@ pub(crate) struct ExternField {
 }
 
 impl ExternType {
-    pub(crate) fn constructor_fields(
+    pub(crate) fn required_init_fields(
         &self,
-    ) -> Option<impl Iterator<Item = (usize, &ExternField)> + '_> {
+    ) -> Option<impl Iterator<Item = (ExternInitField, &ExternField)> + '_> {
         let init = self.init.as_ref()?;
         init.backs_literal(&self.nominal).then(|| {
-            init.fields.iter().map(|id| {
-                let index = id.0;
-                (index, &self.fields[index])
+            init.fields.required.iter().copied().map(|init| {
+                let index = init.field.0;
+                (init, &self.fields[index])
             })
         })
+    }
+
+    pub(crate) fn presence_init_fields(
+        &self,
+    ) -> Option<impl Iterator<Item = (ExternInitField, &ExternField)> + '_> {
+        let init = self.init.as_ref()?;
+        init.backs_literal(&self.nominal).then(|| {
+            init.fields.presence.iter().copied().map(|init| {
+                let index = init.field.0;
+                (init, &self.fields[index])
+            })
+        })
+    }
+
+    pub(crate) fn constructor_fields(
+        &self,
+    ) -> Option<impl Iterator<Item = (ExternInitField, &ExternField)> + '_> {
+        self.required_init_fields()
     }
 }
 
@@ -1184,7 +1220,7 @@ impl<'a> CatalogBuilder<'a> {
             let fields = if backs_literal {
                 self.resolve_init_fields(type_id, raw_init, &signature, &context)
             } else {
-                vec![]
+                ExternInitFields::default()
             };
             self.catalog.types[type_id.0].init = Some(ExternInit {
                 fields,
@@ -1248,10 +1284,41 @@ impl<'a> CatalogBuilder<'a> {
         raw_init: &RawExternInit,
         signature: &ResolvedExternSignature,
         context: &ExternCatalogContext,
-    ) -> Vec<ExternFieldId> {
+    ) -> ExternInitFields {
+        let required = self.resolve_init_field_group(
+            type_id,
+            raw_init,
+            signature,
+            context,
+            &raw_init.decl.field_init,
+        );
+        let presence = self.resolve_init_field_group(
+            type_id,
+            raw_init,
+            signature,
+            context,
+            &raw_init.decl.presence_init,
+        );
+        ExternInitFields { required, presence }
+    }
+
+    fn resolve_init_field_group(
+        &mut self,
+        type_id: ExternTypeId,
+        raw_init: &RawExternInit,
+        signature: &ResolvedExternSignature,
+        context: &ExternCatalogContext,
+        names: &[String],
+    ) -> Vec<ExternInitField> {
         let ty = &self.catalog.types[type_id.0];
+        let param_by_name = signature
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| param.name.map(|name| (name, index)))
+            .collect::<HashMap<_, _>>();
         let mut fields = vec![];
-        for (index, raw_name) in raw_init.decl.field_init.iter().enumerate() {
+        for raw_name in names {
             let name = Ident::new(raw_name);
             let Some(id) = ty.fields_by_name.get(&name).copied() else {
                 self.errors.push(ExternCatalogError::UnknownInitField {
@@ -1261,19 +1328,24 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 continue;
             };
-            if let Some(param) = signature.params.get(index) {
-                let field_ty = &ty.fields[id.0].ty.ty;
-                if param.ty.ty != *field_ty {
-                    self.errors.push(ExternCatalogError::InitFieldTypeMismatch {
-                        context: context.clone(),
-                        field: name,
-                        expected: field_ty.clone(),
-                        found: param.ty.ty.clone(),
-                        site: raw_init.site,
-                    });
-                }
+            let Some(param_index) = param_by_name.get(&name).copied() else {
+                continue;
+            };
+            let param = &signature.params[param_index];
+            let field_ty = &ty.fields[id.0].ty.ty;
+            if param.ty.ty != *field_ty {
+                self.errors.push(ExternCatalogError::InitFieldTypeMismatch {
+                    context: context.clone(),
+                    field: name,
+                    expected: field_ty.clone(),
+                    found: param.ty.ty.clone(),
+                    site: raw_init.site,
+                });
             }
-            fields.push(id);
+            fields.push(ExternInitField {
+                field: id,
+                param: param_index,
+            });
         }
         fields
     }
@@ -2086,7 +2158,14 @@ mod tests {
             let ty = &mut self.catalog.types[owner.0];
             assert!(ty.init.is_none());
             ty.init = Some(ExternInit {
-                fields,
+                fields: ExternInitFields {
+                    required: fields
+                        .into_iter()
+                        .enumerate()
+                        .map(|(param, field)| ExternInitField { field, param })
+                        .collect(),
+                    presence: vec![],
+                },
                 signature: ResolvedExternSignature {
                     params: vec![],
                     ret: resolved_ty(nominal_type(&ty.nominal)),
@@ -3038,6 +3117,7 @@ mod tests {
                     init: Some(ExternInitDescriptor {
                         params: vec![ext_param("missing", ExternTypeExpr::Int)],
                         field_init: vec!["missing".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),
@@ -3080,6 +3160,7 @@ mod tests {
                     init: Some(ExternInitDescriptor {
                         params: vec![ext_param("x", ExternTypeExpr::Int)],
                         field_init: vec!["x".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),
@@ -3111,6 +3192,7 @@ mod tests {
                     init: Some(ExternInitDescriptor {
                         params: vec![ext_param("x", ExternTypeExpr::Int)],
                         field_init: vec!["x".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),
@@ -3124,6 +3206,77 @@ mod tests {
         }
 
         #[test]
+        fn init_presence_fields_resolve_with_param_positions() {
+            let raw = provider_raw(ExternModuleDescriptor {
+                path: extern_module(&["host"]),
+                types: vec![ExternTypeDescriptor {
+                    fields: vec![
+                        ExternFieldDescriptor {
+                            name: "x".to_string(),
+                            ty: ExternTypeExpr::Int,
+                            computed: false,
+                            readable: true,
+                            writable: true,
+                            get_receiver: ReceiverMode::Shared,
+                            set_receiver: ReceiverMode::Mutable,
+                            doc: None,
+                        },
+                        ExternFieldDescriptor {
+                            name: "y".to_string(),
+                            ty: ExternTypeExpr::Bool,
+                            computed: false,
+                            readable: true,
+                            writable: true,
+                            get_receiver: ReceiverMode::Shared,
+                            set_receiver: ReceiverMode::Mutable,
+                            doc: None,
+                        },
+                    ],
+                    variants: vec![],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![
+                            ext_param("y", ExternTypeExpr::Bool),
+                            ext_param("x", ExternTypeExpr::Int),
+                        ],
+                        field_init: vec!["x".to_string()],
+                        presence_init: vec!["y".to_string()],
+                        ret: ExternTypeExpr::Void,
+                        effects: ExternEffects::default(),
+                    }),
+                    ..descriptor_type("Handle")
+                }],
+                functions: vec![],
+            });
+            let decls = decls("", &[], &raw);
+            let catalog = build(raw, &decls).expect("presence init should import");
+            let owner = catalog
+                .type_by_key(&type_key(provider_scope("host"), "Handle"))
+                .expect("extern type");
+            let init = catalog.ty(owner).init.as_ref().expect("init metadata");
+
+            assert_eq!(init.fields.required[0].param, 1);
+            assert_eq!(init.fields.presence[0].param, 0);
+            assert_eq!(
+                catalog
+                    .ty(owner)
+                    .required_init_fields()
+                    .unwrap()
+                    .map(|(_, field)| field.name)
+                    .collect::<Vec<_>>(),
+                [ident("x")]
+            );
+            assert_eq!(
+                catalog
+                    .ty(owner)
+                    .presence_init_fields()
+                    .unwrap()
+                    .map(|(_, field)| field.name)
+                    .collect::<Vec<_>>(),
+                [ident("y")]
+            );
+        }
+
+        #[test]
         fn nonliteral_init_keeps_signature_without_constructor_fields() {
             let raw = provider_raw(ExternModuleDescriptor {
                 path: extern_module(&["host"]),
@@ -3132,6 +3285,7 @@ mod tests {
                     init: Some(ExternInitDescriptor {
                         params: vec![ext_param("ok", ExternTypeExpr::Bool)],
                         field_init: vec!["ok".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Result(
                             Box::new(named("Handle")),
                             Box::new(ExternTypeExpr::String),
@@ -3149,7 +3303,8 @@ mod tests {
                 .expect("extern type");
             let init = catalog.ty(owner).init.as_ref().expect("init metadata");
 
-            assert!(init.fields.is_empty());
+            assert!(init.fields.required.is_empty());
+            assert!(init.fields.presence.is_empty());
             assert_eq!(init.signature.params.len(), 1);
             assert!(catalog.ty(owner).constructor_fields().is_none());
         }

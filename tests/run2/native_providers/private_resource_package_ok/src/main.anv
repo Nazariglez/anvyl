@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @frontend: new
+// @match-begin
+// 15
+// 14
+// 16
+// 21
+// @match-end
+
+import pkg:host.win { WWin, make_win };
+
+fn main() {
+    let made = make_win(5);
+    println(made.score);
+    let constructed = WWin { value: 7 };
+    println(constructed.score);
+    let duplicated = constructed.duplicate(2);
+    println(duplicated.score);
+    var reset = WWin { value: 1, score: 19 };
+    reset.score = 21;
+    println(reset.score);
+}

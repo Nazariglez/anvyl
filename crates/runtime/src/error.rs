@@ -27,6 +27,8 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
 pub fn heap_access_error(error: AccessError) -> RuntimeError {
     let message = match error {
         AccessError::WrongHeap => "heap object belongs to a different heap",

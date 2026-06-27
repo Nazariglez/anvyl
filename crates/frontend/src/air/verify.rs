@@ -712,6 +712,9 @@ pub enum BadCall {
         first: usize,
         second: usize,
     },
+    UnexpectedInitFieldArg {
+        index: usize,
+    },
 }
 
 pub fn verify(program: &Program) -> Result<VerifiedProgram<'_>, Vec<VerifyError>> {
@@ -2313,11 +2316,13 @@ fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
 
 fn call_arg_uses_capture_cell(arg: &CallArg, cell: CaptureCellId) -> bool {
     match arg {
-        CallArg::Value(operand) => operand_uses_capture_cell(operand, cell),
+        CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+            operand_uses_capture_cell(operand, cell)
+        }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             place_uses_capture_cell(place, cell)
         }
-        CallArg::SharedStringConst(_) => false,
+        CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => false,
     }
 }
 
@@ -2767,15 +2772,29 @@ fn verify_extern_type(cx: &mut VerifyCx<'_>, id: ExternTypeId) {
     cx.verify_module_ref(site.clone(), ty.module);
     verify_decl_listed_once(cx, site.clone(), ty.module, id, |m| &m.extern_types);
     let owner_ty = extern_owner_type(cx, id);
-    let mut init_fields = std::collections::HashSet::new();
-    for init_field in &ty.init_fields {
+    let init_decl = cx
+        .program
+        .externs
+        .iter()
+        .find(|ext| matches!(ext.member, ExternMember::Init { owner } if owner == id));
+    let mut init_arg_fields = std::collections::HashSet::new();
+    let mut init_arg_params = std::collections::HashSet::new();
+    for init_arg in &ty.init_args {
+        let field = ty.fields.get(init_arg.field.index());
+        let param_invalid = init_decl.is_some_and(|decl| {
+            decl.params.get(init_arg.param).is_none_or(|param| {
+                param.mode != ParamMode::Value || field.is_some_and(|field| param.ty != field.ty)
+            })
+        });
         let invalid = !ty.has_init
-            || !init_fields.insert(*init_field)
-            || ty.fields.get(init_field.index()).is_none();
+            || field.is_none()
+            || !init_arg_fields.insert(init_arg.field)
+            || !init_arg_params.insert(init_arg.param)
+            || param_invalid;
         if invalid {
             cx.push(
                 site.clone(),
-                VerifyErrorKind::BadExtern(BadExtern::InvalidInitField(*init_field)),
+                VerifyErrorKind::BadExtern(BadExtern::InvalidInitField(init_arg.field)),
             );
         }
     }
@@ -4559,14 +4578,16 @@ fn verify_collection_loan_contract_call_arg(
     escapes: bool,
 ) {
     match arg {
-        CallArg::Value(op) => verify_collection_loan_contract_operand(
-            cx,
-            function_id,
-            op,
-            slot_locals,
-            active_slots,
-            escapes,
-        ),
+        CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                op,
+                slot_locals,
+                active_slots,
+                escapes,
+            );
+        }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             verify_collection_loan_contract_place(
                 cx,
@@ -4577,7 +4598,7 @@ fn verify_collection_loan_contract_call_arg(
                 escapes,
             );
         }
-        CallArg::SharedStringConst(_) => {}
+        CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
     }
 }
 
@@ -5082,13 +5103,13 @@ fn verify_air_rvalue_reads(
             }
             for arg in args {
                 match arg {
-                    CallArg::Value(op) => {
+                    CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
                         verify_air_operand_read(cx, function_id, index, op, state);
                     }
                     CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                         verify_air_place_read(cx, function_id, index, place, state);
                     }
-                    CallArg::SharedStringConst(_) => {}
+                    CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
                 }
             }
         }
@@ -7196,7 +7217,10 @@ fn verify_call_arg(
     arg: &CallArg,
 ) {
     match arg {
-        CallArg::Value(op) => verify_operand(cx, function_id, block_id, stmt_index, op),
+        CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
+            verify_operand(cx, function_id, block_id, stmt_index, op);
+        }
+        CallArg::InitFieldOmitted => {}
         CallArg::SharedBorrow(place) => {
             verify_place(cx, function_id, block_id, stmt_index, place);
         }
@@ -7276,11 +7300,15 @@ fn arg_function_escape(
     state: &LocalInit,
 ) -> FunctionValueCapability {
     match arg {
-        CallArg::Value(operand) => operand_function_escape(program, function_id, operand, state),
+        CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+            operand_function_escape(program, function_id, operand, state)
+        }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             type_function_capability(program, place.ty)
         }
-        CallArg::SharedStringConst(_) => FunctionValueCapability::NonFunction,
+        CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {
+            FunctionValueCapability::NonFunction
+        }
     }
 }
 
@@ -7712,6 +7740,17 @@ fn source_call_return_state(program: &Program, ty: TypeId) -> FunctionValueState
     }
 }
 
+fn extern_presence_init_arg(program: &Program, callee: ExternId, index: usize) -> bool {
+    let ExternMember::Init { owner } = program.externs[callee.index()].member else {
+        return false;
+    };
+    program
+        .extern_type(owner)
+        .init_args
+        .iter()
+        .any(|arg| arg.param == index && arg.presence)
+}
+
 fn verify_call_args(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -7748,6 +7787,18 @@ fn verify_call_args(
         let Some(expected_param) = params.get(cx.program, i) else {
             continue;
         };
+        let expected_init_field = matches!(callee, Callee::Extern(id)
+            if extern_presence_init_arg(cx.program, *id, i));
+        let found_init_field = matches!(
+            arg,
+            CallArg::InitFieldProvided(_) | CallArg::InitFieldOmitted
+        );
+        if found_init_field != expected_init_field {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadCall(BadCall::UnexpectedInitFieldArg { index: i }),
+            );
+        }
         if arg.mode() != expected_param.mode {
             cx.push(
                 site.clone(),

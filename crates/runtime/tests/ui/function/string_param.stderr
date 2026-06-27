@@ -1,0 +1,5 @@
+error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
+ --> tests/ui/function/string_param.rs:4:15
+  |
+4 | fn bad(value: String) { drop(value); }
+  |               ^^^^^^

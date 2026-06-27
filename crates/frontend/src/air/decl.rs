@@ -481,7 +481,7 @@ pub struct ExternTypeDecl {
     pub const_args: Vec<String>,
     pub rep: ExternRep,
     pub has_init: bool,
-    pub init_fields: Vec<FieldId>,
+    pub init_args: Vec<ExternInitArgDecl>,
     pub fields: Vec<ExternFieldDecl>,
     pub variants: Vec<VariantDecl>,
     pub variant_abis: Vec<ExternVariantAbiDecl>,
@@ -491,17 +491,43 @@ pub struct ExternTypeDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternInitArgDecl {
+    pub field: FieldId,
+    pub param: usize,
+    pub presence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternVariantAbiDecl {
     pub fields: Vec<ExternTypeExpr>,
 }
 
 impl ExternTypeDecl {
-    pub fn constructor_fields(&self) -> Option<impl Iterator<Item = (FieldId, &ExternFieldDecl)>> {
+    pub fn required_init_fields(
+        &self,
+    ) -> Option<impl Iterator<Item = (&ExternInitArgDecl, &ExternFieldDecl)>> {
         self.has_init.then(|| {
-            self.init_fields
+            self.init_args
                 .iter()
-                .filter_map(|field| self.fields.get(field.index()).map(|decl| (*field, decl)))
+                .filter(|arg| !arg.presence)
+                .map(|arg| (arg, &self.fields[arg.field.index()]))
         })
+    }
+
+    pub fn presence_init_fields(
+        &self,
+    ) -> Option<impl Iterator<Item = (&ExternInitArgDecl, &ExternFieldDecl)>> {
+        self.has_init.then(|| {
+            self.init_args
+                .iter()
+                .filter(|arg| arg.presence)
+                .map(|arg| (arg, &self.fields[arg.field.index()]))
+        })
+    }
+
+    pub fn constructor_fields(&self) -> Option<impl Iterator<Item = (FieldId, &ExternFieldDecl)>> {
+        self.required_init_fields()
+            .map(|fields| fields.map(|(arg, field)| (arg.field, field)))
     }
 }
 

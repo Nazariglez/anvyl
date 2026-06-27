@@ -1,0 +1,5 @@
+error: computed getters cannot return RuntimeResult<T>
+ --> tests/ui/methods/getter_runtime_result.rs:8:21
+  |
+8 |     pub fn x(&self) -> anvyx_runtime::RuntimeResult<i64> {
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

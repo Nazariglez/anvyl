@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use anvyx_frontend::air::{
-    AirBlock, AirStmt, AirTail, CallArg, Callee, ExternId, FunctionId, FunctionKind, GlobalId,
-    LambdaCaptureArg, Operand, ParamMode, Place, PlaceRoot, Program, RValue, TypeData, TypeId,
-    TypePassClass, TypePassClasses, VariantShape, VerifiedProgram,
+    AirBlock, AirStmt, AirTail, CallArg, Callee, ConstId, ExternId, FunctionId, FunctionKind,
+    GlobalId, LambdaCaptureArg, Operand, ParamMode, Place, PlaceRoot, Program, RValue, TypeData,
+    TypeId, TypePassClass, TypePassClasses, VariantShape, VerifiedProgram,
 };
 
 use super::vir::{
@@ -56,6 +56,7 @@ pub enum VmCompileErrorKind {
     UnsupportedLambdaExternBoundary,
     UnsupportedCollectionLoan,
     UnsupportedGlobal,
+    UnsupportedNativeInitField,
     NonCheapValueParam,
     NonCheapValueArg,
 }
@@ -411,6 +412,11 @@ impl CompileCx<'_> {
                 }
                 VirCallArg::Value(operand.clone())
             }
+            CallArg::InitFieldProvided(operand) => {
+                self.check_operand(function, operand);
+                self.unsupported_init_field(function)
+            }
+            CallArg::InitFieldOmitted => self.unsupported_init_field(function),
             CallArg::SharedBorrow(place) => {
                 self.check_place(function, place);
                 VirCallArg::SharedBorrow(place.clone())
@@ -421,6 +427,11 @@ impl CompileCx<'_> {
                 VirCallArg::MutBorrow(place.clone())
             }
         }
+    }
+
+    fn unsupported_init_field(&mut self, function: FunctionId) -> VirCallArg {
+        self.push_function(function, VmCompileErrorKind::UnsupportedNativeInitField);
+        VirCallArg::Value(Operand::Const(ConstId::from_index(usize::MAX)))
     }
 
     fn supported_call_target(

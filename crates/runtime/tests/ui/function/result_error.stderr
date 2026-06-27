@@ -1,4 +1,4 @@
-error: Result<T, RuntimeError> requires #[function(trap)]
+error: Result<T, RuntimeError> is a hidden runtime failure shape; use RuntimeResult<T>
  --> tests/ui/function/result_error.rs:4:35
   |
 4 | fn bad(value: i64) -> Result<i64, RuntimeError> { Ok(value) }

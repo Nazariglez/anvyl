@@ -9,6 +9,7 @@ pub mod cycle_collector;
 pub mod error;
 mod escaping_lambda;
 mod global_slot;
+mod init_field;
 mod lambda_cell;
 pub mod managed_rc;
 mod mutable_place;
@@ -39,11 +40,12 @@ pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};
 pub use ctx::{Ctx, CtxRoots};
 pub use cycle_collector::{collect_cycles, set_auto_collect};
-pub use error::{RuntimeError, heap_access_error};
+pub use error::{RuntimeError, RuntimeResult, heap_access_error};
 pub use escaping_lambda::{CallbackKey, EscapingLambda, EscapingLambdaCall, EscapingLambdaClose};
 pub use global_slot::{
     GlobalProjectedLoanGuard, GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState,
 };
+pub use init_field::AnvInitField;
 pub use inventory;
 pub use lambda_cell::{LambdaCell, StackLambdaCell};
 pub use managed_rc::{

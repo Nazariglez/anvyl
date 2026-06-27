@@ -1,7 +1,7 @@
-use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+use anvyx_runtime::{function, RuntimeResult, ScopedLambda};
 
-#[function(trap, params(f = "fn(float) -> void"))]
-fn bad(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+#[function(params(f = "fn(float) -> void"))]
+fn bad(f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
     f.call(1)
 }
 

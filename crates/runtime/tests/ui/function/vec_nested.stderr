@@ -1,0 +1,5 @@
+error: Vec<T> is not a provider boundary carrier; use AnvList<'cx, T> or explicit runtime copy helpers
+ --> tests/ui/function/vec_nested.rs:4:23
+  |
+4 | fn bad(values: Option<Vec<i64>>) { drop(values); }
+  |                       ^^^^^^^^

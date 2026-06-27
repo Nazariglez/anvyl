@@ -157,7 +157,8 @@ pub(crate) fn call_arg_ty_with(
     mut const_lookup: impl FnMut(ConstId) -> Option<TypeId>,
 ) -> Option<TypeId> {
     match arg {
-        CallArg::Value(op) => operand_ty_with(op, const_lookup),
+        CallArg::Value(op) | CallArg::InitFieldProvided(op) => operand_ty_with(op, const_lookup),
+        CallArg::InitFieldOmitted => None,
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
         CallArg::SharedStringConst(id) => const_lookup(*id),
     }

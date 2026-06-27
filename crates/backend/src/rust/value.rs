@@ -41,7 +41,10 @@ impl<'a> RustValues<'a> {
 
     pub(super) fn call_arg(&self, arg: &RirCallArg) -> String {
         match arg {
-            RirCallArg::Value(operand) => self.value_operand(operand),
+            RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
+                self.value_operand(operand)
+            }
+            RirCallArg::InitFieldOmitted => target::init_field_omitted(),
             RirCallArg::SharedBorrow(place) => self.borrow_arg(place),
             RirCallArg::SharedStringConst(id) => match &self.program.consts[id.index()].value {
                 RirConstValue::String(value) => rust_string(value),

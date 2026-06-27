@@ -972,7 +972,12 @@ fn apply_value_field(
     match kind {
         MemberAccessKind::Field => {
             match place::field_value(None, receiver, field_id, name, span, tc) {
-                place::FieldValueResult::Value(value, _) => Subject::Value(*value),
+                place::FieldValueResult::Value(value, _) => {
+                    if place::has_computed_extern_target(&value, tc) {
+                        place::record_value_read(receiver_id, receiver, tc);
+                    }
+                    Subject::Value(*value)
+                }
                 place::FieldValueResult::StaticOnValue(ty) => {
                     tc.push_error(TypeError::StaticMethodOnValue {
                         ty,

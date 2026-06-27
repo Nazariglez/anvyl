@@ -1,4 +1,4 @@
-use anvyx_runtime::function;
+use anvyx_runtime::{AnvList, AnvString, Ctx, ListStorage, function};
 
 #[inline]
 #[function]
@@ -33,37 +33,37 @@ pub fn str_find(s: &str, sub: &str) -> i64 {
 
 #[inline]
 #[function]
-pub fn str_to_upper(s: &str) -> String {
-    s.to_uppercase()
+pub fn str_to_upper(s: &str) -> AnvString {
+    AnvString::from(s.to_uppercase())
 }
 
 #[inline]
 #[function]
-pub fn str_to_lower(s: &str) -> String {
-    s.to_lowercase()
+pub fn str_to_lower(s: &str) -> AnvString {
+    AnvString::from(s.to_lowercase())
 }
 
 #[inline]
 #[function]
-pub fn str_trim(s: &str) -> String {
-    s.trim().to_string()
+pub fn str_trim(s: &str) -> AnvString {
+    AnvString::from(s.trim())
 }
 
 #[inline]
 #[function]
-pub fn str_trim_start(s: &str) -> String {
-    s.trim_start().to_string()
+pub fn str_trim_start(s: &str) -> AnvString {
+    AnvString::from(s.trim_start())
 }
 
 #[inline]
 #[function]
-pub fn str_trim_end(s: &str) -> String {
-    s.trim_end().to_string()
+pub fn str_trim_end(s: &str) -> AnvString {
+    AnvString::from(s.trim_end())
 }
 
 #[inline]
 #[function]
-pub fn str_substring(s: &str, start: i64, len: i64) -> Option<String> {
+pub fn str_substring(s: &str, start: i64, len: i64) -> Option<AnvString> {
     if start < 0 || len < 0 {
         return None;
     }
@@ -71,28 +71,31 @@ pub fn str_substring(s: &str, start: i64, len: i64) -> Option<String> {
     let len = usize::try_from(len).ok()?;
     let chars = s.chars().collect::<Vec<_>>();
     let end = start.checked_add(len)?;
-    (end <= chars.len()).then(|| chars[start..end].iter().collect())
+    (end <= chars.len()).then(|| AnvString::from(chars[start..end].iter().collect::<String>()))
 }
 
 #[inline]
 #[function]
-pub fn str_char_at(s: &str, index: i64) -> Option<String> {
+pub fn str_char_at(s: &str, index: i64) -> Option<AnvString> {
     usize::try_from(index)
         .ok()
         .and_then(|index| s.chars().nth(index))
-        .map(|c| c.to_string())
+        .map(|c| AnvString::from(c.to_string()))
+}
+
+#[inline]
+#[function(ctx)]
+pub fn str_split<'cx>(ctx: &mut Ctx<'cx, '_>, s: &str, sep: &str) -> AnvList<'cx, AnvString> {
+    let storage = ctx
+        .heap()
+        .register_untracked::<ListStorage<'_, AnvString>>();
+    AnvList::from_elems(ctx, storage, s.split(sep).map(AnvString::from))
 }
 
 #[inline]
 #[function]
-pub fn str_split(s: &str, sep: &str) -> Vec<String> {
-    s.split(sep).map(str::to_string).collect()
-}
-
-#[inline]
-#[function]
-pub fn str_replace(s: &str, from: &str, to: &str) -> String {
-    s.replace(from, to)
+pub fn str_replace(s: &str, from: &str, to: &str) -> AnvString {
+    AnvString::from(s.replace(from, to))
 }
 
 anvyx_runtime::builtin_module! {

@@ -1221,7 +1221,7 @@ fn inline_extern_field_projection_is_valid() {
             const_args: vec![],
             rep: ExternRep::Inline,
             has_init: false,
-            init_fields: vec![],
+            init_args: vec![],
             fields: vec![ExternFieldDecl {
                 name: Ident::new("x"),
                 ty: int_ty,
@@ -1797,7 +1797,7 @@ fn extern_call() {
         const_args: vec![],
         rep: ExternRep::Shared,
         has_init: false,
-        init_fields: vec![],
+        init_args: vec![],
         fields: vec![],
         variants: vec![],
         variant_abis: vec![],

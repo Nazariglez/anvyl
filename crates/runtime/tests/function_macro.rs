@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvRef, AnvRefType, AnvyxInline, AnvyxRef, CallbackEscape, CallbackThread, Ctx, EscapingLambda,
-    ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr, Heap, MutPlace, ParamFlow,
-    RuntimeError, RustAbiSupport, RustParamAbi, RustWrapperCtx, ScopedLambda, function,
+    AnvList, AnvRef, AnvRefType, AnvString, AnvyxInline, AnvyxRef, CallbackEscape, CallbackThread,
+    Ctx, EscapingLambda, ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr, Heap,
+    MutPlace, ParamFlow, RuntimeError, RuntimeResult, RustAbiSupport, RustParamAbi, RustWrapperCtx,
+    ScopedLambda, function,
 };
 
 /// Adds numbers.
@@ -34,8 +35,13 @@ fn point_x(point: RustPoint) -> f64 {
     point.x
 }
 
-#[function(trap)]
-fn maybe(value: Option<i64>) -> Result<Option<i64>, RuntimeError> {
+#[function(ret = "Point")]
+fn make_point() -> RustPoint {
+    RustPoint { x: 1.0 }
+}
+
+#[function]
+fn maybe(value: Option<i64>) -> RuntimeResult<Option<i64>> {
     if value == Some(i64::MIN) {
         Err(RuntimeError::new("sentinel"))
     } else {
@@ -48,8 +54,12 @@ fn maybe_return(value: i64) -> Option<i64> {
     (value >= 0).then_some(value)
 }
 
-#[function]
-fn strings(values: Vec<String>) -> Vec<String> {
+#[function(ctx)]
+fn strings<'cx>(
+    ctx: &mut Ctx<'cx, '_>,
+    values: AnvList<'cx, AnvString>,
+) -> AnvList<'cx, AnvString> {
+    let _ = ctx.heap();
     values
 }
 
@@ -77,15 +87,15 @@ fn maybe_place<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Option<i64>
     drop(value);
 }
 
-#[function(trap)]
-fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+#[function]
+fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
     let result = f.call(1);
     let _ = std::hint::black_box(f);
     result
 }
 
-#[function(trap, params(f = "fn(int) -> bool"))]
-fn callback_override(f: ScopedLambda<'_, '_, (i64,), bool>) -> Result<(), RuntimeError> {
+#[function(params(f = "fn(int) -> bool"))]
+fn callback_override(f: ScopedLambda<'_, '_, (i64,), bool>) -> RuntimeResult<()> {
     let result = f.call(1).map(|_| ());
     let _ = std::hint::black_box(f);
     result
@@ -108,6 +118,15 @@ fn visible_result(ok: bool) -> Result<i64, LoadError> {
         Ok(1)
     } else {
         Err(LoadError { code: 404 })
+    }
+}
+
+#[function]
+fn fallible_visible_result(ok: bool) -> RuntimeResult<Result<i64, LoadError>> {
+    if ok {
+        Ok(Ok(1))
+    } else {
+        Err(RuntimeError::new("hidden"))
     }
 }
 
@@ -181,14 +200,17 @@ fn named_type_override_updates_descriptor_and_rust_abi() {
         args: vec![],
     };
 
-    assert_eq!(export.descriptor.signature.params[0].ty, point);
+    assert_eq!(export.descriptor.signature.params[0].ty, point.clone());
     assert_eq!(
         export.rust.abi.params[0],
-        RustParamAbi::Value(ExternTypeExpr::Named {
-            module: None,
-            name: "Point".to_string(),
-            args: vec![],
-        })
+        RustParamAbi::OwnedNamed(point.clone())
+    );
+
+    let export = __anvyx_export_make_point();
+    assert_eq!(export.descriptor.signature.ret, point.clone());
+    assert_eq!(
+        export.rust.abi.ret,
+        anvyx_runtime::RustReturnAbi::OwnedNamed(point)
     );
 }
 
@@ -212,10 +234,7 @@ fn option_result_and_list_support_metadata() {
     assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
 
     let export = __anvyx_export_strings();
-    assert_eq!(
-        export.rust.abi.support,
-        RustAbiSupport::NeedsWrapperConversion
-    );
+    assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
 
     let export = __anvyx_export_visible_result();
     let err = ExternTypeExpr::Named {
@@ -232,10 +251,17 @@ fn option_result_and_list_support_metadata() {
         export.rust.abi.ret,
         anvyx_runtime::RustReturnAbi::Result(
             Box::new(anvyx_runtime::RustReturnAbi::Value(ExternTypeExpr::Int)),
-            Box::new(anvyx_runtime::RustReturnAbi::Value(err)),
+            Box::new(anvyx_runtime::RustReturnAbi::OwnedNamed(err.clone())),
         )
     );
     assert_eq!(export.rust.abi.support, RustAbiSupport::Direct);
+
+    let export = __anvyx_export_fallible_visible_result();
+    assert!(export.descriptor.effects.fallible);
+    assert_eq!(
+        export.descriptor.signature.ret,
+        ExternTypeExpr::Result(Box::new(ExternTypeExpr::Int), Box::new(err))
+    );
 
     let export = __anvyx_export_make_counter();
     let counter = ExternTypeExpr::Named {

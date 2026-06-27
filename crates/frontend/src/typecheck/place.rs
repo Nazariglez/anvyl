@@ -966,6 +966,9 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
             tc,
         ) {
             FieldValueResult::Value(value, accepts_extern_any) => {
+                if has_computed_extern_target(&value, tc) {
+                    record_value_read(field.node.target.node.id, &receiver.value, tc);
+                }
                 return CheckedPlace {
                     value: *value,
                     accepts_extern_any,
@@ -1183,6 +1186,14 @@ fn record_place_global_access(
         return;
     };
     tc.record_global_access(expr_id, global.root_expr_id, &global.key, mode);
+}
+
+pub(super) fn has_computed_extern_target(value: &PlaceValue, tc: &TypeChecker) -> bool {
+    value
+        .facts
+        .targets
+        .iter()
+        .any(|field| tc.externs.field_ref(*field).1.computed)
 }
 
 pub(super) fn record_facts_read(expr_id: ExprId, facts: &PlaceUseFacts, tc: &mut TypeChecker) {

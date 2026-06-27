@@ -186,7 +186,7 @@ fn type_tokens(ty: &CleanType) -> TokenStream {
             let elem = type_tokens(elem);
             quote! { anvyx_externs::ExternTypeExpr::Array { elem: Box::new(#elem), len: #len } }
         }
-        CleanType::VecList(item) | CleanType::List(item) => {
+        CleanType::List(item) => {
             let item = type_tokens(item);
             quote! { anvyx_externs::ExternTypeExpr::List(Box::new(#item)) }
         }

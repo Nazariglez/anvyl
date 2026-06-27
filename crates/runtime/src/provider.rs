@@ -111,6 +111,7 @@ fn retarget_abi(abi: &mut RustExternAbi, source_name: &str, target_name: &str) {
 fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &str) {
     match abi {
         RustParamAbi::Value(ty)
+        | RustParamAbi::OwnedNamed(ty)
         | RustParamAbi::Borrow(ty)
         | RustParamAbi::MutBorrow(ty)
         | RustParamAbi::MutPlace(ty) => {
@@ -119,7 +120,9 @@ fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &s
         RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
             retarget_callback(callback, source_name, target_name);
         }
-        RustParamAbi::Option(inner) | RustParamAbi::List(inner) | RustParamAbi::Slice(inner) => {
+        RustParamAbi::InitField(inner)
+        | RustParamAbi::Option(inner)
+        | RustParamAbi::Slice(inner) => {
             retarget_param_abi(inner, source_name, target_name);
         }
         RustParamAbi::Result(ok, err) => {
@@ -139,10 +142,10 @@ fn retarget_callback(callback: &mut ExternCallbackSignature, source_name: &str, 
 fn retarget_return_abi(abi: &mut RustReturnAbi, source_name: &str, target_name: &str) {
     match abi {
         RustReturnAbi::Void => {}
-        RustReturnAbi::Value(ty) => retarget_type(ty, source_name, target_name),
-        RustReturnAbi::Option(inner) | RustReturnAbi::List(inner) => {
-            retarget_return_abi(inner, source_name, target_name);
+        RustReturnAbi::Value(ty) | RustReturnAbi::OwnedNamed(ty) => {
+            retarget_type(ty, source_name, target_name);
         }
+        RustReturnAbi::Option(inner) => retarget_return_abi(inner, source_name, target_name),
         RustReturnAbi::Result(ok, err) => {
             retarget_return_abi(ok, source_name, target_name);
             retarget_return_abi(err, source_name, target_name);
@@ -169,13 +172,16 @@ fn member_binding_has_receiver(
 fn qualify_param_abi_owner(abi: &mut RustParamAbi, owner: &ExternTypeKey) {
     match abi {
         RustParamAbi::Value(ty)
+        | RustParamAbi::OwnedNamed(ty)
         | RustParamAbi::Borrow(ty)
         | RustParamAbi::MutBorrow(ty)
         | RustParamAbi::MutPlace(ty) => qualify_owner_type(ty, owner),
         RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
             qualify_callback_owner(callback, owner);
         }
-        RustParamAbi::Option(inner) | RustParamAbi::List(inner) | RustParamAbi::Slice(inner) => {
+        RustParamAbi::InitField(inner)
+        | RustParamAbi::Option(inner)
+        | RustParamAbi::Slice(inner) => {
             qualify_param_abi_owner(inner, owner);
         }
         RustParamAbi::Result(ok, err) => {
@@ -493,14 +499,15 @@ pub enum RustWrapperCtx {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RustParamAbi {
     Value(ExternTypeExpr),
+    OwnedNamed(ExternTypeExpr),
     Borrow(ExternTypeExpr),
     MutBorrow(ExternTypeExpr),
     MutPlace(ExternTypeExpr),
     ScopedLambda(ExternCallbackSignature),
     EscapingLambda(ExternCallbackSignature),
+    InitField(Box<RustParamAbi>),
     Option(Box<RustParamAbi>),
     Result(Box<RustParamAbi>, Box<RustParamAbi>),
-    List(Box<RustParamAbi>),
     Slice(Box<RustParamAbi>),
 }
 
@@ -508,9 +515,9 @@ pub enum RustParamAbi {
 pub enum RustReturnAbi {
     Void,
     Value(ExternTypeExpr),
+    OwnedNamed(ExternTypeExpr),
     Option(Box<RustReturnAbi>),
     Result(Box<RustReturnAbi>, Box<RustReturnAbi>),
-    List(Box<RustReturnAbi>),
 }
 
 impl RustExternAbi {
@@ -518,13 +525,6 @@ impl RustExternAbi {
         self.params
             .iter()
             .any(|param| param.class() == RustAbiClass::CallbackWrapper)
-    }
-
-    pub fn has_collection_wrapper(&self) -> bool {
-        self.params
-            .iter()
-            .any(|param| param.class() == RustAbiClass::CollectionWrapper)
-            || self.ret.class() == RustAbiClass::CollectionWrapper
     }
 
     pub fn supported_callback_wrapper(&self) -> bool {
@@ -541,22 +541,6 @@ impl RustExternAbi {
             && !self.ret.contains_direct_collection()
     }
 
-    pub fn supported_collection_wrapper(&self) -> bool {
-        self.ctx == RustWrapperCtx::HiddenRuntime
-            && !self.has_callback_wrapper()
-            && self.has_collection_wrapper()
-            && self.params.iter().all(|param| match param.class() {
-                RustAbiClass::Direct => true,
-                RustAbiClass::CollectionWrapper => param.supported_collection_wrapper(),
-                RustAbiClass::CallbackWrapper | RustAbiClass::BackendUnsupported => false,
-            })
-            && match self.ret.class() {
-                RustAbiClass::Direct => true,
-                RustAbiClass::CollectionWrapper => self.ret.supported_collection_wrapper(),
-                RustAbiClass::CallbackWrapper | RustAbiClass::BackendUnsupported => false,
-            }
-    }
-
     pub fn backend_supported(&self) -> bool {
         match self.support {
             RustAbiSupport::Direct => {
@@ -566,9 +550,7 @@ impl RustExternAbi {
                     })
                     && self.ret.class() == RustAbiClass::Direct
             }
-            RustAbiSupport::NeedsWrapperConversion => {
-                self.supported_callback_wrapper() || self.supported_collection_wrapper()
-            }
+            RustAbiSupport::NeedsWrapperConversion => self.supported_callback_wrapper(),
             RustAbiSupport::Unsupported => false,
         }
     }
@@ -594,7 +576,6 @@ impl RustExternAbi {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RustAbiClass {
     Direct,
-    CollectionWrapper,
     CallbackWrapper,
     BackendUnsupported,
 }
@@ -614,14 +595,6 @@ impl RustParamAbi {
         self.class() == RustAbiClass::CallbackWrapper
     }
 
-    pub fn contains_collection_wrapper(&self) -> bool {
-        self.class() == RustAbiClass::CollectionWrapper
-    }
-
-    pub fn supported_collection_wrapper(&self) -> bool {
-        matches!(self, Self::List(inner) if matches!(inner.as_ref(), Self::Value(ty) if scalar_collection_wrapper_leaf(ty)))
-    }
-
     pub fn direct_collection_abi(&self) -> bool {
         matches!(self.class(), RustAbiClass::BackendUnsupported)
             && self.contains_direct_collection()
@@ -631,13 +604,33 @@ impl RustParamAbi {
         matches!(self, Self::MutBorrow(ty) | Self::MutPlace(ty) if type_contains_collection(ty))
     }
 
+    fn contains_init_field(&self) -> bool {
+        match self {
+            Self::InitField(_) => true,
+            Self::Option(inner) | Self::Slice(inner) => inner.contains_init_field(),
+            Self::Result(ok, err) => ok.contains_init_field() || err.contains_init_field(),
+            Self::Value(_)
+            | Self::OwnedNamed(_)
+            | Self::Borrow(_)
+            | Self::MutBorrow(_)
+            | Self::MutPlace(_)
+            | Self::ScopedLambda(_)
+            | Self::EscapingLambda(_) => false,
+        }
+    }
+
     fn class(&self) -> RustAbiClass {
         match self {
             Self::ScopedLambda(_) | Self::EscapingLambda(_) => RustAbiClass::CallbackWrapper,
-            Self::List(_) => RustAbiClass::CollectionWrapper,
-            Self::Option(inner) | Self::Slice(inner) => inner.direct_class(),
+            Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
+                inner.direct_class()
+            }
             Self::Result(ok, err) => ok.direct_class().merge(err.direct_class()),
-            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
+            Self::Value(ty)
+            | Self::OwnedNamed(ty)
+            | Self::Borrow(ty)
+            | Self::MutBorrow(ty)
+            | Self::MutPlace(ty) => {
                 if direct_rust_type_supported(ty) {
                     RustAbiClass::Direct
                 } else {
@@ -663,10 +656,12 @@ impl RustParamAbi {
 
     fn contains_direct_collection(&self) -> bool {
         match self {
-            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
-                type_contains_collection(ty)
-            }
-            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+            Self::Value(ty)
+            | Self::OwnedNamed(ty)
+            | Self::Borrow(ty)
+            | Self::MutBorrow(ty)
+            | Self::MutPlace(ty) => type_contains_collection(ty),
+            Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
                 inner.contains_direct_collection()
             }
             Self::Result(ok, err) => {
@@ -678,11 +673,13 @@ impl RustParamAbi {
 
     fn contains_callback(&self) -> bool {
         match self {
-            Self::Value(ty) | Self::Borrow(ty) | Self::MutBorrow(ty) | Self::MutPlace(ty) => {
-                type_contains_callback(ty)
-            }
+            Self::Value(ty)
+            | Self::OwnedNamed(ty)
+            | Self::Borrow(ty)
+            | Self::MutBorrow(ty)
+            | Self::MutPlace(ty) => type_contains_callback(ty),
             Self::ScopedLambda(_) | Self::EscapingLambda(_) => true,
-            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+            Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
                 inner.contains_callback()
             }
             Self::Result(ok, err) => ok.contains_callback() || err.contains_callback(),
@@ -692,13 +689,14 @@ impl RustParamAbi {
     fn requires_hidden_runtime_arg(&self) -> bool {
         match self {
             Self::MutPlace(_) => true,
-            Self::Option(inner) | Self::List(inner) | Self::Slice(inner) => {
+            Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
                 inner.requires_hidden_runtime_arg()
             }
             Self::Result(ok, err) => {
                 ok.requires_hidden_runtime_arg() || err.requires_hidden_runtime_arg()
             }
             Self::Value(_)
+            | Self::OwnedNamed(_)
             | Self::Borrow(_)
             | Self::MutBorrow(_)
             | Self::ScopedLambda(_)
@@ -708,24 +706,16 @@ impl RustParamAbi {
 }
 
 impl RustReturnAbi {
-    pub fn contains_collection_wrapper(&self) -> bool {
-        self.class() == RustAbiClass::CollectionWrapper
-    }
-
-    pub fn supported_collection_wrapper(&self) -> bool {
-        matches!(self, Self::List(inner) if matches!(inner.as_ref(), Self::Value(ty) if scalar_collection_wrapper_leaf(ty)))
-    }
-
     pub fn direct_collection_abi(&self) -> bool {
         matches!(self.class(), RustAbiClass::BackendUnsupported)
             && self.contains_direct_collection()
     }
 
     fn class(&self) -> RustAbiClass {
-        match self {
-            Self::List(_) => RustAbiClass::CollectionWrapper,
-            _ if self.backend_direct_supported() => RustAbiClass::Direct,
-            _ => RustAbiClass::BackendUnsupported,
+        if self.backend_direct_supported() {
+            RustAbiClass::Direct
+        } else {
+            RustAbiClass::BackendUnsupported
         }
     }
 
@@ -733,18 +723,18 @@ impl RustReturnAbi {
         match self {
             Self::Void => true,
             Self::Value(ty) => direct_rust_type_supported(ty),
+            Self::OwnedNamed(ty) => owned_named_payload_supported(ty),
             Self::Option(inner) => inner.backend_direct_supported(),
             Self::Result(ok, err) => {
                 ok.backend_direct_supported() && err.backend_direct_supported()
             }
-            Self::List(_) => false,
         }
     }
 
     fn contains_direct_collection(&self) -> bool {
         match self {
-            Self::Value(ty) => type_contains_collection(ty),
-            Self::Option(inner) | Self::List(inner) => inner.contains_direct_collection(),
+            Self::Value(ty) | Self::OwnedNamed(ty) => type_contains_collection(ty),
+            Self::Option(inner) => inner.contains_direct_collection(),
             Self::Result(ok, err) => {
                 ok.contains_direct_collection() || err.contains_direct_collection()
             }
@@ -754,20 +744,13 @@ impl RustReturnAbi {
 
     fn requires_hidden_runtime_arg(&self) -> bool {
         match self {
-            Self::Option(inner) | Self::List(inner) => inner.requires_hidden_runtime_arg(),
+            Self::Option(inner) => inner.requires_hidden_runtime_arg(),
             Self::Result(ok, err) => {
                 ok.requires_hidden_runtime_arg() || err.requires_hidden_runtime_arg()
             }
-            Self::Void | Self::Value(_) => false,
+            Self::Void | Self::Value(_) | Self::OwnedNamed(_) => false,
         }
     }
-}
-
-fn scalar_collection_wrapper_leaf(ty: &ExternTypeExpr) -> bool {
-    matches!(
-        ty,
-        ExternTypeExpr::Bool | ExternTypeExpr::Int | ExternTypeExpr::Float | ExternTypeExpr::String
-    )
 }
 
 fn direct_rust_type_supported(ty: &ExternTypeExpr) -> bool {
@@ -796,6 +779,7 @@ fn direct_rust_type_supported(ty: &ExternTypeExpr) -> bool {
 struct NativeSignature {
     signature: ExternSignature,
     effects: ExternEffects,
+    presence_init: Vec<String>,
 }
 
 pub fn validate_rust_provider_support(
@@ -911,6 +895,7 @@ fn native_binding_signature(
                 .map(|function| NativeSignature {
                     signature: function.signature.clone(),
                     effects: function.effects,
+                    presence_init: vec![],
                 })
         }
         (ExternBindingTarget::Member(member), op) if member.owner.module == module.path => {
@@ -940,6 +925,7 @@ fn native_binding_signature(
                     .map(|static_method| NativeSignature {
                         signature: static_method.signature.clone(),
                         effects: static_method.effects,
+                        presence_init: vec![],
                     }),
                 (ExternMemberSelector::Init, ExternBindingOp::Call) => {
                     let init = ty.init.as_ref()?;
@@ -949,6 +935,7 @@ fn native_binding_signature(
                             ret: init.ret.clone(),
                         },
                         effects: init.effects,
+                        presence_init: init.presence_init.clone(),
                     })
                 }
                 (ExternMemberSelector::Operator(op), ExternBindingOp::Call) => {
@@ -1004,7 +991,11 @@ fn with_receiver(
     effects: ExternEffects,
 ) -> NativeSignature {
     signature.params.insert(0, receiver_param(owner, receiver));
-    NativeSignature { signature, effects }
+    NativeSignature {
+        signature,
+        effects,
+        presence_init: vec![],
+    }
 }
 
 fn receiver_param(ty: ExternTypeExpr, receiver: ReceiverMode) -> ExternParam {
@@ -1056,6 +1047,7 @@ fn validate_native_abi(
         .zip(&abi.params)
         .enumerate()
     {
+        validate_init_field_abi(descriptor, key, &signature.presence_init, param, param_abi)?;
         let callback_checked = validate_param_callback_abi(descriptor, key, param, param_abi, abi)?;
         if !callback_checked && !param_abi_matches(param, param_abi) {
             return Err(native_abi_error(
@@ -1065,8 +1057,26 @@ fn validate_native_abi(
             ));
         }
     }
+    if abi
+        .params
+        .iter()
+        .any(|param| param_abi_has_shared_resource_value(descriptor, key, param))
+    {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "shared resource parameters must use top-level, Option, or Result AnvRef",
+        ));
+    }
     if !return_abi_matches(&signature.signature.ret, &abi.ret) {
         return Err(native_abi_error(descriptor, key, "return ABI mismatch"));
+    }
+    if return_abi_has_structural_resource(descriptor, key, &abi.ret) {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "structural owned resource return ABI is unsupported",
+        ));
     }
     if type_contains_callback(&signature.signature.ret) {
         return Err(native_abi_error(
@@ -1087,8 +1097,7 @@ fn validate_native_abi(
         ));
     }
     let direct_collection = abi.params.iter().any(RustParamAbi::direct_collection_abi)
-        || abi.ret.direct_collection_abi()
-        || (abi.support == RustAbiSupport::Direct && abi.has_collection_wrapper());
+        || abi.ret.direct_collection_abi();
     if direct_collection {
         return Err(native_abi_error(
             descriptor,
@@ -1180,15 +1189,11 @@ fn validate_wrapper_conversion_abi(
             key,
             "unsupported native ABI metadata",
         )),
-        RustAbiSupport::NeedsWrapperConversion
-            if abi.supported_callback_wrapper() || abi.supported_collection_wrapper() =>
-        {
-            Ok(())
-        }
+        RustAbiSupport::NeedsWrapperConversion if abi.supported_callback_wrapper() => Ok(()),
         RustAbiSupport::NeedsWrapperConversion => Err(native_abi_error(
             descriptor,
             key,
-            "unsupported collection wrapper ABI",
+            "unsupported wrapper conversion ABI",
         )),
     }
 }
@@ -1225,14 +1230,25 @@ fn validate_callback_wrapper_isolated(
             "callback wrapper ABI cannot be combined with borrowed provider parameters",
         ));
     }
-    if abi.has_collection_wrapper() {
-        return Err(native_abi_error(
-            descriptor,
-            key,
-            "callback wrapper ABI cannot be combined with collection wrapper conversion",
-        ));
-    }
     Ok(())
+}
+
+fn validate_init_field_abi(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    presence_init: &[String],
+    param: &ExternParam,
+    abi: &RustParamAbi,
+) -> Result<(), String> {
+    let listed = param
+        .name
+        .as_ref()
+        .is_some_and(|name| presence_init.contains(name));
+    match (listed, abi) {
+        (true, RustParamAbi::InitField(inner)) if !inner.contains_init_field() => Ok(()),
+        (false, abi) if !abi.contains_init_field() => Ok(()),
+        _ => Err(native_abi_error(descriptor, key, "init field ABI mismatch")),
+    }
 }
 
 fn validate_param_callback_abi(
@@ -1392,7 +1408,6 @@ fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
 fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
     match (&param.ty, param.flow, abi) {
         (ExternTypeExpr::Option(inner), ParamFlow::Value, RustParamAbi::Option(abi))
-        | (ExternTypeExpr::List(inner), ParamFlow::Value, RustParamAbi::List(abi))
         | (ExternTypeExpr::Slice(inner), ParamFlow::Value, RustParamAbi::Slice(abi)) => {
             param_abi_matches(&value_param((**inner).clone()), abi)
         }
@@ -1409,7 +1424,13 @@ fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
             ParamFlow::Value,
             RustParamAbi::ScopedLambda(abi) | RustParamAbi::EscapingLambda(abi),
         ) => callback == abi,
+        (ty, ParamFlow::Value, RustParamAbi::InitField(abi)) => {
+            param_abi_matches(&value_param(ty.clone()), abi)
+        }
         (ty, ParamFlow::Value, RustParamAbi::Value(abi_ty)) => bare_rust_value_matches(ty, abi_ty),
+        (ty, ParamFlow::Value, RustParamAbi::OwnedNamed(abi_ty)) => {
+            owned_named_payload_supported(abi_ty) && bare_rust_value_matches(ty, abi_ty)
+        }
         (ty, ParamFlow::Borrow, RustParamAbi::Borrow(abi_ty))
         | (
             ty,
@@ -1430,6 +1451,10 @@ fn bare_rust_value_matches(expected: &ExternTypeExpr, found: &ExternTypeExpr) ->
     ) && expected == found
 }
 
+fn owned_named_payload_supported(ty: &ExternTypeExpr) -> bool {
+    matches!(ty, ExternTypeExpr::Named { args, .. } if args.is_empty())
+}
+
 fn return_abi_matches(ret: &ExternTypeExpr, abi: &RustReturnAbi) -> bool {
     match (ret, abi) {
         (ExternTypeExpr::Void, RustReturnAbi::Void) => true,
@@ -1439,9 +1464,115 @@ fn return_abi_matches(ret: &ExternTypeExpr, abi: &RustReturnAbi) -> bool {
         (ExternTypeExpr::Result(ok, err), RustReturnAbi::Result(abi_ok, abi_err)) => {
             return_abi_matches(ok, abi_ok) && return_abi_matches(err, abi_err)
         }
-        (ExternTypeExpr::List(inner), RustReturnAbi::List(abi)) => return_abi_matches(inner, abi),
         (ty, RustReturnAbi::Value(abi_ty)) => bare_rust_value_matches(ty, abi_ty),
+        (ty, RustReturnAbi::OwnedNamed(abi_ty)) => {
+            owned_named_payload_supported(abi_ty) && bare_rust_value_matches(ty, abi_ty)
+        }
         _ => false,
+    }
+}
+
+fn param_abi_has_shared_resource_value(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustParamAbi,
+) -> bool {
+    match abi {
+        RustParamAbi::OwnedNamed(ty) => payload_has_resource(descriptor, key, ty),
+        RustParamAbi::Value(ty) => value_has_structural_resource(descriptor, key, ty),
+        RustParamAbi::InitField(inner)
+        | RustParamAbi::Option(inner)
+        | RustParamAbi::Slice(inner) => param_abi_has_shared_resource_value(descriptor, key, inner),
+        RustParamAbi::Result(ok, err) => {
+            param_abi_has_shared_resource_value(descriptor, key, ok)
+                || param_abi_has_shared_resource_value(descriptor, key, err)
+        }
+        RustParamAbi::Borrow(_)
+        | RustParamAbi::MutBorrow(_)
+        | RustParamAbi::MutPlace(_)
+        | RustParamAbi::ScopedLambda(_)
+        | RustParamAbi::EscapingLambda(_) => false,
+    }
+}
+
+fn return_abi_has_structural_resource(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustReturnAbi,
+) -> bool {
+    match abi {
+        RustReturnAbi::Value(ty) => value_has_structural_resource(descriptor, key, ty),
+        RustReturnAbi::Option(inner) => return_abi_has_structural_resource(descriptor, key, inner),
+        RustReturnAbi::Result(ok, err) => {
+            return_abi_has_structural_resource(descriptor, key, ok)
+                || return_abi_has_structural_resource(descriptor, key, err)
+        }
+        RustReturnAbi::Void | RustReturnAbi::OwnedNamed(_) => false,
+    }
+}
+
+fn value_has_structural_resource(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    ty: &ExternTypeExpr,
+) -> bool {
+    match ty {
+        ExternTypeExpr::Tuple(fields) => fields
+            .iter()
+            .any(|field| payload_has_resource(descriptor, key, field)),
+        ExternTypeExpr::Array { elem, .. }
+        | ExternTypeExpr::List(elem)
+        | ExternTypeExpr::Slice(elem) => payload_has_resource(descriptor, key, elem),
+        ExternTypeExpr::Map(key_ty, value_ty) => {
+            payload_has_resource(descriptor, key, key_ty)
+                || payload_has_resource(descriptor, key, value_ty)
+        }
+        _ => false,
+    }
+}
+
+fn payload_has_resource(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    ty: &ExternTypeExpr,
+) -> bool {
+    match ty {
+        ExternTypeExpr::Named { module, name, args } => {
+            args.is_empty() && named_type_is_shared(descriptor, key, module.as_ref(), name)
+        }
+        ExternTypeExpr::Option(inner)
+        | ExternTypeExpr::List(inner)
+        | ExternTypeExpr::Slice(inner) => payload_has_resource(descriptor, key, inner),
+        ExternTypeExpr::Result(ok, err) | ExternTypeExpr::Map(ok, err) => {
+            payload_has_resource(descriptor, key, ok) || payload_has_resource(descriptor, key, err)
+        }
+        ExternTypeExpr::Tuple(fields) => fields
+            .iter()
+            .any(|field| payload_has_resource(descriptor, key, field)),
+        ExternTypeExpr::Array { elem, .. } => payload_has_resource(descriptor, key, elem),
+        _ => false,
+    }
+}
+
+fn named_type_is_shared(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    module: Option<&ModulePath>,
+    name: &str,
+) -> bool {
+    let module = module.unwrap_or_else(|| binding_module(key));
+    descriptor
+        .modules
+        .iter()
+        .find(|candidate| &candidate.path == module)
+        .and_then(|module| module.types.iter().find(|ty| ty.name == name))
+        .is_some_and(|ty| ty.rep == ExternRep::Shared)
+}
+
+fn binding_module(key: &ExternBindingKey) -> &ModulePath {
+    match &key.target {
+        ExternBindingTarget::Function(function) => &function.module,
+        ExternBindingTarget::Member(member) => &member.owner.module,
     }
 }
 
@@ -1498,6 +1629,256 @@ mod tests {
             validate_rust_provider_support(&[descriptor()], &[support(binding)]).unwrap_err();
 
         assert!(error.contains("unknown binding"));
+    }
+
+    #[test]
+    fn rejects_non_named_owned_return_payload() {
+        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
+        assert_abi_error(
+            descriptor_with_params("owned_list", vec![], list.clone()),
+            binding_with_abi(
+                "owned_list",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::OwnedNamed(list),
+            ),
+            "return ABI mismatch",
+        );
+    }
+
+    #[test]
+    fn rejects_structural_resource_value_return() {
+        let resource = ExternTypeExpr::Named {
+            module: None,
+            name: "Thing".to_string(),
+            args: vec![],
+        };
+        let ret = ExternTypeExpr::Tuple(vec![resource.clone(), ExternTypeExpr::Int]);
+        let descriptor = ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ExternTypeDescriptor {
+                    name: "Thing".to_string(),
+                    doc: None,
+                    rep: ExternRep::Shared,
+                    fields: vec![],
+                    variants: vec![],
+                    init: None,
+                    methods: vec![],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "pair".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![],
+                        ret: ret.clone(),
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+
+        assert_abi_error(
+            descriptor,
+            binding_with_abi(
+                "pair",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::Value(ret),
+            ),
+            "structural owned resource return ABI is unsupported",
+        );
+    }
+
+    #[test]
+    fn rejects_wrapped_structural_resource_value_return() {
+        let resource = ExternTypeExpr::Named {
+            module: None,
+            name: "Thing".to_string(),
+            args: vec![],
+        };
+        let payload = ExternTypeExpr::Array {
+            elem: Box::new(resource),
+            len: 2,
+        };
+        let ret = ExternTypeExpr::Option(Box::new(payload.clone()));
+        let descriptor = ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ExternTypeDescriptor {
+                    name: "Thing".to_string(),
+                    doc: None,
+                    rep: ExternRep::Shared,
+                    fields: vec![],
+                    variants: vec![],
+                    init: None,
+                    methods: vec![],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "maybe".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![],
+                        ret,
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+
+        assert_abi_error(
+            descriptor,
+            binding_with_abi(
+                "maybe",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::Option(Box::new(RustReturnAbi::Value(payload))),
+            ),
+            "structural owned resource return ABI is unsupported",
+        );
+    }
+
+    #[test]
+    fn accepts_top_level_runtime_resource_value_return() {
+        let resource = shared_resource();
+        assert_abi_ok(
+            shared_resource_descriptor("borrowed", vec![], resource.clone()),
+            binding_with_abi(
+                "borrowed",
+                RustParamAbi::Value(ExternTypeExpr::Void),
+                RustReturnAbi::Value(resource),
+            ),
+        );
+    }
+
+    #[test]
+    fn accepts_runtime_resource_value_param() {
+        let resource = shared_resource();
+        assert_abi_ok(
+            shared_resource_descriptor(
+                "use_ref",
+                vec![value_param(resource.clone())],
+                ExternTypeExpr::Void,
+            ),
+            void_binding("use_ref", RustParamAbi::Value(resource)),
+        );
+    }
+
+    #[test]
+    fn rejects_owned_shared_resource_param() {
+        let resource = shared_resource();
+        assert_abi_error(
+            shared_resource_descriptor(
+                "use_owned",
+                vec![value_param(resource.clone())],
+                ExternTypeExpr::Void,
+            ),
+            void_binding("use_owned", RustParamAbi::OwnedNamed(resource)),
+            "shared resource parameters must use top-level, Option, or Result AnvRef",
+        );
+    }
+
+    #[test]
+    fn rejects_structural_resource_value_param() {
+        let resource = shared_resource();
+        let tuple = ExternTypeExpr::Tuple(vec![resource]);
+        assert_abi_error(
+            shared_resource_descriptor(
+                "use_tuple",
+                vec![value_param(tuple.clone())],
+                ExternTypeExpr::Void,
+            ),
+            void_binding("use_tuple", RustParamAbi::Value(tuple)),
+            "shared resource parameters must use top-level, Option, or Result AnvRef",
+        );
+    }
+
+    #[test]
+    fn rejects_owned_shared_resource_operator_rhs() {
+        let resource = ExternTypeExpr::Named {
+            module: Some(module()),
+            name: "Thing".to_string(),
+            args: vec![],
+        };
+        let op = ExternOperator::Binary {
+            op: BinaryOp::Add,
+            self_on_right: false,
+        };
+        let descriptor = shared_resource_operator_descriptor(op, resource.clone());
+        let mut binding = binding("add");
+        binding.key.target = ExternBindingTarget::Member(ExternMemberKey {
+            owner: ExternTypeKey {
+                module: module(),
+                name: "Thing".to_string(),
+            },
+            selector: ExternMemberSelector::Operator(op),
+        });
+        binding.abi.params = vec![
+            RustParamAbi::Borrow(resource.clone()),
+            RustParamAbi::OwnedNamed(resource.clone()),
+        ];
+        binding.abi.ret = RustReturnAbi::OwnedNamed(resource);
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "shared resource parameters must use top-level, Option, or Result AnvRef",
+        );
+    }
+
+    #[test]
+    fn accepts_presence_init_field_abi() {
+        assert_abi_ok(
+            presence_init_descriptor(),
+            presence_init_binding(RustParamAbi::InitField(Box::new(RustParamAbi::Value(
+                ExternTypeExpr::Int,
+            )))),
+        );
+    }
+
+    #[test]
+    fn rejects_presence_init_without_init_field_abi() {
+        assert_abi_error(
+            presence_init_descriptor(),
+            presence_init_binding(RustParamAbi::Value(ExternTypeExpr::Int)),
+            "init field ABI mismatch",
+        );
+    }
+
+    #[test]
+    fn rejects_nested_init_field_abi() {
+        let nested_outer = RustParamAbi::Option(Box::new(RustParamAbi::InitField(Box::new(
+            RustParamAbi::Value(ExternTypeExpr::Int),
+        ))));
+        assert_abi_error(
+            presence_init_descriptor(),
+            presence_init_binding(nested_outer),
+            "init field ABI mismatch",
+        );
+
+        let nested_inner = RustParamAbi::InitField(Box::new(RustParamAbi::Option(Box::new(
+            RustParamAbi::InitField(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+        ))));
+        assert_abi_error(
+            presence_init_descriptor(),
+            presence_init_binding(nested_inner),
+            "init field ABI mismatch",
+        );
+    }
+    #[test]
+    fn rejects_init_field_abi_outside_presence_init() {
+        assert_abi_error(
+            descriptor(),
+            binding_with_abi(
+                "ping",
+                RustParamAbi::InitField(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+                RustReturnAbi::Value(ExternTypeExpr::Bool),
+            ),
+            "init field ABI mismatch",
+        );
     }
 
     #[test]
@@ -1686,134 +2067,19 @@ mod tests {
                 RustReturnAbi::Option(Box::new(RustReturnAbi::Value(int_list()))),
             ),
         );
-
-        let direct_wrapper = void_binding(
-            "take_list",
-            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
-        );
-        assert_abi_error(
-            param_descriptor(
-                "take_list",
-                int_list(),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            direct_wrapper,
-            "unsupported native ABI metadata",
-        );
     }
 
     #[test]
-    fn accepts_scalar_list_copy_wrappers() {
-        fn int_list() -> ExternTypeExpr {
-            ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
-        }
-
-        fn list_param_abi() -> RustParamAbi {
-            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int)))
-        }
-
-        fn list_return_abi() -> RustReturnAbi {
-            RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)))
-        }
-
+    fn rejects_wrapper_conversion_without_callback_wrapper() {
         fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
             binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
             binding
         }
-
-        assert_abi_ok(
-            param_descriptor(
-                "take_list_wrapper",
-                int_list(),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            wrapper(void_binding("take_list_wrapper", list_param_abi())),
-        );
-        assert_abi_ok(
-            param_descriptor(
-                "make_list_wrapper",
-                ExternTypeExpr::Void,
-                ParamFlow::Value,
-                int_list(),
-            ),
-            wrapper(binding_with_abi(
-                "make_list_wrapper",
-                RustParamAbi::Value(ExternTypeExpr::Void),
-                list_return_abi(),
-            )),
-        );
-    }
-
-    #[test]
-    fn rejects_unsupported_collection_wrapper_abis() {
-        fn wrapper(mut binding: RustExternBinding) -> RustExternBinding {
-            binding.abi.support = RustAbiSupport::NeedsWrapperConversion;
-            binding
-        }
-
-        let nested_list = ExternTypeExpr::List(Box::new(ExternTypeExpr::List(Box::new(
-            ExternTypeExpr::Int,
-        ))));
-        let nested_list_abi = RustParamAbi::List(Box::new(RustParamAbi::List(Box::new(
-            RustParamAbi::Value(ExternTypeExpr::Int),
-        ))));
-        assert_abi_error(
-            param_descriptor(
-                "nested",
-                nested_list,
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            wrapper(void_binding("nested", nested_list_abi)),
-            "unsupported collection wrapper ABI",
-        );
-
-        let option_list = ExternTypeExpr::Option(Box::new(ExternTypeExpr::List(Box::new(
-            ExternTypeExpr::Int,
-        ))));
-        let option_list_abi = RustReturnAbi::Option(Box::new(RustReturnAbi::List(Box::new(
-            RustReturnAbi::Value(ExternTypeExpr::Int),
-        ))));
-        assert_abi_error(
-            param_descriptor(
-                "maybe_make",
-                ExternTypeExpr::Void,
-                ParamFlow::Value,
-                option_list,
-            ),
-            wrapper(binding_with_abi(
-                "maybe_make",
-                RustParamAbi::Value(ExternTypeExpr::Void),
-                option_list_abi,
-            )),
-            "unsupported collection wrapper ABI",
-        );
-
-        let named = ExternTypeExpr::Named {
-            module: Some(module()),
-            name: "Vec2".to_string(),
-            args: vec![],
-        };
-        assert_abi_error(
-            param_descriptor(
-                "named",
-                ExternTypeExpr::List(Box::new(named.clone())),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            wrapper(void_binding(
-                "named",
-                RustParamAbi::List(Box::new(RustParamAbi::Value(named))),
-            )),
-            "unsupported collection wrapper ABI",
-        );
 
         assert_abi_error(
             descriptor(),
             wrapper(binding("ping")),
-            "unsupported collection wrapper ABI",
+            "unsupported wrapper conversion ABI",
         );
     }
 
@@ -2162,42 +2428,6 @@ mod tests {
             descriptor,
             binding,
             "callback wrapper ABI cannot be combined with borrowed provider parameters",
-        );
-    }
-
-    #[test]
-    fn rejects_collection_wrapper_with_scoped_lambda() {
-        let list = ExternTypeExpr::List(Box::new(ExternTypeExpr::Int));
-        let callback = callback_signature(vec![], ExternTypeExpr::Void);
-        let descriptor = descriptor_with_params(
-            "mixed",
-            vec![
-                ExternParam {
-                    name: Some("items".to_string()),
-                    ty: list.clone(),
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                },
-                ExternParam {
-                    name: Some("cb".to_string()),
-                    ty: ExternTypeExpr::Callback(callback.clone()),
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                },
-            ],
-            list.clone(),
-        );
-        let mut binding = scoped_lambda_binding("mixed", callback);
-        binding.abi.params.insert(
-            0,
-            RustParamAbi::List(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
-        );
-        binding.abi.ret = RustReturnAbi::List(Box::new(RustReturnAbi::Value(ExternTypeExpr::Int)));
-
-        assert_abi_error(
-            descriptor,
-            binding,
-            "callback wrapper ABI cannot be combined with collection wrapper conversion",
         );
     }
 
@@ -2659,6 +2889,133 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn presence_init_descriptor() -> ProviderDescriptor {
+        ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ExternTypeDescriptor {
+                    name: "Thing".to_string(),
+                    doc: None,
+                    rep: ExternRep::Shared,
+                    fields: vec![ExternFieldDescriptor {
+                        name: "n".to_string(),
+                        ty: ExternTypeExpr::Int,
+                        computed: false,
+                        readable: true,
+                        writable: true,
+                        get_receiver: ReceiverMode::Shared,
+                        set_receiver: ReceiverMode::Mutable,
+                        doc: None,
+                    }],
+                    variants: vec![],
+                    init: Some(ExternInitDescriptor {
+                        params: vec![ExternParam {
+                            name: Some("n".to_string()),
+                            ty: ExternTypeExpr::Int,
+                            flow: ParamFlow::Value,
+                            escape: CallbackEscape::NonEscaping,
+                        }],
+                        field_init: vec![],
+                        presence_init: vec!["n".to_string()],
+                        ret: ExternTypeExpr::Named {
+                            module: Some(module()),
+                            name: "Thing".to_string(),
+                            args: vec![],
+                        },
+                        effects: ExternEffects::default(),
+                    }),
+                    methods: vec![],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+                functions: vec![],
+            }],
+        }
+    }
+
+    fn shared_resource() -> ExternTypeExpr {
+        ExternTypeExpr::Named {
+            module: None,
+            name: "Thing".to_string(),
+            args: vec![],
+        }
+    }
+
+    fn shared_resource_descriptor(
+        name: &str,
+        params: Vec<ExternParam>,
+        ret: ExternTypeExpr,
+    ) -> ProviderDescriptor {
+        ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![shared_resource_type(vec![])],
+                functions: vec![ExternFunctionDescriptor {
+                    name: name.to_string(),
+                    doc: None,
+                    signature: ExternSignature { params, ret },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        }
+    }
+
+    fn shared_resource_operator_descriptor(
+        op: ExternOperator,
+        ret: ExternTypeExpr,
+    ) -> ProviderDescriptor {
+        ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![shared_resource_type(vec![ExternOperatorDescriptor {
+                    op,
+                    receiver: ReceiverMode::Shared,
+                    signature: ExternSignature {
+                        params: vec![value_param(ret.clone())],
+                        ret,
+                    },
+                    effects: ExternEffects::default(),
+                }])],
+                functions: vec![],
+            }],
+        }
+    }
+
+    fn shared_resource_type(operators: Vec<ExternOperatorDescriptor>) -> ExternTypeDescriptor {
+        ExternTypeDescriptor {
+            name: "Thing".to_string(),
+            doc: None,
+            rep: ExternRep::Shared,
+            fields: vec![],
+            variants: vec![],
+            init: None,
+            methods: vec![],
+            statics: vec![],
+            operators,
+        }
+    }
+
+    fn presence_init_binding(abi: RustParamAbi) -> RustExternBinding {
+        let mut binding = binding("Thing.init");
+        binding.key.target = ExternBindingTarget::Member(ExternMemberKey {
+            owner: ExternTypeKey {
+                module: module(),
+                name: "Thing".to_string(),
+            },
+            selector: ExternMemberSelector::Init,
+        });
+        binding.abi.params = vec![abi];
+        binding.abi.ret = RustReturnAbi::OwnedNamed(ExternTypeExpr::Named {
+            module: Some(module()),
+            name: "Thing".to_string(),
+            args: vec![],
+        });
+        binding
     }
 
     fn support(binding: RustExternBinding) -> RustProviderSupport {

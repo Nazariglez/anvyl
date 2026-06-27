@@ -1,0 +1,5 @@
+error: Vec<T> is not a provider boundary carrier; use AnvList<'cx, T> or explicit runtime copy helpers
+ --> tests/ui/function/vec_string.rs:4:16
+  |
+4 | fn bad(values: Vec<String>) { drop(values); }
+  |                ^^^^^^^^^^^

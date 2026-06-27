@@ -1,5 +1,5 @@
 error: callback wrapper parameters cannot be combined with borrowed or mutable-place provider parameters
  --> tests/ui/function/scoped_lambda_borrow_param.rs:4:1
   |
-4 | fn bad(name: &str, f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4 | fn bad(name: &str, f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

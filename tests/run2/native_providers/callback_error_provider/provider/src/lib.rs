@@ -1,7 +1,7 @@
-use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+use anvyx_runtime::{function, RuntimeResult, ScopedLambda};
 
-#[function(trap)]
-pub fn host_apply(f: ScopedLambda<'_, '_, (i64,), i64>) -> Result<i64, RuntimeError> {
+#[function]
+pub fn host_apply(f: ScopedLambda<'_, '_, (i64,), i64>) -> RuntimeResult<i64> {
     f.call(99)
 }
 

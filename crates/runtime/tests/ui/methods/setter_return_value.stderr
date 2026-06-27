@@ -1,0 +1,5 @@
+error: computed setters cannot return a value
+  --> tests/ui/methods/setter_return_value.rs:13:42
+   |
+13 |     pub fn set_x(&mut self, _value: i64) -> i64 {
+   |                                          ^^^^^^

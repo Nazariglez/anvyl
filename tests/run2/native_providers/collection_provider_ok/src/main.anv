@@ -2,9 +2,6 @@
 // @expect: success
 // @frontend: new
 // @match-begin
-// 3
-// 7
-// a|b
 // 8
 // 13
 // 99
@@ -12,16 +9,10 @@
 // @match-end
 
 import pkg:host.host {
-    host_first, host_make, host_join,
     host_direct_first, host_direct_make, host_direct_lookup, host_direct_map, host_slice_first,
 };
 
 fn main() {
-    println(host_first([3, 4]));
-    let xs = host_make();
-    println(xs[1]);
-    println(host_join(["a", "b"]));
-
     println(host_direct_first([8, 9]));
     let direct = host_direct_make();
     println(direct[1]);

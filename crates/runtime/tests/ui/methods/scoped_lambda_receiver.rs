@@ -7,7 +7,7 @@ impl Host {
     pub fn bad(
         &self,
         f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), ()>,
-    ) -> Result<(), anvyx_runtime::RuntimeError> {
+    ) -> anvyx_runtime::RuntimeResult<()> {
         let _ = self;
         f.call(1)
     }

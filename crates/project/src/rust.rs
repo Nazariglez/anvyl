@@ -986,8 +986,7 @@ anvyx_runtime::builtin_module! {{
             .into_string();
 
         assert!(source.contains("str_split"));
-        assert!(source.contains("AnvList::from_elems"));
-        assert!(source.contains("AnvString::from"));
+        assert!(!source.contains("AnvList::from_elems"));
     }
 
     #[test]

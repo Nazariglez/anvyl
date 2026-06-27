@@ -165,12 +165,31 @@ Supported scalar mapping for `#[function]`:
 | `int` | `i64` |
 | `float` | `f64` |
 | `string` borrowed parameter | `&str` |
-| `string` return | `String` |
+| owned/value `string` | `AnvString` |
 
-`Option<T>` returns are supported for scalar `T`. `Vec<T>` parameters and
-returns are supported through wrapper conversion for scalar `T` (`bool`, `i64`,
-`f64`, `String`). Direct collection ABI, nested lists, maps, mutable collection
-ABI, and list-of-native-struct wrappers remain unsupported.
+`String` is not a provider boundary carrier. Use `AnvString` for owned string
+values or `&str` for borrowed parameters. `Vec<T>`, `HashMap<K, V>`, and
+`BTreeMap<K, V>` are not provider boundary carriers; use `AnvList`, `AnvMap`,
+or `AnvSlice` plus explicit copy helpers when allocation is intentional.
+
+Return `RuntimeResult<T>` for hidden runtime/provider failure. Visible
+`Result<T, E>` remains an ordinary Anvyx result value. Bare
+`Result<T, RuntimeError>` is rejected to avoid two hidden-failure spellings.
+
+For fixed arrays, Rust `[T; N]` is the direct carrier for Anvyx `[T; N]`.
+Element conversion is recursive through the same ABI rules. Fixed arrays are
+value-shaped, size-known values and do not use runtime collection carriers.
+
+For `rep shared` resources, returning owned `T`, `Option<T>`, or visible
+`Result<T, E>` transfers the resource into the Anvyx runtime. Returning
+`AnvRef<'cx, T>` means the value is already managed and is not adopted again.
+Owned resources inside tuple, fixed-array, list, or map returns are rejected
+until the ABI carries ownership metadata for each leaf. Structural returns
+containing `AnvRef<'cx, T>` are rejected for the same reason; use top-level,
+`Option`, or visible `Result` resource returns. Provider parameters for shared
+resources must use `AnvRef<'cx, T>` directly or through `Option` / visible
+`Result`; bare `T` and structural tuple, fixed-array, list, or map parameters
+containing shared resources are rejected.
 
 Mutable provider parameters have two Rust ABI shapes:
 
@@ -183,13 +202,13 @@ Mutable provider parameters have two Rust ABI shapes:
   manual metadata with the runtime representation type.
 
 ```rust
-use anvyx_runtime::{function, Ctx, MutPlace, RuntimeError};
+use anvyx_runtime::{function, Ctx, MutPlace, RuntimeResult};
 
 #[function(ctx)]
 pub fn bump<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     mut value: MutPlace<'_, 'cx, i64>,
-) -> Result<(), RuntimeError> {
+) -> RuntimeResult<()> {
     value.update_copy(ctx, |n| n + 1)
 }
 ```
@@ -200,18 +219,41 @@ a direct mutable receiver ABI; manual/final provider metadata may use
 `RustParamAbi::MutPlace(owner)` as receiver parameter 0 for place-aware receiver
 bindings.
 
+`#[anvyx(init)]` parameters may use `AnvInitField<T>` when a provider-backed
+extern literal should distinguish a provided field from an omitted field:
+
+```rust
+use anvyx_runtime::{methods, AnvInitField};
+
+pub struct Camera { fov: Option<i64> }
+
+#[methods]
+impl Camera {
+    #[anvyx(init)]
+    pub fn new(fov: AnvInitField<Option<i64>>) -> Camera {
+        Camera {
+            fov: match fov {
+                AnvInitField::Provided(value) => value,
+                AnvInitField::Omitted => None,
+            },
+        }
+    }
+}
+```
+
 Provider functions can accept non-escaping Anvyx function values with
 `ScopedLambda<'_, '_, Args, Ret>`. `Args` is a tuple of up to 8 supported
 callback ABI leaves (`bool`, `i64`, `f64`); `Ret` may also be `()`. Call it
-synchronously and return or handle `RuntimeError`; do not store it.
+synchronously and return or handle `RuntimeError`; do not store it. Return
+`RuntimeResult<T>` when callback failure should be hidden runtime failure.
 `ScopedLambda` cannot be combined with `#[function(ctx)]`, method receivers,
-borrowed params, mutable provider params, or `Vec<T>` wrapper conversion in this slice.
+borrowed params or mutable provider params in this slice.
 
 ```rust
-use anvyx_runtime::{function, RuntimeError, ScopedLambda};
+use anvyx_runtime::{function, RuntimeResult, ScopedLambda};
 
 #[function]
-pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
     f.call(1)?;
     f.call(2)
 }

@@ -5,5 +5,5 @@ error: callback wrapper parameters cannot be combined with method receivers
    |  _________^
  8 | |         &self,
  9 | |         f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), ()>,
-10 | |     ) -> Result<(), anvyx_runtime::RuntimeError> {
-   | |________________________________________________^
+10 | |     ) -> anvyx_runtime::RuntimeResult<()> {
+   | |_________________________________________^

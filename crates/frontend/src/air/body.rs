@@ -272,6 +272,8 @@ pub enum Operand {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallArg {
     Value(Operand),
+    InitFieldProvided(Operand),
+    InitFieldOmitted,
     SharedBorrow(Place),
     SharedStringConst(ConstId),
     MutBorrow(Place),
@@ -280,7 +282,9 @@ pub enum CallArg {
 impl CallArg {
     pub fn mode(&self) -> ParamMode {
         match self {
-            Self::Value(_) => ParamMode::Value,
+            Self::Value(_) | Self::InitFieldProvided(_) | Self::InitFieldOmitted => {
+                ParamMode::Value
+            }
             Self::SharedBorrow(_) | Self::SharedStringConst(_) => ParamMode::SharedBorrow,
             Self::MutBorrow(_) => ParamMode::MutBorrow,
         }
@@ -289,9 +293,13 @@ impl CallArg {
     pub(crate) fn place(&self) -> Option<&Place> {
         match self {
             Self::Value(Operand::Place(place))
+            | Self::InitFieldProvided(Operand::Place(place))
             | Self::SharedBorrow(place)
             | Self::MutBorrow(place) => Some(place),
-            Self::Value(Operand::Const(_)) | Self::SharedStringConst(_) => None,
+            Self::Value(Operand::Const(_))
+            | Self::InitFieldProvided(Operand::Const(_))
+            | Self::InitFieldOmitted
+            | Self::SharedStringConst(_) => None,
         }
     }
 }

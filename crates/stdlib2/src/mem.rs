@@ -1,7 +1,7 @@
-use anvyx_runtime::{Ctx, RuntimeError, function};
+use anvyx_runtime::{Ctx, RuntimeResult, function};
 
-#[function(ctx, trap)]
-pub fn collect_cycles(ctx: &mut Ctx<'_, '_>) -> Result<(), RuntimeError> {
+#[function(ctx)]
+pub fn collect_cycles(ctx: &mut Ctx<'_, '_>) -> RuntimeResult<()> {
     ctx.collect_all()?;
     Ok(())
 }

@@ -8,7 +8,7 @@ impl Host {
     pub fn bad<'cx>(
         ctx: &mut anvyx_runtime::Ctx<'cx, '_>,
         f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), ()>,
-    ) -> Result<(), anvyx_runtime::RuntimeError> {
+    ) -> anvyx_runtime::RuntimeResult<()> {
         let _ = ctx.heap();
         f.call(1)
     }

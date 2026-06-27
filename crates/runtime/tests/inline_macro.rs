@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{AnvyxEnum, AnvyxInline, ExternRep, ExternTypeExpr};
+use anvyx_runtime::{AnvString, AnvyxEnum, AnvyxInline, ExternRep, ExternTypeExpr};
 
 /// Two-dimensional point.
 #[derive(AnvyxInline)]
@@ -18,9 +18,9 @@ struct Vec2 {
 #[anvyx(name = "LoadError")]
 enum HostLoadError {
     /// Missing asset path.
-    Missing(String),
+    Missing(AnvString),
     Decode {
-        message: String,
+        message: AnvString,
     },
 }
 

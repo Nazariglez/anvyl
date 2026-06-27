@@ -294,13 +294,38 @@ fn check_type(
                 },
             );
         }
-        if init.params.len() != init.field_init.len() {
+        let mut presence_inits = HashSet::new();
+        for field in &init.presence_init {
+            check_unique_name(
+                NameKind::FieldInit,
+                &mut presence_inits,
+                field,
+                errors,
+                |name| ExternDescriptorError::DuplicateFieldInit {
+                    ty: key.clone(),
+                    name,
+                },
+            );
+            if field_inits.contains(field) {
+                errors.push(ExternDescriptorError::DuplicateFieldInit {
+                    ty: key.clone(),
+                    name: field.clone(),
+                });
+            }
+        }
+        let init_count = init.field_init.len() + init.presence_init.len();
+        if init.params.len() != init_count {
             errors.push(ExternDescriptorError::InitParamFieldCountMismatch {
                 ty: key.clone(),
                 params: init.params.len(),
-                field_init: init.field_init.len(),
+                field_init: init_count,
             });
         }
+        let init_names = field_inits
+            .union(&presence_inits)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut param_names = HashSet::new();
         for (index, param) in init.params.iter().enumerate() {
             let Some(param_name) = &param.name else {
                 errors.push(ExternDescriptorError::UnnamedInitParam {
@@ -309,16 +334,28 @@ fn check_type(
                 });
                 continue;
             };
-            if let Some(field_name) = init.field_init.get(index)
-                && param_name != field_name
-            {
+            param_names.insert(param_name.clone());
+            if !init_names.contains(param_name) {
                 errors.push(ExternDescriptorError::InitParamFieldMismatch {
                     ty: key.clone(),
                     index,
                     param: param_name.clone(),
-                    field: field_name.clone(),
+                    field: init
+                        .field_init
+                        .get(index)
+                        .or_else(|| init.presence_init.get(index))
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
+        }
+        for field in init_names.difference(&param_names) {
+            errors.push(ExternDescriptorError::InitParamFieldMismatch {
+                ty: key.clone(),
+                index: init.params.len(),
+                param: String::new(),
+                field: field.clone(),
+            });
         }
     }
 
@@ -640,6 +677,7 @@ mod tests {
                             escape: CallbackEscape::NonEscaping,
                         }],
                         field_init: vec!["x".to_string()],
+                        presence_init: vec![],
                         ret: ExternTypeExpr::Void,
                         effects: ExternEffects::default(),
                     }),

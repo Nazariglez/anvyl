@@ -149,6 +149,7 @@ fn normalize_type(
             decl: ExternInitDescriptor {
                 params,
                 field_init,
+                presence_init: vec![],
                 ret: ExternTypeExpr::Void,
                 effects: ExternEffects::default(),
             },

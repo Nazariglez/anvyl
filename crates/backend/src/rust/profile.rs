@@ -1069,12 +1069,13 @@ impl ProfileCx<'_> {
         expected: Option<rir::RirParamSemantic>,
     ) {
         match arg {
-            CallArg::Value(operand) => {
+            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
                 self.check_operand(site, operand);
                 if self.non_shareable_value_operand(operand) {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
+            CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
             CallArg::SharedBorrow(place) => {
                 if matches!(place.root, PlaceRoot::Global(_)) {
                     let Some(function) = Self::current_function_id(site) else {
@@ -1094,7 +1095,6 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                 }
             }
-            CallArg::SharedStringConst(_) => {}
             CallArg::MutBorrow(place) => {
                 let Some(expected) = expected else {
                     if matches!(place.root, PlaceRoot::Global(_)) {

@@ -1,5 +1,5 @@
-error: #[function(ctx)] MutPlace parameters only support bool, i64, f64, and Option of those payloads
- --> tests/ui/function/mut_place_vec.rs:4:44
+error: Vec<T> is not a provider boundary carrier; use AnvList<'cx, T> or explicit runtime copy helpers
+ --> tests/ui/function/mut_place_vec.rs:4:62
   |
 4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Vec<i64>>) {
-  |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |                                                              ^^^^^^^^

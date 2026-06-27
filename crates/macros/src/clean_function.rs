@@ -10,10 +10,10 @@ use syn::{
 
 use crate::clean_type_map::{
     BoundaryConversion, callback_wrapper_has_visible_borrow, classify_param,
-    classify_return_with_trap, conversion_tokens, flow_tokens, has_callback_wrapper, param_abi,
-    param_abi_tokens, param_escape_tokens, return_abi, return_abi_tokens, signature_conversion,
-    type_expr_tokens, type_with_override, validate_callable_signature, validate_ctx_param,
-    validate_mut_place_ctx,
+    classify_provider_return, conversion_tokens, flow_tokens, has_callback_wrapper,
+    param_abi_for_override, param_abi_tokens, param_escape_tokens, return_abi_for_override,
+    return_abi_tokens, signature_conversion, type_expr_tokens, type_with_override,
+    validate_callable_signature, validate_ctx_param, validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -21,7 +21,6 @@ struct FunctionArgs {
     ret: Option<String>,
     params: HashMap<String, String>,
     ctx: bool,
-    trap: bool,
 }
 
 impl Parse for FunctionArgs {
@@ -30,7 +29,6 @@ impl Parse for FunctionArgs {
         let mut ret = None;
         let mut params = None;
         let mut ctx = false;
-        let mut trap = false;
 
         while !input.is_empty() {
             let key: syn::Ident = input.parse()?;
@@ -54,18 +52,15 @@ impl Parse for FunctionArgs {
                     ctx = true;
                 }
                 "trap" => {
-                    if trap {
-                        return Err(syn::Error::new_spanned(
-                            key,
-                            "duplicate #[function] key `trap`",
-                        ));
-                    }
-                    trap = true;
+                    return Err(syn::Error::new_spanned(
+                        key,
+                        "#[function(trap)] was replaced by returning RuntimeResult<T>",
+                    ));
                 }
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "expected `name`, `ret`, `params`, `ctx`, or `trap`",
+                        "expected `name`, `ret`, `params`, or `ctx`",
                     ));
                 }
             }
@@ -79,7 +74,6 @@ impl Parse for FunctionArgs {
             ret,
             params: params.unwrap_or_default(),
             ctx,
-            trap,
         })
     }
 }
@@ -155,7 +149,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         ));
     }
     validate_overrides(&args, &params)?;
-    let ret = classify_return_with_trap(&func.sig.output, args.trap)?;
+    let ret = classify_provider_return(&func.sig.output)?;
     let ret_ty = type_with_override(
         &ret.ty,
         args.ret.as_deref(),
@@ -199,9 +193,9 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
     let param_abis = params
         .iter()
         .zip(&param_types)
-        .map(|(param, ty)| param_abi_tokens(&param_abi(ty, param.flow)))
+        .map(|(param, ty)| param_abi_tokens(&param_abi_for_override(&param.abi, ty, param.flow)))
         .collect::<Vec<_>>();
-    let ret_abi = return_abi_tokens(&return_abi(&ret_ty));
+    let ret_abi = return_abi_tokens(&return_abi_for_override(&ret.abi, &ret_ty));
     let conversion = signature_conversion(&params, &ret);
     if conversion == BoundaryConversion::Unsupported {
         return Err(syn::Error::new_spanned(

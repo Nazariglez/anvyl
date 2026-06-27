@@ -972,6 +972,8 @@ pub enum RirCallTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RirCallArg {
     Value(RirOperand),
+    InitFieldProvided(RirOperand),
+    InitFieldOmitted,
     SharedBorrow(RirPlace),
     SharedStringConst(RirConstId),
     MutBorrow(RirPlace),
@@ -989,7 +991,9 @@ pub enum RirCallArg {
 impl RirCallArg {
     pub fn semantic(&self) -> RirParamSemantic {
         match self {
-            Self::Value(_) => RirParamSemantic::Value,
+            Self::Value(_) | Self::InitFieldProvided(_) | Self::InitFieldOmitted => {
+                RirParamSemantic::Value
+            }
             Self::SharedBorrow(_) | Self::SharedStringConst(_) => RirParamSemantic::SharedBorrow,
             Self::MutBorrow(_) => RirParamSemantic::MutBorrow,
             Self::MutPlace(_) => RirParamSemantic::MutPlace,
@@ -1342,7 +1346,6 @@ pub enum RirExternKind {
 pub struct RirNativeExtern {
     pub path: Vec<String>,
     pub abi: RustExternAbi,
-    pub adopt_resource_return: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2072,9 +2075,7 @@ pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
                 && abi.params.iter().all(rust_param_supported)
                 && rust_return_supported(&abi.ret)
         }
-        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
-            abi.supported_callback_wrapper() || abi.supported_collection_wrapper()
-        }
+        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => abi.supported_callback_wrapper(),
         anvyx_runtime::RustAbiSupport::Unsupported => false,
     }
 }
@@ -2086,11 +2087,12 @@ fn rust_param_supported(abi: &RustParamAbi) -> bool {
             | RustParamAbi::Borrow(ty)
             | RustParamAbi::MutBorrow(ty)
             | RustParamAbi::MutPlace(ty) => extern_value_supported(ty),
-            RustParamAbi::Option(inner) | RustParamAbi::Slice(inner) => rust_param_supported(inner),
+            RustParamAbi::OwnedNamed(ty) => named_abi_supported(ty),
+            RustParamAbi::InitField(inner)
+            | RustParamAbi::Option(inner)
+            | RustParamAbi::Slice(inner) => rust_param_supported(inner),
             RustParamAbi::Result(ok, err) => rust_param_supported(ok) && rust_param_supported(err),
-            RustParamAbi::List(_)
-            | RustParamAbi::ScopedLambda(_)
-            | RustParamAbi::EscapingLambda(_) => false,
+            RustParamAbi::ScopedLambda(_) | RustParamAbi::EscapingLambda(_) => false,
         }
 }
 
@@ -2098,12 +2100,51 @@ fn rust_return_supported(abi: &anvyx_runtime::RustReturnAbi) -> bool {
     match abi {
         anvyx_runtime::RustReturnAbi::Void => true,
         anvyx_runtime::RustReturnAbi::Value(ty) => extern_value_supported(ty),
+        anvyx_runtime::RustReturnAbi::OwnedNamed(ty) => named_abi_supported(ty),
         anvyx_runtime::RustReturnAbi::Option(inner) => rust_return_supported(inner),
         anvyx_runtime::RustReturnAbi::Result(ok, err) => {
             rust_return_supported(ok) && rust_return_supported(err)
         }
-        anvyx_runtime::RustReturnAbi::List(_) => false,
     }
+}
+
+pub(super) fn native_return_adopts_resource(
+    program: &RirProgram,
+    ret: RirTypeId,
+    abi: &anvyx_runtime::RustReturnAbi,
+) -> bool {
+    match abi {
+        anvyx_runtime::RustReturnAbi::OwnedNamed(_) => native_return_ty_is_resource(program, ret),
+        anvyx_runtime::RustReturnAbi::Option(inner) => {
+            let RirType::Option(inner_ty) = program.types[ret.index()] else {
+                return false;
+            };
+            native_return_adopts_resource(program, inner_ty, inner)
+        }
+        anvyx_runtime::RustReturnAbi::Result(ok, err) => {
+            let RirType::Enum(enum_id) = program.types[ret.index()] else {
+                return false;
+            };
+            let [ok_variant, err_variant] = program.enums[enum_id.index()].variants.as_slice()
+            else {
+                return false;
+            };
+            native_return_adopts_resource(program, ok_variant.fields[0].ty, ok)
+                || native_return_adopts_resource(program, err_variant.fields[0].ty, err)
+        }
+        anvyx_runtime::RustReturnAbi::Void | anvyx_runtime::RustReturnAbi::Value(_) => false,
+    }
+}
+
+pub(super) fn native_return_ty_is_resource(program: &RirProgram, ty: RirTypeId) -> bool {
+    matches!(
+        program.types[ty.index()],
+        RirType::Struct(id) if program.structs[id.index()].native_ref
+    )
+}
+
+fn named_abi_supported(ty: &ExternTypeExpr) -> bool {
+    matches!(ty, ExternTypeExpr::Named { args, .. } if args.is_empty())
 }
 
 fn extern_value_supported(ty: &ExternTypeExpr) -> bool {
@@ -2140,9 +2181,10 @@ pub(super) struct NativeParamAbi {
 pub(super) fn rust_param_abi(abi: &RustParamAbi) -> NativeParamAbi {
     let (semantic, abi) = match abi {
         RustParamAbi::Value(_)
+        | RustParamAbi::OwnedNamed(_)
+        | RustParamAbi::InitField(_)
         | RustParamAbi::Option(_)
         | RustParamAbi::Result(_, _)
-        | RustParamAbi::List(_)
         | RustParamAbi::Slice(_) => (RirParamSemantic::Value, RirParamAbi::Value),
         RustParamAbi::Borrow(_) => (RirParamSemantic::SharedBorrow, RirParamAbi::SharedBorrow),
         RustParamAbi::MutBorrow(_) => (RirParamSemantic::MutBorrow, RirParamAbi::MutBorrow),
@@ -4339,7 +4381,6 @@ impl VerifyCx<'_> {
                     self.clear_local_lambda_value(local);
                 }
             }
-            RirPlaceRoot::Local(_) => {}
             RirPlaceRoot::Global(global) if place.projections.is_empty() => {
                 if let Some(slot) = self.global_values.get_mut(global.index()) {
                     *slot = value;
@@ -4351,7 +4392,7 @@ impl VerifyCx<'_> {
                     self.global_values[global.index()] = RirFunctionValueState::Unknown;
                 }
             }
-            RirPlaceRoot::Global(_) => {}
+            RirPlaceRoot::Local(_) | RirPlaceRoot::Global(_) => {}
         }
     }
 
@@ -4851,7 +4892,6 @@ impl VerifyCx<'_> {
                 .get(lambda.index())
                 .map(|decl| decl.escape),
             RirRValue::FunctionValue { escape, .. } => *escape,
-            RirRValue::Call { .. } => None,
             RirRValue::Use(operand) => self.operand_lambda_escape(function, operand),
             _ => None,
         }
@@ -6188,6 +6228,7 @@ impl VerifyCx<'_> {
     ) -> Option<RirLambdaEscape> {
         match arg {
             RirCallArg::Value(operand)
+            | RirCallArg::InitFieldProvided(operand)
             | RirCallArg::ScopedLambda {
                 callee: operand, ..
             }
@@ -6197,6 +6238,7 @@ impl VerifyCx<'_> {
             RirCallArg::SharedBorrow(_)
             | RirCallArg::MutBorrow(_)
             | RirCallArg::MutPlace(_)
+            | RirCallArg::InitFieldOmitted
             | RirCallArg::SharedStringConst(_) => None,
         }
     }
@@ -6211,7 +6253,7 @@ impl VerifyCx<'_> {
         ret: RirTypeId,
     ) {
         let native_call = matches!(callee, RirCallTarget::Extern(_));
-        let (expected, callee_ret) = match callee {
+        let (expected, callee_ret, init_fields) = match callee {
             RirCallTarget::Function(id) => {
                 self.check_function_id(RirVerifySite::RValue(function_id, stmt), id);
                 match self.program.functions.get(id.index()) {
@@ -6222,6 +6264,7 @@ impl VerifyCx<'_> {
                             .map(|param| (param.ty, param.semantic, param.abi, param.escape))
                             .collect::<Vec<_>>(),
                         function.ret.ty,
+                        vec![false; function.params.len()],
                     ),
                     None => return,
                 }
@@ -6229,13 +6272,24 @@ impl VerifyCx<'_> {
             RirCallTarget::Extern(id) => {
                 self.check_extern_id(RirVerifySite::RValue(function_id, stmt), id);
                 match self.program.externs.get(id.index()) {
-                    Some(ext) => (
-                        ext.params
-                            .iter()
-                            .map(|param| (param.ty, param.semantic, param.abi, param.escape))
-                            .collect::<Vec<_>>(),
-                        ext.ret,
-                    ),
+                    Some(ext) => {
+                        let init_fields = match &ext.kind {
+                            RirExternKind::Native(native) => native
+                                .abi
+                                .params
+                                .iter()
+                                .map(|param| matches!(param, RustParamAbi::InitField(_)))
+                                .collect(),
+                        };
+                        (
+                            ext.params
+                                .iter()
+                                .map(|param| (param.ty, param.semantic, param.abi, param.escape))
+                                .collect::<Vec<_>>(),
+                            ext.ret,
+                            init_fields,
+                        )
+                    }
                     None => return,
                 }
             }
@@ -6263,6 +6317,7 @@ impl VerifyCx<'_> {
                         .map(|param| (param.ty, param.semantic, param.abi, param.escape))
                         .collect::<Vec<_>>(),
                     sig_decl.ret,
+                    vec![false; sig_decl.params.len()],
                 )
             }
         };
@@ -6287,6 +6342,13 @@ impl VerifyCx<'_> {
         }
         for (index, (arg, (ty, mode, abi, escape))) in args.iter().zip(expected).enumerate() {
             let site = RirVerifySite::CallArg(function_id, stmt, index);
+            let found_init_field = matches!(
+                arg,
+                RirCallArg::InitFieldProvided(_) | RirCallArg::InitFieldOmitted
+            );
+            if found_init_field != init_fields.get(index).copied().unwrap_or(false) {
+                self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
             if arg.semantic() != mode
                 || matches!(
                     arg,
@@ -6305,7 +6367,10 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::CallArgEscape);
             }
             let found = match arg {
-                RirCallArg::Value(operand) => self.value_operand_ty(site, function, operand),
+                RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
+                    self.value_operand_ty(site, function, operand)
+                }
+                RirCallArg::InitFieldOmitted => None,
                 RirCallArg::SharedBorrow(place) => {
                     self.check_place(site, function, place);
                     match place.root {

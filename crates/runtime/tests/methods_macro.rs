@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
 use anvyx_runtime::{
-    AnvyxEnum, AnvyxInline, BinaryOp, CallbackEscape, CallbackThread, Ctx, EscapingLambda,
-    ExternBindingOp, ExternMemberSelector, ExternOperator, ExternTypeExpr, Heap, ReceiverMode,
-    RuntimeError, RustAbiSupport, RustParamAbi, RustReturnAbi, RustWrapperCtx, ScopedLambda,
-    methods,
+    AnvInitField, AnvRef, AnvString, AnvyxEnum, AnvyxInline, AnvyxRef, BinaryOp, CallbackEscape,
+    CallbackThread, Ctx, EscapingLambda, ExternBindingOp, ExternMemberSelector, ExternOperator,
+    ExternTypeExpr, Heap, ReceiverMode, RuntimeError, RuntimeResult, RustAbiSupport, RustParamAbi,
+    RustReturnAbi, RustWrapperCtx, ScopedLambda, methods,
 };
 
 #[derive(AnvyxInline)]
@@ -30,8 +30,7 @@ struct CallbackOps;
 
 #[methods]
 impl CallbackOps {
-    #[anvyx(trap)]
-    pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> Result<(), RuntimeError> {
+    pub fn each(f: ScopedLambda<'_, '_, (i64,), ()>) -> RuntimeResult<()> {
         let result = f.call(1);
         let _ = std::hint::black_box(f);
         result
@@ -70,6 +69,23 @@ impl DefaultInit {
     }
 }
 
+struct PresenceInit {
+    value: i64,
+}
+
+#[methods]
+impl PresenceInit {
+    #[anvyx(init)]
+    pub fn new(value: AnvInitField<AnvString>) -> Self {
+        Self {
+            value: match value {
+                AnvInitField::Provided(value) => value.len() as i64,
+                AnvInitField::Omitted => 0,
+            },
+        }
+    }
+}
+
 struct FallibleInit;
 
 #[methods]
@@ -80,18 +96,165 @@ impl FallibleInit {
     }
 }
 
-struct TrapInit;
+struct RuntimeResultInit;
 
 #[methods]
-impl TrapInit {
-    #[anvyx(init, trap)]
-    pub fn try_new(ok: bool) -> Result<Self, RuntimeError> {
+impl RuntimeResultInit {
+    #[anvyx(init)]
+    pub fn try_new(ok: bool) -> RuntimeResult<Self> {
         if ok {
             Ok(Self)
         } else {
             Err(RuntimeError::new("bad init"))
         }
     }
+}
+
+#[derive(AnvyxRef)]
+struct OwnerReturns {
+    value: i64,
+}
+
+#[methods]
+impl OwnerReturns {
+    pub fn duplicate(&self) -> Self {
+        Self { value: self.value }
+    }
+
+    pub fn make(value: i64) -> Self {
+        Self { value }
+    }
+
+    pub fn maybe(&self, ok: bool) -> Option<Self> {
+        ok.then_some(Self { value: self.value })
+    }
+
+    pub fn visible(&self, ok: bool) -> Result<Self, InitError> {
+        ok.then_some(Self { value: self.value })
+            .ok_or(InitError::Bad)
+    }
+
+    pub fn hidden(&self) -> RuntimeResult<Self> {
+        if self.value >= 0 {
+            Ok(Self { value: self.value })
+        } else {
+            Err(RuntimeError::new("negative"))
+        }
+    }
+
+    #[anvyx(ctx)]
+    pub fn explicit_ref<'cx>(&self, ctx: &mut Ctx<'cx, '_>) -> AnvRef<'cx, Self> {
+        let _ = (self.value, ctx.heap());
+        panic!("metadata only")
+    }
+}
+
+struct RenamedOwnerReturn;
+
+#[methods(name = "ExportedOwner")]
+impl RenamedOwnerReturn {
+    pub fn duplicate(&self) -> Self {
+        let _ = self;
+        Self
+    }
+
+    pub fn make() -> Self {
+        Self
+    }
+}
+
+#[test]
+fn method_owner_returns_use_export_name_and_owned_abi() {
+    let export = __anvyx_methods_ownerreturns();
+    let owner = ExternTypeExpr::Named {
+        module: None,
+        name: "OwnerReturns".to_string(),
+        args: vec![],
+    };
+
+    let duplicate = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "duplicate"))
+        .unwrap();
+    assert_eq!(export.descriptor.methods[0].signature.ret, owner);
+    assert!(matches!(
+        &duplicate.abi.ret,
+        RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns"
+    ));
+
+    let make = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Static(name) if name == "make"))
+        .unwrap();
+    assert!(matches!(
+        &make.abi.ret,
+        RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns"
+    ));
+
+    let maybe = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "maybe"))
+        .unwrap();
+    assert!(matches!(
+        &maybe.abi.ret,
+        RustReturnAbi::Option(inner)
+            if matches!(inner.as_ref(), RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns")
+    ));
+
+    let visible = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "visible"))
+        .unwrap();
+    assert!(matches!(
+        &visible.abi.ret,
+        RustReturnAbi::Result(ok, _)
+            if matches!(ok.as_ref(), RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns")
+    ));
+
+    let hidden = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "hidden"))
+        .unwrap();
+    assert!(hidden.abi.fallible);
+    assert!(matches!(
+        &hidden.abi.ret,
+        RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns"
+    ));
+}
+
+#[test]
+fn explicit_owner_ref_return_stays_value_abi() {
+    let export = __anvyx_methods_ownerreturns();
+    let binding = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "explicit_ref"))
+        .unwrap();
+
+    assert!(matches!(
+        &binding.abi.ret,
+        RustReturnAbi::Value(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns"
+    ));
+}
+
+#[test]
+fn renamed_owner_returns_use_export_name() {
+    let export = __anvyx_methods_renamedownerreturn();
+
+    assert_eq!(export.descriptor.name, "ExportedOwner");
+    assert!(matches!(
+        &export.descriptor.methods[0].signature.ret,
+        ExternTypeExpr::Named { name, .. } if name == "ExportedOwner"
+    ));
+    assert!(matches!(
+        &export.bindings[0].abi.ret,
+        RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "ExportedOwner"
+    ));
 }
 
 #[test]
@@ -161,11 +324,28 @@ fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
 }
 
 #[test]
-fn init_supports_visible_result_and_trap_metadata() {
+fn init_supports_visible_result_and_runtime_result_metadata() {
     let default = __anvyx_methods_defaultinit();
     let default_init = default.descriptor.init.as_ref().unwrap();
     assert!(default_init.params.is_empty());
     assert!(default_init.field_init.is_empty());
+    assert!(default_init.presence_init.is_empty());
+
+    let presence = __anvyx_methods_presenceinit();
+    let presence_init = presence.descriptor.init.as_ref().unwrap();
+    assert_eq!(presence_init.params.len(), 1);
+    assert_eq!(presence_init.params[0].ty, ExternTypeExpr::String);
+    assert!(presence_init.field_init.is_empty());
+    assert_eq!(presence_init.presence_init, ["value"]);
+    let presence_binding = presence
+        .bindings
+        .iter()
+        .find(|binding| matches!(binding.selector, ExternMemberSelector::Init))
+        .unwrap();
+    assert_eq!(
+        presence_binding.abi.params[0],
+        RustParamAbi::InitField(Box::new(RustParamAbi::Value(ExternTypeExpr::String)))
+    );
 
     let visible = __anvyx_methods_fallibleinit();
     let visible_init = visible.descriptor.init.as_ref().unwrap();
@@ -184,25 +364,28 @@ fn init_supports_visible_result_and_trap_metadata() {
         RustReturnAbi::Result(_, _)
     ));
 
-    let trap = __anvyx_methods_trapinit();
-    let trap_init = trap.descriptor.init.as_ref().unwrap();
+    let hidden = __anvyx_methods_runtimeresultinit();
+    let hidden_init = hidden.descriptor.init.as_ref().unwrap();
     assert_eq!(
-        trap_init.ret,
+        hidden_init.ret,
         ExternTypeExpr::Named {
             module: None,
-            name: "TrapInit".to_string(),
+            name: "RuntimeResultInit".to_string(),
             args: vec![],
         }
     );
-    assert_eq!(trap_init.field_init, ["ok"]);
-    assert!(trap_init.effects.fallible);
-    let trap_binding = trap
+    assert_eq!(hidden_init.field_init, ["ok"]);
+    assert!(hidden_init.effects.fallible);
+    let hidden_binding = hidden
         .bindings
         .iter()
         .find(|binding| matches!(binding.selector, ExternMemberSelector::Init))
         .unwrap();
-    assert!(trap_binding.abi.fallible);
-    assert!(matches!(trap_binding.abi.ret, RustReturnAbi::Value(_)));
+    assert!(hidden_binding.abi.fallible);
+    assert!(matches!(
+        hidden_binding.abi.ret,
+        RustReturnAbi::OwnedNamed(_)
+    ));
 }
 
 #[test]
@@ -274,9 +457,9 @@ impl Vec2 {
     }
 
     #[anvyx(op(Self + Self))]
-    pub fn add(&self, rhs: Vec2) -> Vec2 {
+    pub fn add(&self, rhs: Self) -> Self {
         let (x, y) = rhs.into_parts();
-        Vec2 {
+        Self {
             x: self.x + x,
             y: self.y + y,
         }
@@ -314,7 +497,7 @@ fn methods_merge_into_derive_owned_type_descriptor() {
         .unwrap();
     assert!(matches!(
         &init.abi.ret,
-        RustReturnAbi::Value(ExternTypeExpr::Named { name, .. }) if name == "Vector2"
+        RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "Vector2"
     ));
 }
 
@@ -353,6 +536,23 @@ fn self_operator_uses_derive_owned_type_name() {
     assert!(matches!(
         &op.signature.ret,
         ExternTypeExpr::Named { name, .. } if name == "NamedOps"
+    ));
+    let binding = export
+        .bindings
+        .iter()
+        .find(|binding| {
+            matches!(
+                &binding.selector,
+                ExternMemberSelector::Operator(ExternOperator::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                })
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        &binding.abi.params[1],
+        RustParamAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "NamedOps"
     ));
 }
 

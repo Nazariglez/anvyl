@@ -53,6 +53,14 @@ pub(super) fn native_ref_adopt(native: &str, value: &str) -> String {
     )
 }
 
+pub(super) fn init_field_provided(value: &str) -> String {
+    format!("{}::Provided({value})", rt_path("AnvInitField"))
+}
+
+pub(super) fn init_field_omitted() -> String {
+    format!("{}::Omitted", rt_path("AnvInitField"))
+}
+
 pub(super) fn map_storage_ty(key: &str, value: &str) -> String {
     format!("{}<'cx, {key}, {value}>", rt_path("MapStorage"))
 }
@@ -517,12 +525,12 @@ pub(super) fn anv_string_from(expr: &str) -> String {
     format!("{}::from({expr})", anv_string_ty())
 }
 
-pub(super) fn rust_string_from_anv(value: &str) -> String {
-    format!("({value}).as_str().to_string()")
-}
-
 pub(super) fn rust_option_map(option: &str, body: &str) -> String {
     format!("({option}).map(|value| {body})")
+}
+
+pub(super) fn rust_array_map(array: &str, body: &str) -> String {
+    format!("({array}).map(|value| {{ {body} }})")
 }
 
 pub(super) fn rust_result_match(value: &str, ok: &str, err: &str) -> String {
