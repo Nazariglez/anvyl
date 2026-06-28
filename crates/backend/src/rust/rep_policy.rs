@@ -83,7 +83,6 @@ pub enum LambdaStorageFamily {
     DataRefProjection,
     GlobalRoot,
     GlobalProjection,
-    NativeExternBoundary,
     UnknownOrigin,
 }
 
@@ -95,7 +94,6 @@ pub enum LambdaStorageGap {
     Trace,
     GlobalRooting,
     MapKeyEqualityHash,
-    ExternBoundary,
     UnsupportedType,
 }
 
@@ -108,7 +106,6 @@ impl From<LambdaStorageGap> for RustMaterialGap {
             | LambdaStorageGap::Lifetime
             | LambdaStorageGap::Trace
             | LambdaStorageGap::MapKeyEqualityHash
-            | LambdaStorageGap::ExternBoundary
             | LambdaStorageGap::UnsupportedType => RustMaterialGap::UnsupportedType,
         }
     }
@@ -119,7 +116,6 @@ impl LambdaStorageFamily {
         match self {
             LambdaStorageFamily::MapKey => LambdaStorageGap::MapKeyEqualityHash,
             LambdaStorageFamily::GlobalProjection => LambdaStorageGap::GlobalRooting,
-            LambdaStorageFamily::NativeExternBoundary => LambdaStorageGap::ExternBoundary,
             LambdaStorageFamily::UnknownOrigin => LambdaStorageGap::ProvenanceOrigin,
             LambdaStorageFamily::SliceView => LambdaStorageGap::Lifetime,
             LambdaStorageFamily::GlobalRoot
@@ -160,7 +156,6 @@ fn nested_storage_family(
         (
             LambdaStorageFamily::GlobalRoot
             | LambdaStorageFamily::GlobalProjection
-            | LambdaStorageFamily::NativeExternBoundary
             | LambdaStorageFamily::MapKey
             | LambdaStorageFamily::MapValue,
             _,
@@ -1612,7 +1607,8 @@ impl<'a> RustRepPolicy<'a> {
                 let payload = self.rust_ty(ty);
                 format!("{}<'_, 'cx, {payload}>", target::mut_place_ty())
             }
-            RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda => self.scoped_lambda_ty(ty),
+            RirParamAbi::ScopedLambda => self.scoped_lambda_ty(ty),
+            RirParamAbi::EscapingLambda => self.escaping_lambda_ty(ty),
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!(
@@ -1653,11 +1649,22 @@ impl<'a> RustRepPolicy<'a> {
     }
 
     fn scoped_lambda_ty(self, ty: RirTypeId) -> String {
-        let RirType::Lambda(sig) = self.ty(ty) else {
-            return target::scoped_lambda_ty("()", "()");
-        };
+        let sig = self.expect_lambda_sig(ty);
         let (args, ret) = self.scoped_lambda_sig_args_ret(sig);
         target::scoped_lambda_ty(&args, &ret)
+    }
+
+    fn escaping_lambda_ty(self, ty: RirTypeId) -> String {
+        let sig = self.expect_lambda_sig(ty);
+        let (args, ret) = self.scoped_lambda_sig_args_ret(sig);
+        target::escaping_lambda_ty(&args, &ret)
+    }
+
+    fn expect_lambda_sig(self, ty: RirTypeId) -> RirLambdaSigId {
+        let RirType::Lambda(sig) = self.ty(ty) else {
+            unreachable!("verified lambda ABI type")
+        };
+        sig
     }
 
     pub fn dataref_storage_ty(self, dataref: &RirDataRef) -> String {
@@ -2499,10 +2506,10 @@ mod tests {
     use crate::rust::rir::{
         RirCellId, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirField, RirFieldId,
         RirFunctionId, RirLambda, RirLambdaCapture, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaSig,
-        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi,
+        RirParamEscape, RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple,
+        RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
     };
 
     #[test]
@@ -2690,6 +2697,36 @@ mod tests {
 
         assert_eq!(policy.borrow_view(string), RustBorrowView::Str);
         assert!(policy.cow_value(string));
+    }
+
+    #[test]
+    fn policy_renders_scoped_and_escaping_lambda_params_separately() {
+        let mut program = RirProgram::default();
+        let int = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Int);
+        let sig = RirLambdaSigId::from_index(0);
+        program.lambda_sigs.push(RirLambdaSig {
+            id: sig,
+            params: vec![RirLambdaParam {
+                ty: int,
+                semantic: RirParamSemantic::Value,
+                abi: RirParamAbi::Value,
+                escape: RirParamEscape::NonEscaping,
+            }],
+            ret: int,
+        });
+        let lambda = RirTypeId::from_index(program.types.len());
+        program.types.push(RirType::Lambda(sig));
+        let policy = RustRepPolicy::new(&program);
+
+        assert_eq!(
+            policy.param_ty_with_lifetime(lambda, RirParamAbi::ScopedLambda, None),
+            "anvyx_runtime::ScopedLambda<'_, 'cx, (i64,), i64>"
+        );
+        assert_eq!(
+            policy.param_ty_with_lifetime(lambda, RirParamAbi::EscapingLambda, None),
+            "anvyx_runtime::EscapingLambda<(i64,), i64>"
+        );
     }
 
     #[test]

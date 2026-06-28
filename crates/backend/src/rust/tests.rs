@@ -16,7 +16,7 @@ use anvyx_frontend::{
 use super::{
     CollectionAccessOp, PlanCx, RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
     dataref_place::DataRefPlaceDescriptors,
-    emit,
+    emit, native_call,
     place_access::{PlaceAccessCx, PlaceAccessIntent},
     plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
@@ -76,54 +76,206 @@ fn profile_accepts_native_escaping_lambda_param() {
 
 #[test]
 fn profile_rejects_retained_callback_native_borrow_reentry_arg() {
-    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
-    let string = program.alloc_type(TypeData::String);
-    let text = program.const_arena.alloc(ConstData {
-        ty: string,
-        value: ConstValue::String("x".into()),
-    });
-    let void = program.externs[0].return_type;
-    let borrow = extern_in_module(
-        &mut program,
-        &["host_lambda"],
+    let (program, support) = retained_callback_borrow_air(
         "borrow",
-        vec![(string, ParamMode::SharedBorrow)],
-        void,
-        ExternMember::FreeFunction,
+        TypeData::Int,
+        ConstValue::Int(1),
+        anvyx_runtime::ExternTypeExpr::Int,
     );
-    program.externs[borrow.index()].binding = Some(provider_binding("host_lambda", "borrow"));
-    let entry = program.entry.expect("entry function");
-    let function = program.function_mut(entry);
-    let text_local = air::LocalId::from_index(function.locals.len());
-    function.locals.push(local(string, LocalKind::Temp));
-    function.body.block.stmts.extend([
-        Statement::Init {
-            local: text_local,
-            value: RValue::Use(Operand::Const(text)),
-        },
-        Statement::Eval(RValue::Call {
-            callee: Callee::Extern(borrow),
-            args: vec![CallArg::SharedBorrow(place(text_local, string))],
-        }),
-    ]);
     let verified = air::verify(&program).expect("AIR verify failed");
-    let mut support = host_escaping_lambda_support();
-    support.modules[0].bindings.push(function_binding(
-        "host_lambda",
-        "host",
-        &["host", "borrow"],
-        "borrow",
-        vec![anvyx_runtime::RustParamAbi::Borrow(
-            anvyx_runtime::ExternTypeExpr::String,
-        )],
-        anvyx_runtime::RustReturnAbi::Void,
-        false,
-    ));
 
     let errors = RustBackendProfile::check_with_native_support(&verified, &[support])
         .expect_err("profile accepted retained callback reentry borrow arg");
 
     assert!(has_error(&errors, ProfileErrorKind::UnsupportedCallArgMode));
+}
+
+fn retained_callback_string_borrow_air() -> (Program, anvyx_runtime::RustProviderSupport) {
+    retained_callback_borrow_air(
+        "borrow_string",
+        TypeData::String,
+        ConstValue::String("x".into()),
+        anvyx_runtime::ExternTypeExpr::String,
+    )
+}
+
+fn retained_callback_borrow_air(
+    name: &str,
+    ty: TypeData,
+    value: ConstValue,
+    rust_ty: anvyx_runtime::ExternTypeExpr,
+) -> (Program, anvyx_runtime::RustProviderSupport) {
+    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let ty = match ty {
+        TypeData::Int => program.function(FunctionId::from_index(0)).signature.params[0].ty,
+        ty => program.alloc_type(ty),
+    };
+    let konst = program.const_arena.alloc(ConstData { ty, value });
+    let void = program.externs[0].return_type;
+    let borrow = extern_in_module(
+        &mut program,
+        &["host_lambda"],
+        name,
+        vec![(ty, ParamMode::SharedBorrow)],
+        void,
+        ExternMember::FreeFunction,
+    );
+    program.externs[borrow.index()].binding = Some(provider_binding("host_lambda", name));
+    let entry = program.entry.expect("entry function");
+    let function = program.function_mut(entry);
+    let local_id = air::LocalId::from_index(function.locals.len());
+    function.locals.push(local(ty, LocalKind::Temp));
+    function.body.block.stmts.extend([
+        Statement::Init {
+            local: local_id,
+            value: RValue::Use(Operand::Const(konst)),
+        },
+        Statement::Eval(RValue::Call {
+            callee: Callee::Extern(borrow),
+            args: vec![CallArg::SharedBorrow(place(local_id, ty))],
+        }),
+    ]);
+    let mut support = host_escaping_lambda_support();
+    support.modules[0].bindings.push(function_binding(
+        "host_lambda",
+        "host",
+        &["host", name],
+        name,
+        vec![anvyx_runtime::RustParamAbi::Borrow(rust_ty)],
+        anvyx_runtime::RustReturnAbi::Void,
+        false,
+    ));
+    (program, support)
+}
+
+#[test]
+fn profile_accepts_retained_callback_native_string_borrow_reentry_arg() {
+    let (program, support) = retained_callback_string_borrow_air();
+    let verified = air::verify(&program).expect("AIR verify failed");
+
+    RustBackendProfile::check_with_native_support(&verified, &[support])
+        .expect("profile rejected snapshottable retained callback string borrow");
+}
+
+#[test]
+fn native_plan_rejects_retained_slice_reentry_arg() {
+    let abi = direct_rust_abi(
+        vec![anvyx_runtime::RustParamAbi::Slice(Box::new(
+            anvyx_runtime::RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::Int),
+        ))],
+        anvyx_runtime::RustReturnAbi::Void,
+    );
+    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
+    let arg = RirCallArg::Value(RirOperand::Const(RirConstId::from_index(0)));
+
+    assert!(plan.rejects_reentry_rir_arg(0, &arg, false));
+}
+
+fn retained_callback_string_borrow_rir() -> RirProgram {
+    let (program, support) = retained_callback_string_borrow_air();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    plan(
+        &verified,
+        RustPlanConfig {
+            symbol_prefix: "anv".into(),
+            native_providers: vec![support],
+        },
+    )
+    .expect("plan failed")
+    .verified()
+    .program()
+    .clone()
+}
+
+fn retained_callback_borrow_extern(program: &RirProgram) -> RirExternId {
+    program
+        .externs
+        .iter()
+        .position(|ext| {
+            ext.params.len() == 1 && ext.params[0].semantic == RirParamSemantic::SharedBorrow
+        })
+        .map(RirExternId::from_index)
+        .expect("borrow extern")
+}
+
+#[test]
+fn rir_rejects_forged_retained_callback_live_native_borrow() {
+    let mut program = retained_callback_string_borrow_rir();
+    let int = program
+        .types
+        .iter()
+        .position(|ty| *ty == RirType::Int)
+        .map(RirTypeId::from_index)
+        .expect("int type");
+    let extern_id = retained_callback_borrow_extern(&program);
+    let ext = &mut program.externs[extern_id.index()];
+    ext.params[0].ty = int;
+    let RirExternKind::Native(native) = &mut ext.kind;
+    native.abi.params[0] = anvyx_runtime::RustParamAbi::Borrow(anvyx_runtime::ExternTypeExpr::Int);
+
+    let entry = program.entry.expect("entry function");
+    let function = &mut program.functions[entry.index()];
+    for stmt in &mut function.body.stmts {
+        match stmt {
+            RirStmt::Init {
+                local,
+                value: RirRValue::Use(RirOperand::Const(konst)),
+            } => {
+                if program.consts[konst.index()].ty != int {
+                    program.consts[konst.index()] = RirConst {
+                        id: *konst,
+                        ty: int,
+                        value: RirConstValue::Int(1),
+                    };
+                    function.locals[local.index()].ty = int;
+                }
+            }
+            RirStmt::Eval(RirRValue::Call { callee, args, .. })
+                if *callee == RirCallTarget::Extern(extern_id) =>
+            {
+                let RirCallArg::SharedBorrow(place) = &mut args[0] else {
+                    panic!("shared borrow arg")
+                };
+                place.ty = int;
+            }
+            _ => {}
+        }
+    }
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+}
+
+#[test]
+fn rir_rejects_forged_retained_callback_native_mut_place_reentry() {
+    let mut program = retained_callback_string_borrow_rir();
+    let extern_id = retained_callback_borrow_extern(&program);
+    let ext = &mut program.externs[extern_id.index()];
+    ext.params[0].semantic = RirParamSemantic::MutPlace;
+    ext.params[0].abi = RirParamAbi::MutPlace;
+    let RirExternKind::Native(native) = &mut ext.kind;
+    native.abi.params[0] =
+        anvyx_runtime::RustParamAbi::MutPlace(anvyx_runtime::ExternTypeExpr::String);
+
+    let entry = program.entry.expect("entry function");
+    let function = &mut program.functions[entry.index()];
+    for stmt in &mut function.body.stmts {
+        let RirStmt::Eval(RirRValue::Call { callee, args, .. }) = stmt else {
+            continue;
+        };
+        if *callee != RirCallTarget::Extern(extern_id) {
+            continue;
+        }
+        let RirCallArg::SharedBorrow(place) = &args[0] else {
+            panic!("shared borrow arg")
+        };
+        let RirPlaceRoot::Local(local) = place.root else {
+            panic!("local arg")
+        };
+        function.locals[local.index()].mutable = true;
+        args[0] = RirCallArg::MutPlace(RirMutPlaceArg::local(place.clone()));
+    }
+
+    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
 }
 
 #[test]
@@ -387,18 +539,6 @@ fn emit_native_scoped_lambda_uses_scoped_runtime_state() {
 }
 
 #[test]
-fn native_escaping_lambda_subscription_provider_closes_explicitly() {
-    let program = native_escaping_lambda_subscription_air(NativeLambdaArgKind::EscapingCaptureCell);
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, host_subscription_plan_config()).expect("plan failed");
-    let output = run_source(with_subscription_escaping_lambda_host(emit::emit(
-        &plan.verified(),
-    )));
-
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-}
-
-#[test]
 fn native_escaping_lambda_provider_arg_compiles() {
     for kind in [
         NativeLambdaArgKind::FunctionRef,
@@ -469,28 +609,6 @@ fn native_escaping_lambda_stored_tuple_origin_without_air_proof_is_rejected() {
     let errors = air::verify(&program).expect_err("AIR accepted projected stored callback origin");
 
     assert!(format!("{errors:?}").contains("ArgEscapeUnknown"));
-}
-
-#[test]
-fn native_escaping_lambda_provider_retains_and_invokes_after_registration() {
-    for (kind, first, second) in [
-        (NativeLambdaArgKind::FunctionRef, 41, 41),
-        (NativeLambdaArgKind::EscapingZeroCapture, 41, 41),
-        (NativeLambdaArgKind::EscapingReadonlyCapture, 42, 42),
-        (NativeLambdaArgKind::EscapingCaptureCell, 41, 82),
-    ] {
-        let program = native_escaping_lambda_trigger_air(kind);
-        let verified = air::verify(&program).expect("AIR verify failed");
-        let plan =
-            plan(&verified, host_escaping_lambda_retained_plan_config()).expect("plan failed");
-        let output = run_source(with_retained_escaping_lambda_host(
-            emit::emit(&plan.verified()),
-            first,
-            second,
-        ));
-
-        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-    }
 }
 
 #[test]
@@ -2232,9 +2350,9 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
         program.externs.push(RirExtern {
             id: RirExternId::from_index(0),
             symbol: RirSymbol::new("sink"),
-            kind: RirExternKind::Native(rir::RirNativeExtern {
-                path: vec!["host".to_string(), "sink".to_string()],
-                abi: anvyx_runtime::RustExternAbi {
+            kind: RirExternKind::Native(rir::RirNativeExtern::new(
+                vec!["host".to_string(), "sink".to_string()],
+                anvyx_runtime::RustExternAbi {
                     params: vec![anvyx_runtime::RustParamAbi::Value(
                         anvyx_runtime::ExternTypeExpr::Int,
                     )],
@@ -2243,7 +2361,7 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
                     support: anvyx_runtime::RustAbiSupport::Direct,
                     ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
                 },
-            }),
+            )),
             params: vec![RirExternParam {
                 ty: int,
                 semantic: RirParamSemantic::Value,
@@ -6249,9 +6367,9 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("native_touch"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "touch".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "touch".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![anvyx_runtime::RustParamAbi::MutBorrow(
                     anvyx_runtime::ExternTypeExpr::Int,
                 )],
@@ -6260,7 +6378,7 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(1),
             semantic: RirParamSemantic::MutBorrow,
@@ -11991,7 +12109,7 @@ fn emit_pins_generated_runtime_owner_before_attach() {
     assert!(source.contains("owner_entry.owner_ptr().cast::<AnvRuntimeInner<'cx>>().as_mut()"));
     assert!(!source.contains("fn inner_mut"));
     assert!(source.contains("runtime.owner.__anvyx_attach_owner_ptr"));
-    assert!(source.contains("self.owner.__anvyx_detach_owner_ptr()"));
+    assert!(source.contains("self.owner.__anvyx_begin_shutdown()"));
 
     let pin_pos = source.find("inner: Box::pin(AnvRuntimeInner {").unwrap();
     let attach_pos = source.find("__anvyx_attach_owner_ptr").unwrap();
@@ -13045,9 +13163,9 @@ fn rir_verify_rejects_bad_extern_signature() {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("bad_println"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "println".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "println".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![anvyx_runtime::RustParamAbi::Borrow(
                     anvyx_runtime::ExternTypeExpr::String,
                 )],
@@ -13056,7 +13174,7 @@ fn rir_verify_rejects_bad_extern_signature() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
             semantic: RirParamSemantic::Value,
@@ -13080,9 +13198,9 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("bad_bool"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "bad_bool".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "bad_bool".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![anvyx_runtime::RustParamAbi::Value(
                     anvyx_runtime::ExternTypeExpr::Bool,
                 )],
@@ -13091,7 +13209,7 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![RirExternParam {
             ty: RirTypeId::from_index(0),
             semantic: RirParamSemantic::Value,
@@ -13561,10 +13679,10 @@ fn rir_verify_accepts_direct_native_collection_carriers() {
             externs: vec![RirExtern {
                 id: RirExternId::from_index(0),
                 symbol: RirSymbol::new(symbol),
-                kind: RirExternKind::Native(rir::RirNativeExtern {
-                    path: vec!["host".to_string(), symbol.to_string()],
+                kind: RirExternKind::Native(rir::RirNativeExtern::new(
+                    vec!["host".to_string(), symbol.to_string()],
                     abi,
-                }),
+                )),
                 params,
                 ret,
                 abi: extern_abi,
@@ -13628,10 +13746,10 @@ fn rir_verify_rejects_backend_unsupported_native_collection_shapes() {
             externs: vec![RirExtern {
                 id: RirExternId::from_index(0),
                 symbol: RirSymbol::new("bad"),
-                kind: RirExternKind::Native(rir::RirNativeExtern {
-                    path: vec!["host".to_string(), "bad".to_string()],
+                kind: RirExternKind::Native(rir::RirNativeExtern::new(
+                    vec!["host".to_string(), "bad".to_string()],
                     abi,
-                }),
+                )),
                 params: vec![RirExternParam {
                     ty: list,
                     semantic: RirParamSemantic::Value,
@@ -13714,16 +13832,16 @@ fn rir_verify_rejects_native_extern_return_type_mismatch() {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("bad_return"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "bad_return".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "bad_return".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![],
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::Bool),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![],
         ret: RirTypeId::from_index(0),
         abi: rir_abi(vec![], anvyx_runtime::ExternTypeExpr::Bool),
@@ -20414,9 +20532,9 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("substring"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "substring".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "substring".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![],
                 ret: anvyx_runtime::RustReturnAbi::Option(Box::new(
                     anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String),
@@ -20425,7 +20543,7 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![],
         ret: option,
         abi: rir_abi(
@@ -20442,16 +20560,16 @@ fn native_string_return_program() -> RirProgram {
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
         symbol: RirSymbol::new("host_string"),
-        kind: RirExternKind::Native(rir::RirNativeExtern {
-            path: vec!["host".to_string(), "string".to_string()],
-            abi: anvyx_runtime::RustExternAbi {
+        kind: RirExternKind::Native(rir::RirNativeExtern::new(
+            vec!["host".to_string(), "string".to_string()],
+            anvyx_runtime::RustExternAbi {
                 params: vec![],
                 ret: anvyx_runtime::RustReturnAbi::Value(anvyx_runtime::ExternTypeExpr::String),
                 fallible: false,
                 support: anvyx_runtime::RustAbiSupport::Direct,
                 ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
             },
-        }),
+        )),
         params: vec![],
         ret: RirTypeId::from_index(0),
         abi: rir_abi(vec![], anvyx_runtime::ExternTypeExpr::String),
@@ -20704,72 +20822,6 @@ fn add_scalar_global_read(program: &mut Program) {
         local: tmp,
         value: RValue::Use(Operand::Place(root_place(PlaceRoot::Global(global), int))),
     });
-}
-
-fn native_escaping_lambda_subscription_air(kind: NativeLambdaArgKind) -> Program {
-    let mut program = native_escaping_lambda_air_with(kind);
-    if matches!(kind, NativeLambdaArgKind::EscapingCaptureCell) {
-        make_lambda_increment_capture_cell(&mut program);
-    }
-    let int = program.functions[0].signature.params[0].ty;
-    let void = program.externs[0].return_type;
-    let lambda_ty = program.externs[0].params[0].ty;
-    let subscribe = host_subscription_extern(
-        &mut program,
-        "subscribe",
-        vec![(lambda_ty, ParamMode::Value)],
-        int,
-    );
-    set_extern_param_escape(&mut program, subscribe, 0, ParamEscape::Escaping);
-    let trigger =
-        host_subscription_extern(&mut program, "trigger", vec![(int, ParamMode::Value)], void);
-    let close =
-        host_subscription_extern(&mut program, "close", vec![(int, ParamMode::Value)], void);
-    let entry = program.entry.expect("entry function");
-    let function = program.function_mut(entry);
-    let lambda_stmt = function
-        .body
-        .block
-        .stmts
-        .iter()
-        .position(|stmt| matches!(stmt, Statement::Init { .. }))
-        .expect("lambda init");
-    let lambda_local = match &function.body.block.stmts[lambda_stmt] {
-        Statement::Init { local, .. } => *local,
-        _ => unreachable!(),
-    };
-    let sub = air::LocalId::from_index(function.locals.len());
-    function.locals.push(local(int, LocalKind::Temp));
-    function.body.block.stmts.truncate(lambda_stmt + 1);
-    function.body.block.stmts.extend([
-        Statement::Init {
-            local: sub,
-            value: RValue::Call {
-                callee: Callee::Extern(subscribe),
-                args: vec![CallArg::Value(Operand::Place(place(
-                    lambda_local,
-                    lambda_ty,
-                )))],
-            },
-        },
-        Statement::Eval(RValue::Call {
-            callee: Callee::Extern(trigger),
-            args: vec![CallArg::Value(Operand::Place(place(sub, int)))],
-        }),
-        Statement::Eval(RValue::Call {
-            callee: Callee::Extern(trigger),
-            args: vec![CallArg::Value(Operand::Place(place(sub, int)))],
-        }),
-        Statement::Eval(RValue::Call {
-            callee: Callee::Extern(close),
-            args: vec![CallArg::Value(Operand::Place(place(sub, int)))],
-        }),
-        Statement::Eval(RValue::Call {
-            callee: Callee::Extern(trigger),
-            args: vec![CallArg::Value(Operand::Place(place(sub, int)))],
-        }),
-    ]);
-    program
 }
 
 fn native_escaping_lambda_tuple_air(kind: NativeLambdaArgKind) -> Program {
@@ -21124,9 +21176,9 @@ fn native_scoped_lambda_rir() -> RirProgram {
         externs: vec![RirExtern {
             id: RirExternId::from_index(0),
             symbol: RirSymbol::new("apply"),
-            kind: RirExternKind::Native(rir::RirNativeExtern {
-                path: vec!["host".to_string(), "apply".to_string()],
-                abi: anvyx_runtime::RustExternAbi {
+            kind: RirExternKind::Native(rir::RirNativeExtern::new(
+                vec!["host".to_string(), "apply".to_string()],
+                anvyx_runtime::RustExternAbi {
                     params: vec![anvyx_runtime::RustParamAbi::ScopedLambda(
                         native_callback_sig(),
                     )],
@@ -21135,7 +21187,7 @@ fn native_scoped_lambda_rir() -> RirProgram {
                     support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
                     ctx: anvyx_runtime::RustWrapperCtx::None,
                 },
-            }),
+            )),
             params: vec![RirExternParam {
                 ty: lambda_ty,
                 semantic: RirParamSemantic::ScopedLambda,
@@ -22328,13 +22380,6 @@ fn host_escaping_lambda_retained_plan_config() -> RustPlanConfig {
     }
 }
 
-fn host_subscription_plan_config() -> RustPlanConfig {
-    RustPlanConfig {
-        symbol_prefix: "anv".into(),
-        native_providers: vec![host_escaping_lambda_support(), host_subscription_support()],
-    }
-}
-
 fn host_scoped_and_subscription_plan_config() -> RustPlanConfig {
     RustPlanConfig {
         symbol_prefix: "anv".into(),
@@ -22375,13 +22420,6 @@ fn with_escaping_lambda_host(source: emit::RustSource) -> emit::RustSource {
 fn with_scoped_and_subscription_host(source: emit::RustSource) -> emit::RustSource {
     emit::RustSource::new(format!(
         "mod host {{ pub mod host {{ pub fn apply(f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), i64>) {{ assert_eq!(f.call(41).unwrap(), 41); }} pub fn subscribe(f: anvyx_runtime::EscapingLambda<(i64,), i64>) -> i64 {{ assert_eq!(f.call(41).unwrap(), 41); 0 }} }} pub fn subscribe(f: anvyx_runtime::EscapingLambda<(i64,), i64>) -> i64 {{ assert_eq!(f.call(41).unwrap(), 41); 0 }} }}\n{}",
-        source.into_string()
-    ))
-}
-
-fn with_subscription_escaping_lambda_host(source: emit::RustSource) -> emit::RustSource {
-    emit::RustSource::new(format!(
-        "mod host {{ pub mod host {{ use std::cell::RefCell; thread_local! {{ static STORED: RefCell<Vec<Option<anvyx_runtime::EscapingLambda<(i64,), i64>>>> = RefCell::new(Vec::new()); }} pub fn subscribe(f: anvyx_runtime::EscapingLambda<(i64,), i64>) -> i64 {{ STORED.with(|slot| {{ let mut callbacks = slot.borrow_mut(); callbacks.push(Some(f)); (callbacks.len() - 1) as i64 }}) }} pub fn trigger<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, id: i64) {{ STORED.with(|slot| {{ if let Some(Some(f)) = slot.borrow().get(id as usize) {{ assert!(f.call(1).unwrap() > 0); }} }}); }} pub fn close<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, id: i64) {{ STORED.with(|slot| {{ if let Some(callback) = slot.borrow_mut().get_mut(id as usize).and_then(Option::take) {{ let mut callback = callback; assert!(callback.close().unwrap()); }} }}); }} }} }}\n{}",
         source.into_string()
     ))
 }
@@ -22888,10 +22926,10 @@ fn native_extern_rir(
         externs: vec![RirExtern {
             id: RirExternId::from_index(0),
             symbol: RirSymbol::new("native"),
-            kind: RirExternKind::Native(rir::RirNativeExtern {
-                path: vec!["host".to_string(), "native".to_string()],
-                abi: rust_abi,
-            }),
+            kind: RirExternKind::Native(rir::RirNativeExtern::new(
+                vec!["host".to_string(), "native".to_string()],
+                rust_abi,
+            )),
             params,
             ret,
             abi,

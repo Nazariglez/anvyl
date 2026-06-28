@@ -8,9 +8,7 @@ thread_local! {
 
 #[function]
 pub fn retain(cb: EscapingLambda<(i64,), i64>) {
-    CALLBACK.with(|slot| {
-        drop(slot.replace(Some(cb)));
-    });
+    CALLBACK.with(|slot| *slot.borrow_mut() = Some(cb));
 }
 
 #[function(ctx)]

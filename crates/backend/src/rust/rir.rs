@@ -10,7 +10,7 @@ use anvyx_runtime::{
 };
 
 use super::{
-    native,
+    native, native_call,
     place_access::{CollectionLoanBase, CollectionLoanProjection, collection_loan_step_supported},
     rep_policy::{
         LambdaStorageFamily, RustMaterialIntent, RustMaterialSource, RustMaterialization,
@@ -101,27 +101,29 @@ impl RirProgram {
 
     pub(super) fn retained_callback_sigs(&self) -> Vec<RirLambdaSigId> {
         let mut sigs = vec![];
-        for ext in &self.externs {
-            for param in &ext.params {
-                if param.semantic != RirParamSemantic::EscapingLambda {
-                    continue;
-                }
-                let RirType::Lambda(sig) = self.types[param.ty.index()] else {
-                    continue;
-                };
-                if !sigs.contains(&sig) {
-                    sigs.push(sig);
-                }
+        for sig in self.retained_callback_sig_refs() {
+            if !sigs.contains(&sig) {
+                sigs.push(sig);
             }
         }
         sigs
     }
 
     pub(super) fn has_retained_callbacks(&self) -> bool {
-        self.externs.iter().any(|ext| {
-            ext.params
-                .iter()
-                .any(|param| param.semantic == RirParamSemantic::EscapingLambda)
+        self.retained_callback_sig_refs().next().is_some()
+    }
+
+    fn retained_callback_sig_refs(&self) -> impl Iterator<Item = RirLambdaSigId> + '_ {
+        self.externs.iter().flat_map(|ext| {
+            ext.params.iter().filter_map(|param| {
+                if param.semantic != RirParamSemantic::EscapingLambda {
+                    return None;
+                }
+                match self.types[param.ty.index()] {
+                    RirType::Lambda(sig) => Some(sig),
+                    _ => None,
+                }
+            })
         })
     }
 
@@ -1348,6 +1350,16 @@ pub struct RirNativeExtern {
     pub abi: RustExternAbi,
 }
 
+impl RirNativeExtern {
+    pub(super) fn new(path: Vec<String>, abi: RustExternAbi) -> Self {
+        Self { path, abi }
+    }
+
+    pub(super) fn call_plan(&self, retained_callbacks: bool) -> native_call::NativeCallPlan {
+        native_call::NativeCallPlan::for_abi(&self.abi, retained_callbacks)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RirExternParam {
     pub ty: RirTypeId,
@@ -2038,11 +2050,8 @@ fn native_extern_signature_ok(
         && ext.abi.params.len() == ext.params.len()
         && native::rust_abi_matches_air(&native.abi.params, &native.abi.ret, &ext.abi)
         && native
-            .abi
-            .params
-            .iter()
-            .zip(&ext.params)
-            .all(|(abi, param)| native_param_abi_ok(abi, *param))
+            .call_plan(program.has_retained_callbacks())
+            .matches_signature(&ext.params)
         && native_hidden_ctx_borrows_ok(program, &native.abi, ext)
         && ext
             .abi
@@ -2058,7 +2067,7 @@ fn native_hidden_ctx_borrows_ok(
     abi: &RustExternAbi,
     ext: &RirExtern,
 ) -> bool {
-    abi.ctx != anvyx_runtime::RustWrapperCtx::HiddenRuntime
+    !native_call::NativeHiddenCtxPlan::from_abi(abi.ctx).borrows_runtime()
         || abi.params.iter().zip(&ext.params).all(|(abi, param)| {
             !matches!(abi, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_))
                 || !matches!(
@@ -2169,48 +2178,6 @@ fn extern_value_supported(ty: &ExternTypeExpr) -> bool {
         | ExternTypeExpr::Any
         | ExternTypeExpr::Slice(_)
         | ExternTypeExpr::Callback(_) => false,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct NativeParamAbi {
-    pub semantic: RirParamSemantic,
-    pub abi: RirParamAbi,
-}
-
-pub(super) fn rust_param_abi(abi: &RustParamAbi) -> NativeParamAbi {
-    let (semantic, abi) = match abi {
-        RustParamAbi::Value(_)
-        | RustParamAbi::OwnedNamed(_)
-        | RustParamAbi::InitField(_)
-        | RustParamAbi::Option(_)
-        | RustParamAbi::Result(_, _)
-        | RustParamAbi::Slice(_) => (RirParamSemantic::Value, RirParamAbi::Value),
-        RustParamAbi::Borrow(_) => (RirParamSemantic::SharedBorrow, RirParamAbi::SharedBorrow),
-        RustParamAbi::MutBorrow(_) => (RirParamSemantic::MutBorrow, RirParamAbi::MutBorrow),
-        RustParamAbi::MutPlace(_) => (RirParamSemantic::MutPlace, RirParamAbi::MutPlace),
-        RustParamAbi::ScopedLambda(_) => {
-            (RirParamSemantic::ScopedLambda, RirParamAbi::ScopedLambda)
-        }
-        RustParamAbi::EscapingLambda(_) => (
-            RirParamSemantic::EscapingLambda,
-            RirParamAbi::EscapingLambda,
-        ),
-    };
-    NativeParamAbi { semantic, abi }
-}
-
-fn native_param_abi_ok(abi: &RustParamAbi, param: RirExternParam) -> bool {
-    let native = rust_param_abi(abi);
-    param.semantic == native.semantic
-        && param.abi == native.abi
-        && param.escape == native_param_escape(abi)
-}
-
-fn native_param_escape(abi: &RustParamAbi) -> RirParamEscape {
-    match abi {
-        RustParamAbi::EscapingLambda(_) => RirParamEscape::Escaping,
-        _ => RirParamEscape::NonEscaping,
     }
 }
 
@@ -6253,7 +6220,7 @@ impl VerifyCx<'_> {
         ret: RirTypeId,
     ) {
         let native_call = matches!(callee, RirCallTarget::Extern(_));
-        let (expected, callee_ret, init_fields) = match callee {
+        let (expected, callee_ret, init_fields, native_plan) = match callee {
             RirCallTarget::Function(id) => {
                 self.check_function_id(RirVerifySite::RValue(function_id, stmt), id);
                 match self.program.functions.get(id.index()) {
@@ -6265,6 +6232,7 @@ impl VerifyCx<'_> {
                             .collect::<Vec<_>>(),
                         function.ret.ty,
                         vec![false; function.params.len()],
+                        None,
                     ),
                     None => return,
                 }
@@ -6288,6 +6256,11 @@ impl VerifyCx<'_> {
                                 .collect::<Vec<_>>(),
                             ext.ret,
                             init_fields,
+                            Some(match &ext.kind {
+                                RirExternKind::Native(native) => {
+                                    native.call_plan(self.program.has_retained_callbacks())
+                                }
+                            }),
                         )
                     }
                     None => return,
@@ -6318,6 +6291,7 @@ impl VerifyCx<'_> {
                         .collect::<Vec<_>>(),
                     sig_decl.ret,
                     vec![false; sig_decl.params.len()],
+                    None,
                 )
             }
         };
@@ -6354,6 +6328,13 @@ impl VerifyCx<'_> {
                     arg,
                     RirCallArg::ScopedLambda { .. } | RirCallArg::EscapingLambda { .. }
                 ) && !native_call
+            {
+                self.push(site, RirVerifyErrorKind::CallArgMode);
+            }
+            let arg_is_string = matches!(self.ty(ty), Some(RirType::String));
+            if native_plan
+                .as_ref()
+                .is_some_and(|plan| plan.rejects_reentry_rir_arg(index, arg, arg_is_string))
             {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }

@@ -1,8 +1,10 @@
 use super::{
     analysis,
     dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
+    native_call::{NativeArgBoundary, NativeCallPlan},
     place::RustPlaces,
     rep_policy::{LambdaTraceAction, RustRepPolicy, RustTracePlan},
+    retained_callbacks::RetainedCallbackSigPlan,
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirCoreEnumKind,
@@ -177,9 +179,10 @@ impl EmitCx<'_> {
             (storage.symbol.as_str().to_string(), storage_ty, register)
         }));
         heap_types.extend(retained_sigs.iter().map(|sig| {
-            let record = target::callback_record_symbol(sig.index());
+            let plan = RetainedCallbackSigPlan::new(*sig);
+            let record = plan.record_symbol();
             (
-                format!("callback_record_sig{}", sig.index()),
+                plan.heap_type_field(),
                 format!("{record}<'cx>"),
                 target::heap_register(self.trace_plan.needs_lambda_sig_trace(*sig)),
             )
@@ -424,9 +427,13 @@ impl EmitCx<'_> {
             .block(format_args!("impl<'cx> Drop for {runtime}<'cx>"), |w| {
                 w.block("fn drop(&mut self)", |w| {
                     w.line(format_args!(
-                        "let _ = {};",
-                        target::owner_detach("self.owner")
+                        "if let Err(error) = {} {{",
+                        target::owner_begin_shutdown("self.owner")
                     ));
+                    w.indented(|w| {
+                        w.line("debug_assert!(false, \"runtime shutdown failed: {}\", error.message());");
+                    });
+                    w.line("}");
                 });
             });
         self.w.blank();
@@ -443,7 +450,8 @@ impl EmitCx<'_> {
         let sigs = self.retained_callback_sigs.clone();
         let policy = RustRepPolicy::new(self.program);
         for sig in &sigs {
-            let record = target::callback_record_symbol(sig.index());
+            let plan = RetainedCallbackSigPlan::new(*sig);
+            let record = plan.record_symbol();
             let lambda = policy.lambda_sig_storage_ty(*sig);
             self.w.block(format_args!("struct {record}<'cx>"), |w| {
                 w.line(format_args!("lambda: {lambda},"));
@@ -472,8 +480,9 @@ impl EmitCx<'_> {
         self.w.line("#[derive(Default)]");
         self.w.block(format_args!("struct {registry}<'cx>"), |w| {
             for sig in &sigs {
-                let field = target::callback_table_field(sig.index());
-                let record = target::callback_record_symbol(sig.index());
+                let plan = RetainedCallbackSigPlan::new(*sig);
+                let field = plan.table_field();
+                let record = plan.record_symbol();
                 let root = target::root_id_ty(&format!("{record}<'cx>"));
                 w.line(format_args!(
                     "{field}: Vec<{}>,",
@@ -486,8 +495,9 @@ impl EmitCx<'_> {
         self.w
             .block(format_args!("impl<'cx> {registry}<'cx>"), |w| {
                 for sig in &sigs {
-                    let field = target::callback_table_field(sig.index());
-                    let record = target::callback_record_symbol(sig.index());
+                    let plan = RetainedCallbackSigPlan::new(*sig);
+                    let field = plan.table_field();
+                    let record = plan.record_symbol();
                     let root = target::root_id_ty(&format!("{record}<'cx>"));
                     w.block(
                         format_args!(
@@ -542,20 +552,20 @@ impl EmitCx<'_> {
 
     fn emit_callback_thunks(&mut self) {
         for sig_id in self.retained_callback_sigs.clone() {
-            let sig = &self.program.lambda_sigs[sig_id.index()];
+            let plan = RetainedCallbackSigPlan::new(sig_id);
+            let sig = &self.program.lambda_sigs[plan.sig_index()];
             let args_ty = self.callback_args_ty(sig);
             let ret_ty = self.callback_ret_ty(sig);
-            let call_thunk = target::callback_call_thunk_symbol(sig_id.index());
-            let close_thunk = target::callback_close_thunk_symbol(sig_id.index());
+            let call_thunk = plan.call_thunk_symbol();
+            let close_thunk = plan.close_thunk_symbol();
             let key_ty = target::callback_key_ty();
             let owner_ty = target::runtime_owner_handle_ty();
             let result_ret = target::result_ty(&ret_ty);
             let inner = target::generated_runtime_inner_symbol();
-            let field = target::callback_table_field(sig_id.index());
-            let expected_table = sig_id.index() + 1;
-            let expected_signature = sig_id.index() + 1;
+            let field = plan.table_field();
             let key_check = format!(
-                "key.__anvyx_check_identity(std::num::NonZeroU64::new({expected_table}).unwrap(), std::num::NonZeroU64::new({expected_signature}).unwrap())?;"
+                "{}?;",
+                target::callback_check_identity("key", plan.table_id(), plan.signature_id())
             );
             let lambda_call_args = [
                 "&mut rt".to_string(),
@@ -579,7 +589,10 @@ impl EmitCx<'_> {
                 ),
                 |w| {
                     w.line(&key_check);
-                    w.line("let owner_entry = owner.__anvyx_enter(key.owner_id(), key.shutdown_generation())?;");
+                    w.line(format_args!(
+                        "let owner_entry = {}?;",
+                        target::owner_enter("owner", "key.owner_id()", "key.shutdown_generation()")
+                    ));
                     w.line(format_args!(
                         "let mut inner_ptr = {}.cast::<{inner}<'_>>();",
                         target::owner_entry_ptr("owner_entry")
@@ -661,7 +674,10 @@ impl EmitCx<'_> {
                 ),
                 |w| {
                     w.line(&key_check);
-                    w.line("let owner_entry = owner.__anvyx_enter(key.owner_id(), key.shutdown_generation())?;");
+                    w.line(format_args!(
+                        "let owner_entry = {}?;",
+                        target::owner_enter("owner", "key.owner_id()", "key.shutdown_generation()")
+                    ));
                     w.line(format_args!(
                         "let inner = unsafe {{ {} }};",
                         target::non_null_cast_mut(
@@ -670,7 +686,9 @@ impl EmitCx<'_> {
                         )
                     ));
                     w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                    w.line("let Some(slot) = table.get_mut(key.index()) else { return Ok(false); };");
+                    w.line(
+                        "let Some(slot) = table.get_mut(key.index()) else { return Ok(false); };",
+                    );
                     w.line("let (close, root) = slot.close(key);");
                     w.line("if let Some(root) = root {");
                     w.indented(|w| w.line("inner.heap.remove_root(&root);"));
@@ -1477,6 +1495,10 @@ impl EmitCx<'_> {
                             w.line(format_args!(
                                 "let callbacks = state.5.cast::<{callbacks_ty}>();"
                             ));
+                            w.line(format_args!(
+                                "let __anv_scoped_entry = {}?;",
+                                target::owner_enter_current("owner")
+                            ));
                         }
                         w.line(destructure);
                         let call_args = if retained_callbacks {
@@ -1486,10 +1508,23 @@ impl EmitCx<'_> {
                         };
                         let call = format!("state.0.call({})", comma(call_args));
                         if fallible {
-                            w.line(call);
+                            if retained_callbacks {
+                                w.line(format_args!("let __anv_scoped_result = {call};"));
+                                w.line("drop(__anv_scoped_entry);");
+                                w.line("__anv_scoped_result");
+                            } else {
+                                w.line(call);
+                            }
                         } else if ret_ty == "()" {
                             w.line(format_args!("{call};"));
+                            if retained_callbacks {
+                                w.line("drop(__anv_scoped_entry);");
+                            }
                             w.line("Ok(())");
+                        } else if retained_callbacks {
+                            w.line(format_args!("let __anv_scoped_result = {call};"));
+                            w.line("drop(__anv_scoped_entry);");
+                            w.line("Ok(__anv_scoped_result)");
                         } else {
                             w.line(format_args!("Ok({call})"));
                         }
@@ -3507,13 +3542,14 @@ impl EmitCx<'_> {
         rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
-        self.prepared_native_call_expr(function, args, &[], &[], rendered, render)
+        self.prepared_native_call_expr(function, args, None, &[], &[], rendered, render)
     }
 
     fn prepared_native_call_expr(
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
+        native_plan: Option<&NativeCallPlan>,
         abis: &[anvyx_runtime::RustParamAbi],
         tys: &[RirTypeId],
         mut rendered: Vec<String>,
@@ -3521,26 +3557,50 @@ impl EmitCx<'_> {
     ) -> String {
         let mut prelude = vec![];
         let mut resource_borrows = vec![];
+        let values = RustValues::new(self.program, function);
         for (index, arg) in args.iter().enumerate() {
-            let (mut stmts, mut expr) = self.prepared_call_arg(function, index, arg);
-            prelude.append(&mut stmts);
-            if let (Some(abi), Some(ty)) = (abis.get(index), tys.get(index)) {
-                if let anvyx_runtime::RustParamAbi::InitField(inner) = abi {
-                    expr = match arg {
-                        RirCallArg::InitFieldProvided(_) => {
-                            let value = self.native_arg_expr(inner, *ty, expr);
-                            target::init_field_provided(&value)
-                        }
-                        RirCallArg::InitFieldOmitted => target::init_field_omitted(),
-                        _ => unreachable!("verified init field ABI"),
-                    };
-                } else if let Some(mutable) = self.native_ref_borrow_arg(abi, *ty) {
-                    let arg = format!("__anv_ref_arg_{index}");
-                    resource_borrows.push((expr, arg.clone(), mutable));
-                    expr = arg;
+            let (stmts, mut expr) = self.prepared_call_arg(function, index, arg);
+            let (Some(abi), Some(ty)) = (abis.get(index), tys.get(index)) else {
+                prelude.extend(stmts);
+                rendered.push(expr);
+                continue;
+            };
+            let boundary = native_plan.map_or(NativeArgBoundary::Direct, |plan| {
+                plan.rir_arg_boundary(
+                    index,
+                    arg,
+                    matches!(self.program.types[ty.index()], RirType::String),
+                    self.native_arg_is_native_ref(*ty),
+                )
+            });
+            if boundary == NativeArgBoundary::SnapshotString {
+                let tmp = format!("__anv_native_arg_{index}");
+                let snapshot = format!("{}::from({expr})", target::anv_string_ty());
+                let init = if stmts.is_empty() {
+                    snapshot
                 } else {
-                    expr = self.native_arg_expr(abi, *ty, expr);
-                }
+                    format!("{{ {} {snapshot} }}", stmts.join(" "))
+                };
+                prelude.push(format!("let {tmp} = {init};"));
+                expr = values.borrow_temp_arg(*ty, &tmp);
+            } else {
+                prelude.extend(stmts);
+            }
+            if let anvyx_runtime::RustParamAbi::InitField(inner) = abi {
+                expr = match arg {
+                    RirCallArg::InitFieldProvided(_) => {
+                        let value = self.native_arg_expr(inner, *ty, expr);
+                        target::init_field_provided(&value)
+                    }
+                    RirCallArg::InitFieldOmitted => target::init_field_omitted(),
+                    _ => unreachable!("verified init field ABI"),
+                };
+            } else if let NativeArgBoundary::NativeRefBorrow { mutable } = boundary {
+                let arg = format!("__anv_ref_arg_{index}");
+                resource_borrows.push((expr, arg.clone(), mutable));
+                expr = arg;
+            } else {
+                expr = self.native_arg_expr(abi, *ty, expr);
             }
             rendered.push(expr);
         }
@@ -3555,20 +3615,11 @@ impl EmitCx<'_> {
         }
     }
 
-    fn native_ref_borrow_arg(
-        &self,
-        abi: &anvyx_runtime::RustParamAbi,
-        ty: RirTypeId,
-    ) -> Option<bool> {
-        let native_ref = matches!(
+    fn native_arg_is_native_ref(&self, ty: RirTypeId) -> bool {
+        matches!(
             self.program.types[ty.index()],
             RirType::Struct(id) if self.program.structs[id.index()].native_ref
-        );
-        match (native_ref, abi) {
-            (true, anvyx_runtime::RustParamAbi::Borrow(_)) => Some(false),
-            (true, anvyx_runtime::RustParamAbi::MutBorrow(_)) => Some(true),
-            _ => None,
-        }
+        )
     }
 
     fn native_array_map_expr(expr: &str, body: &str) -> String {
@@ -4064,11 +4115,12 @@ impl EmitCx<'_> {
     ) -> (Vec<String>, String) {
         let values = RustValues::new(self.program, function);
         let lambda = values.value_operand(callee);
-        let sig_data = &self.program.lambda_sigs[sig.index()];
+        let plan = RetainedCallbackSigPlan::new(sig);
+        let sig_data = &self.program.lambda_sigs[plan.sig_index()];
         let args_ty = self.callback_args_ty(sig_data);
         let ret_ty = self.callback_ret_ty(sig_data);
-        let record = target::callback_record_symbol(sig.index());
-        let field = target::callback_table_field(sig.index());
+        let record = plan.record_symbol();
+        let field = plan.table_field();
         let callback_ctor = target::escaping_lambda_ctor_ty(&args_ty, &ret_ty);
         let key = format!("__anv_callback_key_{index}");
         let root = format!("__anv_callback_root_{index}");
@@ -4077,16 +4129,16 @@ impl EmitCx<'_> {
         let index_var = format!("__anv_callback_index_{index}");
         let generation = format!("__anv_callback_generation_{index}");
         let arg = format!("__anv_callback_arg_{index}");
-        let table_id = sig.index() + 1;
-        let signature_id = sig.index() + 1;
+        let table_id = plan.table_id();
+        let signature_id = plan.signature_id();
         (
             vec![
                 format!(
                     "let {record_var} = {record} {{ lambda: {lambda}, _brand: std::marker::PhantomData }};"
                 ),
                 format!(
-                    "let {handle} = rt.heap().alloc(types.callback_record_sig{}, {record_var});",
-                    sig.index()
+                    "let {handle} = rt.heap().alloc(types.{}, {record_var});",
+                    plan.heap_type_field()
                 ),
                 format!("let {root} = rt.heap().root(&{handle});"),
                 format!(
@@ -4098,8 +4150,8 @@ impl EmitCx<'_> {
                 ),
                 format!(
                     "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {key}, {}, {}) }};",
-                    target::callback_call_thunk_symbol(sig.index()),
-                    target::callback_close_thunk_symbol(sig.index())
+                    plan.call_thunk_symbol(),
+                    plan.close_thunk_symbol()
                 ),
             ],
             arg,
@@ -4720,42 +4772,40 @@ impl EmitCx<'_> {
         args: &[RirCallArg],
     ) -> String {
         let ext = &self.program.externs[id.index()];
-        let (symbol, rendered, fallible, ret_abi, param_abis) = match &ext.kind {
-            RirExternKind::Native(native) => {
-                let rendered = match native.abi.ctx {
-                    anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
-                    anvyx_runtime::RustWrapperCtx::None => vec![],
-                };
-                (
-                    native.path.join("::"),
-                    rendered,
-                    native.abi.fallible,
-                    &native.abi.ret,
-                    native.abi.params.as_slice(),
-                )
-            }
+        let RirExternKind::Native(native) = &ext.kind;
+        let rendered = match native.abi.ctx {
+            anvyx_runtime::RustWrapperCtx::HiddenRuntime => target::native_call_args([]),
+            anvyx_runtime::RustWrapperCtx::None => vec![],
         };
-        let suspend_entry = self.has_retained_callbacks();
+        let symbol = native.path.join("::");
+        let native_plan = native.call_plan(self.has_retained_callbacks());
+        let suspend_entry = native_plan.provider_entry().suspends_runtime_entry();
         let param_tys = ext.params.iter().map(|param| param.ty).collect::<Vec<_>>();
         let call = self.prepared_native_call_expr(
             function,
             args,
-            param_abis,
+            Some(&native_plan),
+            native.abi.params.as_slice(),
             &param_tys,
             rendered,
             |rendered| {
                 let call = format!("{symbol}({rendered})");
                 let call = if suspend_entry {
+                    let suspend = target::owner_suspend_for_provider("owner");
                     format!(
-                        "{{ let __anv_provider_entry = owner.__anvyx_suspend_entry_for_provider()?; let __anv_provider_result = {call}; drop(__anv_provider_entry); __anv_provider_result }}"
+                        "{{ let __anv_provider_entry = {suspend}?; let __anv_provider_result = {call}; drop(__anv_provider_entry); __anv_provider_result }}"
                     )
                 } else {
                     call
                 };
-                if fallible { format!("{call}?") } else { call }
+                if native.abi.fallible {
+                    format!("{call}?")
+                } else {
+                    call
+                }
             },
         );
-        self.native_return_call(function, ext.ret, ret_abi, call)
+        self.native_return_call(function, ext.ret, &native.abi.ret, call)
     }
 
     fn dataref_alloc(

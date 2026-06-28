@@ -445,21 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn slot_close_cleans_root_after_guard_drop_fallback() {
-        let (owner, _runtime) = owner();
-        let mut slot = CallbackSlot::default();
-        let key = key(slot.insert(7).unwrap());
-        let (_, guard) = slot.begin_invocation(&owner, key).unwrap();
-
-        assert_eq!(slot.close(key).0.action, CallbackCloseAction::None);
-        drop(guard);
-
-        let (close, root) = slot.close(key);
-        assert!(!close.closed);
-        assert_eq!(root, Some(7));
-    }
-
-    #[test]
     fn slot_close_during_invocation_defers_root_removal() {
         let (owner, _runtime) = owner();
         let mut slot = CallbackSlot::default();

@@ -1,0 +1,14 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: b
+
+import pkg:host.host { retain, retain_second, fire, fire_second, close, close_second };
+
+fn main() {
+    retain(|| { retain_second(|| println("b")); });
+    fire();
+    fire_second();
+    close();
+    close_second();
+}

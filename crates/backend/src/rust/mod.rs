@@ -4,10 +4,12 @@ mod dataref_place;
 pub mod emit;
 mod mut_place;
 mod native;
+mod native_call;
 mod place;
 mod place_access;
 pub mod profile;
 pub mod rep_policy;
+mod retained_callbacks;
 pub mod rir;
 #[cfg(test)]
 mod source_job;
@@ -1374,7 +1376,7 @@ impl<'a> PlanCx<'a> {
             let native = self.native_extern(air_id, decl)?;
             let params = self.extern_params(decl, &native);
             let ret = self.type_map[&decl.return_type];
-            let kind = Self::extern_kind(&native);
+            let kind = self.extern_kind(&native);
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -1408,11 +1410,11 @@ impl<'a> PlanCx<'a> {
             .collect()
     }
 
-    fn extern_kind(native: &native::ResolvedExtern<'_>) -> RirExternKind {
-        RirExternKind::Native(RirNativeExtern {
-            path: native_path(&native.binding.path),
-            abi: native.binding.abi.clone(),
-        })
+    fn extern_kind(&self, native: &native::ResolvedExtern<'_>) -> RirExternKind {
+        RirExternKind::Native(RirNativeExtern::new(
+            native_path(&native.binding.path),
+            native.binding.abi.clone(),
+        ))
     }
 
     fn native_type_binding(
@@ -3248,6 +3250,10 @@ impl<'a> PlanCx<'a> {
         locals: &mut Vec<RirLocal>,
         zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
+        if let Callee::Extern(id) = callee {
+            return self.plan_native_call(function_id, *id, args, locals, zero_env_function_values);
+        }
+
         let (target, ty, callee_stmts, expected_args) = match callee {
             Callee::Function(id) => {
                 let function = self.air.function(*id);
@@ -3263,16 +3269,7 @@ impl<'a> PlanCx<'a> {
                         .collect::<Vec<_>>(),
                 )
             }
-            Callee::Extern(id) => {
-                let ext = self.air.extern_decl(*id);
-                let native = self.native_extern(*id, ext)?;
-                (
-                    RirCallTarget::Extern(self.extern_map[id]),
-                    self.type_map[&ext.return_type],
-                    vec![],
-                    native.params.iter().map(|param| param.semantic).collect(),
-                )
-            }
+            Callee::Extern(_) => unreachable!("extern calls are planned by plan_native_call"),
             Callee::Lambda(operand) => {
                 let air_ty = self.operand_ty(operand);
                 let TypeData::Function(sig_ty) = self.air.type_arena.data(air_ty) else {
@@ -3321,6 +3318,60 @@ impl<'a> PlanCx<'a> {
             },
             post_stmts: vec![],
         })
+    }
+
+    fn plan_native_call(
+        &self,
+        function_id: FunctionId,
+        id: ExternId,
+        args: &[CallArg],
+        locals: &mut Vec<RirLocal>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+    ) -> Result<PlannedRValue, RustPlanError> {
+        let ext = self.air.extern_decl(id);
+        let native = self.native_extern(id, ext)?;
+        if args.len() != native.params.len() {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function_id),
+                RustTargetGapKind::UnsupportedCallArgMode,
+            ));
+        }
+
+        let mut stmts = vec![];
+        let mut planned_args = vec![];
+        for (arg, param) in args.iter().zip(&native.params) {
+            let planned =
+                self.plan_native_arg(function_id, arg, *param, locals, zero_env_function_values)?;
+            stmts.extend(planned.stmts);
+            planned_args.push(planned.arg);
+        }
+
+        Ok(PlannedRValue {
+            stmts,
+            value: RirRValue::Call {
+                callee: RirCallTarget::Extern(self.extern_map[&id]),
+                args: planned_args,
+                ty: self.type_map[&ext.return_type],
+            },
+            post_stmts: vec![],
+        })
+    }
+
+    fn plan_native_arg(
+        &self,
+        function: FunctionId,
+        arg: &CallArg,
+        param: native_call::NativeParamAbi,
+        locals: &mut Vec<RirLocal>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+    ) -> Result<PlannedCallArg, RustPlanError> {
+        self.plan_arg(
+            function,
+            arg,
+            param.semantic,
+            locals,
+            zero_env_function_values,
+        )
     }
 
     fn plan_collection_slot_scope(

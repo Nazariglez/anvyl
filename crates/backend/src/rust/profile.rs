@@ -13,7 +13,7 @@ use anvyx_frontend::{
 use anvyx_runtime::RustProviderSupport;
 
 use super::{
-    CollectionAccessOp, native,
+    CollectionAccessOp, native, native_call,
     place_access::{
         PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
     },
@@ -141,7 +141,6 @@ fn lambda_storage_gap_kind(gap: LambdaStorageGap) -> ProfileErrorKind {
     match gap {
         LambdaStorageGap::MapKeyEqualityHash => ProfileErrorKind::UnsupportedMapKey,
         LambdaStorageGap::GlobalRooting => ProfileErrorKind::UnsupportedGlobalRooting,
-        LambdaStorageGap::ExternBoundary => ProfileErrorKind::UnsupportedLambdaExternBoundary,
         LambdaStorageGap::StorageImplementation
         | LambdaStorageGap::ProvenanceOrigin
         | LambdaStorageGap::Lifetime
@@ -597,12 +596,16 @@ impl ProfileCx<'_> {
             }
             RValue::Call { callee, args } => {
                 self.check_callee(site, callee);
-                let expected = self.callee_param_semantics(callee);
-                let reentry_boundary =
-                    matches!(callee, Callee::Extern(_)) && self.has_retained_callbacks();
+                let native_plan = self.native_call_profile_plan(callee);
+                let expected = native_plan.as_ref().map_or_else(
+                    || self.callee_param_semantics(callee),
+                    native_call::NativeCallPlan::param_semantics,
+                );
                 for (index, arg) in args.iter().enumerate() {
                     self.check_call_arg(site, arg, expected.get(index).copied());
-                    if reentry_boundary && Self::call_arg_exposes_runtime_borrow(arg) {
+                    if native_plan.as_ref().is_some_and(|plan| {
+                        plan.rejects_reentry_arg(index, arg, self.call_arg_is_string(arg))
+                    }) {
                         self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                     }
                 }
@@ -1027,7 +1030,7 @@ impl ProfileCx<'_> {
                 .iter()
                 .map(|param| rir::source_param_semantic(param.mode))
                 .collect(),
-            Callee::Extern(id) => self.extern_param_semantics(*id),
+            Callee::Extern(_) => vec![],
             Callee::Lambda(operand) => match self.program.type_arena.data(self.operand_ty(operand))
             {
                 TypeData::Function(sig) => sig
@@ -1040,26 +1043,34 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn extern_param_semantics(&self, id: ExternId) -> Vec<rir::RirParamSemantic> {
-        native::resolve_extern(self.native_providers, self.program.extern_decl(id))
-            .map(|native| native.params.iter().map(|param| param.semantic).collect())
-            .unwrap_or_default()
-    }
-
-    fn has_retained_callbacks(&self) -> bool {
-        self.program.externs.iter().any(|ext| {
-            ext.params.iter().any(|param| {
-                param.escape == ParamEscape::Escaping
-                    && matches!(
-                        self.program.type_arena.data(param.ty),
-                        TypeData::Function(_)
-                    )
+    fn native_call_profile_plan(&self, callee: &Callee) -> Option<native_call::NativeCallPlan> {
+        let Callee::Extern(id) = callee else {
+            return None;
+        };
+        native::resolve_extern(self.native_providers, self.program.extern_decl(*id))
+            .ok()
+            .map(|native| {
+                native_call::NativeCallPlan::new(
+                    native.params,
+                    native_call::air_has_retained_callbacks(self.program),
+                )
             })
-        })
     }
 
-    fn call_arg_exposes_runtime_borrow(arg: &CallArg) -> bool {
-        matches!(arg, CallArg::SharedBorrow(_) | CallArg::MutBorrow(_))
+    fn call_arg_is_string(&self, arg: &CallArg) -> bool {
+        match arg {
+            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+                matches!(self.program.type_arena.data(place.ty), TypeData::String)
+            }
+            CallArg::SharedStringConst(_) => true,
+            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+                matches!(
+                    self.program.type_arena.data(self.operand_ty(operand)),
+                    TypeData::String
+                )
+            }
+            CallArg::InitFieldOmitted => false,
+        }
     }
 
     fn check_call_arg(

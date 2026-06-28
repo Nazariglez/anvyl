@@ -1,4 +1,5 @@
 use super::{
+    native_call::NativeArgBoundary,
     place::{mut_place_dynamic_facts, place_dynamic_facts},
     rir::{
         RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionAccess,
@@ -140,7 +141,10 @@ fn rvalue_calls_fallible(
                         RirCallTarget::Function(id) => fallible[id.index()],
                         RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
                             RirExternKind::Native(native) => {
-                                program.has_retained_callbacks()
+                                native
+                                    .call_plan(program.has_retained_callbacks())
+                                    .provider_entry()
+                                    .suspends_runtime_entry()
                                     || native.abi.fallible
                                     || native_ref_borrow_conversion_fallible(program, *id, args)
                             }
@@ -671,16 +675,23 @@ fn native_ref_borrow_conversion_fallible(
     ext: super::rir::RirExternId,
     args: &[RirCallArg],
 ) -> bool {
+    let RirExternKind::Native(native) = &program.externs[ext.index()].kind;
+    let plan = native.call_plan(program.has_retained_callbacks());
     program.externs[ext.index()]
         .params
         .iter()
         .zip(args)
-        .any(|(param, arg)| {
-            matches!(arg, RirCallArg::SharedBorrow(_) | RirCallArg::MutBorrow(_))
-                && matches!(
-                    program.types[param.ty.index()],
-                    RirType::Struct(id) if program.structs[id.index()].native_ref
-                )
+        .enumerate()
+        .any(|(index, (param, arg))| {
+            let native_ref = matches!(
+                program.types[param.ty.index()],
+                RirType::Struct(id) if program.structs[id.index()].native_ref
+            );
+            let string = matches!(program.types[param.ty.index()], RirType::String);
+            matches!(
+                plan.rir_arg_boundary(index, arg, string, native_ref),
+                NativeArgBoundary::NativeRefBorrow { .. }
+            )
         })
 }
 

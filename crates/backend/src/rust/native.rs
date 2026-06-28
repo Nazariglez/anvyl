@@ -4,11 +4,11 @@ use anvyx_runtime::{
     RustTypeBinding,
 };
 
-use super::rir::{self, NativeParamAbi};
+use super::{native_call, rir};
 
 pub(super) struct ResolvedExtern<'a> {
     pub binding: &'a RustExternBinding,
-    pub params: Vec<NativeParamAbi>,
+    pub params: Vec<native_call::NativeParamAbi>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,12 @@ pub(super) fn resolve_extern<'a>(
     {
         return Err(ResolveExternError::UnsupportedRustAbi);
     }
-    let params = binding.abi.params.iter().map(rir::rust_param_abi).collect();
+    let params = binding
+        .abi
+        .params
+        .iter()
+        .map(native_call::classify_param)
+        .collect();
     Ok(ResolvedExtern { binding, params })
 }
 

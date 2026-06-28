@@ -105,6 +105,10 @@ pub(super) fn callback_table_field(sig: usize) -> String {
     format!("sig{sig}")
 }
 
+pub(super) fn callback_record_heap_type_field(sig: usize) -> String {
+    format!("callback_record_sig{sig}")
+}
+
 pub(super) fn callback_call_thunk_symbol(sig: usize) -> String {
     format!("__anv_callback_call_sig{sig}")
 }
@@ -113,12 +117,22 @@ pub(super) fn callback_close_thunk_symbol(sig: usize) -> String {
     format!("__anv_callback_close_sig{sig}")
 }
 
+pub(super) fn escaping_lambda_ty(args: &str, ret: &str) -> String {
+    format!("{}<{args}, {ret}>", rt_path("EscapingLambda"))
+}
+
 pub(super) fn escaping_lambda_ctor_ty(args: &str, ret: &str) -> String {
     format!("{}::<{args}, {ret}>", rt_path("EscapingLambda"))
 }
 
 pub(super) fn callback_key_ty() -> String {
     rt_path("CallbackKey")
+}
+
+pub(super) fn callback_check_identity(key: &str, table_id: usize, signature_id: usize) -> String {
+    format!(
+        "{key}.__anvyx_check_identity(std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap())"
+    )
 }
 
 pub(super) fn callback_slot_ty(root: &str) -> String {
@@ -161,12 +175,20 @@ pub(super) fn owner_attach(owner: &str, ptr: &str) -> String {
     format!("{owner}.__anvyx_attach_owner_ptr({ptr})")
 }
 
-pub(super) fn owner_detach(owner: &str) -> String {
-    format!("{owner}.__anvyx_detach_owner_ptr()")
+pub(super) fn owner_begin_shutdown(owner: &str) -> String {
+    format!("{owner}.__anvyx_begin_shutdown()")
 }
 
 pub(super) fn owner_enter_current(owner: &str) -> String {
     format!("{owner}.__anvyx_enter_current()")
+}
+
+pub(super) fn owner_enter(owner: &str, owner_id: &str, shutdown_generation: &str) -> String {
+    format!("{owner}.__anvyx_enter({owner_id}, {shutdown_generation})")
+}
+
+pub(super) fn owner_suspend_for_provider(owner: &str) -> String {
+    format!("{owner}.__anvyx_suspend_entry_for_provider()")
 }
 
 pub(super) fn owner_entry_ptr(entry: &str) -> String {
@@ -975,20 +997,21 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, box_pin_struct_start,
-        checked_index, checked_range, ctx_roots_ty, dataref_place_heap_type_access,
-        dataref_place_heap_type_field, dataref_place_ops_ty, erased_handle_ty, generated_call,
-        generated_runtime_inner_symbol, generated_runtime_symbol, global_begin_projected_loan,
-        global_set_or_replace_collection, heap_access_error, heap_register, heap_scope,
-        heap_scope_owned, heap_type_access, lambda_cell_ctor, map_heap_access_error,
-        mut_place_access, mut_place_dataref, mut_place_get_copy, mut_place_global,
-        mut_place_heap_cell, mut_place_local, mut_place_local_raw, mut_place_projected,
-        mut_place_reborrow, mut_place_replace_collection, mut_place_scoped_cell, mut_place_set,
-        mut_place_stack_cell, mut_place_ty, non_null_cast_mut, optional_payload_ops_ctor,
-        optional_payload_ops_ty, owner_attach, owner_detach, owner_enter_current, owner_entry_ptr,
-        phantom_pinned_ty, phantom_pinned_value, pin_box_ty, pin_get_unchecked_mut,
-        projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase, rt_heap_try_with_erased,
-        rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut, runtime_ctx_ty_with,
-        runtime_owner_handle_new, runtime_owner_handle_ty, runtime_param_name,
+        callback_check_identity, callback_record_heap_type_field, checked_index, checked_range,
+        ctx_roots_ty, dataref_place_heap_type_access, dataref_place_heap_type_field,
+        dataref_place_ops_ty, erased_handle_ty, generated_call, generated_runtime_inner_symbol,
+        generated_runtime_symbol, global_begin_projected_loan, global_set_or_replace_collection,
+        heap_access_error, heap_register, heap_scope, heap_scope_owned, heap_type_access,
+        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
+        mut_place_get_copy, mut_place_global, mut_place_heap_cell, mut_place_local,
+        mut_place_local_raw, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
+        non_null_cast_mut, optional_payload_ops_ctor, optional_payload_ops_ty, owner_attach,
+        owner_begin_shutdown, owner_enter, owner_enter_current, owner_entry_ptr,
+        owner_suspend_for_provider, phantom_pinned_ty, phantom_pinned_value, pin_box_ty,
+        pin_get_unchecked_mut, projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase,
+        rt_heap_try_with_erased, rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut,
+        runtime_ctx_ty_with, runtime_owner_handle_new, runtime_owner_handle_ty, runtime_param_name,
         scoped_mut_place_cell_new, scoped_mut_place_cell_ty, stack_lambda_cell_ctor,
         stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
     };
@@ -1044,10 +1067,26 @@ mod tests {
             owner_attach("owner", "ptr"),
             "owner.__anvyx_attach_owner_ptr(ptr)"
         );
-        assert_eq!(owner_detach("owner"), "owner.__anvyx_detach_owner_ptr()");
+        assert_eq!(
+            owner_begin_shutdown("owner"),
+            "owner.__anvyx_begin_shutdown()"
+        );
+        assert_eq!(
+            callback_check_identity("key", 2, 3),
+            "key.__anvyx_check_identity(std::num::NonZeroU64::new(2).unwrap(), std::num::NonZeroU64::new(3).unwrap())"
+        );
+        assert_eq!(callback_record_heap_type_field(0), "callback_record_sig0");
         assert_eq!(
             owner_enter_current("owner"),
             "owner.__anvyx_enter_current()"
+        );
+        assert_eq!(
+            owner_enter("owner", "owner_id", "generation"),
+            "owner.__anvyx_enter(owner_id, generation)"
+        );
+        assert_eq!(
+            owner_suspend_for_provider("owner"),
+            "owner.__anvyx_suspend_entry_for_provider()"
         );
         assert_eq!(owner_entry_ptr("entry"), "entry.owner_ptr()");
         assert_eq!(

@@ -2563,29 +2563,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_string_scoped_lambda_signature() {
-        let callback = callback_signature(
-            vec![ExternCallbackParam {
-                ty: ExternTypeExpr::String,
-                escape: CallbackEscape::NonEscaping,
-            }],
-            ExternTypeExpr::Void,
-        );
-        let descriptor = callback_descriptor(
-            "with_callback",
-            callback.clone(),
-            CallbackEscape::NonEscaping,
-        );
-        let binding = scoped_lambda_binding("with_callback", callback);
-
-        assert_abi_error(
-            descriptor,
-            binding,
-            "unsupported scoped Lambda ABI signature",
-        );
-    }
-
-    #[test]
     fn rejects_scoped_lambda_signature_mismatch() {
         let callback = callback_signature(vec![], ExternTypeExpr::Void);
         let descriptor =
@@ -2628,49 +2605,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_scoped_lambda_signature() {
-        let callback = callback_signature(
-            vec![ExternCallbackParam {
-                ty: ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
-                escape: CallbackEscape::NonEscaping,
-            }],
-            ExternTypeExpr::Void,
-        );
-        let descriptor = callback_descriptor(
-            "with_callback",
-            callback.clone(),
-            CallbackEscape::NonEscaping,
-        );
-        let binding = scoped_lambda_binding("with_callback", callback);
-
-        assert_abi_error(
-            descriptor,
-            binding,
-            "unsupported scoped Lambda ABI signature",
-        );
-    }
-
-    #[test]
-    fn rejects_scoped_lambda_above_max_arity() {
-        let params = (0..=crate::CALLBACK_WRAPPER_MAX_ARITY)
+    fn rejects_unsupported_scoped_lambda_signatures() {
+        let above_max_arity = (0..=crate::CALLBACK_WRAPPER_MAX_ARITY)
             .map(|_| ExternCallbackParam {
                 ty: ExternTypeExpr::Int,
                 escape: CallbackEscape::NonEscaping,
             })
             .collect();
-        let callback = callback_signature(params, ExternTypeExpr::Void);
-        let descriptor = callback_descriptor(
-            "with_callback",
-            callback.clone(),
-            CallbackEscape::NonEscaping,
-        );
-        let binding = scoped_lambda_binding("with_callback", callback);
+        for params in [
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::String,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::List(Box::new(ExternTypeExpr::Int)),
+                escape: CallbackEscape::NonEscaping,
+            }],
+            above_max_arity,
+        ] {
+            let callback = callback_signature(params, ExternTypeExpr::Void);
+            let descriptor = callback_descriptor(
+                "with_callback",
+                callback.clone(),
+                CallbackEscape::NonEscaping,
+            );
+            let binding = scoped_lambda_binding("with_callback", callback);
 
-        assert_abi_error(
-            descriptor,
-            binding,
-            "unsupported scoped Lambda ABI signature",
-        );
+            assert_abi_error(
+                descriptor,
+                binding,
+                "unsupported scoped Lambda ABI signature",
+            );
+        }
     }
 
     #[test]

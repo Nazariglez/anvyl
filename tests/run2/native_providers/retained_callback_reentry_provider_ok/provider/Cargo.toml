@@ -1,0 +1,9 @@
+[package]
+name = "anvyx-test-retained-reentry-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anvyx-runtime = { path = "../../../../../crates/runtime" }
+
+[workspace]

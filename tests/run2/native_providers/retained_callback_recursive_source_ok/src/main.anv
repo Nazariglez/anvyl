@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 21
+
+import pkg:host.host { retain, fire, close };
+
+fn fib(n: int) -> int {
+    if n <= 1 {
+        return n;
+    }
+    fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    retain(|| println(fib(8)));
+    fire();
+    close();
+}
