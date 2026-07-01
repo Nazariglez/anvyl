@@ -21,7 +21,7 @@ fn second(xs: slice[int]) -> int {
     first(xs[1..2])
 }
 
-fn first_array_param(var xs: [int; 3]) -> int {
+fn first_array_param(ref xs: [int; 3]) -> int {
     first(xs)
 }
 

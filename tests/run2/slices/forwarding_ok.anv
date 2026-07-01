@@ -16,11 +16,11 @@ fn head_forward(xs: slice[int]) -> int {
     head(xs)
 }
 
-fn bump0(var xs: slice[int], amount: int) {
+fn bump0(ref xs: slice[int], amount: int) {
     xs[0] += amount;
 }
 
-fn bump0_forward(var xs: slice[int], amount: int) {
+fn bump0_forward(ref xs: slice[int], amount: int) {
     bump0(xs, amount);
 }
 

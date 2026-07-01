@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    var xs: [int; 3] = [0, 1, 2];
+    var i = 1;
+    bump(xs[i]);
+    println(xs[1]);
+}

@@ -26,7 +26,7 @@ fn sum_slice(xs: slice[int]) -> int {
     sum
 }
 
-fn sum_var_list(var xs: [int]) -> int {
+fn sum_var_list(ref xs: [int]) -> int {
     var sum = 0;
     for x in xs {
         sum += x;

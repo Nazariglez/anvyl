@@ -13,7 +13,7 @@ fn make_values() -> [string: int] {
     ["a": 1]
 }
 
-fn key(var calls: int) -> string {
+fn key(ref calls: int) -> string {
     calls += 1;
     println("key");
     "a"

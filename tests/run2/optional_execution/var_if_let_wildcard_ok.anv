@@ -5,7 +5,7 @@
 
 fn main() {
     var opt: int? = 1;
-    if var _? = opt {
+    if ref _? = opt {
         println("seen");
     }
 }

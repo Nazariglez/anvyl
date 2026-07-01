@@ -1,0 +1,26 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @skip: dynamic match execution is not lowered to clean Rust yet
+// @match: 2
+
+contract Updatable {
+    fn update(ref self);
+}
+
+struct Enemy {
+    hp: int,
+    fn update(ref self) {}
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy { hp: 1 };
+    match ref actor as? {
+        Enemy(enemy) => enemy.hp = 2,
+        other => other.update(),
+    };
+    match actor as? {
+        Enemy(enemy) => println(enemy.hp),
+        other => other.update(),
+    };
+}

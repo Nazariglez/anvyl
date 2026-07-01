@@ -5,7 +5,7 @@
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    if var value? = counts["a"] {
+    if ref value? = counts["a"] {
         println(value);
     }
 }

@@ -9,7 +9,7 @@
 struct Counter {
     value: int,
 
-    fn inc(var self) {
+    fn inc(ref self) {
         self.value = state.counter.value + 1;
     }
 }

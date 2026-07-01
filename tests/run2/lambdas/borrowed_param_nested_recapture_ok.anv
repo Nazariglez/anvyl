@@ -3,7 +3,7 @@
 // @expect: success
 // @match: 1
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let outer = || {
         let middle = || {
             let inner = || {

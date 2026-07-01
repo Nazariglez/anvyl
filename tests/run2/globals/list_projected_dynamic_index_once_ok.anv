@@ -13,7 +13,7 @@ fn make_values() -> [int] {
     [1, 2]
 }
 
-fn index(var calls: int) -> int {
+fn index(ref calls: int) -> int {
     calls += 1;
     println("index");
     1

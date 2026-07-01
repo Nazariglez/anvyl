@@ -3,13 +3,13 @@
 // @expect: success
 // @match: 12
 
-fn apply(var x: int, cb: fn()) {
+fn apply(ref x: int, cb: fn()) {
     x += 1;
     cb();
     x += 1;
 }
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let f = || {
         apply(x, || {
             x += 10;

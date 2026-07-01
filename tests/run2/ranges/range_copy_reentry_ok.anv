@@ -6,7 +6,7 @@
 // 1
 // @match-end
 
-fn mutate(xs: slice[int], var owner: [int]) {
+fn mutate(xs: slice[int], ref owner: [int]) {
     owner.push(4);
     let appended = owner[3];
     let first = xs[0];

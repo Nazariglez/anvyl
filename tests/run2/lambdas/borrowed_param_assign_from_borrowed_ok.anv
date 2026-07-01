@@ -6,7 +6,7 @@
 // 42
 // @match-end
 
-fn copy_from(var a: int, var b: int) {
+fn copy_from(ref a: int, ref b: int) {
     let f = || {
         a = b;
     };

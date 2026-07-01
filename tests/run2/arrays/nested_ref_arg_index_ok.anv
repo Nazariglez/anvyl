@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+struct Box {
+    xs: [int; 3],
+}
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    var box = Box { xs: [0, 1, 2] };
+    var i = 1;
+    bump(box.xs[i]);
+    println(box.xs[1]);
+}

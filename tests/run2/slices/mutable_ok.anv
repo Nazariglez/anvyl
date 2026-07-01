@@ -10,19 +10,19 @@
 // 6
 // @match-end
 
-fn set_first(var xs: slice[int], value: int) {
+fn set_first(ref xs: slice[int], value: int) {
     xs[0] = value;
 }
 
-fn copy_second(var xs: slice[int]) {
+fn copy_second(ref xs: slice[int]) {
     xs[0] = xs[1];
 }
 
-fn wrapper(var xs: [int]) {
+fn wrapper(ref xs: [int]) {
     set_first(xs, 7);
 }
 
-fn array_wrapper(var xs: [int; 3]) {
+fn array_wrapper(ref xs: [int; 3]) {
     set_first(xs, 6);
 }
 

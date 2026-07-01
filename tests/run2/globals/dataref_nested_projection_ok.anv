@@ -21,7 +21,7 @@ fn make_holder() -> Holder {
     Holder { node: Node { value: 4, name: "ready" } }
 }
 
-fn bump(var value: int) {
+fn bump(ref value: int) {
     value += 5;
 }
 

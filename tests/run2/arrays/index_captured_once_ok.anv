@@ -3,13 +3,13 @@
 // @expect: success
 // @match: 11
 
-fn next(var i: int) -> int {
+fn next(ref i: int) -> int {
     let old = i;
     i += 1;
     old
 }
 
-fn bump(var x: int) {
+fn bump(ref x: int) {
     x += 1;
 }
 

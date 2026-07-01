@@ -10,7 +10,7 @@ struct Box { n: int }
 
 fn main() {
     var boxes: [string: Box] = ["a": Box { n: 1 }];
-    if var box? = boxes["a"] {
+    if ref box? = boxes["a"] {
         println(box.n);
         box.n = 2;
     }

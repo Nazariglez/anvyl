@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: error
+// @stderr-contains: slice index 5 out of bounds for len 2
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn bump_slice(ref xs: slice[int]) {
+    bump(xs[5]);
+}
+
+fn main() {
+    var xs: [int] = [0, 1];
+    bump_slice(xs);
+}

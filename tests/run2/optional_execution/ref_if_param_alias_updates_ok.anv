@@ -1,0 +1,18 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 2
+
+fn touch(ref opt: int?) {
+    if ref value? = opt {
+        value = 2;
+    }
+}
+
+fn main() {
+    var opt: int? = 1;
+    touch(opt);
+    if let value? = opt {
+        println(value);
+    }
+}

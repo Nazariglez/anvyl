@@ -6,7 +6,7 @@
 // 5
 // @match-end
 
-fn key(var calls: int) -> string {
+fn key(ref calls: int) -> string {
     calls += 1;
     "a"
 }
@@ -14,7 +14,7 @@ fn key(var calls: int) -> string {
 fn main() {
     var calls = 0;
     var counts: [string: int] = ["a": 1];
-    if var value? = counts[key(calls)] {
+    if ref value? = counts[key(calls)] {
         value = 5;
     }
     println(calls);

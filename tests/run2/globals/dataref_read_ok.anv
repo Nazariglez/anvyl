@@ -7,7 +7,7 @@ dataref Node {
     value: int,
 }
 
-fn bump(var node: Node) {
+fn bump(ref node: Node) {
     node.value += 1;
 }
 

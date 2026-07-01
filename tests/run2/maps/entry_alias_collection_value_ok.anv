@@ -5,7 +5,7 @@
 
 fn main() {
     var groups: [string: [int]] = ["a": [1, 2]];
-    if var xs? = groups["a"] {
+    if ref xs? = groups["a"] {
         xs.push(3);
     }
     if let xs? = groups["a"] {

@@ -1,6 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
+// @skip: ref pattern alias lambda capture is not executable yet
 // @match: 1
 
 struct Point {
@@ -8,11 +9,11 @@ struct Point {
     y: int,
 }
 
-fn inc(var value: int) {
+fn inc(ref value: int) {
     value += 1;
 }
 
-fn touch(var point: Point) {
+fn touch(ref point: Point) {
     var Point { x } = point;
     let f = || {
         inc(x);

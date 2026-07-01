@@ -15,8 +15,8 @@ fn sum_values(map: [string: int]) -> int {
     sum
 }
 
-fn bump(var map: [string: int]) {
-    for _, var value in map {
+fn bump(ref map: [string: int]) {
+    for _, ref value in map {
         value += 10;
     }
 }
@@ -26,13 +26,13 @@ fn main() {
     bump(map);
     println(sum_values(map));
 
-    for _, var value in map {
+    for _, ref value in map {
         value += 77;
     }
     println(sum_values(map));
 
     var nested = ["a": 1, "b": 2];
-    for _, var outer in nested {
+    for _, ref outer in nested {
         for _, inner in nested {
             outer += inner;
         }

@@ -1,7 +1,7 @@
 // @mode: run
 // @frontend: new
 // @expect: success
-// @match: 8
+// @match: 3
 
 fn main() {
     var opt: int? = 3;

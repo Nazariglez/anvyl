@@ -5,8 +5,8 @@
 
 fn main() {
     var groups: [string: [string: int]] = ["a": ["x": 1]];
-    if var inner? = groups["a"] {
-        if var n? = inner["x"] {
+    if ref inner? = groups["a"] {
+        if ref n? = inner["x"] {
             n += 2;
         }
     }

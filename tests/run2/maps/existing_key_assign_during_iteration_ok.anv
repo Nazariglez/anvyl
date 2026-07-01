@@ -22,7 +22,7 @@ fn main() {
     println(sum_values(readonly));
 
     var mutable = ["a": 1, "b": 2];
-    for key, var value in mutable {
+    for key, ref value in mutable {
         value += 1;
         mutable[key] = 15;
     }

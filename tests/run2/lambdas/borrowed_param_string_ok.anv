@@ -3,7 +3,7 @@
 // @expect: success
 // @match: go!
 
-fn touch(var text: string) {
+fn touch(ref text: string) {
     let f = || {
         text = "go!";
     };

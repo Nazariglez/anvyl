@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 9
+
+fn main() {
+    var opt: int? = 4;
+    if ref value? = opt {
+        value = 9;
+    }
+    println(opt ?? 0);
+}

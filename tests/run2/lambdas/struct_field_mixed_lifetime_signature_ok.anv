@@ -9,11 +9,11 @@ struct Holder {
 
 fn one() -> int { 1 }
 
-fn apply(var x: int, cb: fn() -> int) {
+fn apply(ref x: int, cb: fn() -> int) {
     cb();
 }
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let scoped = || {
         apply(x, || {
             x += 1;

@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 12
+
+fn apply(ref x: int, cb: fn()) {
+    x += 1;
+    cb();
+    x += 1;
+}
+
+fn main() {
+    var count = 0;
+    let f = || { apply(count, || { count += 10; }); };
+    f();
+    println(count);
+}

@@ -15,7 +15,7 @@
 extend slice[int] {
     fn first(self) -> int { self[0] }
 
-    fn bump0(var self, amount: int) {
+    fn bump0(ref self, amount: int) {
         self[0] += amount;
     }
 }
@@ -24,7 +24,7 @@ fn first_exact(xs: slice[int]) -> int {
     xs.first()
 }
 
-fn bump_param(var xs: slice[int], amount: int) {
+fn bump_param(ref xs: slice[int], amount: int) {
     xs.bump0(amount);
 }
 

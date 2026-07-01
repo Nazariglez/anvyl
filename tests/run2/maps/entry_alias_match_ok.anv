@@ -8,14 +8,14 @@
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    match var counts["a"] {
+    match ref counts["a"] {
         value? => {
             value = 4;
         },
         nil => {},
     };
     println(counts["a"] ?? 0);
-    match var counts["b"] {
+    match ref counts["b"] {
         value? => {
             value = 9;
         },

@@ -1,0 +1,19 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 5
+
+dataref Counter {
+    value: int,
+}
+
+fn assign(ref src: int, ref dst: int) {
+    dst = src;
+}
+
+fn main() {
+    var n = 5;
+    var c = Counter { value: 0 };
+    assign(n, c.value);
+    println(c.value);
+}

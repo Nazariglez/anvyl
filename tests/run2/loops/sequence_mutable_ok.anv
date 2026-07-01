@@ -10,21 +10,21 @@
 // 10
 // @match-end
 
-fn bump_all(var xs: [int]) {
-    for var x in xs {
+fn bump_all(ref xs: [int]) {
+    for ref x in xs {
         x += 1;
     }
 }
 
-fn set_twice(var xs: [int]) {
-    for var x in xs {
+fn set_twice(ref xs: [int]) {
+    for ref x in xs {
         x = 7;
         x += 1;
     }
 }
 
-fn bump_slice(var xs: slice[int]) {
-    for var x in xs {
+fn bump_slice(ref xs: slice[int]) {
+    for ref x in xs {
         x += 1;
     }
 }

@@ -5,7 +5,7 @@
 
 fn main() {
     var counts: [string: int] = ["a": 1];
-    while var value? = counts["a"] {
+    while ref value? = counts["a"] {
         value += 1;
         if value == 3 {
             break;

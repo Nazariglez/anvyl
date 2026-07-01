@@ -5,13 +5,13 @@
 
 fn keep(f: escaping fn()) -> fn() { f }
 
-fn apply(var x: int, cb: fn()) {
+fn apply(ref x: int, cb: fn()) {
     x += 1;
     cb();
     x += 1;
 }
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let escaped = keep(|| {});
     let f = || {
         apply(x, || {

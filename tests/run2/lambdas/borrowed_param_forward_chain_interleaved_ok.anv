@@ -3,7 +3,7 @@
 // @expect: success
 // @match: 1111111
 
-fn leaf(var x: int) {
+fn leaf(ref x: int) {
     let f = || {
         x += 10;
     };
@@ -12,13 +12,13 @@ fn leaf(var x: int) {
     x += 100;
 }
 
-fn mid(var x: int) {
+fn mid(ref x: int) {
     x += 1000;
     leaf(x);
     x += 10000;
 }
 
-fn top(var x: int) {
+fn top(ref x: int) {
     x += 100000;
     mid(x);
     x += 1000000;

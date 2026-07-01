@@ -1,0 +1,17 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 0
+
+fn main() {
+    var opt: int? = 1;
+    if ref value? = opt {
+        value = 2;
+    }
+    opt = nil;
+    var other: int? = 3;
+    if ref value? = other {
+        value = 4;
+    }
+    println(opt ?? 0);
+}

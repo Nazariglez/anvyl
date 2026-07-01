@@ -7,7 +7,7 @@ fn call(cb: fn()) {
     cb();
 }
 
-fn touch(var count: int) {
+fn touch(ref count: int) {
     let f = || {
         count += 1;
     };

@@ -6,7 +6,7 @@
 // 10
 // @match-end
 
-fn touch(var a: int, var b: int) {
+fn touch(ref a: int, ref b: int) {
     let f = || {
         a += 1;
         b += 10;

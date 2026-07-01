@@ -15,7 +15,7 @@ fn print_slot(slot: int?) {
     }
 }
 
-fn update(var maps: [[string: int]]) {
+fn update(ref maps: [[string: int]]) {
     maps[0]["a"] = 4;
     maps[0]["b"] = 3;
 }

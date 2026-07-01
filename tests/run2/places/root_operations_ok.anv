@@ -11,7 +11,7 @@
 struct Counter {
     value: int,
 
-    fn inc(var self) {
+    fn inc(ref self) {
         self.value += 1;
     }
 }
@@ -22,11 +22,11 @@ dataref Node {
 
 lazy var global = Counter { value: 30 };
 
-fn bump(var value: int) {
+fn bump(ref value: int) {
     value += 1;
 }
 
-fn set_counter(var counter: Counter, value: int) {
+fn set_counter(ref counter: Counter, value: int) {
     counter.value = value;
     counter.inc();
 }

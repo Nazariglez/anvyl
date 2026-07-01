@@ -7,7 +7,7 @@ dataref Node {
     value: int,
 }
 
-fn replace(var target: Node, other: Node) {
+fn replace(ref target: Node, other: Node) {
     target = other;
 }
 

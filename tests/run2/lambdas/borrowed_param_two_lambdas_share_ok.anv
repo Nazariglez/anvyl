@@ -3,7 +3,7 @@
 // @expect: success
 // @match: 12
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let a = || {
         x += 1;
     };

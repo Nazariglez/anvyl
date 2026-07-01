@@ -6,13 +6,13 @@
 lazy var counts: [string: int] = ["a": 1];
 
 fn nested_alias() {
-    if var other? = counts["a"] {
+    if ref other? = counts["a"] {
         other = 99;
     }
 }
 
 fn main() {
-    if var value? = counts["a"] {
+    if ref value? = counts["a"] {
         nested_alias();
         value += 1;
     }

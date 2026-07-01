@@ -5,7 +5,7 @@
 
 fn main() {
     var n = 0;
-    let outer = |var x: int| {
+    let outer = |ref x: int| {
         let inner = || {
             x += 1;
         };

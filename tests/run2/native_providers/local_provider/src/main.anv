@@ -27,7 +27,7 @@ struct Box { value: int }
 
 lazy let title = "global";
 
-fn forward(var value: int) {
+fn forward(ref value: int) {
     host_bump(value);
 }
 

@@ -6,7 +6,7 @@
 lazy var counts: [string: int] = ["a": 1];
 
 fn main() {
-    if var value? = counts["a"] {
+    if ref value? = counts["a"] {
         value = 7;
     }
     println(counts["a"] ?? 0);

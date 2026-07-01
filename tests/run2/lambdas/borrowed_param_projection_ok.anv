@@ -7,11 +7,11 @@ struct Box {
     value: int,
 }
 
-fn inc(var x: int) {
+fn inc(ref x: int) {
     x += 1;
 }
 
-fn touch(var b: Box) {
+fn touch(ref b: Box) {
     let f = || {
         inc(b.value);
     };

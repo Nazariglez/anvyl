@@ -10,7 +10,7 @@ fn apply(cb: fn()) {
 fn main() {
     var map = ["a": 1, "b": 2];
     let cb = || { map["z"] = 9; };
-    for _, var value in map {
+    for _, ref value in map {
         apply(cb);
         value += 1;
     }

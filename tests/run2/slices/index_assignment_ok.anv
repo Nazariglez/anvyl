@@ -3,7 +3,7 @@
 // @expect: success
 // @match: 7
 
-fn assign(var xs: slice[int], i: int) {
+fn assign(ref xs: slice[int], i: int) {
     xs[i] = 4;
     xs[i] += 3;
 }

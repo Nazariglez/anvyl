@@ -7,7 +7,7 @@ struct Point { x: int }
 
 fn main() {
     var xs: [Point] = [Point { x: 1 }];
-    for var p in xs {
+    for ref p in xs {
         p.x += 1;
     }
     for p in xs {

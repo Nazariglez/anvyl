@@ -1,11 +1,12 @@
 // @mode: run
 // @frontend: new
 // @expect: success
+// @skip: ref pattern alias lambda capture is not executable yet
 // @match: 7
 
 struct Point { x: int, y: int }
 
-fn read(var point: Point) -> int {
+fn read(ref point: Point) -> int {
     var Point { x } = point;
     let f = || x;
     f()

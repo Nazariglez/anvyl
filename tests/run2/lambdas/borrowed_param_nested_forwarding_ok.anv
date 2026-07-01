@@ -3,11 +3,11 @@
 // @expect: success
 // @match: 1
 
-fn inc(var x: int) {
+fn inc(ref x: int) {
     x += 1;
 }
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let outer = || {
         let inner = || {
             inc(x);
