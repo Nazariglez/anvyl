@@ -1668,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_param_modes_preserves_noncheap_value_required_var_param() {
+    fn infer_param_modes_preserves_noncheap_value_required_ref_param() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let function = param_function(
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn infer_param_modes_preserves_mixed_noncheap_var_param() {
+    fn infer_param_modes_preserves_mixed_noncheap_ref_param() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let tmp = LocalId::from_index(1);

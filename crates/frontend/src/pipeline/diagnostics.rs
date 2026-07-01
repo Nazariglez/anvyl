@@ -349,7 +349,7 @@ fn render_unsupported_param(
 
 fn render_unsupported_param_reason(reason: UnsupportedSourceParamReason) -> &'static str {
     match reason {
-        UnsupportedSourceParamReason::Mutable => "mutable",
+        UnsupportedSourceParamReason::Mutable => "ref",
         UnsupportedSourceParamReason::CastAccept => "cast-accepting",
         UnsupportedSourceParamReason::Default => "default",
     }
@@ -664,11 +664,11 @@ pub(super) fn diagnose_type_error(
             format!("cannot assign to immutable value '{name}'")
         }
         TypeError::ConstAssignment { name, .. } => format!("cannot assign to constant '{name}'"),
-        TypeError::VarArgNonLvalue { .. } => {
-            "non-lvalue cannot be passed to var parameter".to_string()
+        TypeError::RefArgNonLvalue { .. } => {
+            "non-lvalue cannot be passed to ref parameter".to_string()
         }
-        TypeError::VarArgImmutableBinding { name, .. } => {
-            format!("immutable binding '{name}' cannot be passed to var parameter")
+        TypeError::RefArgImmutableBinding { name, .. } => {
+            format!("immutable binding '{name}' cannot be passed to ref parameter")
         }
         TypeError::SequenceStructuralMutationDuringLoan { .. } => {
             "cannot change list shape while iterating it".to_string()
@@ -687,7 +687,7 @@ pub(super) fn diagnose_type_error(
             format!("mutating method requires mutable receiver '{name}'")
         }
         TypeError::MutableAlias { .. } => {
-            "var arguments must not alias the same variable".to_string()
+            "ref arguments must not alias the same variable".to_string()
         }
         TypeError::InvalidFormatSpec { reason, .. } => {
             format!("invalid format specifier: {reason}")
@@ -704,8 +704,8 @@ pub(super) fn diagnose_type_error(
         TypeError::RequiresMutablePlace { name, .. } => {
             format!("cannot mutably borrow non-storage place '{name}'")
         }
-        TypeError::VarPatternRequiresMutablePlace { .. } => {
-            "var pattern requires a mutable place".to_string()
+        TypeError::RefPatternRequiresMutablePlace { .. } => {
+            "ref pattern requires a mutable place".to_string()
         }
         TypeError::InvalidOperand {
             op, operand_type, ..
@@ -755,14 +755,14 @@ pub(super) fn diagnose_type_error(
         TypeError::ForIterableNotSupported { found, .. } => {
             format!("type '{}' cannot be iterated", render_surface_type(found, type_ctx))
         }
-        TypeError::ForVarRequiresMutableIterable { .. } => {
-            "mutable iteration requires a mutable iterable place".to_string()
+        TypeError::ForRefRequiresMutableIterable { .. } => {
+            "ref iteration requires a mutable iterable place".to_string()
         }
         TypeError::ForMutableMapKey { .. } => {
-            "map keys cannot be mutable; use `for k, var v in map` to mutate values".to_string()
+            "map keys cannot be mutable; use `for k, ref v in map` to mutate values".to_string()
         }
         TypeError::ForMutableMapEntry { .. } => {
-            "mutable map entry iteration is not supported; use `for k, var v in map` to mutate values".to_string()
+            "mutable map entry iteration is not supported; use `for k, ref v in map` to mutate values".to_string()
         }
         TypeError::RefutableForPattern { .. } => {
             "refutable pattern is not allowed in for binding".to_string()
@@ -1017,8 +1017,8 @@ pub(super) fn diagnose_type_error(
         TypeError::DefaultReferencesField { name, .. } => {
             format!("field default initializer cannot reference sibling field '{name}'")
         }
-        TypeError::VarParamDefault { name, .. } => {
-            format!("mutable parameter '{name}' cannot have a default initializer")
+        TypeError::RefParamDefault { name, .. } => {
+            format!("ref parameter '{name}' cannot have a default initializer")
         }
         TypeError::ConstTypeMismatch {
             expected, found, ..
@@ -1083,7 +1083,7 @@ fn borrowed_capture_escape_message(name: Ident, origin: CaptureStorageOrigin) ->
         CaptureStorageOrigin::BorrowedParam => {
             format!("cannot capture borrowed parameter '{name}' in an escaping lambda")
         }
-        CaptureStorageOrigin::VarSelf => {
+        CaptureStorageOrigin::RefSelf => {
             "cannot capture mutable receiver 'self' in an escaping lambda".to_string()
         }
         CaptureStorageOrigin::DynView => {
@@ -1092,10 +1092,7 @@ fn borrowed_capture_escape_message(name: Ident, origin: CaptureStorageOrigin) ->
         CaptureStorageOrigin::PatternAlias => {
             format!("cannot capture mutable pattern alias '{name}' in an escaping lambda")
         }
-        CaptureStorageOrigin::MutableDowncastAlias => {
-            format!("cannot capture mutable downcast alias '{name}' in an escaping lambda")
-        }
-        CaptureStorageOrigin::ForVarAlias => {
+        CaptureStorageOrigin::ForRefAlias => {
             format!("cannot capture mutable loop alias '{name}' in an escaping lambda")
         }
         CaptureStorageOrigin::Owned
@@ -1498,7 +1495,7 @@ fn render_detailed_type(ty: &Type) -> String {
 fn render_param_prefix(mutable: bool, escape: EscapeMode, cast_accept: bool) -> String {
     let mut rendered = String::new();
     if mutable {
-        rendered.push_str("var ");
+        rendered.push_str("ref ");
     }
     if escape.is_escaping() {
         rendered.push_str("escaping ");
@@ -1523,7 +1520,7 @@ fn render_detailed_func(params: &[FuncParam], ret: &ReturnSpec) -> String {
     if !ret.is_implicit_void() {
         rendered.push_str(" -> ");
         if ret.is_place() {
-            rendered.push_str("var ");
+            rendered.push_str("ref ");
         }
         rendered.push_str(&render_detailed_type(&ret.ty));
     }

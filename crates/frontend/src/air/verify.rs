@@ -1834,7 +1834,7 @@ fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
         ScopedBorrowSource::SourceMutParam { local } => {
             verify_source_scoped_borrow(cx, site.clone(), id, &decl, *local, ParamRole::Normal);
         }
-        ScopedBorrowSource::VarSelf { local } => {
+        ScopedBorrowSource::RefSelf { local } => {
             verify_source_scoped_borrow(cx, site.clone(), id, &decl, *local, ParamRole::Receiver);
         }
         ScopedBorrowSource::PatternAlias { source } => {
@@ -5310,7 +5310,7 @@ fn verify_promoted_local_not_used(
     for (borrow_index, decl) in cx.program.scoped_borrows.iter().enumerate() {
         let source = match &decl.source {
             ScopedBorrowSource::SourceMutParam { local }
-            | ScopedBorrowSource::VarSelf { local } => Some(*local),
+            | ScopedBorrowSource::RefSelf { local } => Some(*local),
             ScopedBorrowSource::PatternAlias { .. } => None,
         };
         if decl.owner == function_id && source == Some(local) {

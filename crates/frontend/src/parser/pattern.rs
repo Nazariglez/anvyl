@@ -13,16 +13,31 @@ use crate::{
     span::{SourceSpan, Spanned},
 };
 
-fn let_or_var_head<'src>() -> BoxedParser<'src, ast::PatternHead> {
+fn let_or_var_mutability<'src>() -> BoxedParser<'src, ast::Mutability> {
     select! {
-        Token::Keyword(Keyword::Let) => ast::PatternHead::Let,
-        Token::Keyword(Keyword::Var) => ast::PatternHead::Var,
+        Token::Keyword(Keyword::Let) => ast::Mutability::Immutable,
+        Token::Keyword(Keyword::Var) => ast::Mutability::Mutable,
     }
     .boxed()
 }
 
-pub(super) fn binding_pattern<'src>() -> BoxedParser<'src, (ast::PatternHead, ast::PatternNode)> {
-    let_or_var_head().then(pattern()).boxed()
+fn conditional_access<'src>() -> BoxedParser<'src, ast::ConditionalPatternAccess> {
+    select! {
+        Token::Keyword(Keyword::Let) => ast::ConditionalPatternAccess::Let,
+        Token::Keyword(Keyword::Var) => ast::ConditionalPatternAccess::Var,
+        Token::Keyword(Keyword::Ref) => ast::ConditionalPatternAccess::Ref,
+    }
+    .boxed()
+}
+
+pub(super) fn local_refutable_pattern<'src>()
+-> BoxedParser<'src, (ast::Mutability, ast::PatternNode)> {
+    let_or_var_mutability().then(pattern()).boxed()
+}
+
+pub(super) fn conditional_pattern<'src>()
+-> BoxedParser<'src, (ast::ConditionalPatternAccess, ast::PatternNode)> {
+    conditional_access().then(pattern()).boxed()
 }
 
 pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {

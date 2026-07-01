@@ -1,13 +1,13 @@
 pub extend<T> [T] {
-    fn push(var self, value: T) { }
-    fn for_each(var self, f: fn(var T) -> void) { }
-    fn retain(var self, f: fn(T) -> bool) { }
-    fn remove_where(var self, f: fn(T) -> bool) { }
+    fn push(ref self, value: T) { }
+    fn for_each(ref self, f: fn(ref T) -> void) { }
+    fn retain(ref self, f: fn(T) -> bool) { }
+    fn remove_where(ref self, f: fn(T) -> bool) { }
 }
 
 pub extend<K, V> [K: V] {
-    fn insert(var self, key: K, value: V) { }
-    fn remove(var self, key: K) -> V? { nil }
-    fn retain(var self, f: fn(K, V) -> bool) { }
-    fn remove_where(var self, f: fn(K, V) -> bool) { }
+    fn insert(ref self, key: K, value: V) { }
+    fn remove(ref self, key: K) -> V? { nil }
+    fn retain(ref self, f: fn(K, V) -> bool) { }
+    fn remove_where(ref self, f: fn(K, V) -> bool) { }
 }

@@ -32,7 +32,7 @@ fn assert_main_mut_borrows(source: &str, name: &str) {
 #[test]
 fn records_params_bindings_and_uses() {
     let source = r"
-fn f(a: int, var b: int) -> int {
+fn f(a: int, ref b: int) -> int {
     let x = a;
     var y = x;
     y = b;
@@ -95,7 +95,7 @@ fn mutating_receiver_records_mut_borrow_use() {
     assert_main_mut_borrows(
         r"
 struct Counter { value: int }
-extend Counter { fn reset(var self) { self.value = 0; } }
+extend Counter { fn reset(ref self) { self.value = 0; } }
 fn main() { var counter = Counter { value: 1 }; counter.reset(); }
 ",
         "counter",
@@ -106,10 +106,10 @@ fn main() { var counter = Counter { value: 1 }; counter.reset(); }
 fn map_entry_payload_receiver_records_payload_alias_use() {
     assert_main_mut_borrows(
         r#"
-extend [int] { fn add(var self, _value: int) {} }
+extend [int] { fn add(ref self, _value: int) {} }
 fn main() {
     var groups: [string: [int]] = ["a": [1, 2]];
-    if var xs? = groups["a"] {
+    if ref xs? = groups["a"] {
         xs.add(3);
     }
 }
@@ -123,12 +123,12 @@ fn map_entry_payload_place_return_preserves_payload_alias_use() {
     assert_main_mut_borrows(
         r#"
 extend [int] {
-    fn id(var self) -> var [int] { self }
-    fn add(var self, _value: int) {}
+    fn id(ref self) -> ref [int] { self }
+    fn add(ref self, _value: int) {}
 }
 fn main() {
     var groups: [string: [int]] = ["a": [1, 2]];
-    if var xs? = groups["a"] {
+    if ref xs? = groups["a"] {
         xs.id().add(3);
     }
 }
@@ -880,10 +880,10 @@ fn generic_function_fact_order_distinguishes_function_type_flags() {
         r"
 fn id<T>(x: escaping T) -> T { x }
 fn plain(x: int) -> int { x }
-fn borrowed(var x: int) -> var int { x }
-fn main(var x: int) {
+fn borrowed(ref x: int) -> ref int { x }
+fn main(ref x: int) {
     let plain_fn: fn(int) -> int = plain;
-    let borrowed_fn: fn(var int) -> var int = borrowed;
+    let borrowed_fn: fn(ref int) -> ref int = borrowed;
     id(borrowed_fn);
     id(plain_fn);
 }

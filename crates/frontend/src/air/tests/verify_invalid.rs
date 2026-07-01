@@ -1792,14 +1792,14 @@ fn scoped_borrow_source_rejects_receiver_param() {
 }
 
 #[test]
-fn var_self_scoped_borrow_rejects_normal_param() {
+fn ref_self_scoped_borrow_rejects_normal_param() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let module = test_module(&mut builder);
     let scoped = builder.alloc_scoped_borrow(ScopedBorrowDecl {
         owner: FunctionId::from_index(0),
         binding: BindingId::from_index(0),
-        source: ScopedBorrowSource::VarSelf {
+        source: ScopedBorrowSource::RefSelf {
             local: LocalId::from_index(0),
         },
         ty: int_ty,

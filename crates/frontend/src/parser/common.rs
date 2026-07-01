@@ -170,19 +170,16 @@ pub(super) fn params<'src>(
 pub(super) fn param<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
 ) -> BoxedParser<'src, ast::Param> {
-    let var_kw = select! {
-        Token::Keyword(Keyword::Var) => (),
+    let access = select! {
+        Token::Keyword(Keyword::Ref) => ast::Mutability::Mutable,
     }
     .or_not()
-    .map(|opt| match opt {
-        Some(()) => ast::Mutability::Mutable,
-        None => ast::Mutability::Immutable,
-    });
+    .map(|opt| opt.unwrap_or(ast::Mutability::Immutable));
 
     let ty =
         callable_param_type(param_type_ident()).map_with(|ty, extra| (ty, extra.span().byte()));
 
-    var_kw
+    access
         .then(identifier())
         .then_ignore(colon())
         .then(ty)
@@ -210,7 +207,7 @@ pub(super) fn param<'src>(
 pub(super) fn return_spec_tail<'src>() -> BoxedParser<'src, ast::ReturnSpec> {
     let inferred =
         select! { Token::Ident(ident) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
-    let access = select! { Token::Keyword(Keyword::Var) => ast::ReturnAccess::Place }
+    let access = select! { Token::Keyword(Keyword::Ref) => ast::ReturnAccess::Place }
         .or_not()
         .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
 

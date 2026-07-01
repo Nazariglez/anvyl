@@ -228,7 +228,7 @@ fn source_mut_param_scoped_borrow_verifies() {
 }
 
 #[test]
-fn source_var_call_accepts_scoped_borrow_root() {
+fn source_ref_call_accepts_scoped_borrow_root() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let void_ty = builder.void_ty();
@@ -270,7 +270,7 @@ fn source_var_call_accepts_scoped_borrow_root() {
 }
 
 #[test]
-fn source_var_call_accepts_lambda_slot_scoped_borrow() {
+fn source_ref_call_accepts_lambda_slot_scoped_borrow() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let void_ty = builder.void_ty();

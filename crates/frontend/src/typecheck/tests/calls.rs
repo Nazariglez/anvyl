@@ -133,13 +133,13 @@ fn cached_generic_specialization_restores_call_targets() {
 }
 
 #[test]
-fn dependent_projected_var_arg_records_specialized_expected_projection() {
+fn dependent_projected_ref_arg_records_specialized_expected_projection() {
     let result = check(
         r"
         struct Entity { x: int }
         struct Box<T> { @as embed value: T }
-        fn move_entity(var entity: Entity) { entity.x += 1; }
-        fn move_box<T>(var box: Box<T>) { move_entity(box); }
+        fn move_entity(ref entity: Entity) { entity.x += 1; }
+        fn move_box<T>(ref box: Box<T>) { move_entity(box); }
         fn main() {
             var box = Box<Entity> { value: Entity { x: 1 } };
             move_box<Entity>(box);

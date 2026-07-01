@@ -80,7 +80,7 @@ pub(crate) enum LocalUseMode {
     CompoundAssign,
     Borrow,
     MutBorrow,
-    VarArgument,
+    RefArgument,
 }
 
 impl LocalFacts {
@@ -872,11 +872,10 @@ pub(crate) struct LambdaEscapeFact {
 pub(crate) enum CaptureStorageOrigin {
     Owned,
     BorrowedParam,
-    VarSelf,
+    RefSelf,
     DynView,
     PatternAlias,
-    MutableDowncastAlias,
-    ForVarAlias,
+    ForRefAlias,
     Const,
     ReadonlySelf,
 }
@@ -886,11 +885,10 @@ impl CaptureStorageOrigin {
         matches!(
             self,
             Self::BorrowedParam
-                | Self::VarSelf
+                | Self::RefSelf
                 | Self::DynView
                 | Self::PatternAlias
-                | Self::MutableDowncastAlias
-                | Self::ForVarAlias
+                | Self::ForRefAlias
         )
     }
 
@@ -904,9 +902,9 @@ impl CaptureStorageOrigin {
             Self::Owned
                 | Self::BorrowedParam
                 | Self::ReadonlySelf
-                | Self::VarSelf
+                | Self::RefSelf
                 | Self::PatternAlias
-                | Self::ForVarAlias
+                | Self::ForRefAlias
         )
     }
 
@@ -925,11 +923,10 @@ impl CaptureStorageOrigin {
             Self::Owned if source_mutable => CaptureStorage::OwnedMutableScoped,
             Self::Owned | Self::ReadonlySelf => CaptureStorage::OwnedReadonly,
             Self::BorrowedParam
-            | Self::VarSelf
+            | Self::RefSelf
             | Self::DynView
             | Self::PatternAlias
-            | Self::MutableDowncastAlias
-            | Self::ForVarAlias => unreachable!("borrowed capture origin returned early"),
+            | Self::ForRefAlias => unreachable!("borrowed capture origin returned early"),
         }
     }
 }
@@ -1052,7 +1049,7 @@ pub(crate) enum GlobalAccessMode {
     CompoundAssign,
     ImmutableBorrow,
     MutableBorrow,
-    VarArgument,
+    RefArgument,
     MutReceiver,
 }
 
@@ -1071,7 +1068,7 @@ impl GlobalAccessMode {
             | Self::CompoundAssign
             | Self::ImmutableBorrow
             | Self::MutableBorrow
-            | Self::VarArgument
+            | Self::RefArgument
             | Self::MutReceiver => GlobalInitEffect::InitializeFirst,
         }
     }

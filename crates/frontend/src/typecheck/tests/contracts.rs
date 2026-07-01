@@ -48,11 +48,11 @@ fn module(name: &str) -> ModuleScope {
 #[test]
 fn inclusion_requirements_match() {
     let matched = assert_matches(
-        "contract Updatable { fn update(var self, dt: float); }
+        "contract Updatable { fn update(ref self, dt: float); }
         contract Drawable { fn draw(self); }
         contract Actor { Updatable; Drawable; }
         struct Enemy {
-            fn update(var self, dt: float) {}
+            fn update(ref self, dt: float) {}
             fn draw(self) {}
         }",
         "Enemy",
@@ -192,7 +192,7 @@ fn cached_generic_specialization_restores_dyn_downcast_facts() {
         struct Label { fn draw(self) {} }
         fn use_actor(actor: dyn _) {
             actor.draw();
-            if let enemy = actor as? Enemy {
+            if let enemy? = actor as? Enemy {
                 enemy.attack();
             }
         }
@@ -268,13 +268,13 @@ fn indexed_dynamic_call_records_fact() {
 }
 
 #[test]
-fn for_var_dynamic_call_records_fact() {
+fn for_ref_dynamic_call_records_fact() {
     let result = check(
-        "contract Updatable { fn update(var self); }
-        struct Enemy { fn update(var self) {} }
+        "contract Updatable { fn update(ref self); }
+        struct Enemy { fn update(ref self) {} }
         fn main() {
             var items: [dyn Updatable] = [Enemy {}];
-            for var item in items {
+            for ref item in items {
                 item.update();
             }
         }",
@@ -329,7 +329,7 @@ fn readonly_requirement_rejects_mutating_method() {
     assert!(matches!(
         mismatch(
             "contract Drawable { fn draw(self); }
-            struct Sprite { fn draw(var self) {} }",
+            struct Sprite { fn draw(ref self) {} }",
             "Sprite",
             "Drawable",
         ),
@@ -341,8 +341,8 @@ fn readonly_requirement_rejects_mutating_method() {
 fn parameter_type_mismatch_is_specific() {
     assert!(matches!(
         mismatch(
-            "contract Ticks { fn tick(var self, dt: float); }
-            struct Timer { fn tick(var self, dt: int) {} }",
+            "contract Ticks { fn tick(ref self, dt: float); }
+            struct Timer { fn tick(ref self, dt: int) {} }",
             "Timer",
             "Ticks",
         ),
@@ -383,13 +383,13 @@ fn default_parameter_does_not_reduce_arity() {
 fn imported_extension_method_matches() {
     let mut tc = checker_with_modules(
         "import ai { Enemy };
-        contract Updatable { fn update(var self, dt: float); }",
+        contract Updatable { fn update(ref self, dt: float); }",
         &[
             ("enemy", "pub struct Enemy { hp: int }"),
             (
                 "ai",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
         ],
     );
@@ -414,13 +414,13 @@ fn imported_extension_method_matches() {
 fn missing_extension_import_is_missing_method() {
     let mut tc = checker_with_modules(
         "import enemy { Enemy };
-        contract Updatable { fn update(var self, dt: float); }",
+        contract Updatable { fn update(ref self, dt: float); }",
         &[
             ("enemy", "pub struct Enemy { hp: int }"),
             (
                 "ai",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
         ],
     );
@@ -440,18 +440,18 @@ fn ambiguous_extension_method_is_ambiguous() {
         "import enemy { Enemy };
         import aggressive;
         import passive;
-        contract Updatable { fn update(var self, dt: float); }",
+        contract Updatable { fn update(ref self, dt: float); }",
         &[
             ("enemy", "pub struct Enemy { hp: int }"),
             (
                 "aggressive",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
             (
                 "passive",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
         ],
     );
@@ -468,8 +468,8 @@ fn ambiguous_extension_method_is_ambiguous() {
 #[test]
 fn promoted_method_matches() {
     let matched = assert_matches(
-        "contract Updatable { fn update(var self, dt: float); }
-        struct Entity { fn update(var self, dt: float) {} }
+        "contract Updatable { fn update(ref self, dt: float); }
+        struct Entity { fn update(ref self, dt: float) {} }
         struct Enemy { embed entity: Entity }",
         "Enemy",
         "Updatable",
@@ -484,8 +484,8 @@ fn promoted_method_matches() {
 #[test]
 fn extern_method_matches() {
     let matched = assert_matches(
-        "contract Movable { fn move_by(var self, dx: float); }
-        extern type Point { fn move_by(var self, dx: float); }",
+        "contract Movable { fn move_by(ref self, dx: float); }
+        extern type Point { fn move_by(ref self, dx: float); }",
         "Point",
         "Movable",
     );
@@ -516,18 +516,18 @@ fn witness_key_includes_selected_extension() {
         &[
             (
                 "api",
-                "pub contract Updatable { fn update(var self, dt: float); }",
+                "pub contract Updatable { fn update(ref self, dt: float); }",
             ),
             ("enemy", "pub struct Enemy { hp: int }"),
             (
                 "aggressive_ext",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
             (
                 "passive_ext",
                 "pub import enemy { Enemy };
-                pub extend Enemy { fn update(var self, dt: float) {} }",
+                pub extend Enemy { fn update(ref self, dt: float) {} }",
             ),
             (
                 "aggressive_use",
@@ -578,8 +578,8 @@ fn witness_key_includes_selected_extension() {
 fn ordinary_check_still_closes_contract_requirement_types() {
     let result = check(
         "type Seconds = float;
-        contract Ticks { fn tick(var self, dt: Seconds); }
-        struct Timer { fn tick(var self, dt: float) {} }",
+        contract Ticks { fn tick(ref self, dt: Seconds); }
+        struct Timer { fn tick(ref self, dt: float) {} }",
     )
     .expect("typecheck failed");
 

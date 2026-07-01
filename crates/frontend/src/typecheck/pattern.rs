@@ -1,10 +1,9 @@
 use anvyx_externs::ExternRep;
 
 use super::{
-    ActiveMutAliasRoot, CheckedType, MUT_ALIAS_ROOT_MESSAGE, MUT_DOWNCAST_ROOT_MESSAGE,
-    TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint, check_expected_value_expr,
-    check_value_expr_checked_with_hint, checked_from_type, checked_void, closure, collection_loan,
-    control_flow,
+    CheckedType, TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint,
+    check_expected_value_expr, check_value_expr_checked_with_hint, checked_from_type, checked_void,
+    closure, collection_loan, control_flow,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -646,21 +645,7 @@ impl<'tc> PatternChecker<'tc> {
                         .cloned()
                         .collect();
                     let target = place::AliasTarget::merged(group, targets);
-                    if matches!(
-                        self.context,
-                        PatternContext::IfLet
-                            | PatternContext::WhileLet
-                            | PatternContext::LetElse
-                            | PatternContext::Match
-                    ) {
-                        self.tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
-                            identity: target.identity.clone(),
-                            allowed: name,
-                            scope_depth: self.tc.scopes.len(),
-                            message: MUT_ALIAS_ROOT_MESSAGE,
-                        });
-                    }
-                    self.tc.define_alias_binding_from_handle(
+                    self.tc.define_ref_alias_binding_from_handle(
                         name,
                         &binding.ty,
                         target,
@@ -774,7 +759,7 @@ impl<'tc> PatternChecker<'tc> {
         }
         if input.map_entry_alias && self.context == PatternContext::Binding {
             self.tc.push_error(TypeError::CompileError {
-                message: "map entry aliases require if/while/else/match var syntax".to_string(),
+                message: "map entry aliases require if/while/else/match ref syntax".to_string(),
                 span: self.tc.error_span(inner.span),
             });
             let recovery = input.project(
@@ -1342,6 +1327,48 @@ pub(super) fn check_place_at(
     )
 }
 
+fn validate_ref_alias_shape(
+    pattern: &PatternNode,
+    context: PatternContext,
+    tc: &mut TypeChecker,
+) -> bool {
+    fn immediate_binding(pattern: &PatternNode) -> bool {
+        matches!(pattern.node, Pattern::Ident(_) | Pattern::Wildcard)
+    }
+
+    fn enum_payload_valid(payload: &EnumPatternPayload, context: PatternContext) -> bool {
+        match payload {
+            EnumPatternPayload::Unit => context == PatternContext::Match,
+            EnumPatternPayload::Tuple(fields) => fields.iter().all(immediate_binding),
+            EnumPatternPayload::Struct { fields, .. } => {
+                fields.iter().all(|(_, field)| immediate_binding(field))
+            }
+        }
+    }
+
+    fn valid(pattern: &PatternNode, context: PatternContext) -> bool {
+        match &pattern.node {
+            Pattern::Ident(_) | Pattern::Wildcard if context == PatternContext::For => true,
+            Pattern::Nil => context == PatternContext::Match,
+            Pattern::Optional(inner) => immediate_binding(inner),
+            Pattern::Enum { payload, .. } => enum_payload_valid(payload, context),
+            Pattern::Or(alternatives) => alternatives
+                .iter()
+                .all(|alternative| valid(alternative, context)),
+            _ => false,
+        }
+    }
+
+    if valid(pattern, context) {
+        return true;
+    }
+    tc.push_error(TypeError::CompileError {
+        message: "ref alias patterns must bind an immediate optional or enum payload".to_string(),
+        span: tc.error_span(pattern.span),
+    });
+    false
+}
+
 pub(super) fn check_roots(
     roots: Vec<PatternRoot<'_>>,
     context: PatternContext,
@@ -1371,8 +1398,11 @@ pub(super) fn check_roots(
             }
             PatternRootInput::Place(place, site) => (PatternInput::from_place(*place), Some(site)),
         };
+        let alias_shape_valid = !matches!(root.mode, PatternBindMode::Alias)
+            || validate_ref_alias_shape(root.pattern, context, tc);
         let mut checker = PatternChecker::new(tc, site, context, root.mode);
         let mut result = checker.check(root.pattern, input.clone());
+        result.outcome.had_error |= !alias_shape_valid;
         checker.apply_context_policy(root.pattern, &input.expected_ty, &mut result.outcome);
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
@@ -1395,20 +1425,18 @@ pub(super) fn check_roots(
     }
 }
 
-pub(super) fn mode_for_head(head: PatternHead) -> PatternBindMode {
-    match head {
-        PatternHead::Let => PatternBindMode::Owned { mutable: false },
-        PatternHead::Var => PatternBindMode::Alias,
+pub(super) fn mode_for_conditional_access(access: ConditionalPatternAccess) -> PatternBindMode {
+    match access {
+        ConditionalPatternAccess::Let => PatternBindMode::Owned { mutable: false },
+        ConditionalPatternAccess::Var => PatternBindMode::Owned { mutable: true },
+        ConditionalPatternAccess::Ref => PatternBindMode::Alias,
     }
 }
 
-pub(super) fn mode_for_binding(binding: &Binding) -> PatternBindMode {
-    match binding.mutability {
+pub(super) fn mode_for_refutable_mutability(mutability: Mutability) -> PatternBindMode {
+    match mutability {
         Mutability::Immutable => PatternBindMode::Owned { mutable: false },
-        Mutability::Mutable if matches!(binding.pattern.node, Pattern::Ident(_)) => {
-            PatternBindMode::Owned { mutable: true }
-        }
-        Mutability::Mutable => PatternBindMode::Alias,
+        Mutability::Mutable => PatternBindMode::Owned { mutable: true },
     }
 }
 
@@ -1539,19 +1567,18 @@ fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
 
 pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let binding = &binding_node.node;
-    let mode = mode_for_binding(binding);
+    let mode = PatternBindMode::Owned {
+        mutable: matches!(binding.mutability, Mutability::Mutable),
+    };
     let (value_ty, binding_ty) = match &binding.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
             let annot_handle = tc.type_handle(&annot_ty);
-            let value = match mode {
-                PatternBindMode::Owned { .. } => PatternScrutinee::owned(
-                    check_expected_value_expr(&binding.value, annot_handle.clone(), tc),
-                ),
-                PatternBindMode::Alias => {
-                    PatternScrutinee::alias(check_alias_scrutinee(&binding.value, tc))
-                }
-            };
+            let value = PatternScrutinee::owned(check_expected_value_expr(
+                &binding.value,
+                annot_handle.clone(),
+                tc,
+            ));
             tc.reject_extern_any_escape(&value.checked, binding.value.span);
             tc.solve_constraints();
             let value_ty = value.checked.ty.clone();
@@ -1584,11 +1611,8 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
         }
     };
 
-    if matches!(mode, PatternBindMode::Owned { .. })
-        && let Some(error) = collection_loan::stored_slice_local_error(
-            &binding_ty,
-            tc.error_span(binding.value.span),
-        )
+    if let Some(error) =
+        collection_loan::stored_slice_local_error(&binding_ty, tc.error_span(binding.value.span))
     {
         tc.push_error(error);
     }
@@ -1607,9 +1631,6 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
 }
 
 fn simple_owned_binding_name(binding: &Binding) -> Option<Ident> {
-    if !matches!(mode_for_binding(binding), PatternBindMode::Owned { .. }) {
-        return None;
-    }
     let Pattern::Ident(name) = &binding.pattern.node else {
         return None;
     };
@@ -1618,7 +1639,7 @@ fn simple_owned_binding_name(binding: &Binding) -> Option<Ident> {
 
 pub(super) fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) {
     let node = &let_else_node.node;
-    let mode = mode_for_head(node.head);
+    let mode = mode_for_refutable_mutability(node.mutability);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     control_flow::check_let_else_fallback(&node.fallback, tc);
     check_place_at(
@@ -1633,7 +1654,7 @@ pub(super) fn check_let_else(let_else_node: &LetElseNode, tc: &mut TypeChecker) 
 
 pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecker) {
     let node = &while_let_node.node;
-    let mode = mode_for_head(node.head);
+    let mode = mode_for_conditional_access(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
     check_place_at(
@@ -1657,9 +1678,7 @@ fn check_if_let_exact_downcast(
     let node = &if_let_node.node;
     let binding = exact_downcast_binding(node, tc);
     let policy = match binding {
-        Some(binding) if binding.mutable => DowncastSourcePolicy::MutablePlace {
-            binding: binding.name,
-        },
+        Some(binding) if binding.mutable => DowncastSourcePolicy::MutablePlace,
         _ => DowncastSourcePolicy::Value,
     };
     let site = DowncastSite {
@@ -1687,19 +1706,13 @@ fn check_if_let_exact_downcast(
         tc.push_scope();
         let handle = tc.type_handle(&target);
         match (binding.mutable, checked.source.valid_alias()) {
-            (true, Some(alias)) => {
-                tc.define_downcast_alias_from_handle(
-                    binding.name,
-                    &handle,
-                    alias.target(PlaceAccess::Mutable),
-                );
-                tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
-                    identity: alias.identity.clone(),
-                    allowed: binding.name,
-                    scope_depth: tc.scopes.len(),
-                    message: MUT_DOWNCAST_ROOT_MESSAGE,
-                });
-            }
+            (true, Some(alias)) => tc.define_ref_alias_binding_from_handle(
+                binding.name,
+                &handle,
+                alias.target(PlaceAccess::Mutable),
+                PatternContext::IfLet,
+                Some(node.pattern.span),
+            ),
             _ => {
                 tc.define_pattern_binding_from_handle(
                     binding.name,
@@ -1711,9 +1724,6 @@ fn check_if_let_exact_downcast(
         }
 
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
-        if binding.mutable && checked.source.valid_alias().is_some() {
-            tc.active_mut_alias_roots.pop();
-        }
         tc.pop_scope();
         then
     })
@@ -1729,7 +1739,7 @@ fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDow
     match node.pattern.node {
         Pattern::Ident(name) => Some(ExactDowncastBinding {
             name,
-            mutable: matches!(node.head, PatternHead::Var),
+            mutable: node.head.is_ref(),
         }),
         _ => {
             tc.push_error(TypeError::CompileError {
@@ -1794,11 +1804,13 @@ pub(super) fn check_if_let_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &if_let_node.node;
-    if let ExprKind::ExactDowncast(downcast) = &node.value.node.kind {
+    if node.head.is_ref()
+        && let ExprKind::ExactDowncast(downcast) = &node.value.node.kind
+    {
         return check_if_let_exact_downcast(if_let_node, downcast, expected, tc);
     }
 
-    let mode = mode_for_head(node.head);
+    let mode = mode_for_conditional_access(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {

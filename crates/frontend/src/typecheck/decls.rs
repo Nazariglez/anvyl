@@ -329,7 +329,7 @@ impl MethodMode {
     pub(crate) fn from_receiver(receiver: Option<MethodReceiver>) -> Self {
         match receiver {
             Some(MethodReceiver::Value) => Self::Instance { mutable: false },
-            Some(MethodReceiver::Var) => Self::Instance { mutable: true },
+            Some(MethodReceiver::Ref) => Self::Instance { mutable: true },
             None => Self::Static,
         }
     }
@@ -345,7 +345,7 @@ impl MethodMode {
         match self {
             Self::Static => None,
             Self::Instance { mutable: false } => Some(MethodReceiver::Value),
-            Self::Instance { mutable: true } => Some(MethodReceiver::Var),
+            Self::Instance { mutable: true } => Some(MethodReceiver::Ref),
         }
     }
 }
@@ -2426,7 +2426,7 @@ impl DeclarationIndex {
     fn validate_to_string_method(&mut self, sig: &MethodSig, span: SourceSpan) {
         let message = match sig.receiver {
             None => Some("to_string method must have a 'self' receiver"),
-            Some(MethodReceiver::Var) => Some("to_string method must be 'self', not 'var self'"),
+            Some(MethodReceiver::Ref) => Some("to_string method must be 'self', not 'ref self'"),
             Some(MethodReceiver::Value)
                 if !sig.type_params.is_empty() || !sig.const_params.is_empty() =>
             {

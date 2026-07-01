@@ -128,7 +128,7 @@ struct SourceReceiver {
 
 impl ReceiverUse {
     fn check_root(&self, span: Span, tc: &mut TypeChecker) {
-        tc.check_mut_downcast_root_use(self.root_name, &self.identity, span);
+        tc.check_mut_alias_root_use(self.root_name, &self.identity, span);
     }
 
     fn value(&self, tc: &TypeChecker) -> PlaceValue {
@@ -442,7 +442,7 @@ pub(super) fn check_postfix_chain_place(
             );
         }
         Subject::Value(value) => {
-            tc.check_mut_downcast_root_use(value.root_name, &value.identity, expr.span);
+            tc.check_mut_alias_root_use(value.root_name, &value.identity, expr.span);
             if record_final_read {
                 place::record_value_read(expr.node.id, value, tc);
             }
@@ -1563,7 +1563,7 @@ fn apply_call(
             tc,
         )),
         Subject::Value(value) => {
-            tc.check_mut_downcast_root_use(value.root_name, &value.identity, call.node.func.span);
+            tc.check_mut_alias_root_use(value.root_name, &value.identity, call.node.func.span);
             place::record_value_read(call.node.func.node.id, value, tc);
             call_value(value.checked.ty.clone(), call, call_id, expected, tc).into_place_value()
         }
@@ -1688,11 +1688,11 @@ fn check_dyn_hole_method_call(
 ) -> CheckedType {
     let method_receiver = if matches!(receiver.access, PlaceAccess::Mutable | PlaceAccess::DynView)
     {
-        MethodReceiver::Var
+        MethodReceiver::Ref
     } else {
         MethodReceiver::Value
     };
-    let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
+    let requires_mutable = matches!(method_receiver, MethodReceiver::Ref);
     receiver.check_root(call.span, tc);
     if requires_mutable {
         match receiver.access.error_for(
@@ -1780,7 +1780,7 @@ fn check_dyn_method_call(
     let method_receiver = requirement
         .receiver
         .expect("contract requirements are finalized with receivers");
-    let requires_mutable = matches!(method_receiver, MethodReceiver::Var);
+    let requires_mutable = matches!(method_receiver, MethodReceiver::Ref);
     receiver.check_root(call.span, tc);
     let mut failed = false;
     if requires_mutable {
@@ -2067,25 +2067,25 @@ fn check_mutable_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) ->
     let mutability_error = place
         .value
         .access
-        .error_for(MutableUseKind::VarArg(name), tc.error_span(arg.span));
+        .error_for(MutableUseKind::RefArg(name), tc.error_span(arg.span));
     let target = tc.handle_type(&param.ty);
     if let Some(error) = mutability_error {
         tc.push_error(error);
-        return reject_var_arg(arg, param, &place.value.checked, tc);
+        return reject_ref_arg(arg, param, &place.value.checked, tc);
     }
 
     match expected_place_projection(tc, arg, &place.value, &target) {
-        ExpectedPlaceProjection::SourceAccepted => finish_var_arg(arg, param, &place.value, tc),
-        ExpectedPlaceProjection::Projected(projected) => finish_var_arg(arg, param, &projected, tc),
+        ExpectedPlaceProjection::SourceAccepted => finish_ref_arg(arg, param, &place.value, tc),
+        ExpectedPlaceProjection::Projected(projected) => finish_ref_arg(arg, param, &projected, tc),
         ExpectedPlaceProjection::Failed => SourceArgCheck {
             failed: true,
             mutable_arg: None,
         },
-        ExpectedPlaceProjection::NotNeeded => reject_var_arg(arg, param, &place.into_checked(), tc),
+        ExpectedPlaceProjection::NotNeeded => reject_ref_arg(arg, param, &place.into_checked(), tc),
     }
 }
 
-fn reject_var_arg(
+fn reject_ref_arg(
     arg: &ExprNode,
     param: &CallParam,
     checked: &CheckedType,
@@ -2104,7 +2104,7 @@ fn reject_var_arg(
     }
 }
 
-fn finish_var_arg(
+fn finish_ref_arg(
     arg: &ExprNode,
     param: &CallParam,
     value: &PlaceValue,
@@ -2123,7 +2123,7 @@ fn finish_var_arg(
             mutable_arg: None,
         };
     }
-    place::record_var_argument(arg.node.id, value, tc);
+    place::record_ref_argument(arg.node.id, value, tc);
     tc.reject_extern_any_escape(&value.checked, arg.span);
     tc.expect_assignable_expr(
         arg.span,

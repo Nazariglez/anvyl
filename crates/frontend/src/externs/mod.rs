@@ -514,7 +514,7 @@ mod tests {
                     /// x coordinate.
                     x: float;
                     /// move point.
-                    fn move_by(var self, dx: float) -> void;
+                    fn move_by(ref self, dx: float) -> void;
                     /// origin.
                     fn origin() -> Self;
                     op Self + float -> Self;
@@ -619,7 +619,7 @@ mod tests {
                 extern type T {
                     fn value(self) -> void;
                     fn shared(shared self) -> void;
-                    fn mutable(var self) -> void;
+                    fn mutable(ref self) -> void;
                 }
                 ",
             );
@@ -862,7 +862,7 @@ mod tests {
         #[test]
         fn rejects_param_decorations() {
             for source in [
-                "extern fn f(var x: int) -> void;",
+                "extern fn f(ref x: int) -> void;",
                 "extern fn f(x: as int) -> void;",
                 "extern fn f(x: int = 1) -> void;",
             ] {

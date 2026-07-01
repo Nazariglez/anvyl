@@ -5,7 +5,7 @@ use super::{
     type_ops::{type_closure_facts, type_depends_on_generics},
 };
 use crate::{
-    ast::{ContractRef, ExactDowncastNode, ExprId, ExprNode, Ident, Type},
+    ast::{ContractRef, ExactDowncastNode, ExprId, ExprNode, Type},
     span::{SourceSpan, Span},
 };
 
@@ -17,7 +17,7 @@ pub(super) struct DowncastSite {
 
 pub(super) enum DowncastSourcePolicy {
     Value,
-    MutablePlace { binding: Ident },
+    MutablePlace,
 }
 
 pub(super) enum DowncastSourceContext {
@@ -141,17 +141,15 @@ pub(super) fn check_source(
                 alias: None,
             }
         }
-        DowncastSourcePolicy::MutablePlace { binding } => {
+        DowncastSourcePolicy::MutablePlace => {
             let place = check_place(source, tc);
             let handle = place.checked().handle.clone();
             let (contract, mut valid) =
                 source_contract(&place.checked().ty, source.span, context, tc);
-            if let Some(error) = place
-                .value
-                .access
-                .mut_borrow_error(*binding, tc.error_span(source.span))
-            {
-                tc.push_error(error);
+            if !place.value.access.can_mut_borrow() {
+                tc.push_error(TypeError::RefPatternRequiresMutablePlace {
+                    span: tc.error_span(source.span),
+                });
                 valid = false;
             }
             record_mut_borrow(source.node.id, &place.value, tc);

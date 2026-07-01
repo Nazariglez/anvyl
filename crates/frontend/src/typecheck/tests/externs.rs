@@ -865,7 +865,7 @@ mod fields {
         let result = check_with_provider(
             r"
             import ext:host { Point };
-            fn write(var p: Point) { p.x = 2.0; }
+            fn write(ref p: Point) { p.x = 2.0; }
             ",
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
@@ -920,7 +920,7 @@ mod fields {
         let result = check_with_provider(
             r"
             import ext:host { Point };
-            fn write(var p: Point) { p.x = 2.0; }
+            fn write(ref p: Point) { p.x = 2.0; }
             ",
             provider(ExternModuleDescriptor {
                 path: extern_path(&["host"]),
@@ -1016,7 +1016,7 @@ mod fields {
         let Err(errors) = check(
             r#"
             extern type Box { x: float; }
-            fn write(var p: Box) { p.x *= "bad"; }
+            fn write(ref p: Box) { p.x *= "bad"; }
             "#,
         ) else {
             panic!("invalid compound assignment should fail");
@@ -1253,8 +1253,8 @@ mod methods {
     fn accepts_mut_receiver() {
         let result = check(
             r"
-            extern type Point { fn move_by(var self, dx: float); }
-            fn move(var p: Point) { p.move_by(1.0); }
+            extern type Point { fn move_by(ref self, dx: float); }
+            fn move(ref p: Point) { p.move_by(1.0); }
             ",
         )
         .expect("typecheck failed");
@@ -1276,9 +1276,9 @@ mod methods {
     fn writes_field_receiver() {
         let result = check(
             r"
-            extern type Point { fn move_by(var self, dx: float); }
+            extern type Point { fn move_by(ref self, dx: float); }
             extern type Holder { point: Point; }
-            fn move(var holder: Holder) { holder.point.move_by(1.0); }
+            fn move(ref holder: Holder) { holder.point.move_by(1.0); }
             ",
         )
         .expect("typecheck failed");
@@ -1311,10 +1311,10 @@ mod methods {
     fn writes_nested_field_receiver() {
         let result = check(
             r"
-            extern type Point { fn move_by(var self, dx: float); }
+            extern type Point { fn move_by(ref self, dx: float); }
             extern type Child { point: Point; }
             extern type Holder { child: Child; }
-            fn move(var holder: Holder) { holder.child.point.move_by(1.0); }
+            fn move(ref holder: Holder) { holder.child.point.move_by(1.0); }
             ",
         )
         .expect("typecheck failed");
@@ -1475,7 +1475,7 @@ mod compound {
             r"
             extern type Vec2 { op Self + Self -> Self; }
             extern type Holder { init; value: Vec2; }
-            fn add(var holder: Holder, rhs: Vec2) { holder.value += rhs; }
+            fn add(ref holder: Holder, rhs: Vec2) { holder.value += rhs; }
             ",
         )
         .expect("typecheck failed");
@@ -1531,7 +1531,7 @@ mod compound {
         let result = check(
             r"
             extern type Point { x: float; }
-            fn write(var p: Point) { p.x = 1.0; }
+            fn write(ref p: Point) { p.x = 1.0; }
             ",
         )
         .expect("typecheck failed");
@@ -1553,7 +1553,7 @@ mod compound {
         let result = check(
             r"
             extern type Point { computed x: float; }
-            fn write(var p: Point) { p.x = 1.0; }
+            fn write(ref p: Point) { p.x = 1.0; }
             ",
         )
         .expect("typecheck failed");
@@ -1581,7 +1581,7 @@ mod compound {
                 r"
                 struct Point {{ x: float }}
                 extern type Holder {{ point: Point; }}
-                fn write(var holder: Holder) {{ {body} }}
+                fn write(ref holder: Holder) {{ {body} }}
                 "
             ))
             .expect("typecheck failed");
@@ -1595,52 +1595,12 @@ mod compound {
     }
 
     #[test]
-    fn records_tuple_alias_write_through_extern_field() {
-        let result = check(
-            r"
-            struct Wrapper { pair: (int, int) }
-            extern type Holder rep inline { wrapper: Wrapper; }
-            fn write(var holder: Holder) {
-                var Holder { wrapper: Wrapper { pair: (x, _) } } = holder;
-                x = 3;
-            }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = catalog_type(&result, ModuleScope::Root, "Holder");
-        let field = catalog_field(&result, owner, "wrapper");
-
-        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
-        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
-    }
-
-    #[test]
-    fn records_user_struct_alias_write_through_extern_field() {
-        let result = check(
-            r"
-            struct Point { x: int, y: int }
-            extern type Holder rep inline { point: Point; }
-            fn write(var holder: Holder) {
-                var Holder { point: Point { x } } = holder;
-                x = 3;
-            }
-            ",
-        )
-        .expect("typecheck failed");
-        let owner = catalog_type(&result, ModuleScope::Root, "Holder");
-        let field = catalog_field(&result, owner, "point");
-
-        assert_use_count(&result, ExternUseTarget::FieldRead(field), 1);
-        assert_use_count(&result, ExternUseTarget::FieldWrite(field), 1);
-    }
-
-    #[test]
     fn records_exact_uses() {
         let result = check(
             r"
             extern type Vec2 { op Self + Self -> Self; }
             extern type Holder { value: Vec2; }
-            fn add(var holder: Holder, rhs: Vec2) { holder.value += rhs; }
+            fn add(ref holder: Holder, rhs: Vec2) { holder.value += rhs; }
             ",
         )
         .expect("typecheck failed");
@@ -1653,7 +1613,7 @@ mod compound {
             r"
             extern type Vec2 { op Self + Self -> Self; }
             extern type Holder { computed value: Vec2; }
-            fn add(var holder: Holder, rhs: Vec2) { holder.value += rhs; }
+            fn add(ref holder: Holder, rhs: Vec2) { holder.value += rhs; }
             ",
         )
         .expect("typecheck failed");
@@ -1701,7 +1661,7 @@ mod compound {
             r"
             extern type Child { x: float; }
             extern type Parent { child: Child; }
-            fn write(var p: Parent) { p.child.x = 1.0; }
+            fn write(ref p: Parent) { p.child.x = 1.0; }
             ",
         )
         .expect("typecheck failed");
@@ -1860,7 +1820,7 @@ mod provider_imports {
         let result = check_with_provider(
             r"
             import ext:host { Point };
-            fn use_it(var p: Point) -> float {
+            fn use_it(ref p: Point) -> float {
                 let q = Point { x: 1.0, y: 2.0 };
                 p.x = q.y;
                 p.move_by(q);
@@ -2088,7 +2048,7 @@ mod mut_borrow {
         let result = check_with_provider(
             r"
             import ext:host { Point, touch };
-            fn use_it(var p: Point) { touch(p.x); }
+            fn use_it(ref p: Point) { touch(p.x); }
             ",
             touch_provider(
                 vec![ExternTypeDescriptor {
@@ -2116,7 +2076,7 @@ mod mut_borrow {
         let result = check_with_provider(
             r"
             import ext:host { Parent, touch };
-            fn use_it(var p: Parent) { touch(p.child.x); }
+            fn use_it(ref p: Parent) { touch(p.child.x); }
             ",
             touch_provider(nested_field_types(), ExternTypeExpr::Float),
         )
@@ -2305,7 +2265,7 @@ mod named_modules {
         let result = check_named(
             r"
             import math { Point, use_it };
-            fn main(var p: Point) -> Point { use_it(p, 1) }
+            fn main(ref p: Point) -> Point { use_it(p, 1) }
             ",
             &[(
                 "math",
@@ -2314,11 +2274,11 @@ mod named_modules {
                 pub extern type Point rep inline {
                     init(x: float);
                     x: float;
-                    fn shift(var self, delta: Point);
+                    fn shift(ref self, delta: Point);
                     fn origin() -> Self;
                     op Self + Self -> Self;
                 }
-                pub fn use_it<T>(var p: Point, tag: T) -> Point {
+                pub fn use_it<T>(ref p: Point, tag: T) -> Point {
                     let q = Point { x: 1.0 };
                     p.x = q.x;
                     p.shift(q);

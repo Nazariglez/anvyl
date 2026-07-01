@@ -811,7 +811,7 @@ fn extern_self_param<'src>() -> BoxedParser<'src, ast::ExternReceiverMode> {
     let shared_self = contextual_ident("shared")
         .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Shared);
-    let mutable_self = select! { Token::Keyword(Keyword::Var) => () }
+    let mutable_self = select! { Token::Keyword(Keyword::Ref) => () }
         .ignore_then(self_ident())
         .to(ast::ExternReceiverMode::Mutable);
 
@@ -829,7 +829,7 @@ fn extern_method_param_list<'src>(
             if params.iter().any(|param| param.name.0.as_ref() == SELF_ITEM) {
                 emitter.emit(Rich::custom(
                     extra.span(),
-                    "extern method receiver must be 'self', 'shared self', or 'var self' without a type annotation",
+                    "extern method receiver must be 'self', 'shared self', or 'ref self' without a type annotation",
                 ));
             }
             params
@@ -1125,9 +1125,9 @@ fn method_params<'src>(
 
 fn method_self_param<'src>() -> BoxedParser<'src, ast::MethodReceiver> {
     let value_self = self_ident().to(ast::MethodReceiver::Value);
-    let mutable_self = select! { Token::Keyword(Keyword::Var) => () }
+    let mutable_self = select! { Token::Keyword(Keyword::Ref) => () }
         .ignore_then(self_ident())
-        .to(ast::MethodReceiver::Var);
+        .to(ast::MethodReceiver::Ref);
 
     choice((mutable_self, value_self))
         .then(
@@ -1170,7 +1170,7 @@ fn method_param_list<'src>(
             if params.iter().any(|param| param.name.0.as_ref() == SELF_ITEM) {
                 emitter.emit(Rich::custom(
                     extra.span(),
-                    "method receiver must be first and must be 'self' or 'var self' without a type annotation",
+                    "method receiver must be first and must be 'self' or 'ref self' without a type annotation",
                 ));
             }
             params
@@ -1761,7 +1761,7 @@ fn contract_member<'src>(
             if sig.receiver.is_none() {
                 emitter.emit(Rich::custom(
                     extra.span(),
-                    "contract method requirements must include a `self` or `var self` receiver",
+                    "contract method requirements must include a `self` or `ref self` receiver",
                 ));
             }
             if !sig.type_params.is_empty() || !sig.const_params.is_empty() {

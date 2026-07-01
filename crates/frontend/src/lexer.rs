@@ -157,6 +157,7 @@ spelled_token! {
         Return => "return",
         Let => "let",
         Var => "var",
+        Ref => "ref",
         Const => "const",
         Lazy => "lazy",
         If => "if",
@@ -994,8 +995,9 @@ mod tests {
     }
 
     #[test]
-    fn lazy_is_keyword() {
+    fn reserved_words_are_keywords() {
         assert_eq!(tokenize_tokens("lazy"), vec![Token::Keyword(Keyword::Lazy)]);
+        assert_eq!(tokenize_tokens("ref"), vec![Token::Keyword(Keyword::Ref)]);
     }
 
     #[test]
@@ -1018,6 +1020,7 @@ mod tests {
             "type",
             "import",
             "lazy",
+            "ref",
             "bad-name",
             "math utils",
             " math",

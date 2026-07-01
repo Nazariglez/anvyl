@@ -12,7 +12,7 @@ use super::{
         add_sub_op, and_op, assign_op, bit_and_op, bit_or_op, cmp_op, coalesce_op, eq_op,
         infix_left, mul_div_op, or_op, shift_op, xor_op,
     },
-    pattern::{binding_pattern, pattern},
+    pattern::{conditional_pattern, pattern},
     types::{generic_arg, type_ident, type_subject_type_ident},
 };
 use crate::{
@@ -126,7 +126,7 @@ fn if_expr<'src>(
         )))
         .or_not();
 
-        let let_value = binding_pattern()
+        let let_value = conditional_pattern()
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(cond_expression());
 
@@ -229,19 +229,19 @@ fn match_expr<'src>(
     .map(|arms| (ast::MatchMode::Pattern, arms));
 
     let cond_expr = cond_expression();
-    let match_head = select! { Token::Keyword(Keyword::Var) => ast::PatternHead::Var }
+    let match_access = select! { Token::Keyword(Keyword::Ref) => ast::RefAccess::Ref }
         .or_not()
-        .map(|head| head.unwrap_or(ast::PatternHead::Let));
+        .map(|access| access.unwrap_or(ast::RefAccess::Value));
 
     select! { Token::Keyword(Keyword::Match) => () }
-        .ignore_then(match_head)
+        .ignore_then(match_access)
         .then(cond_expr)
         .then(dynamic_arms.or(pattern_arms))
-        .map_with(|((head, scrutinee), (mode, arms)), e| {
+        .map_with(|((access, scrutinee), (mode, arms)), e| {
             let span = e.span().byte();
             let match_node = Spanned::new(
                 ast::Match {
-                    head,
+                    access,
                     mode,
                     scrutinee: Box::new(scrutinee),
                     arms,
@@ -558,13 +558,13 @@ fn lambda_expr<'src>(
     let colon = select! { Token::Colon => () };
     let assign = select! { Token::Op(Op::Assign) => () };
 
-    let var_kw = select! {
-        Token::Keyword(Keyword::Var) => (),
+    let ref_kw = select! {
+        Token::Keyword(Keyword::Ref) => (),
     }
     .or_not()
     .map(|opt| opt.is_some());
 
-    let lambda_param = var_kw
+    let lambda_param = ref_kw
         .then(identifier())
         .then(
             colon

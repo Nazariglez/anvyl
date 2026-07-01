@@ -1837,7 +1837,7 @@ impl LowerCx<'_> {
 }
 
 type EnumMatchArms<'a> = (
-    Vec<(crate::air::VariantId, &'a ExprNode)>,
+    Vec<(crate::air::VariantId, &'a ast::PatternNode, &'a ExprNode)>,
     Option<&'a ExprNode>,
 );
 
@@ -2130,7 +2130,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
-        let alias = if_let.node.head == ast::PatternHead::Var;
+        if matches!(if_let.node.value.node.kind, ExprKind::ExactDowncast(_)) {
+            return Err(unsupported_expr(&if_let.node.value));
+        }
+        let alias = if_let.node.head.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&if_let.node.value, &if_let.node.value, alias)?;
         match classify_optional_pattern(&if_let.node.pattern)? {
@@ -2165,9 +2168,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let Some(else_block) = &if_let.node.else_block else {
             return Err(unsupported_expr(expr));
         };
+        if matches!(if_let.node.value.node.kind, ExprKind::ExactDowncast(_)) {
+            return Err(unsupported_expr(expr));
+        }
         let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         let result = self.temp(result_ty);
-        let alias = if_let.node.head == ast::PatternHead::Var;
+        let alias = if_let.node.head.is_ref();
         let subject = self.lower_optional_pattern_subject(&if_let.node.value, expr, alias)?;
         match classify_optional_pattern(&if_let.node.pattern)? {
             OptionalPattern::Some(pattern) => {
@@ -2202,7 +2208,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_let_else(&mut self, let_else: &ast::LetElse) -> Result<(), LowerError> {
-        let alias = let_else.head == ast::PatternHead::Var;
+        let alias = false;
         let subject =
             self.lower_optional_pattern_subject(&let_else.value, &let_else.value, alias)?;
         let pattern = classify_optional_pattern(&let_else.pattern)?;
@@ -2352,15 +2358,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let binding = def.binding_id.map(air_binding_id);
         let mutable = def.mutable;
         let source_ty = def.ty.clone();
-        if mutable {
-            return Err(unsupported_pattern_stmt(pattern));
-        }
         let ty = self.cx.lower_ty(&source_ty)?;
         let local = self.push_local(
             Some(name),
             binding,
             ty,
-            AirMutability::Immutable,
+            if mutable {
+                AirMutability::Mutable
+            } else {
+                AirMutability::Immutable
+            },
             LocalKind::User,
         );
         let place = self.local_place(local);
@@ -2463,21 +2470,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
     ) -> Result<(), LowerError> {
+        if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
+            return Err(unsupported_expr(expr));
+        }
         if self.is_optional_expr(&match_expr.node.scrutinee)? {
             return self.lower_optional_match_effect(expr, match_expr);
-        }
-        if match_expr.node.head == ast::PatternHead::Var {
-            return Err(LowerError::UnsupportedExpr {
-                expr_id: expr.node.id,
-                kind: "UnsupportedPayloadAlias",
-            });
         }
         let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
         let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
         let mut air_arms = vec![];
         let mut any_falls = false;
-        for (variant, body) in arms {
-            let block = self.lower_nested_expr_effect(body)?;
+        for (variant, pattern, body) in arms {
+            let block = self.lower_nested_enum_match_arm(
+                body,
+                pattern,
+                &discr,
+                variant,
+                match_expr.node.access.is_ref(),
+                match_expr.node.scrutinee.node.id,
+                MatchOutput::Effect,
+            )?;
             any_falls |= air_block_falls_through(&block);
             air_arms.push(AirEnumMatchArm { variant, block });
         }
@@ -2617,7 +2629,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             _ => return Err(unsupported_pattern_stmt(&for_.bindings[0].pattern)),
         };
-        if item.mutable {
+        if item.access.is_ref() {
             let local = self.push_for_slot_local(&item.pattern, elem)?;
             bindings.push(ForBindingPlan::ElementSlot {
                 pattern: item.pattern.clone(),
@@ -2655,7 +2667,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let mut mode = AirCollectionLoanMode::ReadonlyMap;
         let mut bindings = vec![];
         match for_.bindings.as_slice() {
-            [entry] if !entry.mutable => bindings.push(ForBindingPlan::OwnedMapEntry {
+            [entry] if !entry.access.is_ref() => bindings.push(ForBindingPlan::OwnedMapEntry {
                 pattern: entry.pattern.clone(),
                 ty: self.for_pattern_ty(&entry.pattern)?.unwrap_or_else(|| {
                     self.cx
@@ -2668,7 +2680,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     pattern: key_binding.pattern.clone(),
                     ty: key,
                 });
-                if value_binding.mutable {
+                if value_binding.access.is_ref() {
                     let local = self.push_for_slot_local(&value_binding.pattern, value)?;
                     bindings.push(ForBindingPlan::MapValueSlot {
                         pattern: value_binding.pattern.clone(),
@@ -2896,14 +2908,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     let place = Self::sequence_element_place(&plan.root, plan.index, *ty);
                     self.lower_for_pattern_binding(pattern, Operand::Place(place), false)?;
                 }
-                ForBindingPlan::ElementSlot { pattern, local, .. }
-                | ForBindingPlan::MapValueSlot { pattern, local, .. } => {
+                ForBindingPlan::ElementSlot { pattern, .. }
+                | ForBindingPlan::MapValueSlot { pattern, .. } => {
                     if !matches!(pattern.node, Pattern::Ident(_) | Pattern::Wildcard) {
-                        self.lower_for_pattern_binding(
-                            pattern,
-                            Operand::Place(self.local_place(*local)),
-                            true,
-                        )?;
+                        return Err(unsupported_pattern_stmt(pattern));
                     }
                 }
                 ForBindingPlan::OwnedMapEntry { pattern, ty } => {
@@ -3204,7 +3212,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         id: AirLoopId,
         while_let: &ast::WhileLet,
     ) -> Result<(), LowerError> {
-        let alias = while_let.head == ast::PatternHead::Var;
+        let alias = while_let.head.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&while_let.value, &while_let.value, alias)?;
         match classify_optional_pattern(&while_let.pattern)? {
@@ -3327,14 +3335,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 self.locals.insert(semantic, place.clone());
                 self.insert_capture_source(semantic, place)
             }
-            Pattern::Tuple(_) | Pattern::Struct { .. }
-                if binding.node.mutability == AstMutability::Mutable =>
-            {
-                let place = self
-                    .lower_place_arg(&binding.node.value, true)
-                    .map_err(|_| unsupported_pattern_stmt(&binding.node.pattern))?;
-                self.lower_for_pattern_binding(&binding.node.pattern, Operand::Place(place), true)
-            }
             Pattern::Tuple(_) | Pattern::Struct { .. } => {
                 let value = Operand::Place(self.lower_place_or_temp(&binding.node.value, false)?);
                 self.lower_for_pattern_binding_at(
@@ -3344,9 +3344,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     Some(binding.node.value.node.id),
                 )
             }
-            Pattern::Wildcard if binding.node.mutability == AstMutability::Immutable => {
-                self.lower_effect(&binding.node.value)
-            }
+            Pattern::Wildcard => self.lower_effect(&binding.node.value),
             _ => Err(LowerError::UnsupportedStmt {
                 kind: binding.node.pattern.node.variant_name(),
                 span: Some(self.source_span(binding.span)),
@@ -3471,7 +3469,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let valid = if requires_mut {
                 matches!(
                     fact.mode,
-                    GlobalAccessMode::VarArgument
+                    GlobalAccessMode::RefArgument
                         | GlobalAccessMode::MutableBorrow
                         | GlobalAccessMode::MutReceiver
                 )
@@ -3488,7 +3486,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
         let fact = if requires_mut {
             match self
-                .local_use(expr, LocalUseMode::VarArgument)
+                .local_use(expr, LocalUseMode::RefArgument)
                 .or_else(|_| self.local_use(expr, LocalUseMode::MutBorrow))
             {
                 Ok(fact) => fact,
@@ -5972,16 +5970,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
     ) -> Result<Operand, LowerError> {
+        if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
+            return Err(unsupported_expr(expr));
+        }
         if self.is_optional_expr(&match_expr.node.scrutinee)? {
             let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
             let result = self.temp(result_ty);
             return self.lower_optional_match_value(expr, match_expr, result, result_ty);
-        }
-        if match_expr.node.head == ast::PatternHead::Var {
-            return Err(LowerError::UnsupportedExpr {
-                expr_id: expr.node.id,
-                kind: "UnsupportedPayloadAlias",
-            });
         }
         let result_ty = match self.lower_expr_ty(expr.node.id)? {
             ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => self.cx.lower_ty(&ty)?,
@@ -5992,8 +5987,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
         let mut any_falls = false;
         let mut air_arms = vec![];
-        for (variant, body) in arms {
-            let block = self.lower_nested_expr_branch_value(body, result)?;
+        for (variant, pattern, body) in arms {
+            let block = self.lower_nested_enum_match_arm(
+                body,
+                pattern,
+                &discr,
+                variant,
+                match_expr.node.access.is_ref(),
+                match_expr.node.scrutinee.node.id,
+                MatchOutput::Value { result, result_ty },
+            )?;
             any_falls |= air_block_falls_through(&block);
             air_arms.push(AirEnumMatchArm { variant, block });
         }
@@ -6022,7 +6025,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
     ) -> Result<(), LowerError> {
-        let alias = match_expr.node.head == ast::PatternHead::Var;
+        let alias = match_expr.node.access.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
         let plan = optional_match_plan(expr, &match_expr.node.arms)?;
@@ -6034,7 +6037,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             expr,
             alias,
             payload,
-            OptionalMatchOutput::Effect,
+            MatchOutput::Effect,
         )?;
         let (some_falls, none_falls) = self.push_optional_match(
             subject,
@@ -6057,7 +6060,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         result: LocalId,
         result_ty: TypeId,
     ) -> Result<Operand, LowerError> {
-        let alias = match_expr.node.head == ast::PatternHead::Var;
+        let alias = match_expr.node.access.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
         let plan = optional_match_plan(expr, &match_expr.node.arms)?;
@@ -6069,7 +6072,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             expr,
             alias,
             payload,
-            OptionalMatchOutput::Value { result, result_ty },
+            MatchOutput::Value { result, result_ty },
         )?;
         let (some_falls, none_falls) = self.push_optional_match(
             subject,
@@ -6093,7 +6096,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         site: &ExprNode,
         alias: bool,
         payload: Option<LocalId>,
-        output: OptionalMatchOutput,
+        output: MatchOutput,
     ) -> Result<(AirBlock, AirBlock), LowerError> {
         let some_block = self.with_nested_block(|this| {
             if let Some((pattern, body)) = plan.some {
@@ -6106,28 +6109,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 } else {
                     this.lower_optional_payload_binding(pattern, payload, alias)?;
                 }
-                this.lower_optional_match_body(body, output)
+                this.lower_match_body(body, output)
             } else if let Some((pattern, body)) = plan.default {
                 this.lower_optional_default_binding(
                     pattern,
                     Operand::Place(subject.ok_or_else(|| unsupported_expr(site))?.clone()),
                     alias,
                 )?;
-                this.lower_optional_match_body(body, output)
+                this.lower_match_body(body, output)
             } else {
                 this.terminate(AirTail::Unreachable)
             }
         })?;
         let none_block = self.with_nested_block(|this| {
             if let Some(body) = plan.none {
-                this.lower_optional_match_body(body, output)
+                this.lower_match_body(body, output)
             } else if let Some((pattern, body)) = plan.default {
                 this.lower_optional_default_binding(
                     pattern,
                     Operand::Place(subject.ok_or_else(|| unsupported_expr(site))?.clone()),
                     alias,
                 )?;
-                this.lower_optional_match_body(body, output)
+                this.lower_match_body(body, output)
             } else {
                 this.terminate(AirTail::Unreachable)
             }
@@ -6135,14 +6138,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok((some_block, none_block))
     }
 
-    fn lower_optional_match_body(
-        &mut self,
-        body: &ExprNode,
-        output: OptionalMatchOutput,
-    ) -> Result<(), LowerError> {
+    fn lower_match_body(&mut self, body: &ExprNode, output: MatchOutput) -> Result<(), LowerError> {
         match output {
-            OptionalMatchOutput::Effect => self.lower_effect(body),
-            OptionalMatchOutput::Value { result, result_ty } => {
+            MatchOutput::Effect => self.lower_effect(body),
+            MatchOutput::Value { result, result_ty } => {
                 self.lower_match_result_body(body, result, result_ty)
             }
         }
@@ -6217,24 +6216,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     }
                     else_arm = Some(&arm.node.body);
                 }
-                Pattern::Enum {
-                    variant,
-                    payload: EnumPatternPayload::Unit,
-                    ..
-                } => {
+                Pattern::Enum { variant, .. } => {
                     let Some(id) = self.enum_variant_id(*enum_id, *variant) else {
                         return Err(unsupported_expr(owner));
                     };
-                    if !matches!(
-                        self.cx.program.enum_decl(*enum_id).variants[id.index()].shape,
-                        VariantShape::Unit
-                    ) {
+                    if variants.iter().any(|(seen, _, _)| *seen == id) {
                         return Err(unsupported_expr(owner));
                     }
-                    if variants.iter().any(|(seen, _)| *seen == id) {
-                        return Err(unsupported_expr(owner));
-                    }
-                    variants.push((id, &arm.node.body));
+                    variants.push((id, pattern, &arm.node.body));
                 }
                 _ => return Err(unsupported_expr(owner)),
             }
@@ -6245,6 +6234,112 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Err(unsupported_expr(owner));
         }
         Ok((variants, else_arm))
+    }
+
+    fn lower_nested_enum_match_arm(
+        &mut self,
+        body: &ExprNode,
+        pattern: &ast::PatternNode,
+        discr: &Place,
+        variant: crate::air::VariantId,
+        alias: bool,
+        site: ExprId,
+        output: MatchOutput,
+    ) -> Result<AirBlock, LowerError> {
+        self.with_nested_block(|this| {
+            this.lower_enum_match_pattern_bindings(pattern, discr, variant, alias, site)?;
+            this.lower_match_body(body, output)
+        })
+    }
+
+    fn lower_enum_match_pattern_bindings(
+        &mut self,
+        pattern: &ast::PatternNode,
+        discr: &Place,
+        variant: crate::air::VariantId,
+        alias: bool,
+        site: ExprId,
+    ) -> Result<(), LowerError> {
+        let Pattern::Enum { payload, .. } = &pattern.node else {
+            return Ok(());
+        };
+        let TypeData::Enum(enum_id) = self.cx.program.type_data(discr.ty) else {
+            return Err(unsupported_pattern_stmt(pattern));
+        };
+        let enum_id = *enum_id;
+        let places = {
+            let shape = &self.cx.program.enum_decl(enum_id).variants[variant.index()].shape;
+            match (payload, shape) {
+                (EnumPatternPayload::Unit, VariantShape::Unit) => return Ok(()),
+                (EnumPatternPayload::Tuple(patterns), VariantShape::Tuple(types))
+                    if patterns.len() == types.len() =>
+                {
+                    patterns
+                        .iter()
+                        .zip(types)
+                        .enumerate()
+                        .map(|(index, (pattern, &ty))| {
+                            (
+                                pattern,
+                                Self::enum_variant_field_place(
+                                    discr,
+                                    enum_id,
+                                    variant,
+                                    index as u16,
+                                    ty,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+                (EnumPatternPayload::Struct { fields, .. }, VariantShape::Struct(field_decls)) => {
+                    fields
+                        .iter()
+                        .map(|(name, pattern)| {
+                            let Some((index, field)) = field_decls
+                                .iter()
+                                .enumerate()
+                                .find(|(_, field)| field.name == *name)
+                            else {
+                                return Err(unsupported_pattern_stmt(pattern));
+                            };
+                            Ok((
+                                pattern,
+                                Self::enum_variant_field_place(
+                                    discr,
+                                    enum_id,
+                                    variant,
+                                    index as u16,
+                                    field.ty,
+                                ),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+                _ => return Err(unsupported_pattern_stmt(pattern)),
+            }
+        };
+        for (pattern, place) in places {
+            self.lower_for_pattern_binding_at(pattern, Operand::Place(place), alias, Some(site))?;
+        }
+        Ok(())
+    }
+
+    fn enum_variant_field_place(
+        discr: &Place,
+        enum_id: crate::air::EnumId,
+        variant: crate::air::VariantId,
+        field: u16,
+        ty: TypeId,
+    ) -> Place {
+        let mut place = discr.clone();
+        place.projection.push(crate::air::Projection::VariantField {
+            enum_id,
+            variant,
+            field,
+        });
+        place.ty = ty;
+        place
     }
 
     fn lower_block_branch_value(
@@ -9396,7 +9491,7 @@ struct OptionalMatchPlan<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum OptionalMatchOutput {
+enum MatchOutput {
     Effect,
     Value { result: LocalId, result_ty: TypeId },
 }
@@ -9439,7 +9534,7 @@ fn lowered_capture_kind(
                 && matches!(
                     origin,
                     CaptureStorageOrigin::BorrowedParam
-                        | CaptureStorageOrigin::VarSelf
+                        | CaptureStorageOrigin::RefSelf
                         | CaptureStorageOrigin::PatternAlias
                 ) =>
         {
@@ -9632,7 +9727,7 @@ fn alloc_scoped_borrows(
             if capture.storage != CaptureStorage::BorrowedScoped
                 || !matches!(
                     capture.origin,
-                    CaptureStorageOrigin::BorrowedParam | CaptureStorageOrigin::VarSelf
+                    CaptureStorageOrigin::BorrowedParam | CaptureStorageOrigin::RefSelf
                 )
             {
                 continue;
@@ -9696,7 +9791,7 @@ fn scoped_borrow_source(
     let source = exact_local_capture_source(expr_id, owner, owner_function, sources, capture, ty)?;
     let role = match capture.origin {
         CaptureStorageOrigin::BorrowedParam => ParamRole::Normal,
-        CaptureStorageOrigin::VarSelf => ParamRole::Receiver,
+        CaptureStorageOrigin::RefSelf => ParamRole::Receiver,
         _ => return Err(lambda_capture_gap(expr_id)),
     };
     owner_function
@@ -9712,7 +9807,7 @@ fn scoped_borrow_source(
             CaptureStorageOrigin::BorrowedParam => ScopedBorrowSource::SourceMutParam {
                 local: source.local,
             },
-            CaptureStorageOrigin::VarSelf => ScopedBorrowSource::VarSelf {
+            CaptureStorageOrigin::RefSelf => ScopedBorrowSource::RefSelf {
                 local: source.local,
             },
             _ => unreachable!("scoped borrow origin checked above"),
@@ -11721,9 +11816,9 @@ mod tests {
     }
 
     #[test]
-    fn global_var_argument_emits_ensure_and_mut_borrow_arg() {
+    fn global_ref_argument_emits_ensure_and_mut_borrow_arg() {
         let air = lower_root(
-            "lazy var Value: int = 1; fn set(var x: int) { x = 2; } fn main() { set(Value); }",
+            "lazy var Value: int = 1; fn set(ref x: int) { x = 2; } fn main() { set(Value); }",
             "main",
         )
         .expect("lower failed");
@@ -11781,7 +11876,7 @@ mod tests {
     #[test]
     fn global_mut_receiver_emits_ensure_and_mut_borrow_receiver() {
         let air = lower_root(
-            "struct Box { value: int } extend Box { fn reset(var self) { self.value = 0; } } lazy var State: Box = Box { value: 1 }; fn main() { State.reset(); }",
+            "struct Box { value: int } extend Box { fn reset(ref self) { self.value = 0; } } lazy var State: Box = Box { value: 1 }; fn main() { State.reset(); }",
             "main",
         )
         .expect("lower failed");
@@ -12387,8 +12482,8 @@ mod tests {
     }
 
     #[test]
-    fn sequence_for_var_lowers_slot_inside_collection_loan() {
-        let air = lower_root("fn f(var xs: [int]) { for var x in xs { x += 1; } }", "f")
+    fn sequence_for_ref_lowers_slot_inside_collection_loan() {
+        let air = lower_root("fn f(ref xs: [int]) { for ref x in xs { x += 1; } }", "f")
             .expect("lower failed");
 
         assert!(program_statements(&air).any(|statement| {
@@ -12420,15 +12515,6 @@ mod tests {
     fn sequence_for_tuple_pattern_lowers() {
         lower_root(
             "fn f(xs: [(int, string)]) { for (a, b) in xs { a; b; } }",
-            "f",
-        )
-        .expect("lower failed");
-    }
-
-    #[test]
-    fn sequence_for_var_tuple_pattern_lowers() {
-        lower_root(
-            "fn f(var xs: [(int, int)]) { for var (a, b) in xs { a += 1; b += 1; } }",
             "f",
         )
         .expect("lower failed");
@@ -12490,9 +12576,9 @@ mod tests {
     }
 
     #[test]
-    fn map_for_var_value_lowers_map_value_slot() {
+    fn map_for_ref_value_lowers_map_value_slot() {
         let air = lower_root(
-            "fn f(var m: [string: int]) { for k, var v in m { v += 1; } }",
+            "fn f(ref m: [string: int]) { for k, ref v in m { v += 1; } }",
             "f",
         )
         .expect("lower failed");
@@ -12969,7 +13055,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_enum_match_is_explicitly_unsupported() {
+    fn payload_enum_match_lowers_payload_binding() {
         let source = r"
             enum Event { Hit(int), Miss }
             fn f(e: Event) -> int {
@@ -12979,8 +13065,16 @@ mod tests {
                 }
             }
         ";
-        let err = lower_full_core_root(source, "f").expect_err("expected unsupported match");
-        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
+        let air = lower_root(source, "f").expect("lower failed");
+        let f = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("function missing");
+        assert!(function_statements(f).any(|stmt| {
+            matches!(stmt, AirStmt::Init { value: RValue::Use(Operand::Place(place)), .. }
+                if matches!(place.projection.as_slice(), [crate::air::Projection::VariantField { .. }]))
+        }));
     }
 
     #[test]
@@ -13712,7 +13806,7 @@ mod tests {
             }],
         };
         let (root, resolved, semantic) = checked_with_provider(
-            "import ext:host { touch }; fn f(var x: int) { touch(x); }",
+            "import ext:host { touch }; fn f(ref x: int) { touch(x); }",
             provider,
         );
         let air = lower_checked_roots(&root, &resolved, &semantic, &["f"]).expect("lower failed");
@@ -13730,8 +13824,8 @@ mod tests {
     }
 
     #[test]
-    fn source_var_call_lowers_to_mut_borrow_arg() {
-        let air = lower_root("fn inc(var x: int) {} fn f() { var x = 1; inc(x); }", "f")
+    fn source_ref_call_lowers_to_mut_borrow_arg() {
+        let air = lower_root("fn inc(ref x: int) {} fn f() { var x = 1; inc(x); }", "f")
             .expect("lower failed");
         assert!(program_statements(&air).any(|statement| {
             matches!(
@@ -13745,8 +13839,8 @@ mod tests {
     }
 
     #[test]
-    fn mutable_capture_var_arg_lowers_owner_cell() {
-        let source = "fn bump(var x: int) {} fn f() { var count = 0; let g: fn() = || { count = 1; }; bump(count); g; }";
+    fn mutable_capture_ref_arg_lowers_owner_cell() {
+        let source = "fn bump(ref x: int) {} fn f() { var count = 0; let g: fn() = || { count = 1; }; bump(count); g; }";
         let air = lower_root(source, "f").expect("lower failed");
         let cell = CaptureCellId::from_index(0);
 
@@ -13768,8 +13862,8 @@ mod tests {
     }
 
     #[test]
-    fn projected_capture_var_arg_lowers_owner_cell_projection() {
-        let source = "struct Point { x: int } fn bump(var x: int) {} fn f() { var p = Point { x: 0 }; let g: fn() = || { bump(p.x); }; g; }";
+    fn projected_capture_ref_arg_lowers_owner_cell_projection() {
+        let source = "struct Point { x: int } fn bump(ref x: int) {} fn f() { var p = Point { x: 0 }; let g: fn() = || { bump(p.x); }; g; }";
         let air = lower_root(source, "f").expect("lower failed");
         let body = air.lambdas[0].body;
 
@@ -13783,10 +13877,10 @@ mod tests {
     }
 
     #[test]
-    fn source_valid_read_var_alias_lowers_read_to_value_snapshot() {
+    fn source_valid_read_ref_arg_lowers_read_to_value_snapshot() {
         let air = lower_root(
             r#"
-fn both(read: string, var write: string) {
+fn both(read: string, ref write: string) {
     #stringify(read);
     write = "changed";
 }
@@ -13928,9 +14022,9 @@ fn f() {
     }
 
     #[test]
-    fn source_var_field_call_lowers_to_mut_borrow_projection() {
+    fn source_ref_field_call_lowers_to_mut_borrow_projection() {
         let air = lower_root(
-            "struct Pair { a: int, b: int } fn set(var x: int) {} fn f(var p: Pair) { set(p.a); }",
+            "struct Pair { a: int, b: int } fn set(ref x: int) {} fn f(ref p: Pair) { set(p.a); }",
             "f",
         )
         .expect("lower failed");
@@ -13946,9 +14040,9 @@ fn f() {
     }
 
     #[test]
-    fn source_var_tuple_field_lowers_to_mut_borrow_projection() {
+    fn source_ref_tuple_field_lowers_to_mut_borrow_projection() {
         let air = lower_root(
-            "fn set(var x: int) {} fn f(var pair: (int, int)) { set(pair.0); }",
+            "fn set(ref x: int) {} fn f(ref pair: (int, int)) { set(pair.0); }",
             "f",
         )
         .expect("lower failed");
@@ -13964,9 +14058,9 @@ fn f() {
     }
 
     #[test]
-    fn source_var_index_lowers_to_mut_borrow_projection() {
+    fn source_ref_index_lowers_to_mut_borrow_projection() {
         let air = lower_root(
-            "fn set(var x: int) {} fn f(var xs: [int]) { set(xs[0]); }",
+            "fn set(ref x: int) {} fn f(ref xs: [int]) { set(xs[0]); }",
             "f",
         )
         .expect("lower failed");
@@ -13984,7 +14078,7 @@ fn f() {
     #[test]
     fn map_index_assignment_lowers_to_indexed_insert() {
         let air = lower_root(
-            "fn f(var counts: [string: int]) { counts[\"a\"] = 1; }",
+            "fn f(ref counts: [string: int]) { counts[\"a\"] = 1; }",
             "f",
         )
         .expect("lower failed");
@@ -14005,7 +14099,7 @@ fn f() {
 
     #[test]
     fn concrete_function_lowers_to_verified_body() {
-        let air = lower_root("fn f(var a: int) -> int { a }", "f").expect("lower failed");
+        let air = lower_root("fn f(ref a: int) -> int { a }", "f").expect("lower failed");
         assert_eq!(air.functions.len(), 1);
         let (module_id, module) = air
             .modules
@@ -14962,7 +15056,7 @@ fn main() {}
 
     #[test]
     fn borrowed_param_capture_lowers_to_scoped_borrow() {
-        let source = "fn f(var x: int) { || { x = 1; }; }";
+        let source = "fn f(ref x: int) { || { x = 1; }; }";
         let air = lower_root(source, "f").expect("lower failed");
         let scoped = ScopedBorrowId::from_index(0);
         let lambda = air.lambdas.first().expect("missing lambda");
@@ -14987,67 +15081,8 @@ fn main() {}
     }
 
     #[test]
-    fn mutable_struct_pattern_alias_lowers_to_source_place() {
-        let source = "struct Point { x: int, y: int } fn main() { var p = Point { x: 1, y: 2 }; var Point { x } = p; x = 3; }";
-        let air = lower_root(source, "main").expect("lower failed");
-        let main = air
-            .functions
-            .iter()
-            .find(|function| function.name == Ident::new("main"))
-            .expect("missing main");
-
-        assert!(function_statements(main).any(|statement| {
-            matches!(statement, AirStmt::Assign { dst, .. }
-                if matches!(dst.root, PlaceRoot::Local(_))
-                    && matches!(&dst.projection[..], [crate::air::Projection::Field(_)]))
-        }));
-    }
-
-    #[test]
-    fn mutable_tuple_pattern_alias_lowers_to_source_place() {
-        let source = "fn main() { var pair = (1, 2); var (a, b) = pair; a = 10; b = 20; }";
-        let air = lower_root(source, "main").expect("lower failed");
-        let main = air
-            .functions
-            .iter()
-            .find(|function| function.name == Ident::new("main"))
-            .expect("missing main");
-        let assignments = function_statements(main)
-            .filter_map(|statement| match statement {
-                AirStmt::Assign { dst, .. } if matches!(dst.root, PlaceRoot::Local(_)) => Some(dst),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            assignments
-                .iter()
-                .any(|dst| matches!(&dst.projection[..], [crate::air::Projection::TupleField(0)]))
-        );
-        assert!(
-            assignments
-                .iter()
-                .any(|dst| matches!(&dst.projection[..], [crate::air::Projection::TupleField(1)]))
-        );
-    }
-
-    #[test]
-    fn pattern_alias_capture_lowers_to_projected_scoped_borrow() {
-        let source = "struct Point { x: int, y: int } fn inc(var value: int) { value += 1; } fn touch(var point: Point) { var Point { x } = point; let f = || { inc(x); }; f(); } fn main() { var p = Point { x: 0, y: 0 }; touch(p); }";
-        let air = lower_root(source, "main").expect("lower failed");
-        let scoped = air.scoped_borrows.first().expect("missing scoped borrow");
-
-        assert!(matches!(
-            &scoped.source,
-            ScopedBorrowSource::PatternAlias { source }
-                if matches!(source.root, PlaceRoot::Local(_))
-                    && matches!(&source.projection[..], [crate::air::Projection::Field(_)])
-        ));
-    }
-
-    #[test]
-    fn var_self_capture_lowers_to_receiver_scoped_borrow() {
-        let source = "struct Counter { value: int } extend Counter { fn touch(var self) { let f = || { self.value = 1; }; f(); } } fn main() { var c = Counter { value: 0 }; c.touch(); }";
+    fn ref_self_capture_lowers_to_receiver_scoped_borrow() {
+        let source = "struct Counter { value: int } extend Counter { fn touch(ref self) { let f = || { self.value = 1; }; f(); } } fn main() { var c = Counter { value: 0 }; c.touch(); }";
         let air = lower_root(source, "main").expect("lower failed");
         let scoped = ScopedBorrowId::from_index(0);
         let lambda = air.lambdas.first().expect("missing lambda");
@@ -15055,7 +15090,7 @@ fn main() {}
         assert_eq!(air.scoped_borrows.len(), 1);
         assert!(matches!(
             air.scoped_borrows[scoped.index()].source,
-            ScopedBorrowSource::VarSelf { .. }
+            ScopedBorrowSource::RefSelf { .. }
         ));
         assert!(matches!(
             &lambda.captures[..],
@@ -15071,7 +15106,7 @@ fn main() {}
 
     #[test]
     fn owner_access_after_borrowed_param_capture_uses_scoped_borrow() {
-        let source = "fn f(var x: int) { let g: fn() = || { x = 1; }; x = 2; g; }";
+        let source = "fn f(ref x: int) { let g: fn() = || { x = 1; }; x = 2; g; }";
         let air = lower_root(source, "f").expect("lower failed");
         let scoped = ScopedBorrowId::from_index(0);
         let owner = air
@@ -15101,7 +15136,7 @@ fn main() {}
 
     #[test]
     fn nested_borrowed_param_recapture_uses_parent_slot() {
-        let source = "fn f(var x: int) { let outer: fn() = || { let inner: fn() = || { x = 1; }; inner; }; outer; }";
+        let source = "fn f(ref x: int) { let outer: fn() = || { let inner: fn() = || { x = 1; }; inner; }; outer; }";
         let air = lower_root(source, "f").expect("lower failed");
         let scoped = ScopedBorrowId::from_index(0);
         let outer = air
@@ -15134,8 +15169,8 @@ fn main() {}
     }
 
     #[test]
-    fn uncaptured_var_param_remains_local() {
-        let source = "fn f(var x: int) { x = 1; }";
+    fn uncaptured_ref_param_remains_local() {
+        let source = "fn f(ref x: int) { x = 1; }";
         let air = lower_root(source, "f").expect("lower failed");
 
         assert!(air.scoped_borrows.is_empty());

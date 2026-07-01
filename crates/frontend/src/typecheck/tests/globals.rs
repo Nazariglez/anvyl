@@ -30,9 +30,9 @@ fn modes(
 fn records_global_access_modes() {
     let result = check(
         "struct Counter { value: int }
-         extend Counter { fn reset(var self) { self.value = 0; } }
+         extend Counter { fn reset(ref self) { self.value = 0; } }
          lazy var Count: Counter = Counter { value: 0 };
-         fn set(var x: Counter) { x.value = 1; }
+         fn set(ref x: Counter) { x.value = 1; }
          fn main() {
              let x = Count;
              Count = Counter { value: 2 };
@@ -56,7 +56,7 @@ fn records_global_access_modes() {
                 GlobalInitEffect::InitializeFirst,
             ),
             (
-                GlobalAccessMode::VarArgument,
+                GlobalAccessMode::RefArgument,
                 GlobalInitEffect::InitializeFirst,
             ),
             (
@@ -68,11 +68,11 @@ fn records_global_access_modes() {
 }
 
 #[test]
-fn records_projected_global_var_argument() {
+fn records_projected_global_ref_argument() {
     let result = check(
         "struct Health { @as embed hp: int }
          lazy var Player: Health = Health { hp: 1 };
-         fn bump(var hp: int) { hp += 1; }
+         fn bump(ref hp: int) { hp += 1; }
          fn main() { bump(Player); }",
     )
     .expect("typecheck");
@@ -80,7 +80,7 @@ fn records_projected_global_var_argument() {
     assert_eq!(
         modes(&result),
         vec![(
-            GlobalAccessMode::VarArgument,
+            GlobalAccessMode::RefArgument,
             GlobalInitEffect::InitializeFirst,
         )]
     );
@@ -90,7 +90,7 @@ fn records_projected_global_var_argument() {
 fn records_extern_receiver_access_modes() {
     let result = check(
         "extern type Counter {
-             fn bump(var self);
+             fn bump(ref self);
              fn get(self) -> int;
          }
          extern fn make_counter() -> Counter;

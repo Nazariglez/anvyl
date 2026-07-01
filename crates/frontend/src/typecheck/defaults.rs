@@ -256,7 +256,7 @@ fn check_param_defaults(
             continue;
         };
         if matches!(param.mutability, Mutability::Mutable) {
-            tc.push_error(TypeError::VarParamDefault {
+            tc.push_error(TypeError::RefParamDefault {
                 name: param.name,
                 span: tc.error_span(default.span),
             });

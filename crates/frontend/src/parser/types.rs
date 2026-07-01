@@ -294,11 +294,11 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
                     ty
                 });
 
-        let var_kw = select! { Token::Keyword(Keyword::Var) => () }
+        let ref_kw = select! { Token::Keyword(Keyword::Ref) => () }
             .or_not()
             .map(|opt| opt.is_some());
 
-        let fn_param = var_kw
+        let fn_param = ref_kw
             .then(escaping_type(param_type_parser))
             .map(|(mutable, (escape, ty))| ast::FuncParam::new(ty, mutable, false, escape));
 
@@ -306,7 +306,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             select! { Token::Ident(ident) if ident.0.as_ref() == "_" => Type::InferReturn },
             type_parser.clone(),
         ));
-        let return_access = select! { Token::Keyword(Keyword::Var) => ast::ReturnAccess::Place }
+        let return_access = select! { Token::Keyword(Keyword::Ref) => ast::ReturnAccess::Place }
             .or_not()
             .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
         let fn_return_spec = return_access

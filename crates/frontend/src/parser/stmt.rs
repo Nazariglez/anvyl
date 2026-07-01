@@ -5,7 +5,7 @@ use super::{
     common::{block_stmt, identifier},
     decl::{DeclPolicy, declaration_header, local_function, local_type_alias_statement},
     expr::{cond_expression, expression, for_header_expression},
-    pattern::{binding_pattern, pattern},
+    pattern::{conditional_pattern, local_refutable_pattern, pattern},
     types::type_ident,
 };
 use crate::{
@@ -29,7 +29,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let continue_s = continue_stmt();
         let defer_s = defer_stmt(stmt.clone(), expr.clone());
 
-        let let_else = binding_pattern()
+        let let_else = local_refutable_pattern()
             .then_ignore(select! { Token::Op(Op::Assign) => () })
             .then(expression(stmt.clone()))
             .then_ignore(select! { Token::Keyword(Keyword::Else) => () })
@@ -39,7 +39,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
                 Spanned::new(
                     ast::Stmt::LetElse(Spanned::new(
                         ast::LetElse {
-                            head,
+                            mutability: head,
                             pattern: pat,
                             value,
                             fallback,
@@ -240,7 +240,7 @@ fn while_let_stmt<'src>(
     expr: impl AnvParser<'src, ast::ExprNode>,
 ) -> BoxedParser<'src, ast::StmtNode> {
     select! { Token::Keyword(Keyword::While) => () }
-        .ignore_then(binding_pattern())
+        .ignore_then(conditional_pattern())
         .then_ignore(select! { Token::Op(Op::Assign) => () })
         .then(cond_expression())
         .then(block_stmt(stmt, expr))
@@ -286,11 +286,11 @@ fn contextual_step<'src>(
 }
 
 fn for_binding_segment<'src>() -> BoxedParser<'src, ast::ForBinding> {
-    select! { Token::Keyword(Keyword::Var) => () }
+    select! { Token::Keyword(Keyword::Ref) => ast::RefAccess::Ref }
         .or_not()
         .then(pattern())
-        .map(|(mutable, pattern)| ast::ForBinding {
-            mutable: mutable.is_some(),
+        .map(|(access, pattern)| ast::ForBinding {
+            access: access.unwrap_or(ast::RefAccess::Value),
             pattern,
         })
         .boxed()

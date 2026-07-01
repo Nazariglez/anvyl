@@ -635,12 +635,12 @@ impl Display for ContractRef {
                     write!(f, "fn {}(", requirement.name)?;
                     match requirement.receiver {
                         MethodReceiver::Value => write!(f, "self")?,
-                        MethodReceiver::Var => write!(f, "var self")?,
+                        MethodReceiver::Ref => write!(f, "ref self")?,
                     }
                     for param in &requirement.params {
                         write!(f, ", ")?;
                         if param.mutable {
-                            write!(f, "var ")?;
+                            write!(f, "ref ")?;
                         }
                         write!(f, "{}: ", param.name)?;
                         if param.escape.is_escaping() {
@@ -673,7 +673,7 @@ impl Display for ContractRef {
 impl Display for ReturnSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_place() {
-            write!(f, "var ")?;
+            write!(f, "ref ")?;
         }
         write!(f, "{}", self.ty)
     }
@@ -696,7 +696,7 @@ impl Display for Type {
                         write!(f, ", ")?;
                     }
                     if p.mutable {
-                        write!(f, "var ")?;
+                        write!(f, "ref ")?;
                     }
                     write!(f, "{p}")?;
                 }
@@ -1366,7 +1366,7 @@ pub struct Ternary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfLet {
-    pub head: PatternHead,
+    pub head: ConditionalPatternAccess,
     pub pattern: PatternNode,
     pub value: Box<ExprNode>,
     pub then_block: BlockNode,
@@ -1381,7 +1381,7 @@ pub struct While {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhileLet {
-    pub head: PatternHead,
+    pub head: ConditionalPatternAccess,
     pub pattern: PatternNode,
     pub value: ExprNode,
     pub body: BlockNode,
@@ -1389,7 +1389,7 @@ pub struct WhileLet {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForBinding {
-    pub mutable: bool,
+    pub access: RefAccess,
     pub pattern: PatternNode,
 }
 
@@ -1410,7 +1410,7 @@ pub enum MatchMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
-    pub head: PatternHead,
+    pub access: RefAccess,
     pub mode: MatchMode,
     pub scrutinee: Box<ExprNode>,
     pub arms: Vec<MatchArmNode>,
@@ -1555,12 +1555,6 @@ pub struct IntrinsicCall {
     pub args: Vec<ExprNode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatternHead {
-    Let,
-    Var,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnumPatternPayload {
     Unit,
@@ -1633,7 +1627,7 @@ pub enum LetElseFallback {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetElse {
-    pub head: PatternHead,
+    pub mutability: Mutability,
     pub pattern: PatternNode,
     pub value: ExprNode,
     pub fallback: LetElseFallbackNode,
@@ -1829,6 +1823,48 @@ pub enum Mutability {
     Immutable,
 }
 
+impl Mutability {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Immutable => "let",
+            Self::Mutable => "var",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalPatternAccess {
+    Let,
+    Var,
+    Ref,
+}
+
+impl ConditionalPatternAccess {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Let => "let",
+            Self::Var => "var",
+            Self::Ref => "ref",
+        }
+    }
+
+    pub fn is_ref(self) -> bool {
+        matches!(self, Self::Ref)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefAccess {
+    Value,
+    Ref,
+}
+
+impl RefAccess {
+    pub fn is_ref(self) -> bool {
+        matches!(self, Self::Ref)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateKind {
     Struct,
@@ -1908,7 +1944,7 @@ pub enum ExternReceiverMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MethodReceiver {
     Value,
-    Var,
+    Ref,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

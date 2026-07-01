@@ -532,13 +532,13 @@ fn extern_witness_target(method: &member::ExternMethodAccess) -> WitnessSlotTarg
 fn receiver_compatible(required: MethodReceiver, found: MethodReceiver) -> bool {
     match required {
         MethodReceiver::Value => matches!(found, MethodReceiver::Value),
-        MethodReceiver::Var => matches!(found, MethodReceiver::Value | MethodReceiver::Var),
+        MethodReceiver::Ref => matches!(found, MethodReceiver::Value | MethodReceiver::Ref),
     }
 }
 
 fn extern_receiver(receiver: ReceiverMode) -> MethodReceiver {
     match receiver {
-        ReceiverMode::Mutable => MethodReceiver::Var,
+        ReceiverMode::Mutable => MethodReceiver::Ref,
         ReceiverMode::Value | ReceiverMode::Shared => MethodReceiver::Value,
     }
 }
@@ -554,7 +554,7 @@ pub(crate) fn finalize_contracts(
             if req.receiver.is_none() {
                 errors.push(TypeError::CompileError {
                     message:
-                        "contract method requirements must include a `self` or `var self` receiver"
+                        "contract method requirements must include a `self` or `ref self` receiver"
                             .to_string(),
                     span: req.span,
                 });

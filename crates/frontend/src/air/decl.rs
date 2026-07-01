@@ -225,7 +225,7 @@ pub struct ScopedBorrowDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopedBorrowSource {
     SourceMutParam { local: LocalId },
-    VarSelf { local: LocalId },
+    RefSelf { local: LocalId },
     PatternAlias { source: Place },
 }
 

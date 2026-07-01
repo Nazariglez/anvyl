@@ -308,7 +308,7 @@ pub(super) fn validate_param_escape(
 ) {
     if mutable && cast_accept {
         errors.push(TypeError::CompileError {
-            message: "`as` cannot be combined with `var`; use `var x: T`".to_string(),
+            message: "`as` cannot be combined with `ref`; use `ref x: T`".to_string(),
             span,
         });
     }
@@ -317,7 +317,7 @@ pub(super) fn validate_param_escape(
     }
     if mutable {
         errors.push(TypeError::CompileError {
-            message: "`escaping` cannot be combined with `var`".to_string(),
+            message: "`escaping` cannot be combined with `ref`".to_string(),
             span,
         });
     }
@@ -699,7 +699,7 @@ pub(super) fn has_mutable_func_param(params: &[FuncParam]) -> bool {
 }
 
 fn method_has_mutable_input(sig: &MethodSig) -> bool {
-    matches!(sig.receiver, Some(MethodReceiver::Var)) || has_mutable_param(&sig.params)
+    matches!(sig.receiver, Some(MethodReceiver::Ref)) || has_mutable_param(&sig.params)
 }
 
 pub(super) fn validate_return_spec(

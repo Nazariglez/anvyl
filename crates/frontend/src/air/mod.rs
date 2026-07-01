@@ -234,7 +234,7 @@ impl Program {
         }
         Some(match &decl.source {
             ScopedBorrowSource::SourceMutParam { local }
-            | ScopedBorrowSource::VarSelf { local } => Place {
+            | ScopedBorrowSource::RefSelf { local } => Place {
                 root: PlaceRoot::Local(*local),
                 projection: vec![],
                 ty: decl.ty,
@@ -368,7 +368,7 @@ impl Program {
         let ty = match (mode, param.mode) {
             (_, ParamMode::Value) => ty,
             (TypeRender::Display, ParamMode::SharedBorrow) => format!("borrow {ty}"),
-            (TypeRender::Display, ParamMode::MutBorrow) => format!("var {ty}"),
+            (TypeRender::Display, ParamMode::MutBorrow) => format!("ref {ty}"),
             (TypeRender::HelperKey, ParamMode::SharedBorrow) => format!("borrow_{ty}"),
             (TypeRender::HelperKey, ParamMode::MutBorrow) => format!("mut_{ty}"),
         };
@@ -383,7 +383,7 @@ impl Program {
         let ty = self.render_type(ret.ty(), mode);
         match (mode, ret) {
             (_, ReturnMode::Value(_)) => ty,
-            (TypeRender::Display, ReturnMode::Place(_)) => format!("var {ty}"),
+            (TypeRender::Display, ReturnMode::Place(_)) => format!("ref {ty}"),
             (TypeRender::HelperKey, ReturnMode::Place(_)) => format!("place_{ty}"),
         }
     }

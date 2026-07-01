@@ -328,10 +328,10 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Option<SourceSpan>,
     },
-    VarArgNonLvalue {
+    RefArgNonLvalue {
         span: Option<SourceSpan>,
     },
-    VarArgImmutableBinding {
+    RefArgImmutableBinding {
         name: Ident,
         span: Option<SourceSpan>,
     },
@@ -378,7 +378,7 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Option<SourceSpan>,
     },
-    VarPatternRequiresMutablePlace {
+    RefPatternRequiresMutablePlace {
         span: Option<SourceSpan>,
     },
     InvalidOperand {
@@ -446,7 +446,7 @@ pub(crate) enum TypeError {
         found: Type,
         span: Option<SourceSpan>,
     },
-    ForVarRequiresMutableIterable {
+    ForRefRequiresMutableIterable {
         span: Option<SourceSpan>,
     },
     ForMutableMapKey {
@@ -752,7 +752,7 @@ pub(crate) enum TypeError {
         name: Ident,
         span: Option<SourceSpan>,
     },
-    VarParamDefault {
+    RefParamDefault {
         name: Ident,
         span: Option<SourceSpan>,
     },
@@ -875,8 +875,8 @@ impl TypeError {
             | TypeError::DuplicateName { span, .. }
             | TypeError::ImmutableAssignment { span, .. }
             | TypeError::ConstAssignment { span, .. }
-            | TypeError::VarArgNonLvalue { span, .. }
-            | TypeError::VarArgImmutableBinding { span, .. }
+            | TypeError::RefArgNonLvalue { span, .. }
+            | TypeError::RefArgImmutableBinding { span, .. }
             | TypeError::SequenceStructuralMutationDuringLoan { span, .. }
             | TypeError::MapStructuralMutationDuringLoan { span, .. }
             | TypeError::ActiveCollectionRebind { span, .. }
@@ -889,8 +889,8 @@ impl TypeError {
             | TypeError::UnknownFunctionValueEscapes { span }
             | TypeError::BorrowedCaptureEscapes { span, .. }
             | TypeError::RequiresMutablePlace { span, .. }
-            | TypeError::VarPatternRequiresMutablePlace { span, .. }
-            | TypeError::ForVarRequiresMutableIterable { span, .. }
+            | TypeError::RefPatternRequiresMutablePlace { span, .. }
+            | TypeError::ForRefRequiresMutableIterable { span, .. }
             | TypeError::ForMutableMapKey { span, .. }
             | TypeError::ForMutableMapEntry { span, .. }
             | TypeError::RefutableForPattern { span, .. }
@@ -977,7 +977,7 @@ impl TypeError {
             | TypeError::DefaultReferencesParameter { span, .. }
             | TypeError::DefaultReferencesSelf { span, .. }
             | TypeError::DefaultReferencesField { span, .. }
-            | TypeError::VarParamDefault { span, .. }
+            | TypeError::RefParamDefault { span, .. }
             | TypeError::ConstTypeMismatch { span, .. }
             | TypeError::RawEnumExpectedIntValue { span, .. }
             | TypeError::RawEnumExpectedStringValue { span, .. }
@@ -1056,25 +1056,18 @@ impl LocalBindingKind {
     fn borrowed_self() -> Self {
         Self {
             mutability: BindingMutability::Mutable,
-            storage: CaptureStorageOrigin::VarSelf,
+            storage: CaptureStorageOrigin::RefSelf,
         }
     }
 
     fn pattern_alias(context: PatternContext) -> Self {
         let storage = match context {
-            PatternContext::For => CaptureStorageOrigin::ForVarAlias,
+            PatternContext::For => CaptureStorageOrigin::ForRefAlias,
             _ => CaptureStorageOrigin::PatternAlias,
         };
         Self {
             mutability: BindingMutability::Mutable,
             storage,
-        }
-    }
-
-    fn downcast_alias() -> Self {
-        Self {
-            mutability: BindingMutability::Mutable,
-            storage: CaptureStorageOrigin::MutableDowncastAlias,
         }
     }
 
@@ -1123,12 +1116,12 @@ impl LocalBindingKind {
         match self.storage {
             CaptureStorageOrigin::Owned
             | CaptureStorageOrigin::BorrowedParam
-            | CaptureStorageOrigin::VarSelf => self.mutability.place_access(),
+            | CaptureStorageOrigin::RefSelf => self.mutability.place_access(),
             CaptureStorageOrigin::DynView => PlaceAccess::DynView,
             CaptureStorageOrigin::Const => PlaceAccess::Const,
-            CaptureStorageOrigin::PatternAlias
-            | CaptureStorageOrigin::MutableDowncastAlias
-            | CaptureStorageOrigin::ForVarAlias => PlaceAccess::Mutable,
+            CaptureStorageOrigin::PatternAlias | CaptureStorageOrigin::ForRefAlias => {
+                PlaceAccess::Mutable
+            }
             CaptureStorageOrigin::ReadonlySelf => PlaceAccess::ReadonlySelf,
         }
     }
@@ -1355,8 +1348,6 @@ struct ScopeState {
     active_collection_loans: Vec<collection_loan::ActiveCollectionLoan>,
 }
 
-const MUT_DOWNCAST_ROOT_MESSAGE: &str =
-    "dynamic root cannot be used while a mutable downcast binding is live";
 const MUT_ALIAS_ROOT_MESSAGE: &str = "place cannot be used while a mutable alias binding is live";
 
 #[derive(Clone)]
@@ -1784,6 +1775,23 @@ impl TypeChecker {
         local.type_id
     }
 
+    fn define_ref_alias_binding_from_handle(
+        &mut self,
+        name: Ident,
+        handle: &TypeHandle,
+        target: place::AliasTarget,
+        context: PatternContext,
+        span: Option<Span>,
+    ) {
+        if matches!(
+            context,
+            PatternContext::IfLet | PatternContext::WhileLet | PatternContext::Match
+        ) {
+            self.push_mut_alias_root(target.identity.clone(), name, MUT_ALIAS_ROOT_MESSAGE);
+        }
+        self.define_alias_binding_from_handle(name, handle, target, context, span);
+    }
+
     fn define_alias_binding_from_handle(
         &mut self,
         name: Ident,
@@ -1814,19 +1822,18 @@ impl TypeChecker {
         }
     }
 
-    fn define_downcast_alias_from_handle(
+    fn push_mut_alias_root(
         &mut self,
-        name: Ident,
-        handle: &TypeHandle,
-        target: place::AliasTarget,
+        identity: PlaceIdentity,
+        allowed: Ident,
+        message: &'static str,
     ) {
-        self.define_shadowing_value_from_handle(
-            name,
-            handle,
-            LocalBindingKind::downcast_alias(),
-            None,
-            Some(target),
-        );
+        self.active_mut_alias_roots.push(ActiveMutAliasRoot {
+            identity,
+            allowed,
+            scope_depth: self.scopes.len(),
+            message,
+        });
     }
 
     fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
@@ -2483,7 +2490,7 @@ impl TypeChecker {
             .insert(self.current_module.clone())
     }
 
-    pub(super) fn check_mut_downcast_root_use(
+    pub(super) fn check_mut_alias_root_use(
         &mut self,
         root_name: Option<Ident>,
         identity: &PlaceIdentity,
@@ -3171,7 +3178,7 @@ impl TypeChecker {
                 name: Ident::new("self"),
                 span: SourceSpan::from_byte_span(module.source, input.span),
                 ty: receiver_ty.clone(),
-                mutable: matches!(input.receiver, Some(MethodReceiver::Var)),
+                mutable: matches!(input.receiver, Some(MethodReceiver::Ref)),
                 escape: EscapeMode::NonEscaping,
             });
         }
@@ -4198,7 +4205,7 @@ fn check_expr_checked_with_hint(
                     let value = tc.local_value_from_info(info.clone(), depth);
                     let (place, _) =
                         tc.local_place_value(expr, *name, &value, Some(LocalUseMode::Read));
-                    tc.check_mut_downcast_root_use(Some(*name), &place.identity, expr.span);
+                    tc.check_mut_alias_root_use(Some(*name), &place.identity, expr.span);
                     let checked = place.checked.clone();
                     tc.record_expr_place(expr.node.id, &place);
                     tc.record_function_value_expr(

@@ -31,8 +31,8 @@ use crate::{
     ast::{
         AggregateDeclNode, BlockNode, CastFromNode, ConstValue, EnumPatternPayload, ExprKind,
         ExprNode, ExtendDeclNode, Func, FuncNode, FuncParam, Ident, MethodReceiver, Mutability,
-        Param, Pattern, PatternHead, PatternNode, Program, ReturnAccess, ReturnSpec, Stmt,
-        StmtNode, StructDecl, Type, TypeAliasDeclNode, Visibility,
+        Param, Pattern, PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl,
+        Type, TypeAliasDeclNode, Visibility,
     },
     span::Span,
 };
@@ -666,7 +666,7 @@ fn add_stmt_capture_blockers(
         ),
         Stmt::LetElse(let_else) => add_pattern_capture_blockers(
             &let_else.node.pattern,
-            LocalBindingKind::from_mutable(matches!(let_else.node.head, PatternHead::Var)),
+            LocalBindingKind::from_mutable(matches!(let_else.node.mutability, Mutability::Mutable)),
             env,
             tc,
         ),
@@ -1358,7 +1358,7 @@ fn check_func_body(
             let mut source = None;
             let param_start = if let Some((receiver, self_ty)) = self_binding {
                 let kind = match receiver {
-                    MethodReceiver::Var => LocalBindingKind::borrowed_self(),
+                    MethodReceiver::Ref => LocalBindingKind::borrowed_self(),
                     MethodReceiver::Value => LocalBindingKind::readonly_self(),
                 };
                 let local = tc.define_value(Ident::new("self"), self_ty.clone(), kind, None);
@@ -1368,11 +1368,11 @@ fn check_func_body(
                         Some(local.binding_id),
                         Ident::new("self"),
                         None,
-                        matches!(receiver, MethodReceiver::Var),
+                        matches!(receiver, MethodReceiver::Ref),
                         LocalDefKind::Parameter,
                     );
                     tc.record_param_def(0, local.type_id);
-                    if matches!(receiver, MethodReceiver::Var) {
+                    if matches!(receiver, MethodReceiver::Ref) {
                         source = Some(PlaceIdentity::root(PlaceRoot::Local(local.type_id)));
                     }
                 }

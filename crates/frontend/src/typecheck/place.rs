@@ -367,7 +367,7 @@ pub(super) enum MutableUseKind {
     Assign(Ident),
     MutBorrow(Ident),
     MutatingReceiver(Ident),
-    VarArg(Ident),
+    RefArg(Ident),
     AliasPattern,
 }
 
@@ -427,14 +427,14 @@ impl PlaceAccess {
                     Some(TypeError::MutatingMethodImmutableReceiver { name, span })
                 }
             },
-            MutableUseKind::VarArg(name) => match self {
+            MutableUseKind::RefArg(name) => match self {
                 Self::Mutable | Self::DynView => None,
                 Self::Settable => Some(TypeError::RequiresMutablePlace { name, span }),
                 Self::Immutable | Self::Const => {
-                    Some(TypeError::VarArgImmutableBinding { name, span })
+                    Some(TypeError::RefArgImmutableBinding { name, span })
                 }
                 Self::ReadonlySelf => Some(TypeError::ReadonlyMethodMutation { span }),
-                Self::NotPlace => Some(TypeError::VarArgNonLvalue { span }),
+                Self::NotPlace => Some(TypeError::RefArgNonLvalue { span }),
             },
             MutableUseKind::AliasPattern => match self {
                 Self::Mutable | Self::Settable => None,
@@ -442,7 +442,7 @@ impl PlaceAccess {
                 | Self::Const
                 | Self::ReadonlySelf
                 | Self::Immutable
-                | Self::NotPlace => Some(TypeError::VarPatternRequiresMutablePlace { span }),
+                | Self::NotPlace => Some(TypeError::RefPatternRequiresMutablePlace { span }),
             },
         }
     }
@@ -824,7 +824,7 @@ fn check_map_entry_alias_scrutinee(expr: &ExprNode, tc: &mut TypeChecker) -> Opt
 
 pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
     let place = check_place_inner(expr, tc);
-    tc.check_mut_downcast_root_use(place.value.root_name, &place.value.identity, expr.span);
+    tc.check_mut_alias_root_use(place.value.root_name, &place.value.identity, expr.span);
     place
 }
 
@@ -1016,7 +1016,7 @@ pub(super) enum PlaceUseKind {
     Read,
     Assign,
     CompoundAssign,
-    VarArgument,
+    RefArgument,
     MutReceiver,
     ImmutableBorrow,
     MutableBorrow,
@@ -1048,10 +1048,10 @@ impl PlaceUseKind {
                 Some(GlobalAccessMode::CompoundAssign),
                 ExternPlaceEffect::ReadWrite,
             ),
-            Self::VarArgument => (
+            Self::RefArgument => (
                 ClosurePlaceEffect::Mutable,
-                Some(LocalUseMode::VarArgument),
-                Some(GlobalAccessMode::VarArgument),
+                Some(LocalUseMode::RefArgument),
+                Some(GlobalAccessMode::RefArgument),
                 ExternPlaceEffect::Write,
             ),
             Self::MutReceiver => (
@@ -1160,8 +1160,8 @@ pub(super) fn record_value_read(expr_id: ExprId, value: &PlaceValue, tc: &mut Ty
     record_place_use(expr_id, value, PlaceUseKind::Read, tc);
 }
 
-pub(super) fn record_var_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
-    record_place_use(expr_id, value, PlaceUseKind::VarArgument, tc);
+pub(super) fn record_ref_argument(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {
+    record_place_use(expr_id, value, PlaceUseKind::RefArgument, tc);
 }
 
 pub(super) fn record_mut_receiver(expr_id: ExprId, value: &PlaceValue, tc: &mut TypeChecker) {

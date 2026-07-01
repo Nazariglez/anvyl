@@ -1,6 +1,5 @@
 use super::{
-    ActiveMutAliasRoot, MUT_DOWNCAST_ROOT_MESSAGE, PatternBindMode, PatternContext, PlaceAccess,
-    TypeChecker, TypeError, downcast,
+    PatternBindMode, PatternContext, PlaceAccess, TypeChecker, TypeError, downcast,
     pattern::{self, PatternOutcome, PatternPlace},
 };
 use crate::{
@@ -56,10 +55,8 @@ pub(super) fn check_dynamic_source(
     node: &Match,
     tc: &mut TypeChecker,
 ) -> downcast::CheckedDowncastSource {
-    let policy = if matches!(node.head, crate::ast::PatternHead::Var) {
-        downcast::DowncastSourcePolicy::MutablePlace {
-            binding: first_dynamic_binding(&node.arms).unwrap_or(Ident::new("_")),
-        }
+    let policy = if node.access.is_ref() {
+        downcast::DowncastSourcePolicy::MutablePlace
     } else {
         downcast::DowncastSourcePolicy::Value
     };
@@ -80,7 +77,7 @@ pub(super) fn with_dynamic_arm<R>(
     check_body: impl FnOnce(&mut TypeChecker) -> R,
 ) -> R {
     tc.push_scope();
-    let locked = match &arm.node.head {
+    match &arm.node.head {
         MatchArmHead::DynDowncast(dyn_arm) => {
             let target = downcast::check_target_ref(tc, &dyn_arm.node.target, dyn_arm.span);
             if let Some(target) = &target {
@@ -106,27 +103,16 @@ pub(super) fn with_dynamic_arm<R>(
             }
             match (dyn_arm.node.binding, target, source.valid) {
                 (Some(name), Some(target), true) => {
-                    define_downcast_binding(name, &target, source, tc)
+                    define_downcast_binding(name, &target, source, tc);
                 }
-                (Some(name), _, _) => {
-                    define_recovery_binding(name, tc);
-                    false
-                }
-                (None, _, _) => false,
+                (Some(name), _, _) => define_recovery_binding(name, tc),
+                (None, _, _) => {}
             }
         }
-        MatchArmHead::DynFallback(binding) => {
-            if let Some(name) = binding {
-                define_fallback_binding(*name, source, tc);
-            }
-            false
-        }
-        MatchArmHead::Pattern(_) => false,
-    };
-    let body = check_body(tc);
-    if locked {
-        tc.active_mut_alias_roots.pop();
+        MatchArmHead::DynFallback(Some(name)) => define_fallback_binding(*name, source, tc),
+        MatchArmHead::DynFallback(None) | MatchArmHead::Pattern(_) => {}
     }
+    let body = check_body(tc);
     tc.pop_scope();
     body
 }
@@ -150,20 +136,19 @@ fn define_downcast_binding(
     target: &Type,
     source: &downcast::CheckedDowncastSource,
     tc: &mut TypeChecker,
-) -> bool {
+) {
     let handle = tc.type_handle(target);
     let Some(alias) = source.alias.as_ref() else {
         tc.define_pattern_binding_from_handle(name, &handle, false, None);
-        return false;
+        return;
     };
-    tc.define_downcast_alias_from_handle(name, &handle, alias.target(PlaceAccess::Mutable));
-    tc.active_mut_alias_roots.push(ActiveMutAliasRoot {
-        identity: alias.identity.clone(),
-        allowed: name,
-        scope_depth: tc.scopes.len(),
-        message: MUT_DOWNCAST_ROOT_MESSAGE,
-    });
-    true
+    tc.define_ref_alias_binding_from_handle(
+        name,
+        &handle,
+        alias.target(PlaceAccess::Mutable),
+        PatternContext::Match,
+        None,
+    );
 }
 
 fn define_fallback_binding(
@@ -173,10 +158,8 @@ fn define_fallback_binding(
 ) {
     if !source.valid {
         define_recovery_binding(name, tc);
-        return;
-    }
-    if let Some(alias) = source.alias.as_ref() {
-        tc.define_alias_binding_from_handle(
+    } else if let Some(alias) = source.alias.as_ref() {
+        tc.define_ref_alias_binding_from_handle(
             name,
             &source.handle,
             alias.target(alias.access),
@@ -206,8 +189,4 @@ fn head_binding(head: &MatchArmHead) -> Option<Ident> {
         MatchArmHead::DynFallback(binding) => *binding,
         MatchArmHead::Pattern(_) => None,
     }
-}
-
-fn first_dynamic_binding(arms: &[MatchArmNode]) -> Option<Ident> {
-    arms.iter().find_map(|arm| head_binding(&arm.node.head))
 }

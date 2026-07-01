@@ -261,12 +261,12 @@ fn escaping_read_of_mutable_binding_records_cell_requirement() {
 }
 
 #[test]
-fn projected_var_argument_records_mutable_capture_access() {
+fn projected_ref_argument_records_mutable_capture_access() {
     let result = checked(
         r"
         struct Point { x: int }
 
-        fn bump(var x: int) {}
+        fn bump(ref x: int) {}
 
         fn main() {
             var p = Point { x: 0 };
@@ -286,7 +286,7 @@ fn indexed_mut_receiver_records_mutable_capture_access() {
         struct Player {
             hp: int,
 
-            fn reset(var self) {
+            fn reset(ref self) {
                 self.hp = 0;
             }
         }
@@ -460,7 +460,7 @@ fn generic_specialization_preserves_capture_facts() {
 fn non_escaping_borrowed_capture_records_scoped_storage() {
     let result = checked(
         r"
-        fn touch(var x: int) {
+        fn touch(ref x: int) {
             let f = || { x = 1; };
             f();
         }

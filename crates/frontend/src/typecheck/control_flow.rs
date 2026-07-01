@@ -7,7 +7,7 @@ use super::{
     check_expected_value_expr_deferred, check_expr_checked, check_place,
     check_value_expr_checked_with_hint, checked_from_checked, checked_type, checked_void, closure,
     collection_loan, intrinsic_bool_value, join_checked, match_check, match_coverage,
-    pattern::{self, check_pattern_scrutinee, mode_for_head},
+    pattern::{self, check_pattern_scrutinee},
     place, projection,
 };
 use crate::{
@@ -566,7 +566,11 @@ fn check_match_with_policy(
             },
         )
     } else {
-        let mode = mode_for_head(node.head);
+        let mode = if node.access.is_ref() {
+            PatternBindMode::Alias
+        } else {
+            PatternBindMode::Owned { mutable: false }
+        };
         let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
         let mut outcomes = Vec::with_capacity(node.arms.len());
         let arms = check_match_arm_bodies(
@@ -818,7 +822,7 @@ fn for_slots(
             vec![ForSlot::Item((**elem).clone())]
         }
         ([binding], Type::Map { key, value }, _) => {
-            if binding.mutable {
+            if binding.access.is_ref() {
                 tc.push_error(TypeError::ForMutableMapEntry {
                     span: tc.error_span(binding.pattern.span),
                 });
@@ -829,14 +833,18 @@ fn for_slots(
             ]))]
         }
         ([_], Type::Infer, _) => infer_for_slots(1),
-        ([_], _, Some(inner)) => vec![ForSlot::Owned(inner)],
+        ([binding], _, Some(inner)) => {
+            reject_for_ref_binding(binding, tc);
+            vec![ForSlot::Owned(inner)]
+        }
         ([_], _, None) => unsupported_for_slots(1, iterable_ty, iterable_span, tc),
 
-        ([_, _], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
+        ([index, _], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
+            reject_for_ref_binding(index, tc);
             vec![ForSlot::Owned(Type::Int), ForSlot::Item((**elem).clone())]
         }
         ([first, _], Type::Map { key, value }, _) => {
-            if first.mutable {
+            if first.access.is_ref() {
                 tc.push_error(TypeError::ForMutableMapKey {
                     span: tc.error_span(first.pattern.span),
                 });
@@ -847,7 +855,12 @@ fn for_slots(
             ]
         }
         ([_, _], Type::Infer, _) => infer_for_slots(2),
-        ([_, _], _, Some(inner)) => vec![ForSlot::Owned(Type::Int), ForSlot::Owned(inner)],
+        ([index, binding], _, Some(inner)) => {
+            for binding in [index, binding] {
+                reject_for_ref_binding(binding, tc);
+            }
+            vec![ForSlot::Owned(Type::Int), ForSlot::Owned(inner)]
+        }
         ([_, _], _, None) => unsupported_for_slots(2, iterable_ty, iterable_span, tc),
 
         (bindings, _, _) => infer_for_slots(bindings.len()),
@@ -871,6 +884,14 @@ fn unsupported_for_slots(
     infer_for_slots(count)
 }
 
+fn reject_for_ref_binding(binding: &ForBinding, tc: &mut TypeChecker) {
+    if binding.access.is_ref() {
+        tc.push_error(TypeError::ForRefRequiresMutableIterable {
+            span: tc.error_span(binding.pattern.span),
+        });
+    }
+}
+
 fn for_slot_root<'a>(
     binding: &'a ForBinding,
     slot: ForSlot,
@@ -879,7 +900,9 @@ fn for_slot_root<'a>(
     tc: &mut TypeChecker,
 ) -> PatternRoot<'a> {
     match slot {
-        ForSlot::Item(ty) if binding.mutable => alias_for_root(binding, ty, source, iterable, tc),
+        ForSlot::Item(ty) if binding.access.is_ref() => {
+            alias_for_root(binding, ty, source, iterable, tc)
+        }
         ForSlot::Owned(ty) | ForSlot::Item(ty) => owned_for_root(binding, ty),
     }
 }
@@ -888,9 +911,7 @@ fn owned_for_root(binding: &ForBinding, ty: Type) -> PatternRoot<'_> {
     PatternRoot {
         pattern: &binding.pattern,
         input: PatternRootInput::Owned(ty),
-        mode: PatternBindMode::Owned {
-            mutable: binding.mutable,
-        },
+        mode: PatternBindMode::Owned { mutable: false },
     }
 }
 
@@ -905,7 +926,7 @@ fn alias_for_root<'a>(
     let access = if access.can_assign() {
         access
     } else {
-        tc.push_error(TypeError::ForVarRequiresMutableIterable {
+        tc.push_error(TypeError::ForRefRequiresMutableIterable {
             span: tc.error_span(iterable.span),
         });
         PlaceAccess::Mutable
