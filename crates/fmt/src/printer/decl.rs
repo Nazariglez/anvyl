@@ -6,7 +6,7 @@ impl Printer<'_> {
     fn write_receiver(&mut self, recv: ast::MethodReceiver) {
         match recv {
             ast::MethodReceiver::Value => self.write("self"),
-            ast::MethodReceiver::Var => self.write("var self"),
+            ast::MethodReceiver::Ref => self.write("ref self"),
         }
     }
 
@@ -14,7 +14,7 @@ impl Printer<'_> {
         match recv {
             ast::ExternReceiverMode::Value => self.write("self"),
             ast::ExternReceiverMode::Shared => self.write("shared self"),
-            ast::ExternReceiverMode::Mutable => self.write("var self"),
+            ast::ExternReceiverMode::Mutable => self.write("ref self"),
         }
     }
 
@@ -67,7 +67,7 @@ impl Printer<'_> {
     pub(super) fn format_param(&mut self, param: &ast::Param) {
         let mutable = matches!(param.mutability, ast::Mutability::Mutable);
         if mutable {
-            self.write("var ");
+            self.write("ref ");
         }
         self.write_fmt(param.name);
         self.write(": ");

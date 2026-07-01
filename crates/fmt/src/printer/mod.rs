@@ -115,11 +115,12 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn format_pattern_head(&mut self, head: ast::PatternHead) {
-        self.write(match head {
-            ast::PatternHead::Let => "let",
-            ast::PatternHead::Var => "var",
-        });
+    fn format_conditional_pattern_access(&mut self, access: ast::ConditionalPatternAccess) {
+        self.write(access.keyword());
+    }
+
+    fn format_mutability(&mut self, mutability: ast::Mutability) {
+        self.write(mutability.keyword());
     }
 
     fn indent(&mut self) {
@@ -235,7 +236,7 @@ impl<'a> Printer<'a> {
 
     fn format_return_spec_tail(&mut self, ret: &ast::ReturnSpec) {
         if ret.is_place() {
-            self.write("var ");
+            self.write("ref ");
         }
         self.format_type(&ret.ty);
     }

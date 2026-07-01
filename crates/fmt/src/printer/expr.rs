@@ -240,7 +240,7 @@ impl Printer<'_> {
 
     fn format_if_let(&mut self, il: &ast::IfLet) {
         self.write("if ");
-        self.format_pattern_head(il.head);
+        self.format_conditional_pattern_access(il.head);
         self.write(" ");
         self.format_pattern(&il.pattern.node);
         self.write(" = ");
@@ -276,8 +276,8 @@ impl Printer<'_> {
 
     fn format_match(&mut self, m: &ast::Match) {
         self.write("match ");
-        if matches!(m.head, ast::PatternHead::Var) {
-            self.write("var ");
+        if m.access.is_ref() {
+            self.write("ref ");
         }
         self.format_expr(&m.scrutinee.node);
         if matches!(m.mode, ast::MatchMode::Dynamic) {
@@ -305,23 +305,23 @@ impl Printer<'_> {
             ast::MatchArmHead::DynDowncast(arm) => {
                 self.format_type(&arm.node.target);
                 self.write("(");
-                self.format_dyn_arm_binding(&arm.node.binding);
+                self.format_dyn_arm_binding(arm.node.binding);
                 self.write(")");
             }
-            ast::MatchArmHead::DynFallback(binding) => self.format_dyn_arm_binding(binding),
+            ast::MatchArmHead::DynFallback(binding) => self.format_dyn_arm_binding(*binding),
         }
     }
 
-    fn format_dyn_arm_binding(&mut self, binding: &ast::DynArmBinding) {
+    fn format_dyn_arm_binding(&mut self, binding: ast::DynArmBinding) {
         match binding {
-            Some(name) => self.write_fmt(*name),
+            Some(name) => self.write_fmt(name),
             None => self.write("_"),
         }
     }
 
     fn format_lambda_param(&mut self, param: &ast::LambdaParam) {
         if param.mutable {
-            self.write("var ");
+            self.write("ref ");
         }
         self.write_fmt(param.name);
         if let Some(ty) = &param.ty {

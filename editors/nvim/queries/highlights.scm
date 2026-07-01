@@ -129,7 +129,7 @@
 (visibility_modifier) @keyword.modifier
 "as" @keyword.operator
 
-["let" "var" "const" "lazy"] @keyword
+["let" "var" "ref" "const" "lazy"] @keyword
 ["struct" "enum" "type" "extend" "extern" "dataref" "contract"] @keyword
 ["computed" "embed" "escaping" "rev" "step"] @keyword
 ["break" "continue" "defer" "try"] @keyword

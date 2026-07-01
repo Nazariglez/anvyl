@@ -22,7 +22,7 @@ impl Printer<'_> {
 
     fn format_let_else(&mut self, le: &ast::LetElse) {
         self.write_indent();
-        self.format_pattern_head(le.head);
+        self.format_mutability(le.mutability);
         self.write(" ");
         self.format_pattern(&le.pattern.node);
         self.write(" = ");
@@ -72,7 +72,7 @@ impl Printer<'_> {
     fn format_while_let(&mut self, wl: &ast::WhileLet) {
         self.write_indent();
         self.write("while ");
-        self.format_pattern_head(wl.head);
+        self.format_conditional_pattern_access(wl.head);
         self.write(" ");
         self.format_pattern(&wl.pattern.node);
         self.write(" = ");
@@ -89,8 +89,8 @@ impl Printer<'_> {
             if index > 0 {
                 self.write(", ");
             }
-            if binding.mutable {
-                self.write("var ");
+            if binding.access.is_ref() {
+                self.write("ref ");
             }
             self.format_pattern(&binding.pattern.node);
         }

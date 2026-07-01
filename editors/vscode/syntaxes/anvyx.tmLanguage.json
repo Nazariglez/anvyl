@@ -281,7 +281,7 @@
         },
         {
           "name": "keyword.declaration.anvyx",
-          "match": "\\b(fn|let|var|const|lazy|pub|struct|enum|type|import|extern|extend|dataref|contract)\\b"
+          "match": "\\b(fn|let|var|ref|const|lazy|pub|struct|enum|type|import|extern|extend|dataref|contract)\\b"
         },
         {
           "name": "keyword.operator.anvyx",

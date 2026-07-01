@@ -259,8 +259,8 @@ mod tests {
     #[test]
     fn exact_frontend_extern_members() {
         assert_fmt(
-            "extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(var self); }",
-            "extern type T {\n    init;\n    ro: int;\n    rw: int;\n    computed cached: int;\n    computed live: int;\n    fn a(self);\n    fn b(shared self);\n    fn c(var self);\n}\n",
+            "extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(ref self); }",
+            "extern type T {\n    init;\n    ro: int;\n    rw: int;\n    computed cached: int;\n    computed live: int;\n    fn a(self);\n    fn b(shared self);\n    fn c(ref self);\n}\n",
         );
     }
 
@@ -427,10 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn fn_var_param() {
-        let source = "fn push(var list: [int], val: int) {}";
+    fn fn_ref_param() {
+        let source = "fn push(ref list: [int], val: int) {}";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("var list: [int]"));
+        assert!(formatted.contains("ref list: [int]"));
     }
 
     // --- extern fn formatting ---
@@ -623,10 +623,10 @@ mod tests {
     }
 
     #[test]
-    fn struct_var_self_method() {
-        let source = "struct Player { hp: int, fn damage(var self, amount: int) { self.hp = self.hp - amount; } }";
+    fn struct_ref_self_method() {
+        let source = "struct Player { hp: int, fn damage(ref self, amount: int) { self.hp = self.hp - amount; } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("fn damage(var self, amount: int)"));
+        assert!(formatted.contains("fn damage(ref self, amount: int)"));
     }
 
     // --- dataref formatting ---
@@ -700,10 +700,10 @@ mod tests {
     }
 
     #[test]
-    fn extend_var_self() {
-        let source = "struct Counter { value: int }\nextend Counter { fn reset(var self) { self.value = 0; } }";
+    fn extend_ref_self() {
+        let source = "struct Counter { value: int }\nextend Counter { fn reset(ref self) { self.value = 0; } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("fn reset(var self)"));
+        assert!(formatted.contains("fn reset(ref self)"));
     }
 
     #[test]
@@ -845,16 +845,16 @@ mod tests {
                 "fn f() { for (a, b) in get() { } }",
                 "for (a, b) in get() {}",
             ),
-            ("fn f() { for var x in xs { } }", "for var x in xs {}"),
+            ("fn f() { for ref x in xs { } }", "for ref x in xs {}"),
             (
-                "fn f() { for var (a, b) in get() { } }",
-                "for var (a, b) in get() {}",
+                "fn f() { for ref (a, b) in get() { } }",
+                "for ref (a, b) in get() {}",
             ),
             (
-                "fn f() { for var x in rev xs step 2 { } }",
-                "for var x in rev xs step 2 {}",
+                "fn f() { for ref x in rev xs step 2 { } }",
+                "for ref x in rev xs step 2 {}",
             ),
-            ("fn f() { for i, var x in xs { } }", "for i, var x in xs {}"),
+            ("fn f() { for i, ref x in xs { } }", "for i, ref x in xs {}"),
         ] {
             let formatted = format_source(source).expect("format failed");
             assert!(formatted.contains(expected));
@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn pattern_head_var() {
+    fn pattern_binding_heads() {
         for (source, expected) in [
             (
                 "fn f(x: int?) { if var val? = x { val = 1; } }",
@@ -1035,8 +1035,8 @@ mod tests {
                 "var val? = x else {",
             ),
             (
-                "fn f(x: int?) { match var x { Option.Some(v) => { v = 1; }, Option.None => {} } }",
-                "match var x {",
+                "fn f(x: int?) { match ref x { Option.Some(v) => { v = 1; }, Option.None => {} } }",
+                "match ref x {",
             ),
         ] {
             let formatted = format_source(source).expect("format failed");
@@ -1063,10 +1063,10 @@ mod tests {
     }
 
     #[test]
-    fn expr_dynamic_match_var_wildcards() {
-        let source = "fn f(var actor: dyn Drawable) { match var actor as? { Enemy(_) => actor.draw(), _ => actor.draw(), } }";
+    fn expr_dynamic_match_ref_wildcards() {
+        let source = "fn f(ref actor: dyn Drawable) { match ref actor as? { Enemy(_) => actor.draw(), _ => actor.draw(), } }";
         let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("match var actor as? {"));
+        assert!(formatted.contains("match ref actor as? {"));
         assert!(formatted.contains("Enemy(_) => actor.draw(),"));
         assert!(formatted.contains("_ => actor.draw(),"));
     }

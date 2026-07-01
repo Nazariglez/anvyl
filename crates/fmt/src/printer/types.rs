@@ -67,7 +67,7 @@ impl Printer<'_> {
                         self.write(", ");
                     }
                     if p.mutable {
-                        self.write("var ");
+                        self.write("ref ");
                     }
                     self.format_param_prefix(p.escape, p.cast_accept);
                     self.format_type(&p.ty);

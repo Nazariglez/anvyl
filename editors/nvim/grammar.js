@@ -137,16 +137,16 @@ module.exports = grammar({
     const_parameter: $ => seq($.identifier, ':', 'int'),
 
     parameter_list: $ => seq('(', commaSep(choice($.method_receiver, $.parameter)), ')'),
-    method_receiver: $ => seq(optional('var'), 'self'),
+    method_receiver: $ => seq(optional('ref'), 'self'),
     parameter: $ => seq(
-      optional('var'),
+      optional('ref'),
       field('name', $.identifier),
       ':',
       optional('as'),
       $._type,
       optional(seq('=', $._expression)),
     ),
-    return_type: $ => prec.right(seq('->', optional('var'), $._type)),
+    return_type: $ => prec.right(seq('->', optional('ref'), $._type)),
 
     // struct definition
     struct_definition: $ => seq(
@@ -272,7 +272,7 @@ module.exports = grammar({
     extern_init_parameter_list: $ => seq('(', commaSep($.parameter), ')'),
     extern_method: $ => seq('fn', field('name', $.identifier), $.extern_parameter_list, optional($.return_type), ';'),
     extern_parameter_list: $ => seq('(', commaSep($.extern_parameter), ')'),
-    extern_parameter: $ => choice(seq('shared', 'self'), seq(optional('var'), 'self'), $.parameter),
+    extern_parameter: $ => choice(seq('shared', 'self'), seq(optional('ref'), 'self'), $.parameter),
     extern_operator: $ => seq('op', choice(
       seq($._type, choice('+', '-', '*', '/', '%', '==', '!=', '<', '<=', '>', '>='), $._type),
       seq('-', $._type),
@@ -312,14 +312,14 @@ module.exports = grammar({
       optional(seq(':', $._type)),
       '=',
       $._expression,
-      optional(seq('else', $.block)),
+      optional(seq('else', choice($.block, seq('return', optional($._expression)), 'break', 'continue'))),
       ';',
     ),
 
     // control flow
     if_expression: $ => prec.right(seq(
       'if',
-      optional(seq('let', $._pattern, '=')),
+      optional(seq(choice('let', 'var', 'ref'), $._pattern, '=')),
       field('condition', $._expression),
       $.block,
       optional(seq('else', choice($.if_expression, $.block))),
@@ -328,22 +328,23 @@ module.exports = grammar({
     while_expression: $ => seq(
       'while',
       choice(
-        seq('let', $._pattern, '=', $._expression),
+        seq(choice('let', 'var', 'ref'), $._pattern, '=', $._expression),
         $._expression,
       ),
       $.block,
     ),
 
     for_expression: $ => seq(
-      'for', $._pattern, 'in',
+      'for', $.for_binding, optional(seq(',', $.for_binding)), 'in',
       optional('rev'),
       $._expression,
       optional(seq('step', $._expression)),
       $.block,
     ),
+    for_binding: $ => seq(optional('ref'), $._pattern),
 
     match_expression: $ => seq(
-      'match', $._expression,
+      'match', optional('ref'), $._expression, optional('as?'),
       '{', commaSep($.match_arm), '}',
     ),
     match_arm: $ => seq(
@@ -456,7 +457,7 @@ module.exports = grammar({
       choice($.block, $._expression),
     ),
     lambda_parameter: $ => seq(
-      optional('var'), $.identifier, optional(seq(':', optional('as'), $._type)),
+      optional('ref'), $.identifier, optional(seq(':', optional('as'), $._type)),
     ),
 
     struct_literal: $ => prec(-1, seq(
@@ -527,7 +528,7 @@ module.exports = grammar({
     generic_type: $ => prec(1, seq($.identifier, '<', commaSep1($._type), '>')),
     optional_type: $ => prec.left(seq($._type, '?')),
     function_type: $ => prec.right(seq(
-      'fn', '(', commaSep(seq(optional('var'), optional('escaping'), $._type)), ')', optional($.return_type),
+      'fn', '(', commaSep(seq(optional('ref'), optional('escaping'), $._type)), ')', optional($.return_type),
     )),
     dynamic_type: $ => seq('dyn', choice('_', $.contract_ref)),
     array_type: $ => seq(
@@ -543,10 +544,10 @@ module.exports = grammar({
       '_',
       $.literal_pattern,
       $.struct_pattern,
+      $.dynamic_type_pattern,
       $.enum_pattern,
       $.inferred_enum_pattern,
       $.tuple_pattern,
-      seq('var', $.identifier),
       'nil',
       $.range_pattern,
       $.or_pattern,
@@ -571,6 +572,7 @@ module.exports = grammar({
       )),
       '}',
     ),
+    dynamic_type_pattern: $ => seq($.identifier, '(', commaSep($._pattern), ')'),
     enum_pattern: $ => seq(
       $.identifier,
       '.',
