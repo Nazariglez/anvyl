@@ -4,7 +4,7 @@
 // @contains: mutating method
 
 extend<T> slice[T] {
-    fn bump0(var self) {
+    fn bump0(ref self) {
         self[0] = self[0];
     }
 }

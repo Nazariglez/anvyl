@@ -3,13 +3,13 @@
 // @frontend: new
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Entity {
     hp: int,
 
-    fn update(var self) {
+    fn update(ref self) {
         self.hp += 1;
     }
 }
@@ -18,7 +18,7 @@ struct Enemy {
     @as embed entity: Entity { hp as entity_hp },
 }
 
-fn update_actor(var actor: dyn Updatable) {
+fn update_actor(ref actor: dyn Updatable) {
     actor.update();
 }
 

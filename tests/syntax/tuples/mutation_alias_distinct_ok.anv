@@ -2,7 +2,7 @@
 // @expect: success
 // @frontend: new
 
-fn set(var x: int, var y: int) {
+fn set(ref x: int, ref y: int) {
     x = 1;
     y = 2;
 }

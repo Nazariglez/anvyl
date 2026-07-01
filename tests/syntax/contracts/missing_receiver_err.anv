@@ -1,7 +1,7 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: contract method requirements must include a `self` or `var self` receiver
+// @contains: contract method requirements must include a `self` or `ref self` receiver
 
 contract Factory {
     fn make() -> int;

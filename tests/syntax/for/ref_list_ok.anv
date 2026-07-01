@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var xs = [1, 2, 3];
+    for ref x in xs {
+        x = x + 1;
+    }
+}

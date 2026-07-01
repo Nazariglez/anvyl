@@ -8,12 +8,12 @@ contract Drawable {
 }
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Enemy {
     fn draw(self) {}
-    fn update(var self) {}
+    fn update(ref self) {}
 }
 
 fn main() {

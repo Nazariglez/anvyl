@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let opt: int? = 10;
+    if var n? = opt {
+        n = 20;
+    }
+}

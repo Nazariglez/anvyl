@@ -7,7 +7,7 @@ extern type Point rep inline {
     y: float;
 }
 
-fn main(var p: Point) {
+fn main(ref p: Point) {
     var Point { x } = p;
     x = 1.0;
 }

@@ -2,7 +2,7 @@
 // @expect: success
 
 extend<K, V> [K: V] {
-    fn size(var self, k: K, v: V) {
+    fn size(ref self, k: K, v: V) {
         self.insert(k, v);
     }
 }

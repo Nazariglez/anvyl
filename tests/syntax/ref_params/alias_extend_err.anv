@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+struct Num { value: int }
+
+extend Num {
+    fn set_from(ref self, ref v: int) {
+        self.value = v;
+    }
+}
+
+fn main() {
+    var n = Num { value: 0 };
+    n.set_from(n.value);
+}

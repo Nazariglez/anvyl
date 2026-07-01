@@ -8,7 +8,7 @@ struct Enemy { @as embed actor: Actor }
 struct Boss { @as embed enemy: Enemy }
 
 fn take(entity: Entity) {}
-fn move_entity(var entity: Entity) { entity.x += 1; }
+fn move_entity(ref entity: Entity) { entity.x += 1; }
 fn take_as(entity: as Entity) {}
 
 fn make(boss: Boss) -> Entity { boss }

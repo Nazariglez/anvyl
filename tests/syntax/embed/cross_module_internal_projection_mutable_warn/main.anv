@@ -5,7 +5,7 @@
 
 import lib { Entity, enemy };
 
-fn move_entity(var entity: Entity) {
+fn move_entity(ref entity: Entity) {
     entity.x += 1;
 }
 

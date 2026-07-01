@@ -4,7 +4,7 @@
 
 fn main() {
     var hp = ["a": 1, "b": 2];
-    for key, var value in hp {
+    for key, ref value in hp {
         value += 1;
         hp[key] = value;
     }

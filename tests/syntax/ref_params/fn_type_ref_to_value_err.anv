@@ -1,0 +1,12 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: mismatched types
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    let f: fn(int) -> void = bump;
+}

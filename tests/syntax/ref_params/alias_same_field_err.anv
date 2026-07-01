@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+struct Pair { a: int, b: int }
+
+fn swap(ref a: int, ref b: int) {
+    let tmp = a;
+    a = b;
+    b = tmp;
+}
+
+fn main() {
+    var p = Pair { a: 1, b: 2 };
+    swap(p.a, p.a);
+}

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: immutable binding
+
+fn inc(ref x: int) {
+    x = x + 1;
+}
+
+fn main() {
+    let b = 10;
+    inc(b);
+}

@@ -2,6 +2,6 @@
 // @expect: success
 // @frontend: new
 
-fn set(var m: [string: int], key: string) {
+fn set(ref m: [string: int], key: string) {
     m[key] = 1;
 }

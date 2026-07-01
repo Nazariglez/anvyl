@@ -1,0 +1,11 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: ref alias patterns must bind an immediate optional or enum payload
+
+fn main() {
+    var opt: int? = 2;
+    match ref opt {
+        other => other = nil,
+    };
+}

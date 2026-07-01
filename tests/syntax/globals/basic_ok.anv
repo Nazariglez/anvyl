@@ -7,7 +7,7 @@ struct Counter {
 }
 
 extend Counter {
-    fn reset(var self) {
+    fn reset(ref self) {
         self.value = 0;
     }
 }
@@ -15,7 +15,7 @@ extend Counter {
 lazy let config = 1;
 lazy var count = Counter { value: config };
 
-fn set(var counter: Counter) {
+fn set(ref counter: Counter) {
     counter.value = 2;
 }
 

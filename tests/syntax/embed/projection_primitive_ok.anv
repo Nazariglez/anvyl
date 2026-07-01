@@ -6,7 +6,7 @@ struct Health {
     @as embed hp: int,
 }
 
-fn bump(var hp: int) {
+fn bump(ref hp: int) {
     hp += 1;
 }
 

@@ -5,7 +5,7 @@
 struct Counter { value: int }
 
 extend Counter {
-    fn inc(var self) {
+    fn inc(ref self) {
         self.value = self.value + 1;
     }
 }

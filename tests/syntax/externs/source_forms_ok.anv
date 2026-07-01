@@ -16,7 +16,7 @@ extern type Vec2 rep inline {
     computed type: string;
     fn zero() -> Self;
     fn magnitude(shared self) -> float;
-    fn translate(var self, dx: float, dy: float) -> void;
+    fn translate(ref self, dx: float, dy: float) -> void;
     op - Self -> Self;
     op Self + Self -> Self;
     op Self == Self -> bool;

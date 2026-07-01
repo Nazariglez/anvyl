@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: extern functions cannot return mutable places
-
-extern fn next() -> var int;

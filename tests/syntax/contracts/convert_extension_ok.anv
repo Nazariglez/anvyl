@@ -3,7 +3,7 @@
 // @frontend: new
 
 contract Updatable {
-    fn update(var self, dt: float);
+    fn update(ref self, dt: float);
 }
 
 struct Enemy {
@@ -11,7 +11,7 @@ struct Enemy {
 }
 
 extend Enemy {
-    fn update(var self, dt: float) {
+    fn update(ref self, dt: float) {
         self.hp = self.hp - 1;
     }
 }

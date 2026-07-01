@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable { fn update(ref self); }
+struct Enemy { fn update(ref self) {} }
+
+fn use_actor(ref actor: dyn Updatable) {
+    match ref actor as? {
+        Enemy(enemy) => enemy.update(),
+        other => other.update(),
+    };
+}
+
+fn main() {}

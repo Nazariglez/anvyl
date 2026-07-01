@@ -17,7 +17,7 @@ struct Enemy {
 
 fn main() {
     let actor: dyn Drawable = Source {};
-    if let enemy = actor as? Enemy {
+    if let enemy? = actor as? Enemy {
         enemy.draw();
     }
 }

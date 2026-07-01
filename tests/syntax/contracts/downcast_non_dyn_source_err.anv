@@ -7,5 +7,5 @@ struct Enemy {}
 
 fn main() {
     let actor = Enemy {};
-    if let enemy = actor as? Enemy {}
+    if let enemy? = actor as? Enemy {}
 }

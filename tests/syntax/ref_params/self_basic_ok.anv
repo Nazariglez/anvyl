@@ -1,0 +1,25 @@
+// @mode: check
+// @expect: success
+
+struct Counter {
+    value: int,
+
+    fn get(self) -> int {
+        self.value
+    }
+
+    fn increment(ref self) {
+        self.value = self.value + 1;
+    }
+
+    fn reset(ref self) {
+        self.value = 0;
+    }
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    c.increment();
+    c.reset();
+    let v: int = c.get();
+}

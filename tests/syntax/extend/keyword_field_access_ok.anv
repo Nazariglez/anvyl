@@ -2,7 +2,7 @@
 // @expect: success
 
 extern type Buffer {
-    fn extend(var self, other: Buffer);
+    fn extend(ref self, other: Buffer);
     fn type(self) -> int;
     fn in(self) -> bool;
 }

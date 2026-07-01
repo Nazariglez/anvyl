@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    var value? = counts["a"];
+    value = 2;
+}

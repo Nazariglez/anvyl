@@ -1,14 +1,14 @@
 // @mode: check
 // @expect: error
-// @contains: var arguments must not alias the same variable
+// @contains: ref arguments must not alias the same variable
 // @frontend: new
 
-fn both(var a: int, var b: int) {
+fn both(ref a: int, ref b: int) {
     a += 1;
     b += 1;
 }
 
-fn touch(var x: int) {
+fn touch(ref x: int) {
     let f = || {
         both(x, x);
     };

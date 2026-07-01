@@ -2,7 +2,7 @@
 // @expect: success
 // @frontend: new
 
-fn swap(var xs: slice[int], a: int, b: int) {
+fn swap(ref xs: slice[int], a: int, b: int) {
     let tmp = xs[a];
     xs[a] = xs[b];
     xs[b] = tmp;

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn reset(ref self) {
+        self.value = 0;
+    }
+}
+
+fn main() {
+    var c = Counter { value: 42 };
+    c.reset();
+}

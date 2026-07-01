@@ -6,7 +6,7 @@
 struct Health {
     hp: int,
 
-    fn damage(var self, amount: int) {
+    fn damage(ref self, amount: int) {
         self.hp -= amount;
     }
 }

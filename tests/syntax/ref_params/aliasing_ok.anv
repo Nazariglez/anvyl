@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: success
+
+fn swap(ref a: int, ref b: int) {
+    let tmp = a;
+    a = b;
+    b = tmp;
+}
+
+fn add_to(ref target: int, amount: int) {
+    target = target + amount;
+}
+
+fn main() {
+    var x = 10;
+    var y = 20;
+    swap(x, y);
+    add_to(x, x);
+}

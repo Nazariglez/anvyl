@@ -8,7 +8,7 @@ struct Counter {
 }
 
 extend Counter {
-    fn reset(var self) {
+    fn reset(ref self) {
         self.value = 0;
     }
 }

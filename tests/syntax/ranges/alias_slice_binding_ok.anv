@@ -1,9 +1,0 @@
-// @mode: check
-// @expect: success
-// @frontend: new
-
-fn use_pair(var pair: (slice[int], int)) {
-    var (s, n) = pair;
-    let _: int = s[0];
-    let _: int = n;
-}

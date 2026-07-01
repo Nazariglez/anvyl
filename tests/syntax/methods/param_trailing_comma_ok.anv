@@ -4,7 +4,7 @@
 struct Counter {
     value: int,
 
-    fn set(var self, next: int,) {
+    fn set(ref self, next: int,) {
         self.value = next;
     }
 }

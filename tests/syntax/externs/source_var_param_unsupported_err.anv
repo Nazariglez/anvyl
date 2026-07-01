@@ -1,6 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: mutable parameters are not supported in source extern declarations
-
-extern fn f(var x: int) -> void;

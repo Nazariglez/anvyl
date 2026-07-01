@@ -1,9 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: mutable place return must derive from the first mutable input
-
-fn bad(var x: int) -> var int {
-    var local = 1;
-    local
-}

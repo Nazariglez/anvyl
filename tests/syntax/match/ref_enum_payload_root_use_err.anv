@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable alias binding
+
+enum Event {
+    Quit,
+    Move { dx: int, dy: int },
+}
+
+fn main() {
+    var event = Event.Move { dx: 1, dy: 2 };
+    match ref event {
+        Event.Quit => {},
+        Event.Move { dx, .. } => {
+            event = Event.Quit;
+            dx += 1;
+        },
+    }
+}

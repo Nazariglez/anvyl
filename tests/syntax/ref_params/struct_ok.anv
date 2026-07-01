@@ -1,0 +1,30 @@
+// @mode: check
+// @expect: success
+
+struct Player {
+    hp: int,
+
+    fn reset(ref self) {
+        self.hp = 0;
+    }
+
+    fn apply_damage(ref self, amount: int) {
+        self.hp = self.hp - amount;
+    }
+}
+
+fn swap(ref a: int, ref b: int) {
+    let tmp = a;
+    a = b;
+    b = tmp;
+}
+
+fn main() {
+    var p = Player { hp: 100 };
+    p.apply_damage(10);
+    p.reset();
+
+    var x = 1;
+    var y = 2;
+    swap(x, y);
+}

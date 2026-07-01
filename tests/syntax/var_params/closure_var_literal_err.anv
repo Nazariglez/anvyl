@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @contains: non-lvalue
-
-fn main() {
-    let f: fn(var int) -> void = |var n: int| { n = 10; };
-    f(42);
-}

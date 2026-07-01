@@ -14,9 +14,9 @@ struct Box<T> {
     @as embed value: T,
 }
 
-fn take<T>(var value: T) {}
+fn take<T>(ref value: T) {}
 
-fn project<T>(var box: Box<T>) {
+fn project<T>(ref box: Box<T>) {
     take<T>(box);
 }
 

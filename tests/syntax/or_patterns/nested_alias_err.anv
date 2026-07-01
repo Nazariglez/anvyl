@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: ref alias patterns must bind an immediate optional or enum payload
+// @frontend: new
+
+enum E { A((int, int)), B((int, int)) }
+
+fn main() {
+    var e = E.A((1, 2));
+    match ref e {
+        E.A((x, _)) | E.B((_, x)) => {},
+    }
+}

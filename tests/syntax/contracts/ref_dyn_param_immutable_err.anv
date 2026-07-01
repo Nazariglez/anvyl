@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable binding 'enemy' cannot be passed to ref parameter
+
+contract Updatable {
+    fn update(ref self, dt: float);
+}
+
+struct Enemy {
+    fn update(ref self, dt: float) {}
+}
+
+fn tick(ref actor: dyn Updatable, dt: float) {}
+
+fn main() {
+    let enemy = Enemy {};
+    tick(enemy, 1.0);
+}

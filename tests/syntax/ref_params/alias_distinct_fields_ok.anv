@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+struct Pair { a: int, b: int }
+
+fn set(ref a: int, ref b: int) {
+    a = 1;
+    b = 2;
+}
+
+fn main() {
+    var p = Pair { a: 0, b: 0 };
+    set(p.a, p.b);
+}

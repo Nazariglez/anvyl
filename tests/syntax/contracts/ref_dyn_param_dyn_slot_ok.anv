@@ -1,0 +1,20 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Updatable {
+    fn update(ref self, dt: float);
+}
+
+struct Enemy {
+    fn update(ref self, dt: float) {}
+}
+
+fn tick(ref actor: dyn Updatable, dt: float) {
+    actor.update(dt);
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy {};
+    tick(actor, 1.0);
+}

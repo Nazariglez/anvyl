@@ -1,0 +1,32 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn pick(ref x: int, cond: bool) -> ref int {
+    if cond { x } else { x }
+}
+
+fn pick_ternary(ref x: int, cond: bool) -> ref int {
+    cond ? x : x
+}
+
+fn pick_match(ref x: int, cond: bool) -> ref int {
+    match cond { true => x, false => x }
+}
+
+fn pick_return_branch(ref x: int, cond: bool) -> ref int {
+    if cond { return x; } else { x }
+}
+
+fn pick_match_block(ref x: int, cond: bool) -> ref int {
+    match cond { true => { return x; }, false => { x } }
+}
+
+fn main() {
+    var n = 1;
+    pick(n, true) = 2;
+    pick_ternary(n, false) = 3;
+    pick_match(n, true) = 4;
+    pick_return_branch(n, true) = 5;
+    pick_match_block(n, false) = 6;
+}

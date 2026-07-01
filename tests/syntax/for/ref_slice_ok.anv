@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn update(ref xs: slice[int]) {
+    for ref x in xs {
+        bump(x);
+    }
+}

@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    hp: int,
+
+    fn draw(self) {}
+}
+
+struct Slot {
+    actor: dyn Drawable,
+    count: int,
+}
+
+fn main() {
+    var slot = Slot { actor: Enemy { hp: 1 }, count: 0 };
+    if ref enemy = slot.actor as? Enemy {
+        slot.count = 1;
+        enemy.hp = 2;
+    }
+}

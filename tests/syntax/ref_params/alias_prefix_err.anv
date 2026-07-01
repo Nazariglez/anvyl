@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+struct Inner { x: int }
+struct Outer { a: Inner }
+
+fn take_both(ref a: Inner, ref b: int) {
+    a.x = b;
+}
+
+fn main() {
+    var o = Outer { a: Inner { x: 1 } };
+    take_both(o.a, o.a.x);
+}

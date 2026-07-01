@@ -3,17 +3,17 @@
 // @frontend: new
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Enemy {
     hp: int,
 
-    fn update(var self) {}
+    fn update(ref self) {}
 }
 
-fn touch(var actor: dyn Updatable) {
-    if var enemy = actor as? Enemy {
+fn touch(ref actor: dyn Updatable) {
+    if ref enemy = actor as? Enemy {
         let f = || { enemy.hp = 1; };
         f();
     }

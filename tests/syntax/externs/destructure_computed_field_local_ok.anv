@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+extern type Point rep inline {
+    computed x: float;
+}
+
+fn main(ref p: Point) {
+    var Point { x } = p;
+    x = 1.0;
+}

@@ -2,7 +2,7 @@
 // @expect: success
 
 extend<K> [K: int] {
-    fn set_val(var self, k: K, v: int) {
+    fn set_val(ref self, k: K, v: int) {
         self.insert(k, v);
     }
 }

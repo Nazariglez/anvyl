@@ -3,7 +3,7 @@
 // @frontend: new
 
 contract Updatable {
-    fn update(var self, dt: float);
+    fn update(ref self, dt: float);
 }
 
 contract Drawable {
@@ -20,14 +20,14 @@ struct Enemy {
 }
 
 extend Enemy {
-    fn update(var self, dt: float) {
+    fn update(ref self, dt: float) {
         self.hp -= 1;
     }
 
     fn draw(self) {}
 }
 
-fn tick(var actor: dyn Actor, dt: float) {
+fn tick(ref actor: dyn Actor, dt: float) {
     actor.update(dt);
     actor.draw();
 }

@@ -4,11 +4,11 @@ pub struct Item {
     value: int,
 
     @internal
-    fn reset(var self) {
+    fn reset(ref self) {
         self.value = 0;
     }
 
-    fn increment(var self) {
+    fn increment(ref self) {
         self.value = self.value + 1;
     }
 }

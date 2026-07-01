@@ -26,7 +26,7 @@ extern type Sprite {
     /// Creates a new sprite at the origin.
     fn new() -> Self;
     /// Sets the sprite's position.
-    fn set_position(var self, pos: Vec2);
+    fn set_position(ref self, pos: Vec2);
     /// Renders the sprite to the screen.
     fn render(self) -> void;
 }

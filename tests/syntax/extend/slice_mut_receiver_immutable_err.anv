@@ -4,7 +4,7 @@
 // @contains: mutating method
 
 extend<T> slice[T] {
-    fn swap(var self, a: int, b: int) {
+    fn swap(ref self, a: int, b: int) {
         let tmp = self[a];
         self[a] = self[b];
         self[b] = tmp;

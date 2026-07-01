@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+fn swap(ref a: int, ref b: int) {
+    let tmp = a;
+    a = b;
+    b = tmp;
+}
+
+fn main() {
+    var x = 10;
+    swap(x, x);
+}

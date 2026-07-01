@@ -3,7 +3,7 @@
 // @frontend: new
 // @contains: same variable
 
-fn take(var pair: (int, int), var x: int) {
+fn take(ref pair: (int, int), ref x: int) {
     pair.0 = x;
 }
 

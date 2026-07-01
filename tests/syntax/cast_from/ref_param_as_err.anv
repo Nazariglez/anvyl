@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: `as` cannot be combined with `ref`; use `ref x: T`
+
+fn touch(ref x: as int) {
+    x = x + 1;
+}
+
+fn main() {
+    var x = 1;
+    touch(x);
+}

@@ -2,8 +2,8 @@
 // @expect: success
 // @frontend: new
 
-fn make() -> fn(var int) {
-    |var x: int| {
+fn make() -> fn(ref int) {
+    |ref x: int| {
         let inner = || { x = 1; };
         inner();
     }

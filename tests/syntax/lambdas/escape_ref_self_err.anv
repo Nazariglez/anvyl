@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture mutable receiver 'self' in an escaping lambda
+// @frontend: new
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn bad(ref self) -> fn() {
+        || { self.value = 1; }
+    }
+}

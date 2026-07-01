@@ -4,14 +4,14 @@
 
 extern type HostStats {
     fn hp(self) -> int;
-    fn damage(var self, amount: int);
+    fn damage(ref self, amount: int);
 }
 
 struct Enemy {
     embed stats: HostStats,
 }
 
-fn test(var enemy: Enemy) {
+fn test(ref enemy: Enemy) {
     let hp: int = enemy.hp();
     enemy.damage(1);
 }

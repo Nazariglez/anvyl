@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable binding 'pair'
+
+fn set(ref x: int) {
+    x = 1;
+}
+
+fn main() {
+    let pair = (1, 2);
+    set(pair.0);
+}

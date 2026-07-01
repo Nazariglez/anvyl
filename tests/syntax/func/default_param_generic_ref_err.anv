@@ -1,0 +1,6 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: ref parameter 'x' cannot have a default initializer
+
+fn bad<T>(ref x: T = 0) {}

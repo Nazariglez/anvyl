@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: mutable place returns cannot return void
-
-fn main() {
-    let f = |var x: int| -> var void { x };
-}

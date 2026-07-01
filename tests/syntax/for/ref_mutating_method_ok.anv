@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Counter {
+    n: int,
+
+    fn inc(ref self) {
+        self.n += 1;
+    }
+}
+
+fn main() {
+    var counters = [Counter { n: 0 }];
+    for ref counter in counters {
+        counter.inc();
+    }
+}

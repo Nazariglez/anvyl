@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    var opt: int? = 42;
+    match ref opt {
+        Option.Some(value) => { value = 1; },
+        Option.None => {},
+    }
+}

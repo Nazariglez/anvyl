@@ -4,7 +4,7 @@
 // @contains: does not satisfy contract bound 'Updatable'
 
 contract Updatable {
-    fn update(var self, dt: float);
+    fn update(ref self, dt: float);
 }
 
 struct Rock {}

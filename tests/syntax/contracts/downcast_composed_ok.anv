@@ -7,18 +7,18 @@ contract Drawable {
 }
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Enemy {
     fn draw(self) {}
-    fn update(var self) {}
+    fn update(ref self) {}
     fn attack(self) {}
 }
 
 fn main() {
     var actor: dyn Drawable + Updatable = Enemy {};
-    if let enemy = actor as? Enemy {
+    if let enemy? = actor as? Enemy {
         enemy.attack();
     }
 }

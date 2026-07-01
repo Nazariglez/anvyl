@@ -15,7 +15,7 @@ struct Label {
 }
 
 fn try_down<T>(actor: dyn Drawable) {
-    if let value = actor as? T {
+    if let value? = actor as? T {
         value.draw();
     }
 }

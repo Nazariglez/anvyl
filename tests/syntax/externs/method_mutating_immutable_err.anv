@@ -6,7 +6,7 @@
 extern type Point {
     x: float;
     y: float;
-    fn move_by(var self, dx: float, dy: float);
+    fn move_by(ref self, dx: float, dy: float);
 }
 
 extern fn make_point(x: float, y: float) -> Point;

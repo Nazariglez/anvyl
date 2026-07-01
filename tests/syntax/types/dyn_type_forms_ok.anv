@@ -3,8 +3,8 @@
 // @frontend: new
 
 contract Drawable { fn draw(self); }
-contract Updatable { fn update(var self); }
-struct Actor { fn draw(self) {} fn update(var self) {} }
+contract Updatable { fn update(ref self); }
+struct Actor { fn draw(self) {} fn update(ref self) {} }
 
 fn take(actor: dyn Drawable + Updatable) {
     actor.draw();

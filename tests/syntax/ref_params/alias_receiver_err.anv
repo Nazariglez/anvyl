@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+struct Counter {
+    value: int,
+
+    fn add(ref self, ref amount: int) {
+        self.value = self.value + amount;
+    }
+}
+
+fn main() {
+    var c = Counter { value: 10 };
+    c.add(c.value);
+}

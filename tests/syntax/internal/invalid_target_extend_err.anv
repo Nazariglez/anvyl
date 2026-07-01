@@ -6,7 +6,7 @@ struct Foo { value: int }
 
 pub extend Foo {
     @internal
-    fn bar(var self) {
+    fn bar(ref self) {
         self.value = 0;
     }
 }

@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @contains: cannot pass iterated collection as mutable collection parameter
+// @frontend: new
+
+fn mutate(ref hp: [string: int]) {
+    hp.remove("a");
+}
+
+fn main() {
+    var hp = ["a": 1, "b": 2];
+    for key, value in hp {
+        mutate(hp);
+        let _: string = key;
+        let _: int = value;
+    }
+}

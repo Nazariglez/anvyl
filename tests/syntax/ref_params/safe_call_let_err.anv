@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: mutating method
+
+struct Counter { value: int }
+
+extend Counter {
+    fn inc(ref self) {
+        self.value = self.value + 1;
+    }
+}
+
+fn main() {
+    let opt: Counter? = Counter { value: 0 };
+    opt?.inc();
+}

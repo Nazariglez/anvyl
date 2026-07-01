@@ -5,7 +5,7 @@
 struct Player {
     hp: int,
 
-    fn reset(var self) {
+    fn reset(ref self) {
         self.hp = 0;
     }
 }

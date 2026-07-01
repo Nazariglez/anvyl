@@ -7,7 +7,7 @@ extern type Point {
     y: float;
     fn new(x: float, y: float) -> Self;
     fn origin() -> Self;
-    fn move_by(var self, dx: float, dy: float);
+    fn move_by(ref self, dx: float, dy: float);
 }
 
 fn main() {

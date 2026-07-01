@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable place returns cannot return void
+
+fn bad(ref x: int) -> ref void {
+}

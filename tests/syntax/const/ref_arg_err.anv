@@ -1,0 +1,14 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: immutable binding 'X' cannot be passed to ref parameter
+
+const X = 1;
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    bump(X);
+}

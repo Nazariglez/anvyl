@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: place cannot be used while a mutable alias binding is live
+
+contract Updatable { fn update(ref self); }
+struct Enemy { fn update(ref self) {} }
+
+fn main() {
+    var actor: dyn Updatable = Enemy {};
+    match ref actor as? {
+        Enemy(enemy) => actor.update(),
+        other => other.update(),
+    };
+}

@@ -14,7 +14,7 @@ struct Enemy {
 fn main() {
     let actors: [dyn Drawable] = [Enemy {}];
     for actor in actors {
-        if let enemy = actor as? Enemy {
+        if let enemy? = actor as? Enemy {
             enemy.attack();
         }
     }

@@ -14,7 +14,7 @@ struct EnemySlot {
     enemy: Enemy,
 }
 
-fn move_entity(var entity: Entity, dx: int) {
+fn move_entity(ref entity: Entity, dx: int) {
     entity.x += dx;
 }
 

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+
+fn main() {
+    let f: fn(ref int, ref int) -> void = |ref a: int, ref b: int| { a = b; };
+    var x = 1;
+    f(x, x);
+}

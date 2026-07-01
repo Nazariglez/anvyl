@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: same variable
+// @frontend: new
+
+fn swap(ref a: int, ref b: int) {
+    let tmp = a;
+    a = b;
+    b = tmp;
+}
+
+fn make() -> fn() {
+    var count = 0;
+    || { swap(count, count); }
+}

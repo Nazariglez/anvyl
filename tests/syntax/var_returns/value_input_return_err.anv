@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: mutable place return requires a mutable place
-
-fn bad(x: int, var y: int) -> var int {
-    x
-}

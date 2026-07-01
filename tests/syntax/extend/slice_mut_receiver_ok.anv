@@ -3,14 +3,14 @@
 // @frontend: new
 
 extend<T> slice[T] {
-    fn swap(var self, a: int, b: int) {
+    fn swap(ref self, a: int, b: int) {
         let tmp = self[a];
         self[a] = self[b];
         self[b] = tmp;
     }
 }
 
-fn use(var xs: slice[int]) {
+fn use(ref xs: slice[int]) {
     xs.swap(0, 1);
 }
 

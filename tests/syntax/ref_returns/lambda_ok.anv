@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let id = |ref x: int| -> ref int { x };
+    let f: fn(ref int) -> ref int = id;
+    var n = 1;
+    id(n) = 2;
+    f(n) = 3;
+}

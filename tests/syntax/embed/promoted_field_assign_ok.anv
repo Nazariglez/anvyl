@@ -8,7 +8,7 @@ struct Enemy {
     embed health: Health,
 }
 
-fn test(var enemy: Enemy) {
+fn test(ref enemy: Enemy) {
     enemy.hp = 10;
     enemy.hp += 1;
 }

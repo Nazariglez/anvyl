@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: mutable alias binding
+
+fn main() {
+    var opt: int? = 1;
+    while ref value? = opt {
+        println(opt ?? 0);
+        value = 2;
+        break;
+    }
+}

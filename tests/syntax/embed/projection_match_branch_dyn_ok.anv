@@ -3,13 +3,13 @@
 // @frontend: new
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Entity {
     hp: int,
 
-    fn update(var self) {
+    fn update(ref self) {
         self.hp += 1;
     }
 }

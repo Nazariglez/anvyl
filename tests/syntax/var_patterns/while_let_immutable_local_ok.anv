@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn main() {
+    let opt: int? = 10;
+    while var n? = opt {
+        n = 20;
+        break;
+    }
+}

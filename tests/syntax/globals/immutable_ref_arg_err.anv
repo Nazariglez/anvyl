@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable binding 'config' cannot be passed to ref parameter
+
+lazy let config = 1;
+
+fn set(ref value: int) {
+    value = 2;
+}
+
+fn main() {
+    set(config);
+}

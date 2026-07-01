@@ -13,5 +13,5 @@ struct Enemy {
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    if let _ = actor as? Enemy {}
+    if ref _? = actor as? Enemy {}
 }

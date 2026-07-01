@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn bad(ref point: Point) -> fn() {
+    var Point { x } = point;
+    || { x = 1; }
+}

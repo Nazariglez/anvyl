@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ref pattern requires a mutable place
+
+contract Updatable { fn update(ref self); }
+struct Enemy { fn update(ref self) {} }
+
+fn main() {
+    let actor: dyn Updatable = Enemy {};
+    match ref actor as? {
+        Enemy(enemy) => enemy.update(),
+        other => other.update(),
+    };
+}

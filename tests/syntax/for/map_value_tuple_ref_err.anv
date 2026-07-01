@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: ref alias patterns must bind an immediate optional or enum payload
+// @frontend: new
+
+fn main() {
+    var pairs: [string: (int, int)] = ["a": (1, 2)];
+    for k, ref (a, b) in pairs {
+        let _: string = k;
+        a += 1;
+        b += 1;
+    }
+}

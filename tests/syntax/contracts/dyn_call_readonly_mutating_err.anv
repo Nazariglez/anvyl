@@ -4,11 +4,11 @@
 // @contains: mutating method requires mutable receiver 'update'
 
 contract Updatable {
-    fn update(var self, dt: float);
+    fn update(ref self, dt: float);
 }
 
 struct Enemy {
-    fn update(var self, dt: float) {}
+    fn update(ref self, dt: float) {}
 }
 
 fn main() {

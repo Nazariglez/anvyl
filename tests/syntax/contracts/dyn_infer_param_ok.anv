@@ -3,10 +3,10 @@
 // @frontend: new
 
 struct Actor {
-    fn update(var self, dt: float) {}
+    fn update(ref self, dt: float) {}
 }
 
-fn tick(var actor: dyn _) {
+fn tick(ref actor: dyn _) {
     actor.update(1.0);
 }
 

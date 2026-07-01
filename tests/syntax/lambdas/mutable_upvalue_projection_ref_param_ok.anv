@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Point { x: int }
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn make() -> fn() {
+    var point = Point { x: 0 };
+    || { bump(point.x); }
+}

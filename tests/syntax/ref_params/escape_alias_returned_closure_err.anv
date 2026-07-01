@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture borrowed parameter 'x' in an escaping lambda
+// @frontend: new
+
+fn bad(ref x: int) -> fn() {
+    let f = || { x += 1; };
+    f
+}

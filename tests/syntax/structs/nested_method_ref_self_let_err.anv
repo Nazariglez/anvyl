@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutating method
+
+struct Counter {
+    n: int,
+
+    fn inc(ref self) { self.n = self.n + 1; }
+}
+
+struct Holder { c: Counter }
+
+fn main() {
+    let h = Holder { c: Counter { n: 0 } };
+    h.c.inc();
+}

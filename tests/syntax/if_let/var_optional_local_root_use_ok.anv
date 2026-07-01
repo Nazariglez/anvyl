@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    var opt: int? = 1;
+    var value? = opt else return;
+    println(opt ?? 0);
+    value = 2;
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: non-lvalue
+
+fn inc(ref x: int) {
+    x = x + 1;
+}
+
+fn main() {
+    inc(10);
+}

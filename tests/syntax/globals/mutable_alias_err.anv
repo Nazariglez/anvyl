@@ -1,11 +1,11 @@
 // @mode: check
 // @expect: error
 // @frontend: new
-// @contains: var arguments must not alias the same variable
+// @contains: ref arguments must not alias the same variable
 
 lazy var count = 0;
 
-fn pair(var left: int, var right: int) {}
+fn pair(ref left: int, ref right: int) {}
 
 fn main() {
     pair(count, count);

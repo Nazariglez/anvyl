@@ -11,7 +11,7 @@ struct Enemy {
     @as embed entity: Entity,
 }
 
-fn touch(var a: Entity, var b: Entity) {}
+fn touch(ref a: Entity, ref b: Entity) {}
 
 fn test() {
     var enemy = Enemy { entity: Entity { x: 1 } };

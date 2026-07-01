@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: ref alias patterns must bind an immediate optional or enum payload
+// @frontend: new
+
+fn touch(ref a: int, ref b: int) {}
+
+fn main() {
+    var pair = (1, 2);
+    match ref pair {
+        (x, y) | (y, x) => { touch(x, y); },
+    }
+}

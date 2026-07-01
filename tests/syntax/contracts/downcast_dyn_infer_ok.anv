@@ -9,7 +9,7 @@ struct Enemy {
 
 fn use_actor(actor: dyn _) {
     actor.draw();
-    if let enemy = actor as? Enemy {
+    if let enemy? = actor as? Enemy {
         enemy.attack();
     }
 }

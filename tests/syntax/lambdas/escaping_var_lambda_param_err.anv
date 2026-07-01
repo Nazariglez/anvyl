@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @contains: `escaping` cannot be combined with `var`
-// @frontend: new
-
-fn main() {
-    let f = |var cb: escaping fn()| { cb(); };
-}

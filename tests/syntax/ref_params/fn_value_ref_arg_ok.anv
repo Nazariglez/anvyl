@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn set(ref x: int) { x = 1; }
+
+fn main() {
+    let f: fn(ref int) -> void = set;
+    var x = 0;
+    f(x);
+}

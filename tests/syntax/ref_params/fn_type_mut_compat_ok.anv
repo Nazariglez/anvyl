@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: success
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn show(x: int) {
+    println(x);
+}
+
+fn main() {
+    let mutate: fn(ref int) -> void = bump;
+    let read: fn(int) -> void = show;
+    let lambda_mutate: fn(ref int) -> void = |ref x: int| {
+        x += 1;
+    };
+}

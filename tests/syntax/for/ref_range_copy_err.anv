@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ref iteration requires a mutable iterable place
+
+fn main() {
+    let xs: [int] = [1, 2, 3];
+    for ref x in xs[0..2] {
+        x = 4;
+    }
+}

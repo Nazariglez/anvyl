@@ -1,0 +1,34 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+struct Button {
+    width: int,
+    height: int,
+}
+
+struct ButtonBuilder {
+    width: int,
+    height: int,
+
+    fn width(ref self, width: int) -> ref Self {
+        self.width = width;
+        self
+    }
+
+    fn height(ref self, height: int) -> ref Self {
+        self.height = height;
+        self
+    }
+
+    fn build(self) -> Button {
+        Button { width: self.width, height: self.height }
+    }
+}
+
+fn main() {
+    let button = ButtonBuilder { width: 0, height: 0 }
+        .width(100)
+        .height(40)
+        .build();
+}

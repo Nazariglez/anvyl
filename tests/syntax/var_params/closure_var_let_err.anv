@@ -1,9 +1,0 @@
-// @mode: check
-// @expect: error
-// @contains: immutable binding
-
-fn main() {
-    let f: fn(var int) -> void = |var n: int| { n = 10; };
-    let x = 5;
-    f(x);
-}

@@ -9,7 +9,7 @@ contract Drawable {
 
 struct Sprite {
     fn draw(self) {}
-    fn update(var self) {}
+    fn update(ref self) {}
 }
 
 fn main() {

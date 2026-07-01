@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: immutable binding
+
+fn main() {
+    let f: fn(ref int) -> void = |ref n: int| { n = 10; };
+    let x = 5;
+    f(x);
+}

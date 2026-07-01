@@ -1,0 +1,12 @@
+// @mode: check
+// @frontend: new
+// @expect: error
+// @contains: mismatched types
+
+fn show(x: int) {
+    println(x);
+}
+
+fn main() {
+    let f: fn(ref int) -> void = show;
+}

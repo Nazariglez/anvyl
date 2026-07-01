@@ -2,7 +2,7 @@
 // @expect: success
 // @frontend: new
 
-fn bump(var x: int) {
+fn bump(ref x: int) {
     x += 10;
 }
 

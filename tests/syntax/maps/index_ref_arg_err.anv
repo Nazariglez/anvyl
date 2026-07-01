@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: non-lvalue cannot be passed to ref parameter
+
+fn clear(ref slot: int?) {
+    slot = nil;
+}
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    clear(counts["a"]);
+}

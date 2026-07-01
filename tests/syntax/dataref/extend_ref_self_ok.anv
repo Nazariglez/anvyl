@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+
+dataref Counter {
+    value: int,
+}
+
+extend Counter {
+    fn get(self) -> int { self.value }
+    fn inc(ref self) { self.value = self.value + 1; }
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    c.inc();
+    let v: int = c.get();
+}

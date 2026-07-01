@@ -7,7 +7,7 @@ struct Counter {
     amount: int,
 
     fn value(self) -> int { self.amount }
-    fn value(var self) -> int { self.amount }
+    fn value(ref self) -> int { self.amount }
 }
 
 fn main() {}

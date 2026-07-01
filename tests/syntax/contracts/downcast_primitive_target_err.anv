@@ -13,5 +13,5 @@ struct Enemy {
 
 fn main() {
     let actor: dyn Drawable = Enemy {};
-    if let value = actor as? int {}
+    if let value? = actor as? int {}
 }

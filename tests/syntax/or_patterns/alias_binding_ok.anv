@@ -6,7 +6,7 @@ enum E { A(int), B(int) }
 
 fn main() {
     var e = E.A(1);
-    match var e {
+    match ref e {
         E.A(x) | E.B(x) => {},
     }
 }

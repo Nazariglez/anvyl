@@ -5,7 +5,7 @@ pub fn keep() {}
 pub extend<T> slice[T] {
     fn first(self) -> T { self[0] }
 
-    fn swap(var self, a: int, b: int) {
+    fn swap(ref self, a: int, b: int) {
         let tmp = self[a];
         self[a] = self[b];
         self[b] = tmp;

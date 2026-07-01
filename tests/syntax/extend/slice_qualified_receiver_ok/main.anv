@@ -12,11 +12,11 @@ fn array_first(xs: [int; 3]) -> int {
     exts.first(xs)
 }
 
-fn list_swap(var xs: [int]) {
+fn list_swap(ref xs: [int]) {
     exts.swap(xs, 0, 1);
 }
 
-fn array_swap(var xs: [int; 3]) {
+fn array_swap(ref xs: [int; 3]) {
     exts.swap(xs, 0, 1);
 }
 

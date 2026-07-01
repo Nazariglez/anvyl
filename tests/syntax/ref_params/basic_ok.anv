@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: success
+
+fn inc(ref x: int) {
+    x = x + 1;
+}
+
+fn mixed(a: int, ref b: int, c: string) {
+    b = a + b;
+}
+
+fn main() {
+    var n = 10;
+    inc(n);
+    var m = 20;
+    mixed(1, m, "hello");
+}

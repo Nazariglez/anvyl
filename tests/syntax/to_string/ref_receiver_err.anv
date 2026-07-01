@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: must be 'self', not 'ref self'
+
+struct Foo {
+    x: int,
+
+    fn to_string(ref self) -> string {
+        "foo"
+    }
+}
+
+fn main() {
+    let f = Foo { x: 1 };
+}

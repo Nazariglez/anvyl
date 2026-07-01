@@ -1,10 +1,10 @@
 // @helper
 
 pub contract Resettable {
-    fn reset(var self);
+    fn reset(ref self);
 }
 
 pub struct Item {
     @internal
-    fn reset(var self) {}
+    fn reset(ref self) {}
 }

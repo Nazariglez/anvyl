@@ -4,11 +4,11 @@
 // @contains: mutating method
 
 contract Updatable {
-    fn update(var self);
+    fn update(ref self);
 }
 
 struct Enemy {
-    fn update(var self) {}
+    fn update(ref self) {}
 }
 
 fn main() {

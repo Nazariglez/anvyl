@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: mutable place returns require a first mutable input
-
-fn main() {
-    let f: fn(int) -> var int = |x: int| { x };
-}

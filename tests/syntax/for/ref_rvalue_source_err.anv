@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: ref iteration requires a mutable iterable place
+
+fn main() {
+    for ref x in [1, 2, 3] {
+        x = 4;
+    }
+}

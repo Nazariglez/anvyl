@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: mutable place returns require a first mutable input
+
+fn bad(x: int) -> ref int {
+    x
+}

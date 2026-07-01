@@ -5,7 +5,7 @@ struct Manager {
 }
 
 extend Manager {
-    fn do_thing(var self) {
+    fn do_thing(ref self) {
         self.count += 1;
     }
 }

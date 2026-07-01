@@ -4,7 +4,7 @@
 // @contains: Enemy does not satisfy Updatable: missing method 'update'
 
 contract Updatable {
-    fn update(var self, dt: float);
+    fn update(ref self, dt: float);
 }
 
 struct Enemy {

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: immutable binding
+
+fn set<T>(ref x: T, value: T) {
+    x = value;
+}
+
+fn main() {
+    let x = 0;
+    set(x, 1);
+}

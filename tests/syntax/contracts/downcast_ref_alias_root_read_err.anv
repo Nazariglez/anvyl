@@ -1,0 +1,19 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @contains: place cannot be used while a mutable alias binding is live
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+fn main() {
+    var actor: dyn Drawable = Enemy {};
+    if ref enemy = actor as? Enemy {
+        actor.draw();
+    }
+}

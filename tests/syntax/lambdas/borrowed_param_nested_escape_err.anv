@@ -3,7 +3,7 @@
 // @contains: cannot capture borrowed parameter 'x' in an escaping lambda
 // @frontend: new
 
-fn make(var x: int) -> fn() {
+fn make(ref x: int) -> fn() {
     let inner = || { x = 1; };
     let outer = || { inner(); };
     outer

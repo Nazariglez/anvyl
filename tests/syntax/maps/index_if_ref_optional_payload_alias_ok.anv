@@ -1,0 +1,10 @@
+// @mode: check
+// @frontend: new
+// @expect: success
+
+fn main() {
+    var scores: [string: int?] = ["a": 1];
+    if ref score? = scores["a"] {
+        score = nil;
+    }
+}

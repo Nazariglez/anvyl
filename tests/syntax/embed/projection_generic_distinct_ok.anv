@@ -7,11 +7,11 @@ struct Pair<T, U> {
     @as embed right: U,
 }
 
-fn take_int(var x: int) {
+fn take_int(ref x: int) {
     x += 1;
 }
 
-fn take_string(var x: string) {
+fn take_string(ref x: string) {
     x = x + "!";
 }
 

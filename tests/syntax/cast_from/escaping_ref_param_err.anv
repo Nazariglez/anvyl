@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: `escaping` cannot be combined with `ref`
+// @frontend: new
+
+struct Handler {}
+
+extend Handler {
+    cast from(ref f: escaping fn()) { Handler {} }
+}

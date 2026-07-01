@@ -1,0 +1,17 @@
+// @mode: check
+// @expect: error
+// @contains: immutable binding
+
+struct Num { value: int }
+
+extend Num {
+    fn set_value(ref self, ref v: int) {
+        self.value = v;
+    }
+}
+
+fn main() {
+    var n = Num { value: 0 };
+    let x = 10;
+    n.set_value(x);
+}

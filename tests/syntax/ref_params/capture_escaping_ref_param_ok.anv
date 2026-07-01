@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn make() -> fn() {
+    var count = 0;
+    || { bump(count); }
+}

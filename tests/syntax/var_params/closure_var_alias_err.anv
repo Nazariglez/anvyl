@@ -1,9 +1,0 @@
-// @mode: check
-// @expect: error
-// @contains: same variable
-
-fn main() {
-    let f: fn(var int, var int) -> void = |var a: int, var b: int| { a = b; };
-    var x = 1;
-    f(x, x);
-}

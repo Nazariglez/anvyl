@@ -16,7 +16,7 @@ pub struct Point {
     }
 
     /// Adds the given values to each coordinate.
-    fn add(var self, dx: int, dy: int, dz: int) {
+    fn add(ref self, dx: int, dy: int, dz: int) {
         self.x = self.x + dx;
         self.y = self.y + dy;
         self.z = self.z + dz;

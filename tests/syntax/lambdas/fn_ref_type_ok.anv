@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+
+fn apply(f: fn(ref int) -> void, ref x: int) {
+    f(x);
+}
+
+fn scale(ref x: int) {
+    x *= 2;
+}
+
+fn main() {
+    var n = 5;
+    apply(scale, n);
+}

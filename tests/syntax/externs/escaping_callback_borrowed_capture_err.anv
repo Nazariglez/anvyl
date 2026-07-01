@@ -5,6 +5,6 @@
 
 extern fn later(f: escaping fn()) -> void;
 
-fn bad(var x: int) {
+fn bad(ref x: int) {
     later(|| { x = 1; });
 }

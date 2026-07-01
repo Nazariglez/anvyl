@@ -1,8 +1,0 @@
-// @mode: check
-// @expect: error
-// @frontend: new
-// @contains: contract requirements cannot return mutable places
-
-contract HasValue {
-    fn value(var self) -> var int;
-}

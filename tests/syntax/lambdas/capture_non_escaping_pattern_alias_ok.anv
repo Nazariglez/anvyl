@@ -7,7 +7,7 @@ struct Point {
     y: int,
 }
 
-fn touch(var point: Point) {
+fn touch(ref point: Point) {
     var Point { x } = point;
     let f = || { x = 1; };
     f();
