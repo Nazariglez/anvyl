@@ -428,7 +428,7 @@ pub struct RirScopedPlaceCellDecl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirScopedPlaceSource {
     SourceMutParam { place: RirMutPlaceArg },
-    VarSelf { place: RirMutPlaceArg },
+    RefSelf { place: RirMutPlaceArg },
     PatternAlias { place: RirMutPlaceArg },
 }
 
@@ -436,7 +436,7 @@ impl RirScopedPlaceSource {
     pub fn place(&self) -> &RirMutPlaceArg {
         match self {
             Self::SourceMutParam { place }
-            | Self::VarSelf { place }
+            | Self::RefSelf { place }
             | Self::PatternAlias { place } => place,
         }
     }
@@ -2994,7 +2994,7 @@ impl VerifyCx<'_> {
         );
         match &cell.source {
             RirScopedPlaceSource::SourceMutParam { place }
-            | RirScopedPlaceSource::VarSelf { place } => {
+            | RirScopedPlaceSource::RefSelf { place } => {
                 let Some(source_local) = place.root_local() else {
                     self.push(site, RirVerifyErrorKind::BadId);
                     return;

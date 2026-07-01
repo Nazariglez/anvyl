@@ -1559,7 +1559,7 @@ impl<'a> PlanCx<'a> {
                     ),
                 })
             }
-            air::ScopedBorrowSource::VarSelf { local } => Ok(RirScopedPlaceSource::VarSelf {
+            air::ScopedBorrowSource::RefSelf { local } => Ok(RirScopedPlaceSource::RefSelf {
                 place: RirMutPlaceArg::from_handle(
                     RirMutPlaceHandle::Param {
                         local: RirLocalId::from_index(local.index()),

@@ -2679,7 +2679,7 @@ fn plan_lowers_scalar_global_declaration() {
 }
 
 #[test]
-fn plan_lowers_scalar_global_read_into_var_param_assignment() {
+fn plan_lowers_scalar_global_read_into_ref_param_assignment() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -2985,7 +2985,7 @@ fn plan_lowers_projected_global_assignment() {
 }
 
 #[test]
-fn plan_lowers_projected_global_var_arg_to_mut_place() {
+fn plan_lowers_projected_global_ref_arg_to_mut_place() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
@@ -6559,7 +6559,7 @@ fn rir_rejects_duplicate_scoped_place_cells_for_same_local_with_different_source
     let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
     let mut duplicate = valid_scoped_place_cell_decl();
     duplicate.id = RirScopedPlaceCellId::from_index(1);
-    duplicate.source = scoped_source_var_self(RirLocalId::from_index(0), RirTypeId::from_index(1));
+    duplicate.source = scoped_source_ref_self(RirLocalId::from_index(0), RirTypeId::from_index(1));
     program.scoped_place_cells.push(duplicate);
 
     assert_rir_error(
@@ -10446,8 +10446,8 @@ fn profile_accepts_mut_borrow_call() {
 }
 
 #[test]
-fn profile_accepts_lambda_callee_capture_cell_source_var_arg() {
-    let mut program = owner_capture_cell_source_var_arg_program();
+fn profile_accepts_lambda_callee_capture_cell_source_ref_arg() {
+    let mut program = owner_capture_cell_source_ref_arg_program();
     let callee = FunctionId::from_index(0);
     let caller = FunctionId::from_index(1);
     let int = program.function(callee).signature.params[0].ty;
@@ -10474,7 +10474,7 @@ fn profile_accepts_lambda_callee_capture_cell_source_var_arg() {
         },
     );
     let Statement::Eval(RValue::Call { callee, .. }) = &mut function.body.block.stmts[2] else {
-        unreachable!("test helper should end with the source var call")
+        unreachable!("test helper should end with the source ref call")
     };
     *callee = Callee::Lambda(Operand::Place(place(callee_local, lambda_ty)));
 
@@ -10521,7 +10521,7 @@ fn profile_rejects_scoped_borrowed_param_to_native_mut_borrow() {
     let Statement::Eval(RValue::Call { callee, .. }) =
         &mut program.function_mut(body).body.block.stmts[0]
     else {
-        unreachable!("test helper should start with source var call")
+        unreachable!("test helper should start with source ref call")
     };
     *callee = Callee::Extern(ext);
 
@@ -10532,7 +10532,7 @@ fn profile_rejects_scoped_borrowed_param_to_native_mut_borrow() {
 }
 
 #[test]
-fn access_plan_accepts_direct_scalar_dataref_source_var_arg() {
+fn access_plan_accepts_direct_scalar_dataref_source_ref_arg() {
     let program = projected_mut_call_arg_program();
     let classes = TypePassClasses::analyze(&program);
     let function = FunctionId::from_index(1);
@@ -10552,18 +10552,18 @@ fn access_plan_accepts_direct_scalar_dataref_source_var_arg() {
 }
 
 #[test]
-fn profile_accepts_dataref_source_var_arg() {
+fn profile_accepts_dataref_source_ref_arg() {
     check(projected_mut_call_arg_program());
 }
 
 #[test]
-fn profile_accepts_capture_cell_dataref_source_var_arg() {
-    check(capture_cell_dataref_source_var_arg_program());
+fn profile_accepts_capture_cell_dataref_source_ref_arg() {
+    check(capture_cell_dataref_source_ref_arg_program());
 }
 
 #[test]
 fn profile_rejects_capture_cell_to_native_mut_borrow() {
-    let mut program = lambda_capture_cell_source_var_arg_program();
+    let mut program = lambda_capture_cell_source_ref_arg_program();
     let body = FunctionId::from_index(1);
     let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
     let void = program.function(body).signature.return_mode.ty();
@@ -10579,7 +10579,7 @@ fn profile_rejects_capture_cell_to_native_mut_borrow() {
     let Statement::Eval(RValue::Call { callee, .. }) =
         &mut program.function_mut(body).body.block.stmts[0]
     else {
-        unreachable!("test helper should start with the source var call")
+        unreachable!("test helper should start with the source ref call")
     };
     *callee = Callee::Extern(ext);
 
@@ -10621,8 +10621,8 @@ fn plan_temps_capture_cell_call_value_before_cell_set() {
 }
 
 #[test]
-fn plan_lowers_owner_heap_capture_cell_source_var_arg_to_heap_cell() {
-    let program = heap_capture_cell_source_var_arg_program();
+fn plan_lowers_owner_heap_capture_cell_source_ref_arg_to_heap_cell() {
+    let program = heap_capture_cell_source_ref_arg_program();
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -10638,8 +10638,8 @@ fn plan_lowers_owner_heap_capture_cell_source_var_arg_to_heap_cell() {
 }
 
 #[test]
-fn plan_lowers_lambda_heap_capture_cell_source_var_arg_to_heap_cell() {
-    let program = escaping_lambda_capture_cell_source_var_arg_program();
+fn plan_lowers_lambda_heap_capture_cell_source_ref_arg_to_heap_cell() {
+    let program = escaping_lambda_capture_cell_source_ref_arg_program();
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -10655,8 +10655,8 @@ fn plan_lowers_lambda_heap_capture_cell_source_var_arg_to_heap_cell() {
 }
 
 #[test]
-fn plan_lowers_owner_capture_cell_source_var_arg_to_stack_cell() {
-    let program = owner_capture_cell_source_var_arg_program();
+fn plan_lowers_owner_capture_cell_source_ref_arg_to_stack_cell() {
+    let program = owner_capture_cell_source_ref_arg_program();
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -10672,8 +10672,8 @@ fn plan_lowers_owner_capture_cell_source_var_arg_to_stack_cell() {
 }
 
 #[test]
-fn plan_lowers_lambda_capture_cell_source_var_arg_to_stack_cell() {
-    let program = lambda_capture_cell_source_var_arg_program();
+fn plan_lowers_lambda_capture_cell_source_ref_arg_to_stack_cell() {
+    let program = lambda_capture_cell_source_ref_arg_program();
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -10754,7 +10754,7 @@ fn air_rejects_scoped_borrowed_param_projection_before_profile() {
     owner.locals[0].ty = tuple;
     let lambda_body = program.function_mut(FunctionId::from_index(1));
     let Statement::Eval(RValue::Call { args, .. }) = &mut lambda_body.body.block.stmts[0] else {
-        unreachable!("test helper should start with source var call")
+        unreachable!("test helper should start with source ref call")
     };
     args[0] = CallArg::MutBorrow(Place {
         root: PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
@@ -10799,9 +10799,9 @@ fn plan_lowers_scoped_borrow_to_scoped_place_cell() {
 }
 
 #[test]
-fn plan_preserves_var_self_scoped_borrow_source() {
+fn plan_preserves_ref_self_scoped_borrow_source() {
     let mut program = scoped_borrow_lambda_program();
-    program.scoped_borrows[0].source = air::ScopedBorrowSource::VarSelf {
+    program.scoped_borrows[0].source = air::ScopedBorrowSource::RefSelf {
         local: air::LocalId::from_index(0),
     };
     let owner = program.function_mut(FunctionId::from_index(2));
@@ -10813,7 +10813,7 @@ fn plan_preserves_var_self_scoped_borrow_source() {
 
     assert!(matches!(
         &rir.scoped_place_cells[0].source,
-        RirScopedPlaceSource::VarSelf { place }
+        RirScopedPlaceSource::RefSelf { place }
             if place.root_local() == Some(RirLocalId(0)) && place.projections.is_empty()
     ));
 }
@@ -11001,7 +11001,7 @@ fn plan_lowers_owner_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
         .body
         .block
         .stmts
-        .push(source_var_call(
+        .push(source_ref_call(
             callee,
             PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
             int,
@@ -11056,8 +11056,8 @@ fn plan_lowers_lambda_scoped_borrow_write_to_scoped_place_cell_set() {
 }
 
 #[test]
-fn emit_passes_capture_cell_var_arg_as_stack_cell_mut_place() {
-    let source = plan_source(lambda_capture_cell_source_var_arg_program()).into_string();
+fn emit_passes_capture_cell_ref_arg_as_stack_cell_mut_place() {
+    let source = plan_source(lambda_capture_cell_source_ref_arg_program()).into_string();
 
     assert!(source.contains("MutPlace::stack_cell(&"));
     assert!(!source.contains("MutPlace::local(&mut"));
@@ -11065,8 +11065,8 @@ fn emit_passes_capture_cell_var_arg_as_stack_cell_mut_place() {
 }
 
 #[test]
-fn emit_passes_owner_heap_cell_var_arg_as_heap_cell_mut_place() {
-    let source = plan_source(heap_capture_cell_source_var_arg_program()).into_string();
+fn emit_passes_owner_heap_cell_ref_arg_as_heap_cell_mut_place() {
+    let source = plan_source(heap_capture_cell_source_ref_arg_program()).into_string();
 
     assert!(source.contains(&target::mut_place_heap_cell("__cell0")));
     assert!(!source.contains("MutPlace::local(&mut"));
@@ -11079,8 +11079,8 @@ fn emit_passes_owner_heap_cell_var_arg_as_heap_cell_mut_place() {
 }
 
 #[test]
-fn emit_passes_capture_heap_cell_var_arg_as_heap_cell_mut_place() {
-    let source = plan_source(escaping_lambda_capture_cell_source_var_arg_program()).into_string();
+fn emit_passes_capture_heap_cell_ref_arg_as_heap_cell_mut_place() {
+    let source = plan_source(escaping_lambda_capture_cell_source_ref_arg_program()).into_string();
 
     assert!(source.contains(&target::mut_place_heap_cell("v0")));
     assert!(!source.contains("MutPlace::local(&mut"));
@@ -11093,8 +11093,8 @@ fn emit_passes_capture_heap_cell_var_arg_as_heap_cell_mut_place() {
 }
 
 #[test]
-fn emit_reentrant_heap_cell_var_arg_call_is_not_wrapped_in_cell_borrow() {
-    let source = plan_source(heap_capture_cell_reentrant_source_var_arg_program()).into_string();
+fn emit_reentrant_heap_cell_ref_arg_call_is_not_wrapped_in_cell_borrow() {
+    let source = plan_source(heap_capture_cell_reentrant_source_ref_arg_program()).into_string();
 
     assert!(source.contains("apply(rt, types, globals, anvyx_runtime::MutPlace::heap_cell("));
     assert!(!source.contains("rt.heap().with(&v0, |cell| apply"));
@@ -11136,7 +11136,7 @@ fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
         .body
         .block
         .stmts
-        .push(source_var_call(
+        .push(source_ref_call(
             FunctionId::from_index(0),
             PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
             int,
@@ -11244,7 +11244,7 @@ fn plan_lowers_projected_local_to_native_mut_place() {
 }
 
 #[test]
-fn profile_rejects_source_var_param_to_native_mut_borrow() {
+fn profile_rejects_source_ref_param_to_native_mut_borrow() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -15034,8 +15034,8 @@ fn scoped_source_param(local: RirLocalId, ty: RirTypeId) -> RirScopedPlaceSource
     }
 }
 
-fn scoped_source_var_self(local: RirLocalId, ty: RirTypeId) -> RirScopedPlaceSource {
-    RirScopedPlaceSource::VarSelf {
+fn scoped_source_ref_self(local: RirLocalId, ty: RirTypeId) -> RirScopedPlaceSource {
+    RirScopedPlaceSource::RefSelf {
         place: RirMutPlaceArg::from_handle(RirMutPlaceHandle::Param { local, ty }, vec![], ty),
     }
 }
@@ -16912,7 +16912,7 @@ fn projected_mut_call_arg_program() -> Program {
     program
 }
 
-fn capture_cell_dataref_source_var_arg_program() -> Program {
+fn capture_cell_dataref_source_ref_arg_program() -> Program {
     let mut program = projected_mut_call_arg_program();
     let owner = FunctionId::from_index(1);
     let binding = BindingId::from_index(0);
@@ -21245,7 +21245,7 @@ fn scoped_borrow_lambda_program() -> Program {
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let callee = source_var_callee(&mut program, module, int, void);
+    let callee = source_ref_callee(&mut program, module, int, void);
     let body = FunctionId::from_index(1);
     let owner = FunctionId::from_index(2);
     let source = air::LocalId::from_index(0);
@@ -21277,7 +21277,7 @@ fn scoped_borrow_lambda_program() -> Program {
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(
-            vec![source_var_call(
+            vec![source_ref_call(
                 callee,
                 PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
                 int,
@@ -21324,7 +21324,7 @@ fn nested_scoped_borrow_lambda_program() -> Program {
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let callee = source_var_callee(&mut program, module, int, void);
+    let callee = source_ref_callee(&mut program, module, int, void);
     let outer_body = FunctionId::from_index(1);
     let inner_body = FunctionId::from_index(2);
     let owner = FunctionId::from_index(3);
@@ -21396,7 +21396,7 @@ fn nested_scoped_borrow_lambda_program() -> Program {
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(
-            vec![source_var_call(
+            vec![source_ref_call(
                 callee,
                 PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
                 int,
@@ -21578,14 +21578,14 @@ fn capture_cell_lambda_program(escape: LambdaEscape) -> Program {
     program
 }
 
-fn heap_capture_cell_source_var_arg_program() -> Program {
+fn heap_capture_cell_source_ref_arg_program() -> Program {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
     let lambda_ty = program.alloc_type(TypeData::Function(sig.clone()));
     let module = program.alloc_module(root_module());
-    let callee = source_var_callee(&mut program, module, int, void);
+    let callee = source_ref_callee(&mut program, module, int, void);
     let binding = BindingId::from_index(0);
     let source_local = air::LocalId::from_index(0);
     let lambda_local = air::LocalId::from_index(1);
@@ -21644,7 +21644,7 @@ fn heap_capture_cell_source_var_arg_program() -> Program {
                         ty: lambda_ty,
                     },
                 },
-                source_var_call(callee, PlaceRoot::CaptureCell(cell), int),
+                source_ref_call(callee, PlaceRoot::CaptureCell(cell), int),
             ],
             air::AirTail::Return(None),
         ),
@@ -21776,24 +21776,24 @@ fn capture_cell_projected_assignment_program(in_lambda: bool, escape: LambdaEsca
     program
 }
 
-fn owner_capture_cell_source_var_arg_program() -> Program {
-    capture_cell_source_var_arg_program(false, LambdaEscape::NonEscaping)
+fn owner_capture_cell_source_ref_arg_program() -> Program {
+    capture_cell_source_ref_arg_program(false, LambdaEscape::NonEscaping)
 }
 
-fn lambda_capture_cell_source_var_arg_program() -> Program {
-    capture_cell_source_var_arg_program(true, LambdaEscape::NonEscaping)
+fn lambda_capture_cell_source_ref_arg_program() -> Program {
+    capture_cell_source_ref_arg_program(true, LambdaEscape::NonEscaping)
 }
 
-fn escaping_lambda_capture_cell_source_var_arg_program() -> Program {
-    capture_cell_source_var_arg_program(true, LambdaEscape::Escaping)
+fn escaping_lambda_capture_cell_source_ref_arg_program() -> Program {
+    capture_cell_source_ref_arg_program(true, LambdaEscape::Escaping)
 }
 
-fn capture_cell_source_var_arg_program(in_lambda: bool, escape: LambdaEscape) -> Program {
+fn capture_cell_source_ref_arg_program(in_lambda: bool, escape: LambdaEscape) -> Program {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let callee = source_var_callee(&mut program, module, int, void);
+    let callee = source_ref_callee(&mut program, module, int, void);
     let binding = BindingId::from_index(0);
     let source_local = air::LocalId::from_index(0);
 
@@ -21812,7 +21812,7 @@ fn capture_cell_source_var_arg_program(in_lambda: bool, escape: LambdaEscape) ->
             body: structured_body(
                 vec![
                     init,
-                    source_var_call(callee, PlaceRoot::CaptureCell(cell), int),
+                    source_ref_call(callee, PlaceRoot::CaptureCell(cell), int),
                 ],
                 air::AirTail::Return(None),
             ),
@@ -21857,7 +21857,7 @@ fn capture_cell_source_var_arg_program(in_lambda: bool, escape: LambdaEscape) ->
         signature: Signature::new(vec![], void),
         locals: vec![],
         body: structured_body(
-            vec![source_var_call(
+            vec![source_ref_call(
                 callee,
                 PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
                 int,
@@ -21902,7 +21902,7 @@ fn capture_cell_source_var_arg_program(in_lambda: bool, escape: LambdaEscape) ->
     program
 }
 
-fn heap_capture_cell_reentrant_source_var_arg_program() -> Program {
+fn heap_capture_cell_reentrant_source_ref_arg_program() -> Program {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let void = program.alloc_type(TypeData::Void);
@@ -22148,7 +22148,7 @@ fn heap_cell_set_from_mut_place_param_program() -> Program {
     program
 }
 
-fn source_var_callee(
+fn source_ref_callee(
     program: &mut Program,
     module: air::ModuleId,
     int: air::TypeId,
@@ -22242,7 +22242,7 @@ fn projected_tuple_place(root: PlaceRoot, ty: air::TypeId) -> Place {
     }
 }
 
-fn source_var_call(callee: FunctionId, root: PlaceRoot, ty: air::TypeId) -> Statement {
+fn source_ref_call(callee: FunctionId, root: PlaceRoot, ty: air::TypeId) -> Statement {
     Statement::Eval(RValue::Call {
         callee: Callee::Function(callee),
         args: vec![CallArg::MutBorrow(root_place(root, ty))],

@@ -1276,7 +1276,7 @@ impl ProfileCx<'_> {
             borrow.owner == function
                 && match &borrow.source {
                     air::ScopedBorrowSource::SourceMutParam { local: source }
-                    | air::ScopedBorrowSource::VarSelf { local: source } => *source == local,
+                    | air::ScopedBorrowSource::RefSelf { local: source } => *source == local,
                     air::ScopedBorrowSource::PatternAlias { source } => {
                         source.root.local() == Some(local)
                     }
@@ -1318,7 +1318,7 @@ impl ProfileCx<'_> {
         }
         match &decl.source {
             air::ScopedBorrowSource::SourceMutParam { local }
-            | air::ScopedBorrowSource::VarSelf { local } => {
+            | air::ScopedBorrowSource::RefSelf { local } => {
                 if !self.function_local_is_source_mut_place_param(decl.owner, *local) {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                 }
