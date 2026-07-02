@@ -37,6 +37,7 @@ impl RustBackendProfile {
             program,
             native_providers,
             classes: TypePassClasses::analyze(program),
+            retained_callbacks: native_call::air_has_retained_callbacks(program),
             errors: vec![],
         };
         cx.check();
@@ -112,6 +113,7 @@ struct ProfileCx<'a> {
     program: &'a Program,
     native_providers: &'a [RustProviderSupport],
     classes: TypePassClasses,
+    retained_callbacks: bool,
     errors: Vec<RustBackendProfileError>,
 }
 
@@ -604,7 +606,7 @@ impl ProfileCx<'_> {
                 for (index, arg) in args.iter().enumerate() {
                     self.check_call_arg(site, arg, expected.get(index).copied());
                     if native_plan.as_ref().is_some_and(|plan| {
-                        plan.rejects_reentry_arg(index, arg, self.call_arg_is_string(arg))
+                        plan.rejects_reentry_arg(index, self.call_arg_native_facts(arg))
                     }) {
                         self.push(site, ProfileErrorKind::UnsupportedCallArgMode);
                     }
@@ -1049,28 +1051,30 @@ impl ProfileCx<'_> {
         };
         native::resolve_extern(self.native_providers, self.program.extern_decl(*id))
             .ok()
-            .map(|native| {
-                native_call::NativeCallPlan::new(
-                    native.params,
-                    native_call::air_has_retained_callbacks(self.program),
-                )
-            })
+            .map(|native| native_call::NativeCallPlan::new(native.params, self.retained_callbacks))
     }
 
-    fn call_arg_is_string(&self, arg: &CallArg) -> bool {
-        match arg {
-            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
-                matches!(self.program.type_arena.data(place.ty), TypeData::String)
-            }
-            CallArg::SharedStringConst(_) => true,
+    fn call_arg_native_facts(&self, arg: &CallArg) -> native_call::NativeArgFacts {
+        let ty = match arg {
+            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
             CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                matches!(
-                    self.program.type_arena.data(self.operand_ty(operand)),
-                    TypeData::String
-                )
+                Some(self.operand_ty(operand))
             }
-            CallArg::InitFieldOmitted => false,
-        }
+            CallArg::SharedStringConst(_) | CallArg::InitFieldOmitted => None,
+        };
+        native_call::NativeArgFacts::air(
+            arg,
+            ty.is_some_and(|ty| matches!(self.program.type_arena.data(ty), TypeData::String))
+                || matches!(arg, CallArg::SharedStringConst(_)),
+            ty.is_some_and(|ty| self.ty_is_native_ref(ty)),
+        )
+    }
+
+    fn ty_is_native_ref(&self, ty: TypeId) -> bool {
+        matches!(
+            self.program.type_arena.data(ty),
+            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared
+        )
     }
 
     fn check_call_arg(

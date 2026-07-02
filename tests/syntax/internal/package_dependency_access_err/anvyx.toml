@@ -1,0 +1,6 @@
+[project]
+name = "internal_dependency_game"
+entry = "src/main.anv"
+
+[dependencies]
+dep = { path = "dep" }

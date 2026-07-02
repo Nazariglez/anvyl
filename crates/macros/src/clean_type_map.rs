@@ -3,7 +3,7 @@ use anvyx_externs::{
     ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr,
 };
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::{
     GenericArgument, Ident, PathArguments, ReturnType, Signature, Token, Type, TypePath, bracketed,
     parse::{ParseStream, Parser},
@@ -1082,8 +1082,32 @@ pub fn has_callback_wrapper(params: &[CleanParam]) -> bool {
         .any(|param| matches!(param.ty, CleanType::Callback(_)))
 }
 
-pub fn callback_wrapper_has_visible_borrow(params: &[CleanParam]) -> bool {
-    has_callback_wrapper(params) && params.iter().any(|param| param.flow != CleanFlow::Value)
+pub fn validate_callback_wrapper_precheck(
+    error_target: &impl ToTokens,
+    params: &[CleanParam],
+    has_receiver: bool,
+) -> syn::Result<bool> {
+    let has_callback = has_callback_wrapper(params);
+    if !has_callback {
+        return Ok(false);
+    }
+    if has_receiver
+        && params
+            .iter()
+            .any(|param| matches!(param.abi, CleanParamAbi::ScopedLambda(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            error_target,
+            "scoped callback wrapper parameters cannot be combined with method receivers",
+        ));
+    }
+    if params.iter().any(|param| param.flow != CleanFlow::Value) {
+        return Err(syn::Error::new_spanned(
+            error_target,
+            "callback wrapper parameters cannot be combined with borrowed or mutable-place provider parameters",
+        ));
+    }
+    Ok(true)
 }
 
 pub fn merge_conversions(

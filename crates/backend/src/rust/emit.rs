@@ -17,7 +17,7 @@ use super::{
         RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
         RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirTupleId,
         RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
-        native_return_ty_is_resource, stmt_child_blocks_any,
+        native_arg_facts, native_ty_is_resource_ref, stmt_child_blocks_any,
     },
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
@@ -3566,12 +3566,7 @@ impl EmitCx<'_> {
                 continue;
             };
             let boundary = native_plan.map_or(NativeArgBoundary::Direct, |plan| {
-                plan.rir_arg_boundary(
-                    index,
-                    arg,
-                    matches!(self.program.types[ty.index()], RirType::String),
-                    self.native_arg_is_native_ref(*ty),
-                )
+                plan.arg_boundary(index, native_arg_facts(self.program, *ty, arg))
             });
             if boundary == NativeArgBoundary::SnapshotString {
                 let tmp = format!("__anv_native_arg_{index}");
@@ -3613,13 +3608,6 @@ impl EmitCx<'_> {
         } else {
             format!("{{ {} {call} }}", prelude.join(" "))
         }
-    }
-
-    fn native_arg_is_native_ref(&self, ty: RirTypeId) -> bool {
-        matches!(
-            self.program.types[ty.index()],
-            RirType::Struct(id) if self.program.structs[id.index()].native_ref
-        )
     }
 
     fn native_array_map_expr(expr: &str, body: &str) -> String {
@@ -4476,7 +4464,7 @@ impl EmitCx<'_> {
         abi: &anvyx_runtime::ExternTypeExpr,
         expr: &str,
     ) -> String {
-        if native_return_ty_is_resource(self.program, ret) {
+        if native_ty_is_resource_ref(self.program, ret) {
             self.native_ref_adopt_return(ret, expr)
         } else {
             self.native_value_return_expr(ret, abi, expr)

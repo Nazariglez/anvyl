@@ -50,6 +50,51 @@ pub(super) enum NativeArgBoundary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeArgMode {
+    Direct,
+    SharedBorrow,
+    MutBorrow,
+    Omitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NativeArgFacts {
+    mode: NativeArgMode,
+    string: bool,
+    native_ref: bool,
+}
+
+impl NativeArgFacts {
+    pub(super) fn air(arg: &CallArg, string: bool, native_ref: bool) -> Self {
+        let mode = match arg {
+            CallArg::SharedBorrow(_) => NativeArgMode::SharedBorrow,
+            CallArg::MutBorrow(_) => NativeArgMode::MutBorrow,
+            CallArg::InitFieldOmitted => NativeArgMode::Omitted,
+            _ => NativeArgMode::Direct,
+        };
+        Self {
+            mode,
+            string,
+            native_ref,
+        }
+    }
+
+    pub(super) fn rir(arg: &RirCallArg, string: bool, native_ref: bool) -> Self {
+        let mode = match arg {
+            RirCallArg::SharedBorrow(_) => NativeArgMode::SharedBorrow,
+            RirCallArg::MutBorrow(_) => NativeArgMode::MutBorrow,
+            RirCallArg::InitFieldOmitted => NativeArgMode::Omitted,
+            _ => NativeArgMode::Direct,
+        };
+        Self {
+            mode,
+            string,
+            native_ref,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeReentryPolicy {
     Safe,
     SnapshotStringBorrow,
@@ -81,48 +126,19 @@ impl NativeCallPlan {
         self.params.iter().map(|param| param.semantic).collect()
     }
 
-    pub(super) fn rejects_reentry_arg(
-        &self,
-        index: usize,
-        arg: &CallArg,
-        arg_is_string: bool,
-    ) -> bool {
+    pub(super) fn rejects_reentry_arg(&self, index: usize, facts: NativeArgFacts) -> bool {
         self.provider_entry.suspends_runtime_entry()
             && self
                 .params
                 .get(index)
-                .is_some_and(|param| param.rejects_reentry_arg(arg, arg_is_string))
+                .is_some_and(|param| param.rejects_reentry_arg(facts))
     }
 
-    pub(super) fn rejects_reentry_rir_arg(
-        &self,
-        index: usize,
-        arg: &RirCallArg,
-        arg_is_string: bool,
-    ) -> bool {
-        self.provider_entry.suspends_runtime_entry()
-            && self
-                .params
-                .get(index)
-                .is_some_and(|param| param.rejects_reentry_rir_arg(arg, arg_is_string))
-    }
-
-    pub(super) fn rir_arg_boundary(
-        &self,
-        index: usize,
-        arg: &RirCallArg,
-        arg_is_string: bool,
-        arg_is_native_ref: bool,
-    ) -> NativeArgBoundary {
+    pub(super) fn arg_boundary(&self, index: usize, facts: NativeArgFacts) -> NativeArgBoundary {
         self.params
             .get(index)
             .map_or(NativeArgBoundary::Direct, |param| {
-                param.rir_arg_boundary(
-                    self.provider_entry.suspends_runtime_entry(),
-                    arg,
-                    arg_is_string,
-                    arg_is_native_ref,
-                )
+                param.arg_boundary(self.provider_entry.suspends_runtime_entry(), facts)
             })
     }
 
@@ -166,54 +182,40 @@ impl NativeParamAbi {
         param.semantic == self.semantic && param.abi == self.abi && param.escape == self.escape
     }
 
-    fn rejects_reentry_arg(self, arg: &CallArg, arg_is_string: bool) -> bool {
-        self.rejects_reentry_arg_shape(
-            matches!(arg, CallArg::SharedBorrow(_)),
-            matches!(arg, CallArg::InitFieldOmitted),
-            arg_is_string,
-        )
-    }
-
-    fn rejects_reentry_rir_arg(self, arg: &RirCallArg, arg_is_string: bool) -> bool {
-        self.rejects_reentry_arg_shape(
-            matches!(arg, RirCallArg::SharedBorrow(_)),
-            matches!(arg, RirCallArg::InitFieldOmitted),
-            arg_is_string,
-        )
-    }
-
-    fn rejects_reentry_arg_shape(
-        self,
-        shared_borrow: bool,
-        omitted: bool,
-        arg_is_string: bool,
-    ) -> bool {
-        match self.reentry {
-            NativeReentryPolicy::Safe => false,
-            NativeReentryPolicy::SnapshotStringBorrow => shared_borrow && !arg_is_string,
-            NativeReentryPolicy::UnsupportedLiveBoundary => !omitted,
+    fn rejects_reentry_arg(self, facts: NativeArgFacts) -> bool {
+        match self.arg_boundary(true, facts) {
+            NativeArgBoundary::SnapshotString | NativeArgBoundary::NativeRefBorrow { .. } => false,
+            NativeArgBoundary::Direct => match self.reentry {
+                NativeReentryPolicy::Safe => false,
+                NativeReentryPolicy::SnapshotStringBorrow => {
+                    facts.mode == NativeArgMode::SharedBorrow && !facts.string
+                }
+                NativeReentryPolicy::UnsupportedLiveBoundary => {
+                    facts.mode != NativeArgMode::Omitted
+                }
+            },
         }
     }
 
-    fn rir_arg_boundary(
+    fn arg_boundary(
         self,
         suspends_runtime_entry: bool,
-        arg: &RirCallArg,
-        arg_is_string: bool,
-        arg_is_native_ref: bool,
+        facts: NativeArgFacts,
     ) -> NativeArgBoundary {
         if suspends_runtime_entry
             && self.reentry == NativeReentryPolicy::SnapshotStringBorrow
-            && arg_is_string
-            && matches!(arg, RirCallArg::SharedBorrow(_))
+            && facts.string
+            && facts.mode == NativeArgMode::SharedBorrow
         {
             return NativeArgBoundary::SnapshotString;
         }
-        match (self.abi, arg_is_native_ref) {
-            (RirParamAbi::SharedBorrow, true) => {
+        match (self.abi, facts.native_ref) {
+            (RirParamAbi::SharedBorrow, true) if facts.mode == NativeArgMode::SharedBorrow => {
                 NativeArgBoundary::NativeRefBorrow { mutable: false }
             }
-            (RirParamAbi::MutBorrow, true) => NativeArgBoundary::NativeRefBorrow { mutable: true },
+            (RirParamAbi::MutBorrow, true) if facts.mode == NativeArgMode::MutBorrow => {
+                NativeArgBoundary::NativeRefBorrow { mutable: true }
+            }
             _ => NativeArgBoundary::Direct,
         }
     }

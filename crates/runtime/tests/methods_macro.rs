@@ -26,7 +26,9 @@ impl DerivedVec2 {
     }
 }
 
-struct CallbackOps;
+struct CallbackOps {
+    id: i64,
+}
 
 #[methods]
 impl CallbackOps {
@@ -38,6 +40,11 @@ impl CallbackOps {
 
     pub fn retain(f: EscapingLambda<(i64,), ()>) {
         drop(f);
+    }
+
+    pub fn retain_on_self(&self, f: EscapingLambda<(i64,), ()>) -> i64 {
+        drop(f);
+        self.id
     }
 }
 
@@ -317,6 +324,35 @@ fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
     assert_eq!(callback.policy.escape, CallbackEscape::Escaping);
     assert!(matches!(
         binding.abi.params[0],
+        RustParamAbi::EscapingLambda(_)
+    ));
+    assert_eq!(binding.abi.support, RustAbiSupport::NeedsWrapperConversion);
+    assert_eq!(binding.abi.ctx, RustWrapperCtx::None);
+}
+
+#[test]
+fn escaping_lambda_method_receiver_uses_escaping_callback_descriptor() {
+    let export = __anvyx_methods_callbackops();
+    let method = export
+        .descriptor
+        .methods
+        .iter()
+        .find(|method| method.name == "retain_on_self")
+        .unwrap();
+    let ExternTypeExpr::Callback(callback) = &method.signature.params[0].ty else {
+        panic!("expected callback descriptor");
+    };
+    let binding = export
+        .bindings
+        .iter()
+        .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "retain_on_self"))
+        .unwrap();
+
+    assert_eq!(method.signature.params[0].escape, CallbackEscape::Escaping);
+    assert_eq!(callback.policy.escape, CallbackEscape::Escaping);
+    assert!(matches!(binding.abi.params[0], RustParamAbi::Borrow(_)));
+    assert!(matches!(
+        binding.abi.params[1],
         RustParamAbi::EscapingLambda(_)
     ));
     assert_eq!(binding.abi.support, RustAbiSupport::NeedsWrapperConversion);

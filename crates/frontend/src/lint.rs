@@ -79,7 +79,7 @@ const IMPLEMENTED: &[LintInfo] = &[
         name: "internal_access",
         default: LintLevel::Warn,
         group: "api",
-        description: "cross-module access to @internal members",
+        description: "outside-package access to @internal members",
     },
     LintInfo {
         id: LintId::Deprecated,

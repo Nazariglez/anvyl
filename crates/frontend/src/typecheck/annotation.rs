@@ -325,7 +325,7 @@ pub(super) fn emit_access_policy(
         out.lint_events.push(event);
     }
 
-    if !policy.has_internal() || origin == out.current_module {
+    if !policy.has_internal() || origin.can_access_internal_from(out.current_module) {
         return;
     }
 

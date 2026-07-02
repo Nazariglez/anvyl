@@ -167,8 +167,55 @@ fn native_plan_rejects_retained_slice_reentry_arg() {
     );
     let plan = native_call::NativeCallPlan::for_abi(&abi, true);
     let arg = RirCallArg::Value(RirOperand::Const(RirConstId::from_index(0)));
+    let facts = native_call::NativeArgFacts::rir(&arg, false, false);
 
-    assert!(plan.rejects_reentry_rir_arg(0, &arg, false));
+    assert!(plan.rejects_reentry_arg(0, facts));
+}
+
+#[test]
+fn native_plan_rejects_retained_non_string_snapshot_borrow_reentry_arg() {
+    let abi = direct_rust_abi(
+        vec![anvyx_runtime::RustParamAbi::Borrow(
+            anvyx_runtime::ExternTypeExpr::String,
+        )],
+        anvyx_runtime::RustReturnAbi::Void,
+    );
+    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
+    let arg = RirCallArg::SharedBorrow(RirPlace::local(
+        RirLocalId::from_index(0),
+        vec![],
+        RirTypeId::from_index(0),
+    ));
+    let facts = native_call::NativeArgFacts::rir(&arg, false, false);
+
+    assert!(plan.rejects_reentry_arg(0, facts));
+}
+
+#[test]
+fn native_plan_allows_retained_native_ref_borrow_reentry_arg() {
+    let abi = direct_rust_abi(
+        vec![anvyx_runtime::RustParamAbi::Borrow(
+            anvyx_runtime::ExternTypeExpr::Named {
+                module: Some(anvyx_runtime::ModulePath { segments: vec![] }),
+                name: "Counter".into(),
+                args: vec![],
+            },
+        )],
+        anvyx_runtime::RustReturnAbi::Void,
+    );
+    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
+    let arg = RirCallArg::SharedBorrow(RirPlace::local(
+        RirLocalId::from_index(0),
+        vec![],
+        RirTypeId::from_index(0),
+    ));
+    let facts = native_call::NativeArgFacts::rir(&arg, false, true);
+
+    assert!(!plan.rejects_reentry_arg(0, facts));
+    assert_eq!(
+        plan.arg_boundary(0, facts),
+        native_call::NativeArgBoundary::NativeRefBorrow { mutable: false }
+    );
 }
 
 fn retained_callback_string_borrow_rir() -> RirProgram {
@@ -328,7 +375,7 @@ fn native_scoped_lambda_provider_abi_rejects_visible_borrows() {
         ctx: anvyx_runtime::RustWrapperCtx::None,
     };
 
-    assert!(!rir::rust_extern_abi_supported(&abi));
+    assert!(!rir::rust_extern_abi_supported_with_receiver(&abi, None));
 }
 
 #[test]
@@ -361,7 +408,7 @@ fn native_direct_provider_abi_accepts_canonical_collection_carriers() {
             ctx: RustWrapperCtx::HiddenRuntime,
         };
 
-        assert!(rir::rust_extern_abi_supported(&abi));
+        assert!(rir::rust_extern_abi_supported_with_receiver(&abi, None));
     }
 }
 
@@ -398,7 +445,7 @@ fn native_direct_provider_abi_rejects_mutable_collections_and_ctxless_mut_place(
             ctx,
         };
 
-        assert!(!rir::rust_extern_abi_supported(&abi));
+        assert!(!rir::rust_extern_abi_supported_with_receiver(&abi, None));
     }
 }
 
@@ -455,43 +502,16 @@ fn plan_rejects_non_escaping_lambda_for_escaping_native_callback() {
 }
 
 #[test]
-fn emit_native_escaping_lambda_adds_registry_scaffolding() {
+fn emit_native_escaping_lambda_stays_single_threaded() {
     let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_escaping_lambda_plan_config()).expect("plan failed");
     let source = emit::emit(&plan.verified()).into_string();
 
-    assert!(source.contains("struct AnvCallbackRegistry<'cx>"));
-    assert!(source.contains("struct CallbackRecordSig0<'cx>"));
-    assert!(source.contains("lambda: LambdaSig0"));
-    assert!(source.contains("callbacks: AnvCallbackRegistry<'cx>"));
-    assert!(source.contains("callback_record_sig0: heap.register_"));
-    assert!(source.contains("fn __anv_callback_call_sig0"));
-    assert!(source.contains("fn __anv_callback_close_sig0"));
-    assert!(source.contains("key.__anvyx_check_identity"));
-    assert!(source.contains("slot.begin_invocation(owner, key)?"));
-    assert!(!source.contains("__anv_callback_finish"));
     assert!(source.contains("anvyx_runtime::EscapingLambda::<(i64,), i64>"));
     assert!(!source.contains("Box<dyn Fn"));
     assert!(!source.contains("Arc<Mutex"));
     assert!(!source.contains("thread_local!"));
-    let provider_call = source
-        .lines()
-        .find(|line| line.contains("host::host::apply"))
-        .expect("provider call");
-    assert!(provider_call.contains("EscapingLambda"));
-    assert!(!provider_call.contains("RootId"));
-}
-
-#[test]
-fn emit_without_native_escaping_lambda_omits_registry_scaffolding() {
-    let program = native_scoped_lambda_air_with(NativeLambdaArgKind::FunctionRef);
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
-    let source = emit::emit(&plan.verified()).into_string();
-
-    assert!(!source.contains("AnvCallbackRegistry"));
-    assert!(!source.contains("CallbackRecordSig"));
 }
 
 #[test]
@@ -552,6 +572,43 @@ fn native_escaping_lambda_provider_arg_compiles() {
 
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
+}
+
+#[test]
+fn rir_rejects_forged_callback_receiver_without_native_ref() {
+    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let mut program = plan(&verified, host_escaping_lambda_plan_config())
+        .expect("plan failed")
+        .verified()
+        .program()
+        .clone();
+    let int = program
+        .types
+        .iter()
+        .position(|ty| *ty == RirType::Int)
+        .map(RirTypeId::from_index)
+        .expect("int type");
+    let extern_id = RirExternId::from_index(0);
+    let ext = &mut program.externs[extern_id.index()];
+    let RirExternKind::Native(native) = &mut ext.kind;
+    native.callback_receiver = Some(0);
+    native.abi.params.insert(
+        0,
+        anvyx_runtime::RustParamAbi::Borrow(anvyx_runtime::ExternTypeExpr::Int),
+    );
+    ext.params.insert(
+        0,
+        RirExternParam {
+            ty: int,
+            semantic: RirParamSemantic::SharedBorrow,
+            abi: RirParamAbi::SharedBorrow,
+            escape: RirParamEscape::NonEscaping,
+        },
+    );
+    ext.abi.params.insert(0, anvyx_runtime::ExternTypeExpr::Int);
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]

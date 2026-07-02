@@ -1,4 +1,4 @@
-error: callback wrapper parameters cannot be combined with method receivers
+error: scoped callback wrapper parameters cannot be combined with method receivers
   --> tests/ui/methods/scoped_lambda_receiver.rs:7:9
    |
  7 |       pub fn bad(

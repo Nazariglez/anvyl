@@ -1,0 +1,3 @@
+[project]
+name = "internal_same_package"
+entry = "src/main.anv"

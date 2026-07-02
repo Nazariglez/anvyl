@@ -9,11 +9,11 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    BoundaryConversion, callback_wrapper_has_visible_borrow, classify_param,
-    classify_provider_return, conversion_tokens, flow_tokens, has_callback_wrapper,
+    BoundaryConversion, classify_param, classify_provider_return, conversion_tokens, flow_tokens,
     param_abi_for_override, param_abi_tokens, param_escape_tokens, return_abi_for_override,
     return_abi_tokens, signature_conversion, type_expr_tokens, type_with_override,
-    validate_callable_signature, validate_ctx_param, validate_mut_place_ctx,
+    validate_callable_signature, validate_callback_wrapper_precheck, validate_ctx_param,
+    validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -132,7 +132,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .copied()
         .map(|param| classify_param(param, args.ctx))
         .collect::<syn::Result<Vec<_>>>()?;
-    let callback_wrapper = has_callback_wrapper(&params);
+    let callback_wrapper = validate_callback_wrapper_precheck(&func.sig, &params, false)?;
     if let Some(ctx) = ctx_input {
         validate_mut_place_ctx(&func.sig, ctx, &params, "#[function(ctx)]")?;
         if callback_wrapper {
@@ -141,12 +141,6 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                 "#[function(ctx)] cannot be combined with callback wrapper parameters",
             ));
         }
-    }
-    if callback_wrapper_has_visible_borrow(&params) {
-        return Err(syn::Error::new_spanned(
-            &func.sig,
-            "callback wrapper parameters cannot be combined with borrowed or mutable-place provider parameters",
-        ));
     }
     validate_overrides(&args, &params)?;
     let ret = classify_provider_return(&func.sig.output)?;

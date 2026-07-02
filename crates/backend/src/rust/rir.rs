@@ -1348,11 +1348,21 @@ pub enum RirExternKind {
 pub struct RirNativeExtern {
     pub path: Vec<String>,
     pub abi: RustExternAbi,
+    pub callback_receiver: Option<usize>,
 }
 
 impl RirNativeExtern {
     pub(super) fn new(path: Vec<String>, abi: RustExternAbi) -> Self {
-        Self { path, abi }
+        Self {
+            path,
+            abi,
+            callback_receiver: None,
+        }
+    }
+
+    pub(super) fn with_callback_receiver(mut self, receiver: Option<usize>) -> Self {
+        self.callback_receiver = receiver;
+        self
     }
 
     pub(super) fn call_plan(&self, retained_callbacks: bool) -> native_call::NativeCallPlan {
@@ -2045,13 +2055,14 @@ fn native_extern_signature_ok(
 ) -> bool {
     !native.path.is_empty()
         && native.path.iter().all(|segment| !segment.is_empty())
-        && rust_extern_abi_supported(&native.abi)
+        && rust_extern_abi_supported_with_receiver(&native.abi, native.callback_receiver)
         && native.abi.params.len() == ext.params.len()
         && ext.abi.params.len() == ext.params.len()
         && native::rust_abi_matches_air(&native.abi.params, &native.abi.ret, &ext.abi)
         && native
             .call_plan(program.has_retained_callbacks())
             .matches_signature(&ext.params)
+        && native_callback_receiver_ok(program, native, ext)
         && native_hidden_ctx_borrows_ok(program, &native.abi, ext)
         && ext
             .abi
@@ -2062,6 +2073,28 @@ fn native_extern_signature_ok(
         && extern_return_abi_ok(program, &ext.abi.ret, ext.ret, void)
 }
 
+fn native_callback_receiver_ok(
+    program: &RirProgram,
+    native: &RirNativeExtern,
+    ext: &RirExtern,
+) -> bool {
+    if !native.abi.has_callback_wrapper() {
+        return true;
+    }
+    let Some(receiver) = native.callback_receiver else {
+        return true;
+    };
+    native
+        .abi
+        .params
+        .get(receiver)
+        .is_some_and(|param| matches!(param, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_)))
+        && ext
+            .params
+            .get(receiver)
+            .is_some_and(|param| native_ty_is_resource_ref(program, param.ty))
+}
+
 fn native_hidden_ctx_borrows_ok(
     program: &RirProgram,
     abi: &RustExternAbi,
@@ -2070,21 +2103,23 @@ fn native_hidden_ctx_borrows_ok(
     !native_call::NativeHiddenCtxPlan::from_abi(abi.ctx).borrows_runtime()
         || abi.params.iter().zip(&ext.params).all(|(abi, param)| {
             !matches!(abi, RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_))
-                || !matches!(
-                    program.types[param.ty.index()],
-                    RirType::Struct(id) if program.structs[id.index()].native_ref
-                )
+                || !native_ty_is_resource_ref(program, param.ty)
         })
 }
 
-pub(super) fn rust_extern_abi_supported(abi: &RustExternAbi) -> bool {
+pub(super) fn rust_extern_abi_supported_with_receiver(
+    abi: &RustExternAbi,
+    receiver: Option<usize>,
+) -> bool {
     match abi.support {
         anvyx_runtime::RustAbiSupport::Direct => {
             abi.backend_supported()
                 && abi.params.iter().all(rust_param_supported)
                 && rust_return_supported(&abi.ret)
         }
-        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => abi.supported_callback_wrapper(),
+        anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
+            abi.supported_callback_wrapper_with_receiver(receiver)
+        }
         anvyx_runtime::RustAbiSupport::Unsupported => false,
     }
 }
@@ -2123,7 +2158,7 @@ pub(super) fn native_return_adopts_resource(
     abi: &anvyx_runtime::RustReturnAbi,
 ) -> bool {
     match abi {
-        anvyx_runtime::RustReturnAbi::OwnedNamed(_) => native_return_ty_is_resource(program, ret),
+        anvyx_runtime::RustReturnAbi::OwnedNamed(_) => native_ty_is_resource_ref(program, ret),
         anvyx_runtime::RustReturnAbi::Option(inner) => {
             let RirType::Option(inner_ty) = program.types[ret.index()] else {
                 return false;
@@ -2145,7 +2180,19 @@ pub(super) fn native_return_adopts_resource(
     }
 }
 
-pub(super) fn native_return_ty_is_resource(program: &RirProgram, ty: RirTypeId) -> bool {
+pub(super) fn native_arg_facts(
+    program: &RirProgram,
+    ty: RirTypeId,
+    arg: &RirCallArg,
+) -> native_call::NativeArgFacts {
+    native_call::NativeArgFacts::rir(
+        arg,
+        matches!(program.types[ty.index()], RirType::String),
+        native_ty_is_resource_ref(program, ty),
+    )
+}
+
+pub(super) fn native_ty_is_resource_ref(program: &RirProgram, ty: RirTypeId) -> bool {
     matches!(
         program.types[ty.index()],
         RirType::Struct(id) if program.structs[id.index()].native_ref
@@ -6331,11 +6378,9 @@ impl VerifyCx<'_> {
             {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
-            let arg_is_string = matches!(self.ty(ty), Some(RirType::String));
-            if native_plan
-                .as_ref()
-                .is_some_and(|plan| plan.rejects_reentry_rir_arg(index, arg, arg_is_string))
-            {
+            if native_plan.as_ref().is_some_and(|plan| {
+                plan.rejects_reentry_arg(index, native_arg_facts(self.program, ty, arg))
+            }) {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
             }
             if RustRepPolicy::new(self.program).call_arg_abi(ty, arg.semantic()) != Some(abi) {

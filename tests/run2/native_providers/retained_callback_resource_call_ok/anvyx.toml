@@ -1,0 +1,6 @@
+[project]
+name = "retained_callback_resource_call"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

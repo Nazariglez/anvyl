@@ -1,0 +1,6 @@
+[project]
+name = "native_method_escaping_callback"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

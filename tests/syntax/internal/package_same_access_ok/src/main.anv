@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+// @lint: internal_access=error
+
+import detail { item };
+
+fn main() {
+    let i = item();
+    println(i.cache);
+    println(i.raw());
+}

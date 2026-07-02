@@ -247,7 +247,10 @@ callback ABI leaves (`bool`, `i64`, `f64`); `Ret` may also be `()`. Call it
 synchronously and return or handle `RuntimeError`; do not store it. Return
 `RuntimeResult<T>` when callback failure should be hidden runtime failure.
 `ScopedLambda` cannot be combined with `#[function(ctx)]`, method receivers,
-borrowed params or mutable provider params in this slice.
+borrowed params, or mutable provider params in this slice. Instance methods on
+`AnvyxRef` resources may accept `EscapingLambda<Args, Ret>` for retained event
+callbacks; store or replace the callback and invoke it later only after any
+receiver/resource borrow has ended.
 
 ```rust
 use anvyx_runtime::{function, RuntimeResult, ScopedLambda};

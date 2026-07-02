@@ -1,0 +1,10 @@
+// @helper
+
+pub struct Item {
+    name: string,
+    @internal cache: int,
+}
+
+pub fn item() -> Item {
+    Item { name: "item", cache: 7 }
+}

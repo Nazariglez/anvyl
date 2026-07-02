@@ -63,6 +63,13 @@ impl ModuleScope {
         Self::Package(module.clone())
     }
 
+    pub(crate) fn can_access_internal_from(&self, current: &ModuleScope) -> bool {
+        self == current
+            || matches!((self, current), (Self::Package(origin), Self::Package(current))
+                if origin.package_context().is_some()
+                    && origin.package_context() == current.package_context())
+    }
+
     pub(crate) fn nominal_origin(&self) -> Option<ModuleOrigin> {
         match self {
             ModuleScope::Root => None,
@@ -4830,6 +4837,35 @@ mod tests {
             kind,
             name: ident(name),
         }
+    }
+
+    #[test]
+    fn internal_access_domain_is_same_module_or_same_package() {
+        let package = PackageId::new("pkg");
+        let other = PackageId::new("other");
+        let a = ModuleScope::from_module_id(&ModuleId::named(
+            package.clone(),
+            module_path_segments(&["a"]),
+        ));
+        let b =
+            ModuleScope::from_module_id(&ModuleId::named(package, module_path_segments(&["b"])));
+        let c = ModuleScope::from_module_id(&ModuleId::named(other, module_path_segments(&["c"])));
+
+        assert!(a.can_access_internal_from(&a));
+        assert!(a.can_access_internal_from(&b));
+        assert!(!a.can_access_internal_from(&c));
+        assert!(!scope("a").can_access_internal_from(&scope("b")));
+    }
+
+    #[test]
+    fn source_without_package_internal_domain_is_exact_module_only() {
+        let file_a = SourceFileId::new("/tmp/a.anv").unwrap();
+        let file_b = SourceFileId::new("/tmp/b.anv").unwrap();
+        let a = ModuleScope::from_module_id(&ModuleId::source_without_package(file_a));
+        let b = ModuleScope::from_module_id(&ModuleId::source_without_package(file_b));
+
+        assert!(a.can_access_internal_from(&a));
+        assert!(!a.can_access_internal_from(&b));
     }
 
     #[test]

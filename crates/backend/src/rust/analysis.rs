@@ -6,7 +6,7 @@ use super::{
         RirCollectionLoanScope, RirCollectionRootKind, RirExternKind, RirFunction,
         RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
         RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirStmt,
-        RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
+        RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId, native_arg_facts,
         native_return_adopts_resource, stmt_child_blocks_any,
     },
 };
@@ -683,13 +683,8 @@ fn native_ref_borrow_conversion_fallible(
         .zip(args)
         .enumerate()
         .any(|(index, (param, arg))| {
-            let native_ref = matches!(
-                program.types[param.ty.index()],
-                RirType::Struct(id) if program.structs[id.index()].native_ref
-            );
-            let string = matches!(program.types[param.ty.index()], RirType::String);
             matches!(
-                plan.rir_arg_boundary(index, arg, string, native_ref),
+                plan.arg_boundary(index, native_arg_facts(program, param.ty, arg)),
                 NativeArgBoundary::NativeRefBorrow { .. }
             )
         })

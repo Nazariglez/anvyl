@@ -1,0 +1,5 @@
+error: #[anvyx(init)] cannot be combined with callback wrapper parameters
+ --> tests/ui/methods/escaping_lambda_init.rs:8:9
+  |
+8 |     pub fn new(f: anvyx_runtime::EscapingLambda<(), ()>) -> Self {
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

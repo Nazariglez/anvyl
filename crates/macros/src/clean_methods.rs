@@ -11,11 +11,11 @@ use syn::{
 
 use crate::clean_type_map::{
     BoundaryConversion, CleanParam, CleanReturn, CleanReturnAbi, CleanType, OwnerReturn,
-    callback_wrapper_has_visible_borrow, classify_init_param, classify_param,
-    classify_provider_return_for_owner, classify_return, conversion_tokens, flow_tokens,
-    has_callback_wrapper, merge_conversions, named_type_expr_tokens, param_abi_for_override,
-    param_abi_tokens, param_escape_tokens, return_abi_for_override, return_abi_tokens,
-    signature_conversion, type_expr_tokens, type_with_override, validate_callable_signature,
+    classify_init_param, classify_param, classify_provider_return_for_owner, classify_return,
+    conversion_tokens, flow_tokens, has_callback_wrapper, merge_conversions,
+    named_type_expr_tokens, param_abi_for_override, param_abi_tokens, param_escape_tokens,
+    return_abi_for_override, return_abi_tokens, signature_conversion, type_expr_tokens,
+    type_with_override, validate_callable_signature, validate_callback_wrapper_precheck,
     validate_ctx_param, validate_mut_place_ctx,
 };
 
@@ -1295,25 +1295,21 @@ fn validate_callback_wrapper_method(
     export: &MethodExport,
     params: &[CleanParam],
 ) -> syn::Result<()> {
-    if !has_callback_wrapper(params) {
-        return Ok(());
+    let has_callback = validate_callback_wrapper_precheck(
+        &method.sig,
+        params,
+        role_receiver(method, &export.role).is_some(),
+    )?;
+    if has_callback && matches!(export.role, Role::Init) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[anvyx(init)] cannot be combined with callback wrapper parameters",
+        ));
     }
-    if export.ctx {
+    if has_callback && export.ctx {
         return Err(syn::Error::new_spanned(
             &method.sig,
             "#[anvyx(ctx)] cannot be combined with callback wrapper parameters",
-        ));
-    }
-    if role_receiver(method, &export.role).is_some() {
-        return Err(syn::Error::new_spanned(
-            &method.sig,
-            "callback wrapper parameters cannot be combined with method receivers",
-        ));
-    }
-    if callback_wrapper_has_visible_borrow(params) {
-        return Err(syn::Error::new_spanned(
-            &method.sig,
-            "callback wrapper parameters cannot be combined with borrowed or mutable-place provider parameters",
         ));
     }
     Ok(())

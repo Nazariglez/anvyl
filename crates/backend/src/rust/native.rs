@@ -9,6 +9,7 @@ use super::{native_call, rir};
 pub(super) struct ResolvedExtern<'a> {
     pub binding: &'a RustExternBinding,
     pub params: Vec<native_call::NativeParamAbi>,
+    pub callback_receiver: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +28,8 @@ pub(super) fn resolve_extern<'a>(
         .ok_or(ResolveExternError::UnsupportedExtern)?;
     let binding =
         extern_binding(providers, binding).ok_or(ResolveExternError::UnsupportedExtern)?;
-    if !rir::rust_extern_abi_supported(&binding.abi)
+    let callback_receiver = callback_receiver_index(decl);
+    if !rir::rust_extern_abi_supported_with_receiver(&binding.abi, callback_receiver)
         || binding.abi.params.len() != decl.call_params().count()
         || !rust_abi_matches_air(&binding.abi.params, &binding.abi.ret, &decl.abi)
     {
@@ -39,7 +41,24 @@ pub(super) fn resolve_extern<'a>(
         .iter()
         .map(native_call::classify_param)
         .collect();
-    Ok(ResolvedExtern { binding, params })
+    Ok(ResolvedExtern {
+        binding,
+        params,
+        callback_receiver,
+    })
+}
+
+fn callback_receiver_index(decl: &air::ExternDecl) -> Option<usize> {
+    match decl.member {
+        air::ExternMember::FieldGetter { .. }
+        | air::ExternMember::FieldSetter { .. }
+        | air::ExternMember::Method { .. }
+        | air::ExternMember::UnaryOperator { .. }
+        | air::ExternMember::BinaryOperator { .. } => Some(0),
+        air::ExternMember::FreeFunction
+        | air::ExternMember::StaticMethod { .. }
+        | air::ExternMember::Init { .. } => None,
+    }
 }
 
 pub(super) fn rust_abi_matches_air(

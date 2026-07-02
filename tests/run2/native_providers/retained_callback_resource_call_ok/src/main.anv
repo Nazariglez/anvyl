@@ -1,0 +1,15 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: 42
+
+import pkg:host.host { make_counter, counter_value, retain, fire, close };
+
+fn main() {
+    let counter = make_counter(42);
+    retain(|| {
+        println(counter_value(counter));
+    });
+    fire();
+    close();
+}

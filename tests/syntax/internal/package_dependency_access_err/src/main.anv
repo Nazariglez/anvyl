@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @frontend: new
+// @lint: internal_access=error
+// @contains: accessing internal field 'cache' of type 'Item'
+
+import pkg:dep { item };
+
+fn main() {
+    let i = item();
+    println(i.cache);
+}

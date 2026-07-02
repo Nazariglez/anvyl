@@ -1411,10 +1411,13 @@ impl<'a> PlanCx<'a> {
     }
 
     fn extern_kind(&self, native: &native::ResolvedExtern<'_>) -> RirExternKind {
-        RirExternKind::Native(RirNativeExtern::new(
-            native_path(&native.binding.path),
-            native.binding.abi.clone(),
-        ))
+        RirExternKind::Native(
+            RirNativeExtern::new(
+                native_path(&native.binding.path),
+                native.binding.abi.clone(),
+            )
+            .with_callback_receiver(native.callback_receiver),
+        )
     }
 
     fn native_type_binding(

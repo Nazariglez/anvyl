@@ -462,7 +462,7 @@ mod tests {
 
         assert!(rendered.starts_with("Lint                          Default  Group  Description"));
         assert!(rendered.contains(
-            "internal_access               warn     api    cross-module access to @internal members"
+            "internal_access               warn     api    outside-package access to @internal members"
         ));
         assert!(rendered.contains(
             "deprecated                    warn     api    use of declarations marked @deprecated"

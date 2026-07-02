@@ -528,17 +528,55 @@ impl RustExternAbi {
     }
 
     pub fn supported_callback_wrapper(&self) -> bool {
-        self.ctx == RustWrapperCtx::None
-            && self.has_callback_wrapper()
-            && self.params.iter().all(|param| {
-                matches!(
-                    param.class(),
-                    RustAbiClass::Direct | RustAbiClass::CallbackWrapper
-                ) && !param.is_borrowed_provider_param()
-                    && !param.contains_direct_collection()
-            })
-            && self.ret.class() == RustAbiClass::Direct
-            && !self.ret.contains_direct_collection()
+        self.supported_callback_wrapper_with_receiver(None)
+    }
+
+    pub fn supported_callback_wrapper_with_receiver(&self, receiver: Option<usize>) -> bool {
+        self.has_callback_wrapper() && self.callback_wrapper_shape_error(receiver).is_none()
+    }
+
+    fn callback_wrapper_shape_error(
+        &self,
+        receiver: Option<usize>,
+    ) -> Option<CallbackWrapperAbiError> {
+        if self.ctx != RustWrapperCtx::None {
+            return Some(CallbackWrapperAbiError::Ctx);
+        }
+        if receiver.is_some()
+            && self
+                .params
+                .iter()
+                .any(|param| matches!(param, RustParamAbi::ScopedLambda(_)))
+        {
+            return Some(CallbackWrapperAbiError::ScopedReceiver);
+        }
+        if receiver.is_some_and(|index| index >= self.params.len()) {
+            return Some(CallbackWrapperAbiError::ReceiverMissing);
+        }
+        for (index, param) in self.params.iter().enumerate() {
+            if Some(index) == receiver {
+                match param {
+                    RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) => {}
+                    RustParamAbi::MutPlace(_) => {
+                        return Some(CallbackWrapperAbiError::ReceiverMutPlace);
+                    }
+                    _ => return Some(CallbackWrapperAbiError::ReceiverNotBorrowed),
+                }
+            } else if param.is_borrowed_provider_param() {
+                return Some(CallbackWrapperAbiError::BorrowedParam);
+            }
+            let class_supported = matches!(
+                param.class(),
+                RustAbiClass::Direct | RustAbiClass::CallbackWrapper
+            );
+            if !class_supported || param.contains_direct_collection() {
+                return Some(CallbackWrapperAbiError::UnsupportedParam);
+            }
+        }
+        if self.ret.class() != RustAbiClass::Direct || self.ret.contains_direct_collection() {
+            return Some(CallbackWrapperAbiError::UnsupportedReturn);
+        }
+        None
     }
 
     pub fn backend_supported(&self) -> bool {
@@ -553,10 +591,6 @@ impl RustExternAbi {
             RustAbiSupport::NeedsWrapperConversion => self.supported_callback_wrapper(),
             RustAbiSupport::Unsupported => false,
         }
-    }
-
-    fn validation_supported(&self) -> bool {
-        self.backend_supported()
     }
 
     pub fn direct_ctx_supported(&self) -> bool {
@@ -578,6 +612,39 @@ enum RustAbiClass {
     Direct,
     CallbackWrapper,
     BackendUnsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackWrapperAbiError {
+    Ctx,
+    ScopedReceiver,
+    ReceiverMissing,
+    ReceiverNotBorrowed,
+    ReceiverMutPlace,
+    BorrowedParam,
+    UnsupportedParam,
+    UnsupportedReturn,
+}
+
+impl CallbackWrapperAbiError {
+    fn message(self) -> Option<&'static str> {
+        match self {
+            Self::ScopedReceiver => {
+                Some("scoped callback wrapper ABI cannot be combined with method receivers")
+            }
+            Self::ReceiverMissing => Some("callback wrapper ABI method receiver is missing"),
+            Self::ReceiverMutPlace => {
+                Some("callback wrapper ABI cannot use mutable-place method receivers")
+            }
+            Self::ReceiverNotBorrowed => {
+                Some("callback wrapper ABI method receiver must be borrowed")
+            }
+            Self::BorrowedParam => Some(
+                "callback wrapper ABI cannot be combined with borrowed or mutable-place provider parameters",
+            ),
+            Self::Ctx | Self::UnsupportedParam | Self::UnsupportedReturn => None,
+        }
+    }
 }
 
 impl RustAbiClass {
@@ -1037,9 +1104,10 @@ fn validate_native_abi(
             "parameter count mismatch",
         ));
     }
+    let receiver = callback_receiver_index(key);
     let has_callback_wrapper = abi.has_callback_wrapper();
     validate_wrapper_ctx(descriptor, key, abi, has_callback_wrapper)?;
-    validate_callback_wrapper_isolated(descriptor, key, abi, has_callback_wrapper)?;
+    validate_callback_wrapper_boundary(descriptor, key, abi, receiver)?;
     for (index, (param, param_abi)) in signature
         .signature
         .params
@@ -1105,8 +1173,8 @@ fn validate_native_abi(
             "unsupported native ABI metadata",
         ));
     }
-    validate_wrapper_conversion_abi(descriptor, key, abi)?;
-    if !abi.validation_supported() {
+    validate_wrapper_conversion_abi(descriptor, key, abi, receiver)?;
+    if abi.support == RustAbiSupport::Direct && !abi.backend_supported() {
         return Err(native_abi_error(
             descriptor,
             key,
@@ -1181,6 +1249,7 @@ fn validate_wrapper_conversion_abi(
     descriptor: &ProviderDescriptor,
     key: &ExternBindingKey,
     abi: &RustExternAbi,
+    receiver: Option<usize>,
 ) -> Result<(), String> {
     match abi.support {
         RustAbiSupport::Direct => Ok(()),
@@ -1189,7 +1258,11 @@ fn validate_wrapper_conversion_abi(
             key,
             "unsupported native ABI metadata",
         )),
-        RustAbiSupport::NeedsWrapperConversion if abi.supported_callback_wrapper() => Ok(()),
+        RustAbiSupport::NeedsWrapperConversion
+            if abi.supported_callback_wrapper_with_receiver(receiver) =>
+        {
+            Ok(())
+        }
         RustAbiSupport::NeedsWrapperConversion => Err(native_abi_error(
             descriptor,
             key,
@@ -1198,39 +1271,69 @@ fn validate_wrapper_conversion_abi(
     }
 }
 
-fn validate_callback_wrapper_isolated(
+fn validate_callback_wrapper_boundary(
     descriptor: &ProviderDescriptor,
     key: &ExternBindingKey,
     abi: &RustExternAbi,
-    has_callback_wrapper: bool,
+    receiver: Option<usize>,
 ) -> Result<(), String> {
-    if !has_callback_wrapper {
+    if !abi.has_callback_wrapper() {
         return Ok(());
     }
-    if matches!(
-        &key.target,
-        ExternBindingTarget::Member(member)
-            if !matches!(member.selector, ExternMemberSelector::Static(_))
-    ) {
-        return Err(native_abi_error(
-            descriptor,
-            key,
-            "callback wrapper ABI cannot be combined with method receivers",
-        ));
+    if let Some(message) = abi
+        .callback_wrapper_shape_error(receiver)
+        .and_then(CallbackWrapperAbiError::message)
+    {
+        return Err(native_abi_error(descriptor, key, message));
     }
-    if abi.params.iter().any(|param| {
-        matches!(
-            param,
-            RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::MutPlace(_)
-        )
-    }) {
-        return Err(native_abi_error(
-            descriptor,
-            key,
-            "callback wrapper ABI cannot be combined with borrowed provider parameters",
-        ));
+    if let Some(index) = receiver {
+        validate_callback_wrapper_receiver_resource(descriptor, key, abi, index)?;
     }
     Ok(())
+}
+
+fn callback_receiver_index(key: &ExternBindingKey) -> Option<usize> {
+    match &key.target {
+        ExternBindingTarget::Member(member)
+            if member_binding_has_receiver(&member.selector, key.operation) =>
+        {
+            Some(0)
+        }
+        ExternBindingTarget::Function(_) | ExternBindingTarget::Member(_) => None,
+    }
+}
+
+fn validate_callback_wrapper_receiver_resource(
+    descriptor: &ProviderDescriptor,
+    key: &ExternBindingKey,
+    abi: &RustExternAbi,
+    index: usize,
+) -> Result<(), String> {
+    let Some(RustParamAbi::Borrow(receiver_ty) | RustParamAbi::MutBorrow(receiver_ty)) =
+        abi.params.get(index)
+    else {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "callback wrapper ABI method receiver must be borrowed",
+        ));
+    };
+    let ExternTypeExpr::Named { module, name, args } = receiver_ty else {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "callback wrapper ABI method receiver must be a shared resource",
+        ));
+    };
+    if args.is_empty() && named_type_is_shared(descriptor, key, module.as_ref(), name) {
+        Ok(())
+    } else {
+        Err(native_abi_error(
+            descriptor,
+            key,
+            "callback wrapper ABI method receiver must be a shared resource",
+        ))
+    }
 }
 
 fn validate_init_field_abi(
@@ -2427,7 +2530,7 @@ mod tests {
         assert_abi_error(
             descriptor,
             binding,
-            "callback wrapper ABI cannot be combined with borrowed provider parameters",
+            "callback wrapper ABI cannot be combined with borrowed or mutable-place provider parameters",
         );
     }
 
@@ -2461,7 +2564,7 @@ mod tests {
         assert_abi_error(
             descriptor,
             binding,
-            "callback wrapper ABI cannot be combined with borrowed provider parameters",
+            "callback wrapper ABI cannot be combined with borrowed or mutable-place provider parameters",
         );
     }
 
@@ -2495,70 +2598,86 @@ mod tests {
         assert_abi_error(
             descriptor,
             binding,
-            "callback wrapper ABI cannot be combined with borrowed provider parameters",
+            "callback wrapper ABI cannot be combined with borrowed or mutable-place provider parameters",
         );
+    }
+
+    #[test]
+    fn accepts_method_receiver_with_escaping_lambda() {
+        let callback =
+            callback_signature_with_escape(vec![], ExternTypeExpr::Void, CallbackEscape::Escaping);
+        let descriptor = callback_method_descriptor(callback.clone(), CallbackEscape::Escaping);
+        let binding = callback_method_binding(escaping_lambda_binding("mixed", callback));
+
+        assert_abi_ok(descriptor, binding);
     }
 
     #[test]
     fn rejects_method_receiver_with_scoped_lambda() {
         let callback = callback_signature(vec![], ExternTypeExpr::Void);
-        let owner = ExternTypeKey {
-            module: module(),
-            name: "Host".to_string(),
-        };
-        let descriptor = ProviderDescriptor {
-            provider: provider(),
-            modules: vec![ExternModuleDescriptor {
-                path: module(),
-                types: vec![ExternTypeDescriptor {
-                    name: "Host".to_string(),
-                    doc: None,
-                    rep: ExternRep::Shared,
-                    fields: vec![],
-                    variants: vec![],
-                    init: None,
-                    methods: vec![ExternMethodDescriptor {
-                        name: "mixed".to_string(),
-                        doc: None,
-                        receiver: ReceiverMode::Shared,
-                        signature: ExternSignature {
-                            params: vec![ExternParam {
-                                name: Some("cb".to_string()),
-                                ty: ExternTypeExpr::Callback(callback.clone()),
-                                flow: ParamFlow::Value,
-                                escape: CallbackEscape::NonEscaping,
-                            }],
-                            ret: ExternTypeExpr::Void,
-                        },
-                        effects: ExternEffects::default(),
-                    }],
-                    statics: vec![],
-                    operators: vec![],
-                }],
-                functions: vec![],
-            }],
-        };
-        let mut binding = scoped_lambda_binding("mixed", callback);
-        binding.key = ExternBindingKey {
-            target: ExternBindingTarget::Member(ExternMemberKey {
-                owner,
-                selector: ExternMemberSelector::Method("mixed".to_string()),
-            }),
-            operation: ExternBindingOp::Call,
-        };
-        binding.abi.params.insert(
-            0,
-            RustParamAbi::Borrow(ExternTypeExpr::Named {
-                module: Some(module()),
-                name: "Host".to_string(),
-                args: vec![],
-            }),
-        );
+        let descriptor = callback_method_descriptor(callback.clone(), CallbackEscape::NonEscaping);
+        let binding = callback_method_binding(scoped_lambda_binding("mixed", callback));
 
         assert_abi_error(
             descriptor,
             binding,
-            "callback wrapper ABI cannot be combined with method receivers",
+            "scoped callback wrapper ABI cannot be combined with method receivers",
+        );
+    }
+
+    #[test]
+    fn rejects_method_callback_on_inline_receiver() {
+        let callback =
+            callback_signature_with_escape(vec![], ExternTypeExpr::Void, CallbackEscape::Escaping);
+        let descriptor = callback_method_descriptor_with_rep(
+            callback.clone(),
+            CallbackEscape::Escaping,
+            ExternRep::Inline,
+        );
+        let binding = callback_method_binding(escaping_lambda_binding("mixed", callback));
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "callback wrapper ABI method receiver must be a shared resource",
+        );
+    }
+
+    #[test]
+    fn rejects_method_callback_with_value_receiver_abi() {
+        let callback =
+            callback_signature_with_escape(vec![], ExternTypeExpr::Void, CallbackEscape::Escaping);
+        let descriptor = callback_method_descriptor(callback.clone(), CallbackEscape::Escaping);
+        let mut binding = callback_method_binding(escaping_lambda_binding("mixed", callback));
+        binding.abi.params[0] = RustParamAbi::Value(ExternTypeExpr::Named {
+            module: Some(module()),
+            name: "Thing".to_string(),
+            args: vec![],
+        });
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "callback wrapper ABI method receiver must be borrowed",
+        );
+    }
+
+    #[test]
+    fn rejects_method_callback_with_mut_place_receiver_abi() {
+        let callback =
+            callback_signature_with_escape(vec![], ExternTypeExpr::Void, CallbackEscape::Escaping);
+        let descriptor = callback_method_descriptor(callback.clone(), CallbackEscape::Escaping);
+        let mut binding = callback_method_binding(escaping_lambda_binding("mixed", callback));
+        binding.abi.params[0] = RustParamAbi::MutPlace(ExternTypeExpr::Named {
+            module: Some(module()),
+            name: "Thing".to_string(),
+            args: vec![],
+        });
+
+        assert_abi_error(
+            descriptor,
+            binding,
+            "callback wrapper ABI cannot use mutable-place method receivers",
         );
     }
 
@@ -2699,6 +2818,67 @@ mod tests {
         let error = validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap_err();
 
         assert!(error.contains("CallbackNested"));
+    }
+
+    fn callback_method_descriptor(
+        callback: ExternCallbackSignature,
+        escape: CallbackEscape,
+    ) -> ProviderDescriptor {
+        callback_method_descriptor_with_rep(callback, escape, ExternRep::Shared)
+    }
+
+    fn callback_method_descriptor_with_rep(
+        callback: ExternCallbackSignature,
+        escape: CallbackEscape,
+        rep: ExternRep,
+    ) -> ProviderDescriptor {
+        let mut ty = shared_resource_type(vec![]);
+        ty.rep = rep;
+        ty.methods.push(ExternMethodDescriptor {
+            name: "mixed".to_string(),
+            doc: None,
+            receiver: ReceiverMode::Shared,
+            signature: ExternSignature {
+                params: vec![ExternParam {
+                    name: Some("cb".to_string()),
+                    ty: ExternTypeExpr::Callback(callback),
+                    flow: ParamFlow::Value,
+                    escape,
+                }],
+                ret: ExternTypeExpr::Void,
+            },
+            effects: ExternEffects::default(),
+        });
+        ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ty],
+                functions: vec![],
+            }],
+        }
+    }
+
+    fn callback_method_binding(mut binding: RustExternBinding) -> RustExternBinding {
+        binding.key = ExternBindingKey {
+            target: ExternBindingTarget::Member(ExternMemberKey {
+                owner: ExternTypeKey {
+                    module: module(),
+                    name: "Thing".to_string(),
+                },
+                selector: ExternMemberSelector::Method("mixed".to_string()),
+            }),
+            operation: ExternBindingOp::Call,
+        };
+        binding.abi.params.insert(
+            0,
+            RustParamAbi::Borrow(ExternTypeExpr::Named {
+                module: Some(module()),
+                name: "Thing".to_string(),
+                args: vec![],
+            }),
+        );
+        binding
     }
 
     fn callback_signature(
