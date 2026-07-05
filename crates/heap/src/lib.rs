@@ -10,7 +10,7 @@ pub use anvyx_heap_derive::Trace;
 pub use handle::Handle;
 pub use heap::{
     AccessError, CollectOutcome, CycleStatus, ErasedHandle, Heap, HeapConfig, LeakReport,
-    LeakTypeReport, RootId,
+    LeakTypeReport,
 };
 pub use heap_type::{HeapType, HeapTypeId, TraceMode};
 pub use metrics::HeapStats;
@@ -128,10 +128,10 @@ mod tests {
     struct ModelGraph<'cx> {
         ty: HeapType<'cx, ModelNode<'cx>>,
         handles: Vec<Option<Handle<'cx, ModelNode<'cx>>>>,
-        roots: Vec<Option<RootId<'cx, ModelNode<'cx>>>>,
+        retained: Vec<Option<Handle<'cx, ModelNode<'cx>>>>,
         edges: Vec<Vec<usize>>,
         external: Vec<bool>,
-        rooted: Vec<bool>,
+        retained_live: Vec<bool>,
     }
 
     impl<'cx> ModelGraph<'cx> {
@@ -139,10 +139,10 @@ mod tests {
             Self {
                 ty: heap.register_tracked::<ModelNode<'_>>(),
                 handles: vec![],
-                roots: vec![],
+                retained: vec![],
                 edges: vec![],
                 external: vec![],
-                rooted: vec![],
+                retained_live: vec![],
             }
         }
 
@@ -150,16 +150,16 @@ mod tests {
             let id = self.handles.len();
             let handle = heap.alloc(self.ty, ModelNode { id, edges: vec![] });
             self.handles.push(Some(handle));
-            self.roots.push(None);
+            self.retained.push(None);
             self.edges.push(vec![]);
             self.external.push(true);
-            self.rooted.push(false);
+            self.retained_live.push(false);
             id
         }
 
         fn add_edge(&mut self, heap: &mut Heap<'cx>, from: usize, to: usize) {
-            let target = self.handle(heap, to);
-            heap.with_mut(&self.handle(heap, from), |node| node.edges.push(target));
+            let target = self.handle(to);
+            heap.with_mut(&self.handle(from), |node| node.edges.push(target));
             self.edges[from].push(to);
         }
 
@@ -168,33 +168,32 @@ mod tests {
             self.external[id] = false;
         }
 
-        fn root(&mut self, heap: &mut Heap<'cx>, id: usize) {
-            if self.roots[id].is_none() {
-                self.roots[id] = Some(heap.root(&self.handle(heap, id)));
-                self.rooted[id] = true;
+        fn retain(&mut self, id: usize) {
+            if self.retained[id].is_none() {
+                self.retained[id] = Some(self.handle(id));
+                self.retained_live[id] = true;
             }
         }
 
-        fn remove_root(&mut self, heap: &mut Heap<'cx>, id: usize) {
-            if let Some(root) = self.roots[id].take() {
-                assert!(heap.remove_root(&root));
-                self.rooted[id] = false;
+        fn release(&mut self, id: usize) {
+            if self.retained[id].take().is_some() {
+                self.retained_live[id] = false;
             }
         }
 
-        fn handle(&self, heap: &Heap<'cx>, id: usize) -> Handle<'cx, ModelNode<'cx>> {
-            if let Some(handle) = &self.handles[id] {
-                return handle.clone();
-            }
-            heap.resolve_root(self.roots[id].as_ref().expect("node handle"))
-                .expect("live root")
+        fn handle(&self, id: usize) -> Handle<'cx, ModelNode<'cx>> {
+            self.handles[id]
+                .as_ref()
+                .or(self.retained[id].as_ref())
+                .expect("node handle")
+                .clone()
         }
 
         fn expected_live(&self) -> Vec<bool> {
             let mut live = vec![false; self.handles.len()];
             let mut stack = vec![];
             for id in 0..self.handles.len() {
-                if self.external[id] || self.rooted[id] {
+                if self.external[id] || self.retained_live[id] {
                     stack.push(id);
                 }
             }
@@ -220,9 +219,10 @@ mod tests {
                     assert_eq!(heap.with(handle, |node| node.id), id);
                 }
             }
-            for (id, root) in self.roots.iter().enumerate() {
-                if let Some(root) = root {
-                    assert_eq!(heap.resolve_root(root).is_some(), expected[id]);
+            for (id, handle) in self.retained.iter().enumerate() {
+                if let Some(handle) = handle {
+                    assert!(expected[id]);
+                    assert_eq!(heap.try_with(handle, |node| node.id), Ok(id));
                 }
             }
         }
@@ -259,27 +259,27 @@ mod tests {
                 1 => {
                     let from = rng.next(graph.handles.len());
                     let to = rng.next(graph.handles.len());
-                    if (graph.external[from] || graph.rooted[from])
-                        && (graph.external[to] || graph.rooted[to])
+                    if (graph.external[from] || graph.retained_live[from])
+                        && (graph.external[to] || graph.retained_live[to])
                     {
                         graph.add_edge(heap, from, to);
                     }
                 }
                 2 => {
                     let id = rng.next(graph.handles.len());
-                    if graph.external[id] && !graph.rooted[id] {
+                    if graph.external[id] && !graph.retained_live[id] {
                         graph.drop_external(id);
                     }
                 }
                 3 => {
                     let id = rng.next(graph.handles.len());
-                    if graph.external[id] || graph.rooted[id] {
-                        graph.root(heap, id);
+                    if graph.external[id] || graph.retained_live[id] {
+                        graph.retain(id);
                     }
                 }
                 4 => {
                     let id = rng.next(graph.handles.len());
-                    graph.remove_root(heap, id);
+                    graph.release(id);
                 }
                 _ => {
                     heap.collect_all();
@@ -328,7 +328,7 @@ mod tests {
             };
             drop(node);
 
-            heap.collect_all_with_roots(&root);
+            heap.collect_all_with_external_roots(&root);
 
             assert!(visits.get() > 0);
             assert_eq!(heap.stats().live, 1);
@@ -346,12 +346,12 @@ mod tests {
             let b = graph.alloc(heap);
             graph.add_edge(heap, a, b);
             graph.add_edge(heap, b, a);
-            graph.root(heap, a);
+            graph.retain(a);
             graph.drop_external(a);
             graph.drop_external(b);
             heap.collect_all();
             graph.assert_matches_model(heap);
-            graph.remove_root(heap, a);
+            graph.release(a);
             heap.collect_all();
             graph.assert_matches_model(heap);
         }
@@ -367,7 +367,7 @@ mod tests {
             let child = graph.alloc(heap);
             graph.add_edge(heap, parent, child);
             graph.add_edge(heap, parent, child);
-            graph.root(heap, parent);
+            graph.retain(parent);
             graph.drop_external(parent);
             graph.drop_external(child);
             heap.collect_all();
@@ -398,7 +398,7 @@ mod tests {
                 graph.add_edge(heap, a, b);
                 graph.add_edge(heap, b, a);
                 graph.add_edge(heap, c, a);
-                graph.root(heap, c);
+                graph.retain(c);
                 graph.drop_external(a);
                 graph.drop_external(b);
                 graph.drop_external(c);
@@ -407,11 +407,8 @@ mod tests {
                 }
                 heap.collect_all();
                 graph.assert_matches_model(heap);
-                let root = graph.roots[c].as_ref().expect("rooted c");
-                let resolved = heap.resolve_root(root);
-                let resolved_id = resolved
-                    .as_ref()
-                    .map(|handle| heap.with(handle, |node| node.id));
+                let resolved = graph.retained[c].as_ref();
+                let resolved_id = resolved.map(|handle| heap.with(handle, |node| node.id));
                 (
                     heap.stats().live,
                     pending_cycles(heap),
@@ -554,36 +551,34 @@ mod tests {
     }
 
     #[test]
-    fn generated_context_provider_root_keeps_callback_alive() {
+    fn generated_context_retained_handle_keeps_callback_alive() {
         fn run(heap: &mut Heap<'_>) {
             let mut ctx = GeneratedContext::new(heap);
             let node = ctx.alloc_node(10);
             let callback = ctx.alloc_callback(&node, 2);
             ctx.set_callback(&node, Some(callback.clone()));
-            let root = ctx.heap.root(&callback);
+            let retained = callback.clone();
             drop(callback);
             drop(node);
             ctx.heap.collect_all();
-            let callback = ctx.heap.resolve_root(&root).expect("rooted callback");
-            assert_eq!(ctx.invoke(&callback, 3), 15);
-            drop(callback);
-            assert!(ctx.heap.remove_root(&root));
+            assert_eq!(ctx.invoke(&retained, 3), 15);
+            drop(retained);
         }
 
         Heap::scope(run);
     }
 
     #[test]
-    fn generated_context_remove_provider_root_collects_cycle() {
+    fn generated_context_drop_retained_handle_collects_cycle() {
         fn run(heap: &mut Heap<'_>) {
             let mut ctx = GeneratedContext::new(heap);
             let node = ctx.alloc_node(10);
             let callback = ctx.alloc_callback(&node, 2);
             ctx.set_callback(&node, Some(callback.clone()));
-            let root = ctx.heap.root(&callback);
+            let retained = callback.clone();
             drop(callback);
             drop(node);
-            assert!(ctx.heap.remove_root(&root));
+            drop(retained);
             ctx.heap.collect_all();
             assert_eq!(ctx.heap.stats().live, 0);
         }
@@ -626,18 +621,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_root_lifecycle_counts_are_balanced() {
+    fn retained_handle_lifecycle_counts_are_balanced() {
         fn run(heap: &mut Heap<'_>) {
             let mut ctx = GeneratedContext::new(heap);
             let node = ctx.alloc_node(1);
             let callback = ctx.alloc_callback(&node, 2);
             ctx.heap.reset_stats();
-            let root = ctx.heap.root(&callback);
-            let resolved = ctx.heap.resolve_root(&root).expect("rooted callback");
-            drop(resolved);
-            assert!(ctx.heap.remove_root(&root));
+            let retained = callback.clone();
+            drop(retained);
             let stats = ctx.heap.stats();
-            assert_eq!(stats.clones, 0);
+            assert_eq!(stats.clones, 1);
             assert_eq!(stats.drops, 1);
             assert_eq!(pending_cycles(ctx.heap), 1);
             assert_eq!(ctx.heap.with(&callback, |callback| callback.add), 2);
@@ -827,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_root_keeps_env_cell_graph_alive_until_removed() {
+    fn retained_lambda_keeps_env_cell_graph_alive_until_dropped() {
         fn run(heap: &mut Heap<'_>) {
             let stats = Rc::new(Cell::new(0));
             let lambda_ty = heap.register_tracked::<TestLambda<'_>>();
@@ -855,16 +848,16 @@ mod tests {
                 },
             );
             heap.with_mut(&cell, |cell| cell.payload = Some(lambda.clone()));
-            let root = heap.root(&lambda);
+            let retained = lambda.clone();
 
             drop(lambda);
             drop(env);
             drop(cell);
             heap.collect_all();
             assert_eq!(heap.stats().live, 3);
-            assert!(heap.resolve_root(&root).is_some());
+            assert!(heap.try_with(&retained, |_| ()).is_ok());
 
-            assert!(heap.remove_root(&root));
+            drop(retained);
             let outcome = heap.collect_all();
             assert_eq!(outcome.collected, 3);
             assert_eq!(heap.stats().live, 0);
@@ -1099,29 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn root_table_keeps_handle_alive_and_rejects_stale_root_ids() {
-        fn run(heap: &mut Heap<'_>) {
-            let value_ty = heap.register_untracked::<i32>();
-            let value = heap.alloc(value_ty, 42);
-            let root = heap.root(&value);
-            drop(value);
-            heap.collect(0);
-            assert_eq!(heap.with_root(&root, |value| *value), Some(42));
-            assert_eq!(heap.with_root_mut(&root, |value| *value += 1), Some(()));
-            let resolved = heap.resolve_root(&root).expect("root should resolve");
-            assert_eq!(heap.with(&resolved, |value| *value), 43);
-            drop(resolved);
-            assert!(heap.remove_root(&root));
-            assert!(heap.resolve_root(&root).is_none());
-            assert!(!heap.remove_root(&root));
-            heap.collect(0);
-            assert_eq!(heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
     fn erased_access_uses_heap_type_descriptor_checks() {
         fn run(heap: &mut Heap<'_>) {
             let int_ty = heap.register_untracked::<i32>();
@@ -1346,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn heap_teardown_rooted_objects_drop_roots_first() {
+    fn heap_teardown_objects_drop_payloads_after_handles() {
         struct Child(Rc<Cell<usize>>);
         impl Drop for Child {
             fn drop(&mut self) {
@@ -1370,7 +1340,7 @@ mod tests {
             let child_ty = heap.register_untracked::<Child>();
             let parent_ty = heap.register_untracked::<Parent<'_>>();
             let child = heap.alloc(child_ty, Child(Rc::clone(&child_drops)));
-            let _root = heap.root(&child);
+            let _retained = child.clone();
             let _parent = heap.alloc(
                 parent_ty,
                 Parent {
@@ -1858,42 +1828,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_root_id_never_resolves_after_slot_reuse() {
-        fn run(heap: &mut Heap<'_>) {
-            let ty = heap.register_untracked::<i32>();
-            let first = heap.alloc(ty, 1);
-            let root = heap.root(&first);
-            assert!(heap.remove_root(&root));
-            drop(first);
-            heap.collect(0);
-            let second = heap.alloc(ty, 2);
-            assert!(heap.resolve_root(&root).is_none());
-            assert_eq!(heap.with(&second, |value| *value), 2);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn reused_root_index_rejects_old_root_generation() {
-        fn run(heap: &mut Heap<'_>) {
-            let ty = heap.register_untracked::<i32>();
-            let first = heap.alloc(ty, 1);
-            let old_root = heap.root(&first);
-            assert!(heap.remove_root(&old_root));
-            let second = heap.alloc(ty, 2);
-            let new_root = heap.root(&second);
-            assert_eq!(old_root.index(), new_root.index());
-            assert_ne!(old_root.generation(), new_root.generation());
-            assert!(heap.resolve_root(&old_root).is_none());
-            assert!(!heap.remove_root(&old_root));
-            assert!(heap.resolve_root(&new_root).is_some());
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
     fn zero_drop_payload_can_drop_child_handle() {
         struct Child(Rc<Cell<usize>>);
         impl Drop for Child {
@@ -2030,17 +1964,17 @@ mod tests {
     }
 
     #[test]
-    fn finalize_reports_root_kept_object() {
+    fn finalize_reports_retained_handle_kept_object() {
         fn run(heap: &mut Heap<'_>) {
             let ty = heap.register_untracked::<i32>();
             let handle = heap.alloc(ty, 1);
-            let root = heap.root(&handle);
+            let retained = handle.clone();
             drop(handle);
             heap.collect(0);
             let report = heap.finalize().unwrap_err();
             assert_eq!(report.live, 1);
             assert_eq!(report.by_type[0].live, 1);
-            assert!(heap.remove_root(&root));
+            drop(retained);
             assert!(heap.finalize().is_ok());
         }
 

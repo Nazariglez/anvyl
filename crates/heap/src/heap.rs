@@ -66,18 +66,7 @@ struct CollectionControl {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ReleaseOwner {
     Handle,
-    Root,
     Erased,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
-pub struct RootId<'cx, T> {
-    index: u32,
-    generation: u32,
-    heap_id: HeapId,
-    heap_type_id: HeapTypeId,
-    marker: PhantomData<fn(T) -> T>,
-    brand: PhantomData<Cell<&'cx ()>>,
 }
 
 pub struct ErasedHandle<'cx> {
@@ -89,10 +78,25 @@ pub struct ErasedHandle<'cx> {
     not_send_sync: PhantomData<Rc<()>>,
 }
 
-impl ErasedHandle<'_> {
+impl<'cx> ErasedHandle<'cx> {
     #[inline]
     pub fn heap_type_id(&self) -> HeapTypeId {
         self.heap_type_id
+    }
+
+    #[inline]
+    pub(crate) fn heap_id(&self) -> HeapId {
+        self.state.get().heap_id
+    }
+
+    #[inline]
+    pub(crate) fn ptr(&self) -> ObjPtr<'cx> {
+        self.ptr
+    }
+
+    #[inline]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -119,123 +123,6 @@ impl Drop for ErasedHandle<'_> {
         self.state
             .get()
             .release_strong(self.ptr, self.generation, ReleaseOwner::Erased);
-    }
-}
-
-impl<T> RootId<'_, T> {
-    #[inline]
-    pub fn index(&self) -> u32 {
-        self.index
-    }
-
-    #[inline]
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-}
-
-struct RootEntry<'cx> {
-    ptr: ObjPtr<'cx>,
-    handle_generation: u64,
-    root_generation: u32,
-    heap_type_id: HeapTypeId,
-    occupied: bool,
-    next_free: Option<u32>,
-}
-
-#[derive(Default)]
-struct RootTable<'cx> {
-    entries: Vec<RootEntry<'cx>>,
-    free_head: Option<u32>,
-}
-
-impl<'cx> RootTable<'cx> {
-    fn insert<T>(
-        &mut self,
-        heap_id: HeapId,
-        ptr: ObjPtr<'cx>,
-        handle_generation: u64,
-        heap_type_id: HeapTypeId,
-    ) -> RootId<'cx, T> {
-        let index = match self.free_head {
-            Some(index) => {
-                let entry = &mut self.entries[index as usize];
-                debug_assert!(!entry.occupied);
-                self.free_head = entry.next_free;
-                entry.next_free = None;
-                index
-            }
-            None => {
-                let index = u32::try_from(self.entries.len()).expect("heap root table overflow");
-                self.entries.push(RootEntry {
-                    ptr,
-                    handle_generation,
-                    root_generation: 0,
-                    heap_type_id,
-                    occupied: false,
-                    next_free: None,
-                });
-                index
-            }
-        };
-        let entry = &mut self.entries[index as usize];
-        entry.ptr = ptr;
-        entry.handle_generation = handle_generation;
-        entry.heap_type_id = heap_type_id;
-        entry.root_generation = entry
-            .root_generation
-            .checked_add(1)
-            .expect("heap root generation overflow");
-        entry.occupied = true;
-        entry.next_free = None;
-        RootId {
-            index,
-            generation: entry.root_generation,
-            heap_id,
-            heap_type_id,
-            marker: PhantomData,
-            brand: PhantomData,
-        }
-    }
-
-    fn resolve<T>(&self, heap_id: HeapId, root: &RootId<'cx, T>) -> Option<(ObjPtr<'cx>, u64)> {
-        let entry = self.entries.get(root.index as usize)?;
-        if root.heap_id != heap_id
-            || root.heap_type_id != entry.heap_type_id
-            || !entry.occupied
-            || entry.root_generation != root.generation
-        {
-            return None;
-        }
-        let header = entry.ptr.header();
-        if header.generation.get() != entry.handle_generation || !header.is_live() {
-            return None;
-        }
-        Some((entry.ptr, entry.handle_generation))
-    }
-
-    fn remove<T>(&mut self, heap_id: HeapId, root: &RootId<'cx, T>) -> Option<(ObjPtr<'cx>, u64)> {
-        let entry = self.entries.get_mut(root.index as usize)?;
-        if root.heap_id != heap_id
-            || root.heap_type_id != entry.heap_type_id
-            || !entry.occupied
-            || entry.root_generation != root.generation
-        {
-            return None;
-        }
-        entry.occupied = false;
-        entry.next_free = self.free_head;
-        self.free_head = Some(root.index);
-        Some((entry.ptr, entry.handle_generation))
-    }
-
-    fn drain_occupied(&mut self) -> Vec<(ObjPtr<'cx>, u64)> {
-        self.free_head = None;
-        self.entries
-            .drain(..)
-            .filter(|entry| entry.occupied)
-            .map(|entry| (entry.ptr, entry.handle_generation))
-            .collect()
     }
 }
 
@@ -267,7 +154,6 @@ pub(crate) struct SharedState<'cx> {
     pub(crate) zeroes: RefCell<WorkQueue<'cx>>,
     pub(crate) metrics: MetricsCells,
     type_states: RefCell<Vec<HeapTypeState<'cx>>>,
-    roots: RefCell<RootTable<'cx>>,
     poisoned: Cell<bool>,
     next_generation: Cell<u64>,
     next_epoch: Cell<u64>,
@@ -282,7 +168,6 @@ impl<'cx> SharedState<'cx> {
             zeroes: RefCell::default(),
             metrics: MetricsCells::default(),
             type_states: RefCell::default(),
-            roots: RefCell::default(),
             poisoned: Cell::new(false),
             next_generation: Cell::new(1),
             next_epoch: Cell::new(1),
@@ -398,11 +283,6 @@ fn drop_payload_result(ptr: ObjPtr<'_>) -> Result<(), DropPayload> {
 
 impl Drop for SharedState<'_> {
     fn drop(&mut self) {
-        let roots = self.roots.get_mut().drain_occupied();
-        for (ptr, generation) in roots {
-            self.release_strong(ptr, generation, ReleaseOwner::Root);
-        }
-
         let mut live = vec![];
         self.for_each_initialized_slot(|ptr| {
             if ptr.header().begin_drop() {
@@ -642,71 +522,6 @@ impl<'cx> Heap<'cx> {
     }
 
     #[inline]
-    pub fn root<T: 'cx>(&mut self, handle: &Handle<'cx, T>) -> RootId<'cx, T> {
-        let heap_type_id = self
-            .check_handle(handle)
-            .expect("invalid heap handle")
-            .heap_type_id
-            .get();
-        self.state
-            .retain_strong(handle.ptr, handle.generation)
-            .expect("invalid heap handle");
-        self.state.roots.get_mut().insert(
-            self.state.heap_id,
-            handle.ptr,
-            handle.generation,
-            heap_type_id,
-        )
-    }
-
-    #[inline]
-    pub fn resolve_root<T: 'cx>(&self, root: &RootId<'cx, T>) -> Option<Handle<'cx, T>> {
-        let (ptr, generation) = self.root_ptr(root)?;
-        self.state.retain_strong(ptr, generation)?;
-        Some(Handle::from_raw(ptr, &self.state, generation))
-    }
-
-    #[inline]
-    pub fn with_root<T: 'cx, R>(
-        &self,
-        root: &RootId<'cx, T>,
-        f: impl FnOnce(&T) -> R,
-    ) -> Option<R> {
-        let (ptr, _) = self.root_ptr(root)?;
-        // SAFETY: `root_ptr` validated the live root for `T`.
-        Some(f(unsafe { Slot::payload_ref_unchecked(ptr) }))
-    }
-
-    #[inline]
-    pub fn with_root_mut<T: 'cx, R>(
-        &mut self,
-        root: &RootId<'cx, T>,
-        f: impl FnOnce(&mut T) -> R,
-    ) -> Option<R> {
-        let (ptr, _) = self.root_ptr(root)?;
-        // SAFETY: `root_ptr` validated the live root; `&mut Heap` is exclusive access.
-        Some(f(unsafe { Slot::payload_mut_unchecked(ptr) }))
-    }
-
-    #[inline]
-    pub fn remove_root<T>(&mut self, root: &RootId<'cx, T>) -> bool {
-        self.state.assert_not_poisoned();
-        let removed = self.state.roots.get_mut().remove(self.state.heap_id, root);
-        let Some((ptr, generation)) = removed else {
-            return false;
-        };
-        self.state
-            .release_strong(ptr, generation, ReleaseOwner::Root);
-        true
-    }
-
-    #[inline]
-    fn root_ptr<T>(&self, root: &RootId<'cx, T>) -> Option<(ObjPtr<'cx>, u64)> {
-        self.state.assert_not_poisoned();
-        self.state.roots.borrow().resolve(self.state.heap_id, root)
-    }
-
-    #[inline]
     fn pop_free<T: 'cx>(
         &mut self,
         heap_type: HeapType<'cx, T>,
@@ -881,7 +696,7 @@ impl<'cx> Heap<'cx> {
     }
 
     #[inline]
-    pub fn collect_with_roots<T: Trace<'cx>>(
+    pub fn collect_with_external_roots<T: Trace<'cx>>(
         &mut self,
         cycle_work_hint: usize,
         roots: &T,
@@ -895,7 +710,7 @@ impl<'cx> Heap<'cx> {
     }
 
     #[inline]
-    pub fn collect_all_with_roots<T: Trace<'cx>>(&mut self, roots: &T) -> CollectOutcome {
+    pub fn collect_all_with_external_roots<T: Trace<'cx>>(&mut self, roots: &T) -> CollectOutcome {
         self.collect_impl(None, false, true, Some(roots))
     }
 

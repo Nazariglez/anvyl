@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
-use crate::{AccessError, Handle, Heap, HeapType, Trace, TraceDriver, Visitor};
+use crate::{AccessError, Ctx, Handle, Heap, HeapType, Trace, TraceDriver, Visitor};
 
 const ERR_OWNER_OVERFLOW: &str = "too many logical collection storage owners";
 
@@ -36,6 +36,13 @@ impl<'cx, S> CowStorageOwner<'cx, S> {
         Self::new(heap.alloc(storage_ty, storage))
     }
 
+    pub fn alloc_in<'rt>(ctx: &mut Ctx<'cx, 'rt>, storage_ty: HeapType<'cx, S>, storage: S) -> Self
+    where
+        S: 'cx,
+    {
+        Self::new(ctx.heap().alloc(storage_ty, storage))
+    }
+
     #[must_use]
     pub fn share(&self) -> Self {
         let handle = self.handle.clone();
@@ -69,9 +76,9 @@ impl<'cx, S> CowStorageOwner<'cx, S> {
         &self.handle
     }
 
-    pub(crate) fn make_unique(
+    pub(crate) fn make_unique_in<'rt>(
         &mut self,
-        heap: &mut Heap<'cx>,
+        ctx: &mut Ctx<'cx, 'rt>,
         storage_ty: HeapType<'cx, S>,
     ) -> Result<(), AccessError>
     where
@@ -80,6 +87,7 @@ impl<'cx, S> CowStorageOwner<'cx, S> {
         if self.is_unique() {
             return Ok(());
         }
+        let mut heap = ctx.heap();
         let storage = heap.try_with(self.handle(), Clone::clone)?;
         let handle = heap.alloc(storage_ty, storage);
         self.replace_with_fresh(handle);

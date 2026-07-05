@@ -24,7 +24,7 @@ use crate::{cache, rust_deps};
 
 const PROVIDER_PROBE_TIMEOUT_ENV: &str = "ANVYX_PROVIDER_PROBE_TIMEOUT_SECS";
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_SECS: u64 = 600;
-const PROVIDER_PROBE_PROFILE: &str = "provider-probe-v1";
+const PROVIDER_PROBE_PROFILE: &str = "provider-probe-v2";
 
 fn provider_probe_timeout() -> Result<Duration, String> {
     parse_provider_probe_timeout(std::env::var(PROVIDER_PROBE_TIMEOUT_ENV).ok().as_deref())
@@ -1450,6 +1450,7 @@ mod tests {
                 crate_name: crate_name.to_string(),
                 segments: vec!["Handle".to_string()],
             },
+            owns_heap_edges: false,
         }
     }
 

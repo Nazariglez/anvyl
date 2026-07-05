@@ -1,5 +1,5 @@
 use anvyx_externs::{
-    CALLBACK_WRAPPER_MAX_ARITY, CallbackEscape, CallbackPolicy, CallbackThread,
+    AbiPosition, CALLBACK_WRAPPER_MAX_ARITY, CallbackEscape, CallbackPolicy, CallbackThread,
     ExternCallbackParam, ExternCallbackSignature, ExternTypeExpr,
 };
 use proc_macro2::TokenStream;
@@ -75,6 +75,7 @@ pub enum CleanParamAbi {
     MutPlace(CleanType),
     ScopedLambda(CleanCallback),
     EscapingLambda(CleanCallback),
+    AnvCallback(CleanCallback),
     InitField(Box<CleanParamAbi>),
     Option(Box<CleanParamAbi>),
     Result(Box<CleanParamAbi>, Box<CleanParamAbi>),
@@ -857,6 +858,10 @@ pub fn param_abi_tokens(abi: &CleanParamAbi) -> TokenStream {
             let callback = callback_signature_tokens(&extern_callback_signature(callback));
             quote! { anvyx_runtime::RustParamAbi::EscapingLambda(#callback) }
         }
+        CleanParamAbi::AnvCallback(callback) => {
+            let callback = callback_signature_tokens(&extern_callback_signature(callback));
+            quote! { anvyx_runtime::RustParamAbi::AnvCallback(#callback) }
+        }
         CleanParamAbi::InitField(inner) => {
             let inner = param_abi_tokens(inner);
             quote! { anvyx_runtime::RustParamAbi::InitField(Box::new(#inner)) }
@@ -933,6 +938,9 @@ fn param_abi_for_source(
         return Ok(param_abi(ty, flow));
     }
     match ty {
+        CleanType::Callback(callback) if is_anv_callback_source(source) => {
+            Ok(CleanParamAbi::AnvCallback(callback.clone()))
+        }
         CleanType::Named(_) if is_anv_ref_source(source)? => Ok(CleanParamAbi::Value(ty.clone())),
         CleanType::Named(_) => Ok(CleanParamAbi::OwnedNamed(ty.clone())),
         CleanType::Option(inner) => match option_type_arg(source)? {
@@ -976,6 +984,9 @@ pub fn param_abi_for_override(
             CleanParamAbi::OwnedNamed(ty.clone())
         }
         (CleanParamAbi::Value(_), CleanType::Named(_)) => CleanParamAbi::Value(ty.clone()),
+        (CleanParamAbi::AnvCallback(_), CleanType::Callback(callback)) => {
+            CleanParamAbi::AnvCallback(callback.clone())
+        }
         (CleanParamAbi::Option(inner), CleanType::Option(ty)) => CleanParamAbi::Option(Box::new(
             param_abi_for_override(inner, ty, CleanFlow::Value),
         )),
@@ -1059,6 +1070,13 @@ fn owner_name(path: &TypePath, owner: Option<OwnerReturn<'_>>) -> Option<String>
     }
 }
 
+fn is_anv_callback_source(source: &Type) -> bool {
+    let Type::Path(path) = source else {
+        return false;
+    };
+    path_is(path, &["AnvCallback"]) || path_is(path, &["anvyx_runtime", "AnvCallback"])
+}
+
 fn is_anv_ref_source(source: &Type) -> syn::Result<bool> {
     let Type::Path(path) = source else {
         return Ok(false);
@@ -1080,6 +1098,15 @@ pub fn has_callback_wrapper(params: &[CleanParam]) -> bool {
     params
         .iter()
         .any(|param| matches!(param.ty, CleanType::Callback(_)))
+}
+
+pub fn callback_wrapper_requires_ctxless(params: &[CleanParam]) -> bool {
+    params.iter().any(|param| {
+        matches!(
+            param.abi,
+            CleanParamAbi::ScopedLambda(_) | CleanParamAbi::EscapingLambda(_)
+        )
+    })
 }
 
 pub fn validate_callback_wrapper_precheck(
@@ -1163,7 +1190,7 @@ fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
     }
     match ty {
         CleanType::Callback(_) => BoundaryConversion::NeedsWrapper,
-        _ if direct_abi_supported(ty) => BoundaryConversion::Direct,
+        _ if abi_supported_at(ty, AbiPosition::ParamValue) => BoundaryConversion::Direct,
         _ => BoundaryConversion::Unsupported,
     }
 }
@@ -1171,30 +1198,13 @@ fn param_conversion(ty: &CleanType, flow: CleanFlow) -> BoundaryConversion {
 pub fn return_conversion_for_type(ty: &CleanType) -> BoundaryConversion {
     match ty {
         CleanType::Callback(_) | CleanType::Slice(_) => BoundaryConversion::Unsupported,
-        _ if direct_abi_supported(ty) => BoundaryConversion::Direct,
+        _ if abi_supported_at(ty, AbiPosition::Return) => BoundaryConversion::Direct,
         _ => BoundaryConversion::Unsupported,
     }
 }
 
-fn direct_abi_supported(ty: &CleanType) -> bool {
-    match ty {
-        CleanType::Void
-        | CleanType::Unit
-        | CleanType::Bool
-        | CleanType::Int
-        | CleanType::Float
-        | CleanType::String
-        | CleanType::Named(_)
-        | CleanType::List(_) => true,
-        CleanType::Option(inner)
-        | CleanType::Array { elem: inner, .. }
-        | CleanType::Slice(inner) => direct_abi_supported(inner),
-        CleanType::Result(ok, err) | CleanType::Map(ok, err) => {
-            direct_abi_supported(ok) && direct_abi_supported(err)
-        }
-        CleanType::Tuple(fields) => fields.iter().all(direct_abi_supported),
-        CleanType::Callback(_) => false,
-    }
+fn abi_supported_at(ty: &CleanType, position: AbiPosition) -> bool {
+    extern_type_expr(ty).classify_abi(position).is_ok()
 }
 
 pub(crate) fn reject_wrapper_element(
@@ -1250,6 +1260,7 @@ fn reserved_named_boundary_type(ident: &Ident) -> bool {
             | "String"
             | "ScopedLambda"
             | "EscapingLambda"
+            | "AnvCallback"
             | "MutPlace"
             | "Ctx"
             | "RuntimeError"
@@ -1275,6 +1286,8 @@ fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> 
             CallbackEscape::NonEscaping
         } else if path_is(path, &["EscapingLambda"])
             || path_is(path, &["anvyx_runtime", "EscapingLambda"])
+            || path_is(path, &["AnvCallback"])
+            || path_is(path, &["anvyx_runtime", "AnvCallback"])
         {
             CallbackEscape::Escaping
         } else {
@@ -1307,6 +1320,28 @@ fn callback_wrapper_type(path: &TypePath) -> syn::Result<Option<CleanCallback>> 
                         "ScopedLambda lifetimes must be `'_`",
                     ));
                 }
+            }
+            (
+                args.next().expect("checked len"),
+                args.next().expect("checked len"),
+            )
+        }
+        CallbackEscape::Escaping
+            if path_is(path, &["AnvCallback"])
+                || path_is(path, &["anvyx_runtime", "AnvCallback"]) =>
+        {
+            if generic_args.args.len() != 3 {
+                return Err(syn::Error::new_spanned(
+                    generic_args,
+                    "AnvCallback parameters must be `AnvCallback<'cx, Args, Ret>`",
+                ));
+            }
+            let cx = args.next().expect("checked len");
+            if !matches!(cx, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx") {
+                return Err(syn::Error::new_spanned(
+                    cx,
+                    "AnvCallback lifetime must be `'cx`",
+                ));
             }
             (
                 args.next().expect("checked len"),
@@ -1625,16 +1660,29 @@ fn anv_ref_type_arg(path: &TypePath) -> syn::Result<Option<String>> {
             "AnvRef requires a concrete type argument",
         ));
     };
-    if ty.qself.is_none()
-        && ty.path.segments.len() == 1
-        && matches!(ty.path.segments[0].arguments, PathArguments::None)
-    {
-        return Ok(Some(ty.path.segments[0].ident.to_string()));
+    if ty.qself.is_none() && ty.path.segments.len() == 1 {
+        let segment = &ty.path.segments[0];
+        if matches!(segment.arguments, PathArguments::None)
+            || lifetime_only_args(&segment.arguments)
+        {
+            return Ok(Some(segment.ident.to_string()));
+        }
     }
     Err(syn::Error::new_spanned(
         ty,
         "AnvRef resource type must be a concrete non-generic type name",
     ))
+}
+
+fn lifetime_only_args(args: &PathArguments) -> bool {
+    let PathArguments::AngleBracketed(args) = args else {
+        return false;
+    };
+    !args.args.is_empty()
+        && args
+            .args
+            .iter()
+            .all(|arg| matches!(arg, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx"))
 }
 
 fn mut_place_type_arg(path: &TypePath) -> syn::Result<Option<&Type>> {

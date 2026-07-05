@@ -19,6 +19,10 @@ impl<T: AnvyxRefExport> Clone for AnvRefType<'_, T> {
 
 impl<'cx, T: AnvyxRefExport + 'cx> AnvRefType<'cx, T> {
     pub fn register_untracked(heap: &mut Heap<'cx>) -> Self {
+        assert!(
+            !T::OWNS_ANVYX_HEAP_EDGES,
+            "resource type owns Anvyx heap edges and must be registered as tracked"
+        );
         Self {
             heap_type: heap.register_untracked::<T>(),
         }
@@ -30,6 +34,25 @@ impl<'cx, T: AnvyxRefExport + 'cx> AnvRefType<'cx, T> {
     {
         Self {
             heap_type: heap.register_tracked::<T>(),
+        }
+    }
+
+    pub fn register_untracked_in<'rt>(ctx: &mut Ctx<'cx, 'rt>) -> Self {
+        assert!(
+            !T::OWNS_ANVYX_HEAP_EDGES,
+            "resource type owns Anvyx heap edges and must be registered as tracked"
+        );
+        Self {
+            heap_type: ctx.heap().register_untracked::<T>(),
+        }
+    }
+
+    pub fn register_tracked_in<'rt>(ctx: &mut Ctx<'cx, 'rt>) -> Self
+    where
+        T: Trace<'cx>,
+    {
+        Self {
+            heap_type: ctx.heap().register_tracked::<T>(),
         }
     }
 
@@ -48,7 +71,9 @@ impl<'cx, T: AnvyxRefExport + 'cx> AnvRefType<'cx, T> {
     }
 
     pub fn alloc_in<'rt>(self, ctx: &mut Ctx<'cx, 'rt>, value: T) -> AnvRef<'cx, T> {
-        self.alloc(ctx.heap(), value)
+        AnvRef {
+            handle: ctx.heap().alloc(self.heap_type, value),
+        }
     }
 
     pub fn with_erased<R>(
@@ -99,8 +124,20 @@ impl<'cx, T: AnvyxRefExport + 'cx> AnvRef<'cx, T> {
         heap.erase(&self.handle)
     }
 
+    pub fn erase_in<'rt>(&self, ctx: &Ctx<'cx, 'rt>) -> Result<ErasedHandle<'cx>, AccessError> {
+        ctx.heap_ref().erase(&self.handle)
+    }
+
     pub fn with<R>(&self, heap: &Heap<'cx>, f: impl FnOnce(&T) -> R) -> Result<R, AccessError> {
         heap.try_with(&self.handle, f)
+    }
+
+    pub fn with_in<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, AccessError> {
+        ctx.heap_ref().try_with(&self.handle, f)
     }
 
     pub fn with_mut<R>(
@@ -109,6 +146,14 @@ impl<'cx, T: AnvyxRefExport + 'cx> AnvRef<'cx, T> {
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, AccessError> {
         heap.try_with_mut(&self.handle, f)
+    }
+
+    pub fn with_mut_in<'rt, R>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, AccessError> {
+        ctx.heap().try_with_mut(&self.handle, f)
     }
 }
 

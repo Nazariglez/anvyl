@@ -26,6 +26,19 @@ impl DerivedVec2 {
     }
 }
 
+#[derive(AnvyxRef)]
+struct GenericResource<'cx> {
+    id: i64,
+    _brand: std::marker::PhantomData<&'cx ()>,
+}
+
+#[methods]
+impl GenericResource<'_> {
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+}
+
 struct CallbackOps {
     id: i64,
 }
@@ -510,6 +523,14 @@ impl Vec2 {
     pub fn scale_left(&self, lhs: f64) -> f64 {
         lhs * self.x
     }
+}
+
+#[test]
+fn methods_merge_into_generic_ref_descriptor() {
+    let export = __anvyx_export_genericresource();
+
+    assert_eq!(export.descriptor.name, "GenericResource");
+    assert_eq!(export.descriptor.methods[0].name, "id");
 }
 
 #[test]

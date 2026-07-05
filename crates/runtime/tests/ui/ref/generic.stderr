@@ -1,4 +1,4 @@
-error: AnvyxRef does not support generic types yet
+error: AnvyxRef only supports an optional `'cx` lifetime
  --> tests/ui/ref/generic.rs:4:13
   |
 4 | struct Boxed<T> {

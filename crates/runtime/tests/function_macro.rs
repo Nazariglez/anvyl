@@ -138,7 +138,7 @@ struct Counter {
 
 #[function(ctx)]
 fn make_counter<'cx>(ctx: &mut Ctx<'cx, '_>) -> AnvRef<'cx, Counter> {
-    AnvRefType::<Counter>::register_untracked(ctx.heap()).alloc_in(ctx, Counter { value: 1 })
+    AnvRefType::<Counter>::register_untracked_in(ctx).alloc_in(ctx, Counter { value: 1 })
 }
 
 #[test]

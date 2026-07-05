@@ -1,8 +1,6 @@
 use std::ptr::NonNull;
 
-pub use crate::suspect_buffer::{
-    get_collect_threshold, reset_collect_threshold, set_auto_collect, set_collect_threshold,
-};
+pub use crate::suspect_buffer::{reset_collect_threshold, set_auto_collect};
 use crate::{
     managed_rc::{CycleColor, RcHeader},
     suspect_buffer::SUSPECT_BUFFER,

@@ -18,28 +18,19 @@ pub enum CallbackSlotState {
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallbackCloseAction {
-    None,
-    RemoveRoot,
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallbackCloseResult {
     pub closed: bool,
-    pub action: CallbackCloseAction,
 }
 
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct CallbackSlot<Root> {
-    root: Option<Root>,
-    meta: Box<CallbackSlotMeta>,
+pub struct CallbackSlot<Handle> {
+    inner: Box<CallbackSlotInner<Handle>>,
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub struct CallbackSlotMeta {
+struct CallbackSlotInner<Handle> {
+    handle: Option<Handle>,
     generation: NonZeroU64,
     state: CallbackSlotState,
     active_invocations: usize,
@@ -47,80 +38,73 @@ pub struct CallbackSlotMeta {
 
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct CallbackInvocationGuard {
+pub struct CallbackInvocationGuard<Handle> {
     owner: RuntimeOwnerHandle,
     key: CallbackKey,
-    slot: NonNull<CallbackSlotMeta>,
+    slot: NonNull<CallbackSlotInner<Handle>>,
     active: bool,
 }
 
-impl<Root> Default for CallbackSlot<Root> {
+impl<Handle> Default for CallbackSlot<Handle> {
     fn default() -> Self {
         Self {
-            root: None,
-            meta: Box::default(),
+            inner: Box::default(),
         }
     }
 }
 
-impl<Root> CallbackSlot<Root> {
+impl<Handle> CallbackSlot<Handle> {
     pub fn is_free(&self) -> bool {
-        self.root.is_none()
+        self.inner.handle.is_none()
             && matches!(
-                self.meta.state(),
+                self.inner.state(),
                 CallbackSlotState::Vacant | CallbackSlotState::Closed
             )
     }
 
     pub fn generation(&self) -> NonZeroU64 {
-        self.meta.generation()
+        self.inner.generation()
     }
 
     pub fn state(&self) -> CallbackSlotState {
-        self.meta.state()
+        self.inner.state()
     }
 
-    pub fn insert(&mut self, root: Root) -> Result<NonZeroU64, RuntimeError> {
-        if self.root.is_some() {
-            return Err(RuntimeError::new("callback slot is already open"));
-        }
-        let generation = self.meta.open()?;
-        self.root = Some(root);
-        Ok(generation)
+    pub fn insert(&mut self, handle: Handle) -> Result<NonZeroU64, RuntimeError> {
+        self.inner.insert(handle)
     }
 
-    pub fn begin_invocation(
-        &mut self,
-        owner: &RuntimeOwnerHandle,
-        key: CallbackKey,
-    ) -> Result<(&Root, CallbackInvocationGuard), RuntimeError> {
-        let root = self
-            .root
-            .as_ref()
-            .ok_or_else(|| RuntimeError::new("callback slot is closed"))?;
-        let guard = self.meta.begin_invocation(owner, key)?;
-        Ok((root, guard))
-    }
-
-    pub fn close(&mut self, key: CallbackKey) -> (CallbackCloseResult, Option<Root>) {
-        let close = self.meta.close(key);
-        let should_remove_root =
-            close.action == CallbackCloseAction::RemoveRoot || self.meta.closed_for(key);
-        let root = should_remove_root.then(|| self.root.take()).flatten();
-        (close, root)
-    }
-
-    pub fn take_closed_root(&mut self, key: CallbackKey) -> Option<Root> {
-        self.meta
-            .closed_for(key)
-            .then(|| self.root.take())
-            .flatten()
+    pub fn close(&mut self, key: CallbackKey) -> CallbackCloseResult {
+        self.inner.close(key)
     }
 }
 
-impl Default for CallbackSlotMeta {
+impl<Handle: Clone> CallbackSlot<Handle> {
+    /// # Safety
+    ///
+    /// The owning callback slot allocation must outlive the returned guard.
+    pub unsafe fn begin_invocation(
+        &mut self,
+        owner: &RuntimeOwnerHandle,
+        key: CallbackKey,
+    ) -> Result<(Handle, CallbackInvocationGuard<Handle>), RuntimeError> {
+        let handle = self.inner.begin_invocation(owner, key)?;
+        Ok((
+            handle,
+            CallbackInvocationGuard {
+                owner: owner.clone(),
+                key,
+                slot: NonNull::from(self.inner.as_mut()),
+                active: true,
+            },
+        ))
+    }
+}
+
+impl<Handle> Default for CallbackSlotInner<Handle> {
     fn default() -> Self {
         Self {
+            handle: None,
             generation: nonzero(1),
             state: CallbackSlotState::Vacant,
             active_invocations: 0,
@@ -128,16 +112,25 @@ impl Default for CallbackSlotMeta {
     }
 }
 
-impl CallbackSlotMeta {
-    pub fn generation(&self) -> NonZeroU64 {
+impl<Handle> CallbackSlotInner<Handle> {
+    fn generation(&self) -> NonZeroU64 {
         self.generation
     }
 
-    pub fn state(&self) -> CallbackSlotState {
+    fn state(&self) -> CallbackSlotState {
         self.state
     }
 
-    pub fn open(&mut self) -> Result<NonZeroU64, RuntimeError> {
+    fn insert(&mut self, handle: Handle) -> Result<NonZeroU64, RuntimeError> {
+        if self.handle.is_some() {
+            return Err(RuntimeError::new("callback slot is already open"));
+        }
+        let generation = self.open()?;
+        self.handle = Some(handle);
+        Ok(generation)
+    }
+
+    fn open(&mut self) -> Result<NonZeroU64, RuntimeError> {
         match self.state {
             CallbackSlotState::Vacant | CallbackSlotState::Closed => {}
             CallbackSlotState::Open | CallbackSlotState::Closing => {
@@ -159,53 +152,32 @@ impl CallbackSlotMeta {
         Ok(self.generation)
     }
 
-    pub fn begin_invocation(
-        &mut self,
-        owner: &RuntimeOwnerHandle,
-        key: CallbackKey,
-    ) -> Result<CallbackInvocationGuard, RuntimeError> {
-        self.check_live_key(key)?;
-        if self.state != CallbackSlotState::Open {
-            return Err(RuntimeError::new("callback slot is not open"));
-        }
-        let next_invocations = self
-            .active_invocations
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::new("callback slot invocation count overflow"))?;
-        owner.__anvyx_increment_active_invocations()?;
-        self.active_invocations = next_invocations;
-        Ok(CallbackInvocationGuard {
-            owner: owner.clone(),
-            key,
-            slot: NonNull::from(self),
-            active: true,
-        })
-    }
-
-    pub fn close(&mut self, key: CallbackKey) -> CallbackCloseResult {
+    fn close(&mut self, key: CallbackKey) -> CallbackCloseResult {
         if self.generation != key.slot_generation() {
-            return CallbackCloseResult::none();
+            return CallbackCloseResult { closed: false };
         }
-        match self.state {
+        let closed = match self.state {
             CallbackSlotState::Open if self.active_invocations == 0 => {
                 self.state = CallbackSlotState::Closed;
-                CallbackCloseResult::remove_root()
+                self.handle.take();
+                true
             }
             CallbackSlotState::Open => {
                 self.state = CallbackSlotState::Closing;
-                CallbackCloseResult::closed()
+                true
             }
-            CallbackSlotState::Vacant
-            | CallbackSlotState::Closing
-            | CallbackSlotState::Closed
-            | CallbackSlotState::Retired => CallbackCloseResult::none(),
-        }
+            CallbackSlotState::Closed => {
+                self.handle.take();
+                false
+            }
+            CallbackSlotState::Vacant | CallbackSlotState::Closing | CallbackSlotState::Retired => {
+                false
+            }
+        };
+        CallbackCloseResult { closed }
     }
 
-    pub fn finish_invocation(
-        &mut self,
-        key: CallbackKey,
-    ) -> Result<CallbackCloseAction, RuntimeError> {
+    fn finish_invocation(&mut self, key: CallbackKey) -> Result<(), RuntimeError> {
         self.check_live_key(key)?;
         if self.active_invocations == 0 {
             return Err(RuntimeError::new("callback slot invocation underflow"));
@@ -213,10 +185,9 @@ impl CallbackSlotMeta {
         self.active_invocations -= 1;
         if self.state == CallbackSlotState::Closing && self.active_invocations == 0 {
             self.state = CallbackSlotState::Closed;
-            Ok(CallbackCloseAction::RemoveRoot)
-        } else {
-            Ok(CallbackCloseAction::None)
+            self.handle.take();
         }
+        Ok(())
     }
 
     fn check_live_key(&self, key: CallbackKey) -> Result<(), RuntimeError> {
@@ -226,45 +197,43 @@ impl CallbackSlotMeta {
             Err(RuntimeError::new("callback slot generation mismatch"))
         }
     }
+}
 
-    fn closed_for(&self, key: CallbackKey) -> bool {
-        self.generation == key.slot_generation() && self.state == CallbackSlotState::Closed
+impl<Handle: Clone> CallbackSlotInner<Handle> {
+    fn begin_invocation(
+        &mut self,
+        owner: &RuntimeOwnerHandle,
+        key: CallbackKey,
+    ) -> Result<Handle, RuntimeError> {
+        self.check_live_key(key)?;
+        if self.state != CallbackSlotState::Open {
+            return Err(RuntimeError::new("callback slot is not open"));
+        }
+        let next_invocations = self
+            .active_invocations
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::new("callback slot invocation count overflow"))?;
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("callback slot is closed"))?
+            .clone();
+        owner.__anvyx_increment_active_invocations()?;
+        self.active_invocations = next_invocations;
+        Ok(handle)
     }
 }
 
-impl CallbackCloseResult {
-    fn none() -> Self {
-        Self {
-            closed: false,
-            action: CallbackCloseAction::None,
-        }
-    }
-
-    fn remove_root() -> Self {
-        Self {
-            closed: true,
-            action: CallbackCloseAction::RemoveRoot,
-        }
-    }
-
-    fn closed() -> Self {
-        Self {
-            closed: true,
-            action: CallbackCloseAction::None,
-        }
-    }
-}
-
-impl CallbackInvocationGuard {
-    pub fn finish(mut self) -> Result<CallbackCloseAction, RuntimeError> {
-        let action = unsafe { self.slot.as_mut().finish_invocation(self.key) };
+impl<Handle> CallbackInvocationGuard<Handle> {
+    pub fn finish(mut self) -> Result<(), RuntimeError> {
+        unsafe { self.slot.as_mut().finish_invocation(self.key) }?;
         self.owner.__anvyx_decrement_active_invocations();
         self.active = false;
-        action
+        Ok(())
     }
 }
 
-impl Drop for CallbackInvocationGuard {
+impl<Handle> Drop for CallbackInvocationGuard<Handle> {
     fn drop(&mut self) {
         if !self.active {
             return;
@@ -322,51 +291,43 @@ mod tests {
 
     #[test]
     fn close_is_idempotent_for_closed_slot() {
-        let mut slot = CallbackSlotMeta::default();
-        let key = key(slot.open().unwrap());
+        let mut slot = CallbackSlotInner::<()>::default();
+        let key = key(slot.insert(()).unwrap());
 
-        assert_eq!(
-            slot.close(key),
-            CallbackCloseResult {
-                closed: true,
-                action: CallbackCloseAction::RemoveRoot,
-            }
-        );
-        assert_eq!(slot.close(key), CallbackCloseResult::none());
+        assert!(slot.close(key).closed);
+        assert_eq!(slot.handle, None);
+        assert!(!slot.close(key).closed);
     }
 
     #[test]
     fn stale_generation_close_is_false() {
-        let mut slot = CallbackSlotMeta::default();
+        let mut slot = CallbackSlotInner::<()>::default();
         let stale = key(slot.generation());
-        slot.open().unwrap();
+        slot.insert(()).unwrap();
 
-        assert_eq!(slot.close(stale), CallbackCloseResult::none());
+        assert!(!slot.close(stale).closed);
     }
 
     #[test]
     fn open_rejects_live_or_closing_slot() {
         let (owner, _runtime) = owner();
-        let mut slot = CallbackSlotMeta::default();
-        let key = key(slot.open().unwrap());
+        let mut slot = CallbackSlot::default();
+        let key = key(slot.insert(7).unwrap());
 
         assert_eq!(
-            slot.open().unwrap_err().message(),
+            slot.insert(8).unwrap_err().message(),
             "callback slot is already open"
         );
-        let guard = slot.begin_invocation(&owner, key).unwrap();
-        assert_eq!(slot.close(key).action, CallbackCloseAction::None);
-        assert_eq!(
-            slot.open().unwrap_err().message(),
-            "callback slot is already open"
-        );
+        let (_, guard) = unsafe { slot.begin_invocation(&owner, key) }.unwrap();
         drop(guard);
+        assert!(slot.close(key).closed);
     }
 
     #[test]
     fn begin_invocation_overflow_does_not_increment_owner() {
         let (owner, _runtime) = owner();
-        let mut slot = CallbackSlotMeta {
+        let mut slot = CallbackSlotInner {
+            handle: Some(7),
             generation: nonzero(2),
             state: CallbackSlotState::Open,
             active_invocations: usize::MAX,
@@ -382,7 +343,8 @@ mod tests {
 
     #[test]
     fn generation_overflow_retires_slot() {
-        let mut slot = CallbackSlotMeta {
+        let mut slot = CallbackSlotInner::<()> {
+            handle: None,
             generation: nonzero(u64::MAX),
             state: CallbackSlotState::Vacant,
             active_invocations: 0,
@@ -396,29 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn active_close_defers_root_removal_until_finish() {
+    fn active_close_defers_handle_removal_until_finish() {
         let (owner, _runtime) = owner();
-        let mut slot = CallbackSlotMeta::default();
-        let key = key(slot.open().unwrap());
-        let guard = slot.begin_invocation(&owner, key).unwrap();
+        let mut slot = CallbackSlot::default();
+        let key = key(slot.insert(7).unwrap());
+        let (_, guard) = unsafe { slot.begin_invocation(&owner, key) }.unwrap();
 
-        assert_eq!(
-            slot.close(key),
-            CallbackCloseResult {
-                closed: true,
-                action: CallbackCloseAction::None,
-            }
-        );
-        assert_eq!(guard.finish().unwrap(), CallbackCloseAction::RemoveRoot);
+        let close = slot.close(key);
+        assert!(close.closed);
+        assert_eq!(slot.inner.handle, Some(7));
+        assert_eq!(slot.state(), CallbackSlotState::Closing);
+
+        guard.finish().unwrap();
+        assert_eq!(slot.inner.handle, None);
         assert_eq!(slot.state(), CallbackSlotState::Closed);
     }
 
     #[test]
     fn invocation_guard_blocks_shutdown_until_drop() {
         let (owner, _runtime) = owner();
-        let mut slot = CallbackSlotMeta::default();
-        let key = key(slot.open().unwrap());
-        let guard = slot.begin_invocation(&owner, key).unwrap();
+        let mut slot = CallbackSlot::default();
+        let key = key(slot.insert(7).unwrap());
+        let (_, guard) = unsafe { slot.begin_invocation(&owner, key) }.unwrap();
 
         assert_eq!(
             owner.__anvyx_begin_shutdown().unwrap_err().message(),
@@ -429,34 +390,52 @@ mod tests {
     }
 
     #[test]
+    fn guard_survives_vec_growth() {
+        let (owner, _runtime) = owner();
+        let mut slots = vec![CallbackSlot::default()];
+        let key = key(slots[0].insert(7).unwrap());
+        let (_, guard) = unsafe { slots[0].begin_invocation(&owner, key) }.unwrap();
+        let inner = NonNull::from(slots[0].inner.as_mut());
+
+        for _ in 0..128 {
+            slots.push(CallbackSlot::default());
+        }
+
+        assert_eq!(inner, NonNull::from(slots[0].inner.as_mut()));
+        assert!(slots[0].close(key).closed);
+        guard.finish().unwrap();
+        assert!(slots[0].is_free());
+    }
+
+    #[test]
     fn slot_reuse_keeps_generation_moving() {
         let (owner, _runtime) = owner();
         let mut slot = CallbackSlot::default();
         let first_generation = slot.insert("first").unwrap();
         let first_key = key(first_generation);
 
-        let (close, root) = slot.close(first_key);
+        let close = slot.close(first_key);
         assert!(close.closed);
-        assert_eq!(root, Some("first"));
+        assert!(slot.is_free());
 
         let second_generation = slot.insert("second").unwrap();
         assert_ne!(first_generation, second_generation);
-        assert!(slot.begin_invocation(&owner, first_key).is_err());
+        assert!(unsafe { slot.begin_invocation(&owner, first_key) }.is_err());
     }
 
     #[test]
-    fn slot_close_during_invocation_defers_root_removal() {
+    fn slot_close_during_invocation_defers_handle_removal() {
         let (owner, _runtime) = owner();
         let mut slot = CallbackSlot::default();
         let key = key(slot.insert(7).unwrap());
-        let (_, guard) = slot.begin_invocation(&owner, key).unwrap();
+        let (handle, guard) = unsafe { slot.begin_invocation(&owner, key) }.unwrap();
 
-        let (close, root) = slot.close(key);
-        assert_eq!(close.action, CallbackCloseAction::None);
-        assert_eq!(root, None);
+        let close = slot.close(key);
+        assert!(close.closed);
+        assert_eq!(handle, 7);
+        assert_eq!(slot.state(), CallbackSlotState::Closing);
 
-        assert_eq!(guard.finish().unwrap(), CallbackCloseAction::RemoveRoot);
-        assert_eq!(slot.take_closed_root(key), Some(7));
-        assert_eq!(slot.take_closed_root(key), None);
+        guard.finish().unwrap();
+        assert!(slot.is_free());
     }
 }

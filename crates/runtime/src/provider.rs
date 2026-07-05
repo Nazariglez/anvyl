@@ -21,6 +21,7 @@ pub struct FunctionExport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeExport {
     pub rust_type_path: &'static str,
+    pub owns_heap_edges: bool,
     pub descriptor: ExternTypeDescriptor,
     pub bindings: Vec<RustMemberBinding>,
 }
@@ -117,7 +118,9 @@ fn retarget_param_abi(abi: &mut RustParamAbi, source_name: &str, target_name: &s
         | RustParamAbi::MutPlace(ty) => {
             retarget_type(ty, source_name, target_name);
         }
-        RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
+        RustParamAbi::ScopedLambda(callback)
+        | RustParamAbi::EscapingLambda(callback)
+        | RustParamAbi::AnvCallback(callback) => {
             retarget_callback(callback, source_name, target_name);
         }
         RustParamAbi::InitField(inner)
@@ -176,7 +179,9 @@ fn qualify_param_abi_owner(abi: &mut RustParamAbi, owner: &ExternTypeKey) {
         | RustParamAbi::Borrow(ty)
         | RustParamAbi::MutBorrow(ty)
         | RustParamAbi::MutPlace(ty) => qualify_owner_type(ty, owner),
-        RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
+        RustParamAbi::ScopedLambda(callback)
+        | RustParamAbi::EscapingLambda(callback)
+        | RustParamAbi::AnvCallback(callback) => {
             qualify_callback_owner(callback, owner);
         }
         RustParamAbi::InitField(inner)
@@ -394,6 +399,7 @@ impl ModuleExportItem for TypeExport {
                 crate_name: crate_name.to_string(),
                 segments,
             },
+            owns_heap_edges: self.owns_heap_edges,
         }]
     }
 }
@@ -438,6 +444,7 @@ pub struct RustModuleSupport {
 pub struct RustTypeBinding {
     pub key: ExternTypeKey,
     pub path: RustPath,
+    pub owns_heap_edges: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -505,6 +512,7 @@ pub enum RustParamAbi {
     MutPlace(ExternTypeExpr),
     ScopedLambda(ExternCallbackSignature),
     EscapingLambda(ExternCallbackSignature),
+    AnvCallback(ExternCallbackSignature),
     InitField(Box<RustParamAbi>),
     Option(Box<RustParamAbi>),
     Result(Box<RustParamAbi>, Box<RustParamAbi>),
@@ -539,7 +547,14 @@ impl RustExternAbi {
         &self,
         receiver: Option<usize>,
     ) -> Option<CallbackWrapperAbiError> {
-        if self.ctx != RustWrapperCtx::None {
+        if self.ctx != RustWrapperCtx::None
+            && self.params.iter().any(|param| {
+                matches!(
+                    param,
+                    RustParamAbi::ScopedLambda(_) | RustParamAbi::EscapingLambda(_)
+                )
+            })
+        {
             return Some(CallbackWrapperAbiError::Ctx);
         }
         if receiver.is_some()
@@ -662,6 +677,44 @@ impl RustParamAbi {
         self.class() == RustAbiClass::CallbackWrapper
     }
 
+    pub fn callback_wrapper_signature(&self) -> Option<&ExternCallbackSignature> {
+        match self {
+            Self::ScopedLambda(callback)
+            | Self::EscapingLambda(callback)
+            | Self::AnvCallback(callback) => Some(callback),
+            _ => None,
+        }
+    }
+
+    pub fn callback_wrapper_escape(&self) -> Option<CallbackEscape> {
+        match self {
+            Self::ScopedLambda(_) => Some(CallbackEscape::NonEscaping),
+            Self::EscapingLambda(_) | Self::AnvCallback(_) => Some(CallbackEscape::Escaping),
+            _ => None,
+        }
+    }
+
+    pub fn matches_extern_param(&self, param: &ExternParam) -> bool {
+        param_abi_matches(param, self)
+    }
+
+    pub fn callback_wrapper_matches_param(&self, param: &ExternParam) -> bool {
+        let ExternTypeExpr::Callback(callback) = &param.ty else {
+            return false;
+        };
+        let Some(abi_callback) = self.callback_wrapper_signature() else {
+            return false;
+        };
+        let Some(escape) = self.callback_wrapper_escape() else {
+            return false;
+        };
+        callback == abi_callback
+            && param.flow == ParamFlow::Value
+            && callback.policy.escape == escape
+            && callback.policy.thread == CallbackThread::SameThread
+            && effective_callback_escape(param.escape, callback).is_ok()
+    }
+
     pub fn direct_collection_abi(&self) -> bool {
         matches!(self.class(), RustAbiClass::BackendUnsupported)
             && self.contains_direct_collection()
@@ -682,13 +735,16 @@ impl RustParamAbi {
             | Self::MutBorrow(_)
             | Self::MutPlace(_)
             | Self::ScopedLambda(_)
-            | Self::EscapingLambda(_) => false,
+            | Self::EscapingLambda(_)
+            | Self::AnvCallback(_) => false,
         }
     }
 
     fn class(&self) -> RustAbiClass {
         match self {
-            Self::ScopedLambda(_) | Self::EscapingLambda(_) => RustAbiClass::CallbackWrapper,
+            Self::ScopedLambda(_) | Self::EscapingLambda(_) | Self::AnvCallback(_) => {
+                RustAbiClass::CallbackWrapper
+            }
             Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
                 inner.direct_class()
             }
@@ -734,7 +790,7 @@ impl RustParamAbi {
             Self::Result(ok, err) => {
                 ok.contains_direct_collection() || err.contains_direct_collection()
             }
-            Self::ScopedLambda(_) | Self::EscapingLambda(_) => false,
+            Self::ScopedLambda(_) | Self::EscapingLambda(_) | Self::AnvCallback(_) => false,
         }
     }
 
@@ -745,7 +801,7 @@ impl RustParamAbi {
             | Self::Borrow(ty)
             | Self::MutBorrow(ty)
             | Self::MutPlace(ty) => type_contains_callback(ty),
-            Self::ScopedLambda(_) | Self::EscapingLambda(_) => true,
+            Self::ScopedLambda(_) | Self::EscapingLambda(_) | Self::AnvCallback(_) => true,
             Self::InitField(inner) | Self::Option(inner) | Self::Slice(inner) => {
                 inner.contains_callback()
             }
@@ -767,12 +823,17 @@ impl RustParamAbi {
             | Self::Borrow(_)
             | Self::MutBorrow(_)
             | Self::ScopedLambda(_)
-            | Self::EscapingLambda(_) => false,
+            | Self::EscapingLambda(_)
+            | Self::AnvCallback(_) => false,
         }
     }
 }
 
 impl RustReturnAbi {
+    pub fn matches_extern_type(&self, ty: &ExternTypeExpr) -> bool {
+        return_abi_matches(ty, self)
+    }
+
     pub fn direct_collection_abi(&self) -> bool {
         matches!(self.class(), RustAbiClass::BackendUnsupported)
             && self.contains_direct_collection()
@@ -864,8 +925,13 @@ pub fn validate_rust_provider_support(
                     support.provider.name
                 )
             })?;
+        let types = support
+            .modules
+            .iter()
+            .flat_map(|module| module.types.iter().cloned())
+            .collect::<Vec<_>>();
         for module in &support.modules {
-            validate_native_module(descriptor, module)?;
+            validate_native_module(descriptor, module, &types)?;
         }
     }
     Ok(())
@@ -912,6 +978,7 @@ fn validate_unique_native_support(supports: &[RustProviderSupport]) -> Result<()
 fn validate_native_module(
     descriptor: &ProviderDescriptor,
     support: &RustModuleSupport,
+    types: &[RustTypeBinding],
 ) -> Result<(), String> {
     let module = descriptor
         .modules
@@ -943,8 +1010,57 @@ fn validate_native_module(
             )
         })?;
         validate_native_abi(descriptor, &binding.key, &signature, &binding.abi)?;
+        validate_tracked_owned_return(&binding.key, &binding.abi.ret, types)?;
     }
     Ok(())
+}
+
+fn validate_tracked_owned_return(
+    key: &ExternBindingKey,
+    abi: &RustReturnAbi,
+    types: &[RustTypeBinding],
+) -> Result<(), String> {
+    let Some(ty) = tracked_owned_return_type(key, abi, types) else {
+        return Ok(());
+    };
+    Err(format!(
+        "native binding {:?} returns tracked resource `{}` by owned value; return AnvRef instead",
+        key, ty.name
+    ))
+}
+
+fn tracked_owned_return_type<'a>(
+    key: &ExternBindingKey,
+    abi: &RustReturnAbi,
+    types: &'a [RustTypeBinding],
+) -> Option<&'a ExternTypeKey> {
+    match abi {
+        RustReturnAbi::OwnedNamed(ty) => tracked_owned_named_type(key, ty, types),
+        RustReturnAbi::Option(inner) => tracked_owned_return_type(key, inner, types),
+        RustReturnAbi::Result(ok, err) => tracked_owned_return_type(key, ok, types)
+            .or_else(|| tracked_owned_return_type(key, err, types)),
+        RustReturnAbi::Void | RustReturnAbi::Value(_) => None,
+    }
+}
+
+fn tracked_owned_named_type<'a>(
+    key: &ExternBindingKey,
+    ty: &ExternTypeExpr,
+    types: &'a [RustTypeBinding],
+) -> Option<&'a ExternTypeKey> {
+    let ExternTypeExpr::Named { module, name, args } = ty else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let module = module.as_ref().unwrap_or_else(|| binding_module(key));
+    types
+        .iter()
+        .find(|binding| {
+            binding.owns_heap_edges && &binding.key.module == module && binding.key.name == *name
+        })
+        .map(|binding| &binding.key)
 }
 
 fn native_binding_signature(
@@ -1229,6 +1345,13 @@ fn validate_wrapper_ctx(
 ) -> Result<(), String> {
     let valid = if has_callback_wrapper {
         abi.ctx == RustWrapperCtx::None
+            || (abi.ctx == RustWrapperCtx::HiddenRuntime
+                && abi.params.iter().all(|param| {
+                    !matches!(
+                        param,
+                        RustParamAbi::ScopedLambda(_) | RustParamAbi::EscapingLambda(_)
+                    )
+                }))
     } else if abi.support == RustAbiSupport::Direct {
         abi.direct_ctx_supported()
     } else {
@@ -1371,29 +1494,9 @@ fn validate_param_callback_abi(
         ));
     }
 
-    match (&param.ty, param_abi) {
-        (ExternTypeExpr::Callback(callback), RustParamAbi::ScopedLambda(abi_callback)) => {
-            validate_callback_wrapper_abi(
-                descriptor,
-                key,
-                param,
-                callback,
-                abi_callback,
-                abi.support,
-                CallbackEscape::NonEscaping,
-            )?;
-            Ok(true)
-        }
-        (ExternTypeExpr::Callback(callback), RustParamAbi::EscapingLambda(abi_callback)) => {
-            validate_callback_wrapper_abi(
-                descriptor,
-                key,
-                param,
-                callback,
-                abi_callback,
-                abi.support,
-                CallbackEscape::Escaping,
-            )?;
+    match (&param.ty, param_abi.callback_wrapper_signature()) {
+        (ExternTypeExpr::Callback(_), Some(_)) => {
+            validate_callback_wrapper_abi(descriptor, key, param, param_abi, abi.support)?;
             Ok(true)
         }
         _ if param_contains_callback(param) || param_abi.contains_callback() => Err(
@@ -1407,26 +1510,31 @@ fn validate_callback_wrapper_abi(
     descriptor: &ProviderDescriptor,
     key: &ExternBindingKey,
     param: &ExternParam,
-    callback: &ExternCallbackSignature,
-    abi_callback: &ExternCallbackSignature,
+    param_abi: &RustParamAbi,
     support: RustAbiSupport,
-    escape: CallbackEscape,
 ) -> Result<(), String> {
+    let ExternTypeExpr::Callback(callback) = &param.ty else {
+        return Err(native_abi_error(
+            descriptor,
+            key,
+            "direct callback ABI is unsupported",
+        ));
+    };
+    let escape = param_abi
+        .callback_wrapper_escape()
+        .expect("callback wrapper ABI must have an expected escape");
     let label = match escape {
         CallbackEscape::NonEscaping => "scoped Lambda",
         CallbackEscape::Escaping => "escaping Lambda",
     };
-    if callback != abi_callback {
+    if param_abi.callback_wrapper_signature() != Some(callback) {
         return Err(native_abi_error(
             descriptor,
             key,
             &format!("{label} ABI signature mismatch"),
         ));
     }
-    if param.flow != ParamFlow::Value
-        || callback.policy.escape != escape
-        || callback.policy.thread != CallbackThread::SameThread
-    {
+    if !param_abi.callback_wrapper_matches_param(param) {
         let escape_label = match escape {
             CallbackEscape::NonEscaping => "non-escaping",
             CallbackEscape::Escaping => "escaping",
@@ -1522,11 +1630,9 @@ fn param_abi_matches(param: &ExternParam, abi: &RustParamAbi) -> bool {
             param_abi_matches(&value_param((**ok).clone()), abi_ok)
                 && param_abi_matches(&value_param((**err).clone()), abi_err)
         }
-        (
-            ExternTypeExpr::Callback(callback),
-            ParamFlow::Value,
-            RustParamAbi::ScopedLambda(abi) | RustParamAbi::EscapingLambda(abi),
-        ) => callback == abi,
+        (ExternTypeExpr::Callback(_), _, abi) if abi.is_callback_wrapper() => {
+            abi.callback_wrapper_matches_param(param)
+        }
         (ty, ParamFlow::Value, RustParamAbi::InitField(abi)) => {
             param_abi_matches(&value_param(ty.clone()), abi)
         }
@@ -1594,7 +1700,8 @@ fn param_abi_has_shared_resource_value(
         | RustParamAbi::MutBorrow(_)
         | RustParamAbi::MutPlace(_)
         | RustParamAbi::ScopedLambda(_)
-        | RustParamAbi::EscapingLambda(_) => false,
+        | RustParamAbi::EscapingLambda(_)
+        | RustParamAbi::AnvCallback(_) => false,
     }
 }
 
@@ -1692,7 +1799,13 @@ fn native_abi_error(
 
 pub trait AnvyxInlineExport {}
 
-pub trait AnvyxRefExport {}
+/// # Safety
+/// Manual impls must set `OWNS_ANVYX_HEAP_EDGES` to true when the type owns any
+/// Anvyx heap edge, including hidden `Handle`, `ErasedHandle`, `AnvRef`,
+/// `AnvList`, `AnvMap`, `AnvCallback`, or retained callback fields.
+pub unsafe trait AnvyxRefExport {
+    const OWNS_ANVYX_HEAP_EDGES: bool = false;
+}
 
 pub trait AnvyxEnumExport {}
 
@@ -1746,6 +1859,132 @@ mod tests {
             ),
             "return ABI mismatch",
         );
+    }
+
+    #[test]
+    fn rejects_tracked_owned_resource_return() {
+        let resource = shared_resource();
+        let descriptor = ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![shared_resource_type(vec![])],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "make".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![],
+                        ret: resource.clone(),
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+        let mut support = support(binding_with_abi(
+            "make",
+            RustParamAbi::Value(ExternTypeExpr::Void),
+            RustReturnAbi::OwnedNamed(resource),
+        ));
+        support.modules[0].types.push(RustTypeBinding {
+            key: ExternTypeKey {
+                module: module(),
+                name: "Thing".to_string(),
+            },
+            path: RustPath {
+                crate_name: "test".to_string(),
+                segments: vec!["Thing".to_string()],
+            },
+            owns_heap_edges: true,
+        });
+
+        let error = validate_rust_provider_support(&[descriptor], &[support]).unwrap_err();
+
+        assert!(error.contains("returns tracked resource"), "{error}");
+    }
+
+    #[test]
+    fn rejects_cross_module_tracked_owned_resource_return() {
+        let resource_module = ModulePath {
+            segments: vec!["resource".to_string()],
+        };
+        let api_module = ModulePath {
+            segments: vec!["api".to_string()],
+        };
+        let resource = ExternTypeExpr::Named {
+            module: Some(resource_module.clone()),
+            name: "Thing".to_string(),
+            args: vec![],
+        };
+        let descriptor = ProviderDescriptor {
+            provider: provider(),
+            modules: vec![
+                ExternModuleDescriptor {
+                    path: resource_module.clone(),
+                    types: vec![shared_resource_type(vec![])],
+                    functions: vec![],
+                },
+                ExternModuleDescriptor {
+                    path: api_module.clone(),
+                    types: vec![],
+                    functions: vec![ExternFunctionDescriptor {
+                        name: "make".to_string(),
+                        doc: None,
+                        signature: ExternSignature {
+                            params: vec![],
+                            ret: resource.clone(),
+                        },
+                        effects: ExternEffects::default(),
+                    }],
+                },
+            ],
+        };
+        let binding = RustExternBinding {
+            key: ExternBindingKey {
+                target: ExternBindingTarget::Function(ExternFunctionKey {
+                    module: api_module.clone(),
+                    name: "make".to_string(),
+                }),
+                operation: ExternBindingOp::Call,
+            },
+            path: RustPath {
+                crate_name: "test".to_string(),
+                segments: vec!["make".to_string()],
+            },
+            abi: RustExternAbi {
+                params: vec![],
+                ret: RustReturnAbi::OwnedNamed(resource),
+                fallible: false,
+                support: RustAbiSupport::Direct,
+                ctx: RustWrapperCtx::None,
+            },
+        };
+        let mut support = support(binding);
+        support.modules = vec![
+            RustModuleSupport {
+                module: resource_module.clone(),
+                types: vec![RustTypeBinding {
+                    key: ExternTypeKey {
+                        module: resource_module,
+                        name: "Thing".to_string(),
+                    },
+                    path: RustPath {
+                        crate_name: "test".to_string(),
+                        segments: vec!["Thing".to_string()],
+                    },
+                    owns_heap_edges: true,
+                }],
+                bindings: vec![],
+            },
+            RustModuleSupport {
+                module: api_module,
+                types: vec![],
+                bindings: support.modules[0].bindings.clone(),
+            },
+        ];
+
+        let error = validate_rust_provider_support(&[descriptor], &[support]).unwrap_err();
+
+        assert!(error.contains("returns tracked resource"), "{error}");
     }
 
     #[test]
@@ -2363,6 +2602,75 @@ mod tests {
         let binding = escaping_lambda_binding("with_callback", callback);
 
         assert_abi_ok(descriptor, binding);
+    }
+
+    #[test]
+    fn callback_wrapper_param_matching_is_role_owned() {
+        let scoped = callback_signature(vec![], ExternTypeExpr::Void);
+        let escaping = callback_signature_with_escape(
+            vec![ExternCallbackParam {
+                ty: ExternTypeExpr::Int,
+                escape: CallbackEscape::NonEscaping,
+            }],
+            ExternTypeExpr::Bool,
+            CallbackEscape::Escaping,
+        );
+        let cases = [
+            (
+                RustParamAbi::ScopedLambda(scoped.clone()),
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Callback(scoped.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                true,
+            ),
+            (
+                RustParamAbi::ScopedLambda(escaping.clone()),
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Callback(escaping.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::Escaping,
+                },
+                false,
+            ),
+            (
+                RustParamAbi::EscapingLambda(escaping.clone()),
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Callback(escaping.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::Escaping,
+                },
+                true,
+            ),
+            (
+                RustParamAbi::AnvCallback(escaping.clone()),
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Callback(escaping.clone()),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::Escaping,
+                },
+                true,
+            ),
+            (
+                RustParamAbi::EscapingLambda(scoped.clone()),
+                ExternParam {
+                    name: None,
+                    ty: ExternTypeExpr::Callback(scoped),
+                    flow: ParamFlow::Value,
+                    escape: CallbackEscape::NonEscaping,
+                },
+                false,
+            ),
+        ];
+
+        for (abi, param, expected) in cases {
+            assert_eq!(abi.callback_wrapper_matches_param(&param), expected);
+        }
     }
 
     #[test]

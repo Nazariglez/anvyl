@@ -5,7 +5,10 @@ use std::{
     rc::Rc,
 };
 
-use crate::{RuntimeError, Trace, TraceDriver, Visitor, collection::ACTIVE_COLLECTION_LOAN_ERROR};
+use crate::{
+    RuntimeError, SafepointGuard, SafepointGuardKind, SafepointState, Trace, TraceDriver, Visitor,
+    collection::ACTIVE_COLLECTION_LOAN_ERROR,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalSlotState {
@@ -15,20 +18,27 @@ pub enum GlobalSlotState {
     Failed,
 }
 
-pub struct GlobalRef<'a, T>(Ref<'a, T>);
+pub struct GlobalRef<'a, T> {
+    value: Ref<'a, T>,
+    _safepoint_guard: SafepointGuard,
+}
 
 impl<T> Deref for GlobalRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.value
     }
 }
 
-pub struct GlobalRefMut<'a, T>(RefMut<'a, T>);
+pub struct GlobalRefMut<'a, T> {
+    value: RefMut<'a, T>,
+    _safepoint_guard: SafepointGuard,
+}
 
 pub struct GlobalProjectedLoanGuard<'a, T> {
     slot: &'a GlobalSlot<T>,
+    _safepoint_guard: SafepointGuard,
 }
 
 impl<T> Drop for GlobalProjectedLoanGuard<'_, T> {
@@ -43,13 +53,13 @@ impl<T> Deref for GlobalRefMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.value
     }
 }
 
 impl<T> DerefMut for GlobalRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.value
     }
 }
 
@@ -64,6 +74,7 @@ pub struct GlobalSlot<T> {
     name: &'static str,
     state: RefCell<LazyState<T>>,
     projected_loans: Cell<usize>,
+    safepoint: SafepointState,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -92,10 +103,15 @@ unsafe impl<'cx, T: Trace<'cx>> Trace<'cx> for GlobalSlot<T> {
 
 impl<T> GlobalSlot<T> {
     pub fn new(name: &'static str) -> Self {
+        Self::new_with_safepoint(name, SafepointState::default())
+    }
+
+    pub fn new_with_safepoint(name: &'static str, safepoint: SafepointState) -> Self {
         Self {
             name,
             state: RefCell::new(LazyState::Uninit),
             projected_loans: Cell::new(0),
+            safepoint,
             _not_send_sync: PhantomData,
         }
     }
@@ -184,11 +200,15 @@ impl<T> GlobalSlot<T> {
             .state
             .try_borrow()
             .map_err(|_| self.borrow_conflict())?;
+        let guard = self.safepoint.enter(SafepointGuardKind::Global)?;
         Ref::filter_map(state, |state| match state {
             LazyState::Ready(value) => Some(value),
             LazyState::Uninit | LazyState::Initializing | LazyState::Failed(_) => None,
         })
-        .map(GlobalRef)
+        .map(|value| GlobalRef {
+            value,
+            _safepoint_guard: guard,
+        })
         .map_err(|_| self.internal_error("successful global read found no ready value"))
     }
 
@@ -202,17 +222,30 @@ impl<T> GlobalSlot<T> {
             .state
             .try_borrow_mut()
             .map_err(|_| self.borrow_conflict())?;
+        let guard = self.safepoint.enter(SafepointGuardKind::Global)?;
         RefMut::filter_map(state, |state| match state {
             LazyState::Ready(value) => Some(value),
             LazyState::Uninit | LazyState::Initializing | LazyState::Failed(_) => None,
         })
-        .map(GlobalRefMut)
+        .map(|value| GlobalRefMut {
+            value,
+            _safepoint_guard: guard,
+        })
         .map_err(|_| self.internal_error("successful global write found no ready value"))
     }
 
-    pub fn begin_projected_loan(&self) -> GlobalProjectedLoanGuard<'_, T> {
-        self.projected_loans.set(self.projected_loans.get() + 1);
-        GlobalProjectedLoanGuard { slot: self }
+    pub fn begin_projected_loan(&self) -> Result<GlobalProjectedLoanGuard<'_, T>, RuntimeError> {
+        let active = self
+            .projected_loans
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::new("too many active global projected loans"))?;
+        let guard = self.safepoint.enter(SafepointGuardKind::Global)?;
+        self.projected_loans.set(active);
+        Ok(GlobalProjectedLoanGuard {
+            slot: self,
+            _safepoint_guard: guard,
+        })
     }
 
     pub fn set_without_init(&self, value: T) -> Result<(), RuntimeError> {
@@ -294,7 +327,7 @@ mod tests {
     use super::LazyState;
     use crate::{
         GlobalProjectedLoanGuard, GlobalRef, GlobalRefMut, GlobalSlot, GlobalSlotState,
-        collection::ACTIVE_COLLECTION_LOAN_ERROR,
+        SafepointState, collection::ACTIVE_COLLECTION_LOAN_ERROR,
     };
 
     #[test]
@@ -348,6 +381,22 @@ mod tests {
 
         assert_eq!(*value, 7);
         assert_eq!(slot.state(), GlobalSlotState::Ready);
+    }
+
+    #[test]
+    fn read_registers_safepoint_blocker() {
+        let safepoint = SafepointState::default();
+        let slot = GlobalSlot::new_with_safepoint("score", safepoint.clone());
+        slot.ensure(|| Ok(7)).unwrap();
+
+        let guard = slot.read(|| unreachable!()).unwrap();
+        assert_eq!(
+            safepoint.validate_collect().unwrap_err().message(),
+            "cannot collect while global guard is active"
+        );
+
+        drop(guard);
+        assert!(safepoint.validate_collect().is_ok());
     }
 
     #[test]
@@ -526,7 +575,7 @@ mod tests {
     fn validate_trace_rejects_projected_loan() {
         let slot = GlobalSlot::<i64>::new("score");
         slot.set_without_init(7).unwrap();
-        let loan = slot.begin_projected_loan();
+        let loan = slot.begin_projected_loan().unwrap();
 
         let error = slot.validate_trace().unwrap_err();
 
@@ -540,7 +589,7 @@ mod tests {
     fn projected_loan_blocks_writes_and_replacement() {
         let slot = GlobalSlot::<i64>::new("state");
         slot.set_without_init(1).unwrap();
-        let loan = slot.begin_projected_loan();
+        let loan = slot.begin_projected_loan().unwrap();
 
         let write = slot.write(|| unreachable!()).err().unwrap();
         let set = slot.set_without_init(2).unwrap_err();

@@ -3,8 +3,8 @@ use std::{borrow::Borrow, fmt, hash::Hash, marker::PhantomData, ops::Range, ptr:
 use ecow::EcoString;
 
 use crate::{
-    CollectionLoanState, Ctx, HeapType, ListStorage, MapStorage, RuntimeError, ShapeLoanGuard,
-    Trace, TraceDriver, ValueLoanGuard, Visitor,
+    CollectionLoanState, Ctx, HeapType, ListStorage, MapStorage, RuntimeError, SafepointGuardKind,
+    ShapeLoanGuard, Trace, TraceDriver, ValueLoanGuard, Visitor,
     cow_storage::{CowStorageOwner, CowStorageView},
     heap_access_error,
 };
@@ -107,9 +107,9 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         let storage = ListStorage::from_elems(elems);
         let len = storage.len();
         Self {
-            storage: CowStorageOwner::alloc(ctx.heap(), storage_ty, storage),
+            storage: CowStorageOwner::alloc_in(ctx, storage_ty, storage),
             storage_ty,
-            loan: CollectionLoanState::default(),
+            loan: CollectionLoanState::with_safepoint(ctx.__anvyx_safepoint_state()),
             len,
         }
     }
@@ -153,7 +153,7 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         T: Clone,
     {
         self.storage
-            .make_unique(ctx.heap(), self.storage_ty)
+            .make_unique_in(ctx, self.storage_ty)
             .map_err(heap_access_error)
     }
 
@@ -301,7 +301,7 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         Self {
             storage: self.storage.share(),
             storage_ty: self.storage_ty,
-            loan: CollectionLoanState::default(),
+            loan: self.loan.fresh_with_same_safepoint(),
             len: self.len,
         }
     }
@@ -380,9 +380,9 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         let storage = MapStorage::from_entries(entries);
         let len = storage.len();
         Self {
-            storage: CowStorageOwner::alloc(ctx.heap(), storage_ty, storage),
+            storage: CowStorageOwner::alloc_in(ctx, storage_ty, storage),
             storage_ty,
-            loan: CollectionLoanState::default(),
+            loan: CollectionLoanState::with_safepoint(ctx.__anvyx_safepoint_state()),
             len,
         }
     }
@@ -479,7 +479,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         V: Clone,
     {
         self.storage
-            .make_unique(ctx.heap(), self.storage_ty)
+            .make_unique_in(ctx, self.storage_ty)
             .map_err(heap_access_error)
     }
 
@@ -566,7 +566,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         Self {
             storage: self.storage.share(),
             storage_ty: self.storage_ty,
-            loan: CollectionLoanState::default(),
+            loan: self.loan.fresh_with_same_safepoint(),
             len: self.len,
         }
     }
@@ -610,10 +610,16 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         self.loan.check_value_loan(value_loan)?;
         self.loan.check_stable(expected_version)?;
         self.check_projected_value_storage()?;
-        self.with_storage_unchecked(ctx, |storage| {
-            let value = storage.get(key).ok_or_else(Self::missing_key)?;
-            f(value)
-        })
+        let value = self.with_storage_unchecked(ctx, |storage| {
+            storage
+                .get(key)
+                .map(std::ptr::from_ref)
+                .ok_or_else(Self::missing_key)
+        })?;
+        let _safepoint = ctx
+            .__anvyx_safepoint_state()
+            .enter(SafepointGuardKind::MutPlace)?;
+        f(unsafe { &*value })
     }
 
     pub fn with_value_mut_by_key<'rt, R>(
@@ -627,10 +633,16 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         self.loan.check_value_loan(value_loan)?;
         self.loan.check_stable(expected_version)?;
         self.check_projected_value_storage()?;
-        self.with_storage_mut_unchecked(ctx, |storage| {
-            let value = storage.get_mut(key).ok_or_else(Self::missing_key)?;
-            f(value)
-        })
+        let value = self.with_storage_mut_unchecked(ctx, |storage| {
+            storage
+                .get_mut(key)
+                .map(std::ptr::from_mut)
+                .ok_or_else(Self::missing_key)
+        })?;
+        let _safepoint = ctx
+            .__anvyx_safepoint_state()
+            .enter(SafepointGuardKind::MutPlace)?;
+        f(unsafe { &mut *value })
     }
 
     pub fn insert<'rt>(
@@ -1293,7 +1305,7 @@ mod tests {
 
             drop(root);
             ctx.heap().reset_stats();
-            let outcome = ctx.heap().collect_all();
+            let outcome = ctx.collect_all().unwrap();
 
             assert_eq!(outcome.collected, 3);
             assert_eq!(root_traces.get(), 1);
@@ -1324,7 +1336,7 @@ mod tests {
 
             drop(root);
             ctx.heap().reset_stats();
-            let outcome = ctx.heap().collect_all();
+            let outcome = ctx.collect_all().unwrap();
 
             assert_eq!(outcome.collected, 3);
             assert_eq!(root_traces.get(), 1);
@@ -1358,7 +1370,7 @@ mod tests {
 
             drop(root);
             ctx.heap().reset_stats();
-            let outcome = ctx.heap().collect_all();
+            let outcome = ctx.collect_all().unwrap();
 
             assert_eq!(outcome.collected, 4);
             assert_eq!(root_traces.get(), 1);
@@ -1394,7 +1406,7 @@ mod tests {
 
             drop(root);
             ctx.heap().reset_stats();
-            let outcome = ctx.heap().collect_all();
+            let outcome = ctx.collect_all().unwrap();
 
             assert_eq!(outcome.collected, 4);
             assert_eq!(root_traces.get(), 1);

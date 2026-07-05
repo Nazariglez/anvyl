@@ -9,11 +9,11 @@ use syn::{
 };
 
 use crate::clean_type_map::{
-    BoundaryConversion, classify_param, classify_provider_return, conversion_tokens, flow_tokens,
-    param_abi_for_override, param_abi_tokens, param_escape_tokens, return_abi_for_override,
-    return_abi_tokens, signature_conversion, type_expr_tokens, type_with_override,
-    validate_callable_signature, validate_callback_wrapper_precheck, validate_ctx_param,
-    validate_mut_place_ctx,
+    BoundaryConversion, callback_wrapper_requires_ctxless, classify_param,
+    classify_provider_return, conversion_tokens, flow_tokens, param_abi_for_override,
+    param_abi_tokens, param_escape_tokens, return_abi_for_override, return_abi_tokens,
+    signature_conversion, type_expr_tokens, type_with_override, validate_callable_signature,
+    validate_callback_wrapper_precheck, validate_ctx_param, validate_mut_place_ctx,
 };
 
 struct FunctionArgs {
@@ -133,9 +133,10 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         .map(|param| classify_param(param, args.ctx))
         .collect::<syn::Result<Vec<_>>>()?;
     let callback_wrapper = validate_callback_wrapper_precheck(&func.sig, &params, false)?;
+    let ctxless_callback_wrapper = callback_wrapper_requires_ctxless(&params);
     if let Some(ctx) = ctx_input {
         validate_mut_place_ctx(&func.sig, ctx, &params, "#[function(ctx)]")?;
-        if callback_wrapper {
+        if callback_wrapper && ctxless_callback_wrapper {
             return Err(syn::Error::new_spanned(
                 ctx,
                 "#[function(ctx)] cannot be combined with callback wrapper parameters",
@@ -198,7 +199,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         ));
     }
     let support = conversion_tokens(conversion);
-    let wrapper_ctx = if callback_wrapper {
+    let wrapper_ctx = if callback_wrapper && ctxless_callback_wrapper {
         quote! { anvyx_runtime::RustWrapperCtx::None }
     } else {
         quote! { anvyx_runtime::RustWrapperCtx::HiddenRuntime }
@@ -210,7 +211,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         quote! { _ctx }
     };
     let native_inputs = visible_inputs.iter();
-    let wrapper_inputs = if callback_wrapper {
+    let wrapper_inputs = if callback_wrapper && ctxless_callback_wrapper {
         quote! { #(#native_inputs),* }
     } else {
         quote! { #native_ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #(#native_inputs),* }

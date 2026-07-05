@@ -62,6 +62,7 @@ pub fn clear_suspects() {
     SUSPECT_BUFFER.with(|buf| buf.borrow_mut().clear());
 }
 
+#[cfg(test)]
 pub fn get_collect_threshold() -> usize {
     COLLECT_THRESHOLD.with(Cell::get)
 }
@@ -70,6 +71,7 @@ pub fn reset_collect_threshold() {
     COLLECT_THRESHOLD.with(|t| t.set(DEFAULT_THRESHOLD));
 }
 
+#[cfg(test)]
 pub fn set_collect_threshold(val: usize) {
     COLLECT_THRESHOLD.with(|t| t.set(val));
 }

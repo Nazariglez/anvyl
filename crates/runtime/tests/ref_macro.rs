@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, marker::PhantomData, rc::Rc};
 
 use anvyx_runtime::{
-    AnvRef, AnvRefType, AnvyxRef, ExternRep, ExternTypeExpr, Heap, Trace, TraceDriver, Visitor,
+    AnvRef, AnvRefType, AnvyxRef, AnvyxRefExport, ErasedHandle, ExternRep, ExternTypeExpr, Heap,
+    Trace, TraceDriver, Visitor,
 };
 
 #[derive(AnvyxRef)]
@@ -18,7 +19,26 @@ struct HostNode<'cx> {
     traces: Rc<Cell<usize>>,
 }
 
-impl anvyx_runtime::AnvyxRefExport for HostNode<'_> {}
+#[derive(AnvyxRef)]
+struct EdgeHolder {
+    edge: Option<ErasedHandle<'static>>,
+}
+
+struct HiddenEdge<'cx>(AnvRef<'cx, HostCounter>);
+
+#[derive(AnvyxRef)]
+struct WrappedEdge<'cx> {
+    edge: Option<HiddenEdge<'cx>>,
+}
+
+#[derive(AnvyxRef)]
+struct BrandedResource<'cx> {
+    _brand: PhantomData<AnvRef<'cx, HostCounter>>,
+}
+
+unsafe impl AnvyxRefExport for HostNode<'_> {
+    const OWNS_ANVYX_HEAP_EDGES: bool = true;
+}
 
 unsafe impl<'cx> Trace<'cx> for HostNode<'cx> {
     fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
@@ -27,7 +47,7 @@ unsafe impl<'cx> Trace<'cx> for HostNode<'cx> {
     }
 }
 
-fn assert_ref<T: anvyx_runtime::AnvyxRefExport>() {}
+fn assert_ref<T: AnvyxRefExport>() {}
 
 #[test]
 fn ref_descriptor_contains_exported_fields_and_name() {
@@ -41,6 +61,30 @@ fn ref_descriptor_contains_exported_fields_and_name() {
     assert_eq!(export.descriptor.fields[0].name, "count");
     assert_eq!(export.descriptor.fields[0].ty, ExternTypeExpr::Int);
     assert!(export.bindings.is_empty());
+}
+
+#[test]
+fn derived_ref_marks_heap_edge_fields() {
+    assert!(std::hint::black_box(EdgeHolder::OWNS_ANVYX_HEAP_EDGES));
+    assert!(std::hint::black_box(WrappedEdge::OWNS_ANVYX_HEAP_EDGES));
+}
+
+#[test]
+fn lifetime_brand_does_not_make_resource_tracked() {
+    assert!(!std::hint::black_box(
+        BrandedResource::OWNS_ANVYX_HEAP_EDGES
+    ));
+    Heap::scope(|heap| {
+        let _ = AnvRefType::<BrandedResource<'_>>::register_untracked(heap);
+    });
+}
+
+#[test]
+#[should_panic(expected = "resource type owns Anvyx heap edges and must be registered as tracked")]
+fn untracked_registration_rejects_derived_heap_edge_resource() {
+    Heap::scope(|heap| {
+        let _ = AnvRefType::<EdgeHolder>::register_untracked(heap);
+    });
 }
 
 #[test]

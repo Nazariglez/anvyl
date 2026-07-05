@@ -1,0 +1,5 @@
+error: AnvyxRef resources must not store EscapingLambda leases; store a traceable AnvCallback carrier or keep the callback outside the heap resource
+ --> tests/ui/ref/escaping_lambda_field.rs:5:15
+  |
+5 |     callback: Option<EscapingLambda<(), ()>>,
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -6,7 +6,7 @@ use std::{
 
 use anvyx_heap::{Trace, TraceDriver, Visitor};
 
-use crate::RuntimeError;
+use crate::{RuntimeError, SafepointGuardKind, SafepointState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellBorrowState {
@@ -31,7 +31,12 @@ impl CellBorrowFlag {
     pub(crate) fn shared_guard(&self) -> Result<SharedCellGuard<'_>, RuntimeError> {
         match self.state.get() {
             CellBorrowState::Unborrowed => self.state.set(CellBorrowState::Shared(1)),
-            CellBorrowState::Shared(count) => self.state.set(CellBorrowState::Shared(count + 1)),
+            CellBorrowState::Shared(count) => {
+                self.state
+                    .set(CellBorrowState::Shared(count.checked_add(1).ok_or_else(
+                        || RuntimeError::new("too many shared mutable cell borrows"),
+                    )?));
+            }
             CellBorrowState::Mutable => return Err(cell_borrow_error()),
         }
         Ok(SharedCellGuard { flag: self })
@@ -55,19 +60,26 @@ impl CellBorrowFlag {
 struct LambdaCellCore<T> {
     value: UnsafeCell<T>,
     borrow: CellBorrowFlag,
+    safepoint: SafepointState,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
 impl<T> LambdaCellCore<T> {
     fn new(value: T) -> Self {
+        Self::new_with_safepoint(value, SafepointState::default())
+    }
+
+    fn new_with_safepoint(value: T, safepoint: SafepointState) -> Self {
         Self {
             value: UnsafeCell::new(value),
             borrow: CellBorrowFlag::default(),
+            safepoint,
             _not_send_sync: PhantomData,
         }
     }
 
     fn access<R>(&self, f: impl FnOnce(&T) -> Result<R, RuntimeError>) -> Result<R, RuntimeError> {
+        let _safepoint = self.safepoint.enter(SafepointGuardKind::LambdaCell)?;
         let _guard = self.borrow.shared_guard()?;
         f(unsafe { &*self.value.get() })
     }
@@ -76,6 +88,7 @@ impl<T> LambdaCellCore<T> {
         &self,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
+        let _safepoint = self.safepoint.enter(SafepointGuardKind::LambdaCell)?;
         let _guard = self.borrow.mutable_guard()?;
         f(unsafe { &mut *self.value.get() })
     }
@@ -91,13 +104,22 @@ impl<T> LambdaCellCore<T> {
         })
     }
 
+    fn validate_trace(&self) -> Result<(), RuntimeError> {
+        if self.borrow.is_unborrowed() {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(
+                "cannot collect while lambda cell has an active borrow",
+            ))
+        }
+    }
+
     fn trace_value<'cx, D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>)
     where
         T: Trace<'cx>,
     {
-        // Trace runs at heap safepoints; generated code must not collect while a cell guard is active.
-        // This read reports the contained edges once without cloning, dropping, or mutating the payload.
-        debug_assert!(self.borrow.is_unborrowed());
+        self.validate_trace()
+            .expect("lambda cell traced outside a safepoint");
         unsafe { &*self.value.get() }.trace(visitor);
     }
 }
@@ -116,6 +138,12 @@ impl<T> StackLambdaCell<T> {
     pub fn new(value: T) -> Self {
         Self {
             core: LambdaCellCore::new(value),
+        }
+    }
+
+    pub fn new_with_safepoint(value: T, safepoint: SafepointState) -> Self {
+        Self {
+            core: LambdaCellCore::new_with_safepoint(value, safepoint),
         }
     }
 
@@ -156,6 +184,12 @@ impl<T> LambdaCell<T> {
     pub fn new(value: T) -> Self {
         Self {
             core: LambdaCellCore::new(value),
+        }
+    }
+
+    pub fn new_with_safepoint(value: T, safepoint: SafepointState) -> Self {
+        Self {
+            core: LambdaCellCore::new_with_safepoint(value, safepoint),
         }
     }
 
@@ -236,8 +270,8 @@ mod tests {
 
     use anvyx_heap::{Trace, TraceDriver, Visitor};
 
-    use super::{LambdaCell, StackLambdaCell};
-    use crate::{Handle, Heap, RuntimeError};
+    use super::{LambdaCell, LambdaCellCore, StackLambdaCell};
+    use crate::{Ctx, Handle, Heap, RuntimeError, SafepointState};
 
     struct CountDrop(Rc<Cell<usize>>);
 
@@ -560,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_root_keeps_runtime_cell_graph_alive_until_removed() {
+    fn retained_lambda_keeps_runtime_cell_graph_alive_until_dropped() {
         Heap::scope(|heap| {
             let stats = Rc::new(Cell::new(0));
             let lambda_ty = heap.register_tracked::<TraceLambda<'_>>();
@@ -594,20 +628,54 @@ mod tests {
                 })
                 .unwrap();
             });
-            let root = heap.root(&lambda);
+            let retained = lambda.clone();
 
             drop(lambda);
             drop(env);
             drop(cell);
             heap.collect_all();
             assert_eq!(heap.stats().live, 3);
-            assert!(heap.resolve_root(&root).is_some());
+            assert!(heap.try_with(&retained, |_| ()).is_ok());
 
-            assert!(heap.remove_root(&root));
+            drop(retained);
             let outcome = heap.collect_all();
             assert_eq!(outcome.collected, 3);
             assert_eq!(heap.stats().live, 0);
         });
+    }
+
+    #[test]
+    fn collection_rejects_active_cell_borrow() {
+        Heap::scope(|heap| {
+            let safepoint = SafepointState::default();
+            let mut ctx = Ctx::new_with_safepoint(heap, &safepoint);
+            let cell = StackLambdaCell::new_with_safepoint(1_i64, safepoint);
+
+            cell.access(|_| {
+                assert_eq!(
+                    ctx.collect_all().unwrap_err().message(),
+                    "cannot collect while lambda cell guard is active"
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert!(ctx.collect_all().is_ok());
+        });
+    }
+
+    #[test]
+    fn trace_validation_rejects_active_cell_borrow() {
+        let cell = LambdaCellCore::new(1_i64);
+
+        cell.access(|_| {
+            assert_eq!(
+                cell.validate_trace().unwrap_err().message(),
+                "cannot collect while lambda cell has an active borrow"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(cell.validate_trace().is_ok());
     }
 
     #[test]
@@ -706,7 +774,7 @@ mod tests {
                     edge: old_node.clone(),
                 }),
             );
-            let root = heap.root(&cell);
+            let retained = cell.clone();
 
             heap.with(&cell, |cell| {
                 let replaced = cell
@@ -727,7 +795,7 @@ mod tests {
             assert_eq!(heap.stats().live, 2);
             assert!(stats.get() >= 2);
 
-            assert!(heap.remove_root(&root));
+            drop(retained);
             drop(cell);
             assert_eq!(heap.collect_all().collected, 2);
         });

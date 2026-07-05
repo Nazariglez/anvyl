@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
-use crate::RuntimeError;
+use crate::{RuntimeError, SafepointGuard, SafepointGuardKind, SafepointState};
 
 pub(crate) const ACTIVE_COLLECTION_LOAN_ERROR: &str =
     "cannot structurally mutate collection during active iteration or slice view";
@@ -18,11 +18,13 @@ struct CollectionLoanStateInner {
     active_value_loan: Cell<Option<u64>>,
     next_value_loan: Cell<u64>,
     structural_version: Cell<u64>,
+    safepoint: SafepointState,
 }
 
 pub struct ShapeLoanGuard {
     state: CollectionLoanState,
     expected_version: u64,
+    _safepoint_guard: SafepointGuard,
 }
 
 pub struct ValueLoanGuard {
@@ -40,16 +42,38 @@ impl Clone for ShapeLoanGuard {
             .get()
             .checked_add(1)
             .expect(ERR_LOAN_OVERFLOW);
+        let safepoint_guard = self
+            .state
+            .inner
+            .safepoint
+            .enter(SafepointGuardKind::Collection)
+            .expect(ERR_LOAN_OVERFLOW);
         self.state.inner.active_shape_loans.set(active);
         Self {
             state: self.state.clone(),
             expected_version: self.expected_version,
+            _safepoint_guard: safepoint_guard,
         }
     }
 }
 
 impl CollectionLoanState {
+    pub fn with_safepoint(safepoint: SafepointState) -> Self {
+        Self {
+            inner: Rc::new(CollectionLoanStateInner {
+                safepoint,
+                ..CollectionLoanStateInner::default()
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn fresh_with_same_safepoint(&self) -> Self {
+        Self::with_safepoint(self.inner.safepoint.clone())
+    }
+
     pub fn begin_shape_loan(&self) -> Result<ShapeLoanGuard, RuntimeError> {
+        let safepoint_guard = self.inner.safepoint.enter(SafepointGuardKind::Collection)?;
         let active = self
             .inner
             .active_shape_loans
@@ -60,6 +84,7 @@ impl CollectionLoanState {
         Ok(ShapeLoanGuard {
             state: self.clone(),
             expected_version: self.current_version(),
+            _safepoint_guard: safepoint_guard,
         })
     }
 
@@ -187,6 +212,7 @@ impl Drop for ShapeLoanGuard {
 #[cfg(test)]
 mod tests {
     use super::CollectionLoanState;
+    use crate::SafepointState;
 
     #[test]
     fn guard_owns_state_handle() {
@@ -245,6 +271,21 @@ mod tests {
         assert_eq!(state.active_shape_loans(), 0);
         assert!(state.before_unloaned_storage_access().is_ok());
         assert!(state.check_value_loan(id).is_err());
+    }
+
+    #[test]
+    fn guard_registers_safepoint_blocker() {
+        let safepoint = SafepointState::default();
+        let state = CollectionLoanState::with_safepoint(safepoint.clone());
+        let guard = state.begin_shape_loan().unwrap();
+
+        assert_eq!(
+            safepoint.validate_collect().unwrap_err().message(),
+            "cannot collect while collection loan guard is active"
+        );
+
+        drop(guard);
+        assert!(safepoint.validate_collect().is_ok());
     }
 
     #[test]

@@ -47,7 +47,13 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
             "#[methods] requires an unqualified type name",
         ));
     }
-    let owner = owner_path.path.segments[0].ident.clone();
+    let owner_segment = &owner_path.path.segments[0];
+    let owner = owner_segment.ident.clone();
+    let rust_type_path = if owner_segment.arguments.is_empty() {
+        quote! { concat!(module_path!(), "::", stringify!(#owner)) }
+    } else {
+        quote! { concat!(module_path!(), "::", stringify!(#owner), "<'cx>") }
+    };
     let companion = crate::naming::methods_fn_ident(&owner);
     let export_name = args.name.unwrap_or_else(|| owner.to_string());
     let mut descriptor_methods = vec![];
@@ -154,7 +160,8 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         #[doc(hidden)]
         pub fn #companion() -> anvyx_runtime::TypeExport {
             anvyx_runtime::TypeExport {
-                rust_type_path: concat!(module_path!(), "::", stringify!(#owner)),
+                rust_type_path: #rust_type_path,
+                owns_heap_edges: false,
                 descriptor: anvyx_runtime::ExternTypeDescriptor {
                     name: #export_name.to_string(),
                     doc: None,
@@ -172,7 +179,7 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
 
         anvyx_runtime::inventory::submit! {
             anvyx_runtime::TypeMemberExport {
-                rust_type_path: concat!(module_path!(), "::", stringify!(#owner)),
+                rust_type_path: #rust_type_path,
                 export: #companion,
             }
         }

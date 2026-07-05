@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::{handle::Handle, heap_type::HeapId};
+use crate::{ErasedHandle, handle::Handle, heap_type::HeapId};
 
 pub trait TraceDriver<'cx>: sealed::Driver<'cx> {}
 
@@ -61,6 +61,22 @@ where
             "trace reported a dead or stale edge"
         );
         D::edge(self.state, handle.ptr);
+    }
+
+    #[inline]
+    pub fn edge_erased(&mut self, handle: &ErasedHandle<'cx>) {
+        assert_eq!(
+            handle.heap_id(),
+            self.heap_id,
+            "trace reported an edge from another heap"
+        );
+        let ptr = handle.ptr();
+        let header = ptr.header();
+        assert!(
+            header.is_live() && header.generation.get() == handle.generation(),
+            "trace reported a dead or stale edge"
+        );
+        D::edge(self.state, ptr);
     }
 
     #[inline]
@@ -190,6 +206,14 @@ trace_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
 trace_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
 trace_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
 trace_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+
+// SAFETY: one erased handle is one strong heap edge.
+unsafe impl<'cx> Trace<'cx> for ErasedHandle<'cx> {
+    #[inline]
+    fn trace<D: TraceDriver<'cx>>(&self, visitor: &mut Visitor<'cx, '_, D>) {
+        visitor.edge_erased(self);
+    }
+}
 
 // SAFETY: one `Handle` is one strong heap edge.
 unsafe impl<'cx, T> Trace<'cx> for Handle<'cx, T> {

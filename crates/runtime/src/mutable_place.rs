@@ -2,7 +2,8 @@ use std::{cell::UnsafeCell, hash::Hash, marker::PhantomData, rc::Rc};
 
 use crate::{
     AnvList, AnvMap, AnvSlice, Ctx, ErasedHandle, GlobalSlot, Handle, LambdaCell, RuntimeError,
-    StackLambdaCell, ValueLoanGuard, heap_access_error, lambda_cell::CellBorrowFlag,
+    SafepointGuardKind, SafepointState, StackLambdaCell, ValueLoanGuard, heap_access_error,
+    lambda_cell::CellBorrowFlag,
 };
 
 pub enum MutPlace<'place, 'cx, T> {
@@ -104,6 +105,7 @@ pub trait DataRefPlaceOps<'cx, T> {
 pub struct ScopedMutPlaceCell<'source, 'cx, T> {
     root: ScopedMutPlaceRoot<'source, 'cx, T>,
     borrow: CellBorrowFlag,
+    safepoint: SafepointState,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -121,7 +123,11 @@ fn heap_access<'cx, 'rt, T: 'cx, R>(
     cell: &Handle<'cx, LambdaCell<T>>,
     f: impl FnOnce(&LambdaCell<T>) -> Result<R, RuntimeError>,
 ) -> Result<R, RuntimeError> {
-    ctx.heap().try_with(cell, f).map_err(heap_access_error)?
+    let cell = ctx
+        .heap_ref()
+        .try_with(cell, std::ptr::from_ref::<LambdaCell<T>>)
+        .map_err(heap_access_error)?;
+    f(unsafe { &*cell })
 }
 
 impl<'place, 'cx, R: 'cx, T: 'cx> ProjectedPlace<'place, 'cx, R, T> {
@@ -575,9 +581,14 @@ impl<'cx, T: Copy + 'cx> MutPlace<'_, 'cx, T> {
 
 impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
     pub fn new(place: MutPlace<'source, 'cx, T>) -> Self {
+        Self::new_with_safepoint(place, SafepointState::default())
+    }
+
+    pub fn new_with_safepoint(place: MutPlace<'source, 'cx, T>, safepoint: SafepointState) -> Self {
         Self {
             root: ScopedMutPlaceRoot::from_place(place),
             borrow: CellBorrowFlag::default(),
+            safepoint,
             _not_send_sync: PhantomData,
         }
     }
@@ -587,6 +598,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
+        let _safepoint = self.safepoint.enter(SafepointGuardKind::MutPlace)?;
         let _guard = self.borrow.shared_guard()?;
         match self.root {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &*value }),
@@ -603,6 +615,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
+        let _safepoint = self.safepoint.enter(SafepointGuardKind::MutPlace)?;
         let _guard = self.borrow.mutable_guard()?;
         match self.root {
             ScopedMutPlaceRoot::Local(value, _, _) => f(unsafe { &mut *value }),
@@ -652,7 +665,8 @@ mod tests {
     use crate::{
         AnvList, AnvMap, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType,
         LambdaCell, ListStorage, MapStorage, MapValueOps, MutPlace, OptionalPayloadOps,
-        ProjectionOps, RuntimeError, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
+        ProjectionOps, RuntimeError, SafepointState, ScopedMutPlaceCell, StackLambdaCell,
+        heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -662,6 +676,29 @@ mod tests {
                 $($body)*
             })
         };
+    }
+
+    #[test]
+    fn scoped_cell_registers_safepoint_blocker() {
+        crate::Heap::scope(|heap| {
+            let safepoint = SafepointState::default();
+            let mut ctx = Ctx::new_with_safepoint(heap, &safepoint);
+            let mut value = 1_i64;
+            let cell = ScopedMutPlaceCell::new_with_safepoint(
+                MutPlace::local(&mut value),
+                safepoint.clone(),
+            );
+
+            cell.access(&mut ctx, |_| {
+                assert_eq!(
+                    safepoint.validate_collect().unwrap_err().message(),
+                    "cannot collect while mutable place guard is active"
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert!(safepoint.validate_collect().is_ok());
+        });
     }
 
     #[test]
@@ -1344,7 +1381,7 @@ mod tests {
         let ops = FieldOps { ty };
         let mut place = MutPlace::dataref(erased, &ops);
         drop(object);
-        ctx.heap().collect(0);
+        ctx.collect(0).unwrap();
 
         place.update_copy(&mut ctx, |value| value + 1).unwrap();
         assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
@@ -1383,7 +1420,7 @@ mod tests {
         let dead = manual_copy(&erased);
         drop(object);
         drop(erased);
-        ctx.heap().collect(0);
+        ctx.collect(0).unwrap();
         let ops = FieldOps { ty: int_ty };
         let dead = MutPlace::dataref(ManuallyDrop::into_inner(dead), &ops);
         assert_eq!(
