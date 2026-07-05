@@ -3,7 +3,8 @@ use anvyx_externs::ExternRep;
 use super::{
     CheckedType, TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint,
     check_expected_value_expr, check_value_expr_checked_with_hint, checked_from_type, checked_void,
-    closure, collection_loan, control_flow,
+    closure::{self, FunctionFlowMode},
+    collection_loan, control_flow,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
@@ -773,11 +774,7 @@ impl<'tc> PatternChecker<'tc> {
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
         }
-        if !optional_payload_pattern_supported(inner) {
-            self.tc
-                .push_error(TypeError::UnsupportedOptionalPayloadPattern {
-                    span: self.tc.error_span(inner.span),
-                });
+        if !self.validate_optional_payload_pattern(inner) {
             let recovery = input.project(
                 Type::Infer,
                 input.access,
@@ -825,6 +822,23 @@ impl<'tc> PatternChecker<'tc> {
             key: self.tc.decls.semantic_option_key(expected)?,
             variant: Ident::new(variant),
         })
+    }
+
+    fn validate_optional_payload_pattern(&mut self, pattern: &PatternNode) -> bool {
+        if matches!(pattern.node, Pattern::Optional(_)) {
+            self.tc.push_error(TypeError::NestedOptionalPattern {
+                span: self.tc.error_span(pattern.span),
+            });
+            return false;
+        }
+        if optional_payload_pattern_supported(pattern) {
+            return true;
+        }
+        self.tc
+            .push_error(TypeError::UnsupportedOptionalPayloadPattern {
+                span: self.tc.error_span(pattern.span),
+            });
+        false
     }
 
     fn check_range(
@@ -1114,12 +1128,8 @@ impl<'tc> PatternChecker<'tc> {
         if self.tc.decls.semantic_option_key(&input.expected_ty) == Some(resolved.key.clone())
             && variant == Ident::new("Some")
             && fields.len() == 1
-            && !optional_payload_pattern_supported(&fields[0])
+            && !self.validate_optional_payload_pattern(&fields[0])
         {
-            self.tc
-                .push_error(TypeError::UnsupportedOptionalPayloadPattern {
-                    span: self.tc.error_span(fields[0].span),
-                });
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
             return PatternCheckResult {
                 outcome: PatternOutcome::error(),
@@ -1382,6 +1392,7 @@ pub(super) fn check_roots(
     let mut refutability = Refutability::Irrefutable;
     let mut covers = vec![];
     let mut bindings = BindingAlternatives::single_empty();
+    let mut function_flow_roots = vec![];
 
     for root in roots {
         let (input, site) = match root.input {
@@ -1404,6 +1415,11 @@ pub(super) fn check_roots(
         let mut result = checker.check(root.pattern, input.clone());
         result.outcome.had_error |= !alias_shape_valid;
         checker.apply_context_policy(root.pattern, &input.expected_ty, &mut result.outcome);
+        if refutable_context_binds_function_flows(context)
+            && let Some(site) = site
+        {
+            function_flow_roots.push((root.pattern, input.expected_ty.clone(), site));
+        }
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
         covers.push(result.outcome.cover);
@@ -1412,6 +1428,16 @@ pub(super) fn check_roots(
 
     PatternChecker::new(tc, None, context, PatternBindMode::Owned { mutable: false })
         .install_root_bindings(&bindings, span);
+    for (pattern, ty, site) in function_flow_roots {
+        bind_function_pattern_flows(
+            pattern,
+            &ty,
+            site,
+            pattern.span,
+            FunctionFlowMode::Direct,
+            tc,
+        );
+    }
 
     let cover = if covers.len() == 1 {
         covers.pop().expect("non-empty root covers")
@@ -1423,6 +1449,16 @@ pub(super) fn check_roots(
         had_error,
         refutability,
     }
+}
+
+fn refutable_context_binds_function_flows(context: PatternContext) -> bool {
+    matches!(
+        context,
+        PatternContext::IfLet
+            | PatternContext::WhileLet
+            | PatternContext::LetElse
+            | PatternContext::Match
+    )
 }
 
 pub(super) fn mode_for_conditional_access(access: ConditionalPatternAccess) -> PatternBindMode {
@@ -1511,8 +1547,60 @@ pub(super) fn check_pattern_scrutinee(
     }
 }
 
+fn bind_function_pattern_flows(
+    pattern: &PatternNode,
+    ty: &Type,
+    value: ExprId,
+    span: Span,
+    mode: FunctionFlowMode,
+    tc: &mut TypeChecker,
+) {
+    match semantic_optional_payload_pattern(pattern, ty, tc) {
+        OptionalPayloadPattern::Some(payload) => {
+            if let Some(inner_ty) = tc.decls.semantic_option_inner(ty).cloned() {
+                bind_function_pattern_flows(
+                    payload,
+                    &inner_ty,
+                    value,
+                    span,
+                    FunctionFlowMode::Stored,
+                    tc,
+                );
+            }
+        }
+        OptionalPayloadPattern::None | OptionalPayloadPattern::NotOptional => {
+            if let Pattern::Ident(name) = pattern.node
+                && matches!(ty, Type::Func { .. })
+            {
+                let binding = tc.local_binding_id(name);
+                tc.closure.bind_local(binding, value, mode, span);
+            }
+        }
+    }
+}
+
 fn optional_payload_pattern_supported(pattern: &PatternNode) -> bool {
     matches!(pattern.node, Pattern::Ident(_) | Pattern::Wildcard)
+}
+
+fn semantic_optional_payload_pattern<'a>(
+    pattern: &'a PatternNode,
+    ty: &Type,
+    tc: &TypeChecker,
+) -> OptionalPayloadPattern<'a> {
+    match pattern.node.optional_payload() {
+        payload @ OptionalPayloadPattern::Some(_)
+            if matches!(pattern.node, Pattern::Optional(_)) =>
+        {
+            payload
+        }
+        payload @ (OptionalPayloadPattern::Some(_) | OptionalPayloadPattern::None)
+            if tc.decls.semantic_option_key(ty).is_some() =>
+        {
+            payload
+        }
+        _ => OptionalPayloadPattern::NotOptional,
+    }
 }
 
 fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
@@ -1618,16 +1706,11 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     }
 
     let binding_name = simple_owned_binding_name(binding);
-    let function_value = matches!(value_ty, Type::Func { .. })
-        || matches!(binding_ty, Type::Func { .. })
-        || binding_name.is_some_and(|name| tc.local_binding_is_function_value(name));
+    let direct_local = binding_name.is_some_and(|name| tc.local_binding_is_function_value(name));
+    let mode = tc.function_flow_mode(&value_ty, &binding_ty, direct_local);
     let binding_id = binding_name.and_then(|name| tc.local_binding_id(name));
-    tc.closure.bind_local(
-        binding_id,
-        binding.value.node.id,
-        function_value,
-        binding.value.span,
-    );
+    tc.closure
+        .bind_local(binding_id, binding.value.node.id, mode, binding.value.span);
 }
 
 fn simple_owned_binding_name(binding: &Binding) -> Option<Ident> {

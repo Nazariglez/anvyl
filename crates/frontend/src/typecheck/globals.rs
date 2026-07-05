@@ -127,7 +127,7 @@ fn check_global_initializer(module: &ModuleScope, global: &GlobalDeclNode, tc: &
         let value =
             check_value_expr_checked_with_hint(&global.node.value, Some(expected.clone()), tc);
         tc.record_call_return_function_value(&global.node.value, &tc.handle_type(&expected));
-        tc.record_escaping_use(&global.node.value);
+        tc.record_global_initializer_escape(&global.node.value);
         tc.reject_extern_any_escape(&value, global.node.value.span);
         tc.expect_assignable_expr(
             global.node.value.span,

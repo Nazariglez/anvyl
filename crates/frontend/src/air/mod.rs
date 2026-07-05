@@ -239,7 +239,8 @@ impl Program {
                 projection: vec![],
                 ty: decl.ty,
             },
-            ScopedBorrowSource::PatternAlias { source } => source.clone(),
+            ScopedBorrowSource::PatternAlias { source }
+            | ScopedBorrowSource::ForRefAlias { source } => source.clone(),
         })
     }
 

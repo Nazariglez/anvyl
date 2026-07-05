@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn tick() {}
+fn keep(f: escaping fn()) {}
+
+fn make() -> fn()? {
+    .Some(tick)
+}
+
+fn ok() {
+    keep(make() ?? tick);
+}

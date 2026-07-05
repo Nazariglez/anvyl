@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn keep(f: escaping fn()) {}
+
+fn ok(fs: [string: fn()]) {
+    while let f? = fs["tick"] {
+        keep(f);
+        break;
+    }
+}

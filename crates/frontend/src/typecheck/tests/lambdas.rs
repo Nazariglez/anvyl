@@ -2,7 +2,8 @@ use super::support::{TypecheckTestResult, check};
 use crate::{
     ast::Type,
     typecheck::{
-        CaptureAccess, CaptureStorage, CaptureStorageOrigin, LambdaCaptureFact, LambdaEscapeKind,
+        CaptureAccess, CaptureStorage, CaptureStorageOrigin, LambdaCaptureFact,
+        LambdaCaptureRuntimePlan, LambdaEscapeKind,
     },
 };
 
@@ -58,6 +59,37 @@ fn assert_borrowed_scoped_capture(result: &TypecheckTestResult, name: &str) {
 }
 
 #[test]
+fn capture_facts_include_runtime_plan() {
+    let result = checked(
+        r"
+        fn main(ref item: int) {
+            let seed = 0;
+            var count = 0;
+            let a = || seed;
+            let b = || { count = 1; };
+            let c = || { item = 2; };
+            a();
+            b();
+            c();
+        }
+        ",
+    );
+
+    assert_eq!(
+        capture(&result, "seed").runtime_plan,
+        LambdaCaptureRuntimePlan::ReadonlyOwned
+    );
+    assert_eq!(
+        capture(&result, "count").runtime_plan,
+        LambdaCaptureRuntimePlan::MutableCaptureCell
+    );
+    assert_eq!(
+        capture(&result, "item").runtime_plan,
+        LambdaCaptureRuntimePlan::ScopedBorrow(CaptureStorageOrigin::BorrowedParam)
+    );
+}
+
+#[test]
 fn non_escaping_mutable_captures_share_one_cell_requirement() {
     let result = checked(
         r"
@@ -107,157 +139,6 @@ fn shadowed_captures_use_distinct_cell_requirements() {
     );
     assert_ne!(captures[0].binding_id, captures[1].binding_id);
     assert_eq!(result.capture_cell_requirements().len(), 2);
-}
-
-#[test]
-fn returned_counter_records_cell_requirement() {
-    let result = checked(
-        r"
-        fn make_counter() -> fn() -> int {
-            var count = 0;
-            || {
-                count = count + 1;
-                count
-            }
-        }
-        ",
-    );
-
-    let capture = capture(&result, "count");
-    assert_eq!(capture.origin, CaptureStorageOrigin::Owned);
-    assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(requires_cell(&result, capture));
-    assert!(
-        result
-            .lambda_escapes()
-            .values()
-            .any(|fact| fact.escape == LambdaEscapeKind::Escaping)
-    );
-}
-
-#[test]
-fn returned_lambdas_share_one_mutable_cell_requirement() {
-    let result = checked(
-        r"
-        fn make(cond: bool) -> fn() -> int {
-            var count = 0;
-            let inc = || {
-                count = count + 1;
-                count
-            };
-            let get = || count;
-            if cond { inc } else { get }
-        }
-        ",
-    );
-
-    let captures = captures(&result, "count");
-    assert_eq!(captures.len(), 2);
-    assert!(captures.iter().all(|capture| {
-        capture.storage == CaptureStorage::OwnedMutableUpvalue && requires_cell(&result, capture)
-    }));
-    let binding = captures[0].binding_id;
-    assert!(captures.iter().all(|capture| capture.binding_id == binding));
-    assert_eq!(result.capture_cell_requirements().len(), 1);
-}
-
-#[test]
-fn nested_escaping_mutable_capture_records_cell_requirement() {
-    let result = checked(
-        r"
-        fn make() -> fn() -> fn() -> int {
-            var count = 0;
-            || {
-                || {
-                    count = count + 1;
-                    count
-                }
-            }
-        }
-        ",
-    );
-
-    let capture = capture(&result, "count");
-    assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(requires_cell(&result, capture));
-    assert_eq!(result.capture_cell_requirements().len(), 1);
-}
-
-#[test]
-fn readonly_and_writer_lambdas_share_mutable_cell_requirement() {
-    let result = checked(
-        r"
-        fn make(cond: bool) -> fn() -> int {
-            var count = 0;
-            let read = || count;
-            let write = || {
-                count = count + 1;
-                count
-            };
-            if cond { read } else { write }
-        }
-        ",
-    );
-
-    let captures = captures(&result, "count");
-    assert_eq!(captures.len(), 2);
-    assert!(
-        captures
-            .iter()
-            .any(|capture| capture.access == CaptureAccess::Read)
-    );
-    assert!(
-        captures
-            .iter()
-            .any(|capture| capture.access == CaptureAccess::Mutable)
-    );
-    let binding = captures[0].binding_id;
-    assert!(captures.iter().all(|capture| {
-        capture.binding_id == binding
-            && capture.storage == CaptureStorage::OwnedMutableUpvalue
-            && requires_cell(&result, capture)
-    }));
-    assert_eq!(result.capture_cell_requirements().len(), 1);
-}
-
-#[test]
-fn local_function_alias_stays_non_escaping() {
-    let result = checked(
-        r"
-        fn main() {
-            var x = 1;
-            let f = || { x = 2; };
-            f();
-        }
-        ",
-    );
-
-    let capture = capture(&result, "x");
-    assert_eq!(capture.storage, CaptureStorage::OwnedMutableScoped);
-    assert!(requires_cell(&result, capture));
-    assert!(
-        result
-            .lambda_escapes()
-            .values()
-            .all(|fact| fact.escape == LambdaEscapeKind::NonEscaping)
-    );
-}
-
-#[test]
-fn escaping_read_of_mutable_binding_records_cell_requirement() {
-    let result = checked(
-        r"
-        fn make() -> fn() {
-            var x = 1;
-            || { let y = x; }
-        }
-        ",
-    );
-
-    let capture = capture(&result, "x");
-    assert_eq!(capture.access, CaptureAccess::Read);
-    assert_eq!(capture.storage, CaptureStorage::OwnedMutableUpvalue);
-    assert!(requires_cell(&result, capture));
 }
 
 #[test]

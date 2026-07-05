@@ -1088,7 +1088,7 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
         }
         (Some(expr), None) => {
             let actual = check_value_expr_checked_with_hint(expr, None, tc);
-            tc.record_escaping_use(expr);
+            tc.record_return_escape(expr);
             tc.reject_extern_any_escape(&actual, expr.span);
         }
         (None, Some(ReturnTarget::Explicit { ret, .. })) if !ret.ty.is_void() => {
@@ -1107,7 +1107,7 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
 fn check_discarded_return_value(ret: &Return, tc: &mut TypeChecker) {
     if let Some(expr) = &ret.value {
         let actual = check_value_expr_checked_with_hint(expr, None, tc);
-        tc.record_escaping_use(expr);
+        tc.record_return_escape(expr);
         tc.reject_extern_any_escape(&actual, expr.span);
     }
 }
@@ -1138,7 +1138,7 @@ pub(super) fn check_return_expr(
         Some(expected) => check_expected_value_expr(expr, expected, tc),
         None => check_value_expr_checked_with_hint(expr, None, tc),
     };
-    tc.record_escaping_use(expr);
+    tc.record_return_escape(expr);
     tc.reject_extern_any_escape(&actual, expr.span);
     actual
 }

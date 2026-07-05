@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn tick() {}
+fn keep(f: escaping fn()) {}
+
+fn ok() {
+    let f: fn()? = nil;
+    keep(f ?? tick);
+}

@@ -227,6 +227,7 @@ pub enum ScopedBorrowSource {
     SourceMutParam { local: LocalId },
     RefSelf { local: LocalId },
     PatternAlias { source: Place },
+    ForRefAlias { source: Place },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

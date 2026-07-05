@@ -24,7 +24,7 @@ use self::{
         check_block_checked_with_hint, check_module_bodies, check_specialized_callable_body,
         check_stmts, collect_callable_templates, register_declarations,
     },
-    closure::{ClosureClassifier, ClosureScopeState},
+    closure::{ClosureClassifier, ClosureScopeState, FunctionFlowMode},
     decl_validate::{
         check_finite_size_cycles, check_infer_return_decls, generic_param_type_error,
         method_sig_is_generic,
@@ -2062,6 +2062,8 @@ impl TypeChecker {
         let mut place = place::PlaceValue::new(checked, access.access, access.facts);
         place.identity = access.identity;
         place.root_local = Some(value.info.type_id);
+        place.root_binding = Some(value.info.binding_id);
+        place.root_source_depth = Some(value.source_depth);
         place.root_name = Some(name);
         (place, access.accepts_extern_any)
     }
@@ -2235,20 +2237,47 @@ impl TypeChecker {
         })
     }
 
+    pub(super) fn type_carries_function_value(&self, ty: &Type) -> bool {
+        type_carries_function_value(&self.decls, ty)
+    }
+
+    pub(super) fn function_flow_mode(
+        &self,
+        value_ty: &Type,
+        storage_ty: &Type,
+        direct_local: bool,
+    ) -> FunctionFlowMode {
+        if direct_local || matches!(storage_ty, Type::Func { .. }) {
+            return FunctionFlowMode::Direct;
+        }
+        let function_value =
+            !matches!(value_ty, Type::Infer) && self.type_carries_function_value(value_ty);
+        let function_storage =
+            !matches!(storage_ty, Type::Infer) && self.type_carries_function_value(storage_ty);
+        if function_value || function_storage {
+            FunctionFlowMode::Stored
+        } else {
+            FunctionFlowMode::None
+        }
+    }
+
     pub(super) fn record_function_value_expr(
         &mut self,
         expr_id: ExprId,
         ty: &Type,
         kind: FunctionValueKind,
     ) {
-        if matches!(ty, Type::Func { .. }) && !type_has_unfinished_facts(ty) {
-            self.closure
-                .record_function_value_origin(expr_id, &kind, |id| {
-                    matches!(
-                        self.solver.local_type_to_type(id),
-                        Type::Func { .. } | Type::Infer
-                    )
-                });
+        let is_function = matches!(ty, Type::Func { .. });
+        if !self.type_carries_function_value(ty) || type_has_unfinished_facts(ty) {
+            return;
+        }
+        let decls = &self.decls;
+        let solver = &self.solver;
+        self.closure
+            .record_function_value_origin(expr_id, &kind, |id| {
+                type_carries_function_value(decls, &solver.local_type_to_type(id))
+            });
+        if is_function {
             self.record_function_value(
                 expr_id,
                 FunctionValueFact {
@@ -4860,7 +4889,14 @@ fn check_binary(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     if bin.node.op == BinaryOp::Coalesce {
-        return check_coalesce(&bin.node.left, &bin.node.right, bin.span, expected, tc);
+        return check_coalesce(
+            expr_id,
+            &bin.node.left,
+            &bin.node.right,
+            bin.span,
+            expected,
+            tc,
+        );
     }
     if let Some(checked) = check_nil_equality(expr_id, bin, tc) {
         return checked;
@@ -4934,7 +4970,15 @@ fn is_nil_lit(expr: &ExprNode) -> bool {
     matches!(expr.node.kind, ExprKind::Lit(Lit::Nil))
 }
 
+fn type_carries_function_value(decls: &DeclarationIndex, ty: &Type) -> bool {
+    matches!(ty, Type::Func { .. } | Type::Infer)
+        || decls
+            .semantic_option_inner(ty)
+            .is_some_and(|inner| type_carries_function_value(decls, inner))
+}
+
 fn check_coalesce(
+    expr_id: ExprId,
     left_expr: &ExprNode,
     right_expr: &ExprNode,
     span: Span,
@@ -4951,6 +4995,8 @@ fn check_coalesce(
         if matches!(left.ty, Type::Infer) {
             let mut right = check_expr_checked(right_expr, tc);
             right.contains_extern_any |= left.contains_extern_any;
+            tc.closure
+                .copy_coalesce_selected_flow(left_expr.node.id, right_expr.node.id, expr_id);
             return checked_from_checked(right_expr, right, tc);
         }
         tc.push_error(TypeError::InvalidOperand {
@@ -4964,6 +5010,8 @@ fn check_coalesce(
 
     let mut right = check_expr_checked(right_expr, tc);
     right.contains_extern_any |= left.contains_extern_any;
+    tc.closure
+        .copy_coalesce_selected_flow(left_expr.node.id, right_expr.node.id, expr_id);
     if tc.same_option_payload(&left.ty, &right.ty) {
         return right;
     }
@@ -5195,24 +5243,24 @@ fn expected_assignable_type(expected: Option<&TypeHandle>, tc: &TypeChecker) -> 
 fn sync_assigned_flow(
     target: &ExprNode,
     value: &ExprNode,
-    function_value: bool,
+    mode: FunctionFlowMode,
     tc: &mut TypeChecker,
 ) {
     let ExprKind::Ident(name) = target.node.kind else {
-        tc.record_escaping_use(value);
+        tc.record_assignment_escape(value);
         return;
     };
     if tc.lookup_local_symbol(name).is_none() {
-        tc.record_escaping_use(value);
+        tc.record_assignment_escape(value);
         return;
     }
 
     let Some(binding_id) = tc.local_binding_id(name) else {
-        tc.record_escaping_use(value);
+        tc.record_assignment_escape(value);
         return;
     };
     tc.closure
-        .assign_local_or_use(binding_id, value.node.id, function_value, value.span);
+        .assign_local_or_use(binding_id, value.node.id, mode, value.span);
 }
 
 fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
@@ -5329,7 +5377,7 @@ fn check_map_index_assignment(
         tc.reject_extern_any_escape(&value, assign.node.value.span);
     }
     if target.value.access.can_assign() {
-        tc.record_escaping_use(&assign.node.value);
+        tc.record_assignment_escape(&assign.node.value);
         place::record_projected_write(assign.node.target.node.id, target, tc);
     }
 }
@@ -5353,15 +5401,15 @@ fn check_simple_assignment(
         tc.push_error(error);
     }
     let value = check_expected_value_expr(&assign.node.value, target.checked().handle.clone(), tc);
-    let function_value = matches!(value.ty, Type::Func { .. });
-    if function_value {
+    let flow_mode = tc.function_flow_mode(&value.ty, &target.checked().ty, false);
+    if flow_mode != FunctionFlowMode::None {
         tc.record_call_return_function_value(&assign.node.value, &target.checked().ty);
     }
     if !target.accepts_extern_any() {
         tc.reject_extern_any_escape(&value, assign.node.value.span);
     }
     if target.value.access.can_assign() {
-        sync_assigned_flow(&assign.node.target, &assign.node.value, function_value, tc);
+        sync_assigned_flow(&assign.node.target, &assign.node.value, flow_mode, tc);
         place::record_write(assign.node.target.node.id, target, tc);
     }
 }

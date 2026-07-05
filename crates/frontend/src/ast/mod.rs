@@ -1565,6 +1565,13 @@ pub enum EnumPatternPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OptionalPayloadPattern<'a> {
+    Some(&'a PatternNode),
+    None,
+    NotOptional,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Ident(Ident),
@@ -1592,6 +1599,26 @@ pub enum Pattern {
 }
 
 impl Pattern {
+    pub fn optional_payload(&self) -> OptionalPayloadPattern<'_> {
+        match self {
+            Self::Optional(inner) => OptionalPayloadPattern::Some(inner),
+            Self::Nil => OptionalPayloadPattern::None,
+            Self::Enum {
+                variant,
+                payload: EnumPatternPayload::Tuple(fields),
+                ..
+            } if *variant == Ident::new("Some") && fields.len() == 1 => {
+                OptionalPayloadPattern::Some(&fields[0])
+            }
+            Self::Enum {
+                variant,
+                payload: EnumPatternPayload::Unit,
+                ..
+            } if *variant == Ident::new("None") => OptionalPayloadPattern::None,
+            _ => OptionalPayloadPattern::NotOptional,
+        }
+    }
+
     pub fn variant_name(&self) -> &'static str {
         match self {
             Self::Ident(_) => "Ident",

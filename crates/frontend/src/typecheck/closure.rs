@@ -6,9 +6,11 @@ use std::{
 
 use super::{
     BindingId, BindingMutability, BodyInstanceKey, CaptureAccess, CaptureCellRequirementFact,
-    CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueKind, FunctionValueOrigin,
-    LambdaBodyKey, LambdaCaptureFact, LambdaEscapeFact, LambdaEscapeKind, LambdaEscapeMap,
-    LocalBindingKind, LocalValue, ReturnAccess, ReturnSpec, TypeChecker, TypeError, TypecheckFacts,
+    CaptureStorage, CaptureStorageOrigin, CheckedType, FunctionValueEscapeCapability,
+    FunctionValueKind, FunctionValueOrigin, LambdaBodyKey, LambdaCaptureFact,
+    LambdaCaptureRuntimeError, LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind,
+    LambdaEscapeMap, LocalBindingKind, LocalValue, ReturnAccess, ReturnSpec, TypeChecker,
+    TypeError, TypecheckFacts,
     body::{
         CallableBody, CallableParamBinding, check_callable_body_frame, with_callable_body_scope,
     },
@@ -21,6 +23,23 @@ use crate::{
     ast::{EscapeMode, ExprId, ExprNode, FuncParam, Ident, LambdaNode, Type},
     span::Span,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FunctionFlowMode {
+    None,
+    Direct,
+    Stored,
+}
+
+impl FunctionFlowMode {
+    fn copies_function_values(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn fills_missing_direct_value(self) -> bool {
+        matches!(self, Self::Direct)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct ClosureClassifier {
@@ -41,8 +60,39 @@ pub(super) struct ClosureClassifier {
 }
 
 impl TypeChecker {
-    pub(super) fn record_escaping_use(&mut self, expr: &ExprNode) {
+    fn record_escape_use(&mut self, expr: &ExprNode) {
         self.closure.record_escaping_use(expr.node.id, expr.span);
+    }
+
+    pub(super) fn record_return_escape(&mut self, expr: &ExprNode) {
+        self.record_escape_use(expr);
+    }
+
+    pub(super) fn record_global_initializer_escape(&mut self, expr: &ExprNode) {
+        self.record_escape_use(expr);
+    }
+
+    pub(super) fn record_assignment_escape(&mut self, expr: &ExprNode) {
+        self.record_escape_use(expr);
+    }
+
+    pub(super) fn record_optional_function_storage_escape(
+        &mut self,
+        expr_id: ExprId,
+        span: Span,
+        from: &Type,
+        to: &Type,
+    ) {
+        let Some(inner) = self.decls.semantic_option_inner(to) else {
+            return;
+        };
+        if self.decls.semantic_option_inner(from).is_some()
+            || !self.type_carries_function_value(from)
+            || !self.type_carries_function_value(inner)
+        {
+            return;
+        }
+        self.closure.record_escaping_use(expr_id, span);
     }
 
     pub(super) fn push_escape_events(&mut self, events: Vec<EscapeEvent>) {
@@ -69,9 +119,15 @@ impl TypeChecker {
         result
     }
 
-    pub(super) fn check_argument_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
+    pub(super) fn record_argument_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
         if escape.is_escaping() {
-            self.record_escaping_use(arg);
+            self.record_escape_use(arg);
+        }
+    }
+
+    pub(super) fn record_conversion_escape(&mut self, arg: &ExprNode, escape: EscapeMode) {
+        if escape.is_escaping() {
+            self.record_escape_use(arg);
         }
     }
 
@@ -82,9 +138,13 @@ impl TypeChecker {
         self.closure.add_binding_callback(binding_id, origin);
     }
 
-    pub(super) fn record_aggregate_elem_flow(&mut self, aggregate: ExprId, elem: &ExprNode) {
-        self.record_escaping_use(elem);
+    pub(super) fn record_aggregate_elem_escape(&mut self, aggregate: ExprId, elem: &ExprNode) {
+        self.record_escape_use(elem);
         self.closure.copy_expr_flow(elem.node.id, aggregate);
+    }
+
+    pub(super) fn record_collection_storage_escape(&mut self, elem: &ExprNode) {
+        self.record_escape_use(elem);
     }
 
     pub(super) fn mark_non_escaping_callback_param(
@@ -266,12 +326,12 @@ impl ClosureClassifier {
         &mut self,
         binding_id: Option<BindingId>,
         value: ExprId,
-        function_value: bool,
+        mode: FunctionFlowMode,
         span: Span,
     ) {
         if let Some(binding_id) = binding_id
-            && function_value
-            && self.assign_local(binding_id, value, function_value, span)
+            && mode.copies_function_values()
+            && self.assign_local(binding_id, value, mode, span)
         {
             return;
         }
@@ -282,10 +342,10 @@ impl ClosureClassifier {
         &mut self,
         binding_id: BindingId,
         value: ExprId,
-        function_value: bool,
+        mode: FunctionFlowMode,
         span: Span,
     ) {
-        if !self.assign_local(binding_id, value, function_value, span) {
+        if !self.assign_local(binding_id, value, mode, span) {
             self.record_expr_escaping_flow(value, span);
         }
     }
@@ -294,12 +354,12 @@ impl ClosureClassifier {
         &mut self,
         binding_id: BindingId,
         value: ExprId,
-        function_value: bool,
+        mode: FunctionFlowMode,
         span: Span,
     ) -> bool {
-        let mut flow = self.storable_expr_flow(value, function_value);
-        if function_value {
-            if flow.is_empty() {
+        let mut flow = self.storable_expr_flow(value, mode);
+        if mode.copies_function_values() {
+            if flow.is_empty() && mode.fills_missing_direct_value() {
                 flow.insert_unknown_function();
             }
             self.record_assigned_capture_flow(binding_id, &flow, span);
@@ -317,12 +377,12 @@ impl ClosureClassifier {
         self.record_escaping_flow(&flow, span);
     }
 
-    fn storable_expr_flow(&self, expr: ExprId, function_value: bool) -> EscapeFlow {
+    fn storable_expr_flow(&self, expr: ExprId, mode: FunctionFlowMode) -> EscapeFlow {
         let mut flow = EscapeFlow::default();
         let Some(expr_flow) = self.expr_flows.get(&expr) else {
             return flow;
         };
-        if function_value {
+        if mode.copies_function_values() {
             flow.union(expr_flow);
         } else {
             for origin in expr_flow.callbacks() {
@@ -548,7 +608,7 @@ impl ClosureClassifier {
             .insert(binding_id);
         let crosses_lambda = self.crosses_capture_boundary(depth);
         if crosses_lambda {
-            self.capture_local_read(expr, binding_id, depth);
+            self.capture_local(expr, binding_id, depth, CaptureAccess::Read);
         }
 
         let flow = self.binding_flow(binding_id);
@@ -600,10 +660,9 @@ impl ClosureClassifier {
             }
             FunctionValueKind::Storage(origin) => {
                 let flow = self.expr_flows.entry(expr).or_default();
-                if origin.can_carry_escaping_projection() {
-                    flow.insert_known_function();
-                } else {
-                    flow.insert_unknown_function();
+                match origin.escape_capability() {
+                    FunctionValueEscapeCapability::EscapingSafe => flow.insert_known_function(),
+                    FunctionValueEscapeCapability::Unknown => flow.insert_unknown_function(),
                 }
             }
         }
@@ -653,12 +712,31 @@ impl ClosureClassifier {
         }
     }
 
+    pub(super) fn copy_coalesce_selected_flow(&mut self, left: ExprId, right: ExprId, to: ExprId) {
+        self.copy_expr_flow(left, to);
+        self.copy_expr_flow(right, to);
+    }
+
     pub(super) fn read_place(&mut self, expr: ExprId) {
         self.mark_place_access(expr, CaptureAccess::Read);
     }
 
     pub(super) fn mutably_use_place(&mut self, expr: ExprId) {
         self.mark_place_access(expr, CaptureAccess::Mutable);
+    }
+
+    pub(super) fn record_place_access(
+        &mut self,
+        expr: ExprId,
+        binding_id: BindingId,
+        depth: usize,
+        access: CaptureAccess,
+    ) {
+        if self.place_captures.contains_key(&expr) {
+            self.mark_place_access(expr, access);
+        } else {
+            self.capture_local(expr, binding_id, depth, access);
+        }
     }
 
     pub(super) fn copy_place_identity(&mut self, from: ExprId, to: ExprId) {
@@ -677,7 +755,7 @@ impl ClosureClassifier {
             });
     }
 
-    pub(super) fn record_escaping_use(&mut self, expr: ExprId, span: Span) {
+    fn record_escaping_use(&mut self, expr: ExprId, span: Span) {
         self.record_expr_escaping_flow(expr, span);
     }
 
@@ -718,13 +796,12 @@ impl ClosureClassifier {
 
     fn drain_escape_queue(&mut self, span: Span) {
         while let Some(index) = self.escape_queue.pop_front() {
-            let flow = self
+            let lambda = self
                 .sealed_lambdas
                 .get(index)
                 .expect("escaped lambda must be sealed before queueing")
-                .captured_flow
                 .clone();
-            self.collect_escaping_flow_events(&flow, span);
+            self.collect_escaping_flow_events(&lambda.captured_flow, span);
         }
     }
 
@@ -792,11 +869,8 @@ impl ClosureClassifier {
         let escaping = self.lambda_escapes(lambda.expr_id);
         for capture in &lambda.captures {
             let ty = type_of(capture.type_id);
-            let source_mutable = matches!(capture.kind.mutability, BindingMutability::Mutable);
-            let storage = capture
-                .kind
-                .storage
-                .capture_storage(source_mutable, escaping);
+            let source_mutable = capture_source_mutable(capture);
+            let storage = capture_storage(capture, escaping);
             facts.lambda_captures.insert(
                 (lambda.expr_id, capture.binding_id),
                 LambdaCaptureFact {
@@ -808,12 +882,10 @@ impl ClosureClassifier {
                     source_mutable,
                     access: capture.access,
                     storage,
+                    runtime_plan: capture_runtime_plan(capture, escaping),
                 },
             );
-            if matches!(
-                storage,
-                CaptureStorage::OwnedMutableScoped | CaptureStorage::OwnedMutableUpvalue
-            ) {
+            if capture_requires_cell(storage) {
                 facts.capture_cell_requirements.insert(
                     capture.binding_id,
                     CaptureCellRequirementFact {
@@ -887,7 +959,13 @@ impl ClosureClassifier {
         }
     }
 
-    fn capture_local_read(&mut self, expr: ExprId, binding_id: BindingId, source_depth: usize) {
+    fn capture_local(
+        &mut self,
+        expr: ExprId,
+        binding_id: BindingId,
+        source_depth: usize,
+        access: CaptureAccess,
+    ) {
         let Some(binding) = self.bindings.get(&binding_id).copied() else {
             return;
         };
@@ -900,7 +978,7 @@ impl ClosureClassifier {
                 mutability: binding.mutability,
                 storage: binding.storage,
             },
-            access: CaptureAccess::Read,
+            access,
         };
         self.with_capturing_active_lambdas(source_depth, |frame| {
             frame
@@ -924,9 +1002,15 @@ impl ClosureClassifier {
             .active_lambdas
             .pop()
             .expect("active lambda must exist on exit");
+        let mut captured_flow = frame.captured_flow;
+        for capture in frame.captures.values() {
+            if let Some(borrowed) = self.borrowed_capture(capture.binding_id) {
+                captured_flow.insert_borrowed(borrowed);
+            }
+        }
         let lambda = SealedLambda {
             expr_id: frame.expr_id,
-            captured_flow: frame.captured_flow,
+            captured_flow,
             captures: frame.captures.into_values().collect(),
         };
         let escaped = self.lambda_escapes(lambda.expr_id);
@@ -1115,6 +1199,45 @@ pub(super) struct NonEscapingCallback {
     pub(super) id: SemanticLocalId,
     pub(super) name: Ident,
     pub(super) help: Option<String>,
+}
+
+fn capture_source_mutable(capture: &CaptureUse) -> bool {
+    matches!(capture.kind.mutability, BindingMutability::Mutable)
+}
+
+fn capture_storage(capture: &CaptureUse, escaping: bool) -> CaptureStorage {
+    capture
+        .kind
+        .storage
+        .capture_storage(capture_source_mutable(capture), escaping)
+}
+
+fn capture_requires_cell(storage: CaptureStorage) -> bool {
+    matches!(
+        storage,
+        CaptureStorage::OwnedMutableScoped | CaptureStorage::OwnedMutableUpvalue
+    )
+}
+
+fn capture_runtime_plan(capture: &CaptureUse, escaping: bool) -> LambdaCaptureRuntimePlan {
+    let storage = capture_storage(capture, escaping);
+    let origin = capture.kind.storage;
+    match storage {
+        CaptureStorage::NoRuntime => LambdaCaptureRuntimePlan::NoRuntime,
+        CaptureStorage::OwnedReadonly => LambdaCaptureRuntimePlan::ReadonlyOwned,
+        CaptureStorage::OwnedMutableScoped | CaptureStorage::OwnedMutableUpvalue => {
+            LambdaCaptureRuntimePlan::MutableCaptureCell
+        }
+        CaptureStorage::BorrowedScoped if origin.is_borrowed_runtime() => {
+            LambdaCaptureRuntimePlan::ScopedBorrow(origin)
+        }
+        CaptureStorage::BorrowedEscaping => {
+            LambdaCaptureRuntimePlan::Illegal(LambdaCaptureRuntimeError::BorrowedEscaping(origin))
+        }
+        CaptureStorage::BorrowedScoped => {
+            LambdaCaptureRuntimePlan::Illegal(LambdaCaptureRuntimeError::Unsupported)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

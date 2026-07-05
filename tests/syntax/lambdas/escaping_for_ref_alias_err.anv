@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture mutable loop alias 'x' in an escaping lambda
+// @frontend: new
+
+fn bad(ref xs: [int]) -> fn() {
+    var out: fn() = || {};
+    for ref x in xs {
+        out = || { x = x + 1; };
+    }
+    out
+}

@@ -1,7 +1,7 @@
 use super::{
-    CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig, LocalUseMode,
-    MemberAccessKind, MemberPathFact, MemberPathKind, SemanticLocalId, TypeChecker, TypeError,
-    ValueDecl, check_expr_checked, member, nominal_type,
+    CaptureAccess, CheckedType, Exposure, ExternUseTarget, GlobalAccessMode, GlobalKey, GlobalSig,
+    LocalUseMode, MemberAccessKind, MemberPathFact, MemberPathKind, SemanticLocalId, TypeChecker,
+    TypeError, ValueDecl, check_expr_checked, member, nominal_type,
     postfix::{check_index_access, check_tuple_index_access},
 };
 use crate::{
@@ -524,6 +524,8 @@ pub(super) struct PlaceValue {
     pub(super) facts: PlaceUseFacts,
     pub(super) identity: PlaceIdentity,
     pub(super) root_local: Option<SemanticLocalId>,
+    pub(super) root_binding: Option<super::BindingId>,
+    pub(super) root_source_depth: Option<usize>,
     pub(super) root_name: Option<Ident>,
     pub(super) global: Option<GlobalPlace>,
     pub(super) map_entry_alias: bool,
@@ -579,6 +581,8 @@ impl PlaceValue {
             facts,
             identity: PlaceIdentity::unknown(),
             root_local: None,
+            root_binding: None,
+            root_source_depth: None,
             root_name: None,
             global: None,
             map_entry_alias: false,
@@ -602,6 +606,8 @@ impl PlaceValue {
             facts,
             identity,
             root_local: self.root_local,
+            root_binding: self.root_binding,
+            root_source_depth: self.root_source_depth,
             root_name: self.root_name,
             global: self.global.as_ref().map(GlobalPlace::projected),
             map_entry_alias: false,
@@ -1124,7 +1130,14 @@ pub(super) fn record_place_use(
     let use_ = kind.record(value);
     match use_.closure {
         ClosurePlaceEffect::Read => tc.closure.read_place(expr_id),
-        ClosurePlaceEffect::Mutable => tc.closure.mutably_use_place(expr_id),
+        ClosurePlaceEffect::Mutable => {
+            if let (Some(binding_id), Some(depth)) = (value.root_binding, value.root_source_depth) {
+                tc.closure
+                    .record_place_access(expr_id, binding_id, depth, CaptureAccess::Mutable);
+            } else {
+                tc.closure.mutably_use_place(expr_id);
+            }
+        }
     }
     record_place_global_access(expr_id, value, use_.global, tc);
     if let Some(mode) = use_.local {

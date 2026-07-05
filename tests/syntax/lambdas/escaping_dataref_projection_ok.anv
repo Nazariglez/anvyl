@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+dataref Holder {
+    f: fn(),
+}
+
+fn tick() {}
+fn keep(f: escaping fn()) {}
+
+fn main() {
+    let holder = Holder { f: tick };
+    keep(holder.f);
+}

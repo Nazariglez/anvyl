@@ -947,6 +947,21 @@ pub(crate) enum CaptureStorage {
     BorrowedEscaping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LambdaCaptureRuntimePlan {
+    NoRuntime,
+    ReadonlyOwned,
+    MutableCaptureCell,
+    ScopedBorrow(CaptureStorageOrigin),
+    Illegal(LambdaCaptureRuntimeError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LambdaCaptureRuntimeError {
+    BorrowedEscaping(CaptureStorageOrigin),
+    Unsupported,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LambdaCaptureFact {
     pub(crate) lambda_id: ExprId,
@@ -957,6 +972,7 @@ pub(crate) struct LambdaCaptureFact {
     pub(crate) source_mutable: bool,
     pub(crate) access: CaptureAccess,
     pub(crate) storage: CaptureStorage,
+    pub(crate) runtime_plan: LambdaCaptureRuntimePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1004,18 +1020,28 @@ pub(crate) enum FunctionValueOrigin {
     UnknownProjection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FunctionValueEscapeCapability {
+    EscapingSafe,
+    Unknown,
+}
+
 impl FunctionValueOrigin {
-    pub(crate) fn can_carry_escaping_projection(self) -> bool {
-        matches!(
-            self,
+    pub(crate) fn escape_capability(self) -> FunctionValueEscapeCapability {
+        match self {
             Self::AggregateField
-                | Self::TupleField
-                | Self::FixedArrayElement
-                | Self::ListElement
-                | Self::GlobalRoot
-                | Self::GlobalProjection
-                | Self::SourceCallReturn
-        )
+            | Self::TupleField
+            | Self::FixedArrayElement
+            | Self::ListElement
+            | Self::MapValue
+            | Self::GlobalRoot
+            | Self::GlobalProjection
+            | Self::DataRefProjection
+            | Self::SourceCallReturn => FunctionValueEscapeCapability::EscapingSafe,
+            Self::KnownLocal | Self::MapKey | Self::CallReturn | Self::UnknownProjection => {
+                FunctionValueEscapeCapability::Unknown
+            }
+        }
     }
 }
 

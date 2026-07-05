@@ -82,7 +82,7 @@ pub(super) fn check_arg(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut Ty
         ParamFlow::Borrow => check_arg_borrow(arg, param, tc),
         ParamFlow::MutBorrow => check_arg_place(arg, param, tc),
     };
-    tc.check_argument_escape(arg, param.escape);
+    tc.record_argument_escape(arg, param.escape);
     ok
 }
 
@@ -293,7 +293,7 @@ fn check_extern_literal_fields(
         }
         let hint = tc.type_handle(&field_ty.ty);
         let checked = check_expr_checked_with_hint(value, Some(hint), tc);
-        tc.record_aggregate_elem_flow(aggregate, value);
+        tc.record_aggregate_elem_escape(aggregate, value);
         failed |= !check_checked_value(value, &checked, &field_ty, tc);
     }
     failed

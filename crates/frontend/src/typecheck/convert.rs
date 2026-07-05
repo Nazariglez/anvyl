@@ -112,6 +112,9 @@ fn expect_assignable(
         });
         return;
     }
+    if let Some(expr_id) = expr_id {
+        tc.record_optional_function_storage_escape(expr_id, span, &from_ty, &to_ty);
+    }
     tc.solver
         .add_handle_assignable(tc.error_span(span), from, to);
 }
@@ -641,7 +644,7 @@ fn apply_explicit_cast_effects(
         ExplicitCast::CastFrom(conversion) => {
             super::body::check_cast_from_conversion_body(&conversion, source, target, tc);
             tc.mark_activation_imports_used(&conversion.origin);
-            tc.check_argument_escape(&cast.node.expr, conversion.escape);
+            tc.record_conversion_escape(&cast.node.expr, conversion.escape);
         }
         ExplicitCast::Builtin | ExplicitCast::RawEnum => {}
     }

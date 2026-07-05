@@ -146,9 +146,9 @@ pub(super) fn check_map_lit_hint(
     let mut contains_poison = false;
     for (key_expr, value_expr) in &lit.node.entries {
         let key_checked = check_expected_value_expr(key_expr, key.clone(), tc);
-        tc.record_aggregate_elem_flow(expr.node.id, key_expr);
+        tc.record_aggregate_elem_escape(expr.node.id, key_expr);
         let value_checked = check_expected_value_expr(value_expr, value.clone(), tc);
-        tc.record_aggregate_elem_flow(expr.node.id, value_expr);
+        tc.record_aggregate_elem_escape(expr.node.id, value_expr);
         contains_extern_any |= key_checked.contains_extern_any || value_checked.contains_extern_any;
         contains_poison |=
             tc.checked_is_poison(&key_checked) || tc.checked_is_poison(&value_checked);
@@ -207,7 +207,7 @@ pub(super) fn check_array_lit_hint(
     let mut contains_poison = false;
     for value in &lit.node.elements {
         let checked = check_expected_value_expr(value, elem.clone(), tc);
-        tc.record_aggregate_elem_flow(expr.node.id, value);
+        tc.record_aggregate_elem_escape(expr.node.id, value);
         contains_extern_any |= checked.contains_extern_any;
         contains_poison |= tc.checked_is_poison(&checked);
     }
@@ -253,7 +253,7 @@ pub(super) fn check_array_fill_hint(
         )
     });
     let value = check_expected_value_expr(&fill.node.value, elem.clone(), tc);
-    tc.record_aggregate_elem_flow(expr.node.id, &fill.node.value);
+    tc.record_aggregate_elem_escape(expr.node.id, &fill.node.value);
     let array = collection_literal_handle(kind, elem, len, tc);
     let mut checked = solve_and_checked_from_handle(expr, array, tc);
     checked.contains_extern_any = value.contains_extern_any;
@@ -287,7 +287,7 @@ pub(super) fn check_tuple_checked_with_hint(
     let mut contains_poison = false;
     for (elem, hint) in elems.iter().zip(&hints) {
         let checked = check_expected_value_expr(elem, hint.clone(), tc);
-        tc.record_aggregate_elem_flow(expr.node.id, elem);
+        tc.record_aggregate_elem_escape(expr.node.id, elem);
         contains_extern_any |= checked.contains_extern_any;
         contains_poison |= tc.checked_is_poison(&checked);
     }
@@ -589,7 +589,7 @@ pub(super) fn check_inferred_enum_hint(
             for (arg, param) in args.iter().zip(params) {
                 let hint = inf.instantiate(param, tc);
                 let checked = check_expected_value_expr(arg, hint, tc);
-                tc.record_aggregate_elem_flow(expr.node.id, arg);
+                tc.record_aggregate_elem_escape(expr.node.id, arg);
                 contains_extern_any |= checked.contains_extern_any;
                 failed |= tc.solve_constraints();
             }
@@ -718,7 +718,7 @@ fn check_expr_fields(
         tc.check_matched_field_access_policy(&owner, field.name, &field.policy, value.span);
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expected_value_expr(value, hint.clone(), tc);
-        tc.record_aggregate_elem_flow(aggregate, value);
+        tc.record_aggregate_elem_escape(aggregate, value);
         check.contains_extern_any |= checked.contains_extern_any;
         check.failed |= tc.solve_constraints();
     }

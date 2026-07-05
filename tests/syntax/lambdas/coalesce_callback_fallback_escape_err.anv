@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: callback parameter 'cb' is non-escaping by default, but it escapes here
+// @frontend: new
+
+fn keep(f: escaping fn()) {}
+
+fn bad(fs: [string: fn()], cb: fn()) {
+    keep(fs["tick"] ?? cb);
+}

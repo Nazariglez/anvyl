@@ -114,6 +114,8 @@ struct ReceiverUse {
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_local: Option<SemanticLocalId>,
+    root_binding: Option<super::BindingId>,
+    root_source_depth: Option<usize>,
     root_name: Option<Ident>,
     global: Option<place::GlobalPlace>,
     id: ExprId,
@@ -124,6 +126,27 @@ struct SourceReceiver {
     use_: ReceiverUse,
     name: Ident,
     collection_effect: Option<CollectionStructuralEffect>,
+}
+
+fn receiver_use(
+    source: &PlaceValue,
+    access: PlaceAccess,
+    facts: &PlaceUseFacts,
+    identity: place::PlaceIdentity,
+    global: Option<place::GlobalPlace>,
+    id: ExprId,
+) -> ReceiverUse {
+    ReceiverUse {
+        access,
+        facts: facts.clone(),
+        identity,
+        root_local: source.root_local,
+        root_binding: source.root_binding,
+        root_source_depth: source.root_source_depth,
+        root_name: source.root_name,
+        global,
+        id,
+    }
 }
 
 impl ReceiverUse {
@@ -138,6 +161,8 @@ impl ReceiverUse {
             facts: self.facts.clone(),
             identity: self.identity.clone(),
             root_local: self.root_local,
+            root_binding: self.root_binding,
+            root_source_depth: self.root_source_depth,
             root_name: self.root_name,
             global: self.global.clone(),
             map_entry_alias: false,
@@ -158,6 +183,8 @@ impl ReceiverUse {
             facts: self.facts.clone(),
             identity: self.identity.clone(),
             root_local: self.root_local,
+            root_binding: self.root_binding,
+            root_source_depth: self.root_source_depth,
             root_name: self.root_name,
             global: self.global.clone(),
         }
@@ -364,7 +391,7 @@ pub(super) fn check_postfix_chain_place(
                     );
                 }
                 let value = apply_call(&subject, node, *id, call_expected, tc);
-                let returned_function = matches!(value.checked.ty, Type::Func { .. });
+                let returned_function = tc.type_carries_function_value(&value.checked.ty);
                 let next_subject = if matches!(subject, Subject::Error) {
                     Subject::Error
                 } else {
@@ -924,27 +951,13 @@ fn materialized_receiver_value(expr_id: ExprId, mut value: PlaceValue) -> PlaceV
 
 fn source_receiver(
     mode: MethodMode,
-    access: PlaceAccess,
-    facts: &PlaceUseFacts,
-    identity: place::PlaceIdentity,
-    root_local: Option<SemanticLocalId>,
-    root_name: Option<Ident>,
-    global: Option<place::GlobalPlace>,
-    expr_id: ExprId,
+    use_: ReceiverUse,
     name: Ident,
     collection_effect: Option<CollectionStructuralEffect>,
 ) -> SourceReceiver {
     SourceReceiver {
         mutable: matches!(mode, MethodMode::Instance { mutable: true }),
-        use_: ReceiverUse {
-            access,
-            facts: facts.clone(),
-            identity,
-            root_local,
-            root_name,
-            global,
-            id: expr_id,
-        },
+        use_,
         name,
         collection_effect,
     }
@@ -1001,6 +1014,8 @@ fn apply_value_field(
                         facts: receiver_place.clone(),
                         identity: receiver_identity,
                         root_local: receiver.root_local,
+                        root_binding: receiver.root_binding,
+                        root_source_depth: receiver.root_source_depth,
                         root_name: receiver.root_name,
                         global: receiver.global.clone(),
                         id: receiver_id,
@@ -1024,13 +1039,14 @@ fn apply_value_field(
                         method.callee,
                         Some(source_receiver(
                             method.mode,
-                            receiver_access,
-                            receiver_place,
-                            receiver_identity,
-                            receiver.root_local,
-                            receiver.root_name,
-                            receiver.global.clone(),
-                            receiver_id,
+                            receiver_use(
+                                receiver,
+                                receiver_access,
+                                receiver_place,
+                                receiver_identity,
+                                receiver.global.clone(),
+                                receiver_id,
+                            ),
                             name,
                             collection_loan::classify_method_effect(
                                 receiver_ty,
@@ -1058,13 +1074,14 @@ fn apply_value_field(
                         method.callee,
                         Some(source_receiver(
                             method.mode,
-                            receiver_access,
-                            receiver_place,
-                            receiver_identity,
-                            receiver.root_local,
-                            receiver.root_name,
-                            receiver.global.clone(),
-                            receiver_id,
+                            receiver_use(
+                                receiver,
+                                receiver_access,
+                                receiver_place,
+                                receiver_identity,
+                                receiver.global.clone(),
+                                receiver_id,
+                            ),
                             name,
                             collection_loan::classify_method_effect(
                                 receiver_ty,
@@ -1101,13 +1118,14 @@ fn apply_value_field(
                                 method.callee,
                                 Some(source_receiver(
                                     method.mode,
-                                    promoted_access,
-                                    receiver_place,
-                                    promoted_identity,
-                                    receiver.root_local,
-                                    receiver.root_name,
-                                    receiver.global.as_ref().map(place::GlobalPlace::projected),
-                                    field_id,
+                                    receiver_use(
+                                        receiver,
+                                        promoted_access,
+                                        receiver_place,
+                                        promoted_identity,
+                                        receiver.global.as_ref().map(place::GlobalPlace::projected),
+                                        field_id,
+                                    ),
                                     name,
                                     None,
                                 )),
@@ -1121,6 +1139,8 @@ fn apply_value_field(
                                 facts: receiver_place.clone(),
                                 identity: promoted_identity,
                                 root_local: receiver.root_local,
+                                root_binding: receiver.root_binding,
+                                root_source_depth: receiver.root_source_depth,
                                 root_name: receiver.root_name,
                                 global: receiver.global.as_ref().map(place::GlobalPlace::projected),
                                 id: field_id,
@@ -1151,6 +1171,8 @@ fn apply_value_field(
                         facts: receiver_place.clone(),
                         identity: receiver_identity,
                         root_local: receiver.root_local,
+                        root_binding: receiver.root_binding,
+                        root_source_depth: receiver.root_source_depth,
                         root_name: receiver.root_name,
                         global: receiver.global.clone(),
                         id: receiver_id,
@@ -1978,6 +2000,8 @@ struct ReturnPlaceSource {
     facts: PlaceUseFacts,
     identity: place::PlaceIdentity,
     root_local: Option<SemanticLocalId>,
+    root_binding: Option<super::BindingId>,
+    root_source_depth: Option<usize>,
     root_name: Option<Ident>,
     global: Option<place::GlobalPlace>,
 }
@@ -2007,6 +2031,8 @@ impl CheckedCall {
             facts: source.facts,
             identity: source.identity.returned_place(),
             root_local: source.root_local,
+            root_binding: source.root_binding,
+            root_source_depth: source.root_source_depth,
             root_name: source.root_name,
             global: source.global.as_ref().map(place::GlobalPlace::projected),
             map_entry_alias: false,
@@ -2029,6 +2055,8 @@ fn mutable_arg(span: Span, value: &PlaceValue) -> MutableArg {
             facts: value.facts.clone(),
             identity: value.identity.clone(),
             root_local: value.root_local,
+            root_binding: value.root_binding,
+            root_source_depth: value.root_source_depth,
             root_name: value.root_name,
             global: value.global.clone(),
         },
@@ -2057,7 +2085,7 @@ fn check_source_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) -> 
         (false, true) => check_cast_accept_arg(arg, param, tc),
         (false, false) => check_value_arg(arg, param, tc),
     };
-    tc.check_argument_escape(arg, param.escape);
+    tc.record_argument_escape(arg, param.escape);
     checked
 }
 
@@ -2205,7 +2233,7 @@ fn finish_cast_accept_arg(
             let target = tc.handle_type(&param.ty);
             super::body::check_cast_from_conversion_body(&conversion, &checked.ty, &target, tc);
             tc.mark_activation_imports_used(&conversion.origin);
-            tc.check_argument_escape(arg, conversion.escape);
+            tc.record_conversion_escape(arg, conversion.escape);
         }
         SourceAcceptance::ExplicitCast { .. } => unreachable!(),
     }
@@ -2318,7 +2346,7 @@ fn check_enum_variant_call(
     )
     .checked;
     for arg in &call.node.args {
-        tc.record_aggregate_elem_flow(call_id, arg);
+        tc.record_aggregate_elem_escape(call_id, arg);
     }
     checked
 }
@@ -2367,7 +2395,7 @@ fn record_collection_storage_args(callee: &CallableRef, args: &[ExprNode], tc: &
     };
     for index in collection_effect::storage_value_arg_indices(kind, callee.def.id.name) {
         if let Some(arg) = args.get(*index) {
-            tc.record_escaping_use(arg);
+            tc.record_collection_storage_escape(arg);
         }
     }
 }
@@ -2513,13 +2541,14 @@ fn check_qualified_extend_call(
 
     let receiver_use = source_receiver(
         method.mode,
-        receiver.access,
-        &receiver.facts,
-        receiver.identity.clone(),
-        receiver.root_local,
-        receiver.root_name,
-        receiver.global.clone(),
-        receiver_expr.node.id,
+        receiver_use(
+            &receiver,
+            receiver.access,
+            &receiver.facts,
+            receiver.identity.clone(),
+            receiver.global.clone(),
+            receiver_expr.node.id,
+        ),
         name,
         collection_loan::classify_method_effect(&receiver.checked.ty, name, &extend.origin),
     );

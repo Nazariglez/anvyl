@@ -1024,14 +1024,13 @@ impl LocalInit {
             if param.local_id.index() < function.locals.len() {
                 state.definite[param.local_id.index()] = true;
                 state.possible[param.local_id.index()] = true;
-                if matches!(
-                    program.type_arena.get(param.ty),
-                    Some(TypeData::Function(_))
-                ) {
-                    let escape = FunctionValueCapability::from_param_escape(param.escape);
-                    state.local_values[param.local_id.index()] =
-                        FunctionValueState::function(escape);
-                }
+                state.local_values[param.local_id.index()] = match program.type_arena.get(param.ty)
+                {
+                    Some(TypeData::Function(_)) => FunctionValueState::function(
+                        FunctionValueCapability::from_param_escape(param.escape),
+                    ),
+                    _ => source_call_return_state(program, param.ty),
+                };
             }
         }
         if let FunctionKind::Lambda(lambda) = function.kind
@@ -1840,6 +1839,9 @@ fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
         ScopedBorrowSource::PatternAlias { source } => {
             verify_pattern_alias_scoped_borrow(cx, site.clone(), id, &decl, source);
         }
+        ScopedBorrowSource::ForRefAlias { source } => {
+            verify_for_ref_alias_scoped_borrow(cx, site.clone(), id, &decl, source);
+        }
     }
     if decl.mutability != Mutability::Mutable {
         cx.push(
@@ -1957,6 +1959,57 @@ fn verify_pattern_alias_scoped_borrow(
             VerifyErrorKind::BadPlace(BadPlace::UnsupportedScopedBorrowProjection(id)),
         );
     }
+}
+
+fn verify_for_ref_alias_scoped_borrow(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    id: ScopedBorrowId,
+    decl: &ScopedBorrowDecl,
+    source: &Place,
+) {
+    if source.ty != decl.ty {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceLocalTypeMismatch {
+                borrow: id,
+                expected: decl.ty,
+                found: source.ty,
+            }),
+        );
+    }
+    verify_place(cx, decl.owner, BlockId::from_index(0), None, source);
+    verify_mutable_place(cx, decl.owner, &site, source);
+    let Some(function) = cx.program.functions.get(decl.owner.index()) else {
+        return;
+    };
+    let Some(root_local) = source.root.local() else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedRoot(source.root)),
+        );
+        return;
+    };
+    if !source.projection.is_empty()
+        || !function
+            .locals
+            .get(root_local.index())
+            .is_some_and(|local| {
+                local.kind == LocalKind::PatternBinding && local.binding == Some(decl.binding)
+            })
+        || !function_has_collection_slot_local(function, root_local)
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadPlace(BadPlace::UnsupportedScopedBorrowProjection(id)),
+        );
+    }
+}
+
+fn function_has_collection_slot_local(function: &Function, local: LocalId) -> bool {
+    let mut slots = std::collections::HashSet::new();
+    collect_collection_loan_slot_locals(&function.body.block, &mut slots);
+    slots.contains(&local)
 }
 
 fn function_param_is_mut_borrow(function: &Function, local: LocalId, role: ParamRole) -> bool {
@@ -4630,6 +4683,34 @@ fn verify_collection_loan_contract_place(
     active_slots: &std::collections::HashSet<LocalId>,
     escapes: bool,
 ) {
+    verify_collection_loan_contract_place_reads(
+        cx,
+        function_id,
+        place,
+        slot_locals,
+        active_slots,
+        escapes,
+    );
+    if let Some(source) = scoped_borrow_contract_source(cx.program, function_id, place) {
+        verify_collection_loan_contract_place_reads(
+            cx,
+            function_id,
+            &source,
+            slot_locals,
+            active_slots,
+            escapes,
+        );
+    }
+}
+
+fn verify_collection_loan_contract_place_reads(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    place: &Place,
+    slot_locals: &std::collections::HashSet<LocalId>,
+    active_slots: &std::collections::HashSet<LocalId>,
+    escapes: bool,
+) {
     place.for_each_read_local(&mut |local| {
         let local = match local {
             PlaceReadLocal::Root(local) | PlaceReadLocal::Index(local) => local,
@@ -4643,6 +4724,32 @@ fn verify_collection_loan_contract_place(
             escapes,
         );
     });
+}
+
+fn scoped_borrow_contract_source(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+) -> Option<Place> {
+    let borrow = program.scoped_borrow_root(function_id, place.root)?;
+    let decl = program.scoped_borrows.get(borrow.index())?;
+    if decl.owner != function_id {
+        return None;
+    }
+    let mut source = match &decl.source {
+        ScopedBorrowSource::SourceMutParam { local } | ScopedBorrowSource::RefSelf { local } => {
+            Place {
+                root: PlaceRoot::Local(*local),
+                projection: vec![],
+                ty: decl.ty,
+            }
+        }
+        ScopedBorrowSource::PatternAlias { source }
+        | ScopedBorrowSource::ForRefAlias { source } => source.clone(),
+    };
+    source.projection.extend(place.projection.clone());
+    source.ty = place.ty;
+    Some(source)
 }
 
 fn verify_collection_loan_contract_local(
@@ -4859,6 +4966,10 @@ fn verify_air_optional_match(
                     );
                 }
                 some_state.init(payload);
+                some_state.set_local_value(
+                    payload,
+                    optional_payload_function_state(cx.program, function_id, &match_.discr, state),
+                );
             }
             None => cx.push(
                 site.clone(),
@@ -4978,6 +5089,12 @@ fn verify_air_map_entry_match(
                     );
                 }
                 some_state.init(payload);
+                some_state.set_local_value(
+                    payload,
+                    kv.map_or_else(FunctionValueState::unknown, |(_, value_ty)| {
+                        source_call_return_state(cx.program, value_ty)
+                    }),
+                );
             }
             None => cx.push(
                 site.clone(),
@@ -5311,7 +5428,9 @@ fn verify_promoted_local_not_used(
         let source = match &decl.source {
             ScopedBorrowSource::SourceMutParam { local }
             | ScopedBorrowSource::RefSelf { local } => Some(*local),
-            ScopedBorrowSource::PatternAlias { .. } => None,
+            ScopedBorrowSource::PatternAlias { .. } | ScopedBorrowSource::ForRefAlias { .. } => {
+                None
+            }
         };
         if decl.owner == function_id && source == Some(local) {
             cx.push(
@@ -7530,6 +7649,20 @@ fn rvalue_function_state_inner(
                 },
             ))
         }
+        RValue::OptionalSome { value, .. } => {
+            FunctionValueState::Fields(vec![operand_function_state_inner(
+                program,
+                function_id,
+                value,
+                state,
+                global_init,
+            )])
+        }
+        RValue::MapGet { ty, .. } | RValue::MapRemove { ty, .. } | RValue::ListPop { ty, .. } => {
+            typing::optional_inner(program, *ty).map_or_else(FunctionValueState::unknown, |inner| {
+                FunctionValueState::Fields(vec![source_call_return_state(program, inner)])
+            })
+        }
         RValue::Aggregate { kind, fields, .. } => aggregate_function_state(
             kind,
             fields
@@ -7573,7 +7706,8 @@ fn aggregate_function_state(
         | AggregateCtor::Tuple
         | AggregateCtor::EnumVariant { .. }
         | AggregateCtor::Array
-        | AggregateCtor::List => FunctionValueState::Fields(fields),
+        | AggregateCtor::List
+        | AggregateCtor::DataRef(_) => FunctionValueState::Fields(fields),
         AggregateCtor::Map => FunctionValueState::Fields(
             fields
                 .into_iter()
@@ -7581,7 +7715,6 @@ fn aggregate_function_state(
                 .filter_map(|(index, field)| (index % 2 == 1).then_some(field))
                 .collect(),
         ),
-        AggregateCtor::DataRef(_) => FunctionValueState::unknown(),
     }
 }
 
@@ -7611,6 +7744,18 @@ fn operand_function_state_inner(
         Operand::Place(place) => {
             place_function_state(program, function_id, place, state, global_init)
         }
+    }
+}
+
+fn optional_payload_function_state(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+    state: &LocalInit,
+) -> FunctionValueState {
+    match place_function_state(program, function_id, place, state, true) {
+        FunctionValueState::Fields(fields) if fields.len() == 1 => fields[0].clone(),
+        _ => FunctionValueState::unknown(),
     }
 }
 
@@ -7712,6 +7857,9 @@ fn source_call_return_state(program: &Program, ty: TypeId) -> FunctionValueState
     match program.type_arena.get(ty) {
         Some(TypeData::Function(_)) => {
             FunctionValueState::function(FunctionValueCapability::Escaping)
+        }
+        Some(TypeData::Optional(inner)) => {
+            FunctionValueState::Fields(vec![source_call_return_state(program, *inner)])
         }
         Some(TypeData::Tuple(fields)) => FunctionValueState::Fields(
             fields

@@ -1262,7 +1262,7 @@ fn finish_callable_body_value_return(
     }
 
     if let Some(expr) = body.value_expr() {
-        tc.record_escaping_use(expr);
+        tc.record_return_escape(expr);
     }
     tc.reject_extern_any_escape(checked, body.span());
     if expected_ret.is_none() {

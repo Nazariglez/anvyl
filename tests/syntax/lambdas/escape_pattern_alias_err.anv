@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture mutable pattern alias 'x' in an escaping lambda
+// @frontend: new
+
+fn noop() {}
+
+fn bad(ref opt: int?) -> fn() {
+    if ref x? = opt {
+        return (|| { x = 1; });
+    }
+    noop
+}

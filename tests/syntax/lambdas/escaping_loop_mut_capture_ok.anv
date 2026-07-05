@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @frontend: new
+
+fn f(seed: int) -> fn() {
+    while seed < 1 {
+        var x = seed;
+        return || { x = x + 1; };
+    }
+    || {}
+}

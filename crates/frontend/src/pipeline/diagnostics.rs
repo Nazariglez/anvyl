@@ -696,7 +696,7 @@ pub(super) fn diagnose_type_error(
             format!("callback parameter '{name}' is non-escaping by default, but it escapes here")
         }
         TypeError::UnknownFunctionValueEscapes { .. } => {
-            "function value with unknown storage origin cannot escape".to_string()
+            "cannot retain this function value because its callback ownership is unknown".to_string()
         }
         TypeError::BorrowedCaptureEscapes { name, origin, .. } => {
             borrowed_capture_escape_message(*name, *origin)

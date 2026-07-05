@@ -117,6 +117,42 @@ fn explicit_function_value_capability_verifies_escaping_arg() {
 }
 
 #[test]
+fn explicit_function_value_capability_verifies_projected_storage() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let module = test_module(&mut builder);
+    let sig = SignatureType::new(vec![], ReturnMode::Value(int_ty));
+    let lambda_ty = builder.alloc_type(TypeData::Function(sig));
+    let tuple_ty = builder.alloc_type(TypeData::Tuple(vec![lambda_ty]));
+
+    let mut main = FunctionBuilder::new("main", module, FunctionKind::Normal, int_ty);
+    let pair = main.push_param("pair", tuple_ty, ParamRole::Normal);
+    let temp = main.push_local(None, lambda_ty, Mutability::Immutable, LocalKind::Temp);
+    let bb0 = main.push_block(term_return(op_const(builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    }))));
+    main.add_statement(
+        bb0,
+        stmt_init(
+            temp,
+            RValue::FunctionValue {
+                value: Operand::Place(Place {
+                    root: PlaceRoot::Local(pair),
+                    projection: vec![Projection::TupleField(0)],
+                    ty: lambda_ty,
+                }),
+                capability: FunctionValueCapability::Escaping,
+            },
+        ),
+    );
+    let main = builder.alloc_function(main.finish());
+    builder.set_entry(main);
+
+    expect_verified(&builder.finish());
+}
+
+#[test]
 fn global_with_initializer_verifies() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
