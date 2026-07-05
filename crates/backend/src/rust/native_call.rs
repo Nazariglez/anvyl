@@ -6,20 +6,25 @@ use super::rir::{RirCallArg, RirExternParam, RirParamAbi, RirParamEscape, RirPar
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProviderEntryPlan {
     None,
-    SuspendRuntimeEntry,
+    SuspendRuntimeEntry(ProviderEntryReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProviderEntryReason {
+    RetainedCallbacks,
 }
 
 impl ProviderEntryPlan {
     pub(super) fn for_retained_callbacks(retained_callbacks: bool) -> Self {
         if retained_callbacks {
-            Self::SuspendRuntimeEntry
+            Self::SuspendRuntimeEntry(ProviderEntryReason::RetainedCallbacks)
         } else {
             Self::None
         }
     }
 
     pub(super) fn suspends_runtime_entry(self) -> bool {
-        matches!(self, Self::SuspendRuntimeEntry)
+        matches!(self, Self::SuspendRuntimeEntry(_))
     }
 }
 
@@ -43,10 +48,20 @@ impl NativeHiddenCtxPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NativeArgBoundary {
+pub(super) enum NativeArgAction {
     Direct,
     SnapshotString,
     NativeRefBorrow { mutable: bool },
+    RejectLiveBoundary,
+}
+
+impl NativeArgAction {
+    pub(super) fn native_ref_borrow_mutability(self) -> Option<bool> {
+        match self {
+            Self::NativeRefBorrow { mutable } => Some(mutable),
+            Self::Direct | Self::SnapshotString | Self::RejectLiveBoundary => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,20 +141,16 @@ impl NativeCallPlan {
         self.params.iter().map(|param| param.semantic).collect()
     }
 
-    pub(super) fn rejects_reentry_arg(&self, index: usize, facts: NativeArgFacts) -> bool {
-        self.provider_entry.suspends_runtime_entry()
-            && self
-                .params
-                .get(index)
-                .is_some_and(|param| param.rejects_reentry_arg(facts))
-    }
-
-    pub(super) fn arg_boundary(&self, index: usize, facts: NativeArgFacts) -> NativeArgBoundary {
+    pub(super) fn arg_action(&self, index: usize, facts: NativeArgFacts) -> NativeArgAction {
         self.params
             .get(index)
-            .map_or(NativeArgBoundary::Direct, |param| {
-                param.arg_boundary(self.provider_entry.suspends_runtime_entry(), facts)
+            .map_or(NativeArgAction::Direct, |param| {
+                param.arg_action(self.provider_entry.suspends_runtime_entry(), facts)
             })
+    }
+
+    pub(super) fn rejects_reentry_arg(&self, index: usize, facts: NativeArgFacts) -> bool {
+        self.arg_action(index, facts) == NativeArgAction::RejectLiveBoundary
     }
 
     pub(super) fn provider_entry(&self) -> ProviderEntryPlan {
@@ -182,41 +193,35 @@ impl NativeParamAbi {
         param.semantic == self.semantic && param.abi == self.abi && param.escape == self.escape
     }
 
-    fn rejects_reentry_arg(self, facts: NativeArgFacts) -> bool {
-        match self.arg_boundary(true, facts) {
-            NativeArgBoundary::SnapshotString | NativeArgBoundary::NativeRefBorrow { .. } => false,
-            NativeArgBoundary::Direct => match self.reentry {
-                NativeReentryPolicy::Safe => false,
-                NativeReentryPolicy::SnapshotStringBorrow => {
-                    facts.mode == NativeArgMode::SharedBorrow && !facts.string
-                }
-                NativeReentryPolicy::UnsupportedLiveBoundary => {
-                    facts.mode != NativeArgMode::Omitted
-                }
-            },
-        }
-    }
-
-    fn arg_boundary(
-        self,
-        suspends_runtime_entry: bool,
-        facts: NativeArgFacts,
-    ) -> NativeArgBoundary {
+    fn arg_action(self, suspends_runtime_entry: bool, facts: NativeArgFacts) -> NativeArgAction {
         if suspends_runtime_entry
             && self.reentry == NativeReentryPolicy::SnapshotStringBorrow
             && facts.string
             && facts.mode == NativeArgMode::SharedBorrow
         {
-            return NativeArgBoundary::SnapshotString;
+            return NativeArgAction::SnapshotString;
         }
         match (self.abi, facts.native_ref) {
             (RirParamAbi::SharedBorrow, true) if facts.mode == NativeArgMode::SharedBorrow => {
-                NativeArgBoundary::NativeRefBorrow { mutable: false }
+                NativeArgAction::NativeRefBorrow { mutable: false }
             }
             (RirParamAbi::MutBorrow, true) if facts.mode == NativeArgMode::MutBorrow => {
-                NativeArgBoundary::NativeRefBorrow { mutable: true }
+                NativeArgAction::NativeRefBorrow { mutable: true }
             }
-            _ => NativeArgBoundary::Direct,
+            _ if suspends_runtime_entry && self.rejects_live_boundary(facts) => {
+                NativeArgAction::RejectLiveBoundary
+            }
+            _ => NativeArgAction::Direct,
+        }
+    }
+
+    fn rejects_live_boundary(self, facts: NativeArgFacts) -> bool {
+        match self.reentry {
+            NativeReentryPolicy::Safe => false,
+            NativeReentryPolicy::SnapshotStringBorrow => {
+                facts.mode == NativeArgMode::SharedBorrow && !facts.string
+            }
+            NativeReentryPolicy::UnsupportedLiveBoundary => facts.mode != NativeArgMode::Omitted,
         }
     }
 }
@@ -274,6 +279,12 @@ pub(super) fn classify_param(abi: &RustParamAbi) -> NativeParamAbi {
             RirParamEscape::Escaping,
             reentry,
         ),
+        RustParamAbi::AnvCallback(_) => NativeParamAbi::new(
+            RirParamSemantic::AnvCallback,
+            RirParamAbi::AnvCallback,
+            RirParamEscape::Escaping,
+            reentry,
+        ),
     }
 }
 
@@ -303,7 +314,8 @@ fn reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
         RustParamAbi::Value(_)
         | RustParamAbi::OwnedNamed(_)
         | RustParamAbi::ScopedLambda(_)
-        | RustParamAbi::EscapingLambda(_) => NativeReentryPolicy::Safe,
+        | RustParamAbi::EscapingLambda(_)
+        | RustParamAbi::AnvCallback(_) => NativeReentryPolicy::Safe,
     }
 }
 
@@ -313,6 +325,93 @@ fn nested_value_reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
         NativeReentryPolicy::SnapshotStringBorrow
         | NativeReentryPolicy::UnsupportedLiveBoundary => {
             NativeReentryPolicy::UnsupportedLiveBoundary
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anvyx_runtime::{ExternTypeExpr, RustParamAbi};
+
+    use super::*;
+
+    fn named(name: &str) -> ExternTypeExpr {
+        ExternTypeExpr::Named {
+            module: None,
+            name: name.into(),
+            args: vec![],
+        }
+    }
+
+    fn facts(mode: NativeArgMode, string: bool, native_ref: bool) -> NativeArgFacts {
+        NativeArgFacts {
+            mode,
+            string,
+            native_ref,
+        }
+    }
+
+    #[test]
+    fn native_call_plan_arg_actions() {
+        let cases = [
+            (
+                "plain value stays direct without retained callbacks",
+                RustParamAbi::Value(ExternTypeExpr::Int),
+                false,
+                facts(NativeArgMode::Direct, false, false),
+                NativeArgAction::Direct,
+            ),
+            (
+                "slice value is rejected across retained callback reentry",
+                RustParamAbi::Slice(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
+                true,
+                facts(NativeArgMode::Direct, false, false),
+                NativeArgAction::RejectLiveBoundary,
+            ),
+            (
+                "string shared borrow is snapshotted across retained callback reentry",
+                RustParamAbi::Borrow(ExternTypeExpr::String),
+                true,
+                facts(NativeArgMode::SharedBorrow, true, false),
+                NativeArgAction::SnapshotString,
+            ),
+            (
+                "non-string shared borrow for string ABI is rejected across retained callback reentry",
+                RustParamAbi::Borrow(ExternTypeExpr::String),
+                true,
+                facts(NativeArgMode::SharedBorrow, false, false),
+                NativeArgAction::RejectLiveBoundary,
+            ),
+            (
+                "native shared ref gets a resource borrow wrapper",
+                RustParamAbi::Borrow(named("Counter")),
+                true,
+                facts(NativeArgMode::SharedBorrow, false, true),
+                NativeArgAction::NativeRefBorrow { mutable: false },
+            ),
+            (
+                "native mutable ref gets a mutable resource borrow wrapper",
+                RustParamAbi::MutBorrow(named("Counter")),
+                true,
+                facts(NativeArgMode::MutBorrow, false, true),
+                NativeArgAction::NativeRefBorrow { mutable: true },
+            ),
+            (
+                "scoped callback is direct across retained callback reentry",
+                RustParamAbi::ScopedLambda(anvyx_runtime::ExternCallbackSignature {
+                    params: vec![],
+                    ret: Box::new(ExternTypeExpr::Void),
+                    policy: anvyx_runtime::CallbackPolicy::default(),
+                }),
+                true,
+                facts(NativeArgMode::Direct, false, false),
+                NativeArgAction::Direct,
+            ),
+        ];
+
+        for (name, abi, retained, arg_facts, expected) in cases {
+            let plan = NativeCallPlan::new(vec![classify_param(&abi)], retained);
+            assert_eq!(plan.arg_action(0, arg_facts), expected, "{name}");
         }
     }
 }

@@ -1,0 +1,33 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 11
+// 12
+// @match-end
+
+fn make_callbacks() -> [fn() -> int] {
+    var callbacks: [fn() -> int] = [];
+    var i = 0;
+    while i < 2 {
+        var count = i * 10;
+        callbacks.push(|| {
+            count += 1;
+            count
+        });
+        i += 1;
+    }
+    callbacks
+}
+
+fn main() {
+    let callbacks = make_callbacks();
+    let first = callbacks[0];
+    let second = callbacks[1];
+    println(first());
+    println(first());
+    println(second());
+    println(second());
+}

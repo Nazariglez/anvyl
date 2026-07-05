@@ -1,0 +1,12 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match: ok
+
+fn tick() { println("ok"); }
+fn keep(f: escaping fn()) { f(); }
+
+fn main() {
+    let fs: [string: fn()] = [:];
+    keep(fs["tick"] ?? tick);
+}

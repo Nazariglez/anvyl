@@ -31,14 +31,10 @@ pub(super) fn anv_ref_alias(alias: &str, native: &str) -> String {
 }
 
 pub(super) fn native_ref_borrow(resource: &str, arg: &str, mutable: bool, body: &str) -> String {
-    let access = if mutable { "with_mut" } else { "with" };
-    let heap = if mutable {
-        format!("{}.heap()", runtime_param_name())
-    } else {
-        format!("{}.heap_ref()", runtime_param_name())
-    };
+    let access = if mutable { "with_mut_in" } else { "with_in" };
     format!(
-        "({resource}).{access}({heap}, |{arg}| -> Result<_, {}> {{ Ok({body}) }}).map_err({})??",
+        "({resource}).{access}({}, |{arg}| -> Result<_, {}> {{ Ok({body}) }}).map_err({})??",
+        runtime_param_name(),
         runtime_error_ty(),
         heap_access_error(),
     )
@@ -46,7 +42,7 @@ pub(super) fn native_ref_borrow(resource: &str, arg: &str, mutable: bool, body: 
 
 pub(super) fn native_ref_adopt(native: &str, value: &str) -> String {
     format!(
-        "{{ let __anv_native_ret = {value}; {}::<{native}>::register_untracked({}.heap()).alloc_in({}, __anv_native_ret) }}",
+        "{{ let __anv_native_ret = {value}; let __anv_native_ty = {}::<{native}>::register_untracked_in({}); __anv_native_ty.alloc_in({}, __anv_native_ret) }}",
         rt_path("AnvRefType"),
         runtime_param_name(),
         runtime_param_name(),
@@ -117,12 +113,24 @@ pub(super) fn callback_close_thunk_symbol(sig: usize) -> String {
     format!("__anv_callback_close_sig{sig}")
 }
 
+pub(super) fn callback_anv_call_thunk_symbol(sig: usize) -> String {
+    format!("__anv_callback_carrier_call_sig{sig}")
+}
+
 pub(super) fn escaping_lambda_ty(args: &str, ret: &str) -> String {
     format!("{}<{args}, {ret}>", rt_path("EscapingLambda"))
 }
 
+pub(super) fn anv_callback_ty(args: &str, ret: &str) -> String {
+    format!("{}<'cx, {args}, {ret}>", rt_path("AnvCallback"))
+}
+
 pub(super) fn escaping_lambda_ctor_ty(args: &str, ret: &str) -> String {
     format!("{}::<{args}, {ret}>", rt_path("EscapingLambda"))
+}
+
+pub(super) fn anv_callback_ctor_ty(args: &str, ret: &str) -> String {
+    format!("{}::<{args}, {ret}>", rt_path("AnvCallback"))
 }
 
 pub(super) fn callback_key_ty() -> String {
@@ -141,10 +149,6 @@ pub(super) fn callback_slot_ty(root: &str) -> String {
 
 pub(super) fn callback_slot_turbofish(root: &str) -> String {
     format!("{}::<{root}>", rt_path("CallbackSlot"))
-}
-
-pub(super) fn root_id_ty(payload: &str) -> String {
-    format!("{}<'cx, {payload}>", rt_path("RootId"))
 }
 
 pub(super) fn pin_box_ty(payload: &str) -> String {
@@ -242,32 +246,6 @@ impl DataRefPlaceOp {
             Self::Mutate => format!("&mut {payload}"),
         }
     }
-
-    pub(super) fn path_ref(&self) -> &'static str {
-        match self {
-            Self::Access => "&",
-            Self::Mutate => "&mut ",
-        }
-    }
-
-    pub(super) fn heap_access(
-        &self,
-        rt: &str,
-        object: &str,
-        heap_type: &str,
-        storage: &str,
-        storage_ty: &str,
-        body: &str,
-    ) -> String {
-        match self {
-            Self::Access => {
-                rt_heap_try_with_erased(rt, object, heap_type, storage, storage_ty, body)
-            }
-            Self::Mutate => {
-                rt_heap_try_with_erased_mut(rt, object, heap_type, storage, storage_ty, body)
-            }
-        }
-    }
 }
 
 pub(super) fn dataref_place_ops_ty(payload: &str) -> String {
@@ -321,8 +299,11 @@ pub(super) fn lambda_cell_set(value: &str, replace_collection: bool) -> String {
     }
 }
 
-pub(super) fn scoped_mut_place_cell_new(source: &str) -> String {
-    format!("{}::new({source})", rt_path("ScopedMutPlaceCell"))
+pub(super) fn scoped_mut_place_cell_new(source: &str, safepoint: &str) -> String {
+    format!(
+        "{}::new_with_safepoint({source}, {safepoint})",
+        rt_path("ScopedMutPlaceCell")
+    )
 }
 
 pub(super) fn runtime_error_ty() -> String {
@@ -385,13 +366,38 @@ pub(super) fn runtime_ctx_ty_with(rt_lifetime: &str) -> String {
     format!("{}<'cx, {rt_lifetime}>", rt_path("Ctx"))
 }
 
-pub(super) fn runtime_ctx_from_raw(heap: &str) -> String {
-    format!("unsafe {{ {}::__anvyx_from_raw({heap}) }}", rt_path("Ctx"))
+pub(super) fn safepoint_state_ty() -> String {
+    rt_path("SafepointState")
 }
 
-pub(super) fn runtime_ctx_from_raw_with_roots(heap: &str, roots: &str) -> String {
+pub(super) fn runtime_safepoint_state(runtime: &str) -> String {
+    format!("{runtime}.__anvyx_safepoint_state()")
+}
+
+pub(super) fn runtime_validate_reentry(runtime: &str) -> String {
+    format!("{runtime}.__anvyx_validate_reentry()?")
+}
+
+pub(super) fn runtime_inner_validate_reentry(inner_ptr: &str) -> String {
     format!(
-        "unsafe {{ {}::__anvyx_from_raw_with_roots({heap}, {roots}) }}",
+        "unsafe {{ std::ptr::addr_of!((*{inner_ptr}.as_ptr()).safepoint).as_ref().unwrap() }}.validate_reentry()?"
+    )
+}
+
+pub(super) fn runtime_ctx_from_raw_with_safepoint(heap: &str, safepoint: &str) -> String {
+    format!(
+        "unsafe {{ {}::__anvyx_from_raw_with_safepoint({heap}, {safepoint}) }}",
+        rt_path("Ctx")
+    )
+}
+
+pub(super) fn runtime_ctx_from_raw_with_trace_roots_and_safepoint(
+    heap: &str,
+    roots: &str,
+    safepoint: &str,
+) -> String {
+    format!(
+        "unsafe {{ {}::__anvyx_from_raw_with_trace_roots_and_safepoint({heap}, {roots}, {safepoint}) }}",
         rt_path("Ctx")
     )
 }
@@ -408,8 +414,11 @@ pub(super) fn global_slot_ty(payload: &str) -> String {
     format!("{}<{payload}>", rt_path("GlobalSlot"))
 }
 
-pub(super) fn global_slot_new(name: &str) -> String {
-    format!("{}::new({name:?})", rt_path("GlobalSlot"))
+pub(super) fn global_slot_new(name: &str, safepoint: &str) -> String {
+    format!(
+        "{}::new_with_safepoint({name:?}, {safepoint}.clone())",
+        rt_path("GlobalSlot")
+    )
 }
 
 pub(super) fn global_slot_field(globals: &str, field: &str) -> String {
@@ -437,7 +446,7 @@ pub(super) fn global_set_or_replace_collection(slot: &str, value: &str) -> Strin
 }
 
 pub(super) fn global_begin_projected_loan(slot: &str) -> String {
-    format!("{slot}.begin_projected_loan()")
+    format!("{slot}.begin_projected_loan()?")
 }
 
 pub(super) fn generated_call_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -506,8 +515,8 @@ pub(super) fn trace_driver_ty() -> String {
     rt_path("TraceDriver")
 }
 
-pub(super) fn ctx_roots_ty() -> String {
-    rt_path("CtxRoots")
+pub(super) fn trace_root_set_ty() -> String {
+    rt_path("TraceRootSet")
 }
 
 pub(super) fn visitor_ty(driver: &str) -> String {
@@ -853,14 +862,13 @@ fn rt_heap_try_with_erased_op(
     body: &str,
     mutable: bool,
 ) -> String {
-    let method = if mutable {
-        "try_with_erased_mut"
+    let (heap, method, storage_ref) = if mutable {
+        ("heap()", "try_with_erased_mut", "&mut ")
     } else {
-        "try_with_erased"
+        ("heap_ref()", "try_with_erased", "&")
     };
-    let storage_ref = if mutable { "&mut " } else { "&" };
     map_heap_access_error(&format!(
-        "{rt}.heap().{method}({object}, {heap_type}, |{storage}: {storage_ref}{storage_ty}| {body})"
+        "{rt}.{heap}.{method}({object}, {heap_type}, |{storage}: {storage_ref}{storage_ty}| {body})"
     ))
 }
 
@@ -998,13 +1006,13 @@ mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, box_pin_struct_start,
         callback_check_identity, callback_record_heap_type_field, checked_index, checked_range,
-        ctx_roots_ty, dataref_place_heap_type_access, dataref_place_heap_type_field,
-        dataref_place_ops_ty, erased_handle_ty, generated_call, generated_runtime_inner_symbol,
-        generated_runtime_symbol, global_begin_projected_loan, global_set_or_replace_collection,
-        heap_access_error, heap_register, heap_scope, heap_scope_owned, heap_type_access,
-        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
-        mut_place_get_copy, mut_place_global, mut_place_heap_cell, mut_place_local,
-        mut_place_local_raw, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        dataref_place_heap_type_access, dataref_place_heap_type_field, dataref_place_ops_ty,
+        erased_handle_ty, generated_call, generated_runtime_inner_symbol, generated_runtime_symbol,
+        global_begin_projected_loan, global_set_or_replace_collection, heap_access_error,
+        heap_register, heap_scope, heap_scope_owned, heap_type_access, lambda_cell_ctor,
+        map_heap_access_error, mut_place_access, mut_place_dataref, mut_place_get_copy,
+        mut_place_global, mut_place_heap_cell, mut_place_local, mut_place_local_raw,
+        mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
         mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
         non_null_cast_mut, optional_payload_ops_ctor, optional_payload_ops_ty, owner_attach,
         owner_begin_shutdown, owner_enter, owner_enter_current, owner_entry_ptr,
@@ -1012,8 +1020,9 @@ mod tests {
         pin_get_unchecked_mut, projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase,
         rt_heap_try_with_erased, rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut,
         runtime_ctx_ty_with, runtime_owner_handle_new, runtime_owner_handle_ty, runtime_param_name,
-        scoped_mut_place_cell_new, scoped_mut_place_cell_ty, stack_lambda_cell_ctor,
-        stack_lambda_cell_ty, trace_crate_attr, trace_derive, visitor_ty,
+        runtime_validate_reentry, safepoint_state_ty, scoped_mut_place_cell_new,
+        scoped_mut_place_cell_ty, stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr,
+        trace_derive, trace_root_set_ty, visitor_ty,
     };
 
     #[test]
@@ -1103,8 +1112,8 @@ mod tests {
         );
         assert_eq!(lambda_cell_ctor("i64"), "anvyx_runtime::LambdaCell::<i64>");
         assert_eq!(
-            scoped_mut_place_cell_new("v0"),
-            "anvyx_runtime::ScopedMutPlaceCell::new(v0)"
+            scoped_mut_place_cell_new("v0", "rt.__anvyx_safepoint_state()"),
+            "anvyx_runtime::ScopedMutPlaceCell::new_with_safepoint(v0, rt.__anvyx_safepoint_state())"
         );
         assert_eq!(
             optional_payload_ops_ctor("i64"),
@@ -1137,7 +1146,8 @@ mod tests {
             anv_map_from_entries("rt", "types.map_storage1", "(k, v)"),
             "anvyx_runtime::AnvMap::from_entries(rt, types.map_storage1, [(k, v)])"
         );
-        assert_eq!(ctx_roots_ty(), "anvyx_runtime::CtxRoots");
+        assert_eq!(trace_root_set_ty(), "anvyx_runtime::TraceRootSet");
+        assert_eq!(safepoint_state_ty(), "anvyx_runtime::SafepointState");
         assert_eq!(visitor_ty("D"), "anvyx_runtime::Visitor<'cx, '_, D>");
         assert_eq!(
             generated_call("f", ["x".to_string()]),
@@ -1191,7 +1201,7 @@ mod tests {
                 "Node",
                 "f(&storage.value)"
             ),
-            "rt.heap().try_with_erased(object, self.heap_type, |storage: &Node| f(&storage.value)).map_err(anvyx_runtime::heap_access_error)?"
+            "rt.heap_ref().try_with_erased(object, self.heap_type, |storage: &Node| f(&storage.value)).map_err(anvyx_runtime::heap_access_error)?"
         );
         assert_eq!(
             rt_heap_try_with_erased_mut(
@@ -1205,6 +1215,10 @@ mod tests {
             "rt.heap().try_with_erased_mut(object, self.heap_type, |storage: &mut Node| f(&mut storage.value)).map_err(anvyx_runtime::heap_access_error)?"
         );
         assert_eq!(runtime_param_name(), "rt");
+        assert_eq!(
+            runtime_validate_reentry("rt"),
+            "rt.__anvyx_validate_reentry()?"
+        );
         assert_eq!(heap_type_access("types", "node"), "types.node");
         assert_eq!(
             mut_place_local("slot"),
@@ -1251,7 +1265,7 @@ mod tests {
         );
         assert_eq!(
             global_begin_projected_loan("globals.state"),
-            "globals.state.begin_projected_loan()"
+            "globals.state.begin_projected_loan()?"
         );
         assert_eq!(
             mut_place_replace_collection("place", "rt", "next"),

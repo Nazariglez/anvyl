@@ -71,7 +71,9 @@ impl DataRefPlaceDescriptors {
                 self.collect_collection_access(program, collection);
             }
             RirStmt::MapValueSet { map, .. } => self.collect_collection_access(program, map),
-            RirStmt::GlobalEnsure { .. } | RirStmt::DataRefSet { .. } => {}
+            RirStmt::GlobalEnsure { .. }
+            | RirStmt::ScopedPlaceCellInit { .. }
+            | RirStmt::DataRefSet { .. } => {}
             RirStmt::If(branch) => {
                 self.collect_block(program, function, &branch.then_block);
                 if let Some(block) = &branch.else_block {

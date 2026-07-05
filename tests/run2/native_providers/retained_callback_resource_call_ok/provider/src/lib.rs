@@ -39,12 +39,12 @@ impl Counter {
 
 #[function(ctx)]
 pub fn make_counter<'cx>(ctx: &mut Ctx<'cx, '_>, value: i64) -> AnvRef<'cx, Counter> {
-    AnvRefType::<Counter>::register_untracked(ctx.heap()).alloc_in(ctx, Counter { value })
+    AnvRefType::<Counter>::register_untracked_in(ctx).alloc_in(ctx, Counter { value })
 }
 
 #[function(ctx)]
 pub fn counter_value<'cx>(ctx: &mut Ctx<'cx, '_>, counter: AnvRef<'cx, Counter>) -> i64 {
-    counter.with(ctx.heap_ref(), |counter| counter.value).unwrap()
+    counter.with_in(ctx, |counter| counter.value).unwrap()
 }
 
 #[function]

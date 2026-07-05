@@ -40,7 +40,7 @@ impl Counter {
 
 #[function(ctx)]
 pub fn make_counter<'cx>(ctx: &mut Ctx<'cx, '_>, value: i64) -> AnvRef<'cx, Counter> {
-    AnvRefType::<Counter>::register_untracked(ctx.heap()).alloc_in(ctx, Counter { value })
+    AnvRefType::<Counter>::register_untracked_in(ctx).alloc_in(ctx, Counter { value })
 }
 
 #[function]
@@ -64,7 +64,7 @@ pub fn result_owned_counter(ok: bool, value: i64) -> Result<Counter, AnvString> 
 
 #[function(ctx)]
 pub fn counter_value<'cx>(ctx: &mut Ctx<'cx, '_>, counter: AnvRef<'cx, Counter>) -> i64 {
-    counter.with(ctx.heap_ref(), |counter| counter.value).unwrap()
+    counter.with_in(ctx, |counter| counter.value).unwrap()
 }
 
 #[function(ctx)]
@@ -73,7 +73,7 @@ pub fn counter_result_value<'cx>(
     result: Result<AnvRef<'cx, Counter>, AnvString>,
 ) -> AnvString {
     match result {
-        Ok(counter) => AnvString::from(counter.with(ctx.heap_ref(), |counter| counter.value).unwrap().to_string()),
+        Ok(counter) => AnvString::from(counter.with_in(ctx, |counter| counter.value).unwrap().to_string()),
         Err(message) => message,
     }
 }

@@ -100,6 +100,22 @@ pub fn close_second() -> RuntimeResult<bool> {
     SECONDARY.with(|slot| slot.borrow_mut().close())
 }
 
+#[function(ctx)]
+pub fn fire_with_heap_borrow<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<()> {
+    let heap = ctx.heap_ref();
+    let result = fire_slot(&PRIMARY);
+    drop(heap);
+    result
+}
+
+#[function(ctx)]
+pub fn close_with_heap_borrow<'cx>(ctx: &mut Ctx<'cx, '_>) -> RuntimeResult<bool> {
+    let heap = ctx.heap_ref();
+    let result = PRIMARY.with(|slot| slot.borrow_mut().close());
+    drop(heap);
+    result
+}
+
 #[function]
 pub fn host_log(msg: &str) {
     println!("{msg}");
@@ -140,6 +156,7 @@ anvyx_runtime::builtin_module! {
     source: "",
     exports: [
         retain, retain_second, fire, fire_second, close, close_second,
+        fire_with_heap_borrow, close_with_heap_borrow,
         host_log, host_add, host_name, collect_now, host_slice_first, each,
     ],
 }

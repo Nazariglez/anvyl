@@ -1,0 +1,39 @@
+// @mode: run
+// @frontend: new
+// @expect: success
+// @match-begin
+// 2
+// 2
+// @match-end
+
+fn apply(f: fn()) {
+    f();
+}
+
+fn set_nested(ref xs: [int; 1]) {
+    for i, ref x in xs {
+        if true {
+            x = 1;
+            xs[i] = 2;
+        }
+    }
+}
+
+fn set_nested_indirect(ref xs: [int; 1]) {
+    for i, ref x in xs {
+        if true {
+            apply(|| { x = 1; });
+            xs[i] = 2;
+        }
+    }
+}
+
+fn main() {
+    var direct = [0];
+    set_nested(direct);
+    println(direct[0]);
+
+    var indirect = [0];
+    set_nested_indirect(indirect);
+    println(indirect[0]);
+}

@@ -100,31 +100,50 @@ impl RirProgram {
     }
 
     pub(super) fn retained_callback_sigs(&self) -> Vec<RirLambdaSigId> {
-        let mut sigs = vec![];
-        for sig in self.retained_callback_sig_refs() {
-            if !sigs.contains(&sig) {
-                sigs.push(sig);
-            }
-        }
-        sigs
+        self.callback_sigs_by_role(|semantic| {
+            matches!(
+                semantic,
+                RirParamSemantic::EscapingLambda | RirParamSemantic::AnvCallback
+            )
+        })
+    }
+
+    pub(super) fn provider_callback_sigs(&self) -> Vec<RirLambdaSigId> {
+        self.callback_sigs_by_role(|semantic| semantic == RirParamSemantic::EscapingLambda)
+    }
+
+    pub(super) fn heap_callback_sigs(&self) -> Vec<RirLambdaSigId> {
+        self.callback_sigs_by_role(|semantic| semantic == RirParamSemantic::AnvCallback)
     }
 
     pub(super) fn has_retained_callbacks(&self) -> bool {
-        self.retained_callback_sig_refs().next().is_some()
+        !self.retained_callback_sigs().is_empty()
     }
 
-    fn retained_callback_sig_refs(&self) -> impl Iterator<Item = RirLambdaSigId> + '_ {
-        self.externs.iter().flat_map(|ext| {
-            ext.params.iter().filter_map(|param| {
-                if param.semantic != RirParamSemantic::EscapingLambda {
-                    return None;
+    pub(super) fn native_call_plan(&self, ext: RirExternId) -> native_call::NativeCallPlan {
+        let RirExternKind::Native(native) = &self.externs[ext.index()].kind;
+        native.call_plan(self.has_retained_callbacks())
+    }
+
+    fn callback_sigs_by_role(
+        &self,
+        role: impl Fn(RirParamSemantic) -> bool,
+    ) -> Vec<RirLambdaSigId> {
+        let mut sigs = vec![];
+        for ext in &self.externs {
+            for param in &ext.params {
+                if !role(param.semantic) {
+                    continue;
                 }
-                match self.types[param.ty.index()] {
-                    RirType::Lambda(sig) => Some(sig),
-                    _ => None,
+                let RirType::Lambda(sig) = self.types[param.ty.index()] else {
+                    continue;
+                };
+                if !sigs.contains(&sig) {
+                    sigs.push(sig);
                 }
-            })
-        })
+            }
+        }
+        sigs
     }
 
     pub fn collection_storage_for(&self, value_ty: RirTypeId) -> Option<&RirCollectionStorage> {
@@ -430,6 +449,7 @@ pub enum RirScopedPlaceSource {
     SourceMutParam { place: RirMutPlaceArg },
     RefSelf { place: RirMutPlaceArg },
     PatternAlias { place: RirMutPlaceArg },
+    ForRefAlias { place: RirMutPlaceArg },
 }
 
 impl RirScopedPlaceSource {
@@ -437,7 +457,8 @@ impl RirScopedPlaceSource {
         match self {
             Self::SourceMutParam { place }
             | Self::RefSelf { place }
-            | Self::PatternAlias { place } => place,
+            | Self::PatternAlias { place }
+            | Self::ForRefAlias { place } => place,
         }
     }
 
@@ -521,6 +542,7 @@ pub enum RirParamSemantic {
     MutPlace,
     ScopedLambda,
     EscapingLambda,
+    AnvCallback,
     StackCell,
     HeapCell,
     ScopedPlaceCell,
@@ -534,6 +556,7 @@ pub enum RirParamAbi {
     MutPlace,
     ScopedLambda,
     EscapingLambda,
+    AnvCallback,
     StackCell,
     HeapCell,
     ScopedPlaceCell,
@@ -582,6 +605,9 @@ pub enum RirStmt {
     CellInit {
         cell: RirCellRef,
         value: RirRValue,
+    },
+    ScopedPlaceCellInit {
+        cell: RirScopedPlaceCellId,
     },
     CellSet {
         cell: RirCellRef,
@@ -646,6 +672,7 @@ pub(super) fn stmt_child_blocks_any(
         | RirStmt::MutPlaceSet { .. }
         | RirStmt::Assign { .. }
         | RirStmt::CellInit { .. }
+        | RirStmt::ScopedPlaceCellInit { .. }
         | RirStmt::CellSet { .. }
         | RirStmt::ScopedPlaceCellSet { .. }
         | RirStmt::Eval(_)
@@ -988,6 +1015,10 @@ pub enum RirCallArg {
         callee: RirOperand,
         sig: RirLambdaSigId,
     },
+    AnvCallback {
+        callee: RirOperand,
+        sig: RirLambdaSigId,
+    },
 }
 
 impl RirCallArg {
@@ -1001,6 +1032,7 @@ impl RirCallArg {
             Self::MutPlace(_) => RirParamSemantic::MutPlace,
             Self::ScopedLambda { .. } => RirParamSemantic::ScopedLambda,
             Self::EscapingLambda { .. } => RirParamSemantic::EscapingLambda,
+            Self::AnvCallback { .. } => RirParamSemantic::AnvCallback,
         }
     }
 }
@@ -2059,8 +2091,8 @@ fn native_extern_signature_ok(
         && native.abi.params.len() == ext.params.len()
         && ext.abi.params.len() == ext.params.len()
         && native::rust_abi_matches_air(&native.abi.params, &native.abi.ret, &ext.abi)
-        && native
-            .call_plan(program.has_retained_callbacks())
+        && program
+            .native_call_plan(ext.id)
             .matches_signature(&ext.params)
         && native_callback_receiver_ok(program, native, ext)
         && native_hidden_ctx_borrows_ok(program, &native.abi, ext)
@@ -2112,43 +2144,11 @@ pub(super) fn rust_extern_abi_supported_with_receiver(
     receiver: Option<usize>,
 ) -> bool {
     match abi.support {
-        anvyx_runtime::RustAbiSupport::Direct => {
-            abi.backend_supported()
-                && abi.params.iter().all(rust_param_supported)
-                && rust_return_supported(&abi.ret)
-        }
+        anvyx_runtime::RustAbiSupport::Direct => abi.backend_supported(),
         anvyx_runtime::RustAbiSupport::NeedsWrapperConversion => {
             abi.supported_callback_wrapper_with_receiver(receiver)
         }
         anvyx_runtime::RustAbiSupport::Unsupported => false,
-    }
-}
-
-fn rust_param_supported(abi: &RustParamAbi) -> bool {
-    !abi.direct_mut_collection_abi()
-        && match abi {
-            RustParamAbi::Value(ty)
-            | RustParamAbi::Borrow(ty)
-            | RustParamAbi::MutBorrow(ty)
-            | RustParamAbi::MutPlace(ty) => extern_value_supported(ty),
-            RustParamAbi::OwnedNamed(ty) => named_abi_supported(ty),
-            RustParamAbi::InitField(inner)
-            | RustParamAbi::Option(inner)
-            | RustParamAbi::Slice(inner) => rust_param_supported(inner),
-            RustParamAbi::Result(ok, err) => rust_param_supported(ok) && rust_param_supported(err),
-            RustParamAbi::ScopedLambda(_) | RustParamAbi::EscapingLambda(_) => false,
-        }
-}
-
-fn rust_return_supported(abi: &anvyx_runtime::RustReturnAbi) -> bool {
-    match abi {
-        anvyx_runtime::RustReturnAbi::Void => true,
-        anvyx_runtime::RustReturnAbi::Value(ty) => extern_value_supported(ty),
-        anvyx_runtime::RustReturnAbi::OwnedNamed(ty) => named_abi_supported(ty),
-        anvyx_runtime::RustReturnAbi::Option(inner) => rust_return_supported(inner),
-        anvyx_runtime::RustReturnAbi::Result(ok, err) => {
-            rust_return_supported(ok) && rust_return_supported(err)
-        }
     }
 }
 
@@ -2197,35 +2197,6 @@ pub(super) fn native_ty_is_resource_ref(program: &RirProgram, ty: RirTypeId) -> 
         program.types[ty.index()],
         RirType::Struct(id) if program.structs[id.index()].native_ref
     )
-}
-
-fn named_abi_supported(ty: &ExternTypeExpr) -> bool {
-    matches!(ty, ExternTypeExpr::Named { args, .. } if args.is_empty())
-}
-
-fn extern_value_supported(ty: &ExternTypeExpr) -> bool {
-    match ty {
-        ExternTypeExpr::Unit
-        | ExternTypeExpr::Bool
-        | ExternTypeExpr::Int
-        | ExternTypeExpr::Float
-        | ExternTypeExpr::String => true,
-        ExternTypeExpr::Named { args, .. } => args.is_empty(),
-        ExternTypeExpr::Option(inner)
-        | ExternTypeExpr::List(inner)
-        | ExternTypeExpr::Array { elem: inner, .. } => extern_value_supported(inner),
-        ExternTypeExpr::Result(ok, err) => {
-            extern_value_supported(ok) && extern_value_supported(err)
-        }
-        ExternTypeExpr::Tuple(fields) => fields.iter().all(extern_value_supported),
-        ExternTypeExpr::Map(key, value) => {
-            extern_value_supported(key) && extern_value_supported(value)
-        }
-        ExternTypeExpr::Void
-        | ExternTypeExpr::Any
-        | ExternTypeExpr::Slice(_)
-        | ExternTypeExpr::Callback(_) => false,
-    }
 }
 
 fn extern_param_abi_ok(program: &RirProgram, abi: &ExternTypeExpr, param: RirExternParam) -> bool {
@@ -2620,6 +2591,7 @@ impl VerifyCx<'_> {
                     (
                         RirParamSemantic::ScopedLambda
                             | RirParamSemantic::EscapingLambda
+                            | RirParamSemantic::AnvCallback
                             | RirParamSemantic::StackCell
                             | RirParamSemantic::HeapCell
                             | RirParamSemantic::ScopedPlaceCell,
@@ -2628,6 +2600,7 @@ impl VerifyCx<'_> {
                         _,
                         RirParamAbi::ScopedLambda
                             | RirParamAbi::EscapingLambda
+                            | RirParamAbi::AnvCallback
                             | RirParamAbi::StackCell
                             | RirParamAbi::HeapCell
                             | RirParamAbi::ScopedPlaceCell,
@@ -2779,6 +2752,7 @@ impl VerifyCx<'_> {
                                 RirParamSemantic::MutBorrow
                                     | RirParamSemantic::ScopedLambda
                                     | RirParamSemantic::EscapingLambda
+                                    | RirParamSemantic::AnvCallback
                                     | RirParamSemantic::StackCell
                                     | RirParamSemantic::HeapCell
                                     | RirParamSemantic::ScopedPlaceCell,
@@ -2788,6 +2762,7 @@ impl VerifyCx<'_> {
                                 RirParamAbi::MutBorrow
                                     | RirParamAbi::ScopedLambda
                                     | RirParamAbi::EscapingLambda
+                                    | RirParamAbi::AnvCallback
                                     | RirParamAbi::StackCell
                                     | RirParamAbi::HeapCell
                                     | RirParamAbi::ScopedPlaceCell
@@ -3068,6 +3043,14 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
                 }
             }
+            RirScopedPlaceSource::ForRefAlias { place } => {
+                if !matches!(
+                    &place.access,
+                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { .. })
+                ) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedLambdaCapture);
+                }
+            }
         }
     }
 
@@ -3255,8 +3238,16 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::DuplicateSymbol);
                 }
                 field_symbols.push(field.symbol.clone());
-                self.check_stored_payload(site, field.ty);
-                self.check_lambda_container_type(site, field.ty);
+                self.check_stored_payload_family(
+                    site,
+                    field.ty,
+                    LambdaStorageFamily::DataRefProjection,
+                );
+                self.check_lambda_container_type_family(
+                    site,
+                    field.ty,
+                    LambdaStorageFamily::DataRefProjection,
+                );
             }
         }
     }
@@ -3604,10 +3595,12 @@ impl VerifyCx<'_> {
             }
             if matches!(
                 param.semantic,
-                RirParamSemantic::ScopedLambda | RirParamSemantic::EscapingLambda
+                RirParamSemantic::ScopedLambda
+                    | RirParamSemantic::EscapingLambda
+                    | RirParamSemantic::AnvCallback
             ) || matches!(
                 param.abi,
-                RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda
+                RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda | RirParamAbi::AnvCallback
             ) {
                 self.push(site, RirVerifyErrorKind::UnsupportedAbi);
             }
@@ -3704,14 +3697,17 @@ impl VerifyCx<'_> {
             if let Some(possible) = self.possibly_initialized.get_mut(param.local.index()) {
                 *possible = true;
             }
-            if matches!(self.ty(param.ty), Some(RirType::Lambda(_))) {
+            let value = if matches!(self.ty(param.ty), Some(RirType::Lambda(_))) {
                 let escape = Some(RirLambdaEscape::from_param_escape(param.escape));
                 if let Some(slot) = self.lambda_escapes.get_mut(param.local.index()) {
                     *slot = escape;
                 }
-                if let Some(slot) = self.lambda_values.get_mut(param.local.index()) {
-                    *slot = RirFunctionValueState::Lambda(escape);
-                }
+                RirFunctionValueState::Lambda(escape)
+            } else {
+                self.source_call_return_state(param.ty)
+            };
+            if let Some(slot) = self.lambda_values.get_mut(param.local.index()) {
+                *slot = value;
             }
         }
         for (stmt_index, stmt) in function.body.stmts.iter().enumerate() {
@@ -3786,6 +3782,7 @@ impl VerifyCx<'_> {
                 if let Some(expected) = function.locals.get(local.index()).map(|local| local.ty) {
                     self.check_rvalue(function_id, function, index, value, Some(expected));
                 }
+                self.check_hidden_stack_loop_lambda_rvalue(site, function, value);
                 let escape = self.rvalue_lambda_escape(function, value);
                 self.set_local_lambda_escape(function, *local, escape);
                 self.set_local_lambda_value(
@@ -3823,6 +3820,7 @@ impl VerifyCx<'_> {
             | RirStmt::GlobalUpdateRoot { global, value } => {
                 let Some(global_decl) = self.check_global_id(site, *global).cloned() else {
                     self.check_rvalue(function_id, function, index, value, None);
+                    self.check_stack_loop_lambda_rvalue(site, function, value);
                     return;
                 };
                 let requires_init = matches!(stmt, RirStmt::GlobalUpdateRoot { .. });
@@ -3845,6 +3843,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(global_decl.ty));
+                self.check_stack_loop_lambda_rvalue(site, function, value);
                 let value_state = self.rvalue_function_value_state(function, value);
                 if let Some(slot) = self.global_initialized.get_mut(global.index()) {
                     *slot = true;
@@ -3868,6 +3867,7 @@ impl VerifyCx<'_> {
                     MutPlaceUse::Write,
                 );
                 self.check_rvalue(function_id, function, index, value, Some(ty));
+                self.check_stack_loop_lambda_rvalue(site, function, value);
                 let value_state = self.rvalue_function_value_state(function, value);
                 self.set_mut_place_function_value(function, place, value_state);
             }
@@ -3875,6 +3875,7 @@ impl VerifyCx<'_> {
                 self.check_place(site, function, dst);
                 let Some(dst_local) = self.local_root(site, dst) else {
                     self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                    self.check_stack_loop_lambda_rvalue(site, function, value);
                     return;
                 };
                 self.check_mutable_local_root(site, function, Some(dst_local));
@@ -3887,6 +3888,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 self.check_rvalue(function_id, function, index, value, Some(dst.ty));
+                self.check_hidden_stack_loop_lambda_rvalue(site, function, value);
                 let value_state = self.rvalue_function_value_state(function, value);
                 let loop_scope = self.rvalue_loop_lambda_scope(function, value);
                 if dst.projections.is_empty() {
@@ -3921,8 +3923,16 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::InitCellTwice(decl.id));
                     }
                     self.check_rvalue(function_id, function, index, value, Some(decl.payload_ty));
+                    self.check_stack_loop_lambda_rvalue(site, function, value);
                     self.mark_cell_initialized(decl.id);
                 }
+            }
+            RirStmt::ScopedPlaceCellInit { cell } => {
+                self.check_function_scoped_place_cell_ref(
+                    site,
+                    function_id,
+                    RirScopedPlaceCellRef::Owner(*cell),
+                );
             }
             RirStmt::CellSet { cell, value } => {
                 if !matches!(value, RirRValue::Use(_)) {
@@ -3938,6 +3948,7 @@ impl VerifyCx<'_> {
                         self.push(site, RirVerifyErrorKind::UninitializedCell(decl.id));
                     }
                     self.check_rvalue(function_id, function, index, value, Some(decl.payload_ty));
+                    self.check_stack_loop_lambda_rvalue(site, function, value);
                 }
             }
             RirStmt::ScopedPlaceCellSet { cell, value } => {
@@ -3948,6 +3959,7 @@ impl VerifyCx<'_> {
                     self.check_function_scoped_place_cell_ref(site, function_id, *cell)
                 {
                     self.check_rvalue(function_id, function, index, value, Some(decl.payload_ty));
+                    self.check_stack_loop_lambda_rvalue(site, function, value);
                 }
             }
             RirStmt::DataRefSet {
@@ -3965,6 +3977,7 @@ impl VerifyCx<'_> {
                     StorageProjectionMode::Ordinary,
                 ) {
                     self.check_value_operand_ty(site, function, value, ty);
+                    self.check_stack_loop_lambda_operand(site, function, value);
                 }
             }
             RirStmt::SequenceSlotSet {
@@ -3983,6 +3996,7 @@ impl VerifyCx<'_> {
                 );
                 if let Some(value_ty) = value_ty {
                     self.check_value_operand_ty(site, function, value, value_ty);
+                    self.check_stack_loop_lambda_operand(site, function, value);
                 }
                 self.clear_collection_function_value(function, collection);
             }
@@ -3994,11 +4008,13 @@ impl VerifyCx<'_> {
                     self.check_map_slot(site, function_id, function, map, *index, true)
                 {
                     self.check_value_operand_ty(site, function, value, value_ty);
+                    self.check_stack_loop_lambda_operand(site, function, value);
                 }
                 self.clear_collection_function_value(function, map);
             }
             RirStmt::Eval(value) => {
                 self.check_rvalue(function_id, function, index, value, None);
+                self.check_hidden_stack_loop_lambda_rvalue(site, function, value);
                 self.clear_rvalue_function_writes(function, value);
             }
             RirStmt::If(branch) => {
@@ -4161,11 +4177,15 @@ impl VerifyCx<'_> {
                         if let Some(slot) = some_entry.possible.get_mut(payload.index()) {
                             *slot = true;
                         }
+                        let payload_value = value_ty
+                            .map_or(RirFunctionValueState::Unknown, |value_ty| {
+                                self.source_call_return_state(value_ty)
+                            });
                         if let Some(slot) = some_entry.lambda_escapes.get_mut(payload.index()) {
-                            *slot = None;
+                            *slot = payload_value.escape();
                         }
                         if let Some(slot) = some_entry.lambda_values.get_mut(payload.index()) {
-                            *slot = RirFunctionValueState::Unknown;
+                            *slot = payload_value;
                         }
                         if let Some(slot) = some_entry.loop_lambda_scopes.get_mut(payload.index()) {
                             *slot = None;
@@ -4292,11 +4312,16 @@ impl VerifyCx<'_> {
                         if let Some(slot) = some_entry.possible.get_mut(payload.index()) {
                             *slot = true;
                         }
+                        let payload_value = self.option_payload_function_value_state(
+                            function,
+                            &match_.subject,
+                            inner,
+                        );
                         if let Some(slot) = some_entry.lambda_escapes.get_mut(payload.index()) {
-                            *slot = None;
+                            *slot = payload_value.escape();
                         }
                         if let Some(slot) = some_entry.lambda_values.get_mut(payload.index()) {
-                            *slot = RirFunctionValueState::Unknown;
+                            *slot = payload_value;
                         }
                         if let Some(slot) = some_entry.loop_lambda_scopes.get_mut(payload.index()) {
                             *slot = None;
@@ -4600,6 +4625,84 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_stack_loop_lambda_rvalue(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        value: &RirRValue,
+    ) {
+        if self.rvalue_contains_stack_loop_lambda(function, value) {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+        }
+    }
+
+    fn check_hidden_stack_loop_lambda_rvalue(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        value: &RirRValue,
+    ) {
+        if self.rvalue_hides_stack_loop_lambda(function, value) {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+        }
+    }
+
+    fn check_stack_loop_lambda_operand(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) {
+        if self.operand_contains_stack_loop_lambda(function, operand) {
+            self.push(site, RirVerifyErrorKind::UnsupportedLambdaCell);
+        }
+    }
+
+    fn rvalue_hides_stack_loop_lambda(&self, function: &RirFunction, value: &RirRValue) -> bool {
+        match value {
+            RirRValue::Struct { fields, .. }
+            | RirRValue::Tuple { fields, .. }
+            | RirRValue::DataRefAlloc { fields, .. }
+            | RirRValue::EnumVariant { fields, .. }
+            | RirRValue::Array { elems: fields, .. }
+            | RirRValue::List { elems: fields, .. } => fields
+                .iter()
+                .any(|field| self.operand_contains_stack_loop_lambda(function, field)),
+            RirRValue::Map { entries, .. } => entries.iter().any(|(key, value)| {
+                self.operand_contains_stack_loop_lambda(function, key)
+                    || self.operand_contains_stack_loop_lambda(function, value)
+            }),
+            RirRValue::OptionalSome { value, .. } | RirRValue::ListPush { value, .. } => {
+                self.operand_contains_stack_loop_lambda(function, value)
+            }
+            RirRValue::MapInsert { key, value, .. } => {
+                self.operand_contains_stack_loop_lambda(function, key)
+                    || self.operand_contains_stack_loop_lambda(function, value)
+            }
+            _ => false,
+        }
+    }
+
+    fn rvalue_contains_stack_loop_lambda(&self, function: &RirFunction, value: &RirRValue) -> bool {
+        match value {
+            RirRValue::Use(operand) | RirRValue::FunctionValue { value: operand, .. } => {
+                self.operand_contains_stack_loop_lambda(function, operand)
+            }
+            RirRValue::Lambda { captures, .. } => captures
+                .iter()
+                .any(|capture| self.lambda_capture_arg_uses_loop_cell(capture)),
+            value => self.rvalue_hides_stack_loop_lambda(function, value),
+        }
+    }
+
+    fn operand_contains_stack_loop_lambda(
+        &self,
+        function: &RirFunction,
+        operand: &RirOperand,
+    ) -> bool {
+        self.operand_loop_lambda_scope(function, operand).is_some()
+    }
+
     fn operand_loop_lambda_scope(
         &self,
         function: &RirFunction,
@@ -4627,17 +4730,12 @@ impl VerifyCx<'_> {
     }
 
     fn lambda_capture_arg_uses_loop_cell(&self, capture: &RirLambdaCaptureArg) -> bool {
-        let cell = match capture {
-            RirLambdaCaptureArg::StackCell { cell } | RirLambdaCaptureArg::HeapCell { cell } => {
-                *cell
-            }
-            RirLambdaCaptureArg::Readonly { .. }
-            | RirLambdaCaptureArg::Scoped { .. }
-            | RirLambdaCaptureArg::ScopedPlaceCell { .. } => return false,
+        let RirLambdaCaptureArg::StackCell { cell } = capture else {
+            return false;
         };
         self.program
             .cells
-            .get(cell_ref_id(cell).index())
+            .get(cell_ref_id(*cell).index())
             .is_some_and(|cell| matches!(cell.lifetime, RirCellLifetime::Loop { .. }))
     }
 
@@ -4678,6 +4776,9 @@ impl VerifyCx<'_> {
                     )
                 },
             ),
+            Some(RirType::Option(inner)) => {
+                RirFunctionValueState::Fields(vec![self.source_call_return_state(inner)])
+            }
             Some(RirType::Array { elem, .. } | RirType::List(elem)) => {
                 RirFunctionValueState::Fields(vec![self.source_call_return_state(elem)])
             }
@@ -4797,6 +4898,18 @@ impl VerifyCx<'_> {
                     .get(lambda.index())
                     .map(|decl| decl.escape),
             ),
+            RirRValue::OptionalSome { value, .. } => RirFunctionValueState::Fields(vec![
+                self.operand_function_value_state(function, value),
+            ]),
+            RirRValue::MapGet { ty, .. } | RirRValue::MapRemove { ty, .. } => match self.ty(*ty) {
+                Some(RirType::Option(inner)) => {
+                    RirFunctionValueState::Fields(vec![self.source_call_return_state(inner)])
+                }
+                _ => RirFunctionValueState::Unknown,
+            },
+            RirRValue::SequenceSlotAt { ty, .. }
+            | RirRValue::MapEntryAt { ty, .. }
+            | RirRValue::MapValueAt { ty, .. } => self.source_call_return_state(*ty),
             RirRValue::Struct { fields, .. }
             | RirRValue::Tuple { fields, .. }
             | RirRValue::DataRefAlloc { fields, .. }
@@ -4820,6 +4933,17 @@ impl VerifyCx<'_> {
                     .map(|(_, value)| self.operand_function_value_state(function, value))
                     .collect(),
             ),
+            RirRValue::DataRefGet {
+                object,
+                projections,
+                ..
+            } => {
+                let mut value = self.operand_function_value_state(function, object);
+                for projection in projections {
+                    value = value.project(*projection);
+                }
+                value
+            }
             RirRValue::Call {
                 callee: RirCallTarget::Function(callee),
                 ty,
@@ -4849,6 +4973,26 @@ impl VerifyCx<'_> {
                 .get(id.index())
                 .map_or(RirFunctionValueState::Unknown, |konst| {
                     self.type_function_value_state(konst.ty)
+                }),
+        }
+    }
+
+    fn option_payload_function_value_state(
+        &self,
+        function: &RirFunction,
+        subject: &RirOptionSubject,
+        inner: Option<RirTypeId>,
+    ) -> RirFunctionValueState {
+        match subject {
+            RirOptionSubject::Place(place) => {
+                match self.place_function_value_state(function, place) {
+                    RirFunctionValueState::Fields(fields) if fields.len() == 1 => fields[0].clone(),
+                    _ => RirFunctionValueState::Unknown,
+                }
+            }
+            RirOptionSubject::MutPlace(_) => inner
+                .map_or(RirFunctionValueState::Unknown, |inner| {
+                    self.source_call_return_state(inner)
                 }),
         }
     }
@@ -5421,6 +5565,7 @@ impl VerifyCx<'_> {
             | RirStmt::MutPlaceSet { .. }
             | RirStmt::Assign { .. }
             | RirStmt::CellInit { .. }
+            | RirStmt::ScopedPlaceCellInit { .. }
             | RirStmt::CellSet { .. }
             | RirStmt::ScopedPlaceCellSet { .. }
             | RirStmt::DataRefSet { .. }
@@ -6248,6 +6393,9 @@ impl VerifyCx<'_> {
             }
             | RirCallArg::EscapingLambda {
                 callee: operand, ..
+            }
+            | RirCallArg::AnvCallback {
+                callee: operand, ..
             } => self.operand_lambda_escape(function, operand),
             RirCallArg::SharedBorrow(_)
             | RirCallArg::MutBorrow(_)
@@ -6304,9 +6452,7 @@ impl VerifyCx<'_> {
                             ext.ret,
                             init_fields,
                             Some(match &ext.kind {
-                                RirExternKind::Native(native) => {
-                                    native.call_plan(self.program.has_retained_callbacks())
-                                }
+                                RirExternKind::Native(_) => self.program.native_call_plan(id),
                             }),
                         )
                     }
@@ -6373,7 +6519,9 @@ impl VerifyCx<'_> {
             if arg.semantic() != mode
                 || matches!(
                     arg,
-                    RirCallArg::ScopedLambda { .. } | RirCallArg::EscapingLambda { .. }
+                    RirCallArg::ScopedLambda { .. }
+                        | RirCallArg::EscapingLambda { .. }
+                        | RirCallArg::AnvCallback { .. }
                 ) && !native_call
             {
                 self.push(site, RirVerifyErrorKind::CallArgMode);
@@ -6448,7 +6596,8 @@ impl VerifyCx<'_> {
                     MutPlaceUse::CallArg,
                 )),
                 RirCallArg::ScopedLambda { callee, sig }
-                | RirCallArg::EscapingLambda { callee, sig } => {
+                | RirCallArg::EscapingLambda { callee, sig }
+                | RirCallArg::AnvCallback { callee, sig } => {
                     self.check_lambda_sig_id(site, *sig);
                     let found = self.value_operand_ty(site, function, callee);
                     match found.and_then(|ty| match self.ty(ty) {
@@ -6904,6 +7053,7 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::UnexpectedReturnValue);
             }
             RirTerm::Return(Some(operand)) => {
+                self.check_stack_loop_lambda_operand(site, function, operand);
                 if let Some(found) = self.value_operand_ty(site, function, operand) {
                     if found != function.ret.ty {
                         self.push(
@@ -7472,10 +7622,21 @@ impl VerifyCx<'_> {
         function: RirFunctionId,
         local: RirLocalId,
     ) -> bool {
-        self.program
-            .scoped_place_cells
-            .iter()
-            .any(|cell| cell.owner == function && cell.source.root_local() == Some(local))
+        self.program.scoped_place_cells.iter().any(|cell| {
+            cell.owner == function
+                && match &cell.source {
+                    RirScopedPlaceSource::SourceMutParam { .. }
+                    | RirScopedPlaceSource::RefSelf { .. } => {
+                        cell.source.root_local() == Some(local)
+                    }
+                    RirScopedPlaceSource::PatternAlias { place } => matches!(
+                        place.access,
+                        RirMutPlaceAccess::Handle(RirMutPlaceHandle::Param { local: found, .. })
+                            if found == local
+                    ),
+                    RirScopedPlaceSource::ForRefAlias { .. } => false,
+                }
+        })
     }
 
     fn function_local_is_mut_place_param(function: &RirFunction, local: RirLocalId) -> bool {
@@ -7857,6 +8018,273 @@ mod tests {
         let model = RirPlaceModel::new(&program);
 
         assert!(model.dataref_mut_place_payload_supported(ty(0)));
+    }
+
+    fn stack_loop_lambda_value() -> RirOperand {
+        RirOperand::Place(RirPlace::local(local(1), vec![], ty(2)))
+    }
+
+    fn stack_loop_lambda_program(stmts: Vec<RirStmt>) -> RirProgram {
+        let int = ty(0);
+        let void = ty(1);
+        let lambda_ty = ty(2);
+        let list_ty = ty(3);
+        let map_ty = ty(4);
+        let lambda_sig = RirLambdaSigId::from_index(0);
+        let lambda_id = RirLambdaId::from_index(0);
+        let lambda_function = RirFunctionId::from_index(0);
+        let main_function = RirFunctionId::from_index(1);
+        let cell = RirCellId::from_index(0);
+        let loop_id = RirLoopId::from_index(0);
+        let x = local(0);
+        let callback = local(1);
+        let callbacks = local(2);
+        let callback_map = local(3);
+        let index = local(4);
+        let cell_source = local(5);
+
+        let mut body_stmts = vec![
+            RirStmt::CellInit {
+                cell: RirCellRef::Owner(cell),
+                value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            },
+            RirStmt::Init {
+                local: callback,
+                value: RirRValue::Lambda {
+                    lambda: lambda_id,
+                    captures: vec![RirLambdaCaptureArg::StackCell {
+                        cell: RirCellRef::Owner(cell),
+                    }],
+                    ty: lambda_ty,
+                },
+            },
+        ];
+        body_stmts.extend(stmts);
+
+        RirProgram {
+            types: vec![
+                RirType::Int,
+                RirType::Void,
+                RirType::Lambda(lambda_sig),
+                RirType::List(lambda_ty),
+                RirType::Map {
+                    key: int,
+                    value: lambda_ty,
+                },
+            ],
+            lambda_sigs: vec![RirLambdaSig {
+                id: lambda_sig,
+                params: vec![],
+                ret: void,
+            }],
+            collection_storages: vec![
+                RirCollectionStorage {
+                    id: RirCollectionStorageId::from_index(0),
+                    value_ty: list_ty,
+                    kind: RirCollectionStorageKind::List { elem_ty: lambda_ty },
+                    symbol: RirSymbol::new("ListLambda"),
+                },
+                RirCollectionStorage {
+                    id: RirCollectionStorageId::from_index(1),
+                    value_ty: map_ty,
+                    kind: RirCollectionStorageKind::Map {
+                        key_ty: int,
+                        value_ty: lambda_ty,
+                    },
+                    symbol: RirSymbol::new("MapLambda"),
+                },
+            ],
+            cells: vec![
+                RirCellDecl {
+                    id: cell,
+                    owner: main_function,
+                    source_local: x,
+                    payload_ty: int,
+                    storage: RirCellStorage::StackScoped,
+                    lifetime: RirCellLifetime::Loop { loop_id },
+                    symbol: RirSymbol::new("cell"),
+                },
+                RirCellDecl {
+                    id: RirCellId::from_index(1),
+                    owner: main_function,
+                    source_local: cell_source,
+                    payload_ty: lambda_ty,
+                    storage: RirCellStorage::StackScoped,
+                    lifetime: RirCellLifetime::Loop { loop_id },
+                    symbol: RirSymbol::new("storage_cell"),
+                },
+            ],
+            lambdas: vec![RirLambda {
+                id: lambda_id,
+                source: RirLambdaSource::Function(FunctionId::from_index(0)),
+                function: lambda_function,
+                sig: lambda_sig,
+                escape: RirLambdaEscape::NonEscaping,
+                storage: RirLambdaStorage::ScopedCaptures,
+                captures: vec![RirLambdaCapture {
+                    ty: int,
+                    semantic: RirParamSemantic::StackCell,
+                    abi: RirParamAbi::StackCell,
+                    kind: RirLambdaCaptureKind::StackCell { cell },
+                }],
+            }],
+            functions: vec![
+                RirFunction {
+                    id: lambda_function,
+                    air_id: None,
+                    symbol: RirSymbol::new("lambda"),
+                    params: vec![RirParam {
+                        local: x,
+                        ty: int,
+                        semantic: RirParamSemantic::StackCell,
+                        abi: RirParamAbi::StackCell,
+                        escape: RirParamEscape::NonEscaping,
+                    }],
+                    ret: RirReturn { ty: void },
+                    locals: vec![RirLocal {
+                        id: x,
+                        ty: int,
+                        mutable: false,
+                        symbol: RirSymbol::new("cell_param"),
+                        initialized: true,
+                        payload_ref: false,
+                    }],
+                    body: RirStructuredBlock {
+                        stmts: vec![],
+                        term: RirTerm::Return(None),
+                    },
+                },
+                RirFunction {
+                    id: main_function,
+                    air_id: None,
+                    symbol: RirSymbol::new("main"),
+                    params: vec![],
+                    ret: RirReturn { ty: void },
+                    locals: vec![
+                        RirLocal {
+                            id: x,
+                            ty: int,
+                            mutable: true,
+                            symbol: RirSymbol::new("x"),
+                            initialized: false,
+                            payload_ref: false,
+                        },
+                        RirLocal {
+                            id: callback,
+                            ty: lambda_ty,
+                            mutable: false,
+                            symbol: RirSymbol::new("callback"),
+                            initialized: false,
+                            payload_ref: false,
+                        },
+                        RirLocal {
+                            id: callbacks,
+                            ty: list_ty,
+                            mutable: true,
+                            symbol: RirSymbol::new("callbacks"),
+                            initialized: false,
+                            payload_ref: false,
+                        },
+                        RirLocal {
+                            id: callback_map,
+                            ty: map_ty,
+                            mutable: true,
+                            symbol: RirSymbol::new("callback_map"),
+                            initialized: true,
+                            payload_ref: false,
+                        },
+                        RirLocal {
+                            id: index,
+                            ty: int,
+                            mutable: false,
+                            symbol: RirSymbol::new("index"),
+                            initialized: true,
+                            payload_ref: false,
+                        },
+                        RirLocal {
+                            id: cell_source,
+                            ty: lambda_ty,
+                            mutable: true,
+                            symbol: RirSymbol::new("cell_source"),
+                            initialized: false,
+                            payload_ref: false,
+                        },
+                    ],
+                    body: RirStructuredBlock {
+                        stmts: vec![RirStmt::Loop(RirLoop {
+                            id: loop_id,
+                            body: RirStructuredBlock {
+                                stmts: body_stmts,
+                                term: RirTerm::Return(None),
+                            },
+                        })],
+                        term: RirTerm::Return(None),
+                    },
+                },
+            ],
+            consts: vec![RirConst {
+                id: RirConstId::from_index(0),
+                ty: int,
+                value: RirConstValue::Int(0),
+            }],
+            entry: Some(main_function),
+            ..RirProgram::default()
+        }
+    }
+
+    fn expect_unsupported_loop_lambda(program: RirProgram) {
+        let errors = verify(&program).expect_err("stack loop-cell lambda must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == RirVerifyErrorKind::UnsupportedLambdaCell)
+        );
+    }
+
+    #[test]
+    fn rejects_stack_loop_lambda_in_list_literal() {
+        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::Init {
+            local: local(2),
+            value: RirRValue::List {
+                ty: ty(3),
+                elems: vec![stack_loop_lambda_value()],
+            },
+        }]));
+    }
+
+    #[test]
+    fn rejects_stack_loop_lambda_in_cell_init() {
+        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::CellInit {
+            cell: RirCellRef::Owner(RirCellId::from_index(1)),
+            value: RirRValue::Use(stack_loop_lambda_value()),
+        }]));
+    }
+
+    #[test]
+    fn rejects_stack_loop_lambda_in_sequence_slot() {
+        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![
+            RirStmt::Init {
+                local: local(2),
+                value: RirRValue::List {
+                    ty: ty(3),
+                    elems: vec![],
+                },
+            },
+            RirStmt::SequenceSlotSet {
+                collection: RirCollectionAccess::Direct(RirPlace::local(local(2), vec![], ty(3))),
+                index: local(4),
+                value: stack_loop_lambda_value(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn rejects_stack_loop_lambda_in_map_value() {
+        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::MapValueSet {
+            map: RirCollectionAccess::Direct(RirPlace::local(local(3), vec![], ty(4))),
+            index: local(4),
+            value: stack_loop_lambda_value(),
+        }]));
     }
 
     #[test]

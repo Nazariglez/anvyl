@@ -1,10 +1,10 @@
 use super::{
     analysis,
     dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
-    native_call::{NativeArgBoundary, NativeCallPlan},
+    native_call::{NativeArgAction, NativeCallPlan},
     place::RustPlaces,
-    rep_policy::{LambdaTraceAction, RustRepPolicy, RustTracePlan},
-    retained_callbacks::RetainedCallbackSigPlan,
+    rep_policy::{LambdaTraceAction, LambdaVariantLayout, RustRepPolicy, RustTracePlan},
+    retained_callbacks::{RetainedCallbackEmitter, RetainedCallbackSigPlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirCoreEnumKind,
@@ -15,10 +15,12 @@ use super::{
         RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg,
         RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi,
         RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirTupleId,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
-        native_arg_facts, native_ty_is_resource_ref, stmt_child_blocks_any,
+        RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt,
+        RirStructuredBlock, RirTerm, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram, native_arg_facts, native_ty_is_resource_ref,
+        stmt_child_blocks_any,
     },
+    runtime_owner::RuntimeOwnerEmit,
     syntax::{
         FormatAlign, FormatKind, FormatSign, FormatSpec, binary_op, block_expr, comma, field_init,
         format_fragment, match_expr, rust_string, struct_lit, struct_variant,
@@ -57,6 +59,8 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
         trace_plan: RustTracePlan::build(program),
         fallible_functions: analysis::fallible_functions(program),
         retained_callback_sigs: program.retained_callback_sigs(),
+        provider_callback_sigs: program.provider_callback_sigs(),
+        heap_callback_sigs: program.heap_callback_sigs(),
         w: RustWriter::default(),
         collection_loans: vec![],
     };
@@ -70,6 +74,8 @@ struct EmitCx<'a> {
     trace_plan: RustTracePlan,
     fallible_functions: Vec<bool>,
     retained_callback_sigs: Vec<RirLambdaSigId>,
+    provider_callback_sigs: Vec<RirLambdaSigId>,
+    heap_callback_sigs: Vec<RirLambdaSigId>,
     w: RustWriter,
     collection_loans: Vec<ActiveCollectionLoan>,
 }
@@ -231,19 +237,30 @@ impl EmitCx<'_> {
         self.w.pop_indent();
         self.w.line("}");
         self.w.blank();
+        let safepoint_param = if self.program.globals.is_empty() {
+            "_safepoint"
+        } else {
+            "safepoint"
+        };
         self.w.block(format_args!("impl<'cx> {globals}<'cx>"), |w| {
-            w.block("fn new() -> Self", |w| {
-                w.block("Self", |w| {
-                    for global in &self.program.globals {
-                        w.line(format_args!(
-                            "{}: {},",
-                            global.slot_symbol.as_str(),
-                            target::global_slot_new(global.name.as_str())
-                        ));
-                    }
-                    w.line("_brand: std::marker::PhantomData,");
-                });
-            });
+            w.block(
+                format_args!(
+                    "fn new({safepoint_param}: &{}) -> Self",
+                    target::safepoint_state_ty()
+                ),
+                |w| {
+                    w.block("Self", |w| {
+                        for global in &self.program.globals {
+                            w.line(format_args!(
+                                "{}: {},",
+                                global.slot_symbol.as_str(),
+                                target::global_slot_new(global.name.as_str(), safepoint_param)
+                            ));
+                        }
+                        w.line("_brand: std::marker::PhantomData,");
+                    });
+                },
+            );
         });
         let traced_globals = self
             .program
@@ -270,10 +287,13 @@ impl EmitCx<'_> {
                 },
             );
             self.w.block(
-                format_args!("impl<'cx> {}<'cx> for {ty}", target::ctx_roots_ty()),
+                format_args!("impl<'cx> {}<'cx> for {ty}", target::trace_root_set_ty()),
                 |w| {
                     w.block(
-                        format_args!("fn validate_roots(&self) -> {}", target::result_ty("()")),
+                        format_args!(
+                            "fn validate_trace_roots(&self) -> {}",
+                            target::result_ty("()")
+                        ),
                         |w| {
                             for global in &traced_globals {
                                 w.line(format_args!(
@@ -311,6 +331,7 @@ impl EmitCx<'_> {
                 ));
             }
             w.line(format_args!("heap: {},", target::heap_ty()));
+            w.line(format_args!("safepoint: {},", target::safepoint_state_ty()));
             w.line(format_args!("_pin: {},", target::phantom_pinned_ty()));
         });
         self.w.blank();
@@ -322,6 +343,10 @@ impl EmitCx<'_> {
                 ));
                 w.line(format_args!("types: &'entry {types}<'cx>,"));
                 w.line(format_args!("globals: &'entry {globals}<'cx>,"));
+                w.line(format_args!(
+                    "safepoint: &'entry {},",
+                    target::safepoint_state_ty()
+                ));
                 if !retained_sigs.is_empty() {
                     w.line(format_args!(
                         "owner: &'entry {},",
@@ -346,7 +371,11 @@ impl EmitCx<'_> {
                         target::runtime_owner_handle_new()
                     ));
                     w.line(format_args!("let types = {types}::register(&mut heap);"));
-                    w.line(format_args!("let globals = {globals}::new();"));
+                    w.line(format_args!(
+                        "let safepoint = {}::default();",
+                        target::safepoint_state_ty()
+                    ));
+                    w.line(format_args!("let globals = {globals}::new(&safepoint);"));
                     if !retained_sigs.is_empty() {
                         w.line(format_args!(
                             "let callbacks = {}::default();",
@@ -364,6 +393,7 @@ impl EmitCx<'_> {
                                 w.line("callbacks,");
                             }
                             w.line("heap,");
+                            w.line("safepoint,");
                             w.line(format_args!("_pin: {},", target::phantom_pinned_value()));
                         });
                         w.line("}),");
@@ -374,12 +404,9 @@ impl EmitCx<'_> {
                             "let inner = {};",
                             target::pin_get_unchecked_mut("runtime.inner.as_mut()")
                         ));
-                        w.line(format_args!(
-                            "{}.expect(\"runtime owner attach failed\");",
-                            target::owner_attach(
-                                "runtime.owner",
-                                &format!("{}.cast()", target::non_null_from_mut("inner"))
-                            )
+                        w.line(RuntimeOwnerEmit::attach_line(
+                            "runtime.owner",
+                            &format!("{}.cast()", target::non_null_from_mut("inner")),
                         ));
                     });
                     w.line("runtime");
@@ -392,10 +419,7 @@ impl EmitCx<'_> {
                     target::result_ty("R")
                 ),
                 |w| {
-                    w.line(format_args!(
-                        "let owner_entry = {}?;",
-                        target::owner_enter_current("self.owner")
-                    ));
+                    w.line(RuntimeOwnerEmit::enter_current_line("owner_entry", "self.owner"));
                     w.line(format_args!(
                         "let inner = unsafe {{ {} }};",
                         target::non_null_cast_mut(
@@ -410,6 +434,7 @@ impl EmitCx<'_> {
                         ));
                         w.line("types: &inner.types,");
                         w.line("globals: &inner.globals,");
+                        w.line("safepoint: &inner.safepoint,");
                         if !retained_sigs.is_empty() {
                             w.line("owner: &self.owner,");
                             w.line(format_args!(
@@ -431,7 +456,7 @@ impl EmitCx<'_> {
                         target::owner_begin_shutdown("self.owner")
                     ));
                     w.indented(|w| {
-                        w.line("debug_assert!(false, \"runtime shutdown failed: {}\", error.message());");
+                        w.line("panic!(\"runtime shutdown failed: {}\", error.message());");
                     });
                     w.line("}");
                 });
@@ -444,260 +469,29 @@ impl EmitCx<'_> {
     }
 
     fn emit_callback_registry(&mut self) {
-        if self.retained_callback_sigs.is_empty() {
-            return;
-        }
-        let sigs = self.retained_callback_sigs.clone();
-        let policy = RustRepPolicy::new(self.program);
-        for sig in &sigs {
-            let plan = RetainedCallbackSigPlan::new(*sig);
-            let record = plan.record_symbol();
-            let lambda = policy.lambda_sig_storage_ty(*sig);
-            self.w.block(format_args!("struct {record}<'cx>"), |w| {
-                w.line(format_args!("lambda: {lambda},"));
-                w.line("_brand: std::marker::PhantomData<&'cx ()>,");
-            });
-            self.w.blank();
-            if self.trace_plan.needs_lambda_sig_trace(*sig) {
-                let ty = format!("{record}<'cx>");
-                self.w.block(
-                    format_args!("{}", target::trace_impl_header("<'cx>", &ty)),
-                    |w| {
-                        w.line(format_args!("{} {{", target::trace_fn_header()));
-                        w.indented(|w| {
-                            w.line(format_args!(
-                                "{}::trace(&self.lambda, visitor);",
-                                target::trace_ty()
-                            ));
-                        });
-                        w.line("}");
-                    },
-                );
-                self.w.blank();
-            }
-        }
-        let registry = target::generated_callback_registry_symbol();
-        self.w.line("#[derive(Default)]");
-        self.w.block(format_args!("struct {registry}<'cx>"), |w| {
-            for sig in &sigs {
-                let plan = RetainedCallbackSigPlan::new(*sig);
-                let field = plan.table_field();
-                let record = plan.record_symbol();
-                let root = target::root_id_ty(&format!("{record}<'cx>"));
-                w.line(format_args!(
-                    "{field}: Vec<{}>,",
-                    target::callback_slot_ty(&root)
-                ));
-            }
-            w.line("_brand: std::marker::PhantomData<&'cx ()>,");
-        });
-        self.w.blank();
-        self.w
-            .block(format_args!("impl<'cx> {registry}<'cx>"), |w| {
-                for sig in &sigs {
-                    let plan = RetainedCallbackSigPlan::new(*sig);
-                    let field = plan.table_field();
-                    let record = plan.record_symbol();
-                    let root = target::root_id_ty(&format!("{record}<'cx>"));
-                    w.block(
-                        format_args!(
-                            "fn insert_{field}(&mut self, root: {root}) -> (usize, std::num::NonZeroU64)"
-                        ),
-                        |w| {
-                            w.line(format_args!(
-                                "if let Some((index, slot)) = self.{field}.iter_mut().enumerate().find(|(_, slot)| slot.is_free()) {{"
-                            ));
-                            w.indented(|w| {
-                                w.line("let generation = slot.insert(root).expect(\"callback slot open failed\");");
-                                w.line("return (index, generation);");
-                            });
-                            w.line("}");
-                            w.line(format_args!("let index = self.{field}.len();"));
-                            w.line(format_args!(
-                                "let mut slot = {}::default();",
-                                target::callback_slot_turbofish(&root)
-                            ));
-                            w.line("let generation = slot.insert(root).expect(\"callback slot open failed\");");
-                            w.line(format_args!("self.{field}.push(slot);"));
-                            w.line("(index, generation)");
-                        },
-                    );
-                }
-            });
-        self.w.blank();
-    }
-
-    fn callback_args_ty(&self, sig: &RirLambdaSig) -> String {
-        let policy = RustRepPolicy::new(self.program);
-        match sig.params.as_slice() {
-            [] => "()".to_string(),
-            [param] => format!(
-                "({},)",
-                policy.callable_param_ty(param.ty, param.abi, param.escape)
-            ),
-            params => format!(
-                "({})",
-                comma(params.iter().map(|param| policy.callable_param_ty(
-                    param.ty,
-                    param.abi,
-                    param.escape
-                )))
-            ),
-        }
-    }
-
-    fn callback_ret_ty(&self, sig: &RirLambdaSig) -> String {
-        RustRepPolicy::new(self.program).callable_ret_ty(sig.ret)
+        RetainedCallbackEmitter::new(
+            self.program,
+            &self.trace_plan,
+            &self.fallible_functions,
+            &self.retained_callback_sigs,
+            &self.provider_callback_sigs,
+            &self.heap_callback_sigs,
+            &mut self.w,
+        )
+        .emit_registry();
     }
 
     fn emit_callback_thunks(&mut self) {
-        for sig_id in self.retained_callback_sigs.clone() {
-            let plan = RetainedCallbackSigPlan::new(sig_id);
-            let sig = &self.program.lambda_sigs[plan.sig_index()];
-            let args_ty = self.callback_args_ty(sig);
-            let ret_ty = self.callback_ret_ty(sig);
-            let call_thunk = plan.call_thunk_symbol();
-            let close_thunk = plan.close_thunk_symbol();
-            let key_ty = target::callback_key_ty();
-            let owner_ty = target::runtime_owner_handle_ty();
-            let result_ret = target::result_ty(&ret_ty);
-            let inner = target::generated_runtime_inner_symbol();
-            let field = plan.table_field();
-            let key_check = format!(
-                "{}?;",
-                target::callback_check_identity("key", plan.table_id(), plan.signature_id())
-            );
-            let lambda_call_args = [
-                "&mut rt".to_string(),
-                "types".to_string(),
-                "globals".to_string(),
-                "owner".to_string(),
-                "callbacks".to_string(),
-            ]
-            .into_iter()
-            .chain((0..sig.params.len()).map(|index| format!("args.{index}")))
-            .collect::<Vec<_>>();
-            let lambda_fallible = self.lambda_sig_fallible(sig);
-            let trace_globals = self
-                .program
-                .globals
-                .iter()
-                .any(|global| RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty));
-            self.w.block(
-                format_args!(
-                    "unsafe fn {call_thunk}(owner: &{owner_ty}, key: {key_ty}, args: {args_ty}) -> {result_ret}"
-                ),
-                |w| {
-                    w.line(&key_check);
-                    w.line(format_args!(
-                        "let owner_entry = {}?;",
-                        target::owner_enter("owner", "key.owner_id()", "key.shutdown_generation()")
-                    ));
-                    w.line(format_args!(
-                        "let mut inner_ptr = {}.cast::<{inner}<'_>>();",
-                        target::owner_entry_ptr("owner_entry")
-                    ));
-                    w.line("let (lambda, guard) = {");
-                    w.indented(|w| {
-                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
-                        w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                        w.line("let Some(slot) = table.get_mut(key.index()) else {");
-                        w.indented(|w| {
-                            w.line(format_args!(
-                                "return Err({}::new(\"callback slot is closed\"));",
-                                target::runtime_error_ty()
-                            ));
-                        });
-                        w.line("};");
-                        w.line("let (root, guard) = slot.begin_invocation(owner, key)?;");
-                        w.line("let Some(lambda) = inner.heap.with_root(root, |record| record.lambda.clone()) else {");
-                        w.indented(|w| {
-                            w.line(format_args!(
-                                "return Err({}::new(\"callback root is missing\"));",
-                                target::runtime_error_ty()
-                            ));
-                        });
-                        w.line("};");
-                        w.line("(lambda, guard)");
-                    });
-                    w.line("};");
-                    w.line("let (heap, types, globals, callbacks) = {");
-                    w.indented(|w| {
-                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
-                        w.line("let heap = std::ptr::NonNull::from(&mut inner.heap);");
-                        w.line("let types = std::ptr::NonNull::from(&inner.types);");
-                        w.line("let globals = std::ptr::NonNull::from(&inner.globals);");
-                        w.line("let callbacks = std::ptr::NonNull::from(&mut inner.callbacks);");
-                        w.line("(heap, types, globals, callbacks)");
-                    });
-                    w.line("};");
-                    w.line("let types = unsafe { types.as_ref() };");
-                    w.line("let globals = unsafe { globals.as_ref() };");
-                    w.line(format_args!(
-                        "let mut rt = {};",
-                        if trace_globals {
-                            target::runtime_ctx_from_raw_with_roots("heap", "globals")
-                        } else {
-                            target::runtime_ctx_from_raw("heap")
-                        }
-                    ));
-                    let lambda_call = format!("lambda.call({})", comma(lambda_call_args));
-                    let result = if lambda_fallible {
-                        lambda_call
-                    } else {
-                        format!("Ok({lambda_call})")
-                    };
-                    w.line(format_args!("let __anv_callback_result = {result};"));
-                    w.line("let __anv_callback_action = guard.finish();");
-                    w.line("if __anv_callback_action == Ok(anvyx_runtime::CallbackCloseAction::RemoveRoot) {");
-                    w.indented(|w| {
-                        w.line("let inner = unsafe { inner_ptr.as_mut() };");
-                        w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                        w.line("if let Some(slot) = table.get_mut(key.index()) {");
-                        w.indented(|w| {
-                            w.line("if let Some(root) = slot.take_closed_root(key) {");
-                            w.indented(|w| w.line("inner.heap.remove_root(&root);"));
-                            w.line("}");
-                        });
-                        w.line("}");
-                    });
-                    w.line("}");
-                    w.line("__anv_callback_action?;");
-                    w.line("__anv_callback_result");
-                },
-            );
-            self.w.blank();
-            self.w.block(
-                format_args!(
-                    "unsafe fn {close_thunk}(owner: &{owner_ty}, key: {key_ty}) -> {}",
-                    target::result_ty("bool")
-                ),
-                |w| {
-                    w.line(&key_check);
-                    w.line(format_args!(
-                        "let owner_entry = {}?;",
-                        target::owner_enter("owner", "key.owner_id()", "key.shutdown_generation()")
-                    ));
-                    w.line(format_args!(
-                        "let inner = unsafe {{ {} }};",
-                        target::non_null_cast_mut(
-                            &target::owner_entry_ptr("owner_entry"),
-                            &format!("{inner}<'_>")
-                        )
-                    ));
-                    w.line(format_args!("let table = &mut inner.callbacks.{field};"));
-                    w.line(
-                        "let Some(slot) = table.get_mut(key.index()) else { return Ok(false); };",
-                    );
-                    w.line("let (close, root) = slot.close(key);");
-                    w.line("if let Some(root) = root {");
-                    w.indented(|w| w.line("inner.heap.remove_root(&root);"));
-                    w.line("}");
-                    w.line("Ok(close.closed)");
-                },
-            );
-            self.w.blank();
-        }
+        RetainedCallbackEmitter::new(
+            self.program,
+            &self.trace_plan,
+            &self.fallible_functions,
+            &self.retained_callback_sigs,
+            &self.provider_callback_sigs,
+            &self.heap_callback_sigs,
+            &mut self.w,
+        )
+        .emit_thunks();
     }
 
     fn emit_main(&mut self, entry: super::rir::RirFunctionId) {
@@ -721,12 +515,16 @@ impl EmitCx<'_> {
                     let rt = if self.program.globals.iter().any(|global| {
                         RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty)
                     }) {
-                        target::runtime_ctx_from_raw_with_roots(
+                        target::runtime_ctx_from_raw_with_trace_roots_and_safepoint(
                             "anv_entry.heap",
                             "anv_entry.globals",
+                            "anv_entry.safepoint",
                         )
                     } else {
-                        target::runtime_ctx_from_raw("anv_entry.heap")
+                        target::runtime_ctx_from_raw_with_safepoint(
+                            "anv_entry.heap",
+                            "anv_entry.safepoint",
+                        )
                     };
                     w.line(format_args!("let mut rt = {rt};"));
                     let mut args = vec![
@@ -881,15 +679,52 @@ impl EmitCx<'_> {
             ));
         });
         w.line(format_args!(") -> {} {{", target::result_ty("()")));
-        w.indented(|w| {
-            w.line(op.heap_access(
-                "rt",
-                "object",
-                &target::dataref_place_heap_type_access("self"),
-                "storage",
-                storage,
-                &format!("f({}{path})", op.path_ref()),
-            ));
+        w.indented(|w| match op {
+            target::DataRefPlaceOp::Access => {
+                w.line(format_args!(
+                    "let value = {}?;",
+                    target::rt_heap_try_with_erased(
+                        "rt",
+                        "object",
+                        &target::dataref_place_heap_type_access("self"),
+                        "storage",
+                        storage,
+                        &format!("Ok({path}.clone())"),
+                    )
+                ));
+                w.line("f(&value)");
+            }
+            target::DataRefPlaceOp::Mutate => {
+                w.line(format_args!(
+                    "let mut value = {}?;",
+                    target::rt_heap_try_with_erased(
+                        "rt",
+                        "object",
+                        &target::dataref_place_heap_type_access("self"),
+                        "storage",
+                        storage,
+                        &format!("Ok({path}.clone())"),
+                    )
+                ));
+                w.line("let result = f(&mut value);");
+                w.line(format_args!(
+                    "let writeback = {};",
+                    target::rt_heap_try_with_erased_mut(
+                        "rt",
+                        "object",
+                        &target::dataref_place_heap_type_access("self"),
+                        "storage",
+                        storage,
+                        &format!("{{ {path} = value; Ok(()) }}"),
+                    )
+                ));
+                w.line("match (result, writeback) {");
+                w.indented(|w| {
+                    w.line("(Ok(()), Ok(())) => Ok(()),");
+                    w.line("(Err(error), _) | (_, Err(error)) => Err(error),");
+                });
+                w.line("}");
+            }
         });
         w.line("}");
     }
@@ -1131,19 +966,8 @@ impl EmitCx<'_> {
 
     fn emit_lambda_sig(&mut self, sig: &RirLambdaSig) {
         let policy = RustRepPolicy::new(self.program);
+        let layout = policy.lambda_sig_layout(sig.id);
         let symbol = policy.lambda_sig_symbol(sig.id);
-        let variants = self
-            .program
-            .lambdas_for_sig(sig.id)
-            .map(|lambda| {
-                (
-                    lambda.id,
-                    lambda.function,
-                    lambda.storage,
-                    lambda.captures.as_slice(),
-                )
-            })
-            .collect::<Vec<_>>();
         let retained_callbacks = self.has_retained_callbacks();
         let mut params = vec![
             format!("rt: {}", target::runtime_ctx_ref_ty()),
@@ -1179,26 +1003,12 @@ impl EmitCx<'_> {
                 policy.callable_param_ty(param.ty, param.abi, param.escape)
             )
         }));
-        let fallible = variants
+        let fallible = layout
+            .variants
             .iter()
-            .any(|(_, function, _, _)| self.fallible_functions[function.index()]);
+            .any(|variant| self.fallible_functions[variant.function.index()]);
         let ret = self.lambda_sig_ret_ty(sig, fallible);
-        let captures_self = variants
-            .iter()
-            .any(|(_, _, _, captures)| !captures.is_empty());
-        let mut_self = variants.iter().any(|(_, _, storage, captures)| {
-            if matches!(storage, RirLambdaStorage::HeapEnv { .. }) {
-                return false;
-            }
-            captures
-                .iter()
-                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
-        });
-        let self_arg = match (captures_self, mut_self) {
-            (_, true) => "&mut self",
-            (true, false) => "&self",
-            (false, false) => "self",
-        };
+        let self_arg = layout.self_arg();
         let call_lifetimes = if policy.lambda_sig_needs_ctx_lifetime(sig.id) {
             "<'rt>"
         } else {
@@ -1223,18 +1033,19 @@ impl EmitCx<'_> {
             self.w.line("#[derive(Clone)]");
         }
         self.w.block(format_args!("enum {symbol}{lifetime}"), |w| {
-            for (lambda, _, storage, captures) in &variants {
-                if let RirLambdaStorage::HeapEnv { env } = storage {
+            for variant in &layout.variants {
+                if let RirLambdaStorage::HeapEnv { env } = variant.storage {
                     let env = &self.program.lambda_envs[env.index()];
                     w.line(format_args!(
                         "{} {{ env: {} }},",
-                        lambda_variant(*lambda),
+                        lambda_variant(variant.id),
                         target::handle_ty(&policy.lambda_env_storage_ty(env))
                     ));
-                } else if captures.is_empty() {
-                    w.line(format_args!("{},", lambda_variant(*lambda)));
+                } else if variant.captures.is_empty() {
+                    w.line(format_args!("{},", lambda_variant(variant.id)));
                 } else {
-                    let fields = captures
+                    let fields = variant
+                        .captures
                         .iter()
                         .enumerate()
                         .map(|(index, capture)| {
@@ -1246,7 +1057,7 @@ impl EmitCx<'_> {
                         .collect::<Vec<_>>();
                     w.line(format_args!(
                         "{} {{ {} }},",
-                        lambda_variant(*lambda),
+                        lambda_variant(variant.id),
                         comma(fields)
                     ));
                 }
@@ -1254,7 +1065,7 @@ impl EmitCx<'_> {
         });
         self.w.blank();
         if trace {
-            self.emit_lambda_sig_trace_impl(sig.id, &variants);
+            self.emit_lambda_sig_trace_impl(sig.id, &layout.variants);
         }
         let fallible_functions = &self.fallible_functions;
         let body_call = |function: &RirFunction, capture_args: Vec<String>| {
@@ -1278,17 +1089,17 @@ impl EmitCx<'_> {
                 w.indented(|w| {
                     w.line("match self {");
                     w.indented(|w| {
-                        for (lambda, function_id, storage, captures) in &variants {
-                            let function = &program.functions[function_id.index()];
-                            let variant = lambda_variant(*lambda);
-                            match storage {
+                        for variant_layout in &layout.variants {
+                            let function = &program.functions[variant_layout.function.index()];
+                            let variant = lambda_variant(variant_layout.id);
+                            match variant_layout.storage {
                                 RirLambdaStorage::HeapEnv { env } => {
                                     let env = &program.lambda_envs[env.index()];
                                     w.line(format_args!("Self::{variant} {{ env }} => {{"));
                                     w.indented(|w| {
                                         let values = RustValues::new(program, function);
                                         for (index, field) in env.fields.iter().enumerate() {
-                                            let capture = &captures[index];
+                                            let capture = &variant_layout.captures[index];
                                             let source = format!("&env.{}", field.symbol.as_str());
                                             let value = match field.kind {
                                                 RirLambdaEnvFieldKind::Value => {
@@ -1303,24 +1114,25 @@ impl EmitCx<'_> {
                                                 target::rt_heap_with("rt", "env", "env", &value)
                                             ));
                                         }
-                                        let capture_args = (0..captures.len())
+                                        let capture_args = (0..variant_layout.captures.len())
                                             .map(|index| format!("c{index}"))
                                             .collect();
                                         w.line(body_call(function, capture_args));
                                     });
                                     w.line("},");
                                 }
-                                _ if captures.is_empty() => {
+                                _ if variant_layout.captures.is_empty() => {
                                     w.line(format_args!(
                                         "Self::{variant} => {},",
                                         body_call(function, vec![])
                                     ));
                                 }
                                 _ => {
-                                    let fields = (0..captures.len())
+                                    let fields = (0..variant_layout.captures.len())
                                         .map(|index| format!("c{index}"))
                                         .collect::<Vec<_>>();
-                                    let capture_args = captures
+                                    let capture_args = variant_layout
+                                        .captures
                                         .iter()
                                         .enumerate()
                                         .map(|(index, capture)| {
@@ -1356,12 +1168,7 @@ impl EmitCx<'_> {
     fn emit_lambda_sig_trace_impl(
         &mut self,
         sig: RirLambdaSigId,
-        variants: &[(
-            RirLambdaId,
-            super::rir::RirFunctionId,
-            RirLambdaStorage,
-            &[RirLambdaCapture],
-        )],
+        variants: &[LambdaVariantLayout<'_>],
     ) {
         let policy = RustRepPolicy::new(self.program);
         let symbol = policy.lambda_sig_symbol(sig);
@@ -1374,14 +1181,12 @@ impl EmitCx<'_> {
                 w.indented(|w| {
                     w.line("match self {");
                     w.indented(|w| {
-                        for (lambda, _, storage, captures) in variants {
-                            let variant = lambda_variant(*lambda);
-                            match RustRepPolicy::lambda_trace_action(
-                                &self.program.lambdas[lambda.index()],
-                            ) {
+                        for variant_layout in variants {
+                            let variant = lambda_variant(variant_layout.id);
+                            match &variant_layout.trace_action {
                                 LambdaTraceAction::HeapEnv => {
                                     debug_assert!(matches!(
-                                        storage,
+                                        variant_layout.storage,
                                         RirLambdaStorage::HeapEnv { .. }
                                     ));
                                     w.line(format_args!(
@@ -1390,7 +1195,7 @@ impl EmitCx<'_> {
                                     ));
                                 }
                                 LambdaTraceAction::HeapCellCaptures(cells) => {
-                                    let fields = (0..captures.len())
+                                    let fields = (0..variant_layout.captures.len())
                                         .map(|index| format!("c{index}"))
                                         .collect::<Vec<_>>();
                                     w.line(format_args!(
@@ -1407,7 +1212,7 @@ impl EmitCx<'_> {
                                     });
                                     w.line("},");
                                 }
-                                LambdaTraceAction::Noop if captures.is_empty() => {
+                                LambdaTraceAction::Noop if variant_layout.captures.is_empty() => {
                                     w.line(format_args!("Self::{variant} => {{}},"));
                                 }
                                 LambdaTraceAction::Noop => {
@@ -1483,6 +1288,7 @@ impl EmitCx<'_> {
                         w.line(format_args!(
                             "let globals = unsafe {{ state.3.cast::<{globals_ty}>().as_ref() }};"
                         ));
+                        w.line(format_args!("{};", target::runtime_validate_reentry("rt")));
                         if retained_callbacks {
                             let owner_ty = target::runtime_owner_handle_ty();
                             let callbacks_ty = format!(
@@ -1495,9 +1301,9 @@ impl EmitCx<'_> {
                             w.line(format_args!(
                                 "let callbacks = state.5.cast::<{callbacks_ty}>();"
                             ));
-                            w.line(format_args!(
-                                "let __anv_scoped_entry = {}?;",
-                                target::owner_enter_current("owner")
+                            w.line(RuntimeOwnerEmit::enter_current_line(
+                                "__anv_scoped_entry",
+                                "owner",
                             ));
                         }
                         w.line(destructure);
@@ -1510,7 +1316,7 @@ impl EmitCx<'_> {
                         if fallible {
                             if retained_callbacks {
                                 w.line(format_args!("let __anv_scoped_result = {call};"));
-                                w.line("drop(__anv_scoped_entry);");
+                                w.line(RuntimeOwnerEmit::drop_line("__anv_scoped_entry"));
                                 w.line("__anv_scoped_result");
                             } else {
                                 w.line(call);
@@ -1518,12 +1324,12 @@ impl EmitCx<'_> {
                         } else if ret_ty == "()" {
                             w.line(format_args!("{call};"));
                             if retained_callbacks {
-                                w.line("drop(__anv_scoped_entry);");
+                                w.line(RuntimeOwnerEmit::drop_line("__anv_scoped_entry"));
                             }
                             w.line("Ok(())");
                         } else if retained_callbacks {
                             w.line(format_args!("let __anv_scoped_result = {call};"));
-                            w.line("drop(__anv_scoped_entry);");
+                            w.line(RuntimeOwnerEmit::drop_line("__anv_scoped_entry"));
                             w.line("Ok(__anv_scoped_result)");
                         } else {
                             w.line(format_args!("Ok({call})"));
@@ -1708,22 +1514,18 @@ impl EmitCx<'_> {
     }
 
     fn emit_scoped_place_cells(&mut self, function: &RirFunction) {
-        for cell in self
+        let cells = self
             .program
             .scoped_place_cells
             .iter()
-            .filter(|cell| cell.owner == function.id)
-        {
-            let (prelude, source) =
-                self.prepared_mut_place_arg(function, cell.id.index(), cell.source.place());
-            for line in prelude {
-                self.w.line(format_args!("{line}"));
-            }
-            self.w.line(format_args!(
-                "let {} = {};",
-                cell.symbol.as_str(),
-                target::scoped_mut_place_cell_new(&source)
-            ));
+            .filter(|cell| {
+                cell.owner == function.id && !Self::scoped_place_cell_needs_slot_init(cell)
+            })
+            .map(|cell| cell.id)
+            .collect::<Vec<_>>();
+        for cell in cells {
+            let cell = self.program.scoped_place_cells[cell.index()].clone();
+            self.emit_scoped_place_cell_init(function, &cell);
         }
     }
 
@@ -1828,6 +1630,10 @@ impl EmitCx<'_> {
                         self.cell_ty(function, *cell)
                     ));
                 }
+            }
+            RirStmt::ScopedPlaceCellInit { cell } => {
+                let cell = &self.program.scoped_place_cells[cell.index()];
+                self.emit_scoped_place_cell_init(function, cell);
             }
             RirStmt::CellSet { cell, value } => {
                 let set = self.cell_set(function, *cell, value);
@@ -2089,10 +1895,10 @@ impl EmitCx<'_> {
         self.w.line(format_args!(
             "let {} = {};",
             payload.symbol.as_str(),
-            target::scoped_mut_place_cell_new(&target::mut_place_projected(
-                map,
-                &format!("&{ops}")
-            ))
+            target::scoped_mut_place_cell_new(
+                &target::mut_place_projected(map, &format!("&{ops}")),
+                &target::runtime_safepoint_state("rt"),
+            )
         ));
     }
 
@@ -2258,10 +2064,10 @@ impl EmitCx<'_> {
         self.w.line(format_args!(
             "let {} = {};",
             payload.symbol.as_str(),
-            target::scoped_mut_place_cell_new(&target::mut_place_projected(
-                subject,
-                &format!("&{ops}"),
-            ))
+            target::scoped_mut_place_cell_new(
+                &target::mut_place_projected(subject, &format!("&{ops}")),
+                &target::runtime_safepoint_state("rt"),
+            )
         ));
     }
 
@@ -3461,16 +3267,24 @@ impl EmitCx<'_> {
         let value = self.rvalue(function, value);
         match self.cell_decl(cell).storage {
             RirCellStorage::StackScoped => {
-                format!("{}::new({value})", target::stack_lambda_cell_ctor(&payload))
+                format!(
+                    "{}::new_with_safepoint({value}, {})",
+                    target::stack_lambda_cell_ctor(&payload),
+                    target::runtime_safepoint_state("rt")
+                )
             }
             RirCellStorage::Heap => {
                 let heap_type = format!(
                     "types.{}",
                     lambda_cell_heap_type_symbol(self.cell_decl(cell).id)
                 );
-                let storage = format!("{}::new(value)", target::lambda_cell_ctor(&payload));
+                let storage = format!(
+                    "{}::new_with_safepoint(value, safepoint)",
+                    target::lambda_cell_ctor(&payload)
+                );
                 format!(
-                    "{{ let value = {value}; let heap_type = {heap_type}; {} }}",
+                    "{{ let value = {value}; let heap_type = {heap_type}; let safepoint = {}; {} }}",
+                    target::runtime_safepoint_state("rt"),
                     target::rt_heap_alloc("rt", "heap_type", &storage)
                 )
             }
@@ -3539,17 +3353,28 @@ impl EmitCx<'_> {
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
-        rendered: Vec<String>,
+        mut rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
-        self.prepared_native_call_expr(function, args, None, &[], &[], rendered, render)
+        let mut prelude = vec![];
+        for (index, arg) in args.iter().enumerate() {
+            let (stmts, expr) = self.prepared_call_arg(function, index, arg);
+            prelude.extend(stmts);
+            rendered.push(expr);
+        }
+        let call = render(comma(rendered));
+        if prelude.is_empty() {
+            call
+        } else {
+            format!("{{ {} {call} }}", prelude.join(" "))
+        }
     }
 
     fn prepared_native_call_expr(
         &self,
         function: &RirFunction,
         args: &[RirCallArg],
-        native_plan: Option<&NativeCallPlan>,
+        native_plan: &NativeCallPlan,
         abis: &[anvyx_runtime::RustParamAbi],
         tys: &[RirTypeId],
         mut rendered: Vec<String>,
@@ -3565,10 +3390,8 @@ impl EmitCx<'_> {
                 rendered.push(expr);
                 continue;
             };
-            let boundary = native_plan.map_or(NativeArgBoundary::Direct, |plan| {
-                plan.arg_boundary(index, native_arg_facts(self.program, *ty, arg))
-            });
-            if boundary == NativeArgBoundary::SnapshotString {
+            let action = native_plan.arg_action(index, native_arg_facts(self.program, *ty, arg));
+            if action == NativeArgAction::SnapshotString {
                 let tmp = format!("__anv_native_arg_{index}");
                 let snapshot = format!("{}::from({expr})", target::anv_string_ty());
                 let init = if stmts.is_empty() {
@@ -3590,7 +3413,7 @@ impl EmitCx<'_> {
                     RirCallArg::InitFieldOmitted => target::init_field_omitted(),
                     _ => unreachable!("verified init field ABI"),
                 };
-            } else if let NativeArgBoundary::NativeRefBorrow { mutable } = boundary {
+            } else if let Some(mutable) = action.native_ref_borrow_mutability() {
                 let arg = format!("__anv_ref_arg_{index}");
                 resource_borrows.push((expr, arg.clone(), mutable));
                 expr = arg;
@@ -3647,7 +3470,8 @@ impl EmitCx<'_> {
             | anvyx_runtime::RustParamAbi::MutBorrow(_)
             | anvyx_runtime::RustParamAbi::MutPlace(_)
             | anvyx_runtime::RustParamAbi::ScopedLambda(_)
-            | anvyx_runtime::RustParamAbi::EscapingLambda(_) => expr,
+            | anvyx_runtime::RustParamAbi::EscapingLambda(_)
+            | anvyx_runtime::RustParamAbi::AnvCallback(_) => expr,
         }
     }
 
@@ -3893,6 +3717,9 @@ impl EmitCx<'_> {
         if let RirCallArg::EscapingLambda { callee, sig } = arg {
             return self.prepared_escaping_lambda_call_arg(function, index, callee, *sig);
         }
+        if let RirCallArg::AnvCallback { callee, sig } = arg {
+            return self.prepared_anv_callback_call_arg(function, index, callee, *sig);
+        }
         if let RirCallArg::Value(operand @ RirOperand::Place(place))
         | RirCallArg::InitFieldProvided(operand @ RirOperand::Place(place)) = arg
         {
@@ -3938,6 +3765,50 @@ impl EmitCx<'_> {
             self.w.line(format_args!("{line}"));
         }
         target::mut_place_get_copy(&place, target::runtime_param_name())
+    }
+
+    fn scoped_place_cell_needs_slot_init(cell: &RirScopedPlaceCellDecl) -> bool {
+        matches!(
+            cell.source.place().access,
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { .. })
+        )
+    }
+
+    fn emit_scoped_place_cell_init(
+        &mut self,
+        function: &RirFunction,
+        cell: &RirScopedPlaceCellDecl,
+    ) {
+        let (prelude, source) =
+            self.prepared_scoped_place_cell_source(function, cell.id.index(), cell.source.place());
+        for line in prelude {
+            self.w.line(format_args!("{line}"));
+        }
+        self.w.line(format_args!(
+            "let {} = {};",
+            cell.symbol.as_str(),
+            target::scoped_mut_place_cell_new(&source, &target::runtime_safepoint_state("rt"))
+        ));
+    }
+
+    fn prepared_scoped_place_cell_source(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        mut_place: &RirMutPlaceArg,
+    ) -> (Vec<String>, String) {
+        let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) = mut_place.access
+        else {
+            return self.prepared_mut_place_arg(function, index, mut_place);
+        };
+        if function.locals[local.index()].payload_ref {
+            return self.prepared_mut_place_arg(function, index, mut_place);
+        }
+        let root = target::mut_place_local_raw(function.locals[local.index()].symbol.as_str());
+        if mut_place.projections.is_empty() {
+            return (vec![], root);
+        }
+        self.prepared_projected_mut_place(function, index, mut_place, ty, &root)
     }
 
     fn prepared_mut_place_arg(
@@ -4094,6 +3965,31 @@ impl EmitCx<'_> {
         )
     }
 
+    fn prepared_callback_record_handle(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        callee: &RirOperand,
+        plan: RetainedCallbackSigPlan,
+    ) -> (Vec<String>, String) {
+        let lambda = RustValues::new(self.program, function).value_operand(callee);
+        let handle = format!("__anv_callback_handle_{index}");
+        let record_var = format!("__anv_callback_record_{index}");
+        (
+            vec![
+                format!(
+                    "let {record_var} = {} {{ lambda: {lambda}, _brand: std::marker::PhantomData }};",
+                    plan.record_symbol()
+                ),
+                format!(
+                    "let {handle} = rt.heap().alloc(types.{}, {record_var});",
+                    plan.heap_type_field()
+                ),
+            ],
+            handle,
+        )
+    }
+
     fn prepared_escaping_lambda_call_arg(
         &self,
         function: &RirFunction,
@@ -4101,49 +3997,62 @@ impl EmitCx<'_> {
         callee: &RirOperand,
         sig: RirLambdaSigId,
     ) -> (Vec<String>, String) {
-        let values = RustValues::new(self.program, function);
-        let lambda = values.value_operand(callee);
         let plan = RetainedCallbackSigPlan::new(sig);
-        let sig_data = &self.program.lambda_sigs[plan.sig_index()];
-        let args_ty = self.callback_args_ty(sig_data);
-        let ret_ty = self.callback_ret_ty(sig_data);
-        let record = plan.record_symbol();
+        let args_ty = plan.args_ty(self.program);
+        let ret_ty = plan.ret_ty(self.program);
         let field = plan.table_field();
         let callback_ctor = target::escaping_lambda_ctor_ty(&args_ty, &ret_ty);
         let key = format!("__anv_callback_key_{index}");
-        let root = format!("__anv_callback_root_{index}");
-        let handle = format!("__anv_callback_handle_{index}");
-        let record_var = format!("__anv_callback_record_{index}");
+        let (mut prelude, handle) =
+            self.prepared_callback_record_handle(function, index, callee, plan);
         let index_var = format!("__anv_callback_index_{index}");
         let generation = format!("__anv_callback_generation_{index}");
         let arg = format!("__anv_callback_arg_{index}");
         let table_id = plan.table_id();
         let signature_id = plan.signature_id();
-        (
-            vec![
-                format!(
-                    "let {record_var} = {record} {{ lambda: {lambda}, _brand: std::marker::PhantomData }};"
-                ),
-                format!(
-                    "let {handle} = rt.heap().alloc(types.{}, {record_var});",
-                    plan.heap_type_field()
-                ),
-                format!("let {root} = rt.heap().root(&{handle});"),
-                format!(
-                    "let ({index_var}, {generation}) = unsafe {{ &mut *callbacks.as_ptr() }}.insert_{field}({root});"
-                ),
-                format!(
-                    "let {key} = {}::new(owner.owner_id(), owner.shutdown_generation(), std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap(), {index_var}, {generation});",
-                    target::callback_key_ty()
-                ),
-                format!(
-                    "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {key}, {}, {}) }};",
-                    plan.call_thunk_symbol(),
-                    plan.close_thunk_symbol()
-                ),
-            ],
-            arg,
-        )
+        prelude.extend([
+            format!(
+                "let ({index_var}, {generation}) = unsafe {{ &mut *callbacks.as_ptr() }}.insert_{field}({handle});"
+            ),
+            format!(
+                "let {key} = {}::new(owner.owner_id(), owner.shutdown_generation(), std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap(), {index_var}, {generation});",
+                target::callback_key_ty()
+            ),
+            format!(
+                "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {key}, {}, {}) }};",
+                plan.call_thunk_symbol(),
+                plan.close_thunk_symbol()
+            ),
+        ]);
+        (prelude, arg)
+    }
+
+    fn prepared_anv_callback_call_arg(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        callee: &RirOperand,
+        sig: RirLambdaSigId,
+    ) -> (Vec<String>, String) {
+        let plan = RetainedCallbackSigPlan::new(sig);
+        let args_ty = plan.args_ty(self.program);
+        let ret_ty = plan.ret_ty(self.program);
+        let callback_ctor = target::anv_callback_ctor_ty(&args_ty, &ret_ty);
+        let (mut prelude, handle) =
+            self.prepared_callback_record_handle(function, index, callee, plan);
+        let erased = format!("__anv_callback_erased_{index}");
+        let arg = format!("__anv_callback_arg_{index}");
+        prelude.extend([
+            format!(
+                "let {erased} = {};",
+                target::map_heap_access_error(&format!("rt.heap_ref().erase(&{handle})"))
+            ),
+            format!(
+                "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {erased}, {}) }};",
+                plan.anv_call_thunk_symbol()
+            ),
+        ]);
+        (prelude, arg)
     }
 
     fn prepared_projected_mut_place(
@@ -4766,22 +4675,24 @@ impl EmitCx<'_> {
             anvyx_runtime::RustWrapperCtx::None => vec![],
         };
         let symbol = native.path.join("::");
-        let native_plan = native.call_plan(self.has_retained_callbacks());
+        let native_plan = self.program.native_call_plan(id);
         let suspend_entry = native_plan.provider_entry().suspends_runtime_entry();
         let param_tys = ext.params.iter().map(|param| param.ty).collect::<Vec<_>>();
         let call = self.prepared_native_call_expr(
             function,
             args,
-            Some(&native_plan),
+            &native_plan,
             native.abi.params.as_slice(),
             &param_tys,
             rendered,
             |rendered| {
                 let call = format!("{symbol}({rendered})");
                 let call = if suspend_entry {
-                    let suspend = target::owner_suspend_for_provider("owner");
-                    format!(
-                        "{{ let __anv_provider_entry = {suspend}?; let __anv_provider_result = {call}; drop(__anv_provider_entry); __anv_provider_result }}"
+                    RuntimeOwnerEmit::provider_suspended_call(
+                        "owner",
+                        "__anv_provider_entry",
+                        "__anv_provider_result",
+                        &call,
                     )
                 } else {
                     call
@@ -5046,6 +4957,13 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
         RirStmt::CellInit { cell, value } | RirStmt::CellSet { cell, value } => {
             cell_uses_local(cell, local) || rvalue_uses_local(program, value, local)
         }
+        RirStmt::ScopedPlaceCellInit { cell } => {
+            program.scoped_place_cells[cell.index()]
+                .source
+                .place()
+                .root_local()
+                == Some(local)
+        }
         RirStmt::ScopedPlaceCellSet { cell, value } => {
             scoped_cell_uses_local(program, cell, local) || rvalue_uses_local(program, value, local)
         }
@@ -5210,9 +5128,9 @@ fn call_arg_uses_local(program: &RirProgram, arg: &RirCallArg, local: RirLocalId
             place_uses_local(place, local)
         }
         RirCallArg::MutPlace(place) => mut_place_arg_uses_local(program, place, local),
-        RirCallArg::ScopedLambda { callee, .. } | RirCallArg::EscapingLambda { callee, .. } => {
-            operand_uses_local(program, callee, local)
-        }
+        RirCallArg::ScopedLambda { callee, .. }
+        | RirCallArg::EscapingLambda { callee, .. }
+        | RirCallArg::AnvCallback { callee, .. } => operand_uses_local(program, callee, local),
         RirCallArg::SharedStringConst(_) | RirCallArg::InitFieldOmitted => false,
     }
 }
@@ -5329,6 +5247,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::ScopedPlaceCellSet { value, .. }
         | RirStmt::Eval(value) => rvalue_uses_scoped_lambda_sig(value, sig),
         RirStmt::GlobalEnsure { .. }
+        | RirStmt::ScopedPlaceCellInit { .. }
         | RirStmt::DataRefSet { .. }
         | RirStmt::SequenceSlotSet { .. }
         | RirStmt::MapValueSet { .. }
@@ -5362,6 +5281,10 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             callee: RirOperand::Place(place),
             ..
         }
+        | RirCallArg::AnvCallback {
+            callee: RirOperand::Place(place),
+            ..
+        }
         | RirCallArg::SharedBorrow(place)
         | RirCallArg::MutBorrow(place) => {
             let RirPlaceRoot::Local(local) = place.root else {
@@ -5383,6 +5306,10 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             ..
         }
         | RirCallArg::EscapingLambda {
+            callee: RirOperand::Const(_),
+            ..
+        }
+        | RirCallArg::AnvCallback {
             callee: RirOperand::Const(_),
             ..
         }
@@ -5446,6 +5373,7 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             RirParamSemantic::MutPlace
             | RirParamSemantic::ScopedLambda
             | RirParamSemantic::EscapingLambda
+            | RirParamSemantic::AnvCallback
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified non-param capture kind"),

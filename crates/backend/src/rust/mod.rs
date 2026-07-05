@@ -11,6 +11,7 @@ pub mod profile;
 pub mod rep_policy;
 mod retained_callbacks;
 pub mod rir;
+mod runtime_owner;
 #[cfg(test)]
 mod source_job;
 mod syntax;
@@ -1572,22 +1573,33 @@ impl<'a> PlanCx<'a> {
                     ty,
                 ),
             }),
-            air::ScopedBorrowSource::PatternAlias { source } => {
-                let plan = self
-                    .access()
-                    .plan(borrow.owner, PlaceAccessIntent::MutPlaceArg, source)
-                    .map_err(|gap| Self::access_gap(borrow.owner, gap))?;
-                let mut locals = vec![];
-                let planned = self.plan_mut_place_arg(borrow.owner, &plan, &mut locals)?;
-                if !planned.stmts.is_empty() || !locals.is_empty() {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(borrow.owner),
-                        RustTargetGapKind::UnsupportedMutablePlaceProjection,
-                    ));
-                }
-                Ok(RirScopedPlaceSource::PatternAlias { place: planned.arg })
-            }
+            air::ScopedBorrowSource::PatternAlias { source } => self
+                .plan_alias_scoped_place_source(borrow.owner, source)
+                .map(|place| RirScopedPlaceSource::PatternAlias { place }),
+            air::ScopedBorrowSource::ForRefAlias { source } => self
+                .plan_alias_scoped_place_source(borrow.owner, source)
+                .map(|place| RirScopedPlaceSource::ForRefAlias { place }),
         }
+    }
+
+    fn plan_alias_scoped_place_source(
+        &self,
+        owner: FunctionId,
+        source: &Place,
+    ) -> Result<RirMutPlaceArg, RustPlanError> {
+        let plan = self
+            .access()
+            .plan(owner, PlaceAccessIntent::MutPlaceArg, source)
+            .map_err(|gap| Self::access_gap(owner, gap))?;
+        let mut locals = vec![];
+        let planned = self.plan_mut_place_arg(owner, &plan, &mut locals)?;
+        if !planned.stmts.is_empty() || !locals.is_empty() {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(owner),
+                RustTargetGapKind::UnsupportedMutablePlaceProjection,
+            ));
+        }
+        Ok(planned.arg)
     }
 
     fn plan_lambdas(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
@@ -3410,21 +3422,28 @@ impl<'a> PlanCx<'a> {
         init: bool,
     ) -> Result<(RirStructuredBlock, bool), RustPlanError> {
         let mut stmts = if init {
-            self.collection_slot_reads(function, scope, access, true)
+            let mut stmts = self.collection_slot_reads(function, scope, access, true);
+            stmts.extend(self.collection_slot_scoped_place_cell_inits(function, scope));
+            stmts
         } else {
             vec![]
         };
         let mut first = init;
+        let mut scoped_cells_initialized = init;
         let mut block_updates_slot = false;
         for stmt in std::mem::take(&mut body.stmts) {
             if first {
                 first = false;
             } else {
                 stmts.extend(self.collection_slot_reads(function, scope, access, false));
+                if !scoped_cells_initialized {
+                    stmts.extend(self.collection_slot_scoped_place_cell_inits(function, scope));
+                    scoped_cells_initialized = true;
+                }
             }
             let (stmt, stmt_updates_slot) =
                 self.collection_slot_stmt(function, scope, access, stmt)?;
-            block_updates_slot |= stmt_updates_slot;
+            block_updates_slot = stmt_updates_slot;
             stmts.push(stmt);
             if stmt_updates_slot {
                 stmts.extend(self.collection_slot_writes(function, scope, access));
@@ -3517,39 +3536,80 @@ impl<'a> PlanCx<'a> {
                 )
             }
             stmt => {
-                let updates_slot = Self::direct_stmt_updates_collection_slot(scope, &stmt);
+                let updates_slot = self.direct_stmt_updates_collection_slot(function, scope, &stmt);
                 (stmt, updates_slot)
             }
         })
     }
 
     fn direct_stmt_updates_collection_slot(
+        &self,
+        function: FunctionId,
         scope: &air::AirCollectionSlotScope,
         stmt: &RirStmt,
     ) -> bool {
         match stmt {
             RirStmt::Assign { dst, .. } => Self::place_is_collection_slot(scope, dst),
+            RirStmt::MutPlaceSet { place, value } => {
+                Self::mut_place_arg_is_collection_slot_update(scope, place)
+                    || self.rvalue_updates_collection_slot(function, scope, value)
+            }
+            RirStmt::ScopedPlaceCellSet { cell: _, value } => {
+                !scope.slots.is_empty()
+                    || self.rvalue_updates_collection_slot(function, scope, value)
+            }
             RirStmt::Eval(value)
             | RirStmt::Init { value, .. }
             | RirStmt::CellInit { value, .. }
-            | RirStmt::CellSet { value, .. }
-            | RirStmt::ScopedPlaceCellSet { value, .. } => {
-                Self::rvalue_updates_collection_slot(scope, value)
+            | RirStmt::CellSet { value, .. } => {
+                self.rvalue_updates_collection_slot(function, scope, value)
             }
             _ => false,
         }
     }
 
     fn rvalue_updates_collection_slot(
+        &self,
+        function: FunctionId,
         scope: &air::AirCollectionSlotScope,
         value: &RirRValue,
     ) -> bool {
         match value {
-            RirRValue::Call { args, .. } => args
-                .iter()
-                .any(|arg| Self::call_arg_updates_collection_slot(scope, arg)),
+            RirRValue::Call { callee, args, .. } => {
+                let active_for_ref_cell = !self
+                    .collection_slot_scoped_place_cell_inits(function, scope)
+                    .is_empty();
+                self.call_target_updates_collection_slot(function, scope, callee)
+                    || args
+                        .iter()
+                        .any(|arg| Self::call_arg_updates_collection_slot(scope, arg))
+                    || active_for_ref_cell
+                        && args.iter().any(|arg| self.call_arg_may_invoke_lambda(arg))
+            }
             _ => false,
         }
+    }
+
+    fn call_target_updates_collection_slot(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+        callee: &RirCallTarget,
+    ) -> bool {
+        matches!(callee, RirCallTarget::LambdaValue { .. })
+            && !self
+                .collection_slot_scoped_place_cell_inits(function, scope)
+                .is_empty()
+    }
+
+    fn call_arg_may_invoke_lambda(&self, arg: &RirCallArg) -> bool {
+        matches!(
+            arg,
+            RirCallArg::ScopedLambda { .. }
+                | RirCallArg::EscapingLambda { .. }
+                | RirCallArg::AnvCallback { .. }
+                | RirCallArg::Value(_)
+        )
     }
 
     fn call_arg_updates_collection_slot(
@@ -3558,15 +3618,23 @@ impl<'a> PlanCx<'a> {
     ) -> bool {
         match arg {
             RirCallArg::MutBorrow(place) => Self::place_is_collection_slot(scope, place),
-            RirCallArg::MutPlace(arg) => match &arg.access {
-                RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) => {
-                    Self::place_is_collection_slot(
-                        scope,
-                        &RirPlace::local(*local, arg.projections.clone(), *ty),
-                    )
-                }
-                _ => false,
-            },
+            RirCallArg::MutPlace(arg) => Self::mut_place_arg_is_collection_slot_update(scope, arg),
+            _ => false,
+        }
+    }
+
+    fn mut_place_arg_is_collection_slot_update(
+        scope: &air::AirCollectionSlotScope,
+        arg: &RirMutPlaceArg,
+    ) -> bool {
+        match &arg.access {
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, ty }) => {
+                Self::place_is_collection_slot(
+                    scope,
+                    &RirPlace::local(*local, arg.projections.clone(), *ty),
+                )
+            }
+            RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell { .. }) => true,
             _ => false,
         }
     }
@@ -3725,6 +3793,32 @@ impl<'a> PlanCx<'a> {
         })
     }
 
+    fn collection_slot_scoped_place_cell_inits(
+        &self,
+        function: FunctionId,
+        scope: &air::AirCollectionSlotScope,
+    ) -> Vec<RirStmt> {
+        self.air
+            .scoped_borrows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, borrow)| {
+                let air::ScopedBorrowSource::ForRefAlias { source } = &borrow.source else {
+                    return None;
+                };
+                let air::PlaceRoot::Local(local) = source.root else {
+                    return None;
+                };
+                if borrow.owner != function || !scope.slots.iter().any(|slot| slot.local == local) {
+                    return None;
+                }
+                Some(RirStmt::ScopedPlaceCellInit {
+                    cell: self.scoped_place_cell_map[&air::ScopedBorrowId::from_index(index)],
+                })
+            })
+            .collect()
+    }
+
     fn collection_slot_reads(
         &self,
         function: FunctionId,
@@ -3839,7 +3933,9 @@ impl<'a> PlanCx<'a> {
             CallArg::Value(operand)
                 if matches!(
                     expected,
-                    RirParamSemantic::ScopedLambda | RirParamSemantic::EscapingLambda
+                    RirParamSemantic::ScopedLambda
+                        | RirParamSemantic::EscapingLambda
+                        | RirParamSemantic::AnvCallback
                 ) =>
             {
                 let air_ty = self.operand_ty(operand);
@@ -3865,6 +3961,10 @@ impl<'a> PlanCx<'a> {
                         sig,
                     },
                     RirParamSemantic::EscapingLambda => RirCallArg::EscapingLambda {
+                        callee: planned.operand,
+                        sig,
+                    },
+                    RirParamSemantic::AnvCallback => RirCallArg::AnvCallback {
                         callee: planned.operand,
                         sig,
                     },

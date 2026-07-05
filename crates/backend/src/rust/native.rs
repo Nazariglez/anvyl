@@ -1,7 +1,7 @@
 use anvyx_frontend::air;
 use anvyx_runtime::{
-    ExternTypeExpr, RustExternBinding, RustParamAbi, RustProviderSupport, RustReturnAbi,
-    RustTypeBinding,
+    CallbackEscape, ExternParam, ExternTypeExpr, ParamFlow, RustExternBinding, RustParamAbi,
+    RustProviderSupport, RustReturnAbi, RustTypeBinding,
 };
 
 use super::{native_call, rir};
@@ -67,55 +67,27 @@ pub(super) fn rust_abi_matches_air(
     abi: &air::ExternAbi,
 ) -> bool {
     params.len() == abi.params.len()
-        && params
-            .iter()
-            .zip(&abi.params)
-            .all(|(param, expected)| param_abi_matches(param, expected))
-        && return_abi_matches(ret, &abi.ret)
+        && params.iter().zip(&abi.params).all(|(param, expected)| {
+            param.matches_extern_param(&air_extern_param(param, expected.clone()))
+        })
+        && ret.matches_extern_type(&abi.ret)
 }
 
-fn param_abi_matches(param: &RustParamAbi, expected: &ExternTypeExpr) -> bool {
-    match param {
-        RustParamAbi::Value(ty)
-        | RustParamAbi::OwnedNamed(ty)
-        | RustParamAbi::Borrow(ty)
-        | RustParamAbi::MutBorrow(ty)
-        | RustParamAbi::MutPlace(ty) => expected != &ExternTypeExpr::Void && ty == expected,
-        RustParamAbi::InitField(inner) => param_abi_matches(inner, expected),
-        RustParamAbi::Option(inner) => {
-            matches!(expected, ExternTypeExpr::Option(expected) if param_abi_matches(inner, expected))
-        }
-        RustParamAbi::Result(ok, err) => {
-            matches!(expected, ExternTypeExpr::Result(expected_ok, expected_err) if param_abi_matches(ok, expected_ok) && param_abi_matches(err, expected_err))
-        }
-        RustParamAbi::Slice(inner) => {
-            matches!(expected, ExternTypeExpr::Slice(expected) if param_abi_matches(inner, expected))
-        }
-        RustParamAbi::ScopedLambda(callback) | RustParamAbi::EscapingLambda(callback) => {
-            matches!(expected, ExternTypeExpr::Callback(expected) if callback_shape_matches(callback, expected))
-        }
-    }
-}
-
-fn callback_shape_matches(
-    found: &anvyx_runtime::ExternCallbackSignature,
-    expected: &anvyx_runtime::ExternCallbackSignature,
-) -> bool {
-    found.params == expected.params && found.ret == expected.ret && found.policy == expected.policy
-}
-
-fn return_abi_matches(ret: &RustReturnAbi, expected: &ExternTypeExpr) -> bool {
-    match ret {
-        RustReturnAbi::Void => expected == &ExternTypeExpr::Void,
-        RustReturnAbi::Value(ty) | RustReturnAbi::OwnedNamed(ty) => {
-            expected != &ExternTypeExpr::Void && ty == expected
-        }
-        RustReturnAbi::Option(inner) => {
-            matches!(expected, ExternTypeExpr::Option(expected) if return_abi_matches(inner, expected))
-        }
-        RustReturnAbi::Result(ok, err) => {
-            matches!(expected, ExternTypeExpr::Result(expected_ok, expected_err) if return_abi_matches(ok, expected_ok) && return_abi_matches(err, expected_err))
-        }
+fn air_extern_param(abi: &RustParamAbi, ty: ExternTypeExpr) -> ExternParam {
+    let flow = match abi {
+        RustParamAbi::Borrow(_) => ParamFlow::Borrow,
+        RustParamAbi::MutBorrow(_) | RustParamAbi::MutPlace(_) => ParamFlow::MutBorrow,
+        _ => ParamFlow::Value,
+    };
+    let escape = match &ty {
+        ExternTypeExpr::Callback(callback) => callback.policy.escape,
+        _ => CallbackEscape::NonEscaping,
+    };
+    ExternParam {
+        name: None,
+        ty,
+        flow,
+        escape,
     }
 }
 

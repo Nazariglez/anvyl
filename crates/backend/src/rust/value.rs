@@ -58,6 +58,9 @@ impl<'a> RustValues<'a> {
             RirCallArg::EscapingLambda { .. } => {
                 unreachable!("escaping lambda arguments must be prepared before rendering")
             }
+            RirCallArg::AnvCallback { .. } => {
+                unreachable!("callback carrier arguments must be prepared before rendering")
+            }
         }
     }
 
@@ -791,6 +794,7 @@ impl<'a> RustValues<'a> {
             | RirParamSemantic::MutPlace
             | RirParamSemantic::ScopedLambda
             | RirParamSemantic::EscapingLambda
+            | RirParamSemantic::AnvCallback
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
             | RirParamSemantic::ScopedPlaceCell => unreachable!("verified stringify override mode"),

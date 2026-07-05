@@ -1,5 +1,5 @@
 use super::{
-    native_call::NativeArgBoundary,
+    native_call::NativeArgAction,
     place::{mut_place_dynamic_facts, place_dynamic_facts},
     rir::{
         RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionAccess,
@@ -141,8 +141,8 @@ fn rvalue_calls_fallible(
                         RirCallTarget::Function(id) => fallible[id.index()],
                         RirCallTarget::Extern(id) => match &program.externs[id.index()].kind {
                             RirExternKind::Native(native) => {
-                                native
-                                    .call_plan(program.has_retained_callbacks())
+                                program
+                                    .native_call_plan(*id)
                                     .provider_entry()
                                     .suspends_runtime_entry()
                                     || native.abi.fallible
@@ -261,6 +261,9 @@ fn call_arg_has_fallible_place(
             callee: operand, ..
         }
         | RirCallArg::EscapingLambda {
+            callee: operand, ..
+        }
+        | RirCallArg::AnvCallback {
             callee: operand, ..
         } => operand_has_fallible_place(program, function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
@@ -675,8 +678,7 @@ fn native_ref_borrow_conversion_fallible(
     ext: super::rir::RirExternId,
     args: &[RirCallArg],
 ) -> bool {
-    let RirExternKind::Native(native) = &program.externs[ext.index()].kind;
-    let plan = native.call_plan(program.has_retained_callbacks());
+    let plan = program.native_call_plan(ext);
     program.externs[ext.index()]
         .params
         .iter()
@@ -684,8 +686,8 @@ fn native_ref_borrow_conversion_fallible(
         .enumerate()
         .any(|(index, (param, arg))| {
             matches!(
-                plan.arg_boundary(index, native_arg_facts(program, param.ty, arg)),
-                NativeArgBoundary::NativeRefBorrow { .. }
+                plan.arg_action(index, native_arg_facts(program, param.ty, arg)),
+                NativeArgAction::NativeRefBorrow { .. }
             )
         })
 }
@@ -709,7 +711,9 @@ fn call_arg_context_use(
         RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
             operand_context_use(program, function, operand)
         }
-        RirCallArg::ScopedLambda { callee, .. } | RirCallArg::EscapingLambda { callee, .. } => {
+        RirCallArg::ScopedLambda { callee, .. }
+        | RirCallArg::EscapingLambda { callee, .. }
+        | RirCallArg::AnvCallback { callee, .. } => {
             ContextUse::generated_call().union(operand_context_use(program, function, callee))
         }
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
@@ -804,7 +808,7 @@ fn cell_context_use(program: &RirProgram, cell: RirCellRef) -> ContextUse {
     if cell_uses_ctx(program, cell) {
         ContextUse::rt_types()
     } else {
-        ContextUse::default()
+        ContextUse::rt()
     }
 }
 
@@ -858,6 +862,9 @@ fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bo
             callee: operand, ..
         }
         | RirCallArg::EscapingLambda {
+            callee: operand, ..
+        }
+        | RirCallArg::AnvCallback {
             callee: operand, ..
         } => operand_uses_mut_place_param(function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {

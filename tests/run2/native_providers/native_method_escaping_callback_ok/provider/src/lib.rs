@@ -28,7 +28,7 @@ impl Surface {
 
 #[function(ctx)]
 pub fn make_surface<'cx>(ctx: &mut Ctx<'cx, '_>, id: i64) -> AnvRef<'cx, Surface> {
-    AnvRefType::<Surface>::register_untracked(ctx.heap()).alloc_in(ctx, Surface { id })
+    AnvRefType::<Surface>::register_untracked_in(ctx).alloc_in(ctx, Surface { id })
 }
 
 #[function(ctx)]

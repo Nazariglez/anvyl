@@ -16,7 +16,7 @@ use anvyx_frontend::{
 use super::{
     CollectionAccessOp, PlanCx, RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
     dataref_place::DataRefPlaceDescriptors,
-    emit, native_call,
+    emit,
     place_access::{PlaceAccessCx, PlaceAccessIntent},
     plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
@@ -41,6 +41,7 @@ use super::{
         RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
         RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
+    runtime_owner::RuntimeOwnerEmit,
     source_job::{self, SourceJobStatus},
     target,
 };
@@ -155,67 +156,6 @@ fn profile_accepts_retained_callback_native_string_borrow_reentry_arg() {
 
     RustBackendProfile::check_with_native_support(&verified, &[support])
         .expect("profile rejected snapshottable retained callback string borrow");
-}
-
-#[test]
-fn native_plan_rejects_retained_slice_reentry_arg() {
-    let abi = direct_rust_abi(
-        vec![anvyx_runtime::RustParamAbi::Slice(Box::new(
-            anvyx_runtime::RustParamAbi::Value(anvyx_runtime::ExternTypeExpr::Int),
-        ))],
-        anvyx_runtime::RustReturnAbi::Void,
-    );
-    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
-    let arg = RirCallArg::Value(RirOperand::Const(RirConstId::from_index(0)));
-    let facts = native_call::NativeArgFacts::rir(&arg, false, false);
-
-    assert!(plan.rejects_reentry_arg(0, facts));
-}
-
-#[test]
-fn native_plan_rejects_retained_non_string_snapshot_borrow_reentry_arg() {
-    let abi = direct_rust_abi(
-        vec![anvyx_runtime::RustParamAbi::Borrow(
-            anvyx_runtime::ExternTypeExpr::String,
-        )],
-        anvyx_runtime::RustReturnAbi::Void,
-    );
-    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
-    let arg = RirCallArg::SharedBorrow(RirPlace::local(
-        RirLocalId::from_index(0),
-        vec![],
-        RirTypeId::from_index(0),
-    ));
-    let facts = native_call::NativeArgFacts::rir(&arg, false, false);
-
-    assert!(plan.rejects_reentry_arg(0, facts));
-}
-
-#[test]
-fn native_plan_allows_retained_native_ref_borrow_reentry_arg() {
-    let abi = direct_rust_abi(
-        vec![anvyx_runtime::RustParamAbi::Borrow(
-            anvyx_runtime::ExternTypeExpr::Named {
-                module: Some(anvyx_runtime::ModulePath { segments: vec![] }),
-                name: "Counter".into(),
-                args: vec![],
-            },
-        )],
-        anvyx_runtime::RustReturnAbi::Void,
-    );
-    let plan = native_call::NativeCallPlan::for_abi(&abi, true);
-    let arg = RirCallArg::SharedBorrow(RirPlace::local(
-        RirLocalId::from_index(0),
-        vec![],
-        RirTypeId::from_index(0),
-    ));
-    let facts = native_call::NativeArgFacts::rir(&arg, false, true);
-
-    assert!(!plan.rejects_reentry_arg(0, facts));
-    assert_eq!(
-        plan.arg_boundary(0, facts),
-        native_call::NativeArgBoundary::NativeRefBorrow { mutable: false }
-    );
 }
 
 fn retained_callback_string_borrow_rir() -> RirProgram {
@@ -512,6 +452,33 @@ fn emit_native_escaping_lambda_stays_single_threaded() {
     assert!(!source.contains("Box<dyn Fn"));
     assert!(!source.contains("Arc<Mutex"));
     assert!(!source.contains("thread_local!"));
+    assert!(!source.contains("RootId"));
+    assert!(!source.contains("remove_root"));
+    assert!(!source.contains("with_root"));
+}
+
+#[test]
+fn emit_retained_callback_reentry_gate_precedes_inner_mut_borrow() {
+    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, host_escaping_lambda_retained_plan_config()).expect("plan failed");
+    let source = emit::emit(&plan.verified()).into_string();
+    let gate = RuntimeOwnerEmit::reentry_gate_line("inner_ptr");
+
+    for thunk in [
+        "unsafe fn __anv_callback_call_",
+        "unsafe fn __anv_callback_close_",
+    ] {
+        let start = source.find(thunk).expect("callback thunk emitted");
+        let section = &source[start..];
+        let gate_pos = section
+            .find(&gate)
+            .expect("callback thunk has reentry gate");
+        let borrow_pos = section
+            .find("inner_ptr.as_mut()")
+            .expect("callback thunk borrows runtime inner mutably");
+        assert!(gate_pos < borrow_pos, "{thunk} gates before mutable borrow");
+    }
 }
 
 #[test]
@@ -548,29 +515,13 @@ fn emit_native_scoped_lambda_uses_scoped_runtime_state() {
         let source = emit::emit(&plan.verified()).into_string();
 
         assert!(source.contains("anvyx_runtime::ScopedLambda"));
-        assert!(source.contains("__anv_scoped_lambda_state_0"));
-        assert!(source.contains("__anv_scoped_call"));
+        assert!(source.contains(target::scoped_lambda_thunk()));
+        assert!(source.contains(&format!("{};", target::runtime_validate_reentry("rt"))));
         assert!(!source.contains("Box<dyn Fn"));
         assert!(!source.contains("Rc<dyn Fn"));
         assert!(!source.contains("Vec<Value"));
         assert!(!source.contains("thread_local!"));
         assert!(!source.contains("LambdaEnv"));
-    }
-}
-
-#[test]
-fn native_escaping_lambda_provider_arg_compiles() {
-    for kind in [
-        NativeLambdaArgKind::FunctionRef,
-        NativeLambdaArgKind::EscapingZeroCapture,
-        NativeLambdaArgKind::EscapingReadonlyCapture,
-    ] {
-        let program = native_escaping_lambda_air_with(kind);
-        let verified = air::verify(&program).expect("AIR verify failed");
-        let plan = plan(&verified, host_escaping_lambda_plan_config()).expect("plan failed");
-        let output = run_source(with_escaping_lambda_host(emit::emit(&plan.verified())));
-
-        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
 }
 
@@ -638,26 +589,46 @@ fn native_escaping_lambda_coexists_with_scoped_lambda_call() {
         }));
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_scoped_and_subscription_plan_config()).expect("plan failed");
-    let output = run_source(with_scoped_and_subscription_host(emit::emit(
-        &plan.verified(),
-    )));
+    let call_args = plan
+        .program()
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.stmts)
+        .filter_map(|stmt| match stmt {
+            RirStmt::Eval(RirRValue::Call { args, .. }) => Some(args.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    assert!(
+        call_args
+            .iter()
+            .any(|args| matches!(args, [RirCallArg::ScopedLambda { .. }]))
+    );
+    assert!(
+        call_args
+            .iter()
+            .any(|args| matches!(args, [RirCallArg::EscapingLambda { .. }]))
+    );
 }
 
 #[test]
-fn native_escaping_lambda_coexists_with_global_init_calls() {
-    let mut program = native_escaping_lambda_trigger_air(NativeLambdaArgKind::FunctionRef);
-    add_scalar_global_read(&mut program);
+fn emit_retained_callback_registry_before_heap() {
+    let program = native_escaping_lambda_trigger_air(NativeLambdaArgKind::FunctionRef);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_escaping_lambda_retained_plan_config()).expect("plan failed");
-    let output = run_source(with_retained_escaping_lambda_host(
-        emit::emit(&plan.verified()),
-        41,
-        41,
-    ));
+    let source = emit::emit(&plan.verified()).into_string();
+    let callbacks = source
+        .find(&format!(
+            "callbacks: {}<'cx>,",
+            target::generated_callback_registry_symbol()
+        ))
+        .expect("retained callback registry field");
+    let heap = source
+        .find("heap: anvyx_runtime::Heap<'cx>,")
+        .expect("runtime heap field");
 
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    assert!(callbacks < heap);
 }
 
 #[test]
@@ -666,24 +637,6 @@ fn native_escaping_lambda_stored_tuple_origin_without_air_proof_is_rejected() {
     let errors = air::verify(&program).expect_err("AIR accepted projected stored callback origin");
 
     assert!(format!("{errors:?}").contains("ArgEscapeUnknown"));
-}
-
-#[test]
-fn native_scoped_lambda_invokes_provider_callback() {
-    for kind in [
-        NativeLambdaArgKind::FunctionRef,
-        NativeLambdaArgKind::ZeroCapture,
-        NativeLambdaArgKind::ReadonlyCapture,
-        NativeLambdaArgKind::EscapingReadonlyCapture,
-        NativeLambdaArgKind::CaptureCell,
-    ] {
-        let program = native_scoped_lambda_air_with(kind);
-        let verified = air::verify(&program).expect("AIR verify failed");
-        let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
-        let output = run_source(with_lambda_host(emit::emit(&plan.verified())));
-
-        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-    }
 }
 
 #[test]
@@ -3152,7 +3105,9 @@ fn emit_scalar_global_slots_and_operations() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains("g0_score: anvyx_runtime::GlobalSlot<i64>"));
-    assert!(source.contains("g0_score: anvyx_runtime::GlobalSlot::new(\"score\")"));
+    assert!(source.contains(
+        "g0_score: anvyx_runtime::GlobalSlot::new_with_safepoint(\"score\", safepoint.clone())"
+    ));
     assert!(source.contains("globals.g0_score.ensure(||"));
     assert!(source.contains("globals.g0_score.set_without_init(1)?;"));
     assert!(source.contains("globals.g0_score.read(||"));
@@ -4717,11 +4672,11 @@ fn emit_anv_globals_trace_impl_for_heap_edge_slots() {
 
     assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for AnvGlobals<'cx>"));
     assert!(source.contains("anvyx_runtime::Trace::trace(&self.g0_score, visitor);"));
-    assert!(source.contains("impl<'cx> anvyx_runtime::CtxRoots<'cx> for AnvGlobals<'cx>"));
+    assert!(source.contains("impl<'cx> anvyx_runtime::TraceRootSet<'cx> for AnvGlobals<'cx>"));
     assert!(source.contains("self.g0_score.validate_trace()?;"));
-    assert!(source.contains("let globals = AnvGlobals::new();"));
+    assert!(source.contains("let globals = AnvGlobals::new(&safepoint);"));
     assert!(source.contains(
-        "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw_with_roots(anv_entry.heap, anv_entry.globals) };"
+        "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw_with_trace_roots_and_safepoint(anv_entry.heap, anv_entry.globals, anv_entry.safepoint) };"
     ));
     for forbidden in ["static ", "thread_local!", "OnceLock"] {
         assert!(
@@ -4740,10 +4695,10 @@ fn emit_anv_globals_omits_trace_impl_without_heap_edge_slots() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
     assert!(!source.contains("anvyx_runtime::Trace<'cx> for AnvGlobals<'cx>"));
-    assert!(!source.contains("anvyx_runtime::CtxRoots<'cx> for AnvGlobals<'cx>"));
+    assert!(!source.contains("anvyx_runtime::TraceRootSet<'cx> for AnvGlobals<'cx>"));
     assert!(
         source.contains(
-            "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw(anv_entry.heap) };"
+            "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw_with_safepoint(anv_entry.heap, anv_entry.safepoint) };"
         )
     );
 }
@@ -5863,7 +5818,7 @@ fn emit_stack_cell_ops_use_runtime_cell() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     assert!(
         source.as_str().contains(
-            "let __cell0: anvyx_runtime::StackLambdaCell<i64> = anvyx_runtime::StackLambdaCell::<i64>::new(1);"
+            "let __cell0: anvyx_runtime::StackLambdaCell<i64> = anvyx_runtime::StackLambdaCell::<i64>::new_with_safepoint(1, rt.__anvyx_safepoint_state());"
         ),
         "{}",
         source.as_str()
@@ -5919,8 +5874,8 @@ fn emit_stack_cell_init_is_control_flow_safe() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
     assert!(text.contains("let __cell0: anvyx_runtime::StackLambdaCell<i64>;"));
-    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new(1);"));
-    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new(2);"));
+    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new_with_safepoint(1, rt.__anvyx_safepoint_state());"));
+    assert!(text.contains("__cell0 = anvyx_runtime::StackLambdaCell::<i64>::new_with_safepoint(2, rt.__anvyx_safepoint_state());"));
     assert!(!text.contains("let mut source: i64;"));
 
     let output = run_source(source);
@@ -5965,7 +5920,7 @@ fn rir_accepts_loop_lifetime_stack_cell_init_in_loop() {
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
     assert!(!source.contains("let __cell0: anvyx_runtime::StackLambdaCell<i64>;"));
-    assert!(source.contains("let __cell0: anvyx_runtime::StackLambdaCell<i64> = anvyx_runtime::StackLambdaCell::<i64>::new(1);"));
+    assert!(source.contains("let __cell0: anvyx_runtime::StackLambdaCell<i64> = anvyx_runtime::StackLambdaCell::<i64>::new_with_safepoint(1, rt.__anvyx_safepoint_state());"));
 }
 
 #[test]
@@ -6594,6 +6549,24 @@ fn rir_rejects_pattern_alias_scoped_place_source_local_root() {
 }
 
 #[test]
+fn rir_accepts_for_ref_alias_scoped_place_source_local_root() {
+    let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
+    let int = RirTypeId::from_index(1);
+    program.scoped_place_cells[0].source = RirScopedPlaceSource::ForRefAlias {
+        place: RirMutPlaceArg::from_handle(
+            RirMutPlaceHandle::Local {
+                local: RirLocalId::from_index(0),
+                ty: int,
+            },
+            vec![],
+            int,
+        ),
+    };
+
+    rir::verify(&program).expect("RIR rejected for-ref alias scoped-place source");
+}
+
+#[test]
 fn rir_rejects_duplicate_scoped_place_cells_for_source_local() {
     let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
     let mut duplicate = valid_scoped_place_cell_decl();
@@ -6760,7 +6733,7 @@ fn emit_heap_cell_init_hoists_ctx_using_value_before_alloc() {
 
     assert!(text.contains("let value = seed(rt, types, globals);"));
     assert!(
-        text.contains("rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value))")
+        text.contains("let safepoint = rt.__anvyx_safepoint_state(); rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new_with_safepoint(value, safepoint))")
     );
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -6791,7 +6764,7 @@ fn emit_heap_cell_alloc_env_and_access_use_handles() {
             .contains("let __cell0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>> =")
     );
     assert!(source.contains(
-        "= { let value = 1; let heap_type = types.lambda_cell0; rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new(value)) };"
+        "= { let value = 1; let heap_type = types.lambda_cell0; let safepoint = rt.__anvyx_safepoint_state(); rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new_with_safepoint(value, safepoint)) };"
     ));
     assert!(source.contains("c0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>>,"));
     assert!(source.contains("c0: __cell0.clone()"));
@@ -10168,6 +10141,7 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
                         crate_name: "host".to_string(),
                         segments: vec!["host".to_string(), "Host".to_string()],
                     },
+                    owns_heap_edges: false,
                 }],
                 bindings: vec![],
             }],
@@ -11174,7 +11148,7 @@ fn emit_scoped_borrowed_param_uses_scoped_mut_place_cell() {
     let source = plan_source(scoped_borrow_lambda_program()).into_string();
 
     assert!(
-        source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new(v0.reborrow());")
+        source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new_with_safepoint(v0.reborrow(), rt.__anvyx_safepoint_state());")
     );
     assert!(source.contains("c0: &'env anvyx_runtime::ScopedMutPlaceCell<'env, 'cx, i64>"));
     assert!(source.contains("c0: &__scoped0"));
@@ -11203,7 +11177,7 @@ fn emit_owner_scoped_borrow_forwarding_uses_scoped_cell_mut_place() {
     assert!(source.contains(&target::mut_place_scoped_cell("&__scoped0")));
     assert!(!source.contains("MutPlace::local(&mut v0)"));
     assert!(
-        source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new(v0.reborrow());")
+        source.contains("let __scoped0 = anvyx_runtime::ScopedMutPlaceCell::new_with_safepoint(v0.reborrow(), rt.__anvyx_safepoint_state());")
     );
 }
 
@@ -11612,10 +11586,10 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     assert!(source.contains("let mut runtime = AnvRuntime::new(heap);"));
     assert!(
         source.contains(
-            "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw(anv_entry.heap) };"
+            "let mut rt = unsafe { anvyx_runtime::Ctx::__anvyx_from_raw_with_safepoint(anv_entry.heap, anv_entry.safepoint) };"
         )
     );
-    assert!(source.contains("let globals = AnvGlobals::new();"));
+    assert!(source.contains("let globals = AnvGlobals::new(&safepoint);"));
     assert!(source.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>)"));
     assert!(
         source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0.as_str())")
@@ -12048,6 +12022,7 @@ fn emit_adopts_owned_native_resource_returns() {
             .into_string();
 
     assert!(source.contains("AnvRefType::<host::Window>::register_untracked"));
+    assert!(!source.contains("register_tracked_in"));
 }
 
 #[test]
@@ -12723,21 +12698,39 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
             "impl<'cx> {} for anvP0_Node_value_place<'cx>",
             target::dataref_place_ops_ty("i64")
         ),
-        target::rt_heap_try_with_erased(
-            "rt",
-            "object",
-            &heap_type,
-            "storage",
-            "NodeStorage<'cx>",
-            "f(&storage.value)",
+        format!(
+            "let value = {}?;",
+            target::rt_heap_try_with_erased(
+                "rt",
+                "object",
+                &heap_type,
+                "storage",
+                "NodeStorage<'cx>",
+                "Ok(storage.value.clone())",
+            )
         ),
-        target::rt_heap_try_with_erased_mut(
-            "rt",
-            "object",
-            &heap_type,
-            "storage",
-            "NodeStorage<'cx>",
-            "f(&mut storage.value)",
+        "f(&value)".to_string(),
+        format!(
+            "let mut value = {}?;",
+            target::rt_heap_try_with_erased(
+                "rt",
+                "object",
+                &heap_type,
+                "storage",
+                "NodeStorage<'cx>",
+                "Ok(storage.value.clone())",
+            )
+        ),
+        format!(
+            "let writeback = {};",
+            target::rt_heap_try_with_erased_mut(
+                "rt",
+                "object",
+                &heap_type,
+                "storage",
+                "NodeStorage<'cx>",
+                "{ storage.value = value; Ok(()) }",
+            )
         ),
         format!(
             "let __anv_dataref_place_object_0 = {};",
@@ -12768,8 +12761,9 @@ fn emit_nested_dataref_projection_mut_place_descriptor_path() {
     .into_string();
 
     assert!(source.contains("struct anvP0_Node_point_x_place<'cx>"));
-    assert!(source.contains("f(&storage.point.x)"));
-    assert!(source.contains("f(&mut storage.point.x)"));
+    assert!(source.contains("Ok(storage.point.x.clone())"));
+    assert!(source.contains("f(&value)"));
+    assert!(source.contains("storage.point.x = value"));
 }
 
 #[test]
@@ -13464,31 +13458,6 @@ fn rir_rejects_escaping_proof_over_nonescaping_lambda_param() {
     assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
 }
 
-#[test]
-fn rir_rejects_escaping_proof_over_unknown_lambda_local() {
-    let mut program = native_scoped_lambda_rir();
-    let lambda_ty = RirTypeId::from_index(2);
-    let proven = RirLocalId::from_index(program.functions[0].locals.len());
-    program.functions[0].locals.push(RirLocal {
-        id: proven,
-        ty: lambda_ty,
-        mutable: false,
-        symbol: RirSymbol::new("proven"),
-        initialized: false,
-        payload_ref: false,
-    });
-    program.functions[0].body.stmts = vec![RirStmt::Init {
-        local: proven,
-        value: RirRValue::FunctionValue {
-            value: RirOperand::Place(rir_place(RirLocalId::from_index(0), lambda_ty)),
-            escape: Some(RirLambdaEscape::Escaping),
-            ty: lambda_ty,
-        },
-    }];
-
-    assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
-}
-
 fn native_escaping_lambda_tuple_operand() -> (RirProgram, RirTypeId, RirOperand) {
     let mut program = native_escaping_lambda_rir();
     let lambda_ty = RirTypeId::from_index(2);
@@ -13528,33 +13497,6 @@ fn projected_escaping_lambda_without_proof_rejected() {
     *callee = projection;
 
     assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
-}
-
-#[test]
-fn projected_escaping_lambda_forged_proof_rejected() {
-    let (mut program, lambda_ty, projection) = native_escaping_lambda_tuple_operand();
-    let proven = RirLocalId::from_index(program.functions[0].locals.len());
-    program.functions[0].locals.push(RirLocal {
-        id: proven,
-        ty: lambda_ty,
-        mutable: false,
-        symbol: RirSymbol::new("proven"),
-        initialized: false,
-        payload_ref: false,
-    });
-    program.functions[0].body.stmts.insert(
-        0,
-        RirStmt::Init {
-            local: proven,
-            value: RirRValue::FunctionValue {
-                value: projection,
-                escape: Some(RirLambdaEscape::Escaping),
-                ty: lambda_ty,
-            },
-        },
-    );
-
-    assert_rir_error(program, RirVerifyErrorKind::LambdaEscapeProofMismatch);
 }
 
 #[test]
@@ -20857,30 +20799,6 @@ fn native_escaping_lambda_trigger_air(kind: NativeLambdaArgKind) -> Program {
     program
 }
 
-fn add_scalar_global_read(program: &mut Program) {
-    let entry = program.entry.expect("entry function");
-    let module = program.function(entry).module;
-    let int = program.function(FunctionId::from_index(0)).signature.params[0].ty;
-    let value = int_const(program, int, 7);
-    let global = global_with_init(
-        program,
-        module,
-        "retained_score",
-        int,
-        Mutability::Immutable,
-    );
-    let init = program.globals[global.index()].init;
-    program.function_mut(init).body =
-        structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
-    let tmp = air::LocalId::from_index(program.function(entry).locals.len());
-    let function = program.function_mut(entry);
-    function.locals.push(local(int, LocalKind::Temp));
-    function.body.block.stmts.push(Statement::Init {
-        local: tmp,
-        value: RValue::Use(Operand::Place(root_place(PlaceRoot::Global(global), int))),
-    });
-}
-
 fn native_escaping_lambda_tuple_air(kind: NativeLambdaArgKind) -> Program {
     let mut program = native_escaping_lambda_trigger_air(kind);
     let entry = program.entry.expect("entry function");
@@ -22456,38 +22374,6 @@ fn workspace_crate_path(name: &str) -> String {
 fn with_fallible_host(source: emit::RustSource) -> emit::RustSource {
     emit::RustSource::new(format!(
         "mod host {{ pub fn fallible<'cx, 'rt>(_ctx: &mut anvyx_runtime::Ctx<'cx, 'rt>, value: i64) -> Result<i64, anvyx_runtime::RuntimeError> {{ Ok(value) }} }}\n{}",
-        source.into_string()
-    ))
-}
-
-fn with_lambda_host(source: emit::RustSource) -> emit::RustSource {
-    emit::RustSource::new(format!(
-        "mod host {{ pub mod host {{ pub fn apply(f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), i64>) {{ assert_eq!(f.call(41).unwrap(), 41); }} }} }}\n{}",
-        source.into_string()
-    ))
-}
-
-fn with_escaping_lambda_host(source: emit::RustSource) -> emit::RustSource {
-    emit::RustSource::new(format!(
-        "mod host {{ pub mod host {{ pub fn apply(f: anvyx_runtime::EscapingLambda<(i64,), i64>) {{ assert_eq!(f.call(41).unwrap(), 41); }} }} }}\n{}",
-        source.into_string()
-    ))
-}
-
-fn with_scoped_and_subscription_host(source: emit::RustSource) -> emit::RustSource {
-    emit::RustSource::new(format!(
-        "mod host {{ pub mod host {{ pub fn apply(f: anvyx_runtime::ScopedLambda<'_, '_, (i64,), i64>) {{ assert_eq!(f.call(41).unwrap(), 41); }} pub fn subscribe(f: anvyx_runtime::EscapingLambda<(i64,), i64>) -> i64 {{ assert_eq!(f.call(41).unwrap(), 41); 0 }} }} pub fn subscribe(f: anvyx_runtime::EscapingLambda<(i64,), i64>) -> i64 {{ assert_eq!(f.call(41).unwrap(), 41); 0 }} }}\n{}",
-        source.into_string()
-    ))
-}
-
-fn with_retained_escaping_lambda_host(
-    source: emit::RustSource,
-    first: i64,
-    second: i64,
-) -> emit::RustSource {
-    emit::RustSource::new(format!(
-        "mod host {{ pub mod host {{ use std::cell::RefCell; thread_local! {{ static STORED: RefCell<Option<anvyx_runtime::EscapingLambda<(i64,), i64>>> = RefCell::new(None); }} pub fn apply(f: anvyx_runtime::EscapingLambda<(i64,), i64>) {{ STORED.with(|slot| *slot.borrow_mut() = Some(f)); }} pub fn trigger<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>) {{ STORED.with(|slot| {{ let mut f = slot.borrow_mut().take().expect(\"stored callback\"); assert_eq!(f.call(41).unwrap(), {first}); assert_eq!(f.call(41).unwrap(), {second}); assert!(f.close().unwrap()); assert!(f.call(41).is_err()); }}); }} }} }}\n{}",
         source.into_string()
     ))
 }

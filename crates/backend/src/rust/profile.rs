@@ -224,10 +224,13 @@ impl ProfileCx<'_> {
     fn dataref_decl_supported(&self, aggregate: AggregateId) -> bool {
         let decl = self.program.aggregate(aggregate);
         decl.kind == AggregateKind::DataRef
-            && decl
-                .fields
-                .iter()
-                .all(|field| self.stored_payload_supported(field.ty))
+            && decl.fields.iter().all(|field| {
+                self.stored_payload_supported(field.ty)
+                    || self
+                        .policy()
+                        .storage_supported(field.ty, LambdaStorageFamily::DataRefProjection)
+                        .is_ok()
+            })
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
@@ -1164,6 +1167,7 @@ impl ProfileCx<'_> {
                     | rir::RirParamSemantic::SharedBorrow
                     | rir::RirParamSemantic::ScopedLambda
                     | rir::RirParamSemantic::EscapingLambda
+                    | rir::RirParamSemantic::AnvCallback
                     | rir::RirParamSemantic::StackCell
                     | rir::RirParamSemantic::HeapCell
                     | rir::RirParamSemantic::ScopedPlaceCell => {
@@ -1284,6 +1288,7 @@ impl ProfileCx<'_> {
                     air::ScopedBorrowSource::PatternAlias { source } => {
                         source.root.local() == Some(local)
                     }
+                    air::ScopedBorrowSource::ForRefAlias { .. } => false,
                 }
         })
     }
@@ -1330,6 +1335,21 @@ impl ProfileCx<'_> {
             air::ScopedBorrowSource::PatternAlias { source } => {
                 let source_root_supported = source.root.local().is_some_and(|local| {
                     self.function_local_is_source_mut_place_param(decl.owner, local)
+                });
+                if !source_root_supported
+                    || self
+                        .access()
+                        .plan(decl.owner, PlaceAccessIntent::MutPlaceArg, source)
+                        .is_err()
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
+                }
+            }
+            air::ScopedBorrowSource::ForRefAlias { source } => {
+                let source_root_supported = source.root.local().is_some_and(|local| {
+                    source.projection.is_empty()
+                        && self.program.function(decl.owner).locals[local.index()].kind
+                            == LocalKind::PatternBinding
                 });
                 if !source_root_supported
                     || self
@@ -1401,6 +1421,7 @@ impl ProfileCx<'_> {
                                     ) | (
                                         ParamEscape::Escaping,
                                         rir::RirParamSemantic::EscapingLambda
+                                            | rir::RirParamSemantic::AnvCallback
                                     )
                                 )
                             })

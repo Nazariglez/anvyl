@@ -8,10 +8,10 @@ use anvyx_frontend::air::{
 use super::{
     rir::{
         RirCellDecl, RirCellStorage, RirCollectionStorageKind, RirDataRef, RirEnum, RirEnumId,
-        RirField, RirLambda, RirLambdaCapture, RirLambdaEnvField, RirLambdaEnvFieldKind,
-        RirLambdaEnvLayout, RirLambdaSigId, RirLambdaStorage, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirTuple, RirTupleId, RirType,
-        RirTypeId,
+        RirField, RirFunctionId, RirLambda, RirLambdaCapture, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvLayout, RirLambdaId, RirLambdaSigId, RirLambdaStorage,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirProgram, RirStruct, RirStructId,
+        RirTuple, RirTupleId, RirType, RirTypeId,
     },
     target,
 };
@@ -139,6 +139,7 @@ impl LambdaStorageFamily {
                 | Self::FixedArrayElement
                 | Self::ListElement
                 | Self::MapValue
+                | Self::DataRefProjection
                 | Self::GlobalRoot
         )
     }
@@ -194,6 +195,30 @@ pub(super) enum LambdaTraceAction {
     Noop,
     HeapEnv,
     HeapCellCaptures(Vec<usize>),
+}
+
+pub(super) struct LambdaSigLayout<'a> {
+    pub variants: Vec<LambdaVariantLayout<'a>>,
+    pub captures_self: bool,
+    pub mut_self: bool,
+}
+
+impl LambdaSigLayout<'_> {
+    pub(super) fn self_arg(&self) -> &'static str {
+        match (self.captures_self, self.mut_self) {
+            (_, true) => "&mut self",
+            (true, false) => "&self",
+            (false, false) => "self",
+        }
+    }
+}
+
+pub(super) struct LambdaVariantLayout<'a> {
+    pub id: RirLambdaId,
+    pub function: RirFunctionId,
+    pub storage: RirLambdaStorage,
+    pub captures: &'a [RirLambdaCapture],
+    pub trace_action: LambdaTraceAction,
 }
 
 fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
@@ -946,6 +971,7 @@ impl<'a> RustRepPolicy<'a> {
             RirParamSemantic::MutPlace => RirParamAbi::MutPlace,
             RirParamSemantic::ScopedLambda => RirParamAbi::ScopedLambda,
             RirParamSemantic::EscapingLambda => RirParamAbi::EscapingLambda,
+            RirParamSemantic::AnvCallback => RirParamAbi::AnvCallback,
             RirParamSemantic::StackCell => RirParamAbi::StackCell,
             RirParamSemantic::HeapCell => RirParamAbi::HeapCell,
             RirParamSemantic::ScopedPlaceCell => RirParamAbi::ScopedPlaceCell,
@@ -1609,6 +1635,7 @@ impl<'a> RustRepPolicy<'a> {
             }
             RirParamAbi::ScopedLambda => self.scoped_lambda_ty(ty),
             RirParamAbi::EscapingLambda => self.escaping_lambda_ty(ty),
+            RirParamAbi::AnvCallback => self.anv_callback_ty(ty),
             RirParamAbi::StackCell => {
                 let payload = self.rust_ty(ty);
                 format!(
@@ -1628,6 +1655,35 @@ impl<'a> RustRepPolicy<'a> {
                     target::scoped_mut_place_cell_ty(source_lifetime, &payload)
                 )
             }
+        }
+    }
+
+    pub(super) fn lambda_sig_layout(self, id: RirLambdaSigId) -> LambdaSigLayout<'a> {
+        let variants = self
+            .program
+            .lambdas_for_sig(id)
+            .map(|lambda| LambdaVariantLayout {
+                id: lambda.id,
+                function: lambda.function,
+                storage: lambda.storage,
+                captures: lambda.captures.as_slice(),
+                trace_action: Self::lambda_trace_action(lambda),
+            })
+            .collect::<Vec<_>>();
+        let captures_self = variants.iter().any(|variant| !variant.captures.is_empty());
+        let mut_self = variants.iter().any(|variant| {
+            if matches!(variant.storage, RirLambdaStorage::HeapEnv { .. }) {
+                return false;
+            }
+            variant
+                .captures
+                .iter()
+                .any(|capture| capture.semantic == RirParamSemantic::MutBorrow)
+        });
+        LambdaSigLayout {
+            variants,
+            captures_self,
+            mut_self,
         }
     }
 
@@ -1658,6 +1714,12 @@ impl<'a> RustRepPolicy<'a> {
         let sig = self.expect_lambda_sig(ty);
         let (args, ret) = self.scoped_lambda_sig_args_ret(sig);
         target::escaping_lambda_ty(&args, &ret)
+    }
+
+    fn anv_callback_ty(self, ty: RirTypeId) -> String {
+        let sig = self.expect_lambda_sig(ty);
+        let (args, ret) = self.scoped_lambda_sig_args_ret(sig);
+        target::anv_callback_ty(&args, &ret)
     }
 
     fn expect_lambda_sig(self, ty: RirTypeId) -> RirLambdaSigId {
@@ -1848,9 +1910,10 @@ impl<'a> RustRepPolicy<'a> {
             RirParamAbi::StackCell => LambdaCaptureLayoutEdge::StackCell,
             RirParamAbi::HeapCell => LambdaCaptureLayoutEdge::HeapCell,
             RirParamAbi::ScopedPlaceCell => LambdaCaptureLayoutEdge::ScopedPlaceCell,
-            RirParamAbi::MutPlace | RirParamAbi::ScopedLambda | RirParamAbi::EscapingLambda => {
-                LambdaCaptureLayoutEdge::Unsupported
-            }
+            RirParamAbi::MutPlace
+            | RirParamAbi::ScopedLambda
+            | RirParamAbi::EscapingLambda
+            | RirParamAbi::AnvCallback => LambdaCaptureLayoutEdge::Unsupported,
         }
     }
 
@@ -1930,7 +1993,8 @@ impl<'a> RustRepPolicy<'a> {
                     RirParamAbi::MutBorrow
                     | RirParamAbi::MutPlace
                     | RirParamAbi::ScopedLambda
-                    | RirParamAbi::EscapingLambda => false,
+                    | RirParamAbi::EscapingLambda
+                    | RirParamAbi::AnvCallback => false,
                 })
             })
     }
@@ -1953,7 +2017,8 @@ impl<'a> RustRepPolicy<'a> {
                 RirParamAbi::MutBorrow
                 | RirParamAbi::MutPlace
                 | RirParamAbi::ScopedLambda
-                | RirParamAbi::EscapingLambda => false,
+                | RirParamAbi::EscapingLambda
+                | RirParamAbi::AnvCallback => false,
             })
         });
         active.remove(&id);
@@ -2327,9 +2392,9 @@ impl<'a> RustRepPolicy<'a> {
                 | RirType::Map { .. } => true,
                 RirType::Void | RirType::Slice(_) | RirType::Lambda(_) => false,
             },
-            RirParamSemantic::ScopedLambda | RirParamSemantic::EscapingLambda => {
-                matches!(ty, RirType::Lambda(_))
-            }
+            RirParamSemantic::ScopedLambda
+            | RirParamSemantic::EscapingLambda
+            | RirParamSemantic::AnvCallback => matches!(ty, RirType::Lambda(_)),
             RirParamSemantic::MutPlace
             | RirParamSemantic::StackCell
             | RirParamSemantic::HeapCell
@@ -2420,6 +2485,9 @@ impl RustTracePlan {
                 plan.mark_type(program, global.ty);
             }
         }
+        for sig in program.retained_callback_sigs() {
+            plan.mark_lambda_sig(program, sig);
+        }
         plan
     }
 
@@ -2439,8 +2507,13 @@ impl RustTracePlan {
         self.lambda_sigs.contains(&id)
     }
 
+    fn mark_lambda_sig(&mut self, program: &RirProgram, id: RirLambdaSigId) {
+        if RustRepPolicy::new(program).lambda_sig_owns_heap_edges(id) {
+            self.lambda_sigs.insert(id);
+        }
+    }
+
     fn mark_type(&mut self, program: &RirProgram, ty: RirTypeId) {
-        let policy = RustRepPolicy::new(program);
         if !self.visited.insert(ty) {
             return;
         }
@@ -2477,16 +2550,13 @@ impl RustTracePlan {
                 self.mark_type(program, key);
                 self.mark_type(program, value);
             }
-            RirType::Lambda(id) if policy.lambda_sig_owns_heap_edges(id) => {
-                self.lambda_sigs.insert(id);
-            }
+            RirType::Lambda(id) => self.mark_lambda_sig(program, id),
             RirType::Int
             | RirType::Float
             | RirType::Bool
             | RirType::String
             | RirType::Void
-            | RirType::DataRef(_)
-            | RirType::Lambda(_) => {}
+            | RirType::DataRef(_) => {}
         }
     }
 }
@@ -2504,12 +2574,13 @@ mod tests {
         RustValueRep,
     };
     use crate::rust::rir::{
-        RirCellId, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirField, RirFieldId,
-        RirFunctionId, RirLambda, RirLambdaCapture, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple,
-        RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirCellId, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirExtern,
+        RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFunctionId, RirLambda,
+        RirLambdaCapture, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
+        RirLambdaSource, RirLambdaStorage, RirNativeExtern, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
     };
 
     #[test]
@@ -3450,6 +3521,74 @@ mod tests {
         assert!(policy.type_cx_dependent(a));
         assert_eq!(policy.materialization(a), RustMaterialization::Share);
         assert!(RustTracePlan::build(&program).needs_struct_trace(RirStructId::from_index(0)));
+    }
+
+    #[test]
+    fn retained_callback_sigs_seed_trace_plan() {
+        let int = RirTypeId::from_index(0);
+        let lambda_ty = RirTypeId::from_index(1);
+        let sig = RirLambdaSigId::from_index(0);
+        let callback = anvyx_runtime::ExternCallbackSignature {
+            params: vec![],
+            ret: Box::new(anvyx_runtime::ExternTypeExpr::Int),
+            policy: anvyx_runtime::CallbackPolicy {
+                escape: anvyx_runtime::CallbackEscape::Escaping,
+                thread: anvyx_runtime::CallbackThread::SameThread,
+            },
+        };
+        let program = RirProgram {
+            types: vec![RirType::Int, RirType::Lambda(sig)],
+            lambda_sigs: vec![RirLambdaSig {
+                id: sig,
+                params: vec![],
+                ret: int,
+            }],
+            lambdas: vec![RirLambda {
+                id: RirLambdaId::from_index(0),
+                source: RirLambdaSource::Function(FunctionId::from_index(0)),
+                function: RirFunctionId::from_index(0),
+                sig,
+                escape: RirLambdaEscape::Escaping,
+                storage: RirLambdaStorage::ScopedCaptures,
+                captures: vec![RirLambdaCapture {
+                    ty: int,
+                    semantic: RirParamSemantic::HeapCell,
+                    abi: RirParamAbi::HeapCell,
+                    kind: RirLambdaCaptureKind::HeapCell {
+                        cell: RirCellId::from_index(0),
+                    },
+                }],
+            }],
+            externs: vec![RirExtern {
+                id: RirExternId::from_index(0),
+                symbol: RirSymbol::new("retain"),
+                kind: RirExternKind::Native(RirNativeExtern {
+                    path: vec!["host".to_string(), "retain".to_string()],
+                    abi: anvyx_runtime::RustExternAbi {
+                        params: vec![anvyx_runtime::RustParamAbi::AnvCallback(callback.clone())],
+                        ret: anvyx_runtime::RustReturnAbi::Void,
+                        fallible: false,
+                        support: anvyx_runtime::RustAbiSupport::NeedsWrapperConversion,
+                        ctx: anvyx_runtime::RustWrapperCtx::HiddenRuntime,
+                    },
+                    callback_receiver: None,
+                }),
+                params: vec![RirExternParam {
+                    ty: lambda_ty,
+                    semantic: RirParamSemantic::AnvCallback,
+                    abi: RirParamAbi::AnvCallback,
+                    escape: RirParamEscape::Escaping,
+                }],
+                ret: int,
+                abi: air::ExternAbi {
+                    params: vec![anvyx_runtime::ExternTypeExpr::Callback(callback)],
+                    ret: anvyx_runtime::ExternTypeExpr::Void,
+                },
+            }],
+            ..RirProgram::default()
+        };
+
+        assert!(RustTracePlan::build(&program).needs_lambda_sig_trace(sig));
     }
 
     #[test]
