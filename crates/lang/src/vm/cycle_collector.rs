@@ -1,9 +1,9 @@
 use std::ptr::NonNull;
 
+use anvyx_runtime::legacy_gc::{CycleVtable, ManagedRcInner, RcHeader, typed_dropper};
 #[cfg(test)]
-pub use anvyx_runtime::cycle_collector::{clear_suspects, reset_collect_threshold, suspect_count};
-pub use anvyx_runtime::cycle_collector::{collect_cycles, set_auto_collect};
-use anvyx_runtime::managed_rc::{CycleVtable, ManagedRcInner, RcHeader, typed_dropper};
+pub use anvyx_runtime::legacy_gc::{clear_suspects, reset_collect_threshold, suspect_count};
+pub use anvyx_runtime::legacy_gc::{collect_cycles, set_auto_collect};
 
 use super::value::{StructData, Value};
 

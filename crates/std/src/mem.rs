@@ -4,17 +4,17 @@ use super::StdModule;
 
 #[export_fn]
 pub fn collect_cycles() {
-    anvyx_runtime::collect_cycles();
+    anvyx_runtime::legacy_gc::collect_cycles();
 }
 
 #[export_fn]
 pub fn auto_collect(enabled: bool) {
-    anvyx_runtime::set_auto_collect(enabled);
+    anvyx_runtime::legacy_gc::set_auto_collect(enabled);
 }
 
 #[export_fn]
 pub fn managed_count() -> i64 {
-    anvyx_runtime::managed_alloc_count() as i64
+    anvyx_runtime::legacy_gc::managed_alloc_count() as i64
 }
 
 provider!(collect_cycles, auto_collect, managed_count);

@@ -52,7 +52,7 @@ pub struct CompiledProgram {
     pub extern_names: Vec<String>,
     pub aggregate_meta: Vec<AggregateMeta>,
     pub enum_meta: Vec<EnumMeta>,
-    pub aggregate_vtables: Vec<Option<&'static anvyx_runtime::CycleVtable>>,
+    pub aggregate_vtables: Vec<Option<&'static anvyx_runtime::legacy_gc::CycleVtable>>,
     pub profile: Profile,
 }
 
@@ -167,7 +167,7 @@ impl<'a> FuncCompiler<'a> {
 
 fn build_aggregate_vtables(
     aggregate_meta: &[AggregateMeta],
-) -> Vec<Option<&'static anvyx_runtime::CycleVtable>> {
+) -> Vec<Option<&'static anvyx_runtime::legacy_gc::CycleVtable>> {
     aggregate_meta
         .iter()
         .map(|meta| match meta.kind {
