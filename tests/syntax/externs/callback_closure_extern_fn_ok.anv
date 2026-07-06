@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern fn transform(x: int) -> int;
 extern fn apply(value: int, cb: fn(int) -> int) -> int;

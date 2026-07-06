@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: `to_string` is not promoted; use the explicit path or define it on the outer type
 
 struct Health {

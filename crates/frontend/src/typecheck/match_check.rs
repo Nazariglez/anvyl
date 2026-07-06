@@ -137,7 +137,7 @@ fn define_downcast_binding(
     source: &downcast::CheckedDowncastSource,
     tc: &mut TypeChecker,
 ) {
-    let handle = tc.type_handle(target);
+    let handle = TypeChecker::type_handle(target);
     let Some(alias) = source.alias.as_ref() else {
         tc.define_pattern_binding_from_handle(name, &handle, false, None);
         return;
@@ -172,7 +172,7 @@ fn define_fallback_binding(
 }
 
 fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) {
-    let handle = tc.type_handle(&Type::Infer);
+    let handle = TypeChecker::type_handle(&Type::Infer);
     tc.define_pattern_binding_from_handle(name, &handle, false, None);
 }
 

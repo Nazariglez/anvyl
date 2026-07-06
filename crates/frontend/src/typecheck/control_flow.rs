@@ -116,7 +116,7 @@ fn check_bool_condition(
         return;
     }
     if cond.ty == Type::Infer {
-        let bool_handle = tc.type_handle(&Type::Bool);
+        let bool_handle = TypeChecker::type_handle(&Type::Bool);
         tc.expect_assignable(expr.span, cond.handle, bool_handle);
         return;
     }
@@ -168,7 +168,7 @@ fn join_branches_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     match (left.diverges, right.diverges) {
-        (true, true) => checked_void(tc),
+        (true, true) => checked_void(),
         (true, false) => checked_branch_against_expected(right, expected, tc),
         (false, true) => checked_branch_against_expected(left, expected, tc),
         (false, false) => {
@@ -208,13 +208,10 @@ impl<'a> BranchPolicy<'a> {
         }
     }
 
-    fn place_return(
-        ret: &'a ReturnSpec,
-        source: Option<&'a PlaceIdentity>,
-        tc: &mut TypeChecker,
-    ) -> Self {
+    fn place_return(ret: &'a ReturnSpec, source: Option<&'a PlaceIdentity>) -> Self {
         Self {
-            expected: (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty)),
+            expected: (!matches!(ret.ty, Type::InferReturn))
+                .then(|| TypeChecker::type_handle(&ret.ty)),
             body: BranchBody::PlaceReturn { ret, source },
         }
     }
@@ -294,9 +291,7 @@ impl<'a> BranchPolicy<'a> {
     fn finish(&self, branch: CheckedBranch, tc: &mut TypeChecker) -> CheckedType {
         match self.body {
             BranchBody::Value => branch.checked,
-            BranchBody::PlaceReturn { ret, .. } if branch.diverges => {
-                diverged_place_return(ret, tc)
-            }
+            BranchBody::PlaceReturn { ret, .. } if branch.diverges => diverged_place_return(ret),
             BranchBody::PlaceReturn { .. } => {
                 checked_branch_against_expected(branch, self.expected.clone(), tc)
             }
@@ -322,7 +317,7 @@ impl<'a> BranchPolicy<'a> {
                 .reduce(|left, right| self.join(left, right, tc))
             {
                 Some(branch) => self.finish(branch, tc),
-                None => checked_void(tc),
+                None => checked_void(),
             },
         }
     }
@@ -413,7 +408,7 @@ fn check_if_with_policy(
             ))
         };
         return match &policy.body {
-            BranchBody::Value => checked_void(tc),
+            BranchBody::Value => checked_void(),
             BranchBody::PlaceReturn { ret, .. } => {
                 tc.push_error(TypeError::MissingReturn {
                     expected: ret.ty.clone(),
@@ -421,7 +416,7 @@ fn check_if_with_policy(
                 });
                 match then {
                     Some(branch) if !branch.checked.ty.is_void() => branch.checked,
-                    _ => diverged_place_return(ret, tc),
+                    _ => diverged_place_return(ret),
                 }
             }
         };
@@ -537,7 +532,7 @@ fn check_match_with_policy(
         tc.push_error(TypeError::EmptyMatch {
             span: tc.error_span(match_node.span),
         });
-        return checked_void(tc);
+        return checked_void();
     }
 
     let arms = if matches!(node.mode, MatchMode::Dynamic) {
@@ -675,7 +670,7 @@ fn check_match_arm_expected(
 
 fn finish_match_arms(arms: Vec<CheckedBranch>, tc: &mut TypeChecker) -> CheckedType {
     if arms[0].checked.ty.is_void() {
-        return checked_void(tc);
+        return checked_void();
     }
     let result = tc.fresh_temp_handle(arms[0].span);
     let contains_extern_any = arms
@@ -932,7 +927,7 @@ fn alias_for_root<'a>(
         PlaceAccess::Mutable
     };
     let place = pattern::PatternPlace {
-        expected_handle: tc.type_handle(&ty),
+        expected_handle: TypeChecker::type_handle(&ty),
         expected_ty: ty,
         access,
         facts: source.value.facts.clone(),
@@ -1006,7 +1001,7 @@ fn check_for_step(
     if range_kind.is_some() && (!range_is_int || !step_is_int) {
         push_for_modifier_error(tc, "step is only supported for integer ranges", step.span);
     }
-    let int = tc.type_handle(&Type::Int);
+    let int = TypeChecker::type_handle(&Type::Int);
     tc.expect_assignable(step.span, step_checked.handle, int);
 
     if step_is_int {
@@ -1098,7 +1093,7 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             });
         }
         (None, Some(ReturnTarget::Infer { .. })) => {
-            tc.push_inferred_return(ret_node.span, tc.type_handle(&Type::Void));
+            tc.push_inferred_return(ret_node.span, TypeChecker::type_handle(&Type::Void));
         }
         (None, _) => {}
     }
@@ -1120,20 +1115,21 @@ pub(super) fn check_return_expr(
 ) -> CheckedType {
     if ret.is_place() {
         if let Some(checked) = check_branch_place_return_expr(expr, ret, source, tc) {
-            return checked_from_checked(expr, checked, tc);
+            return checked_from_checked(expr, &checked, tc);
         }
         let place = check_place(expr, tc);
         validate_place_return_expr(&place.value, source, expr.span, tc);
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, expr.span);
         if !matches!(ret.ty, Type::InferReturn) {
-            let expected = tc.type_handle(&ret.ty);
+            let expected = TypeChecker::type_handle(&ret.ty);
             tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
         }
         return checked;
     }
 
-    let expected = (!matches!(ret.ty, Type::InferReturn)).then(|| tc.type_handle(&ret.ty));
+    let expected =
+        (!matches!(ret.ty, Type::InferReturn)).then(|| TypeChecker::type_handle(&ret.ty));
     let actual = match expected {
         Some(expected) => check_expected_value_expr(expr, expected, tc),
         None => check_value_expr_checked_with_hint(expr, None, tc),
@@ -1152,15 +1148,15 @@ fn check_branch_place_return_expr(
     match &expr.node.kind {
         ExprKind::Block(block) => Some(check_place_return_block(block, ret, source, tc)),
         ExprKind::If(if_node) => {
-            let policy = BranchPolicy::place_return(ret, source, tc);
+            let policy = BranchPolicy::place_return(ret, source);
             Some(check_if_with_policy(if_node, expr.span, None, &policy, tc))
         }
         ExprKind::Ternary(ternary) => {
-            let policy = BranchPolicy::place_return(ret, source, tc);
+            let policy = BranchPolicy::place_return(ret, source);
             Some(check_ternary_with_policy(ternary, None, &policy, tc))
         }
         ExprKind::Match(match_node) => {
-            let policy = BranchPolicy::place_return(ret, source, tc);
+            let policy = BranchPolicy::place_return(ret, source);
             Some(check_match_with_policy(match_node, None, &policy, tc))
         }
         _ => None,
@@ -1182,13 +1178,13 @@ fn check_place_return_block(
     )
 }
 
-fn diverged_place_return(ret: &ReturnSpec, tc: &TypeChecker) -> CheckedType {
+fn diverged_place_return(ret: &ReturnSpec) -> CheckedType {
     let ty = if matches!(ret.ty, Type::InferReturn) {
         Type::Infer
     } else {
         ret.ty.clone()
     };
-    checked_type(ty, tc)
+    checked_type(ty)
 }
 
 fn validate_place_return_expr(

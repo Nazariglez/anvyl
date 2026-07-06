@@ -1,0 +1,6 @@
+[project]
+name = "a"
+entry = "a/src/main.anv"
+
+[dependencies]
+b = { path = "b" }

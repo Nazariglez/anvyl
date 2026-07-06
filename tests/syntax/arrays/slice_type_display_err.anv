@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: slice[int]
 
 fn takes(xs: slice[int]) {}

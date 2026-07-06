@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Unknown variant 'Yellow' for enum 'Color'
 // @contains: unknown variable `missing`
 

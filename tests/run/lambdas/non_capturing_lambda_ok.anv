@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 42
+// 7
+// @match-end
+
+fn apply(f: fn() -> int) -> int {
+    f()
+}
+
+fn main() {
+    let f = || 42;
+    println(f());
+    println(apply(|| 7));
+}

@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @contains: tick
+
+dataref Holder {
+    f: fn(),
+}
+
+fn tick() {
+    println("tick");
+}
+
+fn keep(f: escaping fn()) {
+    f();
+}
+
+fn main() {
+    let holder = Holder { f: tick };
+    keep(holder.f);
+}

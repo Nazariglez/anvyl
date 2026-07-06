@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 43
+
+dataref Counter {
+    value: int,
+}
+
+fn bump(ref c: Counter) {
+    c.value +=  1;
+}
+
+fn bump_twice(ref c: Counter) {
+    bump(c);
+    bump(c);
+}
+
+fn main() {
+    var c = Counter { value: 41 };
+    bump_twice(c);
+    println(c.value);
+}

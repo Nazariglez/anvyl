@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn call(cb: fn()) {
+    cb();
+}
+
+fn touch(ref count: int) {
+    let f = || {
+        count += 1;
+    };
+    call(f);
+}
+
+fn main() {
+    var count = 0;
+    touch(count);
+    println(count);
+}

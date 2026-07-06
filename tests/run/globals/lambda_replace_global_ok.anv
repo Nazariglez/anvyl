@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// 11
+// @match-end
+
+lazy var current: fn() -> int = || 1;
+
+fn make(seed: int) -> fn() -> int {
+    var next = seed;
+    || {
+        next = next + 1;
+        next
+    }
+}
+
+fn main() {
+    println(current());
+    current = make(9);
+    println(current());
+    println(current());
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn load(x: int?) -> Result<int, string> {
     let value = try x.or_err("missing");

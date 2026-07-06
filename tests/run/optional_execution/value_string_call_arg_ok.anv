@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: x
+
+fn accept(value: string?) -> string? {
+    value
+}
+
+fn main() {
+    println(accept("x") ?? "none");
+}

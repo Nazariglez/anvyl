@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: unknown variable
 

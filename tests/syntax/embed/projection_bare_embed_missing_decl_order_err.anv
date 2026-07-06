@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: use stored path z, a explicitly
 
 struct Target { x: int }

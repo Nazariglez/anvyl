@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 13
+
+fn main() {
+    let value: int? = 13;
+    match value {
+        Option.Some(v) => println(v),
+        Option.None => println(0),
+    }
+}

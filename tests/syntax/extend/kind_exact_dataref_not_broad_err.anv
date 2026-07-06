@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Unknown method 'get' for type 'OtherNode'
 
 dataref Node { value: int }

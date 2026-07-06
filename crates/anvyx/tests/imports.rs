@@ -1,4 +1,8 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
 fn write(root: &Path, relative: &str, text: &str) {
     let path = root.join(relative);
@@ -12,40 +16,12 @@ fn anvyx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anvyx"))
 }
 
-fn runtime_path() -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("runtime")
-        .display()
-        .to_string()
-}
-
-fn write_provider_crate(root: &Path, package: &str, module: &str) {
-    write(
-        root,
-        &format!("{package}/Cargo.toml"),
-        &format!(
-            "[package]\nname = \"native\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
-            runtime_path()
-        ),
-    );
-    write(
-        root,
-        &format!("{package}/src/lib.rs"),
-        &format!(
-            r#"use anvyx_runtime::function;
-
-#[function]
-pub fn ping() -> i64 {{ 1 }}
-
-anvyx_runtime::builtin_module! {{
-    name: "{module}",
-    source: "",
-    exports: [ping],
-}}
-"#
-        ),
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -73,167 +49,31 @@ fn assert_frontend_parse_failure(stderr: &str, checking: &str) {
     }
 }
 
-#[test]
-fn package_import_smoke() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+fn host_exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
 
-    write(
-        root,
-        "game/anvyx.toml",
-        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
-    );
-    write(
-        root,
-        "math/anvyx.toml",
-        "[project]\nentry = \"src/lib.anv\"\n",
-    );
-    write(
-        root,
-        "game/src/main.anv",
-        "import helper { local };\nimport .helper { local as again };\nimport pkg:math { add };\nimport pkg:math.util { mul };\nimport std:mem;\n\nfn main() {\n    let x: int = local() + again() + add() + mul();\n}\n",
-    );
-    write(root, "game/src/helper.anv", "pub fn local() -> int { 1 }\n");
-    write(
-        root,
-        "math/src/lib.anv",
-        "pub import util;\n\npub fn add() -> int { 1 }\n",
-    );
-    write(root, "math/src/util.anv", "pub fn mul() -> int { 2 }\n");
-
-    let output = anvyx()
-        .current_dir(root.join("game"))
-        .args(["check", "--new-frontend"])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+fn generated_manifest(root: &Path) -> PathBuf {
+    let crates = root.join(".anvyx/cache/rust/crates");
+    let mut manifests = fs::read_dir(&crates)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("Cargo.toml"))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    manifests.sort();
+    assert_eq!(manifests.len(), 1);
+    manifests.remove(0)
 }
 
 #[test]
-fn native_only_dependency_check_smoke() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-
-    write(
-        root,
-        "game/anvyx.toml",
-        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\nhost = { path = \"../host\" }\n",
-    );
-    write(root, "host/anvyx.toml", "[project]\nname = \"host\"\n");
-    write(
-        root,
-        "game/src/main.anv",
-        "import pkg:host.audio { ping };\nfn main() { let x: int = ping(); }\n",
-    );
-    write_provider_crate(root, "host", "audio");
-
-    let output = anvyx()
-        .current_dir(root.join("game"))
-        .args(["check", "--new-frontend"])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-#[test]
-fn source_native_dependency_check_smoke() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-
-    write(
-        root,
-        "game/anvyx.toml",
-        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\ncolors = { path = \"../colors\" }\n",
-    );
-    write(
-        root,
-        "colors/anvyx.toml",
-        "[project]\nentry = \"src/lib.anv\"\n",
-    );
-    write(
-        root,
-        "game/src/main.anv",
-        "import pkg:colors { mix };\nfn main() { let x: int = mix(); }\n",
-    );
-    write(
-        root,
-        "colors/src/lib.anv",
-        "import ext:colors_native { ping };\npub fn mix() -> int { ping() }\n",
-    );
-    write_provider_crate(root, "colors", "colors_native");
-
-    let output = anvyx()
-        .current_dir(root.join("game"))
-        .args(["check", "--new-frontend"])
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-#[test]
-fn source_native_provider_direct_consumer_import_fails() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-
-    write(
-        root,
-        "game/anvyx.toml",
-        "[project]\nentry = \"src/main.anv\"\n\n[dependencies]\ncolors = { path = \"../colors\" }\n",
-    );
-    write(
-        root,
-        "colors/anvyx.toml",
-        "[project]\nentry = \"src/lib.anv\"\n",
-    );
-    write(
-        root,
-        "game/src/main.anv",
-        "import pkg:colors.colors_native { ping };\nfn main() { let x: int = ping(); }\n",
-    );
-    write(root, "colors/src/lib.anv", "pub fn mix() -> int { 1 }\n");
-    write_provider_crate(root, "colors", "colors_native");
-
-    let output = anvyx()
-        .current_dir(root.join("game"))
-        .args(["check", "--new-frontend"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(!output.status.success(), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("Unknown member 'colors_native'"),
-        "stderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn clean_rust_run_renders_frontend_parse_report() {
+fn run_renders_frontend_parse_report() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write(root, "main.anv", "fn main() {\n    }\n}\n");
 
     let output = anvyx()
         .current_dir(root)
-        .args(["run", "--new-frontend", "--backend", "rust", "main.anv"])
+        .args(["run", "main.anv"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -243,7 +83,7 @@ fn clean_rust_run_renders_frontend_parse_report() {
 }
 
 #[test]
-fn clean_rust_build_renders_frontend_parse_report() {
+fn build_renders_frontend_parse_report() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write(
@@ -253,11 +93,7 @@ fn clean_rust_build_renders_frontend_parse_report() {
     );
     write(root, "src/main.anv", "fn main() {\n    }\n}\n");
 
-    let output = anvyx()
-        .current_dir(root)
-        .args(["build", "--new-frontend", "--backend", "rust"])
-        .output()
-        .unwrap();
+    let output = anvyx().current_dir(root).args(["build"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
@@ -265,7 +101,7 @@ fn clean_rust_build_renders_frontend_parse_report() {
 }
 
 #[test]
-fn clean_rust_run_renders_warnings_before_later_phases() {
+fn run_renders_warnings_before_later_phases() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write(root, "main.anv", "import helper;\n\nfn main() {}\n");
@@ -273,16 +109,13 @@ fn clean_rust_run_renders_warnings_before_later_phases() {
 
     let output = anvyx()
         .current_dir(root)
-        .args(["run", "--new-frontend", "--backend", "rust", "main.anv"])
+        .args(["run", "main.anv"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        output.status.success(),
-        "stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+    assert_success(&output);
     assert_eq!(stdout, "");
     assert_in_order(
         &stderr,
@@ -297,21 +130,79 @@ fn clean_rust_run_renders_warnings_before_later_phases() {
 }
 
 #[test]
-fn pkg_requires_context() {
+fn build_copies_debug_and_release_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    write(root, "main.anv", "import pkg:math;\nfn main() {}\n");
+    write(
+        root,
+        "anvyx.toml",
+        "[project]\nname = \"demo\"\nentry = \"src/main.anv\"\n",
+    );
+    write(root, "src/main.anv", "fn main() {}\n");
 
-    let output = anvyx()
+    let debug = anvyx().current_dir(root).args(["build"]).output().unwrap();
+    assert_success(&debug);
+    assert!(root.join("build/debug").join(host_exe("demo")).exists());
+
+    let release = anvyx()
         .current_dir(root)
-        .args(["check", "--new-frontend", "main.anv"])
+        .args(["build", "--release"])
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_success(&release);
+    assert!(root.join("build/release").join(host_exe("demo")).exists());
+}
 
-    assert!(!output.status.success());
-    assert!(
-        stderr.contains("has no package dependency named 'math'"),
-        "stderr:\n{stderr}",
+#[test]
+fn build_manifest_uses_project_version_or_default() {
+    let default_root = tempfile::tempdir().unwrap();
+    write(
+        default_root.path(),
+        "anvyx.toml",
+        "[project]\nname = \"default_version\"\nentry = \"src/main.anv\"\n",
     );
+    write(default_root.path(), "src/main.anv", "fn main() {}\n");
+
+    let default_output = anvyx()
+        .current_dir(default_root.path())
+        .args(["build"])
+        .output()
+        .unwrap();
+    assert_success(&default_output);
+    let default_manifest = fs::read_to_string(generated_manifest(default_root.path())).unwrap();
+    assert!(default_manifest.contains("version = \"0.0.0\""));
+
+    let versioned_root = tempfile::tempdir().unwrap();
+    write(
+        versioned_root.path(),
+        "anvyx.toml",
+        "[project]\nname = \"versioned\"\nversion = \"1.2.3\"\nentry = \"src/main.anv\"\n",
+    );
+    write(versioned_root.path(), "src/main.anv", "fn main() {}\n");
+
+    let versioned_output = anvyx()
+        .current_dir(versioned_root.path())
+        .args(["build"])
+        .output()
+        .unwrap();
+    assert_success(&versioned_output);
+    let versioned_manifest = fs::read_to_string(generated_manifest(versioned_root.path())).unwrap();
+    assert!(versioned_manifest.contains("version = \"1.2.3\""));
+    assert!(versioned_manifest.contains("edition = \"2024\""));
+}
+
+#[test]
+fn build_sanitizes_public_artifact_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write(
+        root,
+        "anvyx.toml",
+        "[project]\nname = \"../Bad Name\"\nentry = \"src/main.anv\"\n",
+    );
+    write(root, "src/main.anv", "fn main() {}\n");
+
+    let output = anvyx().current_dir(root).args(["build"]).output().unwrap();
+    assert_success(&output);
+    assert!(root.join("build/debug").join(host_exe("bad-name")).exists());
 }

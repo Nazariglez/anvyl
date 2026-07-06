@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: ref arguments must not alias the same variable
 
 lazy var count = 0;

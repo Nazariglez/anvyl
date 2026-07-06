@@ -1,0 +1,53 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// start
+// hello juan from pepe
+// end
+// @match-end
+
+struct Payload {
+    a: int,
+    b: bool,
+    c: float,
+    d: string,
+    flags: (bool, bool),
+}
+
+dataref Node {
+    inner: Node?,
+    value: string,
+    payload: Payload,
+
+    fn do_it(self) {
+        self.inner?.hello(self.value);
+    }
+
+    fn hello(self, from: string) {
+        println("hello " + self.value + " from " + from);
+    }
+}
+
+fn main() {
+    println("start");
+    let payload = Payload {
+        a: 1,
+        b: true,
+        c: 9.9,
+        d: "payload",
+        flags: (true, false),
+    };
+    let n = Node {
+        inner: nil,
+        value: "juan",
+        payload: payload,
+    };
+    n.do_it();
+    let n2 = Node {
+        inner: n,
+        value: "pepe",
+        payload: payload,
+    };
+    n2.do_it();
+    println("end");
+}

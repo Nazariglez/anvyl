@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 4
+// @match-end
+
+fn make_pair() -> (int, bool) {
+    println("init");
+    (1, true)
+}
+
+fn bump(ref x: int) { x += 3; }
+
+lazy var state = make_pair();
+
+fn main() {
+    bump(state.0);
+    let local = state;
+    println(local.0);
+}

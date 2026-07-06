@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+struct State {
+    values: [int],
+}
+
+lazy var state = State { values: [1] };
+
+fn main() {
+    state.values.push(2);
+    for value in state.values {
+        println(value);
+    }
+}

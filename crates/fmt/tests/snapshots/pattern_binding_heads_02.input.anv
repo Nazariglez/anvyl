@@ -1,0 +1,1 @@
+fn f(x: int?) { while var val? = x { val = 1; break; } }

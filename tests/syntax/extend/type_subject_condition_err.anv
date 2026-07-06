@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: type '[int]' cannot be used as a value
 
 fn main() {

@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: error
+// @contains: Unknown extern type 'Secret'
+
+import pkg:host.host { secret_value };
+
+fn main() {}

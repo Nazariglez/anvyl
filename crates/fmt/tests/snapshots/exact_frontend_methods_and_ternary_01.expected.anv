@@ -1,0 +1,4 @@
+struct S {
+    fn make() -> S { S {} }
+    fn get(self) -> int { 0 }
+}

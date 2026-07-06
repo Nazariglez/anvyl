@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// ABC
+// hi
+// @match-end
+
+fn main() {
+    println("abc".to_upper());
+    println("  hi  ".trim());
+}

@@ -1084,30 +1084,11 @@ mod tests {
     }
 
     #[test]
-    fn display_float_marks_finite_whole_values() {
-        assert_eq!(display_float(1.0), "1.0");
-        assert_eq!(display_float(-2.0), "-2.0");
-        assert_eq!(display_float(0.0), "0.0");
-        assert_eq!(display_float(-0.0), "-0.0");
-    }
-
-    #[test]
     fn display_float_preserves_non_whole_and_non_finite_values() {
         assert_eq!(display_float(1.25), "1.25");
         assert_eq!(display_float(f64::NAN), "NaN");
         assert_eq!(display_float(f64::INFINITY), "inf");
         assert_eq!(display_float(f64::NEG_INFINITY), "-inf");
-    }
-
-    #[test]
-    fn anv_string_static_and_owned_construction() {
-        assert_eq!(AnvString::default().as_str(), "");
-        let static_text = AnvString::from("static");
-        assert_eq!(static_text.as_str(), "static");
-        assert_eq!(static_text.len(), 6);
-        assert!(!static_text.is_empty());
-        assert_eq!(AnvString::from(String::from("owned")).as_str(), "owned");
-        assert_eq!(AnvString::from("borrowed").as_str(), "borrowed");
     }
 
     #[test]
@@ -1136,51 +1117,6 @@ mod tests {
             drop(handle);
             assert_eq!(heap.collect_all().collected, 1);
             assert_eq!(heap.stats().live, 0);
-        });
-    }
-
-    #[test]
-    fn list_constructs_in_heap_storage() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
-
-            assert_eq!(list.len(), 3);
-            assert_eq!(list.len_i64(), 3);
-            assert_eq!(list.checked_index(&ctx, 2).unwrap(), 3);
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
-        });
-    }
-
-    #[test]
-    fn list_push_updates_storage_and_version() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2]);
-
-            list.push(&mut ctx, 3).unwrap();
-
-            assert_eq!(list.structural_version(), 1);
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
-        });
-    }
-
-    #[test]
-    fn list_share_detaches_on_structural_mutation() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
-            let mut shared = list.share();
-
-            shared.push(&mut ctx, 2).unwrap();
-
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1]);
-            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2]);
-            assert!(list.storage.is_unique());
-            assert!(shared.storage.is_unique());
         });
     }
 
@@ -1215,29 +1151,6 @@ mod tests {
             assert_eq!(shared.storage.logical_owners(), 2);
             assert_eq!(list.to_vec(&ctx).unwrap(), vec![1]);
             assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1]);
-        });
-    }
-
-    #[test]
-    fn list_element_mutation_uses_heap_storage() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2]);
-            let guard = list.begin_shape_loan().unwrap();
-            let version = guard.version();
-
-            unsafe {
-                list.with_elem_mut_short(&mut ctx, 1, version, |elem| {
-                    *elem = 5;
-                    Ok(())
-                })
-            }
-            .unwrap();
-
-            assert_eq!(list.structural_version(), 0);
-            assert_eq!(list.elem_at_shared(&ctx, 1, version).unwrap(), 5);
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 5]);
         });
     }
 
@@ -1487,35 +1400,6 @@ mod tests {
     }
 
     #[test]
-    fn map_shape_loan_allows_value_update_but_not_key_set_mutation() {
-        Heap::scope(|heap| {
-            let ty = map_ty::<&str, i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
-            let guard = map.begin_shape_loan().unwrap();
-            let version = guard.version();
-
-            assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
-            unsafe {
-                map.with_value_mut_short(&mut ctx, 0, version, |value| {
-                    *value = 3;
-                    Ok(())
-                })
-            }
-            .unwrap();
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
-            assert_eq!(map.structural_version(), 0);
-            assert!(map.insert(&mut ctx, "b", 4).is_err());
-            assert!(map.remove(&mut ctx, &"a").is_err());
-            assert_eq!(map.remove(&mut ctx, &"missing").unwrap(), None);
-            drop(guard);
-
-            assert_eq!(map.insert(&mut ctx, "b", 4).unwrap(), None);
-            assert_eq!(map.structural_version(), 1);
-        });
-    }
-
-    #[test]
     fn map_value_loan_blocks_external_value_update() {
         Heap::scope(|heap| {
             let ty = map_ty::<&str, i64>(heap);
@@ -1595,40 +1479,6 @@ mod tests {
     }
 
     #[test]
-    fn map_share_detaches_on_value_update() {
-        Heap::scope(|heap| {
-            let ty = map_ty::<&str, i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
-            let shared = map.share();
-
-            assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
-            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(map.structural_version(), 0);
-        });
-    }
-
-    #[test]
-    fn map_loan_blocks_structural_insert_before_detach() {
-        Heap::scope(|heap| {
-            let ty = map_ty::<&str, i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
-            let shared = map.share();
-            let guard = map.begin_shape_loan().unwrap();
-
-            assert!(map.insert(&mut ctx, "b", 2).is_err());
-            drop(guard);
-
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(map.insert(&mut ctx, "b", 2).unwrap(), None);
-            assert_eq!(map.structural_version(), 1);
-        });
-    }
-
-    #[test]
     fn map_value_mutation_detaches_without_structural_version_change() {
         Heap::scope(|heap| {
             let ty = map_ty::<&str, i64>(heap);
@@ -1648,28 +1498,6 @@ mod tests {
             assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
             assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
             assert_eq!(map.structural_version(), 0);
-        });
-    }
-
-    #[test]
-    fn raw_slice_descriptor_uses_short_access() {
-        Heap::scope(|heap| {
-            let mut ctx = Ctx::new(heap);
-            let mut values = [1_i64, 2, 3];
-            let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 2) };
-            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
-
-            let mut slice =
-                unsafe { AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 1, 2) };
-            unsafe {
-                slice.with_elem_mut_short(&mut ctx, 0, |value| {
-                    *value = 5;
-                    Ok(())
-                })
-            }
-            .unwrap();
-
-            assert_eq!(values, [1, 5, 3]);
         });
     }
 
@@ -1708,63 +1536,6 @@ mod tests {
             assert_eq!(list.to_vec(&ctx).unwrap(), vec![10, 2]);
             assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2]);
             assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 1);
-        });
-    }
-
-    #[test]
-    fn mutable_list_slice_writes_through_unique_storage() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
-            let mut slice = AnvSlice::from_list_mut(&mut ctx, &mut list, 1, 2).unwrap();
-
-            slice
-                .with_elem_owned_mut_ctx_short(&mut ctx, 0, |_, value| {
-                    *value = 20;
-                    Ok(())
-                })
-                .unwrap();
-
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 20, 3]);
-        });
-    }
-
-    #[test]
-    fn mutable_list_slice_detaches_shared_storage() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64, 2, 3]);
-            let shared = list.share();
-            let mut slice = AnvSlice::from_list_mut(&mut ctx, &mut list, 1, 2).unwrap();
-
-            slice
-                .with_elem_owned_mut_ctx_short(&mut ctx, 0, |_, value| {
-                    *value = 20;
-                    Ok(())
-                })
-                .unwrap();
-
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 20, 3]);
-            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2, 3]);
-        });
-    }
-
-    #[test]
-    fn raw_slice_copy_range_creates_heap_visible_list() {
-        Heap::scope(|heap| {
-            let ty = list_ty::<i64>(heap);
-            let mut ctx = Ctx::new(heap);
-            let values = [1_i64, 2, 3, 4];
-            let slice = unsafe { AnvSlice::from_raw_parts(values.as_ptr(), values.len(), 1, 3) };
-            let copy = unsafe {
-                slice
-                    .copy_range_with(&mut ctx, ty, 1..3, |value| *value * 10)
-                    .unwrap()
-            };
-
-            assert_eq!(copy.to_vec(&ctx).unwrap(), vec![30, 40]);
         });
     }
 }

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: cannot extend type 'Name'
 
 enum Name: string { Bob = "bob" }

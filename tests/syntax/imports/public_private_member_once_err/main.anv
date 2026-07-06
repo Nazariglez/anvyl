@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: member 'hidden' in module 'source' is private
 
 import facade { hidden };

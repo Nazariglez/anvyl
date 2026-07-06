@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: collect_cycles
+
+fn main() {
+    collect_cycles();
+}

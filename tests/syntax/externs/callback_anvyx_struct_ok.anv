@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 struct Point2D { x: float, y: float }
 extern fn transform_point(point: Point2D, cb: fn(Point2D) -> float) -> float;

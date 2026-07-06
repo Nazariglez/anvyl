@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+
+fn takes_option(x: Option<int>) {}
+fn takes_ranges(a: Range<int>, b: RangeFrom<int>) {}
+fn main() {}

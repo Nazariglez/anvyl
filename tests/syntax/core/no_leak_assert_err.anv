@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: _assert
+
+fn main() {
+    _assert(true, "hidden");
+}

@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+lazy var target = 0;
+lazy let source = 7;
+
+fn main() {
+    target = source;
+    println(target);
+}

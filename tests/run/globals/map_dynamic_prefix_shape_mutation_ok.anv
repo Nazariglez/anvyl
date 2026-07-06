@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+
+struct State {
+    rows: [[string: int]],
+}
+
+lazy var state = State { rows: [["a": 1]] };
+
+fn main() {
+    let i = 0;
+    state.rows[i].insert("b", 2);
+}

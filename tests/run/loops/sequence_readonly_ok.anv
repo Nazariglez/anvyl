@@ -1,0 +1,62 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 6
+// 15
+// 5
+// 0
+// 20
+// 6
+// @match-end
+
+fn sum_list(xs: [int]) -> int {
+    var sum = 0;
+    for x in xs {
+        sum += x;
+    }
+    sum
+}
+
+fn sum_slice(xs: slice[int]) -> int {
+    var sum = 0;
+    for x in xs {
+        sum += x;
+    }
+    sum
+}
+
+fn sum_var_list(ref xs: [int]) -> int {
+    var sum = 0;
+    for x in xs {
+        sum += x;
+    }
+    sum
+}
+
+fn main() {
+    let list: [int] = [1, 2, 3];
+    println(sum_list(list));
+
+    let array = [4, 5, 6];
+    var total = 0;
+    for x in array {
+        total += x;
+    }
+    println(total);
+
+    println(sum_slice(list[1..3]));
+
+    let empty: [int] = [];
+    println(sum_list(empty));
+
+    var nested = 0;
+    for x in [1, 2] {
+        for y in [3, 4] {
+            nested += x + y;
+        }
+    }
+    println(nested);
+
+    var var_list: [int] = [1, 2, 3];
+    println(sum_var_list(var_list));
+}

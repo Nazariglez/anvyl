@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 type Pair<T> = (T, T);
 type Fixed<T, N: int> = [Pair<T>; N];

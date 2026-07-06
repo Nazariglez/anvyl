@@ -1,0 +1,3 @@
+// @helper
+
+pub fn add() -> int { 1 }

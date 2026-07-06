@@ -1,0 +1,2 @@
+/// ids
+pub type Id=int;

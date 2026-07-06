@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot capture mutable receiver 'self' in an escaping lambda
-// @frontend: new
 
 struct Counter {
     value: int,

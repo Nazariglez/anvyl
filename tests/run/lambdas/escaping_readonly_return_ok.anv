@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 41
+// 41
+// @match-end
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn main() {
+    let f = make(41);
+    println(f());
+    println(f());
+}

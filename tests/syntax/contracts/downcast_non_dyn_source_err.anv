@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: exact downcast source must be a dynamic value
 
 struct Enemy {}

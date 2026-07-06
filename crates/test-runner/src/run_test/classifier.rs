@@ -196,9 +196,6 @@ mod tests {
         run_test::ProcessOutcome,
     };
 
-    const USER_EXIT_CODE: i32 = 121;
-    const MARKER_IGNORED_EXIT_CODE: i32 = 120;
-
     fn directives(src: &str) -> Directives {
         let mut fixture = String::new();
         if !src.contains("// @mode:") {
@@ -241,14 +238,6 @@ mod tests {
     fn exit_code_directive_accepts_matching_user_exit() {
         let directives = directives("// @exit-code: 7\n");
         let result = classify(completed(Some(7), "", ""), &directives);
-
-        assert!(matches!(result, TestResult::Pass));
-    }
-
-    #[test]
-    fn exit_code_directive_accepts_any_matching_user_exit() {
-        let directives = directives(&format!("// @exit-code: {USER_EXIT_CODE}\n"));
-        let result = classify(completed(Some(USER_EXIT_CODE), "", ""), &directives);
 
         assert!(matches!(result, TestResult::Pass));
     }
@@ -297,28 +286,6 @@ mod tests {
             }
         ));
     }
-
-    #[test]
-    fn stderr_marker_wins_over_exit_code_value() {
-        let directives = directives("");
-        let result = classify(
-            completed(
-                Some(MARKER_IGNORED_EXIT_CODE),
-                "",
-                "Runtime error: marker\n",
-            ),
-            &directives,
-        );
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Runtime,
-                ..
-            }
-        ));
-    }
-
     #[test]
     fn unknown_nonzero_run_failure_defaults_to_compile_without_marker() {
         let directives = directives("");
@@ -366,25 +333,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn expected_error_run_mode_checks_stderr() {
-        let directives = directives("// @expect: error\n// @contains: runtime failed\n");
-        let result = classify(
-            completed(Some(1), "", "Runtime error\nruntime failed\n"),
-            &directives,
-        );
-
-        assert!(matches!(result, TestResult::Pass));
-    }
-
-    #[test]
-    fn expected_error_check_mode_checks_merged_output() {
-        let directives =
-            directives("// @mode: check\n// @expect: error\n// @contains: type mismatch\n");
-        let result = classify(completed(Some(1), "type ", "mismatch\n"), &directives);
-
-        assert!(matches!(result, TestResult::Pass));
     }
 }

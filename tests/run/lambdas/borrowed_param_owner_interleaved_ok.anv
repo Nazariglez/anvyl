@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn touch(ref count: int) {
+    let f = || {
+        count += 1;
+    };
+    count += 1;
+    f();
+    count += 1;
+}
+
+fn main() {
+    var count = 0;
+    touch(count);
+    println(count);
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn pick(ref x: int, cond: bool) -> ref int {
     if cond { x } else { x }

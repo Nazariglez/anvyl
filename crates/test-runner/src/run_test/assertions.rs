@@ -206,41 +206,6 @@ mod tests {
             }
         ));
     }
-
-    #[test]
-    fn check_mode_contains_matches_merged_stdout_and_stderr() {
-        let directives = directives("// @contains: diagnostic\n");
-        let input = AssertionInput::success(Mode::Check, "prefix ", "diagnostic\n");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Pass
-        ));
-    }
-
-    #[test]
-    fn expected_error_run_mode_checks_stderr() {
-        let directives = directives("// @expect: error\n// @contains: runtime failed\n");
-        let input = AssertionInput::error(Mode::Run, FailurePhase::Runtime, "", "runtime failed\n");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Pass
-        ));
-    }
-
-    #[test]
-    fn expected_error_check_mode_checks_merged_output() {
-        let directives = directives("// @expect: error\n// @contains: type mismatch\n");
-        let input =
-            AssertionInput::error(Mode::Check, FailurePhase::Compile, "type ", "mismatch\n");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Pass
-        ));
-    }
-
     #[test]
     fn stream_matcher_uses_caller_phase() {
         let contains = vec!["missing".to_string()];

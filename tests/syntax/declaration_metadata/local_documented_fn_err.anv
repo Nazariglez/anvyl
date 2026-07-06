@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: doc comments are not allowed on local function declarations
 
 fn main() {

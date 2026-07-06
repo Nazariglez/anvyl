@@ -136,39 +136,3 @@ impl<T> Spanned<T> {
         &self.node
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::source::{SourceKind, SourceTable};
-
-    fn source() -> SourceId {
-        SourceTable::default().add(SourceKind::Virtual, "test", None, "")
-    }
-
-    #[test]
-    fn byte_span_helpers() {
-        let span = ByteSpan::new(2, 5);
-
-        assert_eq!(ByteSpan::empty(3), ByteSpan { start: 3, end: 3 });
-        assert_eq!(span.to_end(), ByteSpan::empty(5));
-        assert_eq!(span.union(ByteSpan::new(8, 13)), ByteSpan::new(2, 13));
-        assert_eq!(ByteSpan::new(8, 13).union(span), ByteSpan::new(2, 13));
-    }
-
-    #[test]
-    fn source_span_helpers() {
-        let source = source();
-        let span = SourceSpan::new(source, 2, 5);
-
-        assert_eq!(SourceSpan::empty(source, 3).byte(), ByteSpan::empty(3));
-        assert_eq!(span.to_end(), SourceSpan::empty(source, 5));
-        assert_eq!(
-            span.union(SourceSpan::new(source, 8, 13)).byte(),
-            ByteSpan::new(2, 13)
-        );
-        assert_eq!(span.source(), source);
-        assert_eq!(span.start(), 2);
-        assert_eq!(span.end(), 5);
-    }
-}

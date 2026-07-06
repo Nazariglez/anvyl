@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: refutable pattern is not allowed in for binding
 
 enum State { A, B }

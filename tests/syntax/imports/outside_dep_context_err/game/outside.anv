@@ -1,0 +1,5 @@
+// @helper
+
+import pkg:math;
+
+pub fn value() -> int { 1 }

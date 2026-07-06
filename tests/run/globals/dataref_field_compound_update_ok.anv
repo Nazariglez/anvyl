@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 9
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn make_node() -> Node {
+    println("init");
+    Node { value: 4 }
+}
+
+lazy var root = make_node();
+
+fn main() {
+    root.value += 5;
+    println(root.value);
+}

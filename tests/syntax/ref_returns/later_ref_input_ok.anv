@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn add(x: int, ref y: int) -> ref int {
     y

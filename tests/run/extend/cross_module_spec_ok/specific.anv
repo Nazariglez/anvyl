@@ -1,5 +1,0 @@
-// @helper
-
-pub extend [int] {
-    fn label(self) -> string { "int-specific" }
-}

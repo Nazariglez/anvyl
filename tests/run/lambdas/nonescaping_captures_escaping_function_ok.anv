@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn call(f: fn() -> int) -> int {
+    let g = |x: int| f() + x;
+    g(4)
+}
+
+fn main() {
+    let f = make(3);
+    println(call(f));
+}

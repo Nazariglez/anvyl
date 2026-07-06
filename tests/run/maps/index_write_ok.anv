@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 4
+// 0
+// @match-end
+
+fn print_slot(slot: int?) {
+    if let value? = slot {
+        println(value);
+    } else {
+        println(0);
+    }
+}
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    var snapshot = counts;
+    counts["a"] = 2;
+    counts["b"] = 4;
+
+    print_slot(snapshot["a"]);
+    print_slot(counts["a"]);
+    print_slot(counts["b"]);
+    print_slot(counts["c"]);
+}

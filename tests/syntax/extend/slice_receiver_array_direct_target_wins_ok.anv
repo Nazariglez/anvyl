@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extend<T, N: int> [T; N] {
     fn tag(self) -> string { "array" }

@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match: 12
+
+fn apply(ref x: int, cb: fn()) {
+    x += 1;
+    cb();
+    x += 1;
+}
+
+fn touch(ref x: int) {
+    let f = || {
+        apply(x, || {
+            x += 10;
+        });
+    };
+    f();
+}
+
+fn main() {
+    var n = 0;
+    touch(n);
+    println(n);
+}

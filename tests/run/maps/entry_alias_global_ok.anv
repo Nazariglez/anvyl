@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+lazy var counts: [string: int] = ["a": 1];
+
+fn main() {
+    if ref value? = counts["a"] {
+        value = 7;
+    }
+    println(counts["a"] ?? 0);
+}

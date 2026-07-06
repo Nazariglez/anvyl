@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: ref pattern requires a mutable place
-// @frontend: new
 
 fn next() -> int? { return 1; }
 

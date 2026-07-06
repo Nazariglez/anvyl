@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 0
+
+fn make() -> int? {
+    nil
+}
+
+fn main() {
+    println(make() ?? 0);
+}

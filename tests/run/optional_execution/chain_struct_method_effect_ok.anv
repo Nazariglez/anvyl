@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// hi item
+// done
+// @match-end
+
+struct Item {
+    name: string,
+
+    fn hello(self) {
+        println("hi " + self.name);
+    }
+}
+
+fn main() {
+    let some: Item? = Item { name: "item" };
+    let none: Item? = nil;
+    some?.hello();
+    none?.hello();
+    println("done");
+}

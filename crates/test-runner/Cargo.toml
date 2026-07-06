@@ -10,7 +10,7 @@ serde_json = "1"
 walkdir = "2.5.0"
 wait-timeout = "0.2.1"
 anvyx-project = { path = "../project" }
-anvyx-lang2 = { path = "../lang2" }
+anvyx-lang = { path = "../lang" }
 
 [dev-dependencies]
 tempfile = "3"

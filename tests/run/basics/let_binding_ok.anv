@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-
-fn main() {
-    let x = 42;
-    let y = true;
-    let z = "hello";
-}

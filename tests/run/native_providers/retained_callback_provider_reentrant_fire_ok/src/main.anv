@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+import pkg:host.host { retain, fire, close };
+
+fn main() {
+    var depth = 0;
+    retain(|| {
+        depth += 1;
+        println(depth);
+        if depth == 1 {
+            fire();
+        }
+    });
+    fire();
+    close();
+}

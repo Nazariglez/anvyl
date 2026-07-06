@@ -836,7 +836,7 @@ impl TypeChecker {
             }
             self.current_module = site.module.clone();
             let span = site.span;
-            let ty = self.finalize_decl_type(&lookup, site, ty);
+            let ty = self.finalize_decl_type(&lookup, site, &ty);
             let ty = self.normalize_type_consts(&ty, span);
             self.reject_user_any_type(&ty, span);
             ty

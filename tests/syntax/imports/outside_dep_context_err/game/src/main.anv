@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: has no package dependency named 'math'
+
+import ..outside;
+
+fn main() {}

@@ -1,5 +1,4 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn f(x: int) -> int { let y: Later = x; type Later = int; y }

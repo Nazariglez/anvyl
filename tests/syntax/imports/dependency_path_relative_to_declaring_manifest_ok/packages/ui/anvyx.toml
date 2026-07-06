@@ -1,0 +1,6 @@
+[project]
+name = "ui"
+entry = "src/lib.anv"
+
+[dependencies]
+physics = { path = "../physics" }

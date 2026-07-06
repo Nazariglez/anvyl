@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn call(f: fn()) {
+    f();
+}
+
+fn main() {
+    var count = 0;
+    let inc = || {
+        count += 1;
+    };
+    let middle = || {
+        let outer = || { call(inc); };
+        outer();
+        outer();
+    };
+    middle();
+    println(count);
+}

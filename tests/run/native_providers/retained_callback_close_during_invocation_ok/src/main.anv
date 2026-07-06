@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// before close
+// true
+// after close
+// false
+// @match-end
+
+import pkg:host.host { retain, fire, close };
+
+fn main() {
+    retain(|| {
+        println("before close");
+        println(close());
+        println("after close");
+    });
+    fire();
+    println(close());
+}

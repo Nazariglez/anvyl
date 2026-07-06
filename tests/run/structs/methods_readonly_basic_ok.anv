@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 142
+
+struct Counter {
+    value: int,
+
+    fn get(self) -> int {
+        self.value
+    }
+}
+
+fn main() {
+    let c = Counter { value: 42 };
+    var d = Counter { value: 100 };
+    println(c.get() + d.get());
+}

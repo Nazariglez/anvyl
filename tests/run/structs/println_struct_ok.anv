@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @contains: Point
+// @contains: 1
+
+struct Point { x: int }
+
+fn main() {
+    println(Point { x: 1 });
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn take(values: slice[int]) {
     let _: int = values[0];

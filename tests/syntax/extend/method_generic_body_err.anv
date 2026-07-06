@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: expected `string`, found `int`
-// @frontend: new
 
 extend int {
     fn bad<U>(self, value: U) -> U {

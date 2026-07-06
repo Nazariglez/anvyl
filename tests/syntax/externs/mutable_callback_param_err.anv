@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: ref callback parameters are not supported
 
 extern fn bad(callback: fn(ref int) -> void);

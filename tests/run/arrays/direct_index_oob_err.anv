@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: array index 2 out of bounds for len 2
+
+fn main() {
+    var xs: [int; 2] = [0, 1];
+    let i = 2;
+    println(xs[i]);
+}

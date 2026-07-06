@@ -152,7 +152,7 @@ pub(super) fn solve_unit_owner_ty(
         let template = tc
             .solver
             .instantiate_generic_type(&template, session.vars());
-        let expected = tc.type_handle(expected);
+        let expected = TypeChecker::type_handle(expected);
         tc.expect_equal(span, template, expected);
     }
     if tc.solve_constraints() {
@@ -169,9 +169,7 @@ pub(super) fn resolve_use(
     span: Span,
 ) -> Option<ResolvedEnumVariant> {
     let nominal = tc.resolve_nominal(&nominal_type(key))?;
-    let Some(variants) = nominal.variants() else {
-        return None;
-    };
+    let variants = nominal.variants()?;
     let Some(variant_schema) = variants.get(variant).cloned() else {
         tc.push_error(TypeError::UnknownEnumVariant {
             enum_name: key.name,

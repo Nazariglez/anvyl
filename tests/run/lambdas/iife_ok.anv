@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: success
+// @match: 9
+
+fn main() {
+    println((|| 9)());
+}

@@ -1,9 +1,0 @@
-// @helper
-
-import shapes { Vec2 };
-
-pub extend Vec2 {
-    fn __length(self) -> float {
-        self.x + self.y
-    }
-}

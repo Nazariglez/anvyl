@@ -163,8 +163,9 @@ impl Ty {
             }
             Self::Tuple(elems) => elems.iter().any(Self::contains_error),
             Self::Nominal(nominal) => nominal.type_args.iter().any(Self::contains_error),
-            Self::List { elem } | Self::Slice { elem } => elem.contains_error(),
-            Self::Array { elem, .. } => elem.contains_error(),
+            Self::List { elem } | Self::Slice { elem } | Self::Array { elem, .. } => {
+                elem.contains_error()
+            }
             Self::Map { key, value } => key.contains_error() || value.contains_error(),
             _ => false,
         }
@@ -470,8 +471,8 @@ enum ConstraintKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SolveError {
     TypeMismatch {
-        expected: Ty,
-        found: Ty,
+        expected: Box<Ty>,
+        found: Box<Ty>,
         span: Option<SourceSpan>,
     },
     ConstMismatch {
@@ -481,8 +482,8 @@ enum SolveError {
     },
     TypeAlreadyBound {
         var: InferVarId,
-        existing: Ty,
-        found: Ty,
+        existing: Box<Ty>,
+        found: Box<Ty>,
         span: Option<SourceSpan>,
     },
     TypeOccurs {
@@ -504,8 +505,8 @@ enum SolveError {
 impl SolveError {
     fn type_mismatch(expected: Ty, found: Ty, span: Option<SourceSpan>) -> Self {
         Self::TypeMismatch {
-            expected,
-            found,
+            expected: Box::new(expected),
+            found: Box::new(found),
             span,
         }
     }
@@ -670,7 +671,7 @@ impl Solver {
             .unwrap_or(Type::Infer)
     }
 
-    pub(super) fn concrete_type(&self, ty: &Type) -> TypeHandle {
+    pub(super) fn concrete_type(ty: &Type) -> TypeHandle {
         TypeHandle(TypeRef::concrete(Ty::from_recovery_type(ty)))
     }
 
@@ -769,11 +770,11 @@ impl Solver {
         self.finalized_generic_const_arg(arg)
     }
 
-    pub(super) fn local_handle(&self, id: SemanticLocalId) -> TypeHandle {
+    pub(super) fn local_handle(id: SemanticLocalId) -> TypeHandle {
         TypeHandle(TypeRef::local(id))
     }
 
-    pub(super) fn expr_handle(&self, id: ExprId) -> TypeHandle {
+    pub(super) fn expr_handle(id: ExprId) -> TypeHandle {
         TypeHandle(TypeRef::expr(id))
     }
 
@@ -855,7 +856,7 @@ impl Solver {
 
     fn set_expr_handle(&mut self, id: ExprId, span: Option<SourceSpan>, ty: Ty) -> TypeHandle {
         self.set_expr_type(id, span, ty);
-        self.expr_handle(id)
+        Self::expr_handle(id)
     }
 
     pub(super) fn set_expr_type_from_handle(
@@ -866,7 +867,7 @@ impl Solver {
     ) -> TypeHandle {
         let ty = self.resolve_ref(&handle.0);
         self.set_expr_type(id, span, ty);
-        self.expr_handle(id)
+        Self::expr_handle(id)
     }
 
     pub(super) fn handle_to_type(&self, handle: &TypeHandle) -> Type {
@@ -1067,7 +1068,7 @@ impl Solver {
             },
             Type::Array { elem, len } => Ty::Array {
                 elem: Box::new(self.instantiate_type_template(elem, vars)),
-                len: self.instantiate_array_len_template(len, vars),
+                len: Self::instantiate_array_len_template(len, vars),
             },
             Type::Map { key, value } => Ty::Map {
                 key: Box::new(self.instantiate_type_template(key, vars)),
@@ -1100,7 +1101,7 @@ impl Solver {
                 .collect(),
             const_args
                 .iter()
-                .map(|arg| self.instantiate_const_arg_template(arg, vars))
+                .map(|arg| Self::instantiate_const_arg_template(arg, vars))
                 .collect(),
             origin.cloned(),
         )
@@ -1162,16 +1163,12 @@ impl Solver {
         match arg {
             GenericArg::Type(ty) => TyGenericArg::Type(self.instantiate_type_template(ty, vars)),
             GenericArg::Const(arg) => {
-                TyGenericArg::Const(self.instantiate_const_arg_template(arg, vars))
+                TyGenericArg::Const(Self::instantiate_const_arg_template(arg, vars))
             }
         }
     }
 
-    fn instantiate_const_arg_template(
-        &self,
-        arg: &ConstArg,
-        vars: &GenericSolverVars,
-    ) -> ConstTerm {
+    fn instantiate_const_arg_template(arg: &ConstArg, vars: &GenericSolverVars) -> ConstTerm {
         match arg {
             ConstArg::Param(id) => vars
                 .consts
@@ -1182,11 +1179,7 @@ impl Solver {
         }
     }
 
-    fn instantiate_array_len_template(
-        &self,
-        len: &ArrayLen,
-        vars: &GenericSolverVars,
-    ) -> ConstTerm {
+    fn instantiate_array_len_template(len: &ArrayLen, vars: &GenericSolverVars) -> ConstTerm {
         match len {
             ArrayLen::Param(id) => vars
                 .consts
@@ -1350,20 +1343,18 @@ impl Solver {
     fn relate_boxed(
         &mut self,
         span: Option<SourceSpan>,
-        expected: Ty,
-        found: Ty,
+        expected: &Ty,
+        found: &Ty,
         relation: TyRelation,
     ) -> Result<Box<Ty>, SolveError> {
-        Ok(Box::new(
-            self.relate_tys(span, &expected, &found, relation)?,
-        ))
+        Ok(Box::new(self.relate_tys(span, expected, found, relation)?))
     }
 
     fn relate_boxed_assignable(
         &mut self,
         span: Option<SourceSpan>,
-        expected_elem: Ty,
-        found_elem: Ty,
+        expected_elem: &Ty,
+        found_elem: &Ty,
         expected: &Ty,
         found: &Ty,
     ) -> Result<Box<Ty>, SolveError> {
@@ -1414,10 +1405,10 @@ impl Solver {
         span: Option<SourceSpan>,
         expected_func: TyFuncParts,
         found_func: TyFuncParts,
-        expected: Ty,
-        found: Ty,
+        expected: &Ty,
+        found: &Ty,
     ) -> Result<Ty, SolveError> {
-        self.ensure_arity(
+        Self::ensure_arity(
             expected_func.params.len(),
             found_func.params.len(),
             expected,
@@ -1496,12 +1487,8 @@ impl Solver {
 
         match (left, right) {
             (Ty::Error, _) | (_, Ty::Error) => Ok(Ty::Error),
-            (Ty::Infer(id), ty) => {
-                self.bind_type(id, ty, span)?;
-                Ok(self.resolve_ty(&Ty::Infer(id)))
-            }
-            (ty, Ty::Infer(id)) => {
-                self.bind_type(id, ty, span)?;
+            (Ty::Infer(id), ty) | (ty, Ty::Infer(id)) => {
+                self.bind_type(id, &ty, span)?;
                 Ok(self.resolve_ty(&Ty::Infer(id)))
             }
             (
@@ -1517,8 +1504,8 @@ impl Solver {
                     params: found_params,
                     ret: *found_ret,
                 },
-                expected,
-                found,
+                &expected,
+                &found,
             ),
             (
                 Ty::UnresolvedNominal {
@@ -1536,15 +1523,20 @@ impl Solver {
                 if !same_head {
                     return Err(SolveError::type_mismatch(expected, found, span));
                 }
-                self.ensure_arity(
+                Self::ensure_arity(
                     generic_args.len(),
                     found_args.len(),
-                    expected.clone(),
-                    found.clone(),
+                    &expected,
+                    &found,
                     span,
                 )?;
-                let generic_args =
-                    self.unify_generic_args_equal(span, generic_args, found_args, expected, found)?;
+                let generic_args = self.unify_generic_args_equal(
+                    span,
+                    generic_args,
+                    found_args,
+                    &expected,
+                    &found,
+                )?;
                 Ok(Ty::UnresolvedNominal {
                     qualifier,
                     name,
@@ -1552,7 +1544,7 @@ impl Solver {
                 })
             }
             (Ty::Tuple(elems), Ty::Tuple(found_elems)) => {
-                self.ensure_arity(elems.len(), found_elems.len(), expected, found, span)?;
+                Self::ensure_arity(elems.len(), found_elems.len(), &expected, &found, span)?;
                 Ok(Ty::Tuple(self.relate_ty_lists(
                     span,
                     elems,
@@ -1561,7 +1553,12 @@ impl Solver {
                 )?))
             }
             (Ty::List { elem }, Ty::List { elem: found_elem }) => Ok(Ty::List {
-                elem: self.relate_boxed(span, *elem, *found_elem, TyRelation::Equal)?,
+                elem: self.relate_boxed(
+                    span,
+                    elem.as_ref(),
+                    found_elem.as_ref(),
+                    TyRelation::Equal,
+                )?,
             }),
             (
                 Ty::Array { elem, len },
@@ -1570,8 +1567,13 @@ impl Solver {
                     len: found_len,
                 },
             ) => Ok(Ty::Array {
-                elem: self.relate_boxed(span, *elem, *found_elem, TyRelation::Equal)?,
-                len: self.unify_const_equal(span, len, found_len)?,
+                elem: self.relate_boxed(
+                    span,
+                    elem.as_ref(),
+                    found_elem.as_ref(),
+                    TyRelation::Equal,
+                )?,
+                len: self.unify_const_equal(span, &len, &found_len)?,
             }),
             (
                 Ty::Map { key, value },
@@ -1580,11 +1582,26 @@ impl Solver {
                     value: found_value,
                 },
             ) => Ok(Ty::Map {
-                key: self.relate_boxed(span, *key, *found_key, TyRelation::Equal)?,
-                value: self.relate_boxed(span, *value, *found_value, TyRelation::Equal)?,
+                key: self.relate_boxed(
+                    span,
+                    key.as_ref(),
+                    found_key.as_ref(),
+                    TyRelation::Equal,
+                )?,
+                value: self.relate_boxed(
+                    span,
+                    value.as_ref(),
+                    found_value.as_ref(),
+                    TyRelation::Equal,
+                )?,
             }),
             (Ty::Slice { elem }, Ty::Slice { elem: found_elem }) => Ok(Ty::Slice {
-                elem: self.relate_boxed(span, *elem, *found_elem, TyRelation::Equal)?,
+                elem: self.relate_boxed(
+                    span,
+                    elem.as_ref(),
+                    found_elem.as_ref(),
+                    TyRelation::Equal,
+                )?,
             }),
             _ => Err(SolveError::type_mismatch(expected, found, span)),
         }
@@ -1640,11 +1657,11 @@ impl Solver {
                     ret: *to_ret,
                 },
                 TyFuncParts { params, ret: *ret },
-                expected,
-                found,
+                &expected,
+                &found,
             ),
             (Ty::Tuple(elems), Ty::Tuple(to_elems)) => {
-                self.ensure_arity(to_elems.len(), elems.len(), expected, found, span)?;
+                Self::ensure_arity(to_elems.len(), elems.len(), &expected, &found, span)?;
                 Ok(Ty::Tuple(self.relate_ty_lists(
                     span,
                     to_elems,
@@ -1653,7 +1670,13 @@ impl Solver {
                 )?))
             }
             (Ty::List { elem }, Ty::List { elem: to_elem }) => Ok(Ty::List {
-                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
+                elem: self.relate_boxed_assignable(
+                    span,
+                    to_elem.as_ref(),
+                    elem.as_ref(),
+                    &expected,
+                    &found,
+                )?,
             }),
             (
                 Ty::Array { elem, len },
@@ -1662,8 +1685,14 @@ impl Solver {
                     len: to_len,
                 },
             ) => Ok(Ty::Array {
-                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
-                len: self.unify_const_equal(span, len, to_len)?,
+                elem: self.relate_boxed_assignable(
+                    span,
+                    to_elem.as_ref(),
+                    elem.as_ref(),
+                    &expected,
+                    &found,
+                )?,
+                len: self.unify_const_equal(span, &len, &to_len)?,
             }),
             (
                 Ty::Map { key, value },
@@ -1672,15 +1701,39 @@ impl Solver {
                     value: to_value,
                 },
             ) => Ok(Ty::Map {
-                key: self.relate_boxed_assignable(span, *to_key, *key, &expected, &found)?,
-                value: self.relate_boxed_assignable(span, *to_value, *value, &expected, &found)?,
+                key: self.relate_boxed_assignable(
+                    span,
+                    to_key.as_ref(),
+                    key.as_ref(),
+                    &expected,
+                    &found,
+                )?,
+                value: self.relate_boxed_assignable(
+                    span,
+                    to_value.as_ref(),
+                    value.as_ref(),
+                    &expected,
+                    &found,
+                )?,
             }),
             (Ty::Slice { elem }, Ty::Slice { elem: to_elem }) => Ok(Ty::Slice {
-                elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
+                elem: self.relate_boxed_assignable(
+                    span,
+                    to_elem.as_ref(),
+                    elem.as_ref(),
+                    &expected,
+                    &found,
+                )?,
             }),
             (Ty::Array { elem, .. } | Ty::List { elem }, Ty::Slice { elem: to_elem }) => {
                 Ok(Ty::Slice {
-                    elem: self.relate_boxed_assignable(span, *to_elem, *elem, &expected, &found)?,
+                    elem: self.relate_boxed_assignable(
+                        span,
+                        to_elem.as_ref(),
+                        elem.as_ref(),
+                        &expected,
+                        &found,
+                    )?,
                 })
             }
             _ => Err(SolveError::type_mismatch(expected, found, span)),
@@ -1769,8 +1822,8 @@ impl Solver {
         span: Option<SourceSpan>,
         left: Vec<TyGenericArg>,
         right: Vec<TyGenericArg>,
-        expected: Ty,
-        found: Ty,
+        expected: &Ty,
+        found: &Ty,
     ) -> Result<Vec<TyGenericArg>, SolveError> {
         left.into_iter()
             .zip(right)
@@ -1779,7 +1832,7 @@ impl Solver {
                     self.unify_tys_equal(span, &left, &right)?,
                 )),
                 (TyGenericArg::Const(left), TyGenericArg::Const(right)) => Ok(TyGenericArg::Const(
-                    self.unify_const_equal(span, left, right)?,
+                    self.unify_const_equal(span, &left, &right)?,
                 )),
                 _ => Err(SolveError::type_mismatch(
                     expected.clone(),
@@ -1799,29 +1852,25 @@ impl Solver {
         expected
             .into_iter()
             .zip(found)
-            .map(|(expected, found)| self.unify_const_equal(span, expected, found))
+            .map(|(expected, found)| self.unify_const_equal(span, &expected, &found))
             .collect()
     }
 
     fn unify_const_equal(
         &mut self,
         span: Option<SourceSpan>,
-        left: ConstTerm,
-        right: ConstTerm,
+        left: &ConstTerm,
+        right: &ConstTerm,
     ) -> Result<ConstTerm, SolveError> {
-        let left = self.resolve_const(&left);
-        let right = self.resolve_const(&right);
+        let left = self.resolve_const(left);
+        let right = self.resolve_const(right);
         if left == right {
             return Ok(left);
         }
         match (left, right) {
             (ConstTerm::ArrayInfer, term) | (term, ConstTerm::ArrayInfer) => Ok(term),
-            (ConstTerm::Infer(id), term) => {
-                self.bind_const(id, term, span)?;
-                Ok(self.resolve_const(&ConstTerm::Infer(id)))
-            }
-            (term, ConstTerm::Infer(id)) => {
-                self.bind_const(id, term, span)?;
+            (ConstTerm::Infer(id), term) | (term, ConstTerm::Infer(id)) => {
+                self.bind_const(id, &term, span)?;
                 Ok(self.resolve_const(&ConstTerm::Infer(id)))
             }
             (expected, found) => Err(SolveError::const_mismatch(expected, found, span)),
@@ -1829,27 +1878,30 @@ impl Solver {
     }
 
     fn ensure_arity(
-        &self,
         expected_len: usize,
         found_len: usize,
-        expected: Ty,
-        found: Ty,
+        expected: &Ty,
+        found: &Ty,
         span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
         if expected_len == found_len {
             Ok(())
         } else {
-            Err(SolveError::type_mismatch(expected, found, span))
+            Err(SolveError::type_mismatch(
+                expected.clone(),
+                found.clone(),
+                span,
+            ))
         }
     }
 
     fn bind_type(
         &mut self,
         var: InferVarId,
-        ty: Ty,
+        ty: &Ty,
         span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
-        let found = self.resolve_ty(&ty);
+        let found = self.resolve_ty(ty);
         let binds_to_self = matches!(found, Ty::Infer(other) if other == var);
         if binds_to_self {
             return Ok(());
@@ -1862,8 +1914,8 @@ impl Solver {
             }
             return Err(SolveError::TypeAlreadyBound {
                 var,
-                existing,
-                found,
+                existing: Box::new(existing),
+                found: Box::new(found),
                 span,
             });
         }
@@ -1906,10 +1958,10 @@ impl Solver {
     fn bind_const(
         &mut self,
         var: ConstInferVarId,
-        found: ConstTerm,
+        found: &ConstTerm,
         span: Option<SourceSpan>,
     ) -> Result<(), SolveError> {
-        let found = self.resolve_const(&found);
+        let found = self.resolve_const(found);
         if found.is_self_binding(var) {
             return Ok(());
         }
@@ -2083,8 +2135,9 @@ impl Solver {
                 .type_args
                 .iter()
                 .any(|ty| self.type_occurs_in_ty(var, ty)),
-            Ty::List { elem } | Ty::Slice { elem } => self.type_occurs_in_ty(var, &elem),
-            Ty::Array { elem, .. } => self.type_occurs_in_ty(var, &elem),
+            Ty::List { elem } | Ty::Slice { elem } | Ty::Array { elem, .. } => {
+                self.type_occurs_in_ty(var, &elem)
+            }
             Ty::Map { key, value } => {
                 self.type_occurs_in_ty(var, &key) || self.type_occurs_in_ty(var, &value)
             }
@@ -2181,7 +2234,7 @@ impl Solver {
             },
             Ty::Array { elem, len } => {
                 let elem = self.finalize_ty_inner(&elem, cx);
-                match self.finalize_array_len(len, cx) {
+                match self.finalize_array_len(&len, cx) {
                     Some(len) => Type::Array {
                         elem: Box::new(elem),
                         len,
@@ -2226,7 +2279,7 @@ impl Solver {
         cx: &mut FinalizeCx<'_>,
     ) -> Option<Vec<ConstArg>> {
         args.into_iter()
-            .map(|arg| self.finalize_const_arg(arg, cx))
+            .map(|arg| self.finalize_const_arg(&arg, cx))
             .collect()
     }
 
@@ -2237,12 +2290,12 @@ impl Solver {
     ) -> Option<GenericArg> {
         match arg {
             TyGenericArg::Type(ty) => Some(GenericArg::Type(self.finalize_ty_inner(&ty, cx))),
-            TyGenericArg::Const(arg) => Some(GenericArg::Const(self.finalize_const_arg(arg, cx)?)),
+            TyGenericArg::Const(arg) => Some(GenericArg::Const(self.finalize_const_arg(&arg, cx)?)),
         }
     }
 
-    fn finalize_const_arg(&self, arg: ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ConstArg> {
-        match self.resolve_const(&arg) {
+    fn finalize_const_arg(&self, arg: &ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ConstArg> {
+        match self.resolve_const(arg) {
             ConstTerm::Infer(id) => {
                 self.push_unresolved_const(id, cx);
                 None
@@ -2252,8 +2305,8 @@ impl Solver {
         }
     }
 
-    fn finalize_array_len(&self, len: ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ArrayLen> {
-        match self.resolve_const(&len) {
+    fn finalize_array_len(&self, len: &ConstTerm, cx: &mut FinalizeCx<'_>) -> Option<ArrayLen> {
+        match self.resolve_const(len) {
             ConstTerm::Infer(id) => {
                 self.push_unresolved_const(id, cx);
                 None
@@ -2695,7 +2748,7 @@ mod tests {
             panic!("expected fresh type var");
         };
         solver
-            .bind_type(var, Ty::Int, span(30, 40))
+            .bind_type(var, &Ty::Int, span(30, 40))
             .expect("bind should succeed");
         let nested = Ty::nominal(
             NominalKind::Enum,
@@ -2721,7 +2774,7 @@ mod tests {
             len: ConstTerm::from_usize(1),
         };
         assert_eq!(
-            solver.bind_type(var, recursive, span(4, 8)),
+            solver.bind_type(var, &recursive, span(4, 8)),
             Err(SolveError::TypeOccurs {
                 var,
                 span: span(4, 8),
@@ -2736,14 +2789,14 @@ mod tests {
             panic!("expected fresh type var");
         };
         solver
-            .bind_type(var, Ty::Int, span(4, 8))
+            .bind_type(var, &Ty::Int, span(4, 8))
             .expect("initial bind should succeed");
         assert_eq!(
-            solver.bind_type(var, Ty::String, span(9, 12)),
+            solver.bind_type(var, &Ty::String, span(9, 12)),
             Err(SolveError::TypeAlreadyBound {
                 var,
-                existing: Ty::Int,
-                found: Ty::String,
+                existing: Box::new(Ty::Int),
+                found: Box::new(Ty::String),
                 span: span(9, 12),
             })
         );
@@ -2759,10 +2812,10 @@ mod tests {
             panic!("expected fresh array len var");
         };
         solver
-            .bind_const(arg_var, ConstTerm::Value(ConstValue::Int(8)), span(5, 6))
+            .bind_const(arg_var, &ConstTerm::Value(ConstValue::Int(8)), span(5, 6))
             .expect("const arg bind should succeed");
         solver
-            .bind_const(len_var, ConstTerm::from_usize(4), span(7, 8))
+            .bind_const(len_var, &ConstTerm::from_usize(4), span(7, 8))
             .expect("array len bind should succeed");
         assert_eq!(
             solver.resolve_const(&ConstTerm::Infer(arg_var)),
@@ -2785,10 +2838,10 @@ mod tests {
             panic!("expected fresh const var");
         };
         solver
-            .bind_const(var, ConstTerm::Value(ConstValue::Int(1)), span(3, 4))
+            .bind_const(var, &ConstTerm::Value(ConstValue::Int(1)), span(3, 4))
             .expect("initial bind should succeed");
         assert_eq!(
-            solver.bind_const(var, ConstTerm::from_usize(2), span(5, 6)),
+            solver.bind_const(var, &ConstTerm::from_usize(2), span(5, 6)),
             Err(SolveError::ConstAlreadyBound {
                 var,
                 existing: ConstTerm::Value(ConstValue::Int(1)),
@@ -2850,8 +2903,8 @@ mod tests {
         };
         solver.add_handle_equal(
             span(1, 2),
-            solver.concrete_type(&left),
-            solver.concrete_type(&right),
+            Solver::concrete_type(&left),
+            Solver::concrete_type(&right),
         );
         assert!(matches!(
             solver.solve_pending().as_slice(),
@@ -3047,13 +3100,13 @@ mod tests {
             errors,
             vec![
                 SolveError::TypeMismatch {
-                    expected: Ty::Int,
-                    found: Ty::String,
+                    expected: Box::new(Ty::Int),
+                    found: Box::new(Ty::String),
                     span: span(1, 2),
                 },
                 SolveError::TypeMismatch {
-                    expected: Ty::Bool,
-                    found: Ty::String,
+                    expected: Box::new(Ty::Bool),
+                    found: Box::new(Ty::String),
                     span: span(3, 4),
                 },
             ]

@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn main() {
+    var opt: int? = 2;
+    match ref opt {
+        Option.Some(value) => value = 7,
+        Option.None => println(0),
+    };
+    println(opt ?? 0);
+}

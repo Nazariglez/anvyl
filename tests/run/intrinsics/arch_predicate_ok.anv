@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-// @contains: true
-
-fn main() {
-    let detected = #arch(x86_64) || #arch(aarch64);
-    println(detected);
-}

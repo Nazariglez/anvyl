@@ -1,7 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: 6
-
-fn main() {
-    println(#line());
-}

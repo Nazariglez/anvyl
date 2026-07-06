@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: hello
-
-fn main() {
-    #if profile(debug)
-    println("hello");
-    #end
-}

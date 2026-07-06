@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 3
+// @match-end
+
+fn make_values() -> [int; 3] {
+    println("init");
+    [1, 2, 3]
+}
+
+lazy var values = make_values();
+
+fn main() {
+    println(values[2]);
+}

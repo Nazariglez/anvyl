@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: 3
-
-fn main() {
-    let f = |x: int| -> int { x | 2 };
-    println(f(1));
-}

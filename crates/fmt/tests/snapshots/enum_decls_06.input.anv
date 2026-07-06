@@ -1,0 +1,1 @@
+enum State:int{Idle,Dead=10,Respawn}

@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn main() {
+    var x: int = 0;
+
+    if x == 0 {
+        x = 1;
+    }
+
+    if x > 0 {
+        x = x + 1;
+    }
+
+    println(x);
+}

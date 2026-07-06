@@ -1,0 +1,3 @@
+fn f() {
+    Box<int> { value: 1 };
+}

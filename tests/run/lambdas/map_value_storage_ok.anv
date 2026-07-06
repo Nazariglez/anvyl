@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 2
+// 4
+// 5
+// 9
+// @match-end
+
+fn one() -> int { 1 }
+fn nine() -> int { 9 }
+
+fn main() {
+    let readonly = 2;
+    let text = "hi";
+    var state = 3;
+    var fs: [string: fn() -> int] = [
+        "named": one,
+        "zero": || readonly,
+        "heap": || text.len(),
+        "cell": || { state = state + 1; state },
+    ];
+
+    let a = fs["named"] ?? one;
+    let b = fs["zero"] ?? one;
+    let c = fs["heap"] ?? one;
+    let d = fs["cell"] ?? one;
+    println(a());
+    println(b());
+    println(c());
+    println(d());
+    println(d());
+
+    fs["named"] = nine;
+    let e = fs["named"] ?? one;
+    println(e());
+}

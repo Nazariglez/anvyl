@@ -1377,7 +1377,7 @@ impl<'a> PlanCx<'a> {
             let native = self.native_extern(air_id, decl)?;
             let params = self.extern_params(decl, &native);
             let ret = self.type_map[&decl.return_type];
-            let kind = self.extern_kind(&native);
+            let kind = Self::extern_kind(&native);
             program.externs.push(RirExtern {
                 id,
                 symbol: RirSymbol::new(format!(
@@ -1411,7 +1411,7 @@ impl<'a> PlanCx<'a> {
             .collect()
     }
 
-    fn extern_kind(&self, native: &native::ResolvedExtern<'_>) -> RirExternKind {
+    fn extern_kind(native: &native::ResolvedExtern<'_>) -> RirExternKind {
         RirExternKind::Native(
             RirNativeExtern::new(
                 native_path(&native.binding.path),
@@ -3583,8 +3583,7 @@ impl<'a> PlanCx<'a> {
                     || args
                         .iter()
                         .any(|arg| Self::call_arg_updates_collection_slot(scope, arg))
-                    || active_for_ref_cell
-                        && args.iter().any(|arg| self.call_arg_may_invoke_lambda(arg))
+                    || active_for_ref_cell && args.iter().any(Self::call_arg_may_invoke_lambda)
             }
             _ => false,
         }
@@ -3602,7 +3601,7 @@ impl<'a> PlanCx<'a> {
                 .is_empty()
     }
 
-    fn call_arg_may_invoke_lambda(&self, arg: &RirCallArg) -> bool {
+    fn call_arg_may_invoke_lambda(arg: &RirCallArg) -> bool {
         matches!(
             arg,
             RirCallArg::ScopedLambda { .. }

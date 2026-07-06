@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot capture mutable loop alias 'x' in an escaping lambda
-// @frontend: new
 
 fn bad(ref xs: [int]) -> fn() {
     var out: fn() = || {};

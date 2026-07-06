@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @skip: place returns are not executable yet
+// @match: 2
+
+fn id(ref x: int) -> ref int {
+    x
+}
+
+fn main() {
+    var n = 1;
+    id(n) = 2;
+    println(n);
+}

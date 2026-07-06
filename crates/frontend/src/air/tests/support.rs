@@ -412,6 +412,6 @@ pub fn op_const(id: ConstId) -> Operand {
 pub fn expect_verified(program: &Program) -> VerifiedProgram<'_> {
     match verify::verify(program) {
         Ok(v) => v,
-        Err(errors) => panic!("expected verifier-clean AIR, got: {errors:#?}"),
+        Err(errors) => panic!("expected verified AIR, got: {errors:#?}"),
     }
 }

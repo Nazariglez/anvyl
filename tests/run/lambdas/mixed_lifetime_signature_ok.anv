@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match: 12
+
+fn keep(f: escaping fn()) -> fn() { f }
+
+fn apply(ref x: int, cb: fn()) {
+    x += 1;
+    cb();
+    x += 1;
+}
+
+fn touch(ref x: int) {
+    let escaped = keep(|| {});
+    let f = || {
+        apply(x, || {
+            x += 10;
+        });
+    };
+    f();
+    escaped();
+}
+
+fn main() {
+    var n = 0;
+    touch(n);
+    println(n);
+}

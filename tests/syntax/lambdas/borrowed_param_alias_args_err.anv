@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: ref arguments must not alias the same variable
-// @frontend: new
 
 fn both(ref a: int, ref b: int) {
     a += 1;

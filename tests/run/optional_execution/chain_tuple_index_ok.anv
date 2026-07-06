@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// done
+// @match-end
+
+struct Payload {
+    flags: (bool, bool),
+}
+
+fn main() {
+    let some: Payload? = Payload { flags: (true, false) };
+    let empty: Payload? = nil;
+    match some?.flags.0 {
+        value? => println(value),
+        nil => println(false),
+    }
+    match empty?.flags.0 {
+        value? => println(value),
+        nil => println("done"),
+    }
+}

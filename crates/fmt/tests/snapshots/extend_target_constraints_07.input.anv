@@ -1,0 +1,1 @@
+extend<T> dataref Node<T> { fn tag() -> string { "target" } }

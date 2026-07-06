@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate raw enum value "x" on variant 'E.B'
 
 enum E: string {

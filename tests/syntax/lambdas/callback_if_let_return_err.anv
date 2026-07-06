@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: callback parameter 'f' is non-escaping by default, but it escapes here
-// @frontend: new
 
 fn bad(f: fn(), opt: int?) -> fn() {
     if let Option.Some(_) = opt {

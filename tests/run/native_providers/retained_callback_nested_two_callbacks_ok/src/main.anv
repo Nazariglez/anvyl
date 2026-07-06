@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// b
+// @match-end
+
+import pkg:host.host { retain, retain_second, fire, fire_second, close, close_second };
+
+fn main() {
+    retain(|| {
+        println("a");
+        fire_second();
+    });
+    retain_second(|| println("b"));
+    fire();
+    close();
+    close_second();
+}

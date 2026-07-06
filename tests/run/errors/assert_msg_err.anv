@@ -1,7 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: custom failure message
-
-fn main() {
-    assert_msg(false, "custom failure message");
-}

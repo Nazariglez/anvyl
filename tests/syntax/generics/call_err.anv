@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: wrong number of type parameters: expected 0, found 1
 
 fn foo(x: int) -> int {

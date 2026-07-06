@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: invalid range
+
+fn main() {
+    let xs = [1, 2, 3];
+    let start = 2;
+    let end = 1;
+    let ys: [int] = xs[start..end];
+    println(ys[0]);
+}

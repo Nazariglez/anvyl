@@ -1,0 +1,31 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 100
+// 49
+// 100
+// 10
+// 7
+// @match-end
+
+const BASE: int = 10;
+lazy let global_size = 32;
+
+fn fallback() -> int {
+    println(100);
+    7
+}
+
+fn show(a: int = fallback(), b: int = BASE, c: int = global_size) {
+    println(a + b + c);
+}
+
+fn pair(a: int, b: int = fallback()) {
+    println(a + b);
+}
+
+fn main() {
+    show();
+    pair(3);
+    pair(3, 4);
+}

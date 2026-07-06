@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @skip: std linalg provider package is not implemented yet
+// @match: 5
+
+import std:linalg { vec2, Vec2 };
+
+fn main() {
+    let a = vec2(1.0, 2.0);
+    let b = Vec2 { x: 1.0, y: 2.0 };
+    let Vec2 { x, y } = b;
+    assert(a.x == x);
+    assert(a.y == y);
+    println(5);
+}

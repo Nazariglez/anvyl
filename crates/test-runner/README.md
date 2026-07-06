@@ -12,31 +12,27 @@ Common examples:
 
 ```bash
 cargo run --package test-runner -- tests --quiet
-cargo run --package test-runner -- tests/syntax --backend vm
-cargo run --package test-runner -- tests/run --backend both --jobs 8
+cargo run --package test-runner -- tests/syntax --quiet
+cargo run --package test-runner -- tests/run --jobs 8
 cargo run --package test-runner -- tests --report-json
-cargo run --package test-runner -- tests/syntax --new-frontend --quiet
-cargo run --package test-runner -- tests/run2 --new-frontend --backend rust --quiet
 ```
 
 Options:
 
 | Option | Meaning |
 | --- | --- |
-| `--backend <vm|rust|both>` | Backend to test. Defaults to `vm`. |
-| `--new-frontend` | Route check fixtures through `anvyx check --new-frontend`; route rust run fixtures through `anvyx run --new-frontend --backend rust`. Other run backends are skipped. |
 | `--timeout <ms>` | Runtime timeout. Defaults to `2000`. |
 | `--compile-timeout <ms>` | Compile timeout. Defaults to `300000`. |
 | `--jobs <n>` | Maximum parallel tests. Defaults to Rayon. |
 | `--quiet` | Hide per-test output. |
 | `--report-json` | Emit a JSON report. |
-| `--release` | Build the `anvyx` CLI binary in release mode and pass `--release` to run fixtures. Clean Rust batch fixtures use Cargo release profile. |
+| `--release` | Build the `anvyx` CLI binary in release mode and pass `--release` to run fixtures. Rust batch fixtures use Cargo release profile. |
 
 Options can appear before or after paths. Repeated value options use the last value.
 
-By default, fixtures run through the production CLI default frontend/backend path. `--new-frontend` uses the same compiled CLI binary and adds `--new-frontend` to matching child invocations. Run fixtures execute only when the scheduled backend is `rust`; other backends are skipped before spawning `anvyx`. Use `// @frontend: new` or `// @frontend: default` for fixtures that only apply to one frontend path.
+Fixtures run through the production CLI frontend and Rust execution path.
 
-Clean frontend + clean Rust execution fixtures live under `tests/run2`. The clean Rust runner batch-builds eligible fixtures with Cargo, then runs produced binaries in parallel. Fixtures with stdin or forwarded CLI flags use the normal per-file CLI lane.
+Execution fixtures live under `tests/run`. The runner batch-builds eligible run fixtures with Cargo, then runs produced binaries in parallel. Fixtures with stdin or forwarded CLI flags use the normal per-file CLI lane.
 
 ## Fixture directives
 
@@ -72,7 +68,6 @@ Helper files are different. A helper file must contain only `// @helper` as its 
 | `// @stdin: text` | many | line | Adds one stdin line. Valid only in `run` mode. |
 | `// @stdin-empty-line` | many | none | Adds one blank stdin line. Valid only in `run` mode. |
 | `// @warn-contains: text` | many | substring | Successful test stderr must contain this warning substring. Valid only with `@expect: success`. |
-| `// @frontend: any\|default\|new` | once | frontend | Runs only on the matching frontend path. `any` is the default. Non-matching fixtures are reported as skipped. |
 | `// @skip: reason` | once | reason | Skips the test and reports the reason. |
 | `// @helper` | once | none | Marks a helper module. Cannot be combined with other directives. |
 | `// @lint: value` | many | lint override | Forwards `--lint <value>` to the child CLI. |

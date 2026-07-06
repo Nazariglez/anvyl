@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: 99
+
+import pkg:host.host { make_surface, trigger_draw, close_draw };
+
+fn main() {
+    let surface = make_surface(99);
+    surface.on_draw(|| {
+        println(surface.id());
+    });
+    trigger_draw();
+    close_draw();
+}

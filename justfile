@@ -4,13 +4,13 @@ run target:
 check target:
     cargo run -- check {{target}}
 
-tests: frontend-tests clean-rust-tests
+tests: frontend-tests run-tests
 
 frontend-tests target="tests/syntax":
-    cargo run --package test-runner -- {{target}} --new-frontend --quiet
+    cargo run --package test-runner -- {{target}} --quiet
 
-clean-rust-tests target="tests/run2":
-    cargo run --package test-runner -- {{target}} --new-frontend --backend rust --quiet
+run-tests target="tests/run":
+    cargo run --package test-runner -- {{target}} --quiet
 
 full-tests target="tests":
     cargo test -q --workspace
@@ -24,7 +24,7 @@ install:
     cargo install --path crates/anvyx --force
 
 miri:
-    MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -p anvyx-lang --all-targets
+    MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test -p anvyx-runtime --all-targets
 
 clean-rust-cache:
     rm -rf .anvyx/cache/rust/artifacts

@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: Rust backend: unsupported list
-// @skip: rust-only test — run with: cargo run -p test-runner -- tests/run/rust_backend --backend rust
-
-fn main() {
-    let xs: [int] = [1, 2, 3];
-}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate 'init' in extern type body
 
 extern type Handle {

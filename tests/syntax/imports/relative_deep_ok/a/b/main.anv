@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 import ...shared.types { Id };
 import ....too.high;

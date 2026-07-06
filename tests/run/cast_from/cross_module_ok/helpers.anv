@@ -1,7 +1,0 @@
-// @helper
-
-import types { Vec2 };
-
-pub extend Vec2 {
-    cast from(v: float) { Vec2 { x: v, y: v } }
-}

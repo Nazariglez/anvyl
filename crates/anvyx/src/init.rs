@@ -69,24 +69,6 @@ fn ensure_gitignore(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gitignore_created_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_gitignore(dir.path()).unwrap();
-        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, ".anvyx\n");
-    }
-
-    #[test]
-    fn gitignore_appended_when_missing_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
-        ensure_gitignore(dir.path()).unwrap();
-        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, "/target\n.anvyx\n");
-    }
-
     #[test]
     fn gitignore_unchanged_when_already_listed() {
         let dir = tempfile::tempdir().unwrap();

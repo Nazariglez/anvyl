@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extend<A, B> (A, B) {
     fn arity() -> int { 2 }

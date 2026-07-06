@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn ignore<T>(x: T) -> _ {
     let y = x;

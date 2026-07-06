@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate generic parameter
 
 fn f<T, T>(x: T) {}

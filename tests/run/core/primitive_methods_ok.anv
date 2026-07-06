@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 8
+// 5
+// 2.5
+// @match-end
+
+fn main() {
+    println(8.min(2));
+    println(8.max(2));
+    println(9.clamp(1, 5));
+    println(0.0.lerp(10.0, 0.25));
+}

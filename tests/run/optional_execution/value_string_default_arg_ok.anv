@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: x
+
+fn show(value: string? = "x") {
+    println(value ?? "none");
+}
+
+fn main() {
+    show();
+}

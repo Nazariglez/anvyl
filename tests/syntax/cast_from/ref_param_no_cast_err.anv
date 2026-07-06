@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: expected `Vec2`
 
 struct Vec2 { x: float, y: float }

@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: x is 42
-
-fn main() {
-    var x = 0;
-    defer println(f"x is {x}");
-    x = 42;
-}

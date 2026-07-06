@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 type Id = int;
 fn f(x: Id) -> int { x + 1 }

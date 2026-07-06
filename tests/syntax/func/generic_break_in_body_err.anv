@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: break outside of loop
-// @frontend: new
 
 fn bad<T>(x: T) -> T {
     break;

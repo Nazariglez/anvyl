@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot capture mutable pattern alias 'x' in an escaping lambda
-// @frontend: new
 
 fn noop() {}
 

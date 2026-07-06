@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: extern map key type 'float' is not keyable
 
 extern fn bad() -> [float: int];

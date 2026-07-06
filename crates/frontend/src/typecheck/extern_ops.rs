@@ -19,7 +19,7 @@ pub(super) fn check_unary(
     let ret = decl.signature.ret.clone();
     tc.record_extern_use(expr_id, ExternUseTarget::UnaryOperator(operator));
     Some(
-        CheckedType::new(ret.ty.clone(), tc.type_handle(&ret.ty))
+        CheckedType::new(ret.ty.clone(), TypeChecker::type_handle(&ret.ty))
             .with_extern_any(ret.contains_any()),
     )
 }
@@ -138,8 +138,11 @@ fn apply_binary_candidate(
         tc.record_extern_use(expr_id, ExternUseTarget::BinaryOperator(candidate.operator));
     }
 
-    CheckedType::new(candidate.ret.ty.clone(), tc.type_handle(&candidate.ret.ty))
-        .with_extern_any(candidate.ret.contains_any())
+    CheckedType::new(
+        candidate.ret.ty.clone(),
+        TypeChecker::type_handle(&candidate.ret.ty),
+    )
+    .with_extern_any(candidate.ret.contains_any())
 }
 
 fn invalid_operand(
@@ -153,7 +156,7 @@ fn invalid_operand(
         operand_type,
         span: tc.error_span(span),
     });
-    checked_type(Type::Infer, tc)
+    checked_type(Type::Infer)
 }
 
 fn binary_op(op: BinaryOp) -> Option<anvyx_externs::BinaryOp> {

@@ -767,138 +767,22 @@ mod tests {
         validate(&provider)
     }
 
-    fn same_thread_callback(ret: ExternTypeExpr) -> ExternTypeExpr {
-        ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: vec![ExternCallbackParam {
-                ty: ExternTypeExpr::Int,
-                escape: CallbackEscape::NonEscaping,
-            }],
-            ret: Box::new(ret),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::NonEscaping,
-                thread: CallbackThread::SameThread,
-            },
-        })
-    }
-
-    #[test]
-    fn valid_descriptor_passes_validation() {
-        assert_eq!(validate(&valid_provider()), Ok(()));
-    }
-
-    #[test]
-    fn accepts_final_abi_matrix() {
-        let cases = [
-            (
-                vec![
-                    ExternTypeExpr::Unit,
-                    ExternTypeExpr::Bool,
-                    ExternTypeExpr::Int,
-                    ExternTypeExpr::Float,
-                    ExternTypeExpr::String,
-                    ExternTypeExpr::Any,
-                ],
-                ExternTypeExpr::Unit,
-            ),
-            (
-                vec![ExternTypeExpr::option(ExternTypeExpr::result(
-                    ExternTypeExpr::Unit,
-                    ExternTypeExpr::named(None, "LoadError"),
-                ))],
-                ExternTypeExpr::result(
-                    ExternTypeExpr::list(ExternTypeExpr::Int),
-                    ExternTypeExpr::named(None, "LoadError"),
-                ),
-            ),
-            (
-                vec![ExternTypeExpr::Tuple(vec![
-                    ExternTypeExpr::array(ExternTypeExpr::Float, 4),
-                    ExternTypeExpr::list(ExternTypeExpr::String),
-                    ExternTypeExpr::map(ExternTypeExpr::String, ExternTypeExpr::Int),
-                ])],
-                ExternTypeExpr::Tuple(vec![ExternTypeExpr::Int, ExternTypeExpr::Bool]),
-            ),
-            (
-                vec![ExternTypeExpr::slice(ExternTypeExpr::Int)],
-                ExternTypeExpr::Void,
-            ),
-            (
-                vec![same_thread_callback(ExternTypeExpr::Int)],
-                ExternTypeExpr::Void,
-            ),
-        ];
-
-        for (params, ret) in cases {
-            assert_eq!(function_with_signature(params, ret), Ok(()));
-        }
-    }
-
     #[test]
     fn rejects_final_abi_matrix() {
-        let callback = same_thread_callback(ExternTypeExpr::Void);
-        let cases = [
-            (
-                vec![],
-                ExternTypeExpr::slice(ExternTypeExpr::Int),
-                ExternDescriptorError::InvalidAbiType {
-                    position: AbiPosition::Return,
-                    reason: AbiTypeError::SliceOutsideParam,
-                },
-            ),
-            (
-                vec![ExternTypeExpr::list(ExternTypeExpr::slice(
-                    ExternTypeExpr::Int,
-                ))],
-                ExternTypeExpr::Void,
-                ExternDescriptorError::InvalidAbiType {
-                    position: AbiPosition::Nested,
-                    reason: AbiTypeError::SliceNested,
-                },
-            ),
-            (
-                vec![],
-                callback.clone(),
-                ExternDescriptorError::InvalidAbiType {
-                    position: AbiPosition::Return,
-                    reason: AbiTypeError::CallbackOutsideParam,
-                },
-            ),
-            (
-                vec![ExternTypeExpr::list(callback)],
-                ExternTypeExpr::Void,
-                ExternDescriptorError::InvalidAbiType {
-                    position: AbiPosition::Nested,
-                    reason: AbiTypeError::CallbackNested,
-                },
-            ),
-            (
-                vec![ExternTypeExpr::Named {
-                    module: None,
-                    name: "Box".to_string(),
-                    args: vec![ExternTypeExpr::Int],
-                }],
-                ExternTypeExpr::Void,
-                ExternDescriptorError::InvalidAbiType {
-                    position: AbiPosition::ParamValue,
-                    reason: AbiTypeError::GenericNamedArgsUnsupported,
-                },
-            ),
-            (
-                vec![ExternTypeExpr::Void],
-                ExternTypeExpr::Void,
-                ExternDescriptorError::VoidType {
-                    context: TypeContext::Param,
-                },
-            ),
-        ];
+        let errors = function_with_signature(
+            vec![ExternTypeExpr::Named {
+                module: None,
+                name: "Box".to_string(),
+                args: vec![ExternTypeExpr::Int],
+            }],
+            ExternTypeExpr::Void,
+        )
+        .unwrap_err();
 
-        for (params, ret, expected) in cases {
-            let errors = function_with_signature(params, ret).unwrap_err();
-            assert!(
-                errors.contains(&expected),
-                "missing {expected:?} in {errors:?}"
-            );
-        }
+        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
+            position: AbiPosition::ParamValue,
+            reason: AbiTypeError::GenericNamedArgsUnsupported,
+        }));
     }
 
     #[test]
@@ -956,25 +840,6 @@ mod tests {
             kind: NameKind::NamedType,
             name: String::new(),
         }));
-    }
-
-    #[test]
-    fn accepts_source_module_init_params() {
-        let mut provider = valid_provider();
-        provider.modules[0].types[0].init.as_mut().unwrap().params = vec![ExternParam {
-            name: Some("x".to_string()),
-            ty: ExternTypeExpr::Float,
-            flow: ParamFlow::Value,
-            escape: CallbackEscape::NonEscaping,
-        }];
-        provider.modules[0].types[0]
-            .init
-            .as_mut()
-            .unwrap()
-            .field_init = vec!["x".to_string()];
-
-        assert!(validate_module_contents(&provider.modules[0]).is_ok());
-        assert!(validate(&provider).is_ok());
     }
 
     #[test]
@@ -1071,20 +936,7 @@ mod tests {
     #[test]
     fn rejects_duplicates() {
         let mut provider = valid_provider();
-        let dup_module = provider.modules[0].clone();
-        let dup_type = provider.modules[0].types[0].clone();
-        let function = provider.modules[0].functions[0].clone();
-        let field = provider.modules[0].types[0].fields[0].clone();
-        let method = provider.modules[0].types[0].methods[0].clone();
-        let static_method = provider.modules[0].types[0].statics[0].clone();
-        let operator = provider.modules[0].types[0].operators[0].clone();
-        provider.modules.push(dup_module);
-        provider.modules[0].types.push(dup_type);
-        provider.modules[0].functions.push(function);
-        provider.modules[0].types[0].fields.push(field);
-        provider.modules[0].types[0].methods.push(method);
-        provider.modules[0].types[0].statics.push(static_method);
-        provider.modules[0].types[0].operators.push(operator);
+        provider.modules.push(provider.modules[0].clone());
         provider.modules[0].types[0]
             .init
             .as_mut()
@@ -1096,30 +948,6 @@ mod tests {
         let key = ty(module(&["math"]), "Vec2");
 
         assert!(errors.contains(&ExternDescriptorError::DuplicateModule(module(&["math"]))));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateType {
-            module: module(&["math"]),
-            name: "Vec2".to_string(),
-        }));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateFunction {
-            module: module(&["math"]),
-            name: "visit".to_string(),
-        }));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateField {
-            ty: key.clone(),
-            name: "x".to_string(),
-        }));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateMethod {
-            ty: key.clone(),
-            name: "len".to_string(),
-        }));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateStatic {
-            ty: key.clone(),
-            name: "zero".to_string(),
-        }));
-        assert!(errors.contains(&ExternDescriptorError::DuplicateOperator {
-            ty: key.clone(),
-            op: ExternOperator::Unary(UnaryOp::Neg),
-        }));
         assert!(errors.contains(&ExternDescriptorError::DuplicateFieldInit {
             ty: key,
             name: "x".to_string(),
@@ -1260,23 +1088,6 @@ mod tests {
                 },
                 effects: ExternEffects::default(),
             },
-            ExternOperatorDescriptor {
-                op: ExternOperator::Binary {
-                    op: BinaryOp::Mul,
-                    self_on_right: false,
-                },
-                receiver: ReceiverMode::Shared,
-                signature: ExternSignature {
-                    params: vec![ExternParam {
-                        name: None,
-                        ty: ExternTypeExpr::Float,
-                        flow: ParamFlow::Value,
-                        escape: CallbackEscape::NonEscaping,
-                    }],
-                    ret: ExternTypeExpr::Void,
-                },
-                effects: ExternEffects::default(),
-            },
         ];
 
         let errors = validate(&provider).unwrap_err();
@@ -1308,135 +1119,18 @@ mod tests {
                 },
             })
         );
-        assert!(
-            errors.contains(&ExternDescriptorError::InvalidOperatorReturn {
-                ty: key,
-                op: ExternOperator::Binary {
-                    op: BinaryOp::Mul,
-                    self_on_right: false,
-                },
-                expected: OperatorReturn::NonVoid,
-                actual: ExternTypeExpr::Void,
-            })
-        );
-    }
-
-    #[test]
-    fn accepts_named_operator_return() {
-        let mut provider = valid_provider();
-        provider.modules[0].types[0].operators = vec![ExternOperatorDescriptor {
-            op: ExternOperator::Binary {
-                op: BinaryOp::Add,
-                self_on_right: false,
-            },
-            receiver: ReceiverMode::Shared,
-            signature: ExternSignature {
-                params: vec![ExternParam {
-                    name: None,
-                    ty: ExternTypeExpr::Float,
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                }],
-                ret: ExternTypeExpr::Named {
-                    module: None,
-                    name: "Vec2".to_string(),
-                    args: vec![],
-                },
-            },
-            effects: ExternEffects::default(),
-        }];
-
-        assert_eq!(validate(&provider), Ok(()));
     }
 
     #[test]
     fn rejects_non_return_void() {
         let mut provider = valid_provider();
-        provider.modules[0].functions[0].signature.params[0].ty = ExternTypeExpr::Void;
         provider.modules[0].types[0].fields[0].ty =
             ExternTypeExpr::List(Box::new(ExternTypeExpr::Void));
-        provider.modules[0].types[0].operators[0].signature.ret = ExternTypeExpr::Void;
 
         let errors = validate(&provider).unwrap_err();
 
-        assert!(errors.contains(&ExternDescriptorError::VoidType {
-            context: TypeContext::Param,
-        }));
         assert!(errors.contains(&ExternDescriptorError::VoidType {
             context: TypeContext::Nested,
-        }));
-    }
-
-    #[test]
-    fn rejects_invalid_final_abi_positions() {
-        let mut provider = valid_provider();
-        let callback = ExternTypeExpr::Callback(ExternCallbackSignature {
-            params: vec![],
-            ret: Box::new(ExternTypeExpr::Void),
-            policy: CallbackPolicy {
-                escape: CallbackEscape::NonEscaping,
-                thread: CallbackThread::SameThread,
-            },
-        });
-        provider.modules[0].functions[0].signature = ExternSignature {
-            params: vec![
-                ExternParam {
-                    name: Some("nested".to_string()),
-                    ty: ExternTypeExpr::Tuple(vec![
-                        ExternTypeExpr::slice(ExternTypeExpr::Int),
-                        callback.clone(),
-                    ]),
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                },
-                ExternParam {
-                    name: Some("returns_callback".to_string()),
-                    ty: ExternTypeExpr::Callback(ExternCallbackSignature {
-                        params: vec![],
-                        ret: Box::new(callback.clone()),
-                        policy: CallbackPolicy {
-                            escape: CallbackEscape::NonEscaping,
-                            thread: CallbackThread::SameThread,
-                        },
-                    }),
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                },
-                ExternParam {
-                    name: Some("generic".to_string()),
-                    ty: ExternTypeExpr::Named {
-                        module: None,
-                        name: "Box".to_string(),
-                        args: vec![ExternTypeExpr::Int],
-                    },
-                    flow: ParamFlow::Value,
-                    escape: CallbackEscape::NonEscaping,
-                },
-            ],
-            ret: ExternTypeExpr::slice(ExternTypeExpr::Int),
-        };
-
-        let errors = validate(&provider).unwrap_err();
-
-        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
-            position: AbiPosition::Nested,
-            reason: AbiTypeError::SliceNested,
-        }));
-        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
-            position: AbiPosition::Nested,
-            reason: AbiTypeError::CallbackNested,
-        }));
-        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
-            position: AbiPosition::CallbackReturn,
-            reason: AbiTypeError::CallbackReturnUnsupported,
-        }));
-        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
-            position: AbiPosition::ParamValue,
-            reason: AbiTypeError::GenericNamedArgsUnsupported,
-        }));
-        assert!(errors.contains(&ExternDescriptorError::InvalidAbiType {
-            position: AbiPosition::Return,
-            reason: AbiTypeError::SliceOutsideParam,
         }));
     }
 

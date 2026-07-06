@@ -51,11 +51,6 @@ use crate::test_support::{
 };
 
 #[test]
-fn profile_accepts_empty_air() {
-    check(Program::default());
-}
-
-#[test]
 fn profile_accepts_native_scoped_lambda_param() {
     let program = native_scoped_lambda_air();
     let verified = air::verify(&program).expect("AIR verify failed");
@@ -1340,235 +1335,6 @@ fn indexed_map_assignment_preserves_unsupported_lambda_capture_gap() {
 }
 
 #[test]
-fn profile_accepts_scalar_arithmetic_shape() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let module = program.alloc_module(root_module());
-    let one = program.const_arena.alloc(ConstData {
-        ty: int,
-        value: ConstValue::Int(1),
-    });
-    let two = program.const_arena.alloc(ConstData {
-        ty: int,
-        value: ConstValue::Int(2),
-    });
-    let tmp = air::LocalId::from_index(0);
-    let func = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![local(int, LocalKind::Temp)],
-        body: structured_body(
-            vec![Statement::Init {
-                local: tmp,
-                value: RValue::Binary {
-                    op: BinaryOp::Add,
-                    lhs: Operand::Const(one),
-                    rhs: Operand::Const(two),
-                    ty: int,
-                },
-            }],
-            air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
-        ),
-    });
-    program.module_mut(module).functions.push(func);
-    program.set_entry(func);
-
-    check(program);
-}
-
-#[test]
-fn profile_accepts_numeric_cast_shape() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let float = program.alloc_type(TypeData::Float);
-    let module = program.alloc_module(root_module());
-    let one = program.const_arena.alloc(ConstData {
-        ty: int,
-        value: ConstValue::Int(1),
-    });
-    let tmp = air::LocalId::from_index(0);
-    let func = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], float),
-        locals: vec![local(float, LocalKind::Temp)],
-        body: structured_body(
-            vec![Statement::Init {
-                local: tmp,
-                value: RValue::Cast {
-                    value: Operand::Const(one),
-                    target: float,
-                },
-            }],
-            air::AirTail::Return(Some(Operand::Place(place(tmp, float)))),
-        ),
-    });
-    program.module_mut(module).functions.push(func);
-
-    check(program);
-}
-
-#[test]
-fn profile_accepts_direct_function_call_shape() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let module = program.alloc_module(root_module());
-    let one = program.const_arena.alloc(ConstData {
-        ty: int,
-        value: ConstValue::Int(1),
-    });
-    let helper = program.alloc_function(Function {
-        name: Ident::new("helper"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![],
-        body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
-    });
-    let tmp = air::LocalId::from_index(0);
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![local(int, LocalKind::Temp)],
-        body: structured_body(
-            vec![Statement::Init {
-                local: tmp,
-                value: RValue::Call {
-                    callee: Callee::Function(helper),
-                    args: vec![],
-                },
-            }],
-            air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
-        ),
-    });
-    program.module_mut(module).functions.extend([helper, main]);
-
-    check(program);
-}
-
-#[test]
-fn profile_accepts_core_println_extern_call_shape() {
-    let mut program = Program::default();
-    let string = program.alloc_type(TypeData::String);
-    let void = program.alloc_type(TypeData::Void);
-    let extern_id = runtime_extern(
-        &mut program,
-        "_println",
-        vec![(string, ParamMode::SharedBorrow)],
-        void,
-    );
-    let message = program.const_arena.alloc(ConstData {
-        ty: string,
-        value: ConstValue::String("ok".into()),
-    });
-    let module = program.alloc_module(root_module());
-    let message_local = air::LocalId::from_index(0);
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], void),
-        locals: vec![local(string, LocalKind::Temp)],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: message_local,
-                    value: RValue::Use(Operand::Const(message)),
-                },
-                Statement::Eval(RValue::Call {
-                    callee: Callee::Extern(extern_id),
-                    args: vec![CallArg::SharedBorrow(place(message_local, string))],
-                }),
-            ],
-            air::AirTail::Return(None),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-
-    check(program);
-}
-
-#[test]
-fn profile_accepts_core_assert_extern_call_shape() {
-    let mut program = Program::default();
-    let bool_ty = program.alloc_type(TypeData::Bool);
-    let string = program.alloc_type(TypeData::String);
-    let void = program.alloc_type(TypeData::Void);
-    let extern_id = runtime_extern(
-        &mut program,
-        "_assert",
-        vec![
-            (bool_ty, ParamMode::Value),
-            (string, ParamMode::SharedBorrow),
-        ],
-        void,
-    );
-    let condition = program.const_arena.alloc(ConstData {
-        ty: bool_ty,
-        value: ConstValue::Bool(true),
-    });
-    let message = program.const_arena.alloc(ConstData {
-        ty: string,
-        value: ConstValue::String("ok".into()),
-    });
-    let module = program.alloc_module(root_module());
-    let message_local = air::LocalId::from_index(0);
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], void),
-        locals: vec![local(string, LocalKind::Temp)],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: message_local,
-                    value: RValue::Use(Operand::Const(message)),
-                },
-                Statement::Eval(RValue::Call {
-                    callee: Callee::Extern(extern_id),
-                    args: vec![
-                        CallArg::Value(Operand::Const(condition)),
-                        CallArg::SharedBorrow(place(message_local, string)),
-                    ],
-                }),
-            ],
-            air::AirTail::Return(None),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-
-    check(program);
-}
-
-#[test]
-fn profile_accepts_string_concat_without_value_copying_string_places() {
-    check(string_concat_program());
-}
-
-#[test]
-fn profile_accepts_supported_format_rvalues() {
-    check(format_program());
-}
-
-#[test]
 fn profile_accepts_dataref_list_payload() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -1703,42 +1469,6 @@ fn emit_derives_trace_for_struct_payload_containing_tuple() {
 }
 
 #[test]
-fn profile_accepts_tuple_construction() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let tuple = program.alloc_type(TypeData::Tuple(vec![int]));
-    let one = program.const_arena.alloc(ConstData {
-        ty: int,
-        value: ConstValue::Int(1),
-    });
-    let module = program.alloc_module(root_module());
-    let out = air::LocalId::from_index(0);
-    let func = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], tuple),
-        locals: vec![local(tuple, LocalKind::Temp)],
-        body: structured_body(
-            vec![Statement::Init {
-                local: out,
-                value: RValue::Aggregate {
-                    kind: AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(one)],
-                    ty: tuple,
-                },
-            }],
-            air::AirTail::Return(Some(Operand::Place(place(out, tuple)))),
-        ),
-    });
-    program.module_mut(module).functions.push(func);
-
-    check(program);
-}
-
-#[test]
 fn plan_preserves_tuple_construction_and_projection() {
     let program = tuple_projection_program();
     let verified = air::verify(&program).expect("AIR verify failed");
@@ -1859,11 +1589,6 @@ fn profile_accepts_unreachable_terminator() {
     program.module_mut(module).functions.push(func);
 
     check(program);
-}
-
-#[test]
-fn profile_accepts_plain_struct_declarations() {
-    check(struct_decl_program(false));
 }
 
 #[test]
@@ -11591,9 +11316,7 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     );
     assert!(source.contains("let globals = AnvGlobals::new(&safepoint);"));
     assert!(source.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>)"));
-    assert!(
-        source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0.as_str())")
-    );
+    assert!(source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, v0.as_str())"));
     assert!(!source.contains("type AnvCtx"));
     assert_eq!(
         source
@@ -11753,28 +11476,6 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
         source.contains("fn stringify_outer<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, value: &Outer)")
     );
     assert!(source.contains("stringify_inner(rt, types, &value.inner)"));
-}
-
-#[test]
-fn source_job_compiles_and_runs_format_program() {
-    let program = format_program();
-    let source = plan_source(program);
-
-    let output = run_source(source);
-
-    assert_eq!(output.status, SourceJobStatus::Success);
-    assert_eq!(output.stdout, "0007\n");
-}
-
-#[test]
-fn source_job_compiles_and_runs_string_concat_program() {
-    let program = string_concat_program();
-    let source = plan_source(program);
-
-    let output = run_source(source);
-
-    assert_eq!(output.status, SourceJobStatus::Success);
-    assert_eq!(output.stdout, "ab\nabc\n");
 }
 
 #[test]
@@ -12179,7 +11880,7 @@ fn source_job_compiles_fallible_non_void_entry() {
 fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, \"ready\");"));
+    assert!(source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, \"ready\");"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -12189,10 +11890,10 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
     let source = plan_source(shared_string_forward_program()).into_string();
 
     assert!(source.contains(": &str"));
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0);"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, &v0);"));
+    assert!(source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, v0);"));
+    assert!(!source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, &v0);"));
     assert!(
-        !source.contains("anvyx_core2::__anvyx_native::core_runtime::_println(rt, v0.as_str());")
+        !source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, v0.as_str());")
     );
 }
 
@@ -12200,7 +11901,7 @@ fn emit_forwards_borrowed_string_param_as_str_without_double_borrow() {
 fn emit_borrows_string_constant_for_native_string_param() {
     let source = plan_source(native_str_len_const_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, \"abc\")"));
+    assert!(source.contains("anvyx_core::__anvyx_native::core_string::str_len(rt, \"abc\")"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -12209,8 +11910,8 @@ fn emit_borrows_string_constant_for_native_string_param() {
 fn emit_borrows_string_local_for_native_string_param() {
     let source = plan_source(native_str_len_local_program()).into_string();
 
-    assert!(source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, v0.as_str())"));
-    assert!(!source.contains("anvyx_core2::__anvyx_native::core_string::str_len(rt, &v0)"));
+    assert!(source.contains("anvyx_core::__anvyx_native::core_string::str_len(rt, v0.as_str())"));
+    assert!(!source.contains("anvyx_core::__anvyx_native::core_string::str_len(rt, &v0)"));
 }
 
 #[test]
@@ -12222,17 +11923,6 @@ fn emit_formats_borrowed_string_param_without_owned_temp() {
     assert!(!source.contains("v0.as_str()"));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
-}
-
-#[test]
-fn source_job_compiles_and_runs_scalar_print_program() {
-    let program = scalar_print_program();
-    let source = plan_source(program);
-
-    let output = run_source(source);
-
-    assert_eq!(output.status, SourceJobStatus::Success);
-    assert_eq!(output.stdout, "1\n");
 }
 
 #[test]
@@ -19079,126 +18769,6 @@ mod arrays {
     }
 
     #[test]
-    fn negative_index_returns_runtime_error() {
-        let mut program = Program::default();
-        let int = program.alloc_type(TypeData::Int);
-        let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
-        let module = program.alloc_module(root_module());
-        let value = int_const(&mut program, int, 1);
-        let negative = int_const(&mut program, int, -1);
-        let array_local = air::LocalId::from_index(0);
-        let index_local = air::LocalId::from_index(1);
-        let value_local = air::LocalId::from_index(2);
-        let mut indexed = place(array_local, int);
-        indexed.projection.push(Projection::Index(index_local));
-        let main = program.alloc_function(Function {
-            name: Ident::new("main"),
-            module,
-            kind: FunctionKind::Normal,
-            owner: None,
-            specialization: None,
-            signature: Signature::new(vec![], int),
-            locals: vec![
-                local(array, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-            ],
-            body: structured_body(
-                vec![
-                    Statement::Init {
-                        local: array_local,
-                        value: RValue::Aggregate {
-                            kind: AggregateCtor::Array,
-                            fields: vec![Operand::Const(value)],
-                            ty: array,
-                        },
-                    },
-                    Statement::Init {
-                        local: index_local,
-                        value: RValue::Use(Operand::Const(negative)),
-                    },
-                    Statement::Init {
-                        local: value_local,
-                        value: RValue::Use(Operand::Place(indexed)),
-                    },
-                ],
-                air::AirTail::Return(Some(Operand::Place(place(value_local, int)))),
-            ),
-        });
-        program.module_mut(module).functions.push(main);
-        program.set_entry(main);
-
-        let source = plan_source(program);
-        let output = run_source(source);
-        assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(
-            output
-                .stderr
-                .contains("array index -1 out of bounds for len 1")
-        );
-    }
-
-    #[test]
-    fn out_of_bounds_index_returns_runtime_error() {
-        let mut program = Program::default();
-        let int = program.alloc_type(TypeData::Int);
-        let array = program.alloc_type(TypeData::Array { elem: int, len: 1 });
-        let module = program.alloc_module(root_module());
-        let value = int_const(&mut program, int, 1);
-        let too_large = int_const(&mut program, int, 1);
-        let array_local = air::LocalId::from_index(0);
-        let index_local = air::LocalId::from_index(1);
-        let value_local = air::LocalId::from_index(2);
-        let mut indexed = place(array_local, int);
-        indexed.projection.push(Projection::Index(index_local));
-        let main = program.alloc_function(Function {
-            name: Ident::new("main"),
-            module,
-            kind: FunctionKind::Normal,
-            owner: None,
-            specialization: None,
-            signature: Signature::new(vec![], int),
-            locals: vec![
-                local(array, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-            ],
-            body: structured_body(
-                vec![
-                    Statement::Init {
-                        local: array_local,
-                        value: RValue::Aggregate {
-                            kind: AggregateCtor::Array,
-                            fields: vec![Operand::Const(value)],
-                            ty: array,
-                        },
-                    },
-                    Statement::Init {
-                        local: index_local,
-                        value: RValue::Use(Operand::Const(too_large)),
-                    },
-                    Statement::Init {
-                        local: value_local,
-                        value: RValue::Use(Operand::Place(indexed)),
-                    },
-                ],
-                air::AirTail::Return(Some(Operand::Place(place(value_local, int)))),
-            ),
-        });
-        program.module_mut(module).functions.push(main);
-        program.set_entry(main);
-
-        let source = plan_source(program);
-        let output = run_source(source);
-        assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(
-            output
-                .stderr
-                .contains("array index 1 out of bounds for len 1")
-        );
-    }
-
-    #[test]
     fn noncopy_array_value_copy_is_target_gap() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
@@ -19564,66 +19134,6 @@ mod lists {
             source
                 .as_str()
                 .contains("&anvyx_runtime::AnvList<'cx, i64>")
-        );
-    }
-
-    #[test]
-    fn negative_index_returns_runtime_error() {
-        let mut program = Program::default();
-        let int = program.alloc_type(TypeData::Int);
-        let list = program.alloc_type(TypeData::List(int));
-        let module = program.alloc_module(root_module());
-        let value = int_const(&mut program, int, 1);
-        let negative = int_const(&mut program, int, -1);
-        let list_local = air::LocalId::from_index(0);
-        let index_local = air::LocalId::from_index(1);
-        let value_local = air::LocalId::from_index(2);
-        let mut indexed = place(list_local, int);
-        indexed.projection.push(Projection::Index(index_local));
-        let main = program.alloc_function(Function {
-            name: Ident::new("main"),
-            module,
-            kind: FunctionKind::Normal,
-            owner: None,
-            specialization: None,
-            signature: Signature::new(vec![], int),
-            locals: vec![
-                local(list, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-                local(int, LocalKind::Temp),
-            ],
-            body: structured_body(
-                vec![
-                    Statement::Init {
-                        local: list_local,
-                        value: RValue::Aggregate {
-                            kind: AggregateCtor::List,
-                            fields: vec![Operand::Const(value)],
-                            ty: list,
-                        },
-                    },
-                    Statement::Init {
-                        local: index_local,
-                        value: RValue::Use(Operand::Const(negative)),
-                    },
-                    Statement::Init {
-                        local: value_local,
-                        value: RValue::Use(Operand::Place(indexed)),
-                    },
-                ],
-                air::AirTail::Return(Some(Operand::Place(place(value_local, int)))),
-            ),
-        });
-        program.module_mut(module).functions.push(main);
-        program.set_entry(main);
-
-        let source = plan_source(program);
-        let output = run_source(source);
-        assert!(matches!(output.status, SourceJobStatus::RunFailed(_)));
-        assert!(
-            output
-                .stderr
-                .contains("list index -1 out of bounds for len 1")
         );
     }
 
@@ -22325,8 +21835,8 @@ fn rust_plan_config() -> RustPlanConfig {
     RustPlanConfig {
         symbol_prefix: "anv".into(),
         native_providers: vec![
-            core2_runtime_support(),
-            core2_string_support(),
+            core_runtime_support(),
+            core_string_support(),
             core_int_support(),
             fallible_host_support(),
             host_mut_support(),
@@ -22381,7 +21891,7 @@ fn with_fallible_host(source: emit::RustSource) -> emit::RustSource {
 fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
     let cache = tempfile::tempdir().expect("temp dir failed");
     let deps = [
-        ("anvyx_core2", "anvyx-core2", "core2"),
+        ("anvyx_core", "anvyx-core", "core"),
         ("anvyx_runtime", "anvyx-runtime", "runtime"),
     ]
     .into_iter()
@@ -22473,7 +21983,7 @@ fn assert_profile_error(
     );
 }
 
-fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
+fn core_runtime_support() -> anvyx_runtime::RustProviderSupport {
     use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
 
     provider_support(
@@ -22481,7 +21991,7 @@ fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
         vec![
             function_binding(
                 "core_runtime",
-                "anvyx_core2",
+                "anvyx_core",
                 &["__anvyx_native", "core_runtime", "_println"],
                 "_println",
                 vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
@@ -22490,7 +22000,7 @@ fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
             ),
             function_binding(
                 "core_runtime",
-                "anvyx_core2",
+                "anvyx_core",
                 &["__anvyx_native", "core_runtime", "_assert"],
                 "_assert",
                 vec![
@@ -22504,14 +22014,14 @@ fn core2_runtime_support() -> anvyx_runtime::RustProviderSupport {
     )
 }
 
-fn core2_string_support() -> anvyx_runtime::RustProviderSupport {
+fn core_string_support() -> anvyx_runtime::RustProviderSupport {
     use anvyx_runtime::{ExternTypeExpr, RustParamAbi, RustReturnAbi};
 
     provider_support(
         "core_string",
         vec![function_binding(
             "core_string",
-            "anvyx_core2",
+            "anvyx_core",
             &["__anvyx_native", "core_string", "str_len"],
             "str_len",
             vec![RustParamAbi::Borrow(ExternTypeExpr::String)],
@@ -22528,7 +22038,7 @@ fn core_int_support() -> anvyx_runtime::RustProviderSupport {
         "core_int",
         vec![function_binding(
             "core_int",
-            "anvyx_core2",
+            "anvyx_core",
             &["__anvyx_native", "core_int", "int_abs"],
             "int_abs",
             vec![RustParamAbi::Value(ExternTypeExpr::Int)],

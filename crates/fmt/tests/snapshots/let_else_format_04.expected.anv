@@ -1,0 +1,4 @@
+fn f(x: int?) -> int {
+    let val? = x else return 0;
+    val
+}

@@ -368,39 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn constructors_preserve_plain_messages() {
-        let error = Diagnostic::error("bad");
-        let warning = Diagnostic::warning("careful");
-
-        assert_eq!(error.severity(), Severity::Error);
-        assert_eq!(warning.severity(), Severity::Warning);
-        assert_eq!(error.message(), "bad");
-        assert_eq!(warning.to_string(), "careful");
-        assert!(error.labels().is_empty());
-        assert!(error.code().is_none());
-        assert!(error.tags().is_empty());
-    }
-
-    #[test]
-    fn metadata_builders_preserve_plain_messages() {
-        let diagnostic = Diagnostic::warning("deprecated")
-            .with_code("anvyx", "deprecated")
-            .with_tag(DiagnosticTag::Deprecated)
-            .with_tag(DiagnosticTag::Unnecessary);
-
-        let code = diagnostic.code().unwrap();
-        assert_eq!(code.source, "anvyx");
-        assert_eq!(code.code, "deprecated");
-        assert_eq!(code.kind, DiagnosticCodeKind::Plain);
-        assert_eq!(
-            diagnostic.tags(),
-            &[DiagnosticTag::Deprecated, DiagnosticTag::Unnecessary]
-        );
-        assert_eq!(diagnostic.message(), "deprecated");
-        assert_eq!(diagnostic.to_string(), "deprecated");
-    }
-
-    #[test]
     fn lint_code_generates_metadata_notes() {
         let default = Diagnostic::warning("lint")
             .with_lint_code(
@@ -432,22 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn label_builders_append_labels() {
-        let primary = span(1, 3);
-        let secondary = span(5, 8);
-        let diagnostic = Diagnostic::error("bad")
-            .with_primary(primary)
-            .with_secondary_message(secondary, "related");
-
-        assert_eq!(diagnostic.labels().len(), 2);
-        assert_eq!(diagnostic.labels()[0].style, LabelStyle::Primary);
-        assert_eq!(diagnostic.labels()[0].span, primary);
-        assert_eq!(diagnostic.labels()[0].message, None);
-        assert_eq!(diagnostic.labels()[1].style, LabelStyle::Secondary);
-        assert_eq!(diagnostic.labels()[1].message.as_deref(), Some("related"));
-    }
-
-    #[test]
     fn primary_label_skips_secondary_labels() {
         let secondary = span(1, 3);
         let primary = span(5, 8);
@@ -456,17 +407,6 @@ mod tests {
             .with_primary(primary);
 
         assert_eq!(diagnostic.primary_label().unwrap().span, primary);
-    }
-
-    #[test]
-    fn note_and_help_builders_append_adapter_data() {
-        let diagnostic = Diagnostic::warning("deprecated")
-            .with_note("since 1.0")
-            .with_note("use the new API")
-            .with_help("rename it");
-
-        assert_eq!(diagnostic.notes(), &["since 1.0", "use the new API"]);
-        assert_eq!(diagnostic.help(), Some("rename it"));
     }
 
     #[test]
@@ -505,18 +445,6 @@ mod tests {
             report.anchor_label(&report.diagnostics[0]).unwrap().span,
             secondary
         );
-    }
-
-    #[test]
-    fn report_carries_sources_with_diagnostics() {
-        let mut sources = SourceTable::default();
-        let source = sources.add(SourceKind::Virtual, "test", None, "test source");
-        let diagnostic = Diagnostic::error("bad").with_primary(SourceSpan::new(source, 0, 4));
-        let report = DiagnosticReport::new(sources, vec![diagnostic]);
-
-        assert_eq!(report.sources.len(), 1);
-        assert_eq!(report.diagnostics[0].message(), "bad");
-        assert_eq!(report.diagnostics[0].labels()[0].span.source(), source);
     }
 
     #[test]

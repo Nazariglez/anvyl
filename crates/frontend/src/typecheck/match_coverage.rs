@@ -54,8 +54,7 @@ pub(super) fn check(
                 span: tc.error_span(span),
             });
         }
-        MatchSubject::Tuple => {}
-        MatchSubject::Unknown | MatchSubject::Unsupported(_) => {}
+        MatchSubject::Tuple | MatchSubject::Unknown | MatchSubject::Unsupported(_) => {}
     }
 }
 

@@ -1,4 +1,0 @@
-// @helper
-
-pub const TILE_SIZE = 16;
-pub const GAME_NAME = "test";

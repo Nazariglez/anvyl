@@ -1,0 +1,7 @@
+[project]
+name = "game"
+entry = "game/src/main.anv"
+
+[dependencies]
+left = { path = "left" }
+right = { path = "right" }

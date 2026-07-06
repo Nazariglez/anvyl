@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: ready
+
+lazy let title = "ready";
+
+fn main() {
+    let local = title;
+    println(local);
+}

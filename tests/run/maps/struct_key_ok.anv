@@ -1,0 +1,36 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 10
+// 25
+// -1
+// 25
+// 30
+// @match-end
+
+struct Cell {
+    x: int,
+    y: int,
+}
+
+fn print_slot(slot: int?) {
+    if let value? = slot {
+        println(value);
+    } else {
+        println(-1);
+    }
+}
+
+fn main() {
+    var by_cell: [Cell: int] = [Cell { x: 1, y: 2 }: 10];
+    print_slot(by_cell[Cell { x: 1, y: 2 }]);
+
+    by_cell[Cell { x: 1, y: 2 }] = 25;
+    by_cell[Cell { x: 2, y: 3 }] = 30;
+    print_slot(by_cell[Cell { x: 1, y: 2 }]);
+    print_slot(by_cell[Cell { x: 9, y: 9 }]);
+
+    for key, value in by_cell {
+        println(value);
+    }
+}

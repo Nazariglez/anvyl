@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 3
+// @match-end
+
+fn main() {
+    var count = 0;
+    let f = || {
+        count += 1;
+        count
+    };
+    let g = || f();
+    println(f());
+    println(g());
+    println(f());
+}

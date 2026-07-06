@@ -1,0 +1,3 @@
+extend<E> enum E: int {
+    fn tag() -> string { "target" }
+}

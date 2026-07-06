@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+lazy var values: [int] = [1];
+
+fn main() {
+    values.push(2);
+    for value in values {
+        println(value);
+    }
+}

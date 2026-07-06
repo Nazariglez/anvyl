@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 8
+
+struct Bag { xs: [int] }
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    var bag = Bag { xs: [0, 7] };
+    bump(bag.xs[1]);
+    println(bag.xs[1]);
+}

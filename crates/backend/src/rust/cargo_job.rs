@@ -1246,7 +1246,7 @@ mod tests {
         assert!(RustCargoName::parse("").is_err());
         assert!(RustCargoName::parse("1bad").is_err());
         assert!(RustCargoName::parse("bad-name").is_err());
-        assert!(RustCargoPackageName::parse("anvyx-core2").is_ok());
+        assert!(RustCargoPackageName::parse("anvyx-core").is_ok());
         assert!(RustCargoPackageName::parse("bad name").is_err());
         assert!(RustCargoFingerprint::parse("not-hex").is_err());
     }
@@ -1427,17 +1427,17 @@ mod tests {
             package_name: name("anvyx_gen_abcdef"),
             binary_name: name("anvyx_gen_abcdef"),
             dependencies: vec![RustCargoDependency {
-                name: name("anvyx_core2"),
-                package: Some(package_name("anvyx-core2")),
-                source: RustCargoDependencySource::Path("../core2".to_string()),
+                name: name("anvyx_core"),
+                package: Some(package_name("anvyx-core")),
+                source: RustCargoDependencySource::Path("../core".to_string()),
                 features: vec![],
                 default_features: true,
             }],
             metadata: RustCargoPackageMetadata::default(),
         };
 
-        assert!(RustCargoName::parse("anvyx-core2").is_err());
-        let dependency = "anvyx_core2 = { package = \"anvyx-core2\", path = \"../core2\" }";
+        assert!(RustCargoName::parse("anvyx-core").is_err());
+        let dependency = "anvyx_core = { package = \"anvyx-core\", path = \"../core\" }";
         assert!(render_manifest(&package).contains(dependency));
         assert!(render_batch_manifest(&package, &[]).contains(dependency));
     }
@@ -1667,9 +1667,9 @@ mod tests {
             source: RustSource::new("fn main() {}\n".to_string()),
         };
         let dep = RustCargoDependency {
-            name: name("anvyx_core2"),
-            package: Some(package_name("anvyx-core2")),
-            source: RustCargoDependencySource::Path("../core2".to_string()),
+            name: name("anvyx_core"),
+            package: Some(package_name("anvyx-core")),
+            source: RustCargoDependencySource::Path("../core".to_string()),
             features: vec![],
             default_features: true,
         };
@@ -1691,7 +1691,7 @@ mod tests {
         assert_ne!(with.crate_identity, without.crate_identity);
         assert!(
             render_batch_manifest(&with.package, &with.cases)
-                .contains("anvyx_core2 = { package = \"anvyx-core2\", path = \"../core2\" }")
+                .contains("anvyx_core = { package = \"anvyx-core\", path = \"../core\" }")
         );
     }
 

@@ -1,5 +1,4 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern fn on_click(callback: escaping fn()) -> void;

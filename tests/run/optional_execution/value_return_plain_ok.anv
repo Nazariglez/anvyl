@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 9
+
+fn make() -> int? {
+    9
+}
+
+fn main() {
+    println(make() ?? 0);
+}

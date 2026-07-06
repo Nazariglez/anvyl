@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: success
+// @match: hello
+
+const MESSAGE: string = "hello";
+
+fn main() { println(MESSAGE); }

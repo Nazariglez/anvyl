@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// -1
+// 0
+// -1
+// 3
+// 0
+// 0
+// -1
+// @match-end
+
+fn print_nested(slot: Option<int?>) {
+    if let inner? = slot {
+        if let value? = inner {
+            println(value);
+        } else {
+            println(0);
+        }
+    } else {
+        println(-1);
+    }
+}
+
+fn main() {
+    var slots: [string: int?] = ["a": 1];
+
+    print_nested(slots.remove("a"));
+    print_nested(slots["a"]);
+
+    slots["a"] = nil;
+    print_nested(slots.remove("a"));
+    print_nested(slots.remove("a"));
+
+    slots["a"] = 3;
+    print_nested(slots["a"]);
+
+    slots["a"] = nil;
+    print_nested(slots["a"]);
+    print_nested(slots.remove("a"));
+    print_nested(slots["a"]);
+}

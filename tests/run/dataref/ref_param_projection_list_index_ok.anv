@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @skip: dataref list-index mutable-place projections are future work
+// @match: 2
+
+dataref Bag {
+    values: [int],
+}
+
+fn bump(ref value: int) {
+    value += 1;
+}
+
+fn main() {
+    var bag = Bag { values: [1] };
+    bump(bag.values[0]);
+    println(bag.values[0]);
+}

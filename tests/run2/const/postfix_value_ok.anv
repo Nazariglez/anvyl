@@ -1,8 +1,0 @@
-// @mode: run
-// @frontend: new
-// @expect: success
-// @match: 5
-
-const MESSAGE: string = "hello";
-
-fn main() { println(MESSAGE.len()); }

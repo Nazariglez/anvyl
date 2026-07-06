@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
 // @contains: `escaping` cannot be combined with `ref`
-// @frontend: new
 
 type Bad = fn(ref escaping fn());

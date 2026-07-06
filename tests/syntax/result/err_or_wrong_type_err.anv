@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: expected `string`, found `int`
-// @frontend: new
 
 fn main() {
     let r: Result<int, string> = Result.Ok(1);

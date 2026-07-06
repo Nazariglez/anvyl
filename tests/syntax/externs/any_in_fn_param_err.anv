@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: any is only allowed in extern boundary signatures
 
 fn foo(x: any) -> int { 0 }

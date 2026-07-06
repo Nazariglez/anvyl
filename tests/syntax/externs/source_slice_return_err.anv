@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: slice types are only allowed in function parameters
 
 extern fn values() -> slice[int];

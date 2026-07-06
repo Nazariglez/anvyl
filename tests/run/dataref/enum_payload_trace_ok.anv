@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match: yes
+
+enum Flag {
+    Yes,
+    No,
+}
+
+dataref Boxed {
+    flag: Flag,
+}
+
+fn main() {
+    let boxed = Boxed { flag: Flag.Yes };
+    match boxed.flag {
+        Flag.Yes => println("yes"),
+        Flag.No => println("no"),
+    }
+}

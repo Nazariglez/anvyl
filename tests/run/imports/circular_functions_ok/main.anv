@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: done
-
-import ping { start_ping };
-
-fn main() {
-    println(start_ping(3));
-}

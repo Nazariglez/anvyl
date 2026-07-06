@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+struct Point {
+    x: int,
+}
+
+fn bump(ref point: Point) {
+    point.x += 1;
+}
+
+fn main() {
+    var point = Point { x: 1 };
+    bump(point);
+    println(point.x);
+}

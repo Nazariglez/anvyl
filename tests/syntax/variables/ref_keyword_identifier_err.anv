@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: Unexpected token 'ref'
-// @frontend: new
 
 fn main() {
     let ref = 1;

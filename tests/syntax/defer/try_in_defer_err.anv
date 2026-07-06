@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try inside defer
-// @frontend: new
 
 fn read() -> Result<int, string> {
     Result.Ok(1)

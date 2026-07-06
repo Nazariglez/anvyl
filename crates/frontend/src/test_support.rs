@@ -69,24 +69,24 @@ pub(crate) fn core_option_type(inner: Type) -> Type {
     )
 }
 
-const CORE_ROOT_SOURCE: &str = include_str!("../../core2/src/lib.anv");
+const CORE_ROOT_SOURCE: &str = include_str!("../../core/src/lib.anv");
 const CORE_MODULE_SOURCES: &[(&[&str], &str)] = &[
-    (&["option"], include_str!("../../core2/src/option.anv")),
-    (&["result"], include_str!("../../core2/src/result.anv")),
-    (&["range"], include_str!("../../core2/src/range.anv")),
+    (&["option"], include_str!("../../core/src/option.anv")),
+    (&["result"], include_str!("../../core/src/result.anv")),
+    (&["range"], include_str!("../../core/src/range.anv")),
     (
         &["collections"],
-        include_str!("../../core2/src/collections.anv"),
+        include_str!("../../core/src/collections.anv"),
     ),
-    (&["runtime"], include_str!("../../core2/src/runtime.anv")),
-    (&["core_int"], include_str!("../../core2/src/core_int.anv")),
+    (&["runtime"], include_str!("../../core/src/runtime.anv")),
+    (&["core_int"], include_str!("../../core/src/core_int.anv")),
     (
         &["core_float"],
-        include_str!("../../core2/src/core_float.anv"),
+        include_str!("../../core/src/core_float.anv"),
     ),
     (
         &["core_string"],
-        include_str!("../../core2/src/core_string.anv"),
+        include_str!("../../core/src/core_string.anv"),
     ),
 ];
 

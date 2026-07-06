@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 const X = false && (1 / 0 == 0);
 const N = X ? 1 : 2;

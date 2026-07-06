@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+struct Payload {
+    xs: [int],
+}
+
+dataref Box {
+    payload: Payload,
+}
+
+fn main() {
+    let b = Box { payload: Payload { xs: [1, 2] } };
+    println(b.payload.xs[1]);
+}

@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+struct State {
+    values: [int],
+}
+
+lazy var state = State { values: [1, 2] };
+
+fn reset() {
+    state = State { values: [] };
+}
+
+fn main() {
+    for value in state.values {
+        reset();
+        println(value);
+    }
+}

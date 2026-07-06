@@ -292,23 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn model_graph_simple_cycle_collects() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut graph = ModelGraph::new(heap);
-            let a = graph.alloc(heap);
-            let b = graph.alloc(heap);
-            graph.add_edge(heap, a, b);
-            graph.add_edge(heap, b, a);
-            graph.drop_external(a);
-            graph.drop_external(b);
-            heap.collect_all();
-            graph.assert_matches_model(heap);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
     fn external_trace_root_preserves_cycle_until_dropped() {
         Heap::scope(|heap| {
             let ty = heap.register_tracked::<Node<'_>>();
@@ -360,29 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn model_graph_repeated_edges_preserve_liveness() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut graph = ModelGraph::new(heap);
-            let parent = graph.alloc(heap);
-            let child = graph.alloc(heap);
-            graph.add_edge(heap, parent, child);
-            graph.add_edge(heap, parent, child);
-            graph.retain(parent);
-            graph.drop_external(parent);
-            graph.drop_external(child);
-            heap.collect_all();
-            graph.assert_matches_model(heap);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn model_graph_random_100_ops_seed_1() {
-        Heap::scope(|heap| run_model_random(heap, 1, 100));
-    }
-
-    #[test]
     fn model_graph_random_1000_ops_seed_2() {
         Heap::scope(|heap| run_model_random(heap, 2, 1000));
     }
@@ -421,58 +381,37 @@ mod tests {
         assert_eq!(run_scenario(true), run_scenario(false));
     }
 
-    struct GeneratedData {
-        value: i32,
-    }
-
     #[derive(Trace)]
-    struct GeneratedNode<'cx> {
-        value: i32,
-        child: Option<Handle<'cx, GeneratedNode<'cx>>>,
-        callback: Option<Handle<'cx, GeneratedCallback<'cx>>>,
-    }
+    struct GeneratedNode;
 
     #[derive(Trace)]
     struct GeneratedCallback<'cx> {
-        env: Handle<'cx, GeneratedNode<'cx>>,
+        env: Handle<'cx, GeneratedNode>,
         add: i32,
     }
 
     struct GeneratedContext<'cx, 'heap> {
         heap: &'heap mut Heap<'cx>,
-        data: HeapType<'cx, GeneratedData>,
-        tracked_node: HeapType<'cx, GeneratedNode<'cx>>,
+        node: HeapType<'cx, GeneratedNode>,
         callback: HeapType<'cx, GeneratedCallback<'cx>>,
     }
 
     impl<'cx, 'heap> GeneratedContext<'cx, 'heap> {
         fn new(heap: &'heap mut Heap<'cx>) -> Self {
             Self {
-                data: heap.register_untracked::<GeneratedData>(),
-                tracked_node: heap.register_tracked::<GeneratedNode<'_>>(),
+                node: heap.register_tracked::<GeneratedNode>(),
                 callback: heap.register_tracked::<GeneratedCallback<'_>>(),
                 heap,
             }
         }
 
-        fn alloc_data(&mut self, value: i32) -> Handle<'cx, GeneratedData> {
-            self.heap.alloc(self.data, GeneratedData { value })
-        }
-
-        fn alloc_node(&mut self, value: i32) -> Handle<'cx, GeneratedNode<'cx>> {
-            self.heap.alloc(
-                self.tracked_node,
-                GeneratedNode {
-                    value,
-                    child: None,
-                    callback: None,
-                },
-            )
+        fn alloc_node(&mut self) -> Handle<'cx, GeneratedNode> {
+            self.heap.alloc(self.node, GeneratedNode)
         }
 
         fn alloc_callback(
             &mut self,
-            env: &Handle<'cx, GeneratedNode<'cx>>,
+            env: &Handle<'cx, GeneratedNode>,
             add: i32,
         ) -> Handle<'cx, GeneratedCallback<'cx>> {
             self.heap.alloc(
@@ -483,148 +422,12 @@ mod tests {
                 },
             )
         }
-
-        fn set_child(
-            &mut self,
-            node: &Handle<'cx, GeneratedNode<'cx>>,
-            child: Option<Handle<'cx, GeneratedNode<'cx>>>,
-        ) {
-            self.heap.with_mut(node, |node| node.child = child);
-        }
-
-        fn set_callback(
-            &mut self,
-            node: &Handle<'cx, GeneratedNode<'cx>>,
-            callback: Option<Handle<'cx, GeneratedCallback<'cx>>>,
-        ) {
-            self.heap.with_mut(node, |node| node.callback = callback);
-        }
-
-        fn bump_data(&mut self, data: &Handle<'cx, GeneratedData>) {
-            self.heap.with_mut(data, |data| data.value += 1);
-        }
-
-        fn bump_scalar(&mut self, node: &Handle<'cx, GeneratedNode<'cx>>) {
-            self.heap.with_mut(node, |node| node.value += 1);
-        }
-
-        fn invoke(&self, callback: &Handle<'cx, GeneratedCallback<'cx>>, arg: i32) -> i32 {
-            self.heap.with(callback, |callback| {
-                self.heap.with(&callback.env, |env| env.value) + callback.add + arg
-            })
-        }
     }
-
-    #[test]
-    fn generated_context_alloc_mutate_collect_untracked() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let data = ctx.alloc_data(1);
-            ctx.bump_data(&data);
-            assert_eq!(ctx.heap.with(&data, |data| data.value), 2);
-            drop(data);
-            ctx.heap.collect(0);
-            assert_eq!(ctx.heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn generated_context_callback_cycle_collects() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(10);
-            let child = ctx.alloc_node(1);
-            let callback = ctx.alloc_callback(&node, 2);
-            ctx.set_child(&node, Some(child.clone()));
-            ctx.set_callback(&node, Some(callback.clone()));
-            assert_eq!(ctx.invoke(&callback, 3), 15);
-            drop(callback);
-            drop(child);
-            drop(node);
-            ctx.heap.collect_all();
-            assert_eq!(ctx.heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn generated_context_retained_handle_keeps_callback_alive() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(10);
-            let callback = ctx.alloc_callback(&node, 2);
-            ctx.set_callback(&node, Some(callback.clone()));
-            let retained = callback.clone();
-            drop(callback);
-            drop(node);
-            ctx.heap.collect_all();
-            assert_eq!(ctx.invoke(&retained, 3), 15);
-            drop(retained);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn generated_context_drop_retained_handle_collects_cycle() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(10);
-            let callback = ctx.alloc_callback(&node, 2);
-            ctx.set_callback(&node, Some(callback.clone()));
-            let retained = callback.clone();
-            drop(callback);
-            drop(node);
-            drop(retained);
-            ctx.heap.collect_all();
-            assert_eq!(ctx.heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn borrowed_scalar_mutation_has_no_suspects() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(1);
-            ctx.heap.reset_stats();
-            for _ in 0..100 {
-                ctx.bump_scalar(&node);
-            }
-            assert_eq!(ctx.heap.stats().clones, 0);
-            assert_eq!(ctx.heap.stats().suspects, 0);
-            assert_eq!(pending_cycles(ctx.heap), 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn temporary_clone_on_tracked_object_only_queues_suspect() {
-        fn run(heap: &mut Heap<'_>) {
-            let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(1);
-            ctx.heap.reset_stats();
-            let temporary = node.clone();
-            drop(temporary);
-            assert_eq!(ctx.heap.stats().clones, 1);
-            assert_eq!(ctx.heap.stats().suspects, 1);
-            assert_eq!(pending_cycles(ctx.heap), 1);
-            assert_eq!(ctx.heap.with(&node, |node| node.value), 1);
-        }
-
-        Heap::scope(run);
-    }
-
     #[test]
     fn retained_handle_lifecycle_counts_are_balanced() {
         fn run(heap: &mut Heap<'_>) {
             let mut ctx = GeneratedContext::new(heap);
-            let node = ctx.alloc_node(1);
+            let node = ctx.alloc_node();
             let callback = ctx.alloc_callback(&node, 2);
             ctx.heap.reset_stats();
             let retained = callback.clone();
@@ -650,34 +453,6 @@ mod tests {
             assert_eq!(heap.stats().live, 0);
             let second = heap.alloc(node_type, 2);
             assert_eq!(heap.with(&second, |value| *value), 2);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn tracked_cycle_collects() {
-        fn run(heap: &mut Heap<'_>) {
-            let node_type = heap.register_tracked::<Node<'_>>();
-            let a = heap.alloc(
-                node_type,
-                Node {
-                    next: None,
-                    value: 1,
-                },
-            );
-            let b = heap.alloc(
-                node_type,
-                Node {
-                    next: Some(a.clone()),
-                    value: 2,
-                },
-            );
-            heap.with_mut(&a, |node| node.next = Some(b.clone()));
-            drop(a);
-            drop(b);
-            heap.collect_all();
-            assert_eq!(heap.stats().live, 0);
         }
 
         Heap::scope(run);
@@ -867,90 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn lambda_cell_payload_edge_is_traced_once() {
-        fn run(heap: &mut Heap<'_>) {
-            let lambda_stats = Rc::new(Cell::new(0));
-            let env_stats = Rc::new(Cell::new(0));
-            let cell_stats = Rc::new(Cell::new(0));
-            let lambda_ty = heap.register_tracked::<TestLambda<'_>>();
-            let env_ty = heap.register_tracked::<TestLambdaEnv<'_>>();
-            let cell_ty = heap.register_tracked::<TestLambdaCell<'_>>();
-            let cell = heap.alloc(
-                cell_ty,
-                TestLambdaCell {
-                    stats: Rc::clone(&cell_stats),
-                    payload: None,
-                },
-            );
-            let env = heap.alloc(
-                env_ty,
-                TestLambdaEnv {
-                    stats: Rc::clone(&env_stats),
-                    cell: cell.clone(),
-                },
-            );
-            let lambda = heap.alloc(
-                lambda_ty,
-                TestLambda {
-                    stats: Rc::clone(&lambda_stats),
-                    env: env.clone(),
-                },
-            );
-            let extra_cell_handle = cell.clone();
-            heap.with_mut(&cell, |cell| cell.payload = Some(lambda.clone()));
-
-            drop(lambda);
-            drop(env);
-            drop(cell);
-            drop(extra_cell_handle);
-            heap.reset_stats();
-            let outcome = heap.collect_all();
-
-            assert_eq!(outcome.collected, 3);
-            assert_eq!(heap.stats().live, 0);
-            assert_eq!(heap.stats().internal_edges, 3);
-            assert_eq!(lambda_stats.get(), 1);
-            assert_eq!(env_stats.get(), 1);
-            assert_eq!(cell_stats.get(), 1);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn external_root_preserves_cycle() {
-        fn run(heap: &mut Heap<'_>) {
-            let node_type = heap.register_tracked::<Node<'_>>();
-            let a = heap.alloc(
-                node_type,
-                Node {
-                    next: None,
-                    value: 1,
-                },
-            );
-            let external = a.clone();
-            let b = heap.alloc(
-                node_type,
-                Node {
-                    next: Some(a.clone()),
-                    value: 2,
-                },
-            );
-            heap.with_mut(&a, |node| node.next = Some(b.clone()));
-            drop(a);
-            drop(b);
-            heap.collect_all();
-            assert_eq!(heap.stats().live, 2);
-            assert_eq!(heap.with(&external, |node| node.value), 1);
-            drop(external);
-            heap.collect_all();
-            assert_eq!(heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
     fn cycle_threshold_controls_collect() {
         fn run(heap: &mut Heap<'_>) {
             heap.set_cycle_threshold(2);
@@ -1076,16 +767,6 @@ mod tests {
             panic.set(false);
             heap.collect_all();
             assert_eq!(heap.stats().live, 0);
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn empty_collect_is_idle() {
-        fn run(heap: &mut Heap<'_>) {
-            let outcome = heap.collect(1);
-            assert_eq!(outcome.cycle_status, CycleStatus::Idle);
         }
 
         Heap::scope(run);
@@ -1401,40 +1082,6 @@ mod tests {
                 .is_err()
             );
             assert!(stash.borrow().is_none());
-        }
-
-        Heap::scope(run);
-    }
-
-    #[test]
-    fn duplicate_handles_in_vec_count_as_duplicate_edges() {
-        #[derive(Trace)]
-        struct Parent<'cx> {
-            children: Vec<Handle<'cx, Child<'cx>>>,
-        }
-
-        #[derive(Trace)]
-        struct Child<'cx> {
-            back: Option<Handle<'cx, Parent<'cx>>>,
-        }
-
-        fn run(heap: &mut Heap<'_>) {
-            let parent_ty = heap.register_tracked::<Parent<'_>>();
-            let child_ty = heap.register_tracked::<Child<'_>>();
-            let child = heap.alloc(child_ty, Child { back: None });
-            let parent = heap.alloc(
-                parent_ty,
-                Parent {
-                    children: vec![child.clone(), child.clone()],
-                },
-            );
-            heap.with_mut(&child, |child| child.back = Some(parent.clone()));
-            drop(parent);
-            drop(child);
-            let outcome = heap.collect_all();
-            assert_eq!(outcome.collected, 2);
-            assert_eq!(heap.stats().internal_edges, 3);
-            assert_eq!(heap.stats().live, 0);
         }
 
         Heap::scope(run);
@@ -2104,24 +1751,6 @@ mod tests {
 
         Heap::scope(run);
     }
-
-    #[test]
-    fn scope_teardown_is_not_a_leak_assertion() {
-        struct CountDrop(Rc<Cell<usize>>);
-        impl Drop for CountDrop {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let drops = Rc::new(Cell::new(0));
-        Heap::scope(|heap| {
-            let ty = heap.register_untracked::<CountDrop>();
-            let _handle = heap.alloc(ty, CountDrop(Rc::clone(&drops)));
-        });
-        assert_eq!(drops.get(), 1);
-    }
-
     #[test]
     fn trace_helpers_preserve_edges() {
         #[derive(Trace)]

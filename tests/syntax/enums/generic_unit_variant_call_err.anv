@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: variant 'Box.Empty' is not a tuple variant
 
 enum Box<T> { Full(T), Empty }

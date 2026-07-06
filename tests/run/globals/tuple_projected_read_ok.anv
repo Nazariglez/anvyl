@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 2
+// @match-end
+
+fn make_pair() -> (int, bool) {
+    println("init");
+    (2, true)
+}
+
+lazy var state = make_pair();
+
+fn main() {
+    println(state.0);
+}

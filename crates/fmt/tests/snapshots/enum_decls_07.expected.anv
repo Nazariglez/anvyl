@@ -1,0 +1,4 @@
+enum Anim: string {
+    Idle = "idle",
+    Run = "run",
+}

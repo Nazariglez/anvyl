@@ -1,0 +1,1 @@
+fn draw(x: dyn Drawable + Updatable) {}

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+import helper { local };
+import .helper { local as local2 };
+import ..outside { escaped };
+import pkg:math { add };
+import std:mem;
+
+fn main() {
+    let x: int = local() + local2() + escaped() + add();
+    mem.collect_cycles();
+}

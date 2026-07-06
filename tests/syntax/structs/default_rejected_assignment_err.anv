@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: Assign expressions cannot be used as default initializers
 

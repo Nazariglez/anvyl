@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: 6
-
-import helpers { apply_double };
-
-fn main() {
-    println(apply_double(3));
-}

@@ -1,0 +1,5 @@
+// @helper
+
+pub extend string {
+    fn shout(self) -> string { self }
+}

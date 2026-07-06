@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn main() {
+    var n = 0;
+    let outer = |ref x: int| {
+        let inner = || {
+            x += 1;
+        };
+        inner();
+    };
+    outer(n);
+    println(n);
+}

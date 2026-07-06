@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+fn tick() { println("ok"); }
+fn keep(f: escaping fn()) { f(); }
+
+fn main() {
+    let fs: [string: fn()] = ["tick": tick];
+    let Option.Some(f) = fs["tick"] else return;
+    keep(f);
+}

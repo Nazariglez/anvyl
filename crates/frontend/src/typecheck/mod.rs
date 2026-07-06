@@ -843,6 +843,12 @@ pub(crate) enum TypeError {
         span: Option<SourceSpan>,
     },
 }
+impl From<Box<TypeError>> for TypeError {
+    fn from(error: Box<TypeError>) -> Self {
+        *error
+    }
+}
+
 impl TypeError {
     pub(crate) fn span(&self) -> Option<SourceSpan> {
         match self {
@@ -1741,7 +1747,7 @@ impl TypeChecker {
             .define_binding(binding_id, name, type_id, kind, scope_depth);
     }
 
-    fn define(&mut self, name: Ident, ty: Type, mutable: bool) {
+    fn define(&mut self, name: Ident, ty: &Type, mutable: bool) {
         self.define_value(name, ty, LocalBindingKind::from_mutable(mutable), None);
     }
 
@@ -1836,14 +1842,14 @@ impl TypeChecker {
         });
     }
 
-    fn define_const(&mut self, name: Ident, ty: Type, value: ConstValue) {
+    fn define_const(&mut self, name: Ident, ty: &Type, value: ConstValue) {
         self.define_value(name, ty, LocalBindingKind::constant(), Some(value));
     }
 
     fn define_value(
         &mut self,
         name: Ident,
-        ty: Type,
+        ty: &Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
     ) -> Option<DefinedLocal> {
@@ -1853,13 +1859,13 @@ impl TypeChecker {
     fn define_value_with_alias(
         &mut self,
         name: Ident,
-        ty: Type,
+        ty: &Type,
         kind: LocalBindingKind,
         const_value: Option<ConstValue>,
         alias: Option<place::AliasTarget>,
     ) -> Option<DefinedLocal> {
         let binding_id = self.fresh_binding_id();
-        let type_id = self.solver.alloc_local_type(&ty);
+        let type_id = self.solver.alloc_local_type(ty);
         let info = VarInfo::new(binding_id, type_id, kind)
             .with_const_value(const_value)
             .with_alias(alias);
@@ -1946,9 +1952,9 @@ impl TypeChecker {
             .unwrap_or(false)
     }
 
-    fn define_local_callable(&mut self, name: Ident, callee: CallableRef, surface_ty: Type) {
+    fn define_local_callable(&mut self, name: Ident, callee: CallableRef, surface_ty: &Type) {
         let binding_id = self.fresh_binding_id();
-        let type_id = self.solver.alloc_local_type(&surface_ty);
+        let type_id = self.solver.alloc_local_type(surface_ty);
         let info = LocalCallableInfo::new(binding_id, type_id, callee);
         if !self.define_local_symbol(name, LocalSymbol::callable(info.clone())) {
             return;
@@ -1996,7 +2002,7 @@ impl TypeChecker {
         LocalSymbolLookup::Found(symbol, depth)
     }
 
-    fn local_value_from_info(&self, info: VarInfo, depth: usize) -> LocalValue {
+    fn local_value_from_info(info: VarInfo, depth: usize) -> LocalValue {
         LocalValue {
             info,
             source_depth: depth,
@@ -2021,7 +2027,7 @@ impl TypeChecker {
         self.named_function_frames.pop();
     }
 
-    fn local_value_access(&self, value: &LocalValue) -> LocalPlaceAccess {
+    fn local_value_access(value: &LocalValue) -> LocalPlaceAccess {
         let alias = value.info.alias.as_deref();
         let access = alias.map_or_else(|| value.info.kind.place_access(), |alias| alias.access);
         let (facts, identity, accepts_extern_any) = match alias {
@@ -2051,14 +2057,14 @@ impl TypeChecker {
         value: &LocalValue,
         mode: Option<LocalUseMode>,
     ) -> (place::PlaceValue, bool) {
-        let checked = checked_from_handle(expr, self.local_handle(value.info.type_id), self);
+        let checked = checked_from_handle(expr, &Self::local_handle(value.info.type_id), self);
         self.record_local_read(expr.node.id, value);
         if let Some(mode) = mode
             && value.info.kind.is_air_local()
         {
             self.record_local_use(expr.node.id, value.info.type_id, mode);
         }
-        let access = self.local_value_access(value);
+        let access = Self::local_value_access(value);
         let mut place = place::PlaceValue::new(checked, access.access, access.facts);
         place.identity = access.identity;
         place.root_local = Some(value.info.type_id);
@@ -2068,21 +2074,21 @@ impl TypeChecker {
         (place, access.accepts_extern_any)
     }
 
-    fn type_handle(&self, ty: &Type) -> TypeHandle {
-        self.solver.concrete_type(ty)
+    fn type_handle(ty: &Type) -> TypeHandle {
+        Solver::concrete_type(ty)
     }
 
-    fn local_handle(&self, id: SemanticLocalId) -> TypeHandle {
-        self.solver.local_handle(id)
+    fn local_handle(id: SemanticLocalId) -> TypeHandle {
+        Solver::local_handle(id)
     }
 
-    fn set_type(&mut self, id: ExprId, ty: Type, span: Span) -> TypeHandle {
+    fn set_type(&mut self, id: ExprId, ty: &Type, span: Span) -> TypeHandle {
         let span = self.error_span(span);
         if matches!(ty, Type::Infer) {
             self.set_poison_type(id, span)
         } else {
-            self.solver.set_expr_type_from_type(id, span, &ty);
-            let handle = self.solver.expr_handle(id);
+            self.solver.set_expr_type_from_type(id, span, ty);
+            let handle = Solver::expr_handle(id);
             self.record_expr_type(id, span, &handle);
             handle
         }
@@ -2361,7 +2367,7 @@ impl TypeChecker {
         owner_key: NominalKey,
         field: Ident,
         slot: usize,
-        default: FieldDefault,
+        default: &FieldDefault,
         ty: Type,
     ) {
         self.semantic_facts.record_default_field(
@@ -2469,7 +2475,7 @@ impl TypeChecker {
     fn record_resolved_dyn_call(
         &mut self,
         site: SemanticExprSite,
-        receiver: SemanticExprSite,
+        receiver: &SemanticExprSite,
         contract: ContractSetKey,
         method: Ident,
         arg_count: usize,
@@ -2494,7 +2500,7 @@ impl TypeChecker {
     fn record_resolved_dyn_downcast(
         &mut self,
         site: SemanticExprSite,
-        source: SemanticExprSite,
+        source: &SemanticExprSite,
         source_contract: ContractSetKey,
         target: Type,
         mutable: bool,
@@ -2637,8 +2643,8 @@ impl TypeChecker {
         candidates.push((span, handle));
     }
 
-    fn push_error(&mut self, err: TypeError) {
-        self.errors.push(err);
+    fn push_error(&mut self, err: impl Into<TypeError>) {
+        self.errors.push(err.into());
     }
 
     fn push_warning(&mut self, warning: CompileWarning) {
@@ -2932,7 +2938,7 @@ impl TypeChecker {
                             &callable.def.sig.ret,
                         );
                         for (args, params, return_ty) in instances {
-                            facts.functions.push(self.semantic_function_fact(
+                            facts.functions.push(Self::semantic_function_fact(
                                 module, func_node, &callable, args, params, return_ty,
                             ));
                         }
@@ -2998,7 +3004,7 @@ impl TypeChecker {
                                     }
                                 };
                                 debug_assert_eq!(callable.def.id, id);
-                                facts.functions.push(self.semantic_method_fact(
+                                facts.functions.push(Self::semantic_method_fact(
                                     module,
                                     method,
                                     agg_node.span,
@@ -3097,7 +3103,7 @@ impl TypeChecker {
                         owner_args,
                     ),
                 };
-                facts.functions.push(self.semantic_extend_method_fact(
+                facts.functions.push(Self::semantic_extend_method_fact(
                     module,
                     method,
                     method_node.span,
@@ -3111,7 +3117,6 @@ impl TypeChecker {
     }
 
     fn semantic_function_fact(
-        &self,
         module: &SourceModuleFactsInput,
         func_node: &FuncNode,
         callable: &CallableRef,
@@ -3132,7 +3137,7 @@ impl TypeChecker {
                 escape: sig.escape,
             })
             .collect();
-        self.semantic_callable_fact(
+        Self::semantic_callable_fact(
             module,
             callable,
             args,
@@ -3145,7 +3150,6 @@ impl TypeChecker {
     }
 
     fn semantic_method_fact(
-        &self,
         module: &SourceModuleFactsInput,
         method: &Method,
         span: Span,
@@ -3154,7 +3158,7 @@ impl TypeChecker {
         param_types: Vec<FuncParam>,
         ret: ReturnSpec,
     ) -> SemanticFunctionInstanceFact {
-        self.semantic_method_like_fact(
+        Self::semantic_method_like_fact(
             module,
             SemanticMethodLikeInput {
                 name: method.sig.name,
@@ -3171,7 +3175,6 @@ impl TypeChecker {
     }
 
     fn semantic_extend_method_fact(
-        &self,
         module: &SourceModuleFactsInput,
         method: &ExtendMethod,
         span: Span,
@@ -3180,7 +3183,7 @@ impl TypeChecker {
         param_types: Vec<FuncParam>,
         ret: ReturnSpec,
     ) -> SemanticFunctionInstanceFact {
-        self.semantic_method_like_fact(
+        Self::semantic_method_like_fact(
             module,
             SemanticMethodLikeInput {
                 name: method.sig.name,
@@ -3197,7 +3200,6 @@ impl TypeChecker {
     }
 
     fn semantic_method_like_fact(
-        &self,
         module: &SourceModuleFactsInput,
         input: SemanticMethodLikeInput<'_>,
     ) -> SemanticFunctionInstanceFact {
@@ -3224,7 +3226,7 @@ impl TypeChecker {
                     escape: sig.escape,
                 }),
         );
-        self.semantic_callable_fact(
+        Self::semantic_callable_fact(
             module,
             input.callable,
             input.args,
@@ -3237,7 +3239,6 @@ impl TypeChecker {
     }
 
     fn semantic_callable_fact(
-        &self,
         module: &SourceModuleFactsInput,
         callable: &CallableRef,
         args: GenericArgs,
@@ -3348,7 +3349,7 @@ impl TypeChecker {
                 errors,
                 warnings,
                 lint_events,
-                diagnostic_context,
+                diagnostic_context: Box::new(diagnostic_context),
             }),
         }
     }
@@ -3361,7 +3362,7 @@ impl TypeChecker {
             .collect::<Vec<_>>();
         let mut has_errors = false;
         for (local, body) in records {
-            let (ty, errors) = self.finalize_handle_type(&self.solver.local_handle(local));
+            let (ty, errors) = self.finalize_handle_type(&Solver::local_handle(local));
             has_errors |= errors;
             self.semantic_facts.finish_local_def(&body, local, ty);
         }
@@ -3757,7 +3758,7 @@ pub(crate) fn check_with_modules(
             failure.errors,
             failure.warnings,
             failure.lint_events,
-            failure.diagnostic_context,
+            *failure.diagnostic_context,
         ),
     }
 }
@@ -3789,7 +3790,7 @@ fn typechecker_for_modules(
                 errors: errors.into_iter().map(TypeError::ExternCatalog).collect(),
                 warnings: vec![],
                 lint_events: vec![],
-                diagnostic_context,
+                diagnostic_context: Box::new(diagnostic_context),
             });
         }
     };
@@ -3931,7 +3932,7 @@ impl TryCarrier {
     fn operand_handle(&self, success: TypeHandle, tc: &mut TypeChecker) -> TypeHandle {
         let mut args = vec![success];
         if let Some(error) = &self.error {
-            args.push(tc.type_handle(error));
+            args.push(TypeChecker::type_handle(error));
         }
         tc.solver.nominal_handle(&self.nominal, args)
     }
@@ -3958,13 +3959,13 @@ struct TryOperandHint {
     success_matches_result_error: bool,
 }
 
-fn checked_type(ty: Type, tc: &TypeChecker) -> CheckedType {
-    let handle = tc.type_handle(&ty);
+fn checked_type(ty: Type) -> CheckedType {
+    let handle = TypeChecker::type_handle(&ty);
     CheckedType::new(ty, handle)
 }
 
-fn checked_void(tc: &TypeChecker) -> CheckedType {
-    checked_type(Type::Void, tc)
+fn checked_void() -> CheckedType {
+    checked_type(Type::Void)
 }
 
 fn join_checked(
@@ -3975,14 +3976,14 @@ fn join_checked(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     match (left.ty.is_void(), right.ty.is_void()) {
-        (true, true) => return checked_void(tc),
+        (true, true) => return checked_void(),
         (true, false) => {
             tc.push_error(TypeError::TypeMismatch {
                 expected: right.ty,
                 found: Type::Void,
                 span: tc.error_span(left_span),
             });
-            return checked_void(tc);
+            return checked_void();
         }
         (false, true) => {
             tc.push_error(TypeError::TypeMismatch {
@@ -3990,7 +3991,7 @@ fn join_checked(
                 found: Type::Void,
                 span: tc.error_span(right_span),
             });
-            return checked_void(tc);
+            return checked_void();
         }
         (false, false) => {}
     }
@@ -4035,7 +4036,7 @@ fn checked_from_type(expr: &ExprNode, ty: Type, tc: &mut TypeChecker) -> Checked
     if matches!(ty, Type::Infer) {
         return checked_poison(expr, tc);
     }
-    let handle = tc.set_type(expr.node.id, ty.clone(), expr.span);
+    let handle = tc.set_type(expr.node.id, &ty, expr.span);
     CheckedType::new(ty, handle)
 }
 
@@ -4044,15 +4045,15 @@ fn checked_poison(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedType {
     CheckedType::new(Type::Infer, handle)
 }
 
-fn checked_from_handle(expr: &ExprNode, handle: TypeHandle, tc: &mut TypeChecker) -> CheckedType {
-    let handle = tc.set_type_from_handle(expr.node.id, expr.span, &handle);
+fn checked_from_handle(expr: &ExprNode, handle: &TypeHandle, tc: &mut TypeChecker) -> CheckedType {
+    let handle = tc.set_type_from_handle(expr.node.id, expr.span, handle);
     let ty = tc.handle_type(&handle);
     CheckedType::new(ty, handle)
 }
 
 fn checked_from_checked(
     expr: &ExprNode,
-    checked: CheckedType,
+    checked: &CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let handle = tc.set_type_from_handle(expr.node.id, expr.span, &checked.handle);
@@ -4062,7 +4063,7 @@ fn checked_from_checked(
 
 fn solve_and_checked_from_handle(
     expr: &ExprNode,
-    handle: TypeHandle,
+    handle: &TypeHandle,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     tc.solve_constraints();
@@ -4139,7 +4140,7 @@ pub(in crate::typecheck) fn validate_const_expr_type(
     expr: &ExprNode,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
-) -> Result<Type, TypeError> {
+) -> Result<Type, Box<TypeError>> {
     let error_count = tc.errors.len();
     let checked = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
     if let Some(expected) = expected {
@@ -4151,7 +4152,7 @@ pub(in crate::typecheck) fn validate_const_expr_type(
     }
     let error = tc.errors[error_count].clone();
     tc.errors.truncate(error_count);
-    Err(error)
+    Err(Box::new(error))
 }
 
 fn check_arg_count(
@@ -4204,7 +4205,7 @@ fn check_expr_checked_with_hint(
             Some(expected) => {
                 let nil = tc.fresh_nil_handle(expr.span);
                 tc.expect_assignable_expr(expr.span, expr.node.id, nil, expected.clone());
-                checked_from_handle(expr, expected, tc)
+                checked_from_handle(expr, &expected, tc)
             }
             None => {
                 let handle = tc.set_nil_type(expr.node.id, expr.span);
@@ -4231,7 +4232,7 @@ fn check_expr_checked_with_hint(
                     if let Some(checked) = tc.check_local_const_value_expr(expr, *name, info) {
                         return checked;
                     }
-                    let value = tc.local_value_from_info(info.clone(), depth);
+                    let value = TypeChecker::local_value_from_info(info.clone(), depth);
                     let (place, _) =
                         tc.local_place_value(expr, *name, &value, Some(LocalUseMode::Read));
                     tc.check_mut_alias_root_use(Some(*name), &place.identity, expr.span);
@@ -4251,8 +4252,11 @@ fn check_expr_checked_with_hint(
                             checked_from_type(expr, Type::Infer, tc)
                         }
                         None => {
-                            let checked =
-                                checked_from_handle(expr, tc.local_handle(info.type_id), tc);
+                            let checked = checked_from_handle(
+                                expr,
+                                &TypeChecker::local_handle(info.type_id),
+                                tc,
+                            );
                             tc.record_function_value_expr(
                                 expr.node.id,
                                 &checked.ty,
@@ -4275,7 +4279,8 @@ fn check_expr_checked_with_hint(
                             tc.check_const_value_expr(expr, value)
                         }
                         ValueDecl::Global(sig) => {
-                            let checked = checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                            let checked =
+                                checked_from_handle(expr, &tc.global_handle(&sig.key), tc);
                             let value = place::global_value(sig, expr.node.id, checked);
                             tc.record_expr_place(expr.node.id, &value);
                             place::record_value_read(expr.node.id, &value, tc);
@@ -4326,26 +4331,28 @@ fn check_expr_checked_with_hint(
                 ResolvedIdentSubject::Module(_) | ResolvedIdentSubject::Type(_) => unreachable!(),
             }
         }
-        ExprKind::Binary(bin_node) => {
-            checked_from_checked(expr, check_binary(expr.node.id, bin_node, expected, tc), tc)
-        }
+        ExprKind::Binary(bin_node) => checked_from_checked(
+            expr,
+            &check_binary(expr.node.id, bin_node, expected.as_ref(), tc),
+            tc,
+        ),
         ExprKind::Unary(unary_node) => {
-            checked_from_checked(expr, check_unary(expr.node.id, unary_node, tc), tc)
+            checked_from_checked(expr, &check_unary(expr.node.id, unary_node, tc), tc)
         }
         ExprKind::Try(try_node) => {
-            checked_from_checked(expr, check_try(try_node, expected, tc), tc)
+            checked_from_checked(expr, &check_try(try_node, expected, tc), tc)
         }
         ExprKind::Block(block_node) => {
             let checked = check_block_checked_with_hint(block_node, expected, tc);
             if let Some(tail) = &block_node.node.tail {
                 tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
             }
-            checked_from_checked(expr, checked, tc)
+            checked_from_checked(expr, &checked, tc)
         }
         ExprKind::If(if_node) => {
             let checked =
                 control_flow::check_if_checked_with_hint(if_node, expected, expr.node.id, tc);
-            checked_from_checked(expr, checked, tc)
+            checked_from_checked(expr, &checked, tc)
         }
         ExprKind::Ternary(ternary_node) => {
             let checked = control_flow::check_ternary_checked_with_hint(
@@ -4354,21 +4361,21 @@ fn check_expr_checked_with_hint(
                 expr.node.id,
                 tc,
             );
-            checked_from_checked(expr, checked, tc)
+            checked_from_checked(expr, &checked, tc)
         }
         ExprKind::Assign(assign_node) => {
             check_assign(expr.node.id, assign_node, tc);
             checked_from_type(expr, Type::Void, tc)
         }
-        ExprKind::StructLiteral(lit) => check_struct_lit_hint(expr, lit, expected, tc),
+        ExprKind::StructLiteral(lit) => check_struct_lit_hint(expr, lit, expected.as_ref(), tc),
         ExprKind::InferredEnum(node) => check_inferred_enum_hint(expr, node, expected, tc),
         ExprKind::Field(_) | ExprKind::Call(_) | ExprKind::Index(_) | ExprKind::TupleIndex(_) => {
             let chain = collect_postfix_chain(expr).expect("postfix chain");
             check_postfix_chain(&chain, expr, expected.as_ref(), tc)
         }
-        ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected, tc),
-        ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected, tc),
-        ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected, tc),
+        ExprKind::Tuple(elems) => check_tuple_checked_with_hint(expr, elems, expected.as_ref(), tc),
+        ExprKind::ArrayLiteral(lit) => check_array_lit_hint(expr, lit, expected.as_ref(), tc),
+        ExprKind::ArrayFill(fill) => check_array_fill_hint(expr, fill, expected.as_ref(), tc),
         ExprKind::IfLet(if_let_node) => {
             let checked = pattern::check_if_let_checked_with_hint(if_let_node, expected, tc);
             if let Some(tail) = &if_let_node.node.then_block.node.tail {
@@ -4379,17 +4386,17 @@ fn check_expr_checked_with_hint(
             {
                 tc.closure.copy_expr_flow(tail.node.id, expr.node.id);
             }
-            checked_from_checked(expr, checked, tc)
+            checked_from_checked(expr, &checked, tc)
         }
         ExprKind::Match(match_node) => {
             let checked =
                 control_flow::check_match_checked_with_hint(match_node, expected, expr.node.id, tc);
-            checked_from_checked(expr, checked, tc)
+            checked_from_checked(expr, &checked, tc)
         }
         ExprKind::StringInterp(parts) => check_string_interp(expr, parts, tc),
-        ExprKind::MapLiteral(lit) => check_map_lit_hint(expr, lit, expected, tc),
+        ExprKind::MapLiteral(lit) => check_map_lit_hint(expr, lit, expected.as_ref(), tc),
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
-        ExprKind::Range(range) => check_range_expr(expr, range, expected, tc),
+        ExprKind::Range(range) => check_range_expr(expr, range, expected.as_ref(), tc),
         ExprKind::Cast(cast) => convert::check_cast_expr(expr, cast, tc),
         ExprKind::ExactDowncast(downcast) => {
             downcast::check_expr(expr, downcast, expected.as_ref(), tc)
@@ -4641,7 +4648,7 @@ fn try_operand_field_carrier_ty(expr: &ExprNode, tc: &TypeChecker) -> Option<Typ
     let PostfixStep::Field { node, id } = chain.steps.first()? else {
         return None;
     };
-    let field = tc.solver.expr_handle(*id);
+    let field = Solver::expr_handle(*id);
     let carrier_ty = tc.solver.handle_to_partial_type(&field);
     let key = tc.decls.key_for_type(&carrier_ty)?;
     let schema = tc.decls.enum_schema(&key)?;
@@ -4791,7 +4798,7 @@ fn check_try(
             "try is not allowed in runtime global initializers",
         );
         check_value_expr_checked_with_hint(&try_node.node.expr, None, tc);
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     }
 
     if tc.in_defer() {
@@ -4837,13 +4844,13 @@ fn check_try(
             {
                 tc.push_error(error);
             }
-            return checked_type(Type::Infer, tc);
+            return checked_type(Type::Infer);
         }
         if let (Some(enclosing), Some(found)) = (&enclosing, operand_recovery_ty.as_ref())
             && let Some(found) = try_carrier_mismatch_ty(found, enclosing, tc)
         {
             push_try_invalid_carrier(enclosing, found, try_node.span, tc);
-            return checked_type(Type::Infer, tc);
+            return checked_type(Type::Infer);
         }
         if let Some(hint) = &hint {
             let ty = tc.handle_type(&hint.success);
@@ -4856,11 +4863,11 @@ fn check_try(
     }
 
     let Some(enclosing) = enclosing else {
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     };
     let Some(operand_carrier) = tc.try_carrier_parts(&operand_ty) else {
         push_try_invalid_carrier(&enclosing, operand_ty, try_node.span, tc);
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     };
     if operand_carrier.kind != enclosing.kind {
         remove_root_try_operand_error(
@@ -4871,13 +4878,13 @@ fn check_try(
             tc,
         );
         push_try_invalid_carrier(&enclosing, operand_ty, try_node.span, tc);
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     }
     if !enclosing.validate_residual(&operand_carrier, try_node.span, tc) {
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     }
 
-    let mut checked = checked_type(operand_carrier.success.clone(), tc);
+    let mut checked = checked_type(operand_carrier.success.clone());
     checked.contains_extern_any = type_closure_facts(&checked.ty).contains_any;
     checked
 }
@@ -4885,7 +4892,7 @@ fn check_try(
 fn check_binary(
     expr_id: ExprId,
     bin: &BinaryNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     if bin.node.op == BinaryOp::Coalesce {
@@ -4940,16 +4947,16 @@ fn check_nil_equality(
     let value = check_expr_checked(value_expr, tc);
     if tc.checked_is_poison(&value) {
         check_expr_checked(nil_expr, tc);
-        return Some(checked_type(Type::Infer, tc));
+        return Some(checked_type(Type::Infer));
     }
 
     if tc.decls.semantic_option_inner(&value.ty).is_some() {
         check_value_expr_checked_with_hint(nil_expr, Some(value.handle), tc);
-        return Some(checked_type(Type::Bool, tc));
+        return Some(checked_type(Type::Bool));
     }
     if matches!(value.ty, Type::Infer) {
         check_expr_checked(nil_expr, tc);
-        return Some(checked_type(Type::Bool, tc));
+        return Some(checked_type(Type::Bool));
     }
 
     let nil = check_expr_checked(nil_expr, tc);
@@ -4982,14 +4989,14 @@ fn check_coalesce(
     left_expr: &ExprNode,
     right_expr: &ExprNode,
     span: Span,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let expected_ty = expected.map(|handle| tc.handle_type(handle));
     let left_expected = expected_ty
         .as_ref()
         .map(|ty| tc.core_option_or_infer(ty.clone(), span))
-        .map(|ty| tc.type_handle(&ty));
+        .map(|ty| TypeChecker::type_handle(&ty));
     let left = check_value_expr_checked_with_hint(left_expr, left_expected, tc);
     let Some(inner) = tc.decls.semantic_option_inner(&left.ty).cloned() else {
         if matches!(left.ty, Type::Infer) {
@@ -4997,7 +5004,7 @@ fn check_coalesce(
             right.contains_extern_any |= left.contains_extern_any;
             tc.closure
                 .copy_coalesce_selected_flow(left_expr.node.id, right_expr.node.id, expr_id);
-            return checked_from_checked(right_expr, right, tc);
+            return checked_from_checked(right_expr, &right, tc);
         }
         tc.push_error(TypeError::InvalidOperand {
             op: BinaryOp::Coalesce.to_string(),
@@ -5005,7 +5012,7 @@ fn check_coalesce(
             span: tc.error_span(span),
         });
         check_expr_checked(right_expr, tc);
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     };
 
     let mut right = check_expr_checked(right_expr, tc);
@@ -5016,7 +5023,7 @@ fn check_coalesce(
         return right;
     }
 
-    let result = tc.type_handle(&inner);
+    let result = TypeChecker::type_handle(&inner);
     tc.expect_assignable_expr(
         right_expr.span,
         right_expr.node.id,
@@ -5042,12 +5049,12 @@ fn check_binary_checked(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     if tc.checked_is_poison(&left) || tc.checked_is_poison(&right) {
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     }
 
     if op == BinaryOp::Add && (left.ty.is_str() || right.ty.is_str()) {
         record_binary_stringify_conversions(left_expr, &left, right_expr, &right, tc);
-        return checked_type(Type::String, tc);
+        return checked_type(Type::String);
     }
 
     if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
@@ -5057,11 +5064,11 @@ fn check_binary_checked(
     if let (Some(lhs), Some(rhs)) = (left.ty.scalar_kind(), right.ty.scalar_kind())
         && let Some(result) = op.scalar_result(lhs, rhs)
     {
-        return checked_type(type_from_scalar(result), tc);
+        return checked_type(type_from_scalar(result));
     }
 
     extern_ops::check_binary(expr_id, op, left_expr, &left, right_expr, &right, span, tc)
-        .unwrap_or_else(|| checked_type(emit_binary_failure(op, &left.ty, &right.ty, span, tc), tc))
+        .unwrap_or_else(|| checked_type(emit_binary_failure(op, &left.ty, &right.ty, span, tc)))
 }
 
 fn check_equality(
@@ -5084,7 +5091,7 @@ fn check_equality(
                 found: right.ty,
                 span: tc.error_span(span),
             });
-            checked_type(Type::Bool, tc)
+            checked_type(Type::Bool)
         });
     }
 
@@ -5098,18 +5105,18 @@ fn check_equality(
                 operand_type: right.ty,
                 span: tc.error_span(span),
             });
-            checked_type(Type::Infer, tc)
+            checked_type(Type::Infer)
         });
     }
 
     if equatable_type(&left.ty, tc) {
-        checked_type(Type::Bool, tc)
+        checked_type(Type::Bool)
     } else {
         tc.push_error(TypeError::NotEquatable {
             ty: left.ty,
             span: tc.error_span(span),
         });
-        checked_type(Type::Infer, tc)
+        checked_type(Type::Infer)
     }
 }
 
@@ -5204,12 +5211,12 @@ fn type_mismatch(
 fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> CheckedType {
     let operand = check_expr_checked(&unary.node.expr, tc);
     if tc.checked_is_poison(&operand) {
-        return checked_type(Type::Infer, tc);
+        return checked_type(Type::Infer);
     }
     if let Some(value) = operand.ty.scalar_kind()
         && let Some(result) = unary.node.op.scalar_result(value)
     {
-        return checked_type(type_from_scalar(result), tc);
+        return checked_type(type_from_scalar(result));
     }
     extern_ops::check_unary(expr_id, unary.node.op, &operand, tc).unwrap_or_else(|| {
         tc.push_error(TypeError::InvalidOperand {
@@ -5217,7 +5224,7 @@ fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> Chec
             operand_type: operand.ty,
             span: tc.error_span(unary.span),
         });
-        checked_type(Type::Infer, tc)
+        checked_type(Type::Infer)
     })
 }
 
@@ -5325,7 +5332,7 @@ fn check_assignment_place(target: &ExprNode, tc: &mut TypeChecker) -> place::Che
         return check_place(target, tc);
     };
     let receiver = check_place(&index.node.target, tc);
-    place::check_indexed_place(target, index, receiver, tc)
+    place::check_indexed_place(target, index, &receiver, tc)
 }
 
 fn check_simple_index_assignment(assign: &AssignNode, tc: &mut TypeChecker) -> bool {
@@ -5338,7 +5345,7 @@ fn check_simple_index_assignment(assign: &AssignNode, tc: &mut TypeChecker) -> b
 
     let target = check_place(&index.node.target, tc);
     let Type::Map { key, value } = target.checked().ty.clone() else {
-        let target = place::check_indexed_place(&assign.node.target, index, target, tc);
+        let target = place::check_indexed_place(&assign.node.target, index, &target, tc);
         check_simple_assignment(assign, &target, tc);
         return true;
     };
@@ -5371,7 +5378,7 @@ fn check_map_index_assignment(
         tc.push_error(error);
     }
 
-    let value_handle = tc.type_handle(value);
+    let value_handle = TypeChecker::type_handle(value);
     let value = check_expected_value_expr(&assign.node.value, value_handle, tc);
     if !target.accepts_extern_any() {
         tc.reject_extern_any_escape(&value, assign.node.value.span);

@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn main() {
+    var groups: [string: [int]] = ["a": [1, 2]];
+    if ref xs? = groups["a"] {
+        xs.push(3);
+    }
+    if let xs? = groups["a"] {
+        println(xs[2]);
+    }
+}

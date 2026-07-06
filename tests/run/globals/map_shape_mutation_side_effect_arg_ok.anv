@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// 1
+// b
+// 9
+// c
+// 3
+// @match-end
+
+lazy var values: [string: int] = ["a": 1];
+
+fn add_and_return() -> int {
+    values.insert("b", 9);
+    3
+}
+
+fn main() {
+    values.insert("c", add_and_return());
+    for key, value in values {
+        println(key);
+        println(value);
+    }
+}

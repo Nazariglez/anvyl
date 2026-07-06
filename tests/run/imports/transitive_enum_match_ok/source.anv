@@ -1,6 +1,0 @@
-// @helper
-
-import types { Status };
-
-pub fn active_status() -> Status { Status.Active }
-pub fn inactive_status() -> Status { Status.Inactive }

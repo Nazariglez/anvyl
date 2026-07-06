@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: same variable
 
 fn set(ref x: int, ref y: int) {

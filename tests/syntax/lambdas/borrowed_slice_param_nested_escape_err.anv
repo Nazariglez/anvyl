@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot capture borrowed parameter 'xs' in an escaping lambda
-// @frontend: new
 
 fn hold(xs: slice[int]) -> fn() -> fn() -> int {
     || || xs[0]

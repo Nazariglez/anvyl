@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot capture borrowed dynamic view 'actor' in an escaping lambda
-// @frontend: new
 
 contract Updatable {
     fn update(ref self);

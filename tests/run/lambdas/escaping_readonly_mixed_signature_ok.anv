@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 1
+// @match-end
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn use_now() -> int {
+    var count = 0;
+    let f = || {
+        count += 1;
+        count
+    };
+    f()
+}
+
+fn main() {
+    let f = make(3);
+    println(f());
+    println(use_now());
+}

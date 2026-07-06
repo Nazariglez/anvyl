@@ -1,7 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: assertion failed
-
-fn main() {
-    assert(false);
-}

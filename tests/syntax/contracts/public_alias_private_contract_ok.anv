@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 import public_alias_private_contract_helper { Leaked };
 

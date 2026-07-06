@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn main() {
+    var count = 0;
+    let f = || {
+        bump(count);
+    };
+    f();
+    println(count);
+}

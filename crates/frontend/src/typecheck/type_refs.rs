@@ -167,12 +167,12 @@ pub(crate) enum TypeRefError {
     Unknown {
         qualifier: Option<Ident>,
         name: Ident,
-        import: Option<ImportId>,
+        import: Option<Box<ImportId>>,
     },
     PrivateModuleMember {
         module: ModuleScope,
         name: Ident,
-        import: Option<ImportId>,
+        import: Option<Box<ImportId>>,
     },
     GenericArity {
         expected: usize,
@@ -190,7 +190,7 @@ pub(crate) enum TypeRefError {
     UnknownContract {
         qualifier: Option<Ident>,
         name: Ident,
-        import: Option<ImportId>,
+        import: Option<Box<ImportId>>,
     },
     DuplicateContractRequirement {
         name: Ident,
@@ -228,7 +228,7 @@ impl TypeRefError {
         match self {
             Self::Unknown { import, .. }
             | Self::UnknownContract { import, .. }
-            | Self::PrivateModuleMember { import, .. } => import.as_ref(),
+            | Self::PrivateModuleMember { import, .. } => import.as_deref(),
             Self::GenericArity { .. }
             | Self::GenericArgKindMismatch { .. }
             | Self::AliasCycle { .. }
@@ -364,10 +364,10 @@ impl TypeChecker {
         &mut self,
         decls: &DeclarationIndex,
         site: DeclTypeSite,
-        ty: Type,
+        ty: &Type,
     ) -> Type {
         let resolver = TypeRefResolver::module_only(decls);
-        match resolver.finalize_at(&site.module, &site.generics, &ty, Some(site.span)) {
+        match resolver.finalize_at(&site.module, &site.generics, ty, Some(site.span)) {
             Ok(finalized) => {
                 self.used_imports.extend(finalized.used_imports);
                 self.push_type_ref_warnings(finalized.warnings);
@@ -378,7 +378,7 @@ impl TypeChecker {
                 name,
                 import,
             }) => {
-                self.mark_import_used(import);
+                self.mark_import_used(import.map(|import| *import));
                 self.push_error(TypeError::Decl(DeclError::UnknownType {
                     module: site.module,
                     qualifier,
@@ -1040,12 +1040,12 @@ impl<'a> TypeRefResolver<'a> {
             ModuleMemberLookup::Private => Err(TypeRefError::PrivateModuleMember {
                 module: lookup.target.unwrap_or_else(|| module.clone()),
                 name,
-                import: lookup.import,
+                import: lookup.import.map(Box::new),
             }),
             ModuleMemberLookup::Missing => Err(TypeRefError::Unknown {
                 qualifier,
                 name,
-                import: lookup.import,
+                import: lookup.import.map(Box::new),
             }),
         }
     }
@@ -1333,13 +1333,13 @@ impl<'a> TypeRefResolver<'a> {
             ModuleMemberLookup::Private => Err(TypeRefError::PrivateModuleMember {
                 module: lookup.target.unwrap_or_else(|| module.clone()),
                 name: *name,
-                import: lookup.import,
+                import: lookup.import.map(Box::new),
             }),
             ModuleMemberLookup::Found(_) | ModuleMemberLookup::Missing => {
                 Err(TypeRefError::UnknownContract {
                     qualifier: *qualifier,
                     name: *name,
-                    import: lookup.import,
+                    import: lookup.import.map(Box::new),
                 })
             }
         }

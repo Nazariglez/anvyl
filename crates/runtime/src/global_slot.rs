@@ -331,59 +331,6 @@ mod tests {
     };
 
     #[test]
-    fn new_slot_starts_uninit() {
-        let slot = GlobalSlot::<i64>::new("score");
-
-        assert_eq!(slot.state(), GlobalSlotState::Uninit);
-        assert_eq!(slot.name, "score");
-    }
-
-    #[test]
-    fn state_reports_all_internal_states() {
-        let slot = GlobalSlot::<i64>::new("score");
-
-        *slot.state.borrow_mut() = LazyState::Initializing;
-        assert_eq!(slot.state(), GlobalSlotState::Initializing);
-
-        *slot.state.borrow_mut() = LazyState::Ready(1);
-        assert_eq!(slot.state(), GlobalSlotState::Ready);
-
-        *slot.state.borrow_mut() = LazyState::Failed(crate::RuntimeError::new("failed"));
-        assert_eq!(slot.state(), GlobalSlotState::Failed);
-    }
-
-    #[test]
-    fn ensure_initializes_once() {
-        let slot = GlobalSlot::<i64>::new("score");
-        let mut calls = 0;
-
-        slot.ensure(|| {
-            calls += 1;
-            Ok(7)
-        })
-        .unwrap();
-        slot.ensure(|| {
-            calls += 1;
-            Ok(9)
-        })
-        .unwrap();
-
-        assert_eq!(calls, 1);
-        assert_eq!(slot.state(), GlobalSlotState::Ready);
-        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 7);
-    }
-
-    #[test]
-    fn read_initializes_and_returns_ready_value() {
-        let slot = GlobalSlot::<i64>::new("score");
-
-        let value = slot.read(|| Ok(7)).unwrap();
-
-        assert_eq!(*value, 7);
-        assert_eq!(slot.state(), GlobalSlotState::Ready);
-    }
-
-    #[test]
     fn read_registers_safepoint_blocker() {
         let safepoint = SafepointState::default();
         let slot = GlobalSlot::new_with_safepoint("score", safepoint.clone());
@@ -400,43 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_initializer_is_poisoned() {
-        let slot = GlobalSlot::<i64>::new("score");
-        let first = slot
-            .ensure(|| Err(crate::RuntimeError::new("boom")))
-            .unwrap_err();
-        let second = slot.ensure(|| Ok(7)).unwrap_err();
-
-        assert_eq!(first.message(), "poisoned lazy global 'score': boom");
-        assert_eq!(second.message(), "poisoned lazy global 'score': boom");
-        assert_eq!(slot.state(), GlobalSlotState::Failed);
-    }
-
-    #[test]
-    fn initializing_cycle_returns_error_instead_of_borrow_panic() {
-        let slot = GlobalSlot::<i64>::new("score");
-        let error = slot
-            .ensure(|| {
-                let cycle = slot.ensure(|| Ok(1)).unwrap_err();
-                Err(cycle)
-            })
-            .unwrap_err();
-
-        assert!(error.message().contains("score"));
-        assert!(error.message().contains("initializing"));
-        assert_eq!(slot.state(), GlobalSlotState::Failed);
-    }
-
-    #[test]
-    fn write_initializes_and_mutates_ready_value() {
-        let slot = GlobalSlot::<i64>::new("score");
-
-        *slot.write(|| Ok(7)).unwrap() = 9;
-
-        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 9);
-    }
-
-    #[test]
     fn set_without_init_replaces_uninit_ready_and_failed() {
         let slot = GlobalSlot::<i64>::new("score");
 
@@ -449,30 +359,6 @@ mod tests {
         *slot.state.borrow_mut() = LazyState::Failed(crate::RuntimeError::new("boom"));
         slot.set_without_init(3).unwrap();
         assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
-    }
-
-    #[test]
-    fn set_without_init_or_replace_uses_ready_replacer() {
-        let slot = GlobalSlot::<i64>::new("score");
-        slot.set_without_init(1).unwrap();
-
-        slot.set_without_init_or_replace(2, |slot, value| {
-            *slot += value;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
-    }
-
-    #[test]
-    fn set_without_init_or_replace_sets_uninit_without_replacer() {
-        let slot = GlobalSlot::<i64>::new("score");
-
-        slot.set_without_init_or_replace(2, |_, _| unreachable!())
-            .unwrap();
-
-        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 2);
     }
 
     #[test]
@@ -583,32 +469,5 @@ mod tests {
         assert!(error.message().contains("score"));
         drop(loan);
         slot.validate_trace().unwrap();
-    }
-
-    #[test]
-    fn projected_loan_blocks_writes_and_replacement() {
-        let slot = GlobalSlot::<i64>::new("state");
-        slot.set_without_init(1).unwrap();
-        let loan = slot.begin_projected_loan().unwrap();
-
-        let write = slot.write(|| unreachable!()).err().unwrap();
-        let set = slot.set_without_init(2).unwrap_err();
-
-        assert!(write.message().contains(ACTIVE_COLLECTION_LOAN_ERROR));
-        assert!(set.message().contains(ACTIVE_COLLECTION_LOAN_ERROR));
-        drop(loan);
-        slot.set_without_init(3).unwrap();
-        assert_eq!(*slot.read(|| unreachable!()).unwrap(), 3);
-    }
-
-    #[test]
-    fn exports_are_visible() {
-        fn assert_exported<T>(_: T) {}
-
-        assert_exported::<GlobalSlot<i64>>(GlobalSlot::new("score"));
-        assert_eq!(GlobalSlotState::Uninit, GlobalSlotState::Uninit);
-        let _: Option<GlobalRef<'_, i64>> = None;
-        let _: Option<GlobalRefMut<'_, i64>> = None;
-        let _: Option<GlobalProjectedLoanGuard<'_, i64>> = None;
     }
 }

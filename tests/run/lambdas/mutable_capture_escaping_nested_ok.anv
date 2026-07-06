@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn make() -> fn() -> int {
+    var count = 0;
+    || {
+        let inner = || {
+            count = count + 1;
+            count
+        };
+        inner()
+    }
+}
+
+fn main() {
+    let f = make();
+    println(f());
+    println(f());
+}

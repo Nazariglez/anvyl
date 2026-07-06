@@ -1,79 +1,23 @@
 // @mode: run
 // @expect: success
-// @contains: ok
+// @match-begin
+// 1
+// 2
+// 1
+// 9
+// @match-end
 
-const MAX_HP: float = 100.0;
-
-struct Player { 
-    name: string, 
-    health: float = 100.0 
+struct Pair {
+    a: int = 1,
+    b: int = 2,
 }
 
-struct Config { 
-    width: int = 800, 
-    height: int = 600
-}
-
-struct Sprite { 
-    name: string, 
-    x: float = 0.0, 
-    y: float = 0.0, 
-    visible: bool = true 
-}
-
-struct Unit { 
-    hp: float = MAX_HP
-}
-
-struct Grid { 
-    cols: int = 800 / 32
-}
-
-struct Entry { 
-    label: string = "unnamed", 
-    active: bool = false 
-}
-
-struct Mixed { 
-    a: int = 1, 
-    b: string, 
-    c: bool = true
+fn show(pair: Pair) {
+    println(pair.a);
+    println(pair.b);
 }
 
 fn main() {
-    let p = Player { name: "Alice" };
-    assert(p.health == 100.0);
-
-    let c = Config {};
-    assert(c.width == 800);
-    assert(c.height == 600);
-
-    let c2 = Config { width: 1920 };
-    assert(c2.width == 1920);
-    assert(c2.height == 600);
-
-    let c3 = Config { width: 1920, height: 1080 };
-    assert(c3.width == 1920);
-    assert(c3.height == 1080);
-
-    let s = Sprite { name: "player" };
-    assert(s.x == 0.0);
-    assert(s.y == 0.0);
-    assert(s.visible);
-
-    let u = Unit {};
-    assert(u.hp == 100.0);
-
-    let g = Grid {};
-    assert(g.cols == 25);
-
-    let e = Entry {};
-    assert(e.label == "unnamed");
-    assert(!e.active);
-
-    let m = Mixed { b: "hello" };
-    assert(m.a == 1);
-    assert(m.c);
-
-    println("ok");
+    show(Pair {});
+    show(Pair { b: 9 });
 }

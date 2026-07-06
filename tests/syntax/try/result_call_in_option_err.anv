@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires Option, found 'Result<int, string>'
-// @frontend: new
 
 fn read() -> Result<int, string> {
     Result.Ok(1)

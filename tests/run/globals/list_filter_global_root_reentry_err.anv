@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+lazy var values: [int] = [1, 2, 3];
+
+fn reset() {
+    values = [];
+}
+
+fn main() {
+    values.retain(|_| {
+        reset();
+        true
+    });
+}

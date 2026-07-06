@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 struct Box<T> { value: T }
 type BoxAlias<T> = Box<T>;

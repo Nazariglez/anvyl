@@ -6,37 +6,18 @@ mod collection_storage;
 pub mod cow_storage;
 
 pub mod ctx;
-mod cycle_collector;
 pub mod error;
 mod escaping_lambda;
 mod global_slot;
 mod init_field;
 mod lambda_cell;
-mod managed_rc;
 mod mutable_place;
 pub mod provider;
 mod resource;
 mod runtime_owner;
 mod safepoint;
 mod scoped_lambda;
-mod suspect_buffer;
 pub mod value;
-
-pub mod legacy_gc {
-    //! Legacy VM-only GC API. Clean runtime/provider code must use `anvyx_heap` handles.
-
-    pub use crate::{
-        cycle_collector::{
-            clear_suspects, collect_cycles, reset_collect_threshold, set_auto_collect,
-            suspect_count,
-        },
-        managed_rc::{
-            ChildrenVisitorFn, CycleColor, CycleVtable, ManagedRc, ManagedRcInner, RcHeader,
-            managed_alloc_count, managed_alloc_details, rc_dec_count, rc_inc_count,
-            reset_rc_counts, typed_dropper,
-        },
-    };
-}
 
 pub use anv_callback::AnvCallback;
 pub use anvyx_externs::{self, CALLBACK_WRAPPER_MAX_ARITY};

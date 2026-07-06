@@ -1,0 +1,33 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// @match-end
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn make(use_bump: bool) -> fn() -> int {
+    var count = 0;
+    let inc = || {
+        bump(count);
+        count
+    };
+    let add = || {
+        count += 10;
+        count
+    };
+    if use_bump {
+        return inc;
+    }
+    add
+}
+
+fn main() {
+    let f = make(true);
+    println(f());
+    let g = make(false);
+    println(g());
+}

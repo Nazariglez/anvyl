@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: casts only to 'int', not 'string'
 
 enum State: int {

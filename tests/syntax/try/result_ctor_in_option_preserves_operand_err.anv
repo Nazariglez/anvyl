@@ -2,7 +2,6 @@
 // @expect: error
 // @contains: try requires Option
 // @contains: unknown variable `missing`
-// @frontend: new
 
 fn bad() -> int? {
     let value: int = try Result.Ok(missing);

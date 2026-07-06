@@ -1,9 +1,0 @@
-// @helper
-
-import item { Item };
-
-pub struct Owner {
-    name: string,
-
-    fn get_name(self) -> string { self.name }
-}

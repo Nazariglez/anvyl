@@ -1,0 +1,1 @@
+type Higher=fn(escaping fn());

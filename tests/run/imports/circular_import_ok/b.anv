@@ -1,5 +1,0 @@
-// @helper
-
-import a;
-
-pub fn from_b() -> int { 2 }

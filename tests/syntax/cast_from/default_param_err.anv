@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: cast from parameter cannot have a default value
 

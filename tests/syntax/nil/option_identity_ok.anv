@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn takes_suffix(x: int?) -> int? { x }
 fn takes_named(x: Option<int>) -> Option<int> { x }

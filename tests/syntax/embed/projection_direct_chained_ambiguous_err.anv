@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: projection from 'Enemy' to 'Entity' is ambiguous
 // @contains: @as embed paths: entity, actor.entity
 

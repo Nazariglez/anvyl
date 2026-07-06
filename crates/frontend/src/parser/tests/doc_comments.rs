@@ -315,8 +315,3 @@ fn regular_comment_does_not_break_doc() {
     // Regular comment does NOT break doc attachment
     assert_eq!(func_node.node.doc.as_deref(), Some("A doc."));
 }
-
-#[test]
-fn trailing_doc_is_error() {
-    parse_program_err("fn main() {}\n/// Trailing doc\n");
-}

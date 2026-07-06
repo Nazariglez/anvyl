@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn set(ref x: int, ref y: int) {
     x = 1;

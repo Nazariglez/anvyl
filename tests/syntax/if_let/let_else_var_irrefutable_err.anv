@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: irrefutable pattern in let-else
-// @frontend: new
 
 fn main() {
     var n = 99;

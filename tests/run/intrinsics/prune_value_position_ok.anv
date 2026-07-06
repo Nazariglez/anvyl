@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: debug-backend
-
-fn main() {
-    let backend = if #profile(debug) { "debug-backend" } else { "release-backend" };
-    println(backend);
-}

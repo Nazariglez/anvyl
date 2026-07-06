@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: same variable
-// @frontend: new
 
 fn swap(ref a: int, ref b: int) {
     let tmp = a;

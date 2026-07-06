@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: missing extern implementation
-
-extern fn foo() -> int;
-
-fn main() {
-    let x = foo();
-}

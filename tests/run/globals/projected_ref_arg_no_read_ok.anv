@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match: init
+
+struct Point { x: int, y: int }
+
+fn make_point() -> Point {
+    println("init");
+    Point { x: 1, y: 2 }
+}
+
+lazy var point = make_point();
+
+fn inc(ref value: int) {
+    value = value + 1;
+}
+
+fn main() {
+    inc(point.x);
+}

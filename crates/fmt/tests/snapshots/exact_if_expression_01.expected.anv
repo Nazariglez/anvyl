@@ -1,0 +1,7 @@
+fn f(x: bool) -> int {
+    if x {
+        1
+    } else {
+        2
+    }
+}

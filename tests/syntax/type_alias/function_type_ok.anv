@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 type Callback = fn(int) -> bool;
 fn apply(cb: Callback, x: int) -> bool { cb(x) }

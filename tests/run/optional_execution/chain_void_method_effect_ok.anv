@@ -1,0 +1,30 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// arg warm
+// arg some
+// item some
+// done
+// @match-end
+
+dataref Item {
+    name: string,
+
+    fn hello(self, from: string) {
+        println(self.name + " " + from);
+    }
+}
+
+fn arg(label: string) -> string {
+    println("arg " + label);
+    label
+}
+
+fn main() {
+    let warm = arg("warm");
+    let some: Item? = Item { name: "item" };
+    let none: Item? = nil;
+    some?.hello(arg("some"));
+    none?.hello(arg("none"));
+    println("done");
+}

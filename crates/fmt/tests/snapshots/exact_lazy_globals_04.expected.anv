@@ -1,0 +1,3 @@
+@deprecated("use Assets2")
+/// runtime
+pub lazy let Assets = load_assets();

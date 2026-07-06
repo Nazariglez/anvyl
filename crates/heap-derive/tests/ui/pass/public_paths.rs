@@ -18,11 +18,6 @@ mod shapes {
     use anvyx_heap::Trace;
 
     #[derive(Trace)]
-    struct Named<'cx> {
-        child: Option<anvyx_heap::Handle<'cx, Named<'cx>>>,
-    }
-
-    #[derive(Trace)]
     struct Tuple<'cx>(Option<anvyx_heap::Handle<'cx, Tuple<'cx>>>);
 
     #[derive(Trace)]
@@ -80,11 +75,6 @@ mod explicit_crate_path {
 
 mod generic_name_collisions {
     use anvyx_heap::Trace;
-
-    #[derive(Trace)]
-    struct TypeD<D> {
-        value: D,
-    }
 
     #[derive(Trace)]
     struct TypeDriver<AnvyxTraceDriver> {

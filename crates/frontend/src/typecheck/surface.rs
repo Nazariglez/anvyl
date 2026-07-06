@@ -1054,7 +1054,13 @@ fn concrete_surface_type(ty: &Type) -> bool {
             params.iter().all(|param| concrete_surface_type(&param.ty))
                 && concrete_surface_type(&ret.ty)
         }
-        Type::Dyn(_) => true,
+        Type::Dyn(_)
+        | Type::Any
+        | Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::String
+        | Type::Void => true,
         Type::Tuple(elems) => elems.iter().all(concrete_surface_type),
         Type::Nominal(nominal) => {
             nominal.type_args.iter().all(concrete_surface_type)
@@ -1065,7 +1071,6 @@ fn concrete_surface_type(ty: &Type) -> bool {
         }
         Type::Optional { inner } => concrete_surface_type(inner),
         Type::Map { key, value } => concrete_surface_type(key) && concrete_surface_type(value),
-        Type::Any | Type::Int | Type::Float | Type::Bool | Type::String | Type::Void => true,
     }
 }
 

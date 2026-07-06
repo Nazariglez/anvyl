@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: core_int
+
+fn main() {
+    core_int.abs(1);
+}

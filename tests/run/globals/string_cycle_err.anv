@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: is already initializing
+
+lazy let a: string = b;
+lazy let b: string = a;
+
+fn main() {
+    let local = a;
+    println(local);
+}

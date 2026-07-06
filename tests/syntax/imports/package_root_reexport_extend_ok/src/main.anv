@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+import pkg:helpers;
+
+fn main() {
+    let x: string = "hi".shout();
+}

@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: Unknown member 'nonexistent' in module '<std>:<root>'
 

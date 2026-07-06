@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// Init
+// 0
+// 1
+// @match-end
+
+import manager { Manager };
+
+fn main() {
+    println("Init");
+    println(Manager.count());
+    Manager.add();
+    println(Manager.count());
+}

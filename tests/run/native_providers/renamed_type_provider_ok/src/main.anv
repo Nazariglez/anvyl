@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 1280
+
+import pkg:host.host { make_config, config_width, WindowConfig };
+
+fn main() {
+    let config: WindowConfig = make_config(1280);
+    println(config_width(config));
+}

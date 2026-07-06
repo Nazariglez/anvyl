@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn inc(ref x: int) {
+    x += 1;
+}
+
+fn touch(ref x: int) {
+    let outer = || {
+        let inner = || {
+            inc(x);
+        };
+        inner();
+    };
+    outer();
+}
+
+fn main() {
+    var n = 0;
+    touch(n);
+    println(n);
+}

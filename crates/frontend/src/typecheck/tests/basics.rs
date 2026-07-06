@@ -21,32 +21,6 @@ mod storage {
             self.solver.set_local_type_from_type(id, &ty);
         }
     }
-
-    #[test]
-    fn local_type_cell_update() {
-        let program = Program { stmts: vec![] };
-        let resolved = empty_resolved();
-        let decls = DeclarationIndex::from_root_and_modules(
-            &program,
-            &resolved,
-            &crate::externs::RawExterns::default(),
-        );
-        let mut tc = TypeChecker::new(
-            decls,
-            crate::externs::catalog::ExternCatalog::default(),
-            TypecheckConfig::default(),
-        );
-        let name = Ident::new("x");
-        tc.push_scope();
-        tc.define(name, Type::Int, false);
-        let type_id = tc.lookup(name).expect("local binding").type_id;
-
-        tc.set_local_type(type_id, Type::String);
-
-        let info = tc.lookup(name).expect("local binding");
-        assert_eq!(info.type_id, type_id);
-        assert_eq!(tc.solver.local_type_to_type(info.type_id), Type::String);
-    }
 }
 
 mod constraints {

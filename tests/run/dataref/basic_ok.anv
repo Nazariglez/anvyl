@@ -2,7 +2,9 @@
 // @expect: success
 // @match-begin
 // 42
-// hello
+// root
+// true
+// false
 // @match-end
 
 dataref Node {
@@ -11,7 +13,11 @@ dataref Node {
 }
 
 fn main() {
-    let n = Node { value: 42, label: "hello" };
-    println(f"{n.value}");
-    println(f"{n.label}");
+    let n = Node { value: 42, label: "root" };
+    let alias = n;
+    let other = Node { value: 42, label: "root" };
+    println(n.value);
+    println(n.label);
+    println(n == alias);
+    println(n == other);
 }

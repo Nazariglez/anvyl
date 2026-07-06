@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 5
+// 0
+// 0
+// @match-end
+
+fn print_slot(slot: int?) {
+    if let value? = slot {
+        println(value);
+    } else {
+        println(0);
+    }
+}
+
+fn main() {
+    var counts: [string: int] = ["a": 5];
+    let removed = counts.remove("a");
+    let missing = counts.remove("a");
+    print_slot(removed);
+    print_slot(counts["a"]);
+    print_slot(missing);
+}

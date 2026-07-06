@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 80
+
+struct Player {
+    hp: int,
+}
+
+fn main() {
+    var p = Player { hp: 100 };
+    p.hp = 80;
+    println(p.hp);
+}

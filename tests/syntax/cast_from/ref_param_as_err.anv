@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: `as` cannot be combined with `ref`; use `ref x: T`
 
 fn touch(ref x: as int) {

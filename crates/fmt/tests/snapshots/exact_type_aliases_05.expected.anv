@@ -1,0 +1,5 @@
+fn f<T>(x: T) -> T {
+    type Item = T;
+    let y: Item = x;
+    y
+}

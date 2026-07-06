@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+fn apply(cb: fn()) {
+    cb();
+}
+
+fn main() {
+    var map = ["a": 1, "b": 2];
+    let cb = || { map["z"] = 9; };
+    for _, ref value in map {
+        apply(cb);
+        value += 1;
+    }
+}

@@ -1,0 +1,3 @@
+// @helper
+
+pub extern fn tick() -> int;

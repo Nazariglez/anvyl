@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// true
+// @match-end
+
+dataref Node {
+    value: int,
+}
+
+fn passthrough(n: Node) -> Node {
+    n
+}
+
+fn same(a: Node, b: Node) -> bool {
+    a == b
+}
+
+fn main() {
+    let n = Node { value: 1 };
+    let alias = passthrough(n);
+    println(alias == n);
+    println(same(alias, n));
+}

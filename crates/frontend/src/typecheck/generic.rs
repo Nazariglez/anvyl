@@ -661,8 +661,8 @@ pub(crate) fn match_cast_conversion(
     let vars = solver.generic_solver_vars(generics, &seeds, span);
     let source_template = solver.instantiate_generic_type(source_template, &vars);
     let target_template = solver.instantiate_generic_type(target_template, &vars);
-    let source = solver.concrete_type(source);
-    let target = solver.concrete_type(target);
+    let source = Solver::concrete_type(source);
+    let target = Solver::concrete_type(target);
     solver.add_handle_equal(span, source_template, source);
     solver.add_handle_equal(span, target_template, target);
     if !solver.solve_pending().is_empty() {

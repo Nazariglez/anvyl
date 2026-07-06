@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: range end overflow
+
+fn main() {
+    let xs = [1, 2];
+    let end = 9223372036854775807;
+    let ys: [int] = xs[0..=end];
+    println(ys[0]);
+}

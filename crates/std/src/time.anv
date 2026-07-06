@@ -1,3 +1,0 @@
-pub fn since(start: double) -> double {
-    elapsed() - start
-}

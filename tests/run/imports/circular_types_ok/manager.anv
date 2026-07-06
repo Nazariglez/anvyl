@@ -1,5 +1,0 @@
-// @helper
-
-import worker { Worker };
-
-pub struct Manager { name: string, workers: [Worker] }

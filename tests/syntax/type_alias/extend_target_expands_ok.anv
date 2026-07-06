@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 type Id = int;
 extend Id { fn doubled(self) -> int { self * 2 } }

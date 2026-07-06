@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 // @warn-contains: accessing internal field 'hp' of type 'Health'
 
 import lib { Enemy, enemy };

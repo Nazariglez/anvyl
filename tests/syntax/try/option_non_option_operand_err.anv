@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires Option, found 'int'
-// @frontend: new
 
 fn bad(x: int) -> int? {
     let value = try x;

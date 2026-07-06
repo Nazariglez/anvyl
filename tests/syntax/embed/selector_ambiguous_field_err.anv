@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: embed field selector 'x' is ambiguous
 
 struct A { x: int }

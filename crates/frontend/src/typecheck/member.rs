@@ -111,7 +111,7 @@ pub(super) struct PromotedMethodAccess {
 #[derive(Clone)]
 pub(super) enum PromotedMethodTarget {
     Aggregate(Box<MethodAccess>),
-    Extern(ExternMethodAccess),
+    Extern(Box<ExternMethodAccess>),
 }
 
 pub(super) enum MethodResolution {
@@ -527,7 +527,7 @@ fn resolve_promoted_method(
             origin_owner,
             origin_method,
             exposure: alias.exposure,
-            target: PromotedMethodTarget::Extern(method),
+            target: PromotedMethodTarget::Extern(Box::new(method)),
         })));
     }
 

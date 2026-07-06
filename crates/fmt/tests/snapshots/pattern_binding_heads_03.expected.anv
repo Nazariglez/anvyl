@@ -1,0 +1,6 @@
+fn f(x: int?) {
+    var val? = x else {
+        return;
+    }
+    val = 1;
+}

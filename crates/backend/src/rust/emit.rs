@@ -1249,7 +1249,7 @@ impl EmitCx<'_> {
         } else {
             "'scoped_cx"
         };
-        let rt_ty = format!("anvyx_runtime::Ctx<{ctx_lifetime}, '_>");
+        let rt_ty = target::runtime_ctx_ty_with_lifetimes(ctx_lifetime, "'_");
         let types_ty = format!(
             "{}<{ctx_lifetime}>",
             target::generated_types_symbol(&self.program.ctx)
@@ -3961,7 +3961,7 @@ impl EmitCx<'_> {
                 "let mut {state} = ({lambda}, {rt_ptr}.cast::<()>(), {types_ptr}.cast::<()>(), {globals_ptr}.cast::<()>(){});",
                 retained_ptrs.as_deref().unwrap_or("")
             )],
-            format!("unsafe {{ {ctor}::__anvyx_from_raw(&mut {state}, {thunk}) }}"),
+            target::scoped_lambda_from_raw(&ctor, &state, &thunk),
         )
     }
 
@@ -3982,8 +3982,12 @@ impl EmitCx<'_> {
                     plan.record_symbol()
                 ),
                 format!(
-                    "let {handle} = rt.heap().alloc(types.{}, {record_var});",
-                    plan.heap_type_field()
+                    "let {handle} = {};",
+                    target::rt_heap_alloc(
+                        "rt",
+                        &format!("types.{}", plan.heap_type_field()),
+                        &record_var
+                    )
                 ),
             ],
             handle,
@@ -4015,13 +4019,25 @@ impl EmitCx<'_> {
                 "let ({index_var}, {generation}) = unsafe {{ &mut *callbacks.as_ptr() }}.insert_{field}({handle});"
             ),
             format!(
-                "let {key} = {}::new(owner.owner_id(), owner.shutdown_generation(), std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap(), {index_var}, {generation});",
-                target::callback_key_ty()
+                "let {key} = {};",
+                target::callback_key_new(
+                    "owner.owner_id()",
+                    "owner.shutdown_generation()",
+                    table_id,
+                    signature_id,
+                    &index_var,
+                    &generation
+                )
             ),
             format!(
-                "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {key}, {}, {}) }};",
-                plan.call_thunk_symbol(),
-                plan.close_thunk_symbol()
+                "let {arg} = {};",
+                target::escaping_lambda_new(
+                    &callback_ctor,
+                    "owner",
+                    &key,
+                    &plan.call_thunk_symbol(),
+                    &plan.close_thunk_symbol()
+                )
             ),
         ]);
         (prelude, arg)
@@ -4045,11 +4061,16 @@ impl EmitCx<'_> {
         prelude.extend([
             format!(
                 "let {erased} = {};",
-                target::map_heap_access_error(&format!("rt.heap_ref().erase(&{handle})"))
+                target::rt_heap_ref_erase("rt", &format!("&{handle}"))
             ),
             format!(
-                "let {arg} = unsafe {{ {callback_ctor}::__anvyx_new(owner.clone(), {erased}, {}) }};",
-                plan.anv_call_thunk_symbol()
+                "let {arg} = {};",
+                target::anv_callback_new(
+                    &callback_ctor,
+                    "owner",
+                    &erased,
+                    &plan.anv_call_thunk_symbol()
+                )
             ),
         ]);
         (prelude, arg)

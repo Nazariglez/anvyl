@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token ':'
+
+fn take_vec(v: pkg:math.Vec2) {}
+fn main() {}

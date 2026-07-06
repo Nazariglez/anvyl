@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: has no source root
+
+import pkg:host;
+
+fn main() {}

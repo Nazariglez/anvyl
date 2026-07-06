@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: _println
+
+fn main() {
+    _println("hidden");
+}

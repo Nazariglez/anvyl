@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn lookup(map: [string: int]) -> int {
+    map["a"] ?? 0
+}
+
+fn main() {
+    println(lookup(["a": 7]));
+}

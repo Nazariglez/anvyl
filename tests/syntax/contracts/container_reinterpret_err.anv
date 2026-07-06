@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: collection conversion is not implicit
 
 contract Drawable {

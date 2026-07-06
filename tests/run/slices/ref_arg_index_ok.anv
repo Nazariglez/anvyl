@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn bump(ref x: int) {
+    x += 1;
+}
+
+fn bump_slice(ref xs: slice[int], i: int) {
+    bump(xs[i]);
+}
+
+fn main() {
+    var xs: [int] = [0, 1, 2];
+    bump_slice(xs, 1);
+    println(xs[1]);
+}

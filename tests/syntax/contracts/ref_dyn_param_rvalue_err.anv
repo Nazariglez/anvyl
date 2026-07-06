@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: non-lvalue cannot be passed to ref parameter
 
 contract Updatable {

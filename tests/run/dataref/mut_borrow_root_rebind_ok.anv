@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+dataref Node {
+    value: int,
+}
+
+fn replace(ref target: Node, other: Node) {
+    target = other;
+}
+
+fn main() {
+    var a = Node { value: 1 };
+    let b = Node { value: 2 };
+    replace(a, b);
+    println(a.value);
+    assert(a == b);
+}

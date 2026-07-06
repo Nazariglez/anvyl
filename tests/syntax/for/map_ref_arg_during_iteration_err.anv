@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot pass iterated collection as mutable collection parameter
-// @frontend: new
 
 fn mutate(ref hp: [string: int]) {
     hp.remove("a");

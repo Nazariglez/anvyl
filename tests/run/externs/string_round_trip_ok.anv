@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @skip: todo -> extern_runtime
-
-extern fn tag(value: string) -> string;
-
-fn main() -> string {
-    tag("stage6")
-}

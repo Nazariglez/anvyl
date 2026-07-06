@@ -301,14 +301,16 @@ fn reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
             nested_value_reentry_policy(inner)
         }
         RustParamAbi::Result(ok, err) => match (reentry_policy(ok), reentry_policy(err)) {
-            (NativeReentryPolicy::UnsupportedLiveBoundary, _)
-            | (_, NativeReentryPolicy::UnsupportedLiveBoundary) => {
+            (
                 NativeReentryPolicy::UnsupportedLiveBoundary
-            }
-            (NativeReentryPolicy::SnapshotStringBorrow, _)
-            | (_, NativeReentryPolicy::SnapshotStringBorrow) => {
+                | NativeReentryPolicy::SnapshotStringBorrow,
+                _,
+            )
+            | (
+                _,
                 NativeReentryPolicy::UnsupportedLiveBoundary
-            }
+                | NativeReentryPolicy::SnapshotStringBorrow,
+            ) => NativeReentryPolicy::UnsupportedLiveBoundary,
             (NativeReentryPolicy::Safe, NativeReentryPolicy::Safe) => NativeReentryPolicy::Safe,
         },
         RustParamAbi::Value(_)

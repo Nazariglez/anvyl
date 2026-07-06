@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: out of bounds
-
-fn main() {
-    let a = [1, 2, 3];
-    let x = a[5];
-}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: non-raw enum 'Color' cannot be cast to 'int'
 
 enum Color {

@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 12
+
+fn main() {
+    let value: int? = 12;
+    match value {
+        v? => println(v),
+        nil => println(0),
+    }
+}

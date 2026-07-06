@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: @as embed paths: z, a.target
 
 struct Target { x: int }

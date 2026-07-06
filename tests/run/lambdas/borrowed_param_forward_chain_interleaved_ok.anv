@@ -1,0 +1,30 @@
+// @mode: run
+// @expect: success
+// @match: 1111111
+
+fn leaf(ref x: int) {
+    let f = || {
+        x += 10;
+    };
+    x += 1;
+    f();
+    x += 100;
+}
+
+fn mid(ref x: int) {
+    x += 1000;
+    leaf(x);
+    x += 10000;
+}
+
+fn top(ref x: int) {
+    x += 100000;
+    mid(x);
+    x += 1000000;
+}
+
+fn main() {
+    var n = 0;
+    top(n);
+    println(n);
+}

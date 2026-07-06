@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+struct Box {
+    xs: [int],
+}
+
+fn replace(ref box: Box) {
+    box.xs = [1, 2, 3];
+}
+
+fn main() {
+    var box = Box { xs: [0] };
+    replace(box);
+    println(box.xs[2]);
+}

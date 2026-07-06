@@ -702,20 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_payload_ops_project_some_payload() {
-        with_ctx!(ctx;
-        let mut source = Some(1);
-        let ops = OptionalPayloadOps::<i64>::default();
-        let mut place = MutPlace::projected(MutPlace::local(&mut source), &ops);
-
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        drop(place);
-
-        assert_eq!(source, Some(2));
-            );
-    }
-
-    #[test]
     fn optional_payload_ops_reject_nil_payload() {
         with_ctx!(ctx;
         let mut source: Option<i64> = None;
@@ -726,27 +712,6 @@ mod tests {
 
         assert_eq!(err.message(), "optional payload is nil");
             );
-    }
-
-    #[test]
-    fn global_place_initializes_and_reopens_short_guards() {
-        with_ctx!(ctx;
-            let calls = Cell::new(0);
-            let slot = GlobalSlot::new("score");
-            let init = |_: &mut Ctx<'_, '_>| {
-                calls.set(calls.get() + 1);
-                Ok(7)
-            };
-            let mut place = MutPlace::global(&slot, &init);
-
-            assert_eq!(place.access(&mut ctx, |value| Ok(*value)).unwrap(), 7);
-            place.mutate(&mut ctx, |value| {
-                *value += 1;
-                Ok(())
-            }).unwrap();
-            assert_eq!(place.access(&mut ctx, |value| Ok(*value)).unwrap(), 8);
-            assert_eq!(calls.get(), 1);
-        );
     }
 
     #[test]
@@ -878,32 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_field_access_mutate_and_reborrow() {
-        with_ctx!(ctx;
-        let mut pair = Pair { x: 1, y: 2 };
-        let ops = PairYOps {
-            access_calls: Cell::new(0),
-            mutate_calls: Cell::new(0),
-        };
-        {
-            let mut place = MutPlace::projected(MutPlace::local(&mut pair), &ops);
-
-            assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
-            place.update_copy(&mut ctx, |value| value + 10).unwrap();
-            {
-                let mut reborrowed = place.reborrow();
-                reborrowed.set(&mut ctx, 5).unwrap();
-            }
-        }
-
-        assert_eq!(pair.x, 1);
-        assert_eq!(pair.y, 5);
-        assert_eq!(ops.access_calls.get(), 1);
-        assert_eq!(ops.mutate_calls.get(), 2);
-            );
-    }
-
-    #[test]
     fn projected_list_stale_version_rejects_access_and_mutate() {
         with_ctx!(ctx;
         let mut list = list(&mut ctx, [1_i64, 2]);
@@ -940,32 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_map_value_updates_existing_entry() {
-        with_ctx!(ctx;
-        let mut map = map(&mut ctx, [("a", 1_i64)]);
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
-        let ops = MapValueOps::new("a", &guard);
-        {
-            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
-
-            assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
-            place.update_copy(&mut ctx, |value| value + 1).unwrap();
-            let err = place
-                .mutate(&mut ctx, |value| {
-                    *value = 9;
-                    Err::<(), _>(RuntimeError::new("early"))
-                })
-                .unwrap_err();
-            assert_eq!(err.message(), "early");
-        }
-
-        drop(guard);
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(9));
-        assert_eq!(map.structural_version(), 0);
-            );
-    }
-
-    #[test]
     fn projected_map_value_rejects_missing_and_inactive_loans() {
         with_ctx!(ctx;
         let mut map = map(&mut ctx, [("a", 1_i64)]);
@@ -984,69 +897,6 @@ mod tests {
 
         assert!(place.get_copy(&mut ctx).is_err());
         assert!(place.set(&mut ctx, 4).is_err());
-            );
-    }
-
-    #[test]
-    fn projected_map_value_detaches_shared_outer_map() {
-        with_ctx!(ctx;
-        let mut map = map(&mut ctx, [("a", 1_i64)]);
-        let shared = map.share();
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
-        let ops = MapValueOps::new("a", &guard);
-        {
-            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
-            place.set(&mut ctx, 2).unwrap();
-        }
-
-        drop(guard);
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(2));
-        assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
-            );
-    }
-
-    #[test]
-    fn projected_map_value_composes_through_nested_map() {
-        with_ctx!(ctx;
-        let inner = map(&mut ctx, [("x", 1_i64)]);
-        let mut groups = map(&mut ctx, [("a", inner)]);
-        let guard = groups.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
-        let ops = MapValueOps::new("a", &guard);
-        let mut place = MutPlace::projected(MutPlace::local(&mut groups), &ops);
-
-        place.mutate_with_ctx(&mut ctx, |ctx, inner| {
-            let inner_guard = inner.begin_value_loan_by_key(ctx, &"x")?;
-            let inner_ops = MapValueOps::new("x", &inner_guard);
-            let mut inner_place = MutPlace::projected(MutPlace::local(inner), &inner_ops);
-            inner_place.update_copy(ctx, |value| value + 2)
-        }).unwrap();
-        place.access_with_ctx(&mut ctx, |ctx, inner| {
-            assert_eq!(inner.get(ctx, &"x")?, Some(3));
-            Ok(())
-        }).unwrap();
-
-        drop(place);
-        drop(guard);
-        let stored = groups.get(&ctx, &"a").unwrap().unwrap();
-        assert_eq!(stored.get(&ctx, &"x").unwrap(), Some(3));
-        assert_eq!(groups.structural_version(), 0);
-            );
-    }
-
-    #[test]
-    fn projected_map_optional_value_writes_back_present_nil() {
-        with_ctx!(ctx;
-        let mut map = map(&mut ctx, [("a", Some(1_i64))]);
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
-        let ops = MapValueOps::new("a", &guard);
-        {
-            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
-            place.set(&mut ctx, None).unwrap();
-        }
-        drop(guard);
-
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(None));
-        assert_eq!(map.remove(&mut ctx, &"a").unwrap(), Some(None));
             );
     }
 
@@ -1070,80 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_slice_bounds_checked_per_operation() {
-        with_ctx!(ctx;
-        let mut list = list(&mut ctx, [1_i64, 2]);
-        let mut root = MutPlace::local(&mut list)
-            .slice_view_mut(&mut ctx, 0, 2, false)
-            .unwrap();
-        let ops = SliceElemOps { index: 2 };
-        let mut place = MutPlace::projected(MutPlace::local(&mut root), &ops);
-
-        assert!(place.get_copy(&mut ctx).is_err());
-        assert!(place.set(&mut ctx, 3).is_err());
-            );
-    }
-
-    #[test]
-    fn local_access_mutate_and_copy_update() {
-        with_ctx!(ctx;
-        let mut value = 1;
-        let mut place = MutPlace::local(&mut value);
-
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
-        place.set(&mut ctx, 5).unwrap();
-        assert_eq!(place.replace(&mut ctx, 8).unwrap(), 5);
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 8);
-            );
-    }
-
-    #[test]
-    fn stack_cell_routes_through_guarded_cell() {
-        with_ctx!(ctx;
-        let cell = StackLambdaCell::new(1);
-        let mut place = MutPlace::stack_cell(&cell);
-
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
-        place.set(&mut ctx, 4).unwrap();
-        assert_eq!(cell.get_copy().unwrap(), 4);
-            );
-    }
-
-    #[test]
-    fn reborrow_preserves_local_identity() {
-        with_ctx!(ctx;
-        let mut value = 1;
-        let mut place = MutPlace::local(&mut value);
-        {
-            let mut forwarded = place.reborrow();
-            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-        }
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        drop(place);
-
-        assert_eq!(value, 3);
-            );
-    }
-
-    #[test]
-    fn reborrow_preserves_stack_cell_identity() {
-        with_ctx!(ctx;
-        let cell = StackLambdaCell::new(1);
-        let mut place = MutPlace::stack_cell(&cell);
-        {
-            let mut forwarded = place.reborrow();
-            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-        }
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(cell.get_copy().unwrap(), 3);
-            );
-    }
-
-    #[test]
     fn set_and_replace_do_not_require_clone() {
         with_ctx!(ctx;
         struct NonClone(i64);
@@ -1156,19 +932,6 @@ mod tests {
         place.set(&mut ctx, NonClone(3)).unwrap();
         drop(place);
         assert_eq!(value.0, 3);
-            );
-    }
-
-    #[test]
-    fn local_list_mutation_uses_short_region() {
-        with_ctx!(ctx;
-        let mut list = list(&mut ctx, [1_i64]);
-        let place = MutPlace::local(&mut list);
-
-        assert_eq!(place.access(&mut ctx, |list| Ok(list.len())).unwrap(), 1);
-        drop(place);
-        list.push(&mut ctx, 2).unwrap();
-        assert_eq!(list.len(), 2);
             );
     }
 
@@ -1198,51 +961,6 @@ mod tests {
         place.set(&mut ctx, 2).unwrap();
         drop(place);
         assert_eq!(value, 2);
-            );
-    }
-
-    #[test]
-    fn scoped_cell_mutates_local_place() {
-        with_ctx!(ctx;
-        let mut value = 1;
-        let cell = ScopedMutPlaceCell::new(MutPlace::local(&mut value));
-
-        cell.set(&mut ctx, 2).unwrap();
-        assert_eq!(cell.get_copy(&mut ctx).unwrap(), 2);
-        let mut forwarded = MutPlace::scoped_cell(&cell);
-        forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(cell.get_copy(&mut ctx).unwrap(), 3);
-            );
-    }
-
-    #[test]
-    fn scoped_cell_mutates_stack_cell_place() {
-        with_ctx!(ctx;
-        let source = StackLambdaCell::new(1);
-        let cell = ScopedMutPlaceCell::new(MutPlace::stack_cell(&source));
-
-        cell.set(&mut ctx, 2).unwrap();
-        let mut forwarded = MutPlace::scoped_cell(&cell);
-        forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(source.get_copy().unwrap(), 3);
-            );
-    }
-
-    #[test]
-    fn scoped_cell_reborrow_preserves_identity() {
-        with_ctx!(ctx;
-        let mut value = 1;
-        let cell = ScopedMutPlaceCell::new(MutPlace::local(&mut value));
-        let mut place = MutPlace::scoped_cell(&cell);
-        {
-            let mut forwarded = place.reborrow();
-            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-        }
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(cell.get_copy(&mut ctx).unwrap(), 3);
             );
     }
 
@@ -1319,24 +1037,6 @@ mod tests {
     }
 
     #[test]
-    fn dataref_place_routes_through_descriptor() {
-        with_ctx!(ctx;
-        let ty = ctx.heap().register_untracked::<Storage<i64>>();
-        let object = ctx.heap().alloc(ty, Storage { field: 1 });
-        let erased = ctx.heap().erase(&object).unwrap();
-        let ops = FieldOps { ty };
-        let mut place = MutPlace::dataref(erased, &ops);
-
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
-        place.set(&mut ctx, 5).unwrap();
-        assert_eq!(place.replace(&mut ctx, 8).unwrap(), 5);
-        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 8);
-            );
-    }
-
-    #[test]
     fn dataref_place_set_and_replace_do_not_require_clone() {
         with_ctx!(ctx;
         struct NonClone(i64);
@@ -1351,24 +1051,6 @@ mod tests {
         assert_eq!(old.0, 1);
         place.set(&mut ctx, NonClone(3)).unwrap();
         assert_eq!(ctx.heap().with(&object, |storage| storage.field.0), 3);
-            );
-    }
-
-    #[test]
-    fn dataref_place_reborrow_preserves_identity() {
-        with_ctx!(ctx;
-        let ty = ctx.heap().register_untracked::<Storage<i64>>();
-        let object = ctx.heap().alloc(ty, Storage { field: 1 });
-        let erased = ctx.heap().erase(&object).unwrap();
-        let ops = FieldOps { ty };
-        let mut place = MutPlace::dataref(erased, &ops);
-        {
-            let mut forwarded = place.reborrow();
-            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-        }
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 3);
             );
     }
 
@@ -1445,68 +1127,6 @@ mod tests {
         assert_eq!(err.message(), "early");
         place.set(&mut ctx, 2).unwrap();
         assert_eq!(ctx.heap().with(&object, |storage| storage.field), 2);
-            );
-    }
-
-    #[test]
-    fn scoped_cell_mutates_dataref_place() {
-        with_ctx!(ctx;
-        let ty = ctx.heap().register_untracked::<Storage<i64>>();
-        let object = ctx.heap().alloc(ty, Storage { field: 1 });
-        let erased = ctx.heap().erase(&object).unwrap();
-        let ops = FieldOps { ty };
-        let cell = ScopedMutPlaceCell::new(MutPlace::dataref(erased, &ops));
-
-        cell.set(&mut ctx, 2).unwrap();
-        let mut forwarded = MutPlace::scoped_cell(&cell);
-        forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 3);
-            );
-    }
-
-    #[test]
-    fn heap_cell_routes_through_lambda_cell() {
-        with_ctx!(ctx;
-        let cell_ty = ctx.heap().register_untracked::<LambdaCell<i64>>();
-        let cell = ctx.heap().alloc(cell_ty, LambdaCell::new(1));
-        let mut place = MutPlace::heap_cell(cell.clone());
-
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-        assert_eq!(place.get_copy(&mut ctx).unwrap(), 2);
-        place.set(&mut ctx, 4).unwrap();
-        assert_eq!(ctx.heap().with(&cell, LambdaCell::get_copy).unwrap(), 4);
-            );
-    }
-
-    #[test]
-    fn reborrow_preserves_heap_cell_identity() {
-        with_ctx!(ctx;
-        let cell_ty = ctx.heap().register_untracked::<LambdaCell<i64>>();
-        let cell = ctx.heap().alloc(cell_ty, LambdaCell::new(1));
-        let mut place = MutPlace::heap_cell(cell.clone());
-        {
-            let mut forwarded = place.reborrow();
-            forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-        }
-        place.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(ctx.heap().with(&cell, LambdaCell::get_copy).unwrap(), 3);
-            );
-    }
-
-    #[test]
-    fn scoped_cell_mutates_heap_cell_place() {
-        with_ctx!(ctx;
-        let cell_ty = ctx.heap().register_untracked::<LambdaCell<i64>>();
-        let source = ctx.heap().alloc(cell_ty, LambdaCell::new(1));
-        let cell = ScopedMutPlaceCell::new(MutPlace::heap_cell(source.clone()));
-
-        cell.set(&mut ctx, 2).unwrap();
-        let mut forwarded = MutPlace::scoped_cell(&cell);
-        forwarded.update_copy(&mut ctx, |value| value + 1).unwrap();
-
-        assert_eq!(ctx.heap().with(&source, LambdaCell::get_copy).unwrap(), 3);
             );
     }
 
@@ -1590,33 +1210,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    fn local_slice_views_succeed() {
-        with_ctx!(ctx;
-        let mut list = list(&mut ctx, [1_i64, 2, 3]);
-        let mut place = MutPlace::local(&mut list);
-
-        let slice = place.slice_view(1, 3, false).unwrap();
-        assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
-        assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 3);
-        let mut slice = place.slice_view_mut(&mut ctx, 0, 2, false).unwrap();
-        set_slice_second(&mut ctx, &mut slice);
-        drop(place);
-        assert_eq!(list.checked_index(&ctx, 1).unwrap(), 9);
-
-        let mut array = [1_i64, 2, 3];
-        let mut place = MutPlace::local(&mut array);
-
-        let slice = unsafe { place.slice_view(1, 3, false) }.unwrap();
-        assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
-        assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 3);
-        let mut slice = unsafe { place.slice_view_mut(&mut ctx, 0, 2, false) }.unwrap();
-        set_slice_second(&mut ctx, &mut slice);
-        drop(place);
-        assert_eq!(array[1], 9);
-            );
     }
 
     #[test]

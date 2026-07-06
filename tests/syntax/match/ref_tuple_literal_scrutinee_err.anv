@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: ref pattern requires a mutable place
-// @frontend: new
 
 fn main() {
     match ref (1, 2) {

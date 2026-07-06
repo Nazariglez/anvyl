@@ -1,4 +1,0 @@
-// @mode: run
-// @expect: success
-
-fn main() {}

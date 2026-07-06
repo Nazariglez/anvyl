@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// 1
+// @match-end
+
+lazy var values: [string: int] = ["a": 1, "b": 2];
+lazy var removed = 2;
+
+fn main() {
+    values.remove_where(|key, value| value == removed);
+    for key, value in values {
+        println(key);
+        println(value);
+    }
+}

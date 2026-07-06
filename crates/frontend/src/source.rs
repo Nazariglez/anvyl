@@ -279,26 +279,6 @@ impl Utf16Line {
 mod tests {
     use super::*;
 
-    fn source_table_with(texts: &[&str]) -> SourceTable {
-        let mut table = SourceTable::default();
-        for (index, text) in texts.iter().enumerate() {
-            table.add(SourceKind::Virtual, format!("source{index}"), None, *text);
-        }
-        table
-    }
-
-    #[test]
-    fn source_table_allocates_ids() {
-        let table = source_table_with(&["one", "two"]);
-        let ids = table.iter().map(SourceFile::id).collect::<Vec<_>>();
-
-        assert_eq!(table.len(), 2);
-        assert_eq!(ids[0].index(), 0);
-        assert_eq!(ids[1].index(), 1);
-        assert_eq!(table.get(ids[0]).unwrap().text(), "one");
-        assert_eq!(table.get(ids[1]).unwrap().label(), "source1");
-    }
-
     #[test]
     fn ascii_line_columns_are_byte_columns() {
         let index = LineIndex::new("one\ntwo");

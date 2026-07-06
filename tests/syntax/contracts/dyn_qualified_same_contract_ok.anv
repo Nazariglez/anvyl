@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 import contract_use_helper as helper;
 import contract_use_helper { PublicAction, PublicActor };

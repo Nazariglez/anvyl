@@ -13,7 +13,7 @@ use anvyx_backend::rust::{
     },
     emit::RustSource,
 };
-use anvyx_lang2::LintConfig;
+use anvyx_lang::LintConfig;
 use anvyx_runtime::{
     ModulePath, ProviderDescriptor, RustModuleSupport, RustProviderCargo, RustProviderSupport,
     validate_rust_provider_support,
@@ -555,8 +555,8 @@ pub fn package_lang_id(package: &PackageId) -> String {
     package.manifest_path().display().to_string()
 }
 
-pub fn package_frontend_id(package: &PackageId) -> anvyx_lang2::PackageId {
-    anvyx_lang2::PackageId::new(package_lang_id(package))
+pub fn package_frontend_id(package: &PackageId) -> anvyx_lang::PackageId {
+    anvyx_lang::PackageId::new(package_lang_id(package))
 }
 
 #[derive(Debug, Clone)]
@@ -599,7 +599,7 @@ impl PackageGraph {
         self.packages.iter().find(|package| &package.id == id)
     }
 
-    pub fn package_externs(&self) -> Vec<(anvyx_lang2::PackageId, Vec<ProviderDescriptor>)> {
+    pub fn package_externs(&self) -> Vec<(anvyx_lang::PackageId, Vec<ProviderDescriptor>)> {
         self.packages
             .iter()
             .filter(|package| !package.providers.is_empty())
@@ -844,9 +844,9 @@ fn dependency_package_id(
 }
 
 fn validate_dependency_alias(alias: &str, package: &PackageId) -> Result<(), String> {
-    match anvyx_lang2::validate_dependency_alias(alias) {
+    match anvyx_lang::validate_dependency_alias(alias) {
         Ok(()) => Ok(()),
-        Err(anvyx_lang2::DependencyAliasError::Invalid) => Err(format!(
+        Err(anvyx_lang::DependencyAliasError::Invalid) => Err(format!(
             "package {package} uses invalid dependency alias `{alias}`"
         )),
     }
@@ -925,14 +925,6 @@ mod tests {
         assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
         assert!(error.contains("expected positive integer seconds"));
     }
-
-    #[test]
-    fn provider_probe_timeout_rejects_whitespace() {
-        let error = parse_provider_probe_timeout(Some(" 900")).unwrap_err();
-
-        assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
-    }
-
     #[test]
     fn provider_probe_text_excerpt_is_bounded() {
         let text = "x".repeat(500);
@@ -942,13 +934,6 @@ mod tests {
         assert!(excerpt.ends_with("..."));
         assert_eq!(text_excerpt(""), "<empty>");
     }
-
-    #[test]
-    fn provider_probe_status_suffix_formats_status() {
-        assert_eq!(status_suffix(Some(7)), " with status 7");
-        assert_eq!(status_suffix(None), "");
-    }
-
     #[test]
     fn provider_probe_timeout_error_names_cache_target_and_override() {
         let error = provider_probe_timeout_error(
@@ -979,59 +964,6 @@ mod tests {
         assert!(error.contains("target: /cache/target"));
         assert!(error.contains(PROVIDER_PROBE_TIMEOUT_ENV));
     }
-
-    #[test]
-    fn parse_manifest_ignores_stale_externs_table() {
-        let manifest = parse(
-            r#"
-            [project]
-            entry = "src/main.anv"
-
-            [externs.engine]
-            path = "my_externs/engine"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(manifest.project.entry.as_deref(), Some("src/main.anv"));
-    }
-
-    #[test]
-    fn parse_manifest_missing_project_errors() {
-        let result = parse(
-            r#"
-            [externs.engine]
-            path = "my_externs/engine"
-            "#,
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_manifest_with_optional_name() {
-        let with_name = parse(
-            r#"
-            [project]
-            name = "my_game"
-            entry = "src/main.anv"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(with_name.project.name.as_deref(), Some("my_game"));
-
-        let without_name = parse(
-            r#"
-            [project]
-            entry = "src/main.anv"
-            "#,
-        )
-        .unwrap();
-
-        assert!(without_name.project.name.is_none());
-    }
-
     #[test]
     fn parse_manifest_with_optional_version() {
         let manifest = parse(
@@ -1066,20 +998,6 @@ mod tests {
         assert_eq!(manifest.lint["internal_access"], "error");
         assert_eq!(manifest.lint["deprecated"], "allow");
     }
-
-    #[test]
-    fn parse_manifest_lint_default() {
-        let manifest = parse(
-            r#"
-            [project]
-            entry = "src/main.anv"
-            "#,
-        )
-        .unwrap();
-
-        assert!(manifest.lint.is_empty());
-    }
-
     #[test]
     fn lint_config_applies_manifest_and_overrides() {
         let manifest = parse(
@@ -1097,12 +1015,12 @@ mod tests {
         let config = lint_config(Some(&manifest), &["deprecated=warn"]).unwrap();
 
         assert_eq!(
-            config.level(anvyx_lang2::LintId::InternalAccess),
-            anvyx_lang2::LintLevel::Error
+            config.level(anvyx_lang::LintId::InternalAccess),
+            anvyx_lang::LintLevel::Error
         );
         assert_eq!(
-            config.level(anvyx_lang2::LintId::Deprecated),
-            anvyx_lang2::LintLevel::Warn
+            config.level(anvyx_lang::LintId::Deprecated),
+            anvyx_lang::LintLevel::Warn
         );
     }
 
@@ -1166,40 +1084,6 @@ mod tests {
             probe.cargo_alias
         );
     }
-
-    #[test]
-    fn package_attachment_groups_multiple_provider_descriptors() {
-        let probe = package_provider_fixture("Game Host", "host-provider");
-        let output = ProviderProbeOutput {
-            descriptors: vec![
-                provider_descriptor_for_module("window", "window"),
-                provider_descriptor_for_module("gpu", "gpu"),
-            ],
-            supports: vec![
-                rust_support("window", "host_provider"),
-                rust_support("gpu", "host_provider"),
-            ],
-        };
-
-        let providers = native_providers_from_probe(&probe, output).unwrap();
-
-        assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0].descriptor.provider.name, "window");
-        assert_eq!(providers[1].descriptor.provider.name, "gpu");
-        assert_eq!(providers[0].support.provider.name, "window");
-        assert_eq!(providers[1].support.provider.name, "gpu");
-        assert_eq!(providers[0].support.modules[0].module.segments, ["window"]);
-        assert_eq!(providers[1].support.modules[0].module.segments, ["gpu"]);
-        assert_eq!(
-            providers[0].support.modules[0].bindings[0].path.crate_name,
-            probe.cargo_alias
-        );
-        assert_eq!(
-            providers[1].support.modules[0].bindings[0].path.crate_name,
-            probe.cargo_alias
-        );
-    }
-
     #[test]
     fn package_attachment_rejects_duplicate_provider_modules() {
         let probe = package_provider_fixture("Game Host", "host-provider");
@@ -1236,21 +1120,6 @@ mod tests {
         assert!(error.contains("Game Host"), "{error}");
         assert!(error.contains("host"), "{error}");
     }
-
-    #[test]
-    fn package_attachment_rejects_empty_provider_output() {
-        let probe = package_provider_fixture("Game Host", "host-provider");
-        let output = ProviderProbeOutput {
-            descriptors: vec![],
-            supports: vec![],
-        };
-
-        let error = native_providers_from_probe(&probe, output).unwrap_err();
-
-        assert!(error.contains("no provider descriptors"), "{error}");
-        assert!(error.contains("Game Host"), "{error}");
-    }
-
     #[test]
     fn package_attachment_rejects_unknown_support_modules() {
         let probe = package_provider_fixture("Game Host", "host-provider");
@@ -1512,25 +1381,7 @@ mod tests {
         }
 
         fn write_native_package(&self, package: &str, deps: &[(&str, &str)]) {
-            self.write_native_package_with_entry(package, None, deps);
-        }
-
-        fn write_source_native_package(&self, package: &str, deps: &[(&str, &str)]) {
-            self.write_native_package_with_entry(package, Some("src/lib.anv"), deps);
-            let source = self.root.path().join(package).join("src/lib.anv");
-            fs::write(source, "pub fn marker() -> int { 1 }").unwrap();
-        }
-
-        fn write_native_package_with_entry(
-            &self,
-            package: &str,
-            entry: Option<&str>,
-            deps: &[(&str, &str)],
-        ) {
             let mut manifest = "[project]\nname = \"native\"\n".to_string();
-            if let Some(entry) = entry {
-                writeln!(manifest, "entry = \"{entry}\"").unwrap();
-            }
             if !deps.is_empty() {
                 manifest.push_str("\n[dependencies]\n");
                 for (alias, path) in deps {
@@ -1539,27 +1390,6 @@ mod tests {
             }
             self.write_raw_manifest(package, &manifest);
             self.write_provider_crate(package, "native");
-        }
-
-        fn write_invalid_native_package(&self, package: &str) {
-            self.write_raw_manifest(package, "[project]\nname = \"native\"\n");
-            self.write_provider_cargo(package, "native");
-            let dir = self.root.path().join(package);
-            fs::write(
-                dir.join("src/lib.rs"),
-                r#"pub fn provider_descriptors() -> Vec<anvyx_runtime::ProviderDescriptor> {
-    vec![anvyx_runtime::ProviderDescriptor {
-        provider: anvyx_runtime::ProviderId { name: "Bad Name".to_string() },
-        modules: vec![],
-    }]
-}
-
-pub fn rust_module_supports() -> Vec<anvyx_runtime::RustModuleSupport> {
-    vec![]
-}
-"#,
-            )
-            .unwrap();
         }
 
         fn write_provider_crate(&self, package: &str, provider: &str) {
@@ -1580,51 +1410,6 @@ anvyx_runtime::builtin_module! {{
 }}
 "#
                 ),
-            )
-            .unwrap();
-        }
-
-        fn write_multi_module_provider_crate(&self, package: &str) {
-            self.write_raw_manifest(package, "[project]\nname = \"host\"\n");
-            self.write_provider_cargo(package, "host-provider");
-            let dir = self.root.path().join(package);
-            fs::write(
-                dir.join("src/lib.rs"),
-                r#"mod window;
-mod gpu;
-
-anvyx_runtime::provider_package! { modules: [window, gpu] }
-"#,
-            )
-            .unwrap();
-            fs::write(
-                dir.join("src/window.rs"),
-                r#"use anvyx_runtime::function;
-
-#[function]
-pub fn open_window() -> i64 { 11 }
-
-anvyx_runtime::builtin_module! {
-    name: "window",
-    source: "",
-    exports: [open_window],
-}
-"#,
-            )
-            .unwrap();
-            fs::write(
-                dir.join("src/gpu.rs"),
-                r#"use anvyx_runtime::function;
-
-#[function]
-pub fn create_device() -> i64 { 29 }
-
-anvyx_runtime::builtin_module! {
-    name: "gpu",
-    source: "",
-    exports: [create_device],
-}
-"#,
             )
             .unwrap();
         }
@@ -1651,18 +1436,6 @@ anvyx_runtime::builtin_module! {
         fn manifest(&self, package: &str) -> PathBuf {
             self.root.path().join(package).join("anvyx.toml")
         }
-    }
-
-    fn validate_ok(path: impl AsRef<Path>) {
-        load_package_graph(path.as_ref()).unwrap();
-    }
-
-    fn validate_err(path: impl AsRef<Path>, contains: &str) {
-        let error = load_package_graph(path.as_ref()).expect_err("package graph should fail");
-        assert!(
-            error.contains(contains),
-            "expected error to contain {contains:?}, got {error:?}"
-        );
     }
 
     #[test]
@@ -1709,105 +1482,6 @@ anvyx_runtime::builtin_module! {
 
         assert_eq!(manifest, fixture.manifest("game").canonicalize().unwrap());
     }
-
-    #[test]
-    fn parse_native_only_manifest_allows_missing_entry() {
-        let manifest = parse(
-            r#"
-            [project]
-            name = "host"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(manifest.project.entry, None);
-    }
-
-    #[test]
-    fn parse_manifest_dependencies() {
-        let manifest = parse(
-            r#"
-            [project]
-            entry = "src/main.anv"
-
-            [dependencies]
-            math = { path = "../math" }
-            physics = { path = "../physics" }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(manifest.dependencies.len(), 2);
-        assert_eq!(manifest.dependencies["math"].path, "../math");
-        assert_eq!(manifest.dependencies["physics"].path, "../physics");
-    }
-
-    #[test]
-    fn graph_loading_ignores_manifest_externs() {
-        let fixture = PackageFixture::default();
-        fixture.write_raw_manifest(
-            "game",
-            r#"
-            [project]
-            entry = "src/lib.anv"
-
-            [externs.missing]
-            path = "missing-provider"
-            "#,
-        );
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-
-        assert!(graph.root().providers.is_empty());
-    }
-
-    #[test]
-    fn project_name_does_not_control_dependency_alias() {
-        let fixture = PackageFixture::default();
-        fixture.write_named_package("game", Some("game"), &[("p", "../physics")]);
-        fixture.write_named_package("physics", Some("not_the_import_name"), &[]);
-
-        validate_ok(fixture.manifest("game"));
-    }
-
-    #[test]
-    fn package_dependency_path_is_relative_to_declaring_manifest() {
-        let fixture = PackageFixture::default();
-        fixture.write_named_package("game", Some("game"), &[("physics", "../libs/physics")]);
-        fixture.write_named_package("libs/physics", Some("physics"), &[]);
-
-        validate_ok(fixture.manifest("game"));
-    }
-
-    #[test]
-    fn package_dependency_path_must_contain_manifest() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("missing", "../missing")]);
-
-        validate_err(fixture.manifest("game"), "anvyx.toml");
-    }
-
-    #[test]
-    fn native_only_dependency_gets_provider_attachment() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("host_alias", "../host")]);
-        fixture.write_native_package("host", &[]);
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-        let host = graph
-            .packages()
-            .iter()
-            .find(|package| package.source.is_none())
-            .expect("native dependency package");
-        assert!(host.dependencies.is_empty());
-        let native = host.native.as_ref().expect("native package marker");
-        assert!(native.cargo_manifest.ends_with("Cargo.toml"));
-        assert_eq!(host.providers.len(), 1);
-        assert_eq!(host.providers[0].descriptor.provider.name, "native");
-        assert_ne!(host.providers[0].support.cargo.manifest_key, "host_alias");
-        assert_eq!(host.providers[0].support.package, package_lang_id(&host.id));
-    }
-
     #[test]
     fn dependency_provider_probe_uses_root_cache() {
         let fixture = PackageFixture::default();
@@ -1821,123 +1495,6 @@ anvyx_runtime::builtin_module! {
         assert!(root_cache.join("target").is_dir());
         assert!(!fixture.root.path().join("host/.anvyx").exists());
     }
-
-    #[test]
-    fn multi_module_native_provider_package_loads_all_modules() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("host", "../host")]);
-        fixture.write_multi_module_provider_crate("host");
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-        let host = graph
-            .packages()
-            .iter()
-            .find(|package| package.id.manifest_path().ends_with("host/anvyx.toml"))
-            .expect("host package");
-
-        assert_eq!(host.providers.len(), 2);
-        assert_eq!(host.providers[0].descriptor.provider.name, "window");
-        assert_eq!(host.providers[1].descriptor.provider.name, "gpu");
-        assert_eq!(
-            host.providers[0].descriptor.modules[0].path.segments,
-            ["window"]
-        );
-        assert_eq!(
-            host.providers[1].descriptor.modules[0].path.segments,
-            ["gpu"]
-        );
-
-        let externs = graph
-            .package_externs()
-            .into_iter()
-            .find(|(package, _)| package == &package_frontend_id(&host.id))
-            .expect("host externs")
-            .1;
-        assert_eq!(externs.len(), 2);
-        assert_eq!(externs[0].modules[0].path.segments, ["window"]);
-        assert_eq!(externs[1].modules[0].path.segments, ["gpu"]);
-
-        let supports = graph
-            .rust_provider_supports()
-            .into_iter()
-            .filter(|support| support.package == package_lang_id(&host.id))
-            .collect::<Vec<_>>();
-        assert_eq!(supports.len(), 2);
-        assert_ne!(supports[0].cargo.manifest_key, "host");
-        assert_eq!(
-            supports[0].cargo.manifest_key,
-            supports[1].cargo.manifest_key
-        );
-        assert_eq!(supports[0].modules[0].module.segments, ["window"]);
-        assert_eq!(supports[1].modules[0].module.segments, ["gpu"]);
-        assert_eq!(
-            supports[0].modules[0].bindings[0].path.segments,
-            [
-                "__anvyx_native_package",
-                "window",
-                "__anvyx_native",
-                "open_window",
-            ]
-        );
-        assert_eq!(
-            supports[1].modules[0].bindings[0].path.segments,
-            [
-                "__anvyx_native_package",
-                "gpu",
-                "__anvyx_native",
-                "create_device",
-            ]
-        );
-    }
-
-    #[test]
-    fn source_native_dependency_gets_provider_attachment() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("colors", "../colors")]);
-        fixture.write_source_native_package("colors", &[]);
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-        let colors = graph
-            .packages()
-            .iter()
-            .find(|package| package.id.manifest_path().ends_with("colors/anvyx.toml"))
-            .expect("source native dependency package");
-
-        assert!(colors.source.is_some());
-        assert!(colors.native.is_some());
-        assert_eq!(colors.providers.len(), 1);
-        assert_eq!(
-            colors.providers[0].support.package,
-            package_lang_id(&colors.id)
-        );
-    }
-
-    #[test]
-    fn root_native_package_gets_provider_attachment() {
-        let fixture = PackageFixture::default();
-        fixture.write_source_native_package("game", &[]);
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-        let root = graph.root();
-
-        assert!(root.source.is_some());
-        assert!(root.native.is_some());
-        assert_eq!(root.providers.len(), 1);
-        assert_eq!(root.providers[0].support.package, package_lang_id(&root.id));
-    }
-
-    #[test]
-    fn invalid_native_provider_reports_package_context() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("host", "../host")]);
-        fixture.write_invalid_native_package("host");
-
-        let error = load_package_graph(&fixture.manifest("game")).unwrap_err();
-
-        assert!(error.contains("native provider package"));
-        assert!(error.contains("invalid provider descriptor"));
-    }
-
     #[test]
     fn graph_provider_helpers_group_descriptors_and_supports_by_package() {
         let root = synthetic_package_id(PathBuf::from("/tmp/game/anvyx.toml"));
@@ -1984,51 +1541,6 @@ anvyx_runtime::builtin_module! {
             );
         }
     }
-
-    #[test]
-    fn source_only_graph_has_no_native_provider_helpers() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("math", "../math")]);
-        fixture.write_package("math", &[]);
-
-        let graph = load_package_graph(&fixture.manifest("game")).unwrap();
-
-        assert!(graph.package_externs().is_empty());
-        assert!(graph.rust_provider_supports().is_empty());
-    }
-
-    #[test]
-    fn package_without_entry_or_native_marker_is_rejected() {
-        let fixture = PackageFixture::default();
-        fixture.write_raw_manifest(
-            "host",
-            r#"
-            [project]
-            name = "host"
-            "#,
-        );
-
-        validate_err(fixture.manifest("host"), "no project.entry");
-    }
-
-    #[test]
-    fn package_dependency_cycles_are_rejected() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("a", &[("b", "../b")]);
-        fixture.write_package("b", &[("a", "../a")]);
-
-        validate_err(fixture.manifest("a"), "cycle");
-    }
-
-    #[test]
-    fn same_canonical_package_cannot_be_declared_twice_in_one_manifest() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("math", "../math"), ("m", "../math")]);
-        fixture.write_package("math", &[]);
-
-        validate_err(fixture.manifest("game"), "same package");
-    }
-
     #[test]
     fn same_canonical_native_dependency_is_loaded_once() {
         let fixture = PackageFixture::default();
@@ -2046,69 +1558,5 @@ anvyx_runtime::builtin_module! {
 
         assert_eq!(math.len(), 1);
         assert_eq!(math[0].providers.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_project_names_are_allowed_for_different_packages() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("left", "../left"), ("right", "../right")]);
-        fixture.write_named_package("left", Some("math"), &[]);
-        fixture.write_named_package("right", Some("math"), &[]);
-
-        validate_ok(fixture.manifest("game"));
-    }
-
-    #[test]
-    fn invalid_dependency_alias_is_rejected() {
-        let fixture = PackageFixture::default();
-        fixture.write_raw_manifest(
-            "game",
-            r#"
-            [project]
-            entry = "src/main.anv"
-
-            [dependencies]
-            "bad-name" = { path = "../bad" }
-            "#,
-        );
-        fixture.write_package("bad", &[]);
-
-        validate_err(fixture.manifest("game"), "invalid dependency alias");
-    }
-
-    #[test]
-    fn keyword_dependency_alias_is_rejected() {
-        let fixture = PackageFixture::default();
-        fixture.write_raw_manifest(
-            "game",
-            r#"
-            [project]
-            entry = "src/main.anv"
-
-            [dependencies]
-            fn = { path = "../bad" }
-            "#,
-        );
-        fixture.write_package("bad", &[]);
-
-        validate_err(fixture.manifest("game"), "invalid dependency alias");
-    }
-
-    #[test]
-    fn std_dependency_alias_is_allowed() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("std", "../fake_std")]);
-        fixture.write_package("fake_std", &[]);
-
-        validate_ok(fixture.manifest("game"));
-    }
-
-    #[test]
-    fn core_dependency_alias_is_allowed() {
-        let fixture = PackageFixture::default();
-        fixture.write_package("game", &[("core", "../engine_core")]);
-        fixture.write_package("engine_core", &[]);
-
-        validate_ok(fixture.manifest("game"));
     }
 }

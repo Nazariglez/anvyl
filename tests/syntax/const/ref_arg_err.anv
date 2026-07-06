@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: immutable binding 'X' cannot be passed to ref parameter
 

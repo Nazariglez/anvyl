@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extend<T> [T] {
     fn tag(self) -> string { "list" }

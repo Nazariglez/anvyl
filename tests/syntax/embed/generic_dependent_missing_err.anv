@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Unknown field 'hp' for type 'Box<int>'
 
 struct Box<T> {

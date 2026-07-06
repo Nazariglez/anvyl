@@ -81,7 +81,7 @@ impl TypeChecker {
             .global_types
             .get(key)
             .expect("global type was not seeded");
-        self.local_handle(id)
+        TypeChecker::local_handle(id)
     }
 
     pub(super) fn global_checked(&self, sig: &GlobalSig) -> CheckedType {

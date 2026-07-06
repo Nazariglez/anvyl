@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: use a wider dynamic type at the conversion site
 
 contract Drawable {

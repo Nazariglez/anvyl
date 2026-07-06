@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: extern functions cannot return callbacks
 
 extern fn make() -> fn();

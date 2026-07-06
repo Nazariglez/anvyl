@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 4
+// @match-end
+
+struct Counter {
+    value: int,
+
+    fn get(self) -> int {
+        state = Box { counter: Counter { value: self.value } };
+        self.value
+    }
+}
+
+struct Box { counter: Counter }
+
+fn make_box() -> Box {
+    println("init");
+    Box { counter: Counter { value: 4 } }
+}
+
+lazy var state = make_box();
+
+fn main() {
+    println(state.counter.get());
+}

@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 5
+// 5
+// @match-end
+
+fn set_direct(ref xs: [int]) {
+    for i, ref x in xs {
+        xs[i] = 5;
+    }
+}
+
+fn main() {
+    var values: [int] = [1, 2];
+    set_direct(values);
+    println(values[0]);
+    println(values[1]);
+}

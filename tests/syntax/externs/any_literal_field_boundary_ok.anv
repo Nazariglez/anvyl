@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern fn get() -> any;
 extern type Box rep inline { init; value: any; }

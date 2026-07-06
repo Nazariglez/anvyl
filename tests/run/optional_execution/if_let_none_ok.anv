@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: none
+
+fn main() {
+    let value: int? = nil;
+    if let nil = value {
+        println("none");
+    } else {
+        println("some");
+    }
+}

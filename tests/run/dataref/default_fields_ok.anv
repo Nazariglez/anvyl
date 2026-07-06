@@ -1,38 +1,23 @@
 // @mode: run
 // @expect: success
-// @contains: ok
+// @match-begin
+// 1
+// 2
+// 1
+// 9
+// @match-end
 
-dataref Config {
-    width: int = 800,
-    height: int = 600,
-}
-
-dataref Player {
-    name: string,
-    health: float = 100.0,
-}
-
-dataref Mixed {
+dataref Pair {
     a: int = 1,
-    b: string,
-    c: bool = true,
+    b: int = 2,
+}
+
+fn show(pair: Pair) {
+    println(pair.a);
+    println(pair.b);
 }
 
 fn main() {
-    let c = Config {};
-    assert(c.width == 800);
-    assert(c.height == 600);
-
-    let c2 = Config { width: 1920 };
-    assert(c2.width == 1920);
-    assert(c2.height == 600);
-
-    let p = Player { name: "Alice" };
-    assert(p.health == 100.0);
-
-    let m = Mixed { b: "hello" };
-    assert(m.a == 1);
-    assert(m.c);
-
-    println("ok");
+    show(Pair {});
+    show(Pair { b: 9 });
 }

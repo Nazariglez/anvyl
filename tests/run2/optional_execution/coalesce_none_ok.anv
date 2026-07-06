@@ -1,9 +1,0 @@
-// @mode: run
-// @frontend: new
-// @expect: success
-// @match: 9
-
-fn main() {
-    let value: int? = nil;
-    println(value ?? 9);
-}

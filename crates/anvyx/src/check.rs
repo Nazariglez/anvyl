@@ -1,22 +1,12 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::IsTerminal,
-    path::Path,
-};
+use std::{collections::HashSet, io::IsTerminal, path::Path};
 
-use anvyx_lang::{CompilationContext, LintConfig, Profile, TargetArch, TargetOs};
-use anvyx_lang2::{
-    CompilationContext as FrontendCompilationContext, Diagnostic, DiagnosticLabel,
-    DiagnosticProjection, DiagnosticReport, DiagnosticSeverity, DiagnosticTag, FrontendConfig,
-    LineCol, LintConfig as FrontendLintConfig, Profile as FrontendProfile, SourceFile,
-    TargetArch as FrontendTargetArch, TargetOs as FrontendTargetOs, implemented_lints,
-    render_rich_report_with_overrides,
+use anvyx_lang::{
+    CompilationContext, Diagnostic, DiagnosticLabel, DiagnosticProjection, DiagnosticReport,
+    DiagnosticSeverity, DiagnosticTag, FrontendConfig, LineCol, LintConfig, SourceFile,
+    implemented_lints, render_rich_report_with_overrides,
 };
 use clap::ValueEnum;
 use serde::Serialize;
-
-use crate::std_support::{collect_core, collect_std};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CheckOutputFormat {
@@ -39,34 +29,14 @@ pub fn render_lint_list() -> String {
     lines.join("\n")
 }
 
-pub fn cmd(file: &Path, lint: LintConfig, ctx: &CompilationContext) -> Result<(), String> {
-    let program = fs::read_to_string(file).map_err(|e| format!("Failed to read file: {e}"))?;
-    let file_path = file.to_string_lossy().to_string();
-    let (std_sources, _) = collect_std();
-    let (core_prelude, core_sources, _) = collect_core();
-    let metadata = HashMap::new();
-
-    let _ast = anvyx_lang::generate_ast_with_std(
-        &program,
-        &file_path,
-        &core_prelude,
-        &metadata,
-        &std_sources,
-        &core_sources,
-        lint,
-        ctx,
-    )?;
-    Ok(())
-}
-
-pub fn new_frontend_cmd(
+pub fn cmd(
     file: &Path,
-    lint: FrontendLintConfig,
+    lint: LintConfig,
     ctx: &CompilationContext,
     format: CheckOutputFormat,
     warnings_are_errors: bool,
 ) -> Result<(), String> {
-    let output = match anvyx_project::check::check_path(file, new_frontend_config(lint, ctx)) {
+    let output = match anvyx_project::check::check_path(file, frontend_config(lint, ctx)) {
         Ok(output) => output,
         Err(error) => return emit_host_error(error, format),
     };
@@ -84,7 +54,7 @@ fn emit_host_error(error: String, format: CheckOutputFormat) -> Result<(), Strin
 }
 
 fn emit_check_output(
-    output: &anvyx_lang2::CheckOutput,
+    output: &anvyx_lang::CheckOutput,
     format: CheckOutputFormat,
     warnings_are_errors: bool,
 ) -> Result<(), String> {
@@ -98,36 +68,11 @@ fn emit_check_output(
     Ok(())
 }
 
-pub(crate) fn new_frontend_config(
-    lint: FrontendLintConfig,
-    ctx: &CompilationContext,
-) -> FrontendConfig {
+pub(crate) fn frontend_config(lint: LintConfig, ctx: &CompilationContext) -> FrontendConfig {
     FrontendConfig {
         lint,
-        context: new_frontend_context(ctx),
+        context: ctx.clone(),
         ..FrontendConfig::default()
-    }
-}
-
-fn new_frontend_context(ctx: &CompilationContext) -> FrontendCompilationContext {
-    FrontendCompilationContext {
-        profile: match ctx.profile {
-            Profile::Debug => FrontendProfile::Debug,
-            Profile::Release => FrontendProfile::Release,
-        },
-        os: match ctx.os {
-            TargetOs::MacOs => FrontendTargetOs::Macos,
-            TargetOs::Linux => FrontendTargetOs::Linux,
-            TargetOs::Windows => FrontendTargetOs::Windows,
-            TargetOs::Wasm => FrontendTargetOs::Wasm,
-            TargetOs::Ios => FrontendTargetOs::Ios,
-            TargetOs::Android => FrontendTargetOs::Android,
-        },
-        arch: match ctx.arch {
-            TargetArch::X86_64 => FrontendTargetArch::X86_64,
-            TargetArch::Aarch64 => FrontendTargetArch::Aarch64,
-        },
-        features: ctx.features.iter().cloned().collect(),
     }
 }
 
@@ -180,7 +125,7 @@ fn render_text_report_with_color(
 ) -> Option<String> {
     let mut rendered = render_rich_report_with_overrides(
         report,
-        anvyx_lang2::RenderConfig { color },
+        anvyx_lang::RenderConfig { color },
         |diagnostic| diagnostic_projection(diagnostic, warnings_are_errors),
     );
     if rendered.is_empty() {
@@ -194,7 +139,7 @@ fn render_text_report_with_color(
 
 fn message_report(message: impl Into<String>) -> DiagnosticReport {
     DiagnosticReport::new(
-        anvyx_lang2::SourceTable::default(),
+        anvyx_lang::SourceTable::default(),
         vec![Diagnostic::error(message)],
     )
 }
@@ -398,63 +343,11 @@ fn json_excerpt<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::fs;
 
-    use anvyx_lang2::CheckFileInput;
+    use anvyx_lang::CheckFileInput;
 
     use super::*;
-    use crate::manifest::{DependencyEntry, Manifest, Project};
-
-    fn check_new_frontend(file: &Path) -> Result<(), String> {
-        new_frontend_cmd(
-            file,
-            FrontendLintConfig::default(),
-            &CompilationContext::from_host(Profile::Debug),
-            CheckOutputFormat::Text,
-            false,
-        )
-    }
-
-    fn check_new_frontend_error(file: &Path) -> String {
-        let sources = anvyx_project::source_bundle().unwrap();
-        let input = CheckFileInput::new(file.to_path_buf(), sources).unwrap();
-        let output = anvyx_lang2::check_file(input).unwrap();
-        render_text_report(&output.report, false).unwrap_or_else(|| output.summary().to_string())
-    }
-
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    fn check_new_frontend_standalone_uses_project_input() {
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main.anv");
-        fs::write(&main, "fn main() {}\n").unwrap();
-
-        check_new_frontend(&main).unwrap();
-    }
-
-    #[test]
-    fn check_new_frontend_manifest_uses_project_input() {
-        let _guard = cwd_lock().lock().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("src")).unwrap();
-        fs::write(
-            temp.path().join("anvyx.toml"),
-            "[project]\nentry = \"src/main.anv\"\n",
-        )
-        .unwrap();
-        fs::write(temp.path().join("src/main.anv"), "fn main() {}\n").unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
-
-        let result = check_new_frontend(Path::new("src/main.anv"));
-
-        std::env::set_current_dir(previous).unwrap();
-        result.unwrap();
-    }
 
     #[test]
     fn list_lints_output_is_stable() {
@@ -514,9 +407,9 @@ mod tests {
 
     #[test]
     fn warn_as_error_text_includes_promotion_note() {
-        let mut sources = anvyx_lang2::SourceTable::default();
+        let mut sources = anvyx_lang::SourceTable::default();
         let source = sources.add(
-            anvyx_lang2::SourceKind::Virtual,
+            anvyx_lang::SourceKind::Virtual,
             "main.anv",
             None,
             "let x = 1;",
@@ -525,7 +418,7 @@ mod tests {
             DiagnosticReport {
                 sources,
                 diagnostics: vec![Diagnostic::warning("careful").with_primary_message(
-                    anvyx_lang2::SourceSpan::new(source, 0, 3),
+                    anvyx_lang::SourceSpan::new(source, 0, 3),
                     "warning here",
                 )],
             };
@@ -549,7 +442,7 @@ mod tests {
 
     #[test]
     fn warn_as_error_fails_on_final_warning_report() {
-        let output = anvyx_lang2::CheckOutput::passed(DiagnosticReport {
+        let output = anvyx_lang::CheckOutput::passed(DiagnosticReport {
             diagnostics: vec![Diagnostic::warning("careful")],
             ..DiagnosticReport::default()
         });
@@ -566,7 +459,7 @@ mod tests {
         fs::write(&main, "import helper; fn main() {}\n").unwrap();
         fs::write(temp.path().join("helper.anv"), "pub fn f() {}\n").unwrap();
         let input = anvyx_project::check::standalone_check_input(&main).unwrap();
-        let report = anvyx_lang2::check_file(input).unwrap().report;
+        let report = anvyx_lang::check_file(input).unwrap().report;
         let json: serde_json::Value =
             serde_json::from_str(&render_json_report(&report, false).unwrap()).unwrap();
         let diagnostic = &json["diagnostics"][0];
@@ -574,18 +467,6 @@ mod tests {
         assert_eq!(diagnostic["source"], "anvyx");
         assert_eq!(diagnostic["code"], "unused_import");
         assert_eq!(diagnostic["tags"], serde_json::json!(["unnecessary"]));
-    }
-
-    fn plain_manifest() -> Manifest {
-        Manifest {
-            project: Project {
-                name: None,
-                version: None,
-                entry: Some("main.anv".to_string()),
-            },
-            dependencies: HashMap::new(),
-            lint: std::collections::BTreeMap::default(),
-        }
     }
 
     mod frontend {
@@ -600,16 +481,12 @@ mod tests {
             file
         }
 
-        fn frontend_error(code: &str) -> anvyx_lang2::CheckOutput {
+        fn check_error_report(code: &str) -> DiagnosticReport {
             let temp = tempfile::tempdir().unwrap();
             let main = write(&temp, "main.anv", code);
             let sources = anvyx_project::source_bundle().unwrap();
             let input = CheckFileInput::new(main, sources).unwrap();
-            anvyx_lang2::check_file(input).unwrap()
-        }
-
-        fn check_error_report(code: &str) -> DiagnosticReport {
-            frontend_error(code).report
+            anvyx_lang::check_file(input).unwrap().report
         }
 
         fn json_value(report: &DiagnosticReport) -> serde_json::Value {
@@ -641,161 +518,12 @@ mod tests {
                 let graph =
                     crate::manifest::load_package_graph(&dir.path().join("game/anvyx.toml"))?;
                 let input = anvyx_project::check::package_check_input(&graph, file)?;
-                let output =
-                    anvyx_lang2::check_package(input).map_err(|error| error.to_string())?;
+                let output = anvyx_lang::check_package(input).map_err(|error| error.to_string())?;
                 if output.has_errors() {
                     return Err(render_text_report(&output.report, false)
                         .unwrap_or_else(|| output.summary().to_string()));
                 }
                 Ok(())
-            }
-
-            #[test]
-            fn core_prelude_nominals_are_visible_without_import() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "main.anv",
-                    "fn takes_option(x: Option<int>) {} fn takes_ranges(a: Range<int>, b: RangeFrom<int>) {}",
-                );
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn core_primitive_extensions_are_forwarded_by_core_root() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "main.anv",
-                    "fn main() { let a: int = (-1).abs(); let b: float = 4.0.sqrt(); let c: int = \"abc\".len(); }",
-                );
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn core_helper_externs_are_not_visible_to_user_modules() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "fn main() { int_abs(1); }");
-                let error = check_new_frontend_error(&main);
-
-                assert!(error.contains("int_abs"));
-            }
-
-            #[test]
-            fn core_primitive_wrapper_modules_are_not_preluded() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "fn main() { core_int.abs(1); }");
-                let error = check_new_frontend_error(&main);
-
-                assert!(error.contains("core_int"));
-            }
-
-            #[test]
-            fn std_import_resolves_implicit_package() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "main.anv",
-                    "import std:mem; fn main() { mem.collect_cycles(); }",
-                );
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn std_selective_import_resolves_implicit_package() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "main.anv",
-                    "import std:mem { collect_cycles }; fn main() { collect_cycles(); }",
-                );
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn std_declarations_are_not_preluded() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "fn main() { collect_cycles(); }");
-                let error = check_new_frontend_error(&main);
-
-                assert!(error.contains("collect_cycles"));
-            }
-
-            #[test]
-            fn old_std_dot_import_is_local_source_syntax() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(&temp, "main.anv", "import std.mem; fn main() {}");
-                let error = check_new_frontend_error(&main);
-
-                assert!(error.contains("std/mem.anv") || error.contains("std\\mem.anv"));
-            }
-
-            #[test]
-            fn local_std_path_does_not_affect_std_colon_import() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "main.anv",
-                    "import std.mem { local }; import std:mem { collect_cycles }; fn main() { local(); collect_cycles(); }",
-                );
-                write(&temp, "std/mem.anv", "pub fn local() {}");
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn script_relative_imports_work() {
-                let temp = tempfile::tempdir().unwrap();
-                let main = write(
-                    &temp,
-                    "src/ui/main.anv",
-                    "import helper { value as a }; import .helper { value as b }; import ..common { value as c }; fn main() { let x: int = a() + b() + c(); }",
-                );
-                write(&temp, "src/ui/helper.anv", "pub fn value() -> int { 1 }");
-                write(&temp, "src/common.anv", "pub fn value() -> int { 1 }");
-
-                check_new_frontend(&main).unwrap();
-            }
-
-            #[test]
-            fn pkg_std_and_relative_imports() {
-                let temp = tempfile::tempdir().unwrap();
-                write_manifest(&temp, "game", "src/main.anv", &[("math", "../math")]);
-                write_manifest(&temp, "math", "src/lib.anv", &[]);
-                let main = write(
-                    &temp,
-                    "game/src/main.anv",
-                    "import helper { local }; import .helper { local as local2 }; import ..outside { escaped }; import pkg:math { add }; import std:mem; fn main() { let x: int = local() + local2() + escaped() + add(); }",
-                );
-                write(&temp, "game/src/helper.anv", "pub fn local() -> int { 1 }");
-                write(&temp, "game/outside.anv", "pub fn escaped() -> int { 1 }");
-                write(&temp, "math/src/lib.anv", "pub fn add() -> int { 1 }");
-
-                check_manifest_file(&temp, &main).unwrap();
-            }
-
-            #[test]
-            fn package_root_reexport_forwards_extend() {
-                let temp = tempfile::tempdir().unwrap();
-                write_manifest(&temp, "game", "src/main.anv", &[("helpers", "../helpers")]);
-                write_manifest(&temp, "helpers", "src/lib.anv", &[]);
-                let main = write(
-                    &temp,
-                    "game/src/main.anv",
-                    "import pkg:helpers; fn main() { let x: string = \"hi\".shout(); }",
-                );
-                write(&temp, "helpers/src/lib.anv", "pub import strings;");
-                write(
-                    &temp,
-                    "helpers/src/strings.anv",
-                    "pub extend string { fn shout(self) -> string { self } }",
-                );
-
-                check_manifest_file(&temp, &main).unwrap();
             }
 
             #[test]
@@ -808,81 +536,6 @@ mod tests {
 
                 assert!(error.contains("outside every loaded package source root"));
             }
-
-            #[test]
-            fn old_dep_root_fails() {
-                let temp = tempfile::tempdir().unwrap();
-                write_manifest(&temp, "game", "src/main.anv", &[]);
-                let main = write(&temp, "game/src/main.anv", "import dep:math; fn main() {}");
-                let error = check_manifest_file(&temp, &main).unwrap_err();
-
-                assert!(
-                    error.contains("Unexpected token ':'") || error.contains("import declaration")
-                );
-            }
-        }
-
-        #[test]
-        fn text_type_error_renders_rich_report_and_short_summary() {
-            let code = "fn main() { let hp: int = true; }";
-            let error = frontend_error(code);
-            let rendered = render_text_report_with_color(&error.report, false, false).unwrap();
-
-            assert!(rendered.contains("Error: mismatched types"), "{rendered}");
-            assert!(rendered.contains("main.anv"), "{rendered}");
-            assert!(rendered.contains(code), "{rendered}");
-            assert!(
-                rendered.contains("expected `int`, found `bool`"),
-                "{rendered}"
-            );
-            assert_eq!(error.summary(), "Failed to typecheck program");
-            assert!(
-                !rendered.contains("frontend typecheck failed"),
-                "{rendered}"
-            );
-            assert!(!rendered.contains("\n- mismatched types"), "{rendered}");
-        }
-
-        #[test]
-        fn text_parse_error_renders_label_and_short_summary() {
-            let error = frontend_error("fn");
-            let rendered = render_text_report_with_color(&error.report, false, false).unwrap();
-
-            assert!(rendered.contains("Unexpected end of input"), "{rendered}");
-            assert!(rendered.contains("end of file"), "{rendered}");
-            assert_eq!(error.summary(), "Failed to parse program");
-        }
-
-        #[test]
-        fn text_message_only_report_renders_plain_message() {
-            let report = message_report("bad path");
-
-            assert!(render_text_report_with_color(&report, false, false).is_some());
-        }
-
-        #[test]
-        fn text_warning_report_uses_rich_renderer() {
-            let mut sources = anvyx_lang2::SourceTable::default();
-            let source = sources.add(
-                anvyx_lang2::SourceKind::Virtual,
-                "main.anv",
-                None,
-                "fn main() {}",
-            );
-            let report = DiagnosticReport {
-                sources,
-                diagnostics: vec![Diagnostic::warning("careful").with_primary_message(
-                    anvyx_lang2::SourceSpan::new(source, 0, 2),
-                    "compile warning emitted here",
-                )],
-            };
-            let rendered = render_text_report_with_color(&report, false, false).unwrap();
-
-            assert!(rendered.contains("Warning: careful"), "{rendered}");
-            assert!(
-                rendered.contains("compile warning emitted here"),
-                "{rendered}"
-            );
         }
 
         #[test]
@@ -965,12 +618,12 @@ mod tests {
 
         #[test]
         fn json_report_skips_labels_outside_source_text() {
-            let mut sources = anvyx_lang2::SourceTable::default();
-            let source = sources.add(anvyx_lang2::SourceKind::Virtual, "main.anv", None, "short");
+            let mut sources = anvyx_lang::SourceTable::default();
+            let source = sources.add(anvyx_lang::SourceKind::Virtual, "main.anv", None, "short");
             let report = DiagnosticReport {
                 sources,
                 diagnostics: vec![Diagnostic::error("bad").with_primary_message(
-                    anvyx_lang2::SourceSpan::new(source, 20, 25),
+                    anvyx_lang::SourceSpan::new(source, 20, 25),
                     "outside source",
                 )],
             };
@@ -987,9 +640,9 @@ mod tests {
 
         #[test]
         fn json_report_serializes_warnings_labels_notes_help_and_metadata() {
-            let mut sources = anvyx_lang2::SourceTable::default();
+            let mut sources = anvyx_lang::SourceTable::default();
             let source = sources.add(
-                anvyx_lang2::SourceKind::Virtual,
+                anvyx_lang::SourceKind::Virtual,
                 "main.anv",
                 None,
                 "fn main() {}",
@@ -999,7 +652,7 @@ mod tests {
                 .with_tag(DiagnosticTag::Deprecated)
                 .with_tag(DiagnosticTag::Unnecessary)
                 .with_primary_message(
-                    anvyx_lang2::SourceSpan::new(source, 0, 2),
+                    anvyx_lang::SourceSpan::new(source, 0, 2),
                     "compile warning emitted here",
                 )
                 .with_note("first note")
@@ -1028,48 +681,6 @@ mod tests {
                 json["diagnostics"][0]["labels"][0]["excerpts"][0]["text"],
                 "fn main() {}"
             );
-        }
-
-        mod unsupported {
-            use super::*;
-
-            #[test]
-            fn accepts_feature_flags() {
-                assert!(plain_manifest().lint.is_empty());
-            }
-
-            #[test]
-            fn accepts_cfg_flags() {
-                assert!(plain_manifest().dependencies.is_empty());
-            }
-
-            #[test]
-            fn accepts_lint_flags() {
-                assert!(plain_manifest().lint.is_empty());
-            }
-
-            #[test]
-            fn accepts_manifest_lint() {
-                let mut manifest = plain_manifest();
-                manifest
-                    .lint
-                    .insert("internal_access".to_string(), "error".to_string());
-
-                assert_eq!(manifest.lint["internal_access"], "error");
-            }
-
-            #[test]
-            fn accepts_manifest_dependencies() {
-                let mut manifest = plain_manifest();
-                manifest.dependencies.insert(
-                    "math".to_string(),
-                    DependencyEntry {
-                        path: "../math".to_string(),
-                    },
-                );
-
-                assert!(manifest.dependencies.contains_key("math"));
-            }
         }
     }
 }

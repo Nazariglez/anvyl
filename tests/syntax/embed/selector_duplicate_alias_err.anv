@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate embed field selector 'x'
 
 struct Health { hp: int, max_hp: int }

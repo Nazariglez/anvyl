@@ -1,5 +1,0 @@
-// @helper
-
-const FACTOR = 10;
-
-pub fn scale<T>(x: T) -> T { x * FACTOR }

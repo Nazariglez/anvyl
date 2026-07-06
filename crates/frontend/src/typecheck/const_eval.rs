@@ -48,10 +48,16 @@ pub(super) enum ConstNameLookup {
     Missing,
 }
 
-fn const_lookup(result: Result<ConstValue, TypeError>) -> ConstNameLookup {
+type ConstEvalResult<T> = Result<T, Box<TypeError>>;
+
+fn const_error<T>(error: TypeError) -> ConstEvalResult<T> {
+    Err(Box::new(error))
+}
+
+fn const_lookup(result: ConstEvalResult<ConstValue>) -> ConstNameLookup {
     match result {
         Ok(value) => ConstNameLookup::Value(value),
-        Err(error) => ConstNameLookup::Error(Box::new(error)),
+        Err(error) => ConstNameLookup::Error(error),
     }
 }
 
@@ -95,7 +101,7 @@ pub(super) fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
         }
         None => value_ty,
     };
-    tc.define_const(c.name, ty, value);
+    tc.define_const(c.name, &ty, value);
 }
 
 pub(super) fn const_type(value: &ConstValue) -> Type {
@@ -107,18 +113,15 @@ pub(super) fn const_type(value: &ConstValue) -> Type {
     }
 }
 
-pub(super) fn const_usize(
-    value: &ConstValue,
-    span: Option<SourceSpan>,
-) -> Result<usize, TypeError> {
+pub(super) fn const_usize(value: &ConstValue, span: Option<SourceSpan>) -> ConstEvalResult<usize> {
     match value {
-        ConstValue::Int(value) => {
-            usize::try_from(*value).map_err(|_| TypeError::NegativeArrayLength {
+        ConstValue::Int(value) => usize::try_from(*value).map_err(|_| {
+            Box::new(TypeError::NegativeArrayLength {
                 value: *value,
                 span,
             })
-        }
-        value => Err(TypeError::ExpectedIntConst {
+        }),
+        value => const_error(TypeError::ExpectedIntConst {
             found: const_type(value),
             span,
         }),
@@ -302,7 +305,7 @@ impl TypeChecker {
         &mut self,
         expr: &ExprNode,
         warn_deprecated: bool,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.eval_const_lit(lit, expr.span),
             ExprKind::Ident(name) => {
@@ -312,16 +315,16 @@ impl TypeChecker {
                 match self.lookup_visible_const_name(*name, expr.span) {
                     ConstNameLookup::Value(value) => Ok(value),
                     ConstNameLookup::RuntimeGlobal(global) => {
-                        Err(TypeError::RuntimeGlobalInConstPosition {
+                        const_error(TypeError::RuntimeGlobalInConstPosition {
                             global,
                             span: self.error_span(expr.span),
                         })
                     }
-                    ConstNameLookup::NotConstLocal => Err(TypeError::NonConstExpression {
+                    ConstNameLookup::NotConstLocal => const_error(TypeError::NonConstExpression {
                         span: self.error_span(expr.span),
                     }),
-                    ConstNameLookup::Error(error) => Err(*error),
-                    ConstNameLookup::Missing => Err(TypeError::UnknownConst {
+                    ConstNameLookup::Error(error) => Err(error),
+                    ConstNameLookup::Missing => const_error(TypeError::UnknownConst {
                         name: *name,
                         span: self.error_span(expr.span),
                     }),
@@ -380,7 +383,7 @@ impl TypeChecker {
                     ConstValue::Bool(false) => {
                         self.eval_const_expr(&node.node.else_expr, warn_deprecated)
                     }
-                    other => Err(TypeError::InvalidOperand {
+                    other => const_error(TypeError::InvalidOperand {
                         op: "?:".to_string(),
                         operand_type: const_type(&other),
                         span: self.error_span(node.node.cond.span),
@@ -391,7 +394,7 @@ impl TypeChecker {
                 self.eval_const_string_interp(parts, expr.span, warn_deprecated)
             }
             ExprKind::Field(node) => self.eval_const_field(node, expr.span, warn_deprecated),
-            _ => Err(TypeError::NonConstExpression {
+            _ => const_error(TypeError::NonConstExpression {
                 span: self.error_span(expr.span),
             }),
         }
@@ -402,16 +405,16 @@ impl TypeChecker {
         node: &FieldAccessNode,
         span: Span,
         warn_deprecated: bool,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         let err_span = self.error_span(span);
         if node.node.safe {
-            return Err(TypeError::NonConstExpression { span: err_span });
+            return const_error(TypeError::NonConstExpression { span: err_span });
         }
         let ExprKind::Ident(module) = &node.node.target.node.kind else {
-            return Err(TypeError::NonConstExpression { span: err_span });
+            return const_error(TypeError::NonConstExpression { span: err_span });
         };
         let Some(scope) = self.lookup_module_alias(*module) else {
-            return Err(TypeError::NonConstExpression { span: err_span });
+            return const_error(TypeError::NonConstExpression { span: err_span });
         };
         match self.exported_value_in_module(&scope, node.node.field) {
             Some((module, name, ValueDecl::Const(sig))) => {
@@ -420,14 +423,16 @@ impl TypeChecker {
                 }
                 self.eval_top_const(&module, name, err_span)
             }
-            Some((_, _, ValueDecl::Global(sig))) => Err(TypeError::RuntimeGlobalInConstPosition {
-                global: sig.key,
-                span: err_span,
-            }),
-            Some((_, _, ValueDecl::Func(_))) => {
-                Err(TypeError::NonConstExpression { span: err_span })
+            Some((_, _, ValueDecl::Global(sig))) => {
+                const_error(TypeError::RuntimeGlobalInConstPosition {
+                    global: sig.key,
+                    span: err_span,
+                })
             }
-            None => Err(TypeError::UndefinedModuleMember {
+            Some((_, _, ValueDecl::Func(_))) => {
+                const_error(TypeError::NonConstExpression { span: err_span })
+            }
+            None => const_error(TypeError::UndefinedModuleMember {
                 module: scope,
                 name: node.node.field,
                 span: err_span,
@@ -475,7 +480,7 @@ impl TypeChecker {
         info: &VarInfo,
         name: Ident,
         span: Span,
-    ) -> Option<Result<ConstValue, TypeError>> {
+    ) -> Option<ConstEvalResult<ConstValue>> {
         if let Some(value) = info.const_value.clone() {
             return Some(Ok(value));
         }
@@ -503,7 +508,7 @@ impl TypeChecker {
     pub(super) fn check_const_value_expr(
         &mut self,
         expr: &ExprNode,
-        value: Result<ConstValue, TypeError>,
+        value: ConstEvalResult<ConstValue>,
     ) -> CheckedType {
         let ty = self.record_const_value_result(expr.node.id, value);
         checked_from_type(expr, ty, self)
@@ -512,7 +517,7 @@ impl TypeChecker {
     pub(super) fn record_const_value_result(
         &mut self,
         expr_id: ExprId,
-        value: Result<ConstValue, TypeError>,
+        value: ConstEvalResult<ConstValue>,
     ) -> Type {
         match value {
             Ok(value) => {
@@ -531,20 +536,22 @@ impl TypeChecker {
         &mut self,
         id: LocalConstId,
         span: Span,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         let err_span = self.error_span(span);
         let Some(entry) = self.local_consts.get(id.0 as usize) else {
-            return Err(TypeError::NonConstExpression { span: err_span });
+            return const_error(TypeError::NonConstExpression { span: err_span });
         };
         match entry.state.clone() {
             ConstState::Evaluated(value) => return Ok(value),
             ConstState::Evaluating => {
-                return Err(TypeError::ConstCycle {
+                return const_error(TypeError::ConstCycle {
                     name: entry.name,
                     span: err_span,
                 });
             }
-            ConstState::Failed => return Err(TypeError::NonConstExpression { span: err_span }),
+            ConstState::Failed => {
+                return const_error(TypeError::NonConstExpression { span: err_span });
+            }
             ConstState::Unevaluated => {}
         }
 
@@ -594,15 +601,15 @@ impl TypeChecker {
         module: &ModuleScope,
         name: Ident,
         span: Option<SourceSpan>,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         let key = (module.clone(), name);
         let Some(state) = self.consts.get(&key).map(|entry| entry.state.clone()) else {
-            return Err(TypeError::UnknownConst { name, span });
+            return const_error(TypeError::UnknownConst { name, span });
         };
         match state {
             ConstState::Evaluated(value) => return Ok(value),
-            ConstState::Evaluating => return Err(TypeError::ConstCycle { name, span }),
-            ConstState::Failed => return Err(TypeError::NonConstExpression { span }),
+            ConstState::Evaluating => return const_error(TypeError::ConstCycle { name, span }),
+            ConstState::Failed => return const_error(TypeError::NonConstExpression { span }),
             ConstState::Unevaluated => {}
         }
 
@@ -659,13 +666,13 @@ impl TypeChecker {
         self.solver.set_local_type_from_type(type_id, ty);
     }
 
-    fn eval_const_lit(&self, lit: &Lit, span: Span) -> Result<ConstValue, TypeError> {
+    fn eval_const_lit(&self, lit: &Lit, span: Span) -> ConstEvalResult<ConstValue> {
         match lit {
             Lit::Int(value) => Ok(ConstValue::Int(*value)),
             Lit::Float(value) => Ok(ConstValue::Float(*value)),
             Lit::Bool(value) => Ok(ConstValue::Bool(*value)),
             Lit::String(value) => Ok(ConstValue::String(value.clone())),
-            Lit::Nil => Err(TypeError::NonConstExpression {
+            Lit::Nil => const_error(TypeError::NonConstExpression {
                 span: self.error_span(span),
             }),
         }
@@ -675,7 +682,7 @@ impl TypeChecker {
         &mut self,
         node: &CastNode,
         warn_deprecated: bool,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         let value = self.eval_const_expr(&node.node.expr, warn_deprecated)?;
         let from = const_type(&value);
         let to = self.resolve_type_for_tc_at(&node.node.target, node.span);
@@ -683,7 +690,7 @@ impl TypeChecker {
             (value, _) if from == to => Ok(value),
             (ConstValue::Int(value), Type::Float) => Ok(ConstValue::Float(value as f64)),
             (ConstValue::Float(value), Type::Int) => Ok(ConstValue::Int(value as i64)),
-            _ => Err(TypeError::InvalidConstCast {
+            _ => const_error(TypeError::InvalidConstCast {
                 from,
                 to,
                 span: self.error_span(node.span),
@@ -696,7 +703,7 @@ impl TypeChecker {
         parts: &[StringPart],
         span: Span,
         warn_deprecated: bool,
-    ) -> Result<ConstValue, TypeError> {
+    ) -> ConstEvalResult<ConstValue> {
         let mut out = String::new();
         for part in parts {
             match part {
@@ -709,7 +716,7 @@ impl TypeChecker {
         }
         let empty_interpolation = out.is_empty() && parts.is_empty();
         if empty_interpolation {
-            return Err(TypeError::NonConstExpression {
+            return const_error(TypeError::NonConstExpression {
                 span: self.error_span(span),
             });
         }
@@ -722,14 +729,14 @@ fn eval_const_decl(
     value_expr: &ExprNode,
     decl_span: Span,
     tc: &mut TypeChecker,
-) -> Result<(ConstValue, Type), TypeError> {
+) -> ConstEvalResult<(ConstValue, Type)> {
     let expected_ty = ty.map(|annot| tc.resolve_type_for_tc_at(annot, decl_span));
-    let expected_handle = expected_ty.as_ref().map(|ty| tc.type_handle(ty));
+    let expected_handle = expected_ty.as_ref().map(TypeChecker::type_handle);
     super::validate_const_expr_type(value_expr, expected_handle, tc)?;
     let value = tc.eval_const_expr(value_expr, false)?;
     let value_ty = const_type(&value);
     match expected_ty {
-        Some(expected) if expected != value_ty => Err(TypeError::ConstTypeMismatch {
+        Some(expected) if expected != value_ty => const_error(TypeError::ConstTypeMismatch {
             expected,
             found: value_ty,
             span: tc.error_span(decl_span),
@@ -750,10 +757,10 @@ fn bool_operand(
     op: BinaryOp,
     value: ConstValue,
     span: Option<SourceSpan>,
-) -> Result<bool, TypeError> {
+) -> ConstEvalResult<bool> {
     match value {
         ConstValue::Bool(value) => Ok(value),
-        value => Err(TypeError::InvalidOperand {
+        value => const_error(TypeError::InvalidOperand {
             op: format!("{op}"),
             operand_type: const_type(&value),
             span,
@@ -765,16 +772,16 @@ fn eval_unary(
     op: UnaryOp,
     value: ConstValue,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     match (op, value) {
         (UnaryOp::Neg, ConstValue::Int(value)) => value
             .checked_neg()
             .map(ConstValue::Int)
-            .ok_or(TypeError::ConstOverflow { span }),
+            .ok_or_else(|| Box::new(TypeError::ConstOverflow { span })),
         (UnaryOp::Neg, ConstValue::Float(value)) => Ok(ConstValue::Float(-value)),
         (UnaryOp::Not, ConstValue::Bool(value)) => Ok(ConstValue::Bool(!value)),
         (UnaryOp::BitNot, ConstValue::Int(value)) => Ok(ConstValue::Int(!value)),
-        (_, value) => Err(TypeError::InvalidOperand {
+        (_, value) => const_error(TypeError::InvalidOperand {
             op: format!("{op}"),
             operand_type: const_type(&value),
             span,
@@ -787,7 +794,7 @@ fn eval_binary(
     left: ConstValue,
     right: ConstValue,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     match (left, right) {
         (ConstValue::Int(a), ConstValue::Int(b)) => eval_int_binary(op, a, b, span),
         (ConstValue::Float(a), ConstValue::Float(b)) => eval_float_binary(op, a, b, span),
@@ -799,7 +806,7 @@ fn eval_binary(
         (value, ConstValue::String(b)) if op == BinaryOp::Add => {
             Ok(ConstValue::String(format!("{}{b}", const_string(&value))))
         }
-        (left, right) => Err(TypeError::TypeMismatch {
+        (left, right) => const_error(TypeError::TypeMismatch {
             expected: const_type(&left),
             found: const_type(&right),
             span,
@@ -812,7 +819,7 @@ fn eval_int_binary(
     a: i64,
     b: i64,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     let int = |value| Ok(ConstValue::Int(value));
     let bool = |value| Ok(ConstValue::Bool(value));
     match op {
@@ -820,7 +827,7 @@ fn eval_int_binary(
         BinaryOp::Sub => a.checked_sub(b).map(ConstValue::Int),
         BinaryOp::Mul => a.checked_mul(b).map(ConstValue::Int),
         BinaryOp::Div | BinaryOp::Rem if b == 0 => {
-            return Err(TypeError::ConstDivisionByZero { span });
+            return const_error(TypeError::ConstDivisionByZero { span });
         }
         BinaryOp::Div => a.checked_div(b).map(ConstValue::Int),
         BinaryOp::Rem => a.checked_rem(b).map(ConstValue::Int),
@@ -842,14 +849,14 @@ fn eval_int_binary(
             .and_then(|rhs| a.checked_shr(rhs))
             .map(ConstValue::Int),
         BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce => {
-            return Err(TypeError::InvalidOperand {
+            return const_error(TypeError::InvalidOperand {
                 op: format!("{op}"),
                 operand_type: Type::Int,
                 span,
             });
         }
     }
-    .ok_or(TypeError::ConstOverflow { span })
+    .ok_or_else(|| Box::new(TypeError::ConstOverflow { span }))
 }
 
 fn eval_float_binary(
@@ -857,12 +864,12 @@ fn eval_float_binary(
     a: f64,
     b: f64,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     match op {
         BinaryOp::Add => Ok(ConstValue::Float(a + b)),
         BinaryOp::Sub => Ok(ConstValue::Float(a - b)),
         BinaryOp::Mul => Ok(ConstValue::Float(a * b)),
-        BinaryOp::Div if b == 0.0 => Err(TypeError::ConstDivisionByZero { span }),
+        BinaryOp::Div if b == 0.0 => const_error(TypeError::ConstDivisionByZero { span }),
         BinaryOp::Div => Ok(ConstValue::Float(a / b)),
         BinaryOp::Eq => Ok(ConstValue::Bool(a.to_bits() == b.to_bits())),
         BinaryOp::NotEq => Ok(ConstValue::Bool(a.to_bits() != b.to_bits())),
@@ -870,7 +877,7 @@ fn eval_float_binary(
         BinaryOp::GreaterThan => Ok(ConstValue::Bool(a > b)),
         BinaryOp::LessThanEq => Ok(ConstValue::Bool(a <= b)),
         BinaryOp::GreaterThanEq => Ok(ConstValue::Bool(a >= b)),
-        _ => Err(TypeError::InvalidOperand {
+        _ => const_error(TypeError::InvalidOperand {
             op: format!("{op}"),
             operand_type: Type::Float,
             span,
@@ -883,13 +890,13 @@ fn eval_bool_binary(
     a: bool,
     b: bool,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     match op {
         BinaryOp::And => Ok(ConstValue::Bool(a && b)),
         BinaryOp::Or => Ok(ConstValue::Bool(a || b)),
         BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
         BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
-        _ => Err(TypeError::InvalidOperand {
+        _ => const_error(TypeError::InvalidOperand {
             op: format!("{op}"),
             operand_type: Type::Bool,
             span,
@@ -902,12 +909,12 @@ fn eval_string_binary(
     a: &str,
     b: &str,
     span: Option<SourceSpan>,
-) -> Result<ConstValue, TypeError> {
+) -> ConstEvalResult<ConstValue> {
     match op {
         BinaryOp::Add => Ok(ConstValue::String(format!("{a}{b}"))),
         BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
         BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
-        _ => Err(TypeError::InvalidOperand {
+        _ => const_error(TypeError::InvalidOperand {
             op: format!("{op}"),
             operand_type: Type::String,
             span,

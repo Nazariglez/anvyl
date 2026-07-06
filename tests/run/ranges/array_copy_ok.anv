@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 20
+// 30
+// @match-end
+
+fn main() {
+    let xs = [10, 20, 30, 40];
+    let ys: [int] = xs[1..3];
+    println(ys[0]);
+    println(ys[1]);
+}

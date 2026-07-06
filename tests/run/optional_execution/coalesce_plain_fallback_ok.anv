@@ -1,0 +1,8 @@
+// @mode: run
+// @expect: success
+// @match: 4
+
+fn main() {
+    let left: int? = nil;
+    println(left ?? 4);
+}

@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: go!
+
+fn touch(ref text: string) {
+    let f = || {
+        text = "go!";
+    };
+    f();
+}
+
+fn main() {
+    var text = "go";
+    touch(text);
+    println(text);
+}

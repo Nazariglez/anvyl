@@ -555,8 +555,9 @@ impl<'a> RustValues<'a> {
     ) -> String {
         let access = Self::projected_access("root", true, steps);
         let mutate = Self::projected_mutate("root", true, steps);
+        let rt_ty = target::runtime_ctx_ty_with_lifetimes("'cx", "'_");
         format!(
-            "impl<'cx> {} for {ops} {{ fn access(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, rt: &mut anvyx_runtime::Ctx<'cx, '_>, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
+            "impl<'cx> {} for {ops} {{ fn access(&self, rt: &mut {rt_ty}, root: &{root_ty}, f: &mut dyn FnMut(&{slot_ty}) -> {}) -> {} {{ {access} }} fn mutate(&self, rt: &mut {rt_ty}, root: &mut {root_ty}, f: &mut dyn FnMut(&mut {slot_ty}) -> {}) -> {} {{ {mutate} }} }}",
             target::projection_ops_ty(root_ty, slot_ty),
             target::result_ty("()"),
             target::result_ty("()"),

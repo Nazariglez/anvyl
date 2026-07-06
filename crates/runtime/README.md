@@ -193,7 +193,7 @@ containing shared resources are rejected.
 
 Mutable provider parameters have two Rust ABI shapes:
 
-- `&mut T` is a low-level/manual ABI. The clean Rust backend only passes whole
+- `&mut T` is a low-level/manual ABI. The Rust backend only passes whole
   mutable local lvalues to it.
 - `#[function(ctx)]` with `MutPlace<'_, 'cx, T>` is the normal place-aware ABI.
   It accepts supported projected/source mutable places without copy-back. The

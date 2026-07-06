@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn main() {
     var hp = ["a": 1, "b": 2];

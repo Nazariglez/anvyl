@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: 30
-
-import alpha { scale };
-
-fn main() {
-    println(scale(3));
-}

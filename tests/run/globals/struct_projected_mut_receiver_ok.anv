@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 5
+// @match-end
+
+struct Counter {
+    value: int,
+
+    fn inc(ref self) {
+        self.value = state.counter.value + 1;
+    }
+}
+
+struct Box { counter: Counter }
+
+fn make_box() -> Box {
+    println("init");
+    Box { counter: Counter { value: 4 } }
+}
+
+lazy var state = make_box();
+
+fn main() {
+    state.counter.inc();
+    println(state.counter.value);
+}

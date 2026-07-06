@@ -1,0 +1,1 @@
+extend int { fn abs(self) -> int { self } }

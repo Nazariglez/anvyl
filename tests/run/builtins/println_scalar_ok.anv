@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: success
+// @match: 42
+
+fn main() {
+    println(42);
+}

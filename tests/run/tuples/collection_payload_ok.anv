@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 3
+// @match-end
+
+fn main() {
+    var pair = ([1, 2], ["a": 3]);
+    println(pair.0[1]);
+    if let value? = pair.1["a"] {
+        println(value);
+    }
+}

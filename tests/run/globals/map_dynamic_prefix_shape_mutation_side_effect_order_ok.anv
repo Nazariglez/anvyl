@@ -1,0 +1,38 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// 1
+// x
+// 9
+// b
+// 2
+// z
+// 8
+// @match-end
+
+struct State {
+    rows: [[string: int]],
+}
+
+lazy var state = State { rows: [["a": 1]] };
+
+fn choose_row() -> int {
+    state.rows.push(["x": 9]);
+    1
+}
+
+fn next_value() -> int {
+    state.rows.push(["z": 8]);
+    2
+}
+
+fn main() {
+    state.rows[choose_row()].insert("b", next_value());
+    for row in state.rows {
+        for key, value in row {
+            println(key);
+            println(value);
+        }
+    }
+}

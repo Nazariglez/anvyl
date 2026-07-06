@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: unused const parameter 'N'
 
 type Id<N: int> = int;

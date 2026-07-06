@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: error
+// @contains: Unknown member 'host'
+
+import pkg:colors.host { ping };
+
+fn main() {
+    println(ping());
+}

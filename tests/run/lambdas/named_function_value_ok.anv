@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// tick
+// tick
+// @match-end
+
+fn tick() {
+    println("tick");
+}
+
+fn each(f: fn()) {
+    f();
+}
+
+fn main() {
+    let f = tick;
+    f();
+    each(tick);
+}

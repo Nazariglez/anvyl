@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: cannot infer return type for dynamic method 'count'
 
 struct Actor {

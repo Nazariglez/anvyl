@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 42
+// Anvyx
+// @match-end
+
+fn apply_int(f: fn() -> int) -> int {
+    f()
+}
+
+fn apply_string(f: fn() -> string) -> string {
+    f()
+}
+
+fn main() {
+    let x = 42;
+    println(apply_int(|| x));
+
+    let name = "Anvyx";
+    println(apply_string(|| name));
+}

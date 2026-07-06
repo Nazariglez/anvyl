@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: success
+
+import pkg:p { value };
+
+fn main() { let x: int = value(); }

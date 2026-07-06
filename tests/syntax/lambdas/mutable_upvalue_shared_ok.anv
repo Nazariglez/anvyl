@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn make_counter(cond: bool) -> fn() -> int {
     var count = 0;

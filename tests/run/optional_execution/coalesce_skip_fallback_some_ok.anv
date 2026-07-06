@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn fallback() -> int {
+    println("fallback");
+    5
+}
+
+fn main() {
+    let left: int? = 7;
+    println(left ?? fallback());
+}

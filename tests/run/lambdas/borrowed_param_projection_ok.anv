@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+struct Box {
+    value: int,
+}
+
+fn inc(ref x: int) {
+    x += 1;
+}
+
+fn touch(ref b: Box) {
+    let f = || {
+        inc(b.value);
+    };
+    f();
+}
+
+fn main() {
+    var b = Box { value: 0 };
+    touch(b);
+    println(b.value);
+}

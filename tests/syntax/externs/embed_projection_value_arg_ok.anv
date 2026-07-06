@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern type Point;
 extern fn use_point(point: Point) -> void;

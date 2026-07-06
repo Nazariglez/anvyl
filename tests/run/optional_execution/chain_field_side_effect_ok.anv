@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 14
+
+struct Item { value: int }
+
+fn make() -> Item? {
+    Item { value: 14 }
+}
+
+fn main() {
+    println(make()?.value ?? 0);
+}

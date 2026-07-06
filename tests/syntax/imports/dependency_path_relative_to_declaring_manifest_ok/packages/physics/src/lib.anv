@@ -1,0 +1,3 @@
+// @helper
+
+pub fn force() -> int { 4 }

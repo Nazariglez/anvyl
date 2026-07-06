@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 9
+// @match-end
+
+lazy var score = 7;
+
+fn main() {
+    println(score);
+    score = 9;
+    println(score);
+}

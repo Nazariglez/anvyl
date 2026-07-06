@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: hi
+
+fn make() -> fn() -> string {
+    var text = "hi";
+    || text
+}
+
+fn main() {
+    let f = make();
+    println(f());
+}

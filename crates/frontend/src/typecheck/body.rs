@@ -268,7 +268,7 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
         })
         .collect::<Vec<_>>();
     for (name, ty, callee) in extern_functions {
-        tc.define_local_callable(name, callee, ty);
+        tc.define_local_callable(name, callee, &ty);
     }
 
     let register_dyn_infer = tc.should_register_dyn_infer_params();
@@ -309,8 +309,8 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                     .local_value(&tc.current_module, func.name)
                     .and_then(|value| tc.decls.callable_for_value(&value));
                 match callee {
-                    Some(callee) => tc.define_local_callable(func.name, callee, func_ty),
-                    None => tc.define(func.name, func_ty, false),
+                    Some(callee) => tc.define_local_callable(func.name, callee, &func_ty),
+                    None => tc.define(func.name, &func_ty, false),
                 }
             }
             Stmt::Const(const_node) => {
@@ -319,7 +319,7 @@ pub(super) fn register_declarations(program: &Program, tc: &mut TypeChecker) {
                     Some(t) => tc.resolve_type_for_tc_at(t, const_node.span),
                     None => Type::Infer,
                 };
-                tc.define_value(c.name, ty, LocalBindingKind::constant(), None);
+                tc.define_value(c.name, &ty, LocalBindingKind::constant(), None);
             }
             _ => {}
         }
@@ -623,7 +623,7 @@ pub(super) fn register_block_declarations(
             owner_args: decl.sig.owner_args.clone(),
             is_stringify_override: false,
         };
-        tc.define_local_callable(func.name, callee, decl.sig.surface_ty.clone());
+        tc.define_local_callable(func.name, callee, &decl.sig.surface_ty);
     }
 
     let mut funcs = funcs.into_iter();
@@ -1126,7 +1126,7 @@ pub(super) fn check_block_checked_with_hint(
     }
     let checked = match &block.node.tail {
         Some(expr) => check_tail_expr_with_hint(expr, expected, tc),
-        None => checked_void(tc),
+        None => checked_void(),
     };
     tc.pop_scope();
     checked
@@ -1153,7 +1153,7 @@ fn check_callable_body_with_return(
         return check_callable_body_place_return(body, expected_ret, source, callable_span, tc);
     }
 
-    let expected = expected_ret.map(|ret| tc.type_handle(&ret.ty));
+    let expected = expected_ret.map(|ret| TypeChecker::type_handle(&ret.ty));
     let checked = body.check_with_hint(expected, tc);
     finish_callable_body_value_return(body, &checked, expected_ret, callable_span, tc);
     checked
@@ -1175,7 +1175,7 @@ pub(super) fn check_callable_body_place_return(
             }
             let checked = match &block.node.tail {
                 Some(expr) => check_tail_place_return(expr, expected_ret, source, tc),
-                None => checked_void(tc),
+                None => checked_void(),
             };
             finish_missing_place_return(
                 &checked,
@@ -1232,7 +1232,7 @@ fn finish_missing_place_return(
                 expected: ret.ty.clone(),
                 span: tc.error_span(missing_span),
             }),
-            None => tc.push_inferred_return(callable_span, tc.type_handle(&Type::Void)),
+            None => tc.push_inferred_return(callable_span, TypeChecker::type_handle(&Type::Void)),
             _ => {}
         }
     }
@@ -1254,7 +1254,7 @@ fn finish_callable_body_value_return(
                 });
             }
             None if !body.diverges() => {
-                tc.push_inferred_return(callable_span, tc.type_handle(&Type::Void));
+                tc.push_inferred_return(callable_span, TypeChecker::type_handle(&Type::Void));
             }
             _ => {}
         }
@@ -1304,7 +1304,7 @@ pub(super) fn check_callable_body_frame(
 ) -> Option<Type> {
     for (index, param) in params.iter().enumerate() {
         let kind = LocalBindingKind::from_param(param.ty.mutable, &param.ty.ty);
-        let Some(local) = tc.define_value(param.name, param.ty.ty.clone(), kind, None) else {
+        let Some(local) = tc.define_value(param.name, &param.ty.ty, kind, None) else {
             continue;
         };
         tc.record_local_def(
@@ -1353,7 +1353,7 @@ fn check_func_body(
         TypeChecker::enter_named_function,
         |tc| {
             for (name, value) in const_bindings {
-                tc.define_const(*name, const_eval::const_type(value), value.clone());
+                tc.define_const(*name, &const_eval::const_type(value), value.clone());
             }
             let mut source = None;
             let param_start = if let Some((receiver, self_ty)) = self_binding {
@@ -1361,7 +1361,7 @@ fn check_func_body(
                     MethodReceiver::Ref => LocalBindingKind::borrowed_self(),
                     MethodReceiver::Value => LocalBindingKind::readonly_self(),
                 };
-                let local = tc.define_value(Ident::new("self"), self_ty.clone(), kind, None);
+                let local = tc.define_value(Ident::new("self"), &self_ty, kind, None);
                 if let Some(local) = local {
                     tc.record_local_def(
                         local.type_id,

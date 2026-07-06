@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// rhs
+// 10
+// @match-end
+
+fn make_score() -> int {
+    println("init");
+    7
+}
+
+fn rhs() -> int {
+    println("rhs");
+    3
+}
+
+lazy var score = make_score();
+
+fn main() {
+    score += rhs();
+    println(score);
+}

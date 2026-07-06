@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: place cannot be used while a mutable alias binding is live
 
 contract Drawable {

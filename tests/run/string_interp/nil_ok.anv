@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: value: .None<int>
-
-fn main() {
-    let v: int? = nil;
-    println(f"value: {v}");
-}

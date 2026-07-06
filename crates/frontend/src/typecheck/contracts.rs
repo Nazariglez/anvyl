@@ -72,12 +72,12 @@ pub(super) enum RequirementError {
     },
     Param {
         index: usize,
-        expected: FuncParam,
-        found: FuncParam,
+        expected: Box<FuncParam>,
+        found: Box<FuncParam>,
     },
     Return {
-        expected: Type,
-        found: Type,
+        expected: Box<Type>,
+        found: Box<Type>,
     },
 }
 
@@ -183,11 +183,11 @@ pub(super) fn contract_set_key(requirements: &[ContractRequirementSchema]) -> Co
 pub(super) fn merge_effective_requirements(
     target: &mut Vec<ContractRequirementSchema>,
     source: &[ContractRequirementSchema],
-) -> Result<(), ContractRequirementSchema> {
+) -> Result<(), Box<ContractRequirementSchema>> {
     for req in source {
         if let Some(prev) = target.iter().find(|prev| prev.name == req.name) {
             if !same_requirement_signature(prev, req) {
-                return Err(req.clone());
+                return Err(Box::new(req.clone()));
             }
         } else {
             target.push(req.clone());
@@ -421,15 +421,15 @@ fn signature_error(
         if expected != found {
             return Some(RequirementError::Param {
                 index,
-                expected: expected.clone(),
-                found: found.clone(),
+                expected: Box::new(expected.clone()),
+                found: Box::new(found.clone()),
             });
         }
     }
     if requirement.ret != candidate.ret {
         return Some(RequirementError::Return {
-            expected: requirement.ret.ty.clone(),
-            found: candidate.ret.ty.clone(),
+            expected: Box::new(requirement.ret.ty.clone()),
+            found: Box::new(candidate.ret.ty.clone()),
         });
     }
     None

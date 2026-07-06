@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// cold
+// ready
+// @match-end
+
+fn make_names() -> [string] {
+    println("init");
+    ["cold"]
+}
+
+lazy var names = make_names();
+
+fn main() {
+    let before = names;
+    println(before[0]);
+    names = ["ready"];
+    let after = names;
+    println(after[0]);
+}

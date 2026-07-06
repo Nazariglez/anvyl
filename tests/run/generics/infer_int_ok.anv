@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: 7
-
-fn identity<T>(x: T) -> T { x }
-
-fn main() {
-    println(identity(7));
-}

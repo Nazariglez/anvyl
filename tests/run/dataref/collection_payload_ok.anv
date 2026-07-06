@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 3
+// 7
+// @match-end
+
+dataref Bag {
+    xs: [int],
+    counts: [string: int],
+}
+
+fn main() {
+    let bag = Bag { xs: [1, 2], counts: ["a": 7] };
+    let original = bag.xs;
+    var xs = bag.xs;
+    let counts = bag.counts;
+    xs.push(3);
+
+    println(original[1]);
+    println(xs[2]);
+    if let value? = counts["a"] {
+        println(value);
+    }
+}

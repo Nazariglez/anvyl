@@ -1,0 +1,3 @@
+fn f(x: int?) {
+    let val? = x else return;
+}

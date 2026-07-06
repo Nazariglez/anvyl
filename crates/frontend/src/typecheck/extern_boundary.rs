@@ -70,7 +70,7 @@ pub(super) fn check_call(
         ok &= check_arg(arg, param, tc);
     }
 
-    let ret = tc.type_handle(&signature.ret.ty);
+    let ret = TypeChecker::type_handle(&signature.ret.ty);
     ok &= !constrain_expected_return(call_span, ret, expected, tc).failed();
 
     ok
@@ -119,7 +119,7 @@ fn check_projected_place_arg(
 
 fn check_arg_expr(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let error_count = tc.errors.len();
-    let expected = tc.type_handle(&param.ty.ty);
+    let expected = TypeChecker::type_handle(&param.ty.ty);
     let checked = check_expected_value_expr(arg, expected, tc);
     check_boundary_value(arg, &checked, &param.ty, tc) && tc.errors.len() == error_count
 }
@@ -149,7 +149,7 @@ pub(super) fn check_checked_value(
     tc: &mut TypeChecker,
 ) -> bool {
     let boundary_ok = check_boundary_value(expr, checked, boundary, tc);
-    let expected = tc.type_handle(&boundary.ty);
+    let expected = TypeChecker::type_handle(&boundary.ty);
     tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
     boundary_ok && !tc.solve_constraints()
 }
@@ -226,8 +226,8 @@ pub(super) fn check_extern_lit(
     if let Some(expected_ty) = expected_ty.as_ref()
         && tc.decls.key_for_type(expected_ty).as_ref() == Some(key)
     {
-        let expected = tc.type_handle(expected_ty);
-        let actual = tc.type_handle(&nominal_type(key));
+        let expected = TypeChecker::type_handle(expected_ty);
+        let actual = TypeChecker::type_handle(&nominal_type(key));
         tc.expect_equal(lit.span, actual, expected);
     }
 
@@ -239,8 +239,8 @@ pub(super) fn check_extern_lit(
 
     tc.record_extern_use(expr.node.id, ExternUseTarget::Init(owner));
     let ty = nominal_type(key);
-    let handle = tc.type_handle(&ty);
-    solve_and_checked_from_handle(expr, handle, tc)
+    let handle = TypeChecker::type_handle(&ty);
+    solve_and_checked_from_handle(expr, &handle, tc)
 }
 
 fn check_extern_literal_fields(
@@ -291,7 +291,7 @@ fn check_extern_literal_fields(
                 failed = true;
             }
         }
-        let hint = tc.type_handle(&field_ty.ty);
+        let hint = TypeChecker::type_handle(&field_ty.ty);
         let checked = check_expr_checked_with_hint(value, Some(hint), tc);
         tc.record_aggregate_elem_escape(aggregate, value);
         failed |= !check_checked_value(value, &checked, &field_ty, tc);

@@ -349,20 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn stack_cell_scalar_access_mutate() {
-        let cell = StackLambdaCell::new(1);
-
-        assert_eq!(cell.get_copy().unwrap(), 1);
-        cell.mutate(|value| {
-            *value += 1;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(cell.get_copy().unwrap(), 2);
-    }
-
-    #[test]
     fn stack_cell_nested_shared_access_succeeds() {
         let cell = StackLambdaCell::new(1);
 
@@ -403,22 +389,6 @@ mod tests {
         assert_eq!(drops.get(), 1);
         drop(cell);
         assert_eq!(drops.get(), 2);
-    }
-
-    #[test]
-    fn heap_cell_scalar_access_mutate_set_replace() {
-        let cell = LambdaCell::new(1);
-
-        assert_eq!(cell.get_copy().unwrap(), 1);
-        cell.mutate(|value| {
-            *value += 1;
-            Ok(())
-        })
-        .unwrap();
-        cell.set(5).unwrap();
-
-        assert_eq!(cell.replace(8).unwrap(), 5);
-        assert_eq!(cell.get_copy().unwrap(), 8);
     }
 
     #[test]

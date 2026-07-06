@@ -99,9 +99,9 @@ struct PatternInput {
 }
 
 impl PatternInput {
-    fn owned(expected_ty: Type, tc: &mut TypeChecker) -> Self {
+    fn owned(expected_ty: Type) -> Self {
         Self {
-            expected: tc.type_handle(&expected_ty),
+            expected: TypeChecker::type_handle(&expected_ty),
             expected_ty,
             access: PlaceAccess::Mutable,
             identity: PlaceIdentity::unknown(),
@@ -111,9 +111,9 @@ impl PatternInput {
         }
     }
 
-    fn recovery(access: PlaceAccess, tc: &mut TypeChecker) -> Self {
+    fn recovery(access: PlaceAccess) -> Self {
         Self {
-            expected: tc.type_handle(&Type::Infer),
+            expected: TypeChecker::type_handle(&Type::Infer),
             expected_ty: Type::Infer,
             access,
             identity: PlaceIdentity::unknown(),
@@ -135,61 +135,45 @@ impl PatternInput {
         }
     }
 
-    fn tuple_field(&self, index: usize, expected_ty: Type, tc: &mut TypeChecker) -> Self {
+    fn tuple_field(&self, index: usize, expected_ty: Type) -> Self {
         self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
             |identity| identity.tuple(index),
-            tc,
         )
     }
 
-    fn optional_some(&self, expected_ty: Type, tc: &mut TypeChecker) -> Self {
+    fn optional_some(&self, expected_ty: Type) -> Self {
         let mut input = self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
             |identity| identity.variant(Ident::new("Some")).tuple(0),
-            tc,
         );
         input.map_entry_alias = false;
         input
     }
 
-    fn enum_tuple_field(
-        &self,
-        variant: Ident,
-        index: usize,
-        expected_ty: Type,
-        tc: &mut TypeChecker,
-    ) -> Self {
+    fn enum_tuple_field(&self, variant: Ident, index: usize, expected_ty: Type) -> Self {
         self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
             |identity| identity.variant(variant).tuple(index),
-            tc,
         )
     }
 
-    fn enum_struct_field(
-        &self,
-        variant: Ident,
-        field: Ident,
-        expected_ty: Type,
-        tc: &mut TypeChecker,
-    ) -> Self {
+    fn enum_struct_field(&self, variant: Ident, field: Ident, expected_ty: Type) -> Self {
         self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
             |identity| identity.variant(variant).field(field),
-            tc,
         )
     }
 
@@ -199,18 +183,12 @@ impl PatternInput {
         expected_ty: Type,
         access: PlaceAccess,
         extern_facts: Option<(PlaceUseFacts, bool)>,
-        tc: &mut TypeChecker,
     ) -> Self {
         let (facts, accepts_extern_any) =
             extern_facts.unwrap_or_else(|| (self.facts.clone(), self.accepts_extern_any));
-        self.project(
-            expected_ty,
-            access,
-            facts,
-            accepts_extern_any,
-            |identity| identity.field(field),
-            tc,
-        )
+        self.project(expected_ty, access, facts, accepts_extern_any, |identity| {
+            identity.field(field)
+        })
     }
 
     fn project(
@@ -220,10 +198,9 @@ impl PatternInput {
         facts: PlaceUseFacts,
         accepts_extern_any: bool,
         project_identity: impl FnOnce(PlaceIdentity) -> PlaceIdentity,
-        tc: &mut TypeChecker,
     ) -> Self {
         Self {
-            expected: tc.type_handle(&expected_ty),
+            expected: TypeChecker::type_handle(&expected_ty),
             expected_ty,
             access,
             identity: project_identity(self.identity.clone()),
@@ -337,7 +314,7 @@ impl BindingAlternatives {
         Self { envs: vec![env] }
     }
 
-    fn product(self, other: Self, tc: &mut TypeChecker) -> Self {
+    fn product(&self, other: &Self, tc: &mut TypeChecker) -> Self {
         let mut envs = vec![];
         for left in &self.envs {
             for right in &other.envs {
@@ -545,14 +522,14 @@ impl<'tc> PatternChecker<'tc> {
             Pattern::Nil => {
                 PatternCheckResult::empty(self.check_nil(pattern.span, &input.expected_ty))
             }
-            Pattern::Optional(inner) => self.check_optional(inner, input),
+            Pattern::Optional(inner) => self.check_optional(inner, &input),
             Pattern::Range { start, end, .. } => PatternCheckResult::empty(self.check_range(
                 pattern.span,
-                start.clone(),
-                end.clone(),
+                start.as_ref(),
+                end.as_ref(),
                 &input.expected_ty,
             )),
-            Pattern::Or(alternatives) => self.check_or(alternatives, pattern.span, input),
+            Pattern::Or(alternatives) => self.check_or(alternatives, pattern.span, &input),
             Pattern::Rest => PatternCheckResult::empty(self.unsupported_named("..", pattern.span)),
             Pattern::Struct { name, fields } => {
                 self.check_struct(*name, fields, pattern.span, input)
@@ -569,7 +546,7 @@ impl<'tc> PatternChecker<'tc> {
                     &input.expected_ty,
                 )),
                 EnumPatternPayload::Tuple(fields) => {
-                    self.check_enum_tuple(*qualifier, *variant, fields, pattern.span, input)
+                    self.check_enum_tuple(*qualifier, *variant, fields, pattern.span, &input)
                 }
                 EnumPatternPayload::Struct { fields, has_rest } => self.check_enum_struct(
                     *qualifier,
@@ -577,7 +554,7 @@ impl<'tc> PatternChecker<'tc> {
                     fields,
                     *has_rest,
                     pattern.span,
-                    input,
+                    &input,
                 ),
             },
         }
@@ -587,7 +564,7 @@ impl<'tc> PatternChecker<'tc> {
         &mut self,
         alternatives: &[PatternNode],
         span: Span,
-        input: PatternInput,
+        input: &PatternInput,
     ) -> PatternCheckResult {
         let mut checked = Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
@@ -688,11 +665,11 @@ impl<'tc> PatternChecker<'tc> {
         let mut bindings = BindingAlternatives::single_empty();
         let mut covers = vec![];
         for (index, (elem, elem_ty)) in elems.iter().zip(elem_tys).enumerate() {
-            let elem_input = input.tuple_field(index, elem_ty, self.tc);
+            let elem_input = input.tuple_field(index, elem_ty);
             let result = self.check(elem, elem_input);
             had_error |= result.outcome.had_error;
             refutability = combine_refutability(refutability, result.outcome.refutability);
-            bindings = bindings.product(result.bindings, self.tc);
+            bindings = bindings.product(&result.bindings, self.tc);
             covers.push(result.outcome.cover);
         }
         PatternCheckResult {
@@ -742,7 +719,7 @@ impl<'tc> PatternChecker<'tc> {
         )
     }
 
-    fn check_optional(&mut self, inner: &PatternNode, input: PatternInput) -> PatternCheckResult {
+    fn check_optional(&mut self, inner: &PatternNode, input: &PatternInput) -> PatternCheckResult {
         if matches!(inner.node, Pattern::Optional(_)) {
             self.tc.push_error(TypeError::NestedOptionalPattern {
                 span: self.tc.error_span(inner.span),
@@ -753,7 +730,6 @@ impl<'tc> PatternChecker<'tc> {
                 input.facts.clone(),
                 input.accepts_extern_any,
                 |identity| identity,
-                self.tc,
             );
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
@@ -769,7 +745,6 @@ impl<'tc> PatternChecker<'tc> {
                 input.facts.clone(),
                 input.accepts_extern_any,
                 |identity| identity,
-                self.tc,
             );
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
@@ -781,7 +756,6 @@ impl<'tc> PatternChecker<'tc> {
                 input.facts.clone(),
                 input.accepts_extern_any,
                 |identity| identity,
-                self.tc,
             );
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
@@ -798,12 +772,11 @@ impl<'tc> PatternChecker<'tc> {
                 input.facts.clone(),
                 input.accepts_extern_any,
                 |identity| identity,
-                self.tc,
             );
             self.check(inner, recovery);
             return PatternCheckResult::empty(PatternOutcome::error());
         };
-        let inner_input = input.optional_some(inner_ty, self.tc);
+        let inner_input = input.optional_some(inner_ty);
         let result = self.check(inner, inner_input);
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -844,11 +817,11 @@ impl<'tc> PatternChecker<'tc> {
     fn check_range(
         &mut self,
         span: Span,
-        start: Option<Lit>,
-        end: Option<Lit>,
+        start: Option<&Lit>,
+        end: Option<&Lit>,
         expected: &Type,
     ) -> PatternOutcome {
-        for lit in start.iter().chain(end.iter()) {
+        for lit in start.into_iter().chain(end) {
             let found = type_from_lit(lit);
             if found != *expected && !matches!(expected, Type::Infer) {
                 self.tc.push_error(TypeError::InvalidLiteralPattern {
@@ -945,7 +918,7 @@ impl<'tc> PatternChecker<'tc> {
                 } else {
                     head_ty
                 };
-                self.check_struct_fields(fields, owner_ty, &agg.fields, input)
+                self.check_struct_fields(fields, &owner_ty, &agg.fields, &input)
             }
             NominalKind::Extern => {
                 let Some(owner) = self.tc.externs.type_by_nominal(&key) else {
@@ -953,7 +926,7 @@ impl<'tc> PatternChecker<'tc> {
                 };
                 let field_schema =
                     field_check::extern_readable_field_schema(self.tc.extern_type(owner));
-                self.check_struct_fields(fields, nominal_type(&key), &field_schema, input)
+                self.check_struct_fields(fields, &nominal_type(&key), &field_schema, &input)
             }
             NominalKind::Enum => PatternCheckResult::empty(self.unsupported_named("Struct", span)),
         }
@@ -962,9 +935,9 @@ impl<'tc> PatternChecker<'tc> {
     fn check_struct_fields(
         &mut self,
         fields: &[(Ident, PatternNode)],
-        owner_ty: Type,
+        owner_ty: &Type,
         schema: &NamedSchemas<FieldSchema>,
-        input: PatternInput,
+        input: &PatternInput,
     ) -> PatternCheckResult {
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
@@ -984,26 +957,26 @@ impl<'tc> PatternChecker<'tc> {
         self.check_bad_field_patterns(fields, &shape, input.access);
         for field in shape.fields {
             let pattern = &fields[field.index].1;
-            self.record_extern_field_read(field.name, pattern, &owner_ty);
+            self.record_extern_field_read(field.name, pattern, owner_ty);
             self.tc.check_matched_field_access_policy(
                 &owner,
                 field.name,
                 &field.policy,
                 pattern.span,
             );
-            let field_access = self.struct_field_access(&owner_ty, field.name, input.access);
+            let field_access = self.struct_field_access(owner_ty, field.name, input.access);
             let field_ty = self
                 .tc
                 .decls
-                .aggregate_field_type(&owner_ty, field.name)
+                .aggregate_field_type(owner_ty, field.name)
                 .unwrap_or(field.ty);
-            let extern_facts = self.extern_field_alias_facts(&owner_ty, field.name, &input.facts);
+            let extern_facts = self.extern_field_alias_facts(owner_ty, field.name, &input.facts);
             let field_input =
-                input.aggregate_field(field.name, field_ty, field_access, extern_facts, self.tc);
+                input.aggregate_field(field.name, field_ty, field_access, extern_facts);
             let result = self.check(pattern, field_input);
             had_error |= result.outcome.had_error;
             refutability = combine_refutability(refutability, result.outcome.refutability);
-            bindings = bindings.product(result.bindings, self.tc);
+            bindings = bindings.product(&result.bindings, self.tc);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -1017,7 +990,7 @@ impl<'tc> PatternChecker<'tc> {
 
     fn check_field_patterns(&mut self, fields: &[(Ident, PatternNode)], access: PlaceAccess) {
         for (_, pattern) in fields {
-            let input = PatternInput::recovery(access, self.tc);
+            let input = PatternInput::recovery(access);
             self.check(pattern, input);
         }
     }
@@ -1029,7 +1002,7 @@ impl<'tc> PatternChecker<'tc> {
         access: PlaceAccess,
     ) {
         for index in &shape.invalid_indices {
-            let input = PatternInput::recovery(access, self.tc);
+            let input = PatternInput::recovery(access);
             self.check(&fields[*index].1, input);
         }
     }
@@ -1107,7 +1080,7 @@ impl<'tc> PatternChecker<'tc> {
         variant: Ident,
         fields: &[PatternNode],
         span: Span,
-        input: PatternInput,
+        input: &PatternInput,
     ) -> PatternCheckResult {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, &input.expected_ty)
@@ -1152,10 +1125,10 @@ impl<'tc> PatternChecker<'tc> {
         let mut bindings = BindingAlternatives::single_empty();
         for (index, (field, payload)) in fields.iter().zip(payloads).enumerate() {
             let ty = self.payload_ty(payload, &resolved, &input.expected_ty, span);
-            let field_input = input.enum_tuple_field(variant, index, ty, self.tc);
+            let field_input = input.enum_tuple_field(variant, index, ty);
             let result = self.check(field, field_input);
             had_error |= result.outcome.had_error;
-            bindings = bindings.product(result.bindings, self.tc);
+            bindings = bindings.product(&result.bindings, self.tc);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -1177,7 +1150,7 @@ impl<'tc> PatternChecker<'tc> {
         fields: &[(Ident, PatternNode)],
         has_rest: bool,
         span: Span,
-        input: PatternInput,
+        input: &PatternInput,
     ) -> PatternCheckResult {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, &input.expected_ty)
@@ -1212,10 +1185,10 @@ impl<'tc> PatternChecker<'tc> {
                 fields[field.index].1.span,
             );
             let ty = self.payload_ty(&field.ty, &resolved, &input.expected_ty, span);
-            let field_input = input.enum_struct_field(variant, field.name, ty, self.tc);
+            let field_input = input.enum_struct_field(variant, field.name, ty);
             let result = self.check(&fields[field.index].1, field_input);
             had_error |= result.outcome.had_error;
-            bindings = bindings.product(result.bindings, self.tc);
+            bindings = bindings.product(&result.bindings, self.tc);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -1237,9 +1210,9 @@ impl<'tc> PatternChecker<'tc> {
     ) -> BindingAlternatives {
         let mut bindings = BindingAlternatives::single_empty();
         for field in fields {
-            let input = PatternInput::recovery(access, self.tc);
+            let input = PatternInput::recovery(access);
             let result = self.check(field, input);
-            bindings = bindings.product(result.bindings, self.tc);
+            bindings = bindings.product(&result.bindings, self.tc);
         }
         bindings
     }
@@ -1405,7 +1378,7 @@ pub(super) fn check_roots(
                 {
                     tc.push_error(error);
                 }
-                (PatternInput::owned(ty, tc), None)
+                (PatternInput::owned(ty), None)
             }
             PatternRootInput::Place(place, site) => (PatternInput::from_place(*place), Some(site)),
         };
@@ -1423,7 +1396,7 @@ pub(super) fn check_roots(
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
         covers.push(result.outcome.cover);
-        bindings = bindings.product(result.bindings, checker.tc);
+        bindings = bindings.product(&result.bindings, checker.tc);
     }
 
     PatternChecker::new(tc, None, context, PatternBindMode::Owned { mutable: false })
@@ -1661,7 +1634,7 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
     let (value_ty, binding_ty) = match &binding.ty {
         Some(annot) => {
             let annot_ty = tc.resolve_type_for_tc_at(annot, binding_node.span);
-            let annot_handle = tc.type_handle(&annot_ty);
+            let annot_handle = TypeChecker::type_handle(&annot_ty);
             let value = PatternScrutinee::owned(check_expected_value_expr(
                 &binding.value,
                 annot_handle.clone(),
@@ -1671,7 +1644,7 @@ pub(super) fn check_binding(binding_node: &BindingNode, tc: &mut TypeChecker) {
             tc.solve_constraints();
             let value_ty = value.checked.ty.clone();
             let binding_ty = refined_binding_type(&annot_ty, &value.checked.ty, tc);
-            let binding_handle = tc.type_handle(&binding_ty);
+            let binding_handle = TypeChecker::type_handle(&binding_ty);
             check_place_at(
                 &binding.pattern,
                 value.pattern_place(binding_handle, binding_ty.clone()),
@@ -1774,20 +1747,20 @@ fn check_if_let_exact_downcast(
     let binding_ty = checked.target.clone().unwrap_or(Type::Infer);
     checked_from_type(&node.value, binding_ty.clone(), tc);
     let Some(binding) = binding else {
-        return check_downcast_branches(node, None, binding_ty, expected, tc);
+        return check_downcast_branches(node, None, &binding_ty, expected, tc);
     };
     let Some(target) = checked.target.clone() else {
-        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+        return check_downcast_branches(node, Some(binding), &binding_ty, expected, tc);
     };
 
     if checked.source.valid_contract().is_none() {
-        return check_downcast_branches(node, Some(binding), binding_ty, expected, tc);
+        return check_downcast_branches(node, Some(binding), &binding_ty, expected, tc);
     }
 
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
-        let handle = tc.type_handle(&target);
+        let handle = TypeChecker::type_handle(&target);
         match (binding.mutable, checked.source.valid_alias()) {
             (true, Some(alias)) => tc.define_ref_alias_binding_from_handle(
                 binding.name,
@@ -1837,7 +1810,7 @@ fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDow
 fn check_downcast_branches(
     node: &IfLet,
     binding: Option<ExactDowncastBinding>,
-    binding_ty: Type,
+    binding_ty: &Type,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
@@ -1845,7 +1818,7 @@ fn check_downcast_branches(
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
         if let Some(binding) = binding {
-            let handle = tc.type_handle(&binding_ty);
+            let handle = TypeChecker::type_handle(binding_ty);
             tc.define_pattern_binding_from_handle(
                 binding.name,
                 &handle,
@@ -1867,7 +1840,7 @@ fn check_if_let_branches(
 ) -> CheckedType {
     let Some(else_block) = &node.else_block else {
         closure::check_closure_flow_branch(tc, then);
-        return checked_void(tc);
+        return checked_void();
     };
     let (then, else_checked) = closure::check_closure_flow_branches(tc, then, |tc| {
         check_block_checked_with_hint(else_block, expected, tc)

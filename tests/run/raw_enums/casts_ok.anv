@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 10
+
+enum State: int {
+    Idle,
+    Dead = 10,
+}
+
+fn main() {
+    println(State.Dead as int);
+}

@@ -213,7 +213,7 @@ pub(super) fn check_aggregate_field_defaults(
             continue;
         }
         if validate_default(default, DefaultKind::Field, &forbidden, tc) {
-            check_default_type(default, tc.type_handle(&schema.ty), tc);
+            check_default_type(default, TypeChecker::type_handle(&schema.ty), tc);
         }
     }
     tc.pop_generic_owner_frame();
@@ -263,7 +263,7 @@ fn check_param_defaults(
             continue;
         }
         if validate_default(default, DefaultKind::Param { has_receiver }, &forbidden, tc) {
-            check_default_type(default, tc.type_handle(&param_ty.ty), tc);
+            check_default_type(default, TypeChecker::type_handle(&param_ty.ty), tc);
         }
     }
 }

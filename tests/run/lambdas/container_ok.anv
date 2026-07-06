@@ -1,0 +1,34 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 2
+// 4
+// 5
+// 1
+// @match-end
+
+fn one() -> int { 1 }
+
+fn main() {
+    let readonly = 2;
+    var state = 3;
+    let text = "hi";
+    let named = [one];
+    let zero_env = [|| readonly];
+    let heap_env = [|| text.len()];
+    let heap_cell = [|| { state = state + 1; state }];
+    let dynamic_index = 0;
+
+    let a = named[dynamic_index];
+    let b = zero_env[0];
+    let c = heap_env[0];
+    let d = heap_cell[0];
+    println(a());
+    println(b());
+    println(c());
+    println(d());
+    println(d());
+    println(named[dynamic_index]());
+}

@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+lazy let values: [int; 3] = [1, 2, 3];
+
+fn main() {
+    let local = values;
+    println(local[2]);
+}

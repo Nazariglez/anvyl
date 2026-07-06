@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// 2
+// 10
+// 10
+// 20
+// 3
+// 2
+// 5
+// @match-end
+
+fn first(xs: slice[int]) -> int {
+    xs[0]
+}
+
+fn second(xs: slice[int]) -> int {
+    first(xs[1..2])
+}
+
+fn first_array_param(ref xs: [int; 3]) -> int {
+    first(xs)
+}
+
+fn main() {
+    var list: [int] = [1, 2, 3, 4];
+    println(first(list));
+    println(first([10, 20, 30]));
+    println(first(list[1..3]));
+
+    let array = [10, 20, 30];
+    println(first(array));
+    var mutable_array = [10, 20, 30];
+    println(first_array_param(mutable_array));
+    println(first(array[1..=2]));
+
+    println(first(list[2..4]));
+    println(second(list[0..3]));
+    list.push(5);
+    println(list[4]);
+}

@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// -2
+// -1
+// 7
+// @match-end
+
+import pkg:host.host { Thing };
+
+fn main() {
+    let omitted = Thing { value: 1 };
+    println(omitted.tag_code());
+    let provided_nil = Thing { value: 2, tag: nil };
+    println(provided_nil.tag_code());
+    let provided_value = Thing { value: 3, tag: 7 };
+    println(provided_value.tag_code());
+}

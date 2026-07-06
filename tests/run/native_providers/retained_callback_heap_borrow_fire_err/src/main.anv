@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: cannot reenter runtime while heap borrow guard is active
+
+import pkg:host.host { retain, fire_with_heap_borrow };
+
+fn main() {
+    retain(|| println("should not run"));
+    fire_with_heap_borrow();
+}

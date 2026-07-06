@@ -3,55 +3,6 @@ use std::path::PathBuf;
 pub const DEFAULT_RUNTIME_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_COMPILE_TIMEOUT_MS: u64 = 300_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendArg {
-    Vm,
-    Rust,
-    Both,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FrontendArg {
-    #[default]
-    Default,
-    New,
-}
-
-impl FrontendArg {
-    pub fn is_new(self) -> bool {
-        self == Self::New
-    }
-}
-
-impl BackendArg {
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "vm" => Ok(Self::Vm),
-            "rust" => Ok(Self::Rust),
-            "both" => Ok(Self::Both),
-            _ => Err(format!(
-                "Unknown backend: '{s}'. Expected 'vm', 'rust', or 'both'"
-            )),
-        }
-    }
-
-    pub fn expand(self) -> &'static [&'static str] {
-        match self {
-            Self::Vm => &["vm"],
-            Self::Rust => &["rust"],
-            Self::Both => &["vm", "rust"],
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Vm => "vm",
-            Self::Rust => "rust",
-            Self::Both => "both",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct RunnerArgs {
     pub paths: Vec<PathBuf>,
@@ -61,14 +12,6 @@ pub struct RunnerArgs {
     pub quiet: bool,
     pub report_json: bool,
     pub release: bool,
-    pub backend: BackendArg,
-    pub frontend: FrontendArg,
-}
-
-impl RunnerArgs {
-    pub fn new_frontend(&self) -> bool {
-        self.frontend.is_new()
-    }
 }
 
 pub fn usage() -> String {
@@ -80,8 +23,6 @@ Arguments:
   <PATH>...  One or more test files or directories
 
 Options:
-  --backend <vm|rust|both>  Backend to test (default: vm)
-  --new-frontend            Run check fixtures through the clean frontend and rust run fixtures through the clean Rust backend
   --timeout <ms>            Runtime timeout in milliseconds (default: {DEFAULT_RUNTIME_TIMEOUT_MS})
   --compile-timeout <ms>    Compile timeout in milliseconds (default: {DEFAULT_COMPILE_TIMEOUT_MS})
   --jobs <n>                Maximum tests to run in parallel (default: rayon default)
@@ -106,7 +47,6 @@ impl RunnerArgs {
                 "--quiet" => parsed.quiet = true,
                 "--report-json" => parsed.report_json = true,
                 "--release" => parsed.release = true,
-                "--new-frontend" => parsed.frontend = FrontendArg::New,
                 "--timeout" => {
                     let value = parse_value(&mut iter, "--timeout")?;
                     parsed.timeout_ms = parse_u64("--timeout", &value)?;
@@ -118,10 +58,6 @@ impl RunnerArgs {
                 "--jobs" => {
                     let value = parse_value(&mut iter, "--jobs")?;
                     parsed.jobs = Some(parse_jobs(&value)?);
-                }
-                "--backend" => {
-                    let value = parse_value(&mut iter, "--backend")?;
-                    parsed.backend = BackendArg::from_str(&value)?;
                 }
                 flag if flag.starts_with("--") => return Err(format!("Unknown option: {flag}")),
                 path => parsed.paths.push(PathBuf::from(path)),
@@ -140,8 +76,6 @@ struct ParsedArgs {
     quiet: bool,
     report_json: bool,
     release: bool,
-    backend: BackendArg,
-    frontend: FrontendArg,
 }
 
 impl Default for ParsedArgs {
@@ -154,8 +88,6 @@ impl Default for ParsedArgs {
             quiet: false,
             report_json: false,
             release: false,
-            backend: BackendArg::Vm,
-            frontend: FrontendArg::Default,
         }
     }
 }
@@ -180,8 +112,6 @@ impl ParsedArgs {
             quiet: self.quiet,
             report_json: self.report_json,
             release: self.release,
-            backend: self.backend,
-            frontend: self.frontend,
         })
     }
 }
@@ -222,10 +152,7 @@ fn parse_jobs(value: &str) -> Result<usize, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, FrontendArg,
-        RunnerArgs, usage,
-    };
+    use super::{DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs};
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(ToString::to_string).collect()
@@ -246,8 +173,6 @@ mod tests {
         assert!(!parsed.quiet);
         assert!(!parsed.report_json);
         assert!(!parsed.release);
-        assert_eq!(parsed.backend, BackendArg::Vm);
-        assert_eq!(parsed.frontend, FrontendArg::Default);
     }
 
     #[test]
@@ -257,7 +182,6 @@ mod tests {
             "--quiet",
             "--report-json",
             "--release",
-            "--new-frontend",
             "--timeout",
             "1234",
             ".",
@@ -265,8 +189,6 @@ mod tests {
             "5678",
             "--jobs",
             "4",
-            "--backend",
-            "both",
         ])
         .unwrap();
 
@@ -276,45 +198,13 @@ mod tests {
         assert!(parsed.quiet);
         assert!(parsed.report_json);
         assert!(parsed.release);
-        assert_eq!(parsed.backend, BackendArg::Both);
-        assert_eq!(parsed.frontend, FrontendArg::New);
-    }
-
-    #[test]
-    fn accepts_options_before_and_after_paths() {
-        let parsed = parse(&[
-            "test-runner",
-            "--timeout",
-            "10",
-            ".",
-            "--compile-timeout",
-            "20",
-        ])
-        .unwrap();
-
-        assert_eq!(parsed.paths, [PathBuf::from(".")]);
-        assert_eq!(parsed.timeout_ms, 10);
-        assert_eq!(parsed.compile_timeout_ms, 20);
     }
 
     #[test]
     fn repeated_value_options_use_last_value() {
-        let parsed = parse(&[
-            "test-runner",
-            ".",
-            "--timeout",
-            "10",
-            "--timeout",
-            "20",
-            "--backend",
-            "vm",
-            "--backend",
-            "rust",
-        ])
-        .unwrap();
+        let parsed = parse(&["test-runner", ".", "--timeout", "10", "--timeout", "20"]).unwrap();
 
         assert_eq!(parsed.timeout_ms, 20);
-        assert_eq!(parsed.backend, BackendArg::Rust);
     }
 
     #[test]
@@ -322,14 +212,6 @@ mod tests {
         assert_eq!(
             parse(&["test-runner", ".", "--unknown"]).unwrap_err(),
             "Unknown option: --unknown"
-        );
-    }
-
-    #[test]
-    fn rejects_driver() {
-        assert_eq!(
-            parse(&["test-runner", ".", "--driver", "cli"]).unwrap_err(),
-            "Unknown option: --driver"
         );
     }
 
@@ -355,10 +237,6 @@ mod tests {
             parse(&["test-runner", ".", "--jobs", "0"]).unwrap_err(),
             "--jobs must be greater than zero"
         );
-        assert_eq!(
-            parse(&["test-runner", ".", "--backend", "unknown"]).unwrap_err(),
-            "Unknown backend: 'unknown'. Expected 'vm', 'rust', or 'both'"
-        );
     }
 
     #[test]
@@ -367,34 +245,5 @@ mod tests {
             parse(&["test-runner", "--quiet"]).unwrap_err(),
             "Provide one or more directories or files as arguments"
         );
-    }
-
-    #[test]
-    fn rejects_missing_path_targets() {
-        assert!(parse(&["test-runner", "definitely-not-an-anvyx-test-path"]).is_err());
-    }
-
-    #[test]
-    fn expands_backend_args() {
-        assert_eq!(BackendArg::Vm.expand(), &["vm"]);
-        assert_eq!(BackendArg::Rust.expand(), &["rust"]);
-        assert_eq!(BackendArg::Both.expand(), &["vm", "rust"]);
-    }
-
-    #[test]
-    fn labels_backend_args() {
-        assert_eq!(BackendArg::Vm.as_str(), "vm");
-        assert_eq!(BackendArg::Rust.as_str(), "rust");
-        assert_eq!(BackendArg::Both.as_str(), "both");
-    }
-
-    #[test]
-    fn usage_documents_new_frontend() {
-        assert!(usage().contains("--new-frontend"));
-    }
-
-    #[test]
-    fn usage_omits_driver() {
-        assert!(!usage().contains("--driver"));
     }
 }

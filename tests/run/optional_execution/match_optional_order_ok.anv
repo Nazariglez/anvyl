@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: default
+
+fn main() {
+    let value: int? = 1;
+    match value {
+        _ => println("default"),
+        v? => println("some"),
+    }
+}

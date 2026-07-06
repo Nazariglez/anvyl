@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 280
+
+fn main() {
+    let a = 0B1010;
+    let b = 0O17;
+    let c = 0xFF;
+    println(a + b + c);
+}

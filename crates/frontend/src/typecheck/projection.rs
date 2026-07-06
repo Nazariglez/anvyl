@@ -2,7 +2,7 @@ use super::{
     CastFromConversion, CheckedType, ExpectedProjectionFact, ProjectionPath, TypeChecker,
     TypeError, checked_from_type, checked_type, convert,
     convert::{ExpectedDynPlan, ExplicitCast},
-    infer::TypeHandle,
+    infer::{Solver, TypeHandle},
     place,
     type_ops::type_depends_on_generics,
 };
@@ -262,7 +262,7 @@ pub(super) fn apply_value_projection(
     let projected = match tc.expr_place(expr.node.id) {
         Some(source) => place::projected_value(&source, checked.clone(), &path),
         None => {
-            let mut source = checked_type(source_ty.clone(), tc);
+            let mut source = checked_type(source_ty.clone());
             source.contains_extern_any = source_checked.contains_extern_any;
             let source = place::PlaceValue::not_place(source);
             place::projected_value(&source, checked.clone(), &path)
@@ -325,8 +325,8 @@ fn assignable_without_errors(tc: &TypeChecker, span: Span, source: &Type, target
     let mut solver = tc.solver.clone();
     solver.add_handle_assignable(
         tc.error_span(span),
-        solver.concrete_type(source),
-        solver.concrete_type(target),
+        Solver::concrete_type(source),
+        Solver::concrete_type(target),
     );
     solver.solve_pending().is_empty()
 }

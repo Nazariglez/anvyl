@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn higher(f: fn(escaping fn()) -> void) {
 }

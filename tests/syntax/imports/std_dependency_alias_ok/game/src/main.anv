@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+import pkg:std { value };
+import std:mem;
+
+fn main() { let x: int = value(); mem.collect_cycles(); }

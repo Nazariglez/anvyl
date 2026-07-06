@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 5
+// true
+// @match-end
+
+lazy let title = "ready";
+
+fn main() {
+    println(title.len());
+    println(title.contains("ead"));
+}

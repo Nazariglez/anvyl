@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @contains: 9
+
+fn make() -> fn() -> int {
+    || 9
+}
+
+fn main() {
+    let f = make();
+    println(f());
+}

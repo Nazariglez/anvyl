@@ -1,5 +1,0 @@
-// @helper
-
-import manager { Manager };
-
-pub struct Worker { name: string, manager: Manager? }

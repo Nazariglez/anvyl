@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot pass iterated collection as mutable collection parameter
-// @frontend: new
 
 fn replace<T>(ref target: T, next: T) {
     target = next;

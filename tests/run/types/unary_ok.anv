@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// -1
+// true
+// @match-end
+
+fn main() {
+    let a: int = -1;
+    let b: bool = !false;
+    let c: int = ~0;
+    let d: float = -1.5;
+    assert(c == -1);
+    assert(d == -1.5);
+    println(a);
+    println(b);
+}

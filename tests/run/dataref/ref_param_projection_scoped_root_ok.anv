@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+dataref Counter {
+    value: int,
+}
+
+fn bump(ref value: int) {
+    value += 1;
+}
+
+fn touch(ref c: Counter) {
+    let cb = || { bump(c.value); };
+    cb();
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    touch(c);
+    println(c.value);
+}

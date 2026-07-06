@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+struct Point {
+    x: int,
+}
+
+fn main() {
+    let p = Point { x: 7 };
+    let xs: [Point] = [p];
+    println(xs[0].x);
+}

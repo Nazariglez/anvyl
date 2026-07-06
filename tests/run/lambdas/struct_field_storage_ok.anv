@@ -1,0 +1,42 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// 4
+// 5
+// 2
+// 9
+// @match-end
+
+struct Holder {
+    f: fn() -> int,
+}
+
+fn one() -> int { 1 }
+fn nine() -> int { 9 }
+
+fn main() {
+    let readonly = 2;
+    var state = 3;
+    let text = "hi";
+    let named = Holder { f: one };
+    let zero_env = Holder { f: || 2 };
+    let heap_env = Holder { f: || text.len() };
+    let heap_cell = Holder { f: || { state = state + 1; state } };
+    var replace = Holder { f: one };
+
+    let a = named.f;
+    let b = zero_env.f;
+    let c = heap_cell.f;
+    let d = heap_env.f;
+    println(a());
+    println(b());
+    println(c());
+    println(c());
+    println(d());
+
+    replace.f = nine;
+    let e = replace.f;
+    println(e());
+}

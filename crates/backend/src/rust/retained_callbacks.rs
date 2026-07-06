@@ -232,7 +232,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         let owner_ty = target::runtime_owner_handle_ty();
         let inner = target::generated_runtime_inner_symbol();
         let field = plan.table_field();
-        let key_check = self.key_check(plan);
+        let key_check = Self::key_check(plan);
         let trace_globals = self.trace_globals();
         let result = self.lambda_call_result(plan);
         self.w.block(
@@ -330,7 +330,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         let owner_ty = target::runtime_owner_handle_ty();
         let inner = target::generated_runtime_inner_symbol();
         let field = plan.table_field();
-        let key_check = self.key_check(plan);
+        let key_check = Self::key_check(plan);
         self.w.block(
             format_args!(
                 "unsafe fn {close_thunk}(owner: &{owner_ty}, key: {key_ty}) -> {}",
@@ -416,7 +416,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         .collect()
     }
 
-    fn key_check(&self, plan: RetainedCallbackSigPlan) -> String {
+    fn key_check(plan: RetainedCallbackSigPlan) -> String {
         format!(
             "{}?;",
             target::callback_check_identity("key", plan.table_id(), plan.signature_id())

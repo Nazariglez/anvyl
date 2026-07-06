@@ -1,5 +1,0 @@
-// @helper
-
-pub dataref Node {
-    value: int,
-}

@@ -1,0 +1,1 @@
+pub import pkg:math.vec { self as vec, Vec2 };

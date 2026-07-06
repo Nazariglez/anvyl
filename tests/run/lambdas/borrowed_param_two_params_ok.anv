@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// @match-end
+
+fn touch(ref a: int, ref b: int) {
+    let f = || {
+        a += 1;
+        b += 10;
+    };
+    f();
+}
+
+fn main() {
+    var a = 0;
+    var b = 0;
+    touch(a, b);
+    println(a);
+    println(b);
+}

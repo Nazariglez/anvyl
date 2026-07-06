@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: callbacks cannot be nested
 
 extern fn higher(callback: fn(escaping fn()) -> void) -> void;

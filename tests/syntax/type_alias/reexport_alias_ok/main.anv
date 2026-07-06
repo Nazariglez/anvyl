@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 import facade { Id };
 fn f(x: Id) -> int { x }

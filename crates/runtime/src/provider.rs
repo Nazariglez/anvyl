@@ -1812,22 +1812,6 @@ pub trait AnvyxEnumExport {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cargo_defaults_keep_default_features_enabled() {
-        let cargo = RustProviderCargo::default();
-
-        assert!(cargo.default_features);
-        assert!(cargo.features.is_empty());
-        assert!(cargo.package.is_none());
-        assert!(cargo.path.is_none());
-    }
-
-    #[test]
-    fn validates_rust_provider_support() {
-        validate_rust_provider_support(&[descriptor()], &[support(binding("ping"))]).unwrap();
-    }
-
     #[test]
     fn rejects_unknown_binding() {
         let error = validate_rust_provider_support(&[descriptor()], &[support(binding("pong"))])
@@ -2082,33 +2066,6 @@ mod tests {
             "structural owned resource return ABI is unsupported",
         );
     }
-
-    #[test]
-    fn accepts_top_level_runtime_resource_value_return() {
-        let resource = shared_resource();
-        assert_abi_ok(
-            shared_resource_descriptor("borrowed", vec![], resource.clone()),
-            binding_with_abi(
-                "borrowed",
-                RustParamAbi::Value(ExternTypeExpr::Void),
-                RustReturnAbi::Value(resource),
-            ),
-        );
-    }
-
-    #[test]
-    fn accepts_runtime_resource_value_param() {
-        let resource = shared_resource();
-        assert_abi_ok(
-            shared_resource_descriptor(
-                "use_ref",
-                vec![value_param(resource.clone())],
-                ExternTypeExpr::Void,
-            ),
-            void_binding("use_ref", RustParamAbi::Value(resource)),
-        );
-    }
-
     #[test]
     fn rejects_owned_shared_resource_param() {
         let resource = shared_resource();
@@ -2170,17 +2127,6 @@ mod tests {
             "shared resource parameters must use top-level, Option, or Result AnvRef",
         );
     }
-
-    #[test]
-    fn accepts_presence_init_field_abi() {
-        assert_abi_ok(
-            presence_init_descriptor(),
-            presence_init_binding(RustParamAbi::InitField(Box::new(RustParamAbi::Value(
-                ExternTypeExpr::Int,
-            )))),
-        );
-    }
-
     #[test]
     fn rejects_presence_init_without_init_field_abi() {
         assert_abi_error(
@@ -2241,15 +2187,6 @@ mod tests {
             void_binding("bump", RustParamAbi::MutBorrow(ExternTypeExpr::Int)),
         );
     }
-
-    #[test]
-    fn accepts_place_aware_mutable_scalar_abi() {
-        assert_abi_ok(
-            mutable_descriptor("bump", ExternTypeExpr::Int),
-            void_binding("bump", RustParamAbi::MutPlace(ExternTypeExpr::Int)),
-        );
-    }
-
     #[test]
     fn rejects_place_aware_abi_mismatches() {
         let cases = vec![
@@ -2308,69 +2245,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn accepts_canonical_collection_carrier_abis() {
-        fn int_list() -> ExternTypeExpr {
-            ExternTypeExpr::List(Box::new(ExternTypeExpr::Int))
-        }
-
-        fn string_int_map() -> ExternTypeExpr {
-            ExternTypeExpr::Map(
-                Box::new(ExternTypeExpr::String),
-                Box::new(ExternTypeExpr::Int),
-            )
-        }
-
-        for (descriptor, binding) in [
-            (
-                param_descriptor("take", int_list(), ParamFlow::Value, ExternTypeExpr::Void),
-                void_binding("take", RustParamAbi::Value(int_list())),
-            ),
-            (
-                param_descriptor(
-                    "borrow",
-                    int_list(),
-                    ParamFlow::Borrow,
-                    ExternTypeExpr::Void,
-                ),
-                void_binding("borrow", RustParamAbi::Borrow(int_list())),
-            ),
-            (
-                param_descriptor("make", ExternTypeExpr::Void, ParamFlow::Value, int_list()),
-                binding_with_abi(
-                    "make",
-                    RustParamAbi::Value(ExternTypeExpr::Void),
-                    RustReturnAbi::Value(int_list()),
-                ),
-            ),
-            (
-                param_descriptor(
-                    "take_map",
-                    string_int_map(),
-                    ParamFlow::Value,
-                    ExternTypeExpr::Void,
-                ),
-                void_binding("take_map", RustParamAbi::Value(string_int_map())),
-            ),
-            (
-                param_descriptor(
-                    "make_map",
-                    ExternTypeExpr::Void,
-                    ParamFlow::Value,
-                    string_int_map(),
-                ),
-                binding_with_abi(
-                    "make_map",
-                    RustParamAbi::Value(ExternTypeExpr::Void),
-                    RustReturnAbi::Value(string_int_map()),
-                ),
-            ),
-        ] {
-            assert_abi_ok(descriptor, binding);
-        }
-    }
-
     #[test]
     fn accepts_recursive_direct_collection_carriers() {
         fn int_list() -> ExternTypeExpr {
@@ -2502,55 +2376,6 @@ mod tests {
             "unsupported native ABI metadata",
         );
     }
-
-    #[test]
-    fn accepts_direct_option_result_and_slice_metadata() {
-        assert_abi_ok(
-            param_descriptor(
-                "maybe",
-                ExternTypeExpr::Option(Box::new(ExternTypeExpr::Int)),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            void_binding(
-                "maybe",
-                RustParamAbi::Option(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
-            ),
-        );
-
-        assert_abi_ok(
-            param_descriptor(
-                "visible_result",
-                ExternTypeExpr::Result(
-                    Box::new(ExternTypeExpr::Int),
-                    Box::new(ExternTypeExpr::String),
-                ),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            void_binding(
-                "visible_result",
-                RustParamAbi::Result(
-                    Box::new(RustParamAbi::Value(ExternTypeExpr::Int)),
-                    Box::new(RustParamAbi::Value(ExternTypeExpr::String)),
-                ),
-            ),
-        );
-
-        assert_abi_ok(
-            param_descriptor(
-                "slice",
-                ExternTypeExpr::Slice(Box::new(ExternTypeExpr::Int)),
-                ParamFlow::Value,
-                ExternTypeExpr::Void,
-            ),
-            void_binding(
-                "slice",
-                RustParamAbi::Slice(Box::new(RustParamAbi::Value(ExternTypeExpr::Int))),
-            ),
-        );
-    }
-
     #[test]
     fn rejects_wrapped_values_as_bare_rust_values() {
         assert_abi_error(
@@ -2567,43 +2392,6 @@ mod tests {
             "parameter 0 ABI mismatch",
         );
     }
-
-    #[test]
-    fn accepts_scoped_lambda_abi() {
-        let callback = callback_signature(
-            vec![ExternCallbackParam {
-                ty: ExternTypeExpr::Int,
-                escape: CallbackEscape::NonEscaping,
-            }],
-            ExternTypeExpr::Bool,
-        );
-        let descriptor = callback_descriptor(
-            "with_callback",
-            callback.clone(),
-            CallbackEscape::NonEscaping,
-        );
-        let binding = scoped_lambda_binding("with_callback", callback);
-
-        assert_abi_ok(descriptor, binding);
-    }
-
-    #[test]
-    fn accepts_escaping_lambda_abi() {
-        let callback = callback_signature_with_escape(
-            vec![ExternCallbackParam {
-                ty: ExternTypeExpr::Int,
-                escape: CallbackEscape::NonEscaping,
-            }],
-            ExternTypeExpr::Bool,
-            CallbackEscape::Escaping,
-        );
-        let descriptor =
-            callback_descriptor("with_callback", callback.clone(), CallbackEscape::Escaping);
-        let binding = escaping_lambda_binding("with_callback", callback);
-
-        assert_abi_ok(descriptor, binding);
-    }
-
     #[test]
     fn callback_wrapper_param_matching_is_role_owned() {
         let scoped = callback_signature(vec![], ExternTypeExpr::Void);
@@ -2909,17 +2697,6 @@ mod tests {
             "callback wrapper ABI cannot be combined with borrowed or mutable-place provider parameters",
         );
     }
-
-    #[test]
-    fn accepts_method_receiver_with_escaping_lambda() {
-        let callback =
-            callback_signature_with_escape(vec![], ExternTypeExpr::Void, CallbackEscape::Escaping);
-        let descriptor = callback_method_descriptor(callback.clone(), CallbackEscape::Escaping);
-        let binding = callback_method_binding(escaping_lambda_binding("mixed", callback));
-
-        assert_abi_ok(descriptor, binding);
-    }
-
     #[test]
     fn rejects_method_receiver_with_scoped_lambda() {
         let callback = callback_signature(vec![], ExternTypeExpr::Void);

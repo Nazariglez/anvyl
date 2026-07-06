@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Unknown method 'tag' for type 'Player'
 
 struct Player {

@@ -10,7 +10,7 @@ use crate::{
     model::{FailurePhase, Mode, RunTestResult, TestResult},
 };
 
-const JSON_SCHEMA_VERSION: u32 = 2;
+const JSON_SCHEMA_VERSION: u32 = 3;
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
@@ -42,9 +42,7 @@ pub(crate) struct Summary {
 #[derive(Debug)]
 struct SummaryEvent {
     file: PathBuf,
-    scheduled_backend: Option<&'static str>,
     mode: Mode,
-    backend: Option<&'static str>,
     duration: Duration,
     outcome: SummaryOutcome,
 }
@@ -75,14 +73,8 @@ enum IssueKind {
 }
 
 impl Summary {
-    pub(crate) fn add(
-        &mut self,
-        file: PathBuf,
-        scheduled_backend: Option<&'static str>,
-        result: RunTestResult,
-        quiet: bool,
-    ) {
-        let event = SummaryEvent::new(file, scheduled_backend, result);
+    pub(crate) fn add(&mut self, file: PathBuf, result: RunTestResult, quiet: bool) {
+        let event = SummaryEvent::new(file, result);
         event.print(quiet);
         self.events.push(event);
     }
@@ -253,8 +245,6 @@ impl Summary {
 
         JsonReport {
             schema_version: JSON_SCHEMA_VERSION,
-            backend: args.backend.as_str().to_string(),
-            new_frontend: args.new_frontend(),
             input_paths: args
                 .paths
                 .iter()
@@ -278,41 +268,35 @@ impl Summary {
 }
 
 impl SummaryEvent {
-    fn new(file: PathBuf, scheduled_backend: Option<&'static str>, result: RunTestResult) -> Self {
+    fn new(file: PathBuf, result: RunTestResult) -> Self {
         let RunTestResult {
             result,
             mode,
-            backend,
             duration,
         } = result;
         let outcome = SummaryOutcome::from(result);
 
         Self {
             file,
-            scheduled_backend,
             mode,
-            backend,
             duration,
             outcome,
         }
     }
 
     fn print(&self, quiet: bool) {
-        match self.outcome {
-            SummaryOutcome::Passed => {
-                pass_msg(&self.file, quiet, self.mode, self.backend, self.duration);
-            }
-            SummaryOutcome::Failed { .. } => {
-                fail_msg(&self.file, quiet, self.mode, self.backend, self.duration);
-            }
-            SummaryOutcome::TimedOut { .. } => {
-                timeout_msg(&self.file, quiet, self.mode, self.backend, self.duration);
-            }
-            SummaryOutcome::Skipped { .. } => {
-                skip_msg(&self.file, quiet, self.mode, self.backend, self.duration);
-            }
-            SummaryOutcome::Helper => {}
-        }
+        let Some((color, label, is_error)) = self.outcome.label() else {
+            return;
+        };
+        event_msg(
+            &self.file,
+            quiet,
+            self.mode,
+            self.duration,
+            color,
+            label,
+            is_error,
+        );
     }
 }
 
@@ -335,6 +319,16 @@ impl SummaryOutcome {
 
     fn is_helper(&self) -> bool {
         matches!(self, Self::Helper)
+    }
+
+    fn label(&self) -> Option<(&'static str, &'static str, bool)> {
+        match self {
+            Self::Passed => Some((GREEN, "PASS", false)),
+            Self::Failed { .. } => Some((RED, "FAIL", true)),
+            Self::TimedOut { .. } => Some((BLUE, "TIMEOUT", true)),
+            Self::Skipped { .. } => Some((YELLOW, "SKIP", false)),
+            Self::Helper => None,
+        }
     }
 
     fn issue_kind(&self) -> Option<IssueKind> {
@@ -402,8 +396,6 @@ impl IssueKind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct JsonReport {
     schema_version: u32,
-    backend: String,
-    new_frontend: bool,
     input_paths: Vec<String>,
     runtime_timeout_ms: u64,
     compile_timeout_ms: u64,
@@ -424,7 +416,6 @@ struct JsonReport {
 struct JsonIssue {
     kind: &'static str,
     mode: String,
-    backend: Option<String>,
     phase: Option<String>,
     path: String,
     message: String,
@@ -438,7 +429,6 @@ impl JsonIssue {
         Some(Self {
             kind: kind.as_str(),
             mode: event.mode.to_string(),
-            backend: event.scheduled_backend.map(str::to_string),
             phase: kind.phase().map(|phase| phase.as_str().to_string()),
             path: event.file.display().to_string(),
             message: event.outcome.issue_message()?,
@@ -452,66 +442,34 @@ fn sort_issues(issues: &mut [JsonIssue]) {
         left.path
             .cmp(&right.path)
             .then(left.mode.cmp(&right.mode))
-            .then(left.backend.cmp(&right.backend))
             .then(left.kind.cmp(right.kind))
             .then(left.phase.cmp(&right.phase))
             .then(left.message.cmp(&right.message))
     });
 }
 
-fn mode_label(mode: Mode, backend: Option<&str>) -> String {
-    match backend {
-        Some(backend) => format!("{mode}/{backend}"),
-        None => format!("{mode}"),
-    }
-}
-
-fn pass_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
+fn event_msg(
+    file: &Path,
+    quiet: bool,
+    mode: Mode,
+    duration: Duration,
+    color: &str,
+    label: &str,
+    is_error: bool,
+) {
     if quiet {
         return;
     }
-    println!(
-        "{GREEN}[PASS]{RESET} {} {GREY}({} - {:.3}s){RESET}",
+    let line = format!(
+        "{color}[{label}]{RESET} {} {GREY}({mode} - {:.3}s){RESET}",
         file.display(),
-        mode_label(mode, backend),
         duration.as_secs_f32()
     );
-}
-
-fn fail_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
+    if is_error {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
     }
-    eprintln!(
-        "{RED}[FAIL]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
-}
-
-fn timeout_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    eprintln!(
-        "{BLUE}[TIMEOUT]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
-}
-
-fn skip_msg(file: &Path, quiet: bool, mode: Mode, backend: Option<&str>, duration: Duration) {
-    if quiet {
-        return;
-    }
-    println!(
-        "{YELLOW}[SKIP]{RESET} {} {GREY}({} - {:.3}s){RESET}",
-        file.display(),
-        mode_label(mode, backend),
-        duration.as_secs_f32()
-    );
 }
 
 fn tab_print(spaces: usize, message: &str, is_error: bool) {
@@ -534,14 +492,11 @@ mod tests {
 
     use super::Summary;
     use crate::{
-        args::{
-            BackendArg, DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, FrontendArg,
-            RunnerArgs,
-        },
+        args::{DEFAULT_COMPILE_TIMEOUT_MS, DEFAULT_RUNTIME_TIMEOUT_MS, RunnerArgs},
         model::{FailurePhase, Mode, RunTestResult, TestResult},
     };
 
-    fn runner_args(backend: BackendArg) -> RunnerArgs {
+    fn runner_args() -> RunnerArgs {
         RunnerArgs {
             paths: vec![PathBuf::from("tests")],
             timeout_ms: DEFAULT_RUNTIME_TIMEOUT_MS,
@@ -550,23 +505,13 @@ mod tests {
             quiet: true,
             report_json: true,
             release: false,
-            backend,
-            frontend: FrontendArg::Default,
         }
     }
 
-    fn new_frontend_args() -> RunnerArgs {
-        RunnerArgs {
-            frontend: FrontendArg::New,
-            ..runner_args(BackendArg::Vm)
-        }
-    }
-
-    fn result(result: TestResult, mode: Mode, backend: Option<&'static str>) -> RunTestResult {
+    fn result(result: TestResult, mode: Mode) -> RunTestResult {
         RunTestResult {
             result,
             mode,
-            backend,
             duration: Duration::from_millis(250),
         }
     }
@@ -576,73 +521,40 @@ mod tests {
         let mut summary = Summary::default();
         summary.add(
             PathBuf::from("b.anv"),
-            Some("vm"),
             result(
                 TestResult::Fail {
                     phase: FailurePhase::Compile,
                     message: "compile fail".to_string(),
                 },
                 Mode::Run,
-                Some("vm"),
             ),
             true,
         );
         summary.add(
             PathBuf::from("a.anv"),
-            Some("rust"),
             result(
                 TestResult::Skip {
                     message: "skip me".to_string(),
                 },
                 Mode::Check,
-                None,
             ),
             true,
         );
 
-        let report = summary.json_report(&runner_args(BackendArg::Both), Instant::now());
+        let report = summary.json_report(&runner_args(), Instant::now());
 
-        assert_eq!(report.schema_version, 2);
-        assert_eq!(report.backend, "both");
-        assert!(!report.new_frontend);
+        assert_eq!(report.schema_version, 3);
         assert_eq!(report.issues.len(), 2);
         assert_eq!(report.issues[0].path, "a.anv");
         assert_eq!(report.issues[0].mode, "check");
-        assert_eq!(report.issues[0].backend.as_deref(), Some("rust"));
         assert_eq!(report.issues[0].phase, None);
         assert_eq!(report.issues[0].kind, "skipped");
         assert_eq!(report.issues[0].message, "skip me");
         assert_eq!(report.issues[1].path, "b.anv");
         assert_eq!(report.issues[1].kind, "compile_failed");
         assert_eq!(report.issues[1].phase.as_deref(), Some("compile"));
-        assert_eq!(report.issues[1].backend.as_deref(), Some("vm"));
         assert_eq!(report.issues[1].message, "compile fail");
         assert!(report.issues[1].duration_seconds > 0.0);
-    }
-
-    #[test]
-    fn json_report_uses_scheduled_backend_for_check_mode_issues() {
-        let mut summary = Summary::default();
-        summary.add(
-            PathBuf::from("syntax.anv"),
-            Some("rust"),
-            result(
-                TestResult::Fail {
-                    phase: FailurePhase::Compile,
-                    message: "parse fail".to_string(),
-                },
-                Mode::Check,
-                None,
-            ),
-            true,
-        );
-
-        let report = summary.json_report(&runner_args(BackendArg::Both), Instant::now());
-        let issue = report.issues.first().expect("one issue");
-
-        assert_eq!(issue.mode, "check");
-        assert_eq!(issue.backend.as_deref(), Some("rust"));
-        assert_eq!(issue.phase.as_deref(), Some("compile"));
     }
 
     #[test]
@@ -650,56 +562,48 @@ mod tests {
         let mut summary = Summary::default();
         summary.add(
             PathBuf::from("compile_fail.anv"),
-            Some("vm"),
             result(
                 TestResult::Fail {
                     phase: FailurePhase::Compile,
                     message: "compile fail".to_string(),
                 },
                 Mode::Check,
-                None,
             ),
             true,
         );
         summary.add(
             PathBuf::from("runtime_fail.anv"),
-            Some("vm"),
             result(
                 TestResult::Fail {
                     phase: FailurePhase::Runtime,
                     message: "runtime fail".to_string(),
                 },
                 Mode::Run,
-                Some("vm"),
             ),
             true,
         );
         summary.add(
             PathBuf::from("compile_timeout.anv"),
-            Some("vm"),
             result(
                 TestResult::Timeout {
                     phase: FailurePhase::Compile,
                 },
                 Mode::Check,
-                None,
             ),
             true,
         );
         summary.add(
             PathBuf::from("runtime_timeout.anv"),
-            Some("vm"),
             result(
                 TestResult::Timeout {
                     phase: FailurePhase::Runtime,
                 },
                 Mode::Run,
-                Some("vm"),
             ),
             true,
         );
 
-        let report = summary.json_report(&runner_args(BackendArg::Vm), Instant::now());
+        let report = summary.json_report(&runner_args(), Instant::now());
         let kinds = report
             .issues
             .iter()
@@ -723,51 +627,19 @@ mod tests {
         let mut summary = Summary::default();
         summary.add(
             PathBuf::from("pass.anv"),
-            Some("vm"),
-            result(TestResult::Pass, Mode::Run, Some("vm")),
+            result(TestResult::Pass, Mode::Run),
             true,
         );
         summary.add(
             PathBuf::from("helper.anv"),
-            Some("vm"),
-            result(TestResult::Helper, Mode::Check, None),
+            result(TestResult::Helper, Mode::Check),
             true,
         );
 
-        let report = summary.json_report(&runner_args(BackendArg::Vm), Instant::now());
+        let report = summary.json_report(&runner_args(), Instant::now());
 
         assert_eq!(report.passed, 1);
         assert_eq!(report.helpers, 1);
         assert!(report.issues.is_empty());
-    }
-
-    #[test]
-    fn json_report_serializes() {
-        let mut summary = Summary::default();
-        summary.add(
-            PathBuf::from("skip.anv"),
-            Some("vm"),
-            result(
-                TestResult::Skip {
-                    message: "skip".to_string(),
-                },
-                Mode::Check,
-                None,
-            ),
-            true,
-        );
-
-        let report = summary.json_report(&runner_args(BackendArg::Vm), Instant::now());
-        let json = serde_json::to_string(&report).expect("report serializes");
-
-        assert!(json.contains("schema_version"));
-    }
-
-    #[test]
-    fn json_report_records_new_frontend_mode() {
-        let summary = Summary::default();
-        let report = summary.json_report(&new_frontend_args(), Instant::now());
-
-        assert!(report.new_frontend);
     }
 }

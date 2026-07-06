@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: slice values cannot be stored
-// @frontend: new
 
 fn f(xs: [slice[int]?]) {}
 

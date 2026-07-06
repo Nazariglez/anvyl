@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 3
+// @match-end
+
+fn main() {
+    var a: [int] = [1, 2];
+    var b = a;
+    a.push(3);
+    println(b[1]);
+    println(a[2]);
+}

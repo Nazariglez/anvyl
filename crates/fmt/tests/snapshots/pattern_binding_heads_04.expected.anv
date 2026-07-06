@@ -1,0 +1,8 @@
+fn f(x: int?) {
+    match ref x {
+        Option.Some(v) => {
+            v = 1;
+        },
+        Option.None => {},
+    }
+}

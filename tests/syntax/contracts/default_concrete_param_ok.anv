@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 contract Drawable {
     fn draw(self, layer: int);

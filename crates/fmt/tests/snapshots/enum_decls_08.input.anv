@@ -1,0 +1,1 @@
+enum E: int { A = BASE + 1 }

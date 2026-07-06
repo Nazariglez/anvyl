@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: debug mode
-
-fn main() {
-    if #profile(debug) {
-        println("debug mode");
-    }
-}

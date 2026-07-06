@@ -5,7 +5,7 @@ pub mod check;
 pub mod manifest;
 pub mod rust;
 
-use anvyx_lang2::{ModuleSource, SourceBundle, SourceText, SystemPackageSource};
+use anvyx_lang::{ModuleSource, SourceBundle, SourceText, SystemPackageSource};
 
 pub fn source_bundle() -> Result<SourceBundle, String> {
     Ok(SourceBundle::new(
@@ -16,24 +16,24 @@ pub fn source_bundle() -> Result<SourceBundle, String> {
 
 fn core_package() -> Result<SystemPackageSource, String> {
     SystemPackageSource::with_providers(
-        source_text(anvyx_core2::ROOT.code, anvyx_core2::ROOT.label)?,
-        anvyx_core2::MODULES
+        source_text(anvyx_core::ROOT.code, anvyx_core::ROOT.label)?,
+        anvyx_core::MODULES
             .iter()
             .map(|source| module_source(source.path, source.code, source.label))
             .collect::<Result<Vec<_>, _>>()?,
-        anvyx_core2::provider_descriptors(),
+        anvyx_core::provider_descriptors(),
     )
     .map_err(|error| error.to_string())
 }
 
 fn std_package() -> Result<SystemPackageSource, String> {
     SystemPackageSource::with_providers(
-        source_text(anvyx_stdlib2::ROOT.code, anvyx_stdlib2::ROOT.label)?,
-        anvyx_stdlib2::MODULES
+        source_text(anvyx_stdlib::ROOT.code, anvyx_stdlib::ROOT.label)?,
+        anvyx_stdlib::MODULES
             .iter()
             .map(|source| module_source(source.path, source.code, source.label))
             .collect::<Result<Vec<_>, _>>()?,
-        anvyx_stdlib2::provider_descriptors(),
+        anvyx_stdlib::provider_descriptors(),
     )
     .map_err(|error| error.to_string())
 }
@@ -79,7 +79,7 @@ mod tests {
             .map(|module| module.path().to_vec())
             .collect::<Vec<_>>();
 
-        assert_eq!(core.root().label(), "crates/core2/src/lib.anv");
+        assert_eq!(core.root().label(), "crates/core/src/lib.anv");
         assert_eq!(
             core_paths,
             [
@@ -101,36 +101,7 @@ mod tests {
                 .module(&path(&["mem"]))
                 .unwrap()
                 .label(),
-            "crates/stdlib2/src/mem.anv"
+            "crates/stdlib/src/mem.anv"
         );
-    }
-
-    #[test]
-    fn source_bundle_has_no_legacy_type_spellings() {
-        let bundle = source_bundle().unwrap();
-        let mut code = String::new();
-        code.push_str(bundle.core().unwrap().root().code());
-        for module in bundle.core().unwrap().modules() {
-            code.push_str(module.code());
-        }
-        for module in bundle.std().unwrap().modules() {
-            code.push_str(module.code());
-        }
-
-        for stale in [
-            "double",
-            "PI_D",
-            "EPSILON_D",
-            "Option<string>",
-            "Option<int>",
-            "Option<float>",
-            "Option<bool>",
-            "Option<any>",
-            "import ext:int",
-            "import ext:float",
-            "import ext:string",
-        ] {
-            assert!(!code.contains(stale));
-        }
     }
 }

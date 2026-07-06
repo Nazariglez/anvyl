@@ -1,0 +1,1 @@
+fn f(){if let enemy=actor as? Enemy{enemy.draw();}}

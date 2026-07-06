@@ -1,15 +1,12 @@
 // @mode: run
 // @expect: success
-// @contains: done
+// @match: 2
 
 fn main() {
-    var i = 0;
+    var x = 0;
     while true {
-        i = i + 1;
-        if i == 5 {
-            break;
-        }
+        if x == 2 { break; }
+        x = x + 1;
     }
-    assert(i == 5);
-    println("done");
+    println(x);
 }

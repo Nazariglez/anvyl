@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: success
 // @warn-contains: accessing internal field 'old_x' of type 'Event'
 

@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: mark the parameter as `f: escaping Handler`
-// @frontend: new
 
 type Handler = fn();
 

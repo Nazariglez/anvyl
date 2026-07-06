@@ -1,3 +1,0 @@
-pub fn ordered<K, V>() -> [K: V] {
-    ordered_map()
-}

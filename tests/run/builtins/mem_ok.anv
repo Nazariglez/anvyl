@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 0
+// 0
+// @match-end
+
+import std:mem;
+
+fn main() {
+    println(mem.managed_count());
+    mem.auto_collect(false);
+    mem.collect_cycles();
+    mem.auto_collect(true);
+    println(mem.managed_count());
+}

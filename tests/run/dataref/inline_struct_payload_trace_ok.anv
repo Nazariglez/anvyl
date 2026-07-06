@@ -1,0 +1,37 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 8
+// hi
+// @match-end
+
+dataref Child {
+    value: int,
+}
+
+struct Payload {
+    child: Child,
+}
+
+dataref Parent {
+    payload: Payload,
+}
+
+struct Label {
+    text: string,
+}
+
+dataref Named {
+    label: Label,
+}
+
+fn main() {
+    let child = Child { value: 8 };
+    let payload = Payload { child: child };
+    let parent = Parent { payload: payload };
+    println(parent.payload.child.value);
+
+    let label = Label { text: "hi" };
+    let named = Named { label: label };
+    println(named.label.text);
+}

@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn outer(seed: int) -> fn() -> int {
+    let f = make(seed);
+    || f()
+}
+
+fn main() {
+    let f = outer(3);
+    println(f());
+}

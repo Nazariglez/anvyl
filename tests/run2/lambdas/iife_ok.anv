@@ -1,8 +1,0 @@
-// @mode: run
-// @expect: success
-// @frontend: new
-// @match: 9
-
-fn main() {
-    println((|| 9)());
-}

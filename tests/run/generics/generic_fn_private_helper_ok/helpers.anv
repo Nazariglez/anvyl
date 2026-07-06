@@ -1,5 +1,0 @@
-// @helper
-
-fn mul2(x: int) -> int { x * 2 }
-
-pub fn apply_double<T>(x: T) -> T { mul2(x) }

@@ -1,0 +1,5 @@
+// @helper
+
+import pkg:physics { force };
+
+pub fn total() -> int { force() }

@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @contains: 2
+
+fn main() {
+    var count = 0;
+    let f = || {
+        count += 1;
+    };
+    f();
+    f();
+    println(count);
+}

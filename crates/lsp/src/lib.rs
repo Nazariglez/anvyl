@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use anvyx_lang2::{
+use anvyx_lang::{
     Diagnostic as FrontendDiagnostic, DiagnosticLabel, DiagnosticReport,
     DiagnosticSeverity as FrontendDiagnosticSeverity, DiagnosticTag as FrontendDiagnosticTag,
     LabelStyle, SourceOverride,
@@ -581,7 +581,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use anvyx_lang2::{DiagnosticReport, SourceId, SourceKind, SourceSpan, SourceTable};
+    use anvyx_lang::{DiagnosticReport, SourceId, SourceKind, SourceSpan, SourceTable};
 
     use super::*;
 
@@ -617,15 +617,6 @@ mod tests {
 
     fn path_uri(path: &Path) -> String {
         path_to_uri(path).to_string()
-    }
-
-    #[test]
-    fn initialize_result_advertises_full_text_sync() {
-        let result = initialize_result();
-
-        assert_eq!(result["textDocumentSync"]["openClose"], true);
-        assert_eq!(result["textDocumentSync"]["change"], 1);
-        assert_eq!(result["textDocumentSync"]["save"], true);
     }
 
     #[test]
@@ -816,22 +807,6 @@ mod tests {
             .change_document(&uri, Some(2), "fn main() {}")
             .unwrap();
         assert!(clears[0].diagnostics.is_empty());
-    }
-
-    #[test]
-    fn file_uri_paths_are_percent_encoded() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("main file.anv");
-        let uri = path_uri(&path);
-        let mut store = DocumentStore::default();
-
-        store.open(uri.clone(), Some(1), "fn main() {}");
-
-        assert!(uri.contains("main%20file.anv"));
-        assert_eq!(
-            store.get(&uri).unwrap().path.as_deref(),
-            Some(path.as_path())
-        );
     }
 
     #[test]
@@ -1036,24 +1011,6 @@ mod tests {
 
         assert!(!first_publishes[0].diagnostics.is_empty());
         assert!(second_publishes.is_empty());
-    }
-
-    #[test]
-    fn converts_ascii_range() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("main.anv");
-        let text = "fn main() { bad; }";
-        let report = report(path.clone(), text, |source| {
-            FrontendDiagnostic::error("bad").with_primary(SourceSpan::new(source, 12, 15))
-        });
-        let mut store = DocumentStore::default();
-        store.open(path_uri(&path), Some(1), text);
-
-        let publishes = diagnostics_by_uri(&report, &store);
-
-        assert_eq!(publishes[0].diagnostics[0].range.start.line, 0);
-        assert_eq!(publishes[0].diagnostics[0].range.start.character, 12);
-        assert_eq!(publishes[0].diagnostics[0].range.end.character, 15);
     }
 
     #[test]

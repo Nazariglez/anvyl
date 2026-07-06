@@ -1,0 +1,7 @@
+// @helper
+
+import ext:host { ping };
+
+pub fn mix() -> int {
+    ping()
+}

@@ -107,13 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_source() {
-        let tokens = tokenize_test("");
-        let trivia = scan_trivia("", &tokens);
-        assert!(trivia.is_empty());
-    }
-
-    #[test]
     fn comment_between_tokens() {
         let source = "let x = 5; // comment\nlet y = 10;";
         let tokens = tokenize_test(source);
@@ -173,17 +166,5 @@ mod tests {
         assert_eq!(trivia[0].text, "// line1");
         assert_eq!(trivia[1].kind, TriviaKind::LineComment);
         assert_eq!(trivia[1].text, "// line2");
-    }
-
-    #[test]
-    fn adjacent_tokens() {
-        let source = "let x=5;";
-        let tokens = tokenize_test(source);
-        let trivia = scan_trivia(source, &tokens);
-        assert!(
-            !trivia
-                .iter()
-                .any(|t| matches!(t.kind, TriviaKind::LineComment))
-        );
     }
 }

@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// tick
+// tick
+// @match-end
+
+fn tick() {
+    println("tick");
+}
+
+lazy let global_tick: fn() = tick;
+
+fn main() {
+    global_tick();
+    global_tick();
+}

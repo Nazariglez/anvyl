@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: promoted field 'x' for type 'Enemy' is ambiguous: b.x, a.x
 
 struct A { x: int }

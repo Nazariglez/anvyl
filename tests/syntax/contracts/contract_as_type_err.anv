@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: contract 'Action' is not a concrete type; use 'dyn Action' or a generic bound
 
 contract Action {

@@ -196,9 +196,10 @@ impl PlaceIdentity {
 
     pub(super) fn derives_from(&self, source: &Self) -> bool {
         match (self, source) {
-            (Self::Unknown, _) | (_, Self::Unknown) => false,
             (Self::ConstIndex(left), Self::ConstIndex(right)) => left == right,
-            (Self::ConstIndex(_), _) | (_, Self::ConstIndex(_)) => false,
+            (Self::Unknown | Self::ConstIndex(_), _) | (_, Self::Unknown | Self::ConstIndex(_)) => {
+                false
+            }
             (Self::Alternatives { alternatives, .. }, source) => {
                 alternatives.iter().all(|alt| alt.derives_from(source))
             }
@@ -778,7 +779,7 @@ fn field_checked(
 ) -> CheckedType {
     let mut checked = match expr {
         Some(expr) => super::checked_from_type(expr, ty, tc),
-        None => super::checked_type(ty, tc),
+        None => super::checked_type(ty),
     };
     checked.contains_extern_any = contains_extern_any;
     checked
@@ -837,7 +838,7 @@ pub(super) fn check_place(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace
 pub(super) fn check_indexed_place(
     expr: &ExprNode,
     index: &IndexNode,
-    target: CheckedPlace,
+    target: &CheckedPlace,
     tc: &mut TypeChecker,
 ) -> CheckedPlace {
     let indexed = check_index_access(index, &target.value.checked, tc);
@@ -877,7 +878,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
                         PlaceAccess::NotPlace,
                     );
                 }
-                let value = tc.local_value_from_info(symbol.value_view(), depth);
+                let value = TypeChecker::local_value_from_info(symbol.value_view(), depth);
                 let (value, accepts_extern_any) = tc.local_place_value(expr, *name, &value, None);
                 return CheckedPlace {
                     value,
@@ -903,7 +904,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
                         value_name,
                         expr.span,
                     );
-                    let checked = super::checked_from_handle(expr, tc.global_handle(&sig.key), tc);
+                    let checked = super::checked_from_handle(expr, &tc.global_handle(&sig.key), tc);
                     let value = global_value(&sig, expr.node.id, checked);
                     return CheckedPlace {
                         accepts_extern_any: value.checked.contains_extern_any,
@@ -934,7 +935,7 @@ fn check_place_inner(expr: &ExprNode, tc: &mut TypeChecker) -> CheckedPlace {
 
     if let ExprKind::Index(index) = &expr.node.kind {
         let target = check_place_inner(&index.node.target, tc);
-        return check_indexed_place(expr, index, target, tc);
+        return check_indexed_place(expr, index, &target, tc);
     }
 
     if let ExprKind::TupleIndex(index) = &expr.node.kind {

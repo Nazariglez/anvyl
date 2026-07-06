@@ -1,5 +1,0 @@
-// @helper
-
-import c { val_c };
-
-pub fn val_b() -> int { 2 }

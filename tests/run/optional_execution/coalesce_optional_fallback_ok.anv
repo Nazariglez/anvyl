@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn main() {
+    let left: int? = nil;
+    let fallback: int? = 2;
+    let value: int? = left ?? fallback;
+    println(value ?? 0);
+}

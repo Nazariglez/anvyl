@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extend int? {
     fn unwrap_or(self, default: int) -> int {

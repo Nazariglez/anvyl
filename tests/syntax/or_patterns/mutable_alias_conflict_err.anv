@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: ref arguments must not alias
 
 fn touch_pair(ref p: (int, int), ref n: int) {}

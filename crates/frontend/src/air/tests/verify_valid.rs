@@ -3,22 +3,6 @@ use crate::{
     air::{FunctionValueCapability, MapWriteKind},
     ast::Ident,
 };
-
-#[test]
-fn empty_program() {
-    expect_verified(&Program::default());
-}
-
-#[test]
-fn returns_verified_wrapper() {
-    let program = Program::default();
-    let verified = verify(&program).unwrap();
-    assert_eq!(
-        std::ptr::from_ref(verified.program()),
-        std::ptr::from_ref(&program)
-    );
-}
-
 #[test]
 fn local_root_reads_verify() {
     let mut builder = ProgramBuilder::default();

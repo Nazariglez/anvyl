@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn main() {
+    println((-7).abs());
+}

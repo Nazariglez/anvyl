@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires Result, found 'int?'
-// @frontend: new
 
 fn read() -> int? {
     1

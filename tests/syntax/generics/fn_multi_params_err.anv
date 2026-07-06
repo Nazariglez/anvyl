@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: wrong number of type parameters: expected 2, found 3
 
 fn pair<T, U>(a: T, b: U) -> T {

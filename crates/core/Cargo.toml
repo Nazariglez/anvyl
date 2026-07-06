@@ -2,10 +2,11 @@
 name = "anvyx-core"
 version.workspace = true
 edition.workspace = true
+description.workspace = true
 
 [dependencies]
-anvyx-lang = { path = "../lang" }
-anvyx-macros = { path = "../macros" }
+anvyx-externs = { path = "../externs" }
+anvyx-runtime = { path = "../runtime" }
 
 [lints]
 workspace = true

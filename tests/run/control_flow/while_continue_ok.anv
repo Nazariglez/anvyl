@@ -1,16 +1,14 @@
 // @mode: run
 // @expect: success
-// @contains: ok
+// @match: 4
 
 fn main() {
-    var i = 0;
+    var x = 0;
     var sum = 0;
-    while i < 5 {
-        i = i + 1;
-        if i == 3 { continue; }
-        sum = sum + i;
+    while x < 5 {
+        x = x + 1;
+        if x == 3 { continue; }
+        sum = sum + 1;
     }
-    // sums 1 + 2 + 4 + 5 = 12  (skips 3)
-    assert(sum == 12);
-    println("ok");
+    println(sum);
 }

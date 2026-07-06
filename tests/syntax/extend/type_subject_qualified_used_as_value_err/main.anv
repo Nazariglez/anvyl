@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: type 'Point' cannot be used as a value
 
 import tools;

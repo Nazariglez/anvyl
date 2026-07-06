@@ -71,21 +71,15 @@ dependencies = [
 name = "anvyx"
 version = "0.1.0"
 dependencies = [
- "anvyx-core",
- "anvyx-externs",
  "anvyx-fmt",
  "anvyx-lang",
- "anvyx-lang2",
  "anvyx-lsp",
  "anvyx-project",
- "anvyx-std",
  "clap",
  "console",
- "indicatif",
  "serde",
  "serde_json",
  "tempfile",
- "toml 0.8.23",
  "walkdir",
 ]
 
@@ -102,14 +96,6 @@ dependencies = [
 
 [[package]]
 name = "anvyx-core"
-version = "0.1.0"
-dependencies = [
- "anvyx-lang",
- "anvyx-macros",
-]
-
-[[package]]
-name = "anvyx-core2"
 version = "0.1.0"
 dependencies = [
  "anvyx-externs",
@@ -164,23 +150,6 @@ dependencies = [
 name = "anvyx-lang"
 version = "0.1.0"
 dependencies = [
- "anvyx-backend",
- "anvyx-frontend",
- "anvyx-macros",
- "anvyx-runtime",
- "ariadne",
- "chumsky",
- "fd-lock",
- "indexmap",
- "internment",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "anvyx-lang2"
-version = "0.1.0"
-dependencies = [
  "anvyx-externs",
  "anvyx-frontend",
  "tempfile",
@@ -190,7 +159,7 @@ dependencies = [
 name = "anvyx-lsp"
 version = "0.1.0"
 dependencies = [
- "anvyx-lang2",
+ "anvyx-lang",
  "anvyx-project",
  "lsp-server",
  "lsp-types",
@@ -203,7 +172,6 @@ name = "anvyx-macros"
 version = "0.1.0"
 dependencies = [
  "anvyx-externs",
- "anvyx-lang",
  "proc-macro2",
  "quote",
  "syn",
@@ -214,11 +182,11 @@ name = "anvyx-project"
 version = "0.1.0"
 dependencies = [
  "anvyx-backend",
- "anvyx-core2",
+ "anvyx-core",
  "anvyx-externs",
- "anvyx-lang2",
+ "anvyx-lang",
  "anvyx-runtime",
- "anvyx-stdlib2",
+ "anvyx-stdlib",
  "serde",
  "serde_json",
  "tempfile",
@@ -240,16 +208,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvyx-std"
-version = "0.1.0"
-dependencies = [
- "anvyx-lang",
- "anvyx-runtime",
- "glam",
-]
-
-[[package]]
-name = "anvyx-stdlib2"
+name = "anvyx-stdlib"
 version = "0.1.0"
 dependencies = [
  "anvyx-externs",
@@ -301,12 +260,6 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
-
-[[package]]
-name = "bumpalo"
-version = "3.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
 name = "cc"
@@ -567,12 +520,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glam"
-version = "0.29.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8babf46d4c1c9d92deac9f7be466f76dfc4482b6452fc5024b5e8daf6ffeb3ee"
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -722,19 +669,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console",
- "number_prefix",
- "portable-atomic",
- "unicode-width",
- "web-time",
-]
-
-[[package]]
 name = "internment"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,16 +697,6 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
-
-[[package]]
-name = "js-sys"
-version = "0.3.91"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
-dependencies = [
- "once_cell",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "leb128fmt"
@@ -837,12 +761,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
-
-[[package]]
 name = "object"
 version = "0.32.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -868,12 +786,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "portable-atomic"
-version = "1.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "potential_utf"
@@ -1182,7 +1094,7 @@ dependencies = [
 name = "test-runner"
 version = "0.1.0"
 dependencies = [
- "anvyx-lang2",
+ "anvyx-lang",
  "anvyx-project",
  "rayon",
  "serde",
@@ -1408,51 +1320,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-bindgen"
-version = "0.2.114"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6532f9a5c1ece3798cb1c2cfdba640b9b3ba884f5db45973a6f442510a87d38e"
-dependencies = [
- "cfg-if",
- "once_cell",
- "rustversion",
- "wasm-bindgen-macro",
- "wasm-bindgen-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-macro"
-version = "0.2.114"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18a2d50fcf105fb33bb15f00e7a77b772945a2ee45dcf454961fd843e74c18e6"
-dependencies = [
- "quote",
- "wasm-bindgen-macro-support",
-]
-
-[[package]]
-name = "wasm-bindgen-macro-support"
-version = "0.2.114"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03ce4caeaac547cdf713d280eda22a730824dd11e6b8c3ca9e42247b25c631e3"
-dependencies = [
- "bumpalo",
- "proc-macro2",
- "quote",
- "syn",
- "wasm-bindgen-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-shared"
-version = "0.2.114"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75a326b8c223ee17883a4251907455a2431acc2791c98c26279376490c378c16"
-dependencies = [
- "unicode-ident",
-]
-
-[[package]]
 name = "wasm-encoder"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1484,16 +1351,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "web-time"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]

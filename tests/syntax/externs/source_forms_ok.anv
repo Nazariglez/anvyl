@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern type Texture;
 extern type SharedTexture rep shared;

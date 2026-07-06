@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern fn add(a: int, b: int) -> int;
 extern fn tick();

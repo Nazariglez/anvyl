@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 struct Player { hp: int }
 struct Enemy { hp: int }

@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @contains: 7
+
+fn keep(f: escaping fn() -> int) -> fn() -> int {
+    f
+}
+
+fn main() {
+    let x = 7;
+    let f = keep(|| x);
+    println(f());
+}

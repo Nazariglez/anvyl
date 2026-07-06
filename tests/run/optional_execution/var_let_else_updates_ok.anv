@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn main() {
+    var opt: int? = 3;
+    {
+        var value? = opt else return;
+        value = 8;
+    }
+    if let value? = opt {
+        println(value);
+    }
+}

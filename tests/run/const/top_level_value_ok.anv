@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: success
+// @match: 42
+
+const ANSWER: int = 41;
+
+fn value() -> int { ANSWER + 1 }
+
+fn main() { println(value()); }

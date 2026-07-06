@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: error
 // @contains: callback parameter 'f' is non-escaping by default, but it escapes here
 

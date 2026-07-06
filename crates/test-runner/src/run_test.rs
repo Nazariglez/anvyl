@@ -32,7 +32,6 @@ pub(super) enum ProcessOutcome {
 pub(super) struct CliCase {
     pub(super) file: PathBuf,
     pub(super) mode: Mode,
-    pub(super) backend: Option<&'static str>,
     pub(super) runtime_timeout: Duration,
     pub(super) compile_timeout: Duration,
     pub(super) cli_options: CliOptions,
@@ -52,8 +51,6 @@ pub(crate) fn plan_test_file(
     file: &Path,
     runtime_timeout: Duration,
     compile_timeout: Duration,
-    backend: Option<&'static str>,
-    new_frontend: bool,
 ) -> Result<TestPlan, String> {
     let src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     let directives = Directives::parse(&src)?;
@@ -62,8 +59,6 @@ pub(crate) fn plan_test_file(
         directives,
         runtime_timeout,
         compile_timeout,
-        backend,
-        new_frontend,
     ))
 }
 
@@ -71,16 +66,10 @@ pub(crate) fn run_test_file(
     file: &Path,
     runtime_timeout: Duration,
     compile_timeout: Duration,
-    backend: Option<&'static str>,
     cli: &Cli,
 ) -> Result<RunTestResult, String> {
-    let (contract, assertions, case) = match plan_test_file(
-        file,
-        runtime_timeout,
-        compile_timeout,
-        backend,
-        cli.new_frontend(),
-    )? {
+    let (contract, assertions, case) = match plan_test_file(file, runtime_timeout, compile_timeout)?
+    {
         TestPlan::Done(result) => return Ok(result),
         TestPlan::Run {
             contract,
@@ -90,7 +79,6 @@ pub(crate) fn run_test_file(
     };
 
     let start_time = Instant::now();
-    let backend = case.backend;
     let mode = case.mode;
     let outcome = cli.run(&case)?;
     let elapsed = start_time.elapsed();
@@ -99,7 +87,6 @@ pub(crate) fn run_test_file(
     Ok(RunTestResult {
         result,
         mode,
-        backend,
         duration: elapsed,
     })
 }
@@ -109,8 +96,6 @@ fn plan_test(
     directives: Directives,
     runtime_timeout: Duration,
     compile_timeout: Duration,
-    backend: Option<&'static str>,
-    new_frontend: bool,
 ) -> TestPlan {
     let contract = directives.contract;
     if directives.helper {
@@ -119,27 +104,6 @@ fn plan_test(
     if let Some(reason) = directives.skip {
         return TestPlan::Done(done(TestResult::Skip { message: reason }, contract.mode));
     }
-    if let Some(reason) = directives.frontend.skip_reason(new_frontend) {
-        return TestPlan::Done(done(
-            TestResult::Skip {
-                message: reason.to_string(),
-            },
-            contract.mode,
-        ));
-    }
-    if new_frontend && contract.mode == Mode::Run && backend != Some("rust") {
-        return TestPlan::Done(done(
-            TestResult::Skip {
-                message: "new frontend run requires --backend rust".to_string(),
-            },
-            contract.mode,
-        ));
-    }
-
-    let backend = match contract.mode {
-        Mode::Run => backend,
-        Mode::Check => None,
-    };
 
     TestPlan::Run {
         contract,
@@ -147,7 +111,6 @@ fn plan_test(
         case: CliCase {
             file: file.to_path_buf(),
             mode: contract.mode,
-            backend,
             runtime_timeout,
             compile_timeout,
             cli_options: directives.cli_options,
@@ -161,7 +124,6 @@ pub(crate) fn is_batch_eligible(plan: &TestPlan) -> bool {
         TestPlan::Run { contract, case, .. } => {
             contract.mode == Mode::Run
                 && contract.expect == ExpectedResult::Success
-                && case.backend == Some("rust")
                 && case.cli_options.is_empty()
                 && case.stdin.is_empty()
                 && !case_blocks_batch(&case.file)
@@ -171,11 +133,10 @@ pub(crate) fn is_batch_eligible(plan: &TestPlan) -> bool {
 }
 
 fn case_blocks_batch(file: &Path) -> bool {
-    match anvyx_project::manifest::find_nearest_manifest(file) {
-        Ok(Some(path)) => anvyx_project::manifest::parse_manifest_file(&path).is_err(),
-        Ok(None) => false,
-        Err(_) => true,
-    }
+    !matches!(
+        anvyx_project::manifest::find_nearest_manifest(file),
+        Ok(None)
+    )
 }
 
 pub(crate) fn run_binary_case(plan: TestPlan, binary: &Path) -> Result<RunTestResult, String> {
@@ -194,7 +155,6 @@ pub(crate) fn run_binary_case(plan: TestPlan, binary: &Path) -> Result<RunTestRe
     Ok(RunTestResult {
         result,
         mode: case.mode,
-        backend: case.backend,
         duration: elapsed,
     })
 }
@@ -239,7 +199,6 @@ fn done(result: TestResult, mode: Mode) -> RunTestResult {
     RunTestResult {
         result,
         mode,
-        backend: None,
         duration: Duration::ZERO,
     }
 }
@@ -249,286 +208,72 @@ mod tests {
     use std::{fs, path::Path, time::Duration};
 
     use super::{TestPlan, is_batch_eligible, plan_test};
-    use crate::{
-        directives::Directives,
-        model::{Mode, TestResult},
-    };
+    use crate::directives::Directives;
 
     fn directives(src: &str) -> Directives {
         Directives::parse(src).unwrap()
     }
 
-    fn plan(src: &str, new_frontend: bool) -> TestPlan {
-        plan_with_backend(src, new_frontend, Some("rust"))
+    fn plan(src: &str) -> TestPlan {
+        plan_file(Path::new("test.anv"), src)
     }
 
-    fn plan_with_backend(src: &str, new_frontend: bool, backend: Option<&'static str>) -> TestPlan {
-        plan_file(Path::new("test.anv"), src, new_frontend, backend)
-    }
-
-    fn plan_file(
-        file: &Path,
-        src: &str,
-        new_frontend: bool,
-        backend: Option<&'static str>,
-    ) -> TestPlan {
+    fn plan_file(file: &Path, src: &str) -> TestPlan {
         plan_test(
             file,
             directives(src),
             Duration::from_millis(1),
             Duration::from_millis(2),
-            backend,
-            new_frontend,
         )
     }
 
-    fn case(src: &str) -> super::CliCase {
-        match plan(src, false) {
-            TestPlan::Run { case, .. } => case,
-            TestPlan::Done(_) => panic!("expected runnable plan"),
-        }
+    #[test]
+    fn batch_eligible_for_plain_success_run() {
+        let plan = plan("// @mode: run\n// @expect: success\n");
+
+        assert!(is_batch_eligible(&plan));
     }
 
     #[test]
-    fn helper_skips_cli() {
-        let TestPlan::Done(result) = plan("// @helper\n", true) else {
-            panic!("expected done plan");
-        };
-
-        assert!(matches!(result.result, TestResult::Helper));
-    }
-
-    #[test]
-    fn skip_skips_cli() {
-        let TestPlan::Done(result) = plan(
-            "// @mode: run\n// @expect: success\n// @skip: not today\n",
-            false,
-        ) else {
-            panic!("expected done plan");
-        };
-
-        assert!(matches!(result.result, TestResult::Skip { .. }));
-    }
-
-    #[test]
-    fn new_frontend_skips_non_rust_run() {
-        let TestPlan::Done(result) =
-            plan_with_backend("// @mode: run\n// @expect: success\n", true, Some("vm"))
-        else {
-            panic!("expected done plan");
-        };
-
-        assert!(matches!(result.result, TestResult::Skip { .. }));
-    }
-
-    #[test]
-    fn new_frontend_allows_rust_run() {
-        let TestPlan::Run { .. } = plan("// @mode: run\n// @expect: success\n", true) else {
-            panic!("expected runnable plan");
-        };
-    }
-
-    #[test]
-    fn helper_before_mode_support() {
-        let TestPlan::Done(result) = plan("// @helper\n", true) else {
-            panic!("expected done plan");
-        };
-
-        assert!(matches!(result.result, TestResult::Helper));
-    }
-
-    #[test]
-    fn skip_before_mode_support() {
-        let TestPlan::Done(result) = plan(
-            "// @mode: run\n// @expect: success\n// @contains: ignored\n// @skip: no\n",
-            true,
-        ) else {
-            panic!("expected done plan");
-        };
-
-        assert!(matches!(result.result, TestResult::Skip { .. }));
-    }
-
-    #[test]
-    fn frontend_requirement_skips_incompatible_runner() {
-        let TestPlan::Done(result) = plan(
-            "// @mode: check\n// @expect: success\n// @frontend: new\n",
-            false,
-        ) else {
-            panic!("expected done plan");
-        };
-
-        assert!(
-            matches!(result.result, TestResult::Skip { message } if message == "requires new frontend")
-        );
-    }
-
-    #[test]
-    fn frontend_requirement_allows_matching_runner() {
-        let TestPlan::Run { .. } = plan(
-            "// @mode: check\n// @expect: success\n// @frontend: new\n",
-            true,
-        ) else {
-            panic!("expected runnable plan");
-        };
-    }
-
-    #[test]
-    fn default_frontend_requirement_skips_new_frontend_runner() {
-        let TestPlan::Done(result) = plan(
-            "// @mode: check\n// @expect: success\n// @frontend: default\n",
-            true,
-        ) else {
-            panic!("expected done plan");
-        };
-
-        assert!(
-            matches!(result.result, TestResult::Skip { message } if message == "requires default frontend")
-        );
-    }
-
-    #[test]
-    fn run_uses_backend() {
-        let case = case(
-            "// @mode: run\n// @expect: success\n// @stdin: input\n// @lint: unused\n// @feature: gc\n// @cfg: debug\n",
-        );
-
-        assert_eq!(case.mode, Mode::Run);
-        assert_eq!(case.backend, Some("rust"));
-        assert_eq!(case.runtime_timeout, Duration::from_millis(1));
-        assert_eq!(case.compile_timeout, Duration::from_millis(2));
-        let mut args = vec![];
-        case.cli_options.append_args(&mut args);
-        assert_eq!(
-            args,
-            vec!["--lint", "unused", "--feature", "gc", "--cfg", "debug"]
-        );
-        assert_eq!(case.stdin, "input\n");
-    }
-
-    #[test]
-    fn check_omits_backend() {
-        let case = case("// @mode: check\n// @expect: success\n");
-
-        assert_eq!(case.mode, Mode::Check);
-        assert_eq!(case.backend, None);
-    }
-
-    #[test]
-    fn check_allows_text_assertions() {
-        let TestPlan::Run { assertions, .. } = plan(
-            "// @mode: check\n// @expect: success\n// @contains: available\n",
-            true,
-        ) else {
-            panic!("expected runnable plan");
-        };
-
-        assert_eq!(assertions.selected.contains, ["available"]);
-    }
-
-    #[test]
-    fn check_mode_is_not_batch_eligible() {
-        let plan = plan("// @mode: check\n// @expect: success\n", true);
+    fn error_run_not_batch_eligible() {
+        let plan = plan("// @mode: run\n// @expect: error\n// @contains: bad\n");
 
         assert!(!is_batch_eligible(&plan));
     }
 
     #[test]
-    fn batch_eligibility_requires_plain_successful_rust_run() {
-        assert!(is_batch_eligible(&plan(
-            "// @mode: run\n// @expect: success\n",
-            true,
-        )));
-        assert!(!is_batch_eligible(&plan(
-            "// @mode: run\n// @expect: error\n",
-            true,
-        )));
-        assert!(!is_batch_eligible(&plan_with_backend(
-            "// @mode: run\n// @expect: success\n",
-            true,
-            Some("vm"),
-        )));
-        assert!(!is_batch_eligible(&plan(
-            "// @mode: run\n// @expect: success\n// @stdin: input\n",
-            true,
-        )));
-        assert!(!is_batch_eligible(&plan(
-            "// @mode: run\n// @expect: success\n// @cfg: debug\n",
-            true,
-        )));
+    fn check_not_batch_eligible() {
+        let plan = plan("// @mode: check\n// @expect: success\n");
+
+        assert!(!is_batch_eligible(&plan));
     }
 
     #[test]
-    fn stale_externs_and_native_dependencies_do_not_block_batch_eligibility() {
+    fn cli_options_block_batch() {
+        let plan = plan("// @mode: run\n// @expect: success\n// @feature: demo\n");
+
+        assert!(!is_batch_eligible(&plan));
+    }
+
+    #[test]
+    fn stdin_blocks_batch() {
+        let plan = plan("// @mode: run\n// @expect: success\n// @stdin: hello\n");
+
+        assert!(!is_batch_eligible(&plan));
+    }
+
+    #[test]
+    fn manifest_context_blocks_batch() {
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("test.anv");
-        fs::write(&file, "fn main() {}\n").unwrap();
         fs::write(
             temp.path().join("anvyx.toml"),
-            "[project]\nentry = \"test.anv\"\n\n[externs.engine]\npath = \"missing\"\n",
+            "[project]\nentry = \"main.anv\"\n",
         )
         .unwrap();
-        let plan = plan_file(
-            &file,
-            "// @mode: run\n// @expect: success\n",
-            true,
-            Some("rust"),
-        );
-        assert!(is_batch_eligible(&plan));
+        let main = temp.path().join("main.anv");
+        fs::write(&main, "// @mode: run\n// @expect: success\nfn main() {}\n").unwrap();
+        let plan = plan_file(&main, "// @mode: run\n// @expect: success\nfn main() {}\n");
 
-        fs::create_dir_all(temp.path().join("provider/src")).unwrap();
-        fs::write(
-            temp.path().join("provider/anvyx.toml"),
-            "[project]\nname = \"host\"\n",
-        )
-        .unwrap();
-        fs::write(
-            temp.path().join("provider/Cargo.toml"),
-            format!(
-                "[package]\nname = \"native-host\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nanvyx-runtime = {{ path = \"{}\" }}\n",
-                Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("runtime").display()
-            ),
-        )
-        .unwrap();
-        fs::write(
-            temp.path().join("provider/src/lib.rs"),
-            r#"use anvyx_runtime::function;
-
-#[function]
-pub fn ping() -> i64 { 1 }
-
-anvyx_runtime::builtin_module! {
-    name: "host",
-    source: "",
-    exports: [ping],
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            temp.path().join("anvyx.toml"),
-            "[project]\nentry = \"test.anv\"\n\n[dependencies]\nhost = { path = \"provider\" }\n",
-        )
-        .unwrap();
-        let plan = plan_file(
-            &file,
-            "// @mode: run\n// @expect: success\n",
-            true,
-            Some("rust"),
-        );
-        assert!(is_batch_eligible(&plan));
-
-        fs::write(
-            temp.path().join("anvyx.toml"),
-            "[project]\nversion = \"01.0.0\"\nentry = \"test.anv\"\n",
-        )
-        .unwrap();
-        let plan = plan_file(
-            &file,
-            "// @mode: run\n// @expect: success\n",
-            true,
-            Some("rust"),
-        );
         assert!(!is_batch_eligible(&plan));
     }
 }

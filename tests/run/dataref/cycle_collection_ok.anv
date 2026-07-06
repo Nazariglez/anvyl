@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 0
+// 2
+// 0
+// @match-end
+
+import std:mem;
+
+dataref Node {
+    value: int,
+    next: Node?,
+}
+
+fn make_self_cycle() {
+    var node = Node { value: 1, next: nil };
+    node.next = node;
+}
+
+fn make_mutual_cycle() {
+    var a = Node { value: 1, next: nil };
+    var b = Node { value: 2, next: nil };
+    a.next = b;
+    b.next = a;
+}
+
+fn main() {
+    make_self_cycle();
+    println(mem.managed_count());
+    mem.collect_cycles();
+    println(mem.managed_count());
+
+    make_mutual_cycle();
+    println(mem.managed_count());
+    mem.collect_cycles();
+    println(mem.managed_count());
+}

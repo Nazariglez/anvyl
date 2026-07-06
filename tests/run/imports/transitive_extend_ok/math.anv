@@ -1,9 +1,0 @@
-// @helper
-
-import shapes { Point };
-
-pub extend Point {
-    fn sum(self) -> float {
-        self.x + self.y
-    }
-}

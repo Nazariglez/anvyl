@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match: 6
+
+dataref Child {
+    value: int,
+}
+
+dataref Parent {
+    child: Child,
+}
+
+fn bump(ref value: int) {
+    value += 5;
+}
+
+fn main() {
+    var parent = Parent { child: Child { value: 1 } };
+    bump(parent.child.value);
+    println(parent.child.value);
+}

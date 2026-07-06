@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 type Fixed<T, N: int> = [T; N];
 fn first<T, N: int>(xs: Fixed<T, N>) -> T { xs[0] }

@@ -131,7 +131,11 @@ impl Printer<'_> {
                 }
                 self.write_fmt(name);
             }
-            ast::ContractRef::Anonymous(_) => self.write("_"),
+            ast::ContractRef::Anonymous(_)
+            | ast::ContractRef::Infer
+            | ast::ContractRef::Hole(_) => {
+                self.write("_");
+            }
             ast::ContractRef::Intersection(contracts) => {
                 for (i, contract) in contracts.iter().enumerate() {
                     if i > 0 {
@@ -140,7 +144,6 @@ impl Printer<'_> {
                     self.format_contract_ref(contract);
                 }
             }
-            ast::ContractRef::Infer | ast::ContractRef::Hole(_) => self.write("_"),
         }
     }
 

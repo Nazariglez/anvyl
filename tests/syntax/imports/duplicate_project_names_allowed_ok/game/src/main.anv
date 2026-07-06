@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+import pkg:left { value as left_value };
+import pkg:right { value as right_value };
+
+fn main() { let x: int = left_value() + right_value(); }

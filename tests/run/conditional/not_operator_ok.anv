@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: not release
-
-fn main() {
-    #if !profile(release)
-    println("not release");
-    #end
-}

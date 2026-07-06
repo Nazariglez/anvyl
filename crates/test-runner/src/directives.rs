@@ -6,8 +6,6 @@ pub(crate) struct Directives {
     pub(crate) assertions: Assertions,
     pub(crate) stdin: Stdin,
     pub(crate) cli_options: CliOptions,
-    // FIXME: remove frontend once it is promoted to the only frontend
-    pub(crate) frontend: FrontendRequirement,
     pub(crate) skip: Option<String>,
     pub(crate) helper: bool,
 }
@@ -28,33 +26,6 @@ impl TestContract {
         match self.mode {
             Mode::Run => self.exit_code.map(i32::from),
             Mode::Check => None,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrontendRequirement {
-    #[default]
-    Any,
-    Default,
-    New,
-}
-
-impl FrontendRequirement {
-    fn from_str(value: &str) -> Result<Self, String> {
-        match value {
-            "any" => Ok(Self::Any),
-            "default" => Ok(Self::Default),
-            "new" => Ok(Self::New),
-            _ => Err(format!("invalid @frontend value: {value}")),
-        }
-    }
-
-    pub(crate) fn skip_reason(self, new_frontend: bool) -> Option<&'static str> {
-        match (self, new_frontend) {
-            (Self::Any, _) | (Self::Default, false) | (Self::New, true) => None,
-            (Self::Default, true) => Some("requires default frontend"),
-            (Self::New, false) => Some("requires new frontend"),
         }
     }
 }
@@ -170,7 +141,6 @@ enum DirectiveKind {
     Stdin,
     StdinEmptyLine,
     WarnContains,
-    Frontend,
     Skip,
     Helper,
     CliOption(CliFlag),
@@ -281,12 +251,6 @@ const DIRECTIVE_SPECS: &[DirectiveSpec] = &[
         DirectiveKind::WarnContains,
         "substring",
         Repeatability::Many,
-    ),
-    DirectiveSpec::value(
-        "frontend",
-        DirectiveKind::Frontend,
-        "any|default|new",
-        Repeatability::Once,
     ),
     DirectiveSpec::value("skip", DirectiveKind::Skip, "reason", Repeatability::Once),
     DirectiveSpec::flag("helper", DirectiveKind::Helper, Repeatability::Once),
@@ -465,7 +429,6 @@ impl Directives {
             DirectiveKind::WarnContains => {
                 self.assertions.warnings.contains.push(value.to_string());
             }
-            DirectiveKind::Frontend => self.frontend = FrontendRequirement::from_str(value)?,
             DirectiveKind::Skip => self.skip = Some(value.to_string()),
             DirectiveKind::Helper => self.helper = true,
             DirectiveKind::CliOption(flag) => self.cli_options.push(flag, value.to_string()),
@@ -506,7 +469,7 @@ fn validate_directive_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CliFlag, Directives, FrontendRequirement};
+    use super::Directives;
 
     fn fixture(body: &str) -> String {
         format!("// @mode: run\n// @expect: success\n{body}")
@@ -519,31 +482,6 @@ mod tests {
     fn directives(src: &str) -> Directives {
         Directives::parse(&fixture(src)).expect("directives should parse")
     }
-
-    #[test]
-    fn parses_stderr_directives() {
-        let directives = directives(
-            "// @stderr-contains: first\n\
-             // @stderr-contains: second\n\
-             fn main() {}\n",
-        );
-
-        assert_eq!(
-            directives.assertions.stderr.contains,
-            vec!["first", "second"]
-        );
-    }
-
-    #[test]
-    fn parses_stderr_match_directive() {
-        let directives = directives("// @stderr-match: exact stderr\nfn main() {}\n");
-
-        assert_eq!(
-            directives.assertions.stderr.exact.as_deref(),
-            Some("exact stderr")
-        );
-    }
-
     #[test]
     fn stdin_directives_build_trailing_newline_text() {
         let directives = directives(
@@ -555,38 +493,12 @@ mod tests {
 
         assert_eq!(directives.stdin.text(), "first\n\nthird\n");
     }
-
-    #[test]
-    fn no_stdin_directives_build_empty_text_for_eof() {
-        let directives = directives("fn main() {}\n");
-
-        assert!(directives.stdin.is_empty());
-        assert_eq!(directives.stdin.text(), "");
-    }
-
-    #[test]
-    fn parses_exit_code() {
-        let directives = directives("// @exit-code: 7\nfn main() {}\n");
-
-        assert_eq!(directives.contract.exit_code, Some(7));
-    }
-
     #[test]
     fn rejects_exit_code_in_check_mode() {
         let error = Directives::parse(&check_fixture("// @exit-code: 7\nfn main() {}\n"))
             .expect_err("@exit-code should be rejected in check mode");
 
         assert_eq!(error, "@exit-code is only valid in @mode: run");
-    }
-
-    #[test]
-    fn rejects_duplicate_exit_code() {
-        let error = Directives::parse(&fixture(
-            "// @exit-code: 1\n// @exit-code: 2\nfn main() {}\n",
-        ))
-        .expect_err("duplicate @exit-code should fail");
-
-        assert_eq!(error, "duplicate @exit-code directive");
     }
 
     #[test]
@@ -641,37 +553,9 @@ mod tests {
 
     #[test]
     fn skip_preserves_multi_word_reason() {
-        let directives = directives("// @skip: needs old backend behavior\nfn main() {}\n");
+        let directives = directives("// @skip: needs runtime feature\nfn main() {}\n");
 
-        assert_eq!(
-            directives.skip.as_deref(),
-            Some("needs old backend behavior")
-        );
-    }
-
-    #[test]
-    fn parses_frontend_requirement() {
-        let directives = directives("// @frontend: new\nfn main() {}\n");
-
-        assert_eq!(directives.frontend, FrontendRequirement::New);
-    }
-
-    #[test]
-    fn rejects_invalid_frontend_requirement() {
-        let error = Directives::parse(&fixture("// @frontend: maybe\nfn main() {}\n"))
-            .expect_err("invalid frontend requirement should fail");
-
-        assert_eq!(error, "invalid @frontend value: maybe");
-    }
-
-    #[test]
-    fn rejects_duplicate_frontend_requirement() {
-        let error = Directives::parse(&fixture(
-            "// @frontend: new\n// @frontend: default\nfn main() {}\n",
-        ))
-        .expect_err("duplicate frontend requirement should fail");
-
-        assert_eq!(error, "duplicate @frontend directive");
+        assert_eq!(directives.skip.as_deref(), Some("needs runtime feature"));
     }
 
     #[test]
@@ -712,44 +596,6 @@ mod tests {
             .expect_err("duplicate directive should fail");
 
         assert_eq!(error, "duplicate @mode directive");
-    }
-
-    #[test]
-    fn allows_repeatable_directive() {
-        let directives = directives(
-            "// @contains: first\n\
-             // @contains: second\n\
-             fn main() {}\n",
-        );
-
-        assert_eq!(
-            directives.assertions.selected.contains,
-            vec!["first", "second"]
-        );
-    }
-
-    #[test]
-    fn parses_cli_options_in_order() {
-        let directives = directives(
-            "// @lint: deprecated=allow\n\
-             // @feature: gc\n\
-             // @cfg: debug\n\
-             fn main() {}\n",
-        );
-
-        let mut args = vec![];
-        directives.cli_options.append_args(&mut args);
-        assert_eq!(
-            args,
-            vec![
-                CliFlag::Lint.cli_flag(),
-                "deprecated=allow",
-                CliFlag::Feature.cli_flag(),
-                "gc",
-                CliFlag::Cfg.cli_flag(),
-                "debug",
-            ]
-        );
     }
 
     #[test]
@@ -814,13 +660,6 @@ mod tests {
             .expect_err("helper with other directives should fail");
 
         assert_eq!(error, "@helper cannot be combined with other directives");
-    }
-
-    #[test]
-    fn skip_allows_expectation_directives() {
-        let directives = directives("// @skip: not today\nfn main() {}\n");
-
-        assert_eq!(directives.skip.as_deref(), Some("not today"));
     }
 
     #[test]

@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+struct Counter {
+    value: int,
+}
+
+extend Counter {
+    fn touch(ref self) {
+        let f = || {
+            self.value = 1;
+        };
+        f();
+    }
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    c.touch();
+    println(c.value);
+}

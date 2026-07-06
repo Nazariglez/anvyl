@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @contains: UnsupportedCallArgMode
+
+import pkg:host.host { retain, host_slice_first };
+
+fn main() {
+    retain(|| {});
+    let xs = [1, 2];
+    println(host_slice_first(xs));
+}

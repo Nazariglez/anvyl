@@ -2,7 +2,6 @@
 // @expect: error
 // @contains: expected `int`, found `string`
 // @contains: try requires Result, found 'int?'
-// @frontend: new
 
 fn takes_int(x: int) -> int { x }
 

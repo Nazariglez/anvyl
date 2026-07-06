@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn use_slice_now(xs: slice[int]) -> int {
     let f = || xs[0];

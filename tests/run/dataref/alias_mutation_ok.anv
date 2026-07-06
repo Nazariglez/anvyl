@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: 99
+
+dataref Box {
+    value: int,
+}
+
+fn main() {
+    var box = Box { value: 1 };
+    let alias = box;
+    box.value = 99;
+    println(alias.value);
+}

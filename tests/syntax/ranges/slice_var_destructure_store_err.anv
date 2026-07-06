@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: slice values cannot be stored
-// @frontend: new
 
 fn use_pair(ref pair: (slice[int], int)) {
     var (s, n) = pair;

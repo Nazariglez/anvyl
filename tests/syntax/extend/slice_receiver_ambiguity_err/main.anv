@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: ambiguous method 'tag' for type '[int]'
 
 import a;

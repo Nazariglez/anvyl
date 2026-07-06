@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Unknown extern type 'Self' in extern function make
 
 extern fn make() -> Self;

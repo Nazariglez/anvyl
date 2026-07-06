@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 9
+// 3
+// @match-end
+
+struct Point {
+    x: int,
+    y: int,
+}
+
+fn main() {
+    var points: [string: Point] = ["a": Point { x: 1, y: 2 }];
+    var snapshot = points;
+    points["a"] = Point { x: 9, y: 8 };
+    points.insert("b", Point { x: 3, y: 4 });
+
+    if let point? = snapshot["a"] {
+        println(point.x);
+    }
+    if let point? = points["a"] {
+        println(point.x);
+    }
+    if let point? = points["b"] {
+        println(point.x);
+    }
+}

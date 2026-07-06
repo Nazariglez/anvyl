@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Could not infer type parameter 'T'
 
 fn make<T>() -> _ {

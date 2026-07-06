@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// ready
+// ready
+// @match-end
+
+fn make_title() -> string {
+    println("init");
+    "ready"
+}
+
+lazy let title = make_title();
+
+fn main() {
+    let first = title;
+    let second = title;
+    println(first);
+    println(second);
+}

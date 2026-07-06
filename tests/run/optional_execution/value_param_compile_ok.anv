@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+fn accept(x: int?) {}
+
+fn main() {
+    accept(1);
+    accept(nil);
+    println("ok");
+}

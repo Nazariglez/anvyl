@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: cannot infer empty dynamic contract
 
 fn take(actor: dyn _) {}

@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 4
+// @match-end
+
+dataref Bag {
+    xs: [int],
+}
+
+fn main() {
+    var bag = Bag { xs: [1, 2] };
+    let before = bag.xs;
+    bag.xs = [3, 4];
+    let after = bag.xs;
+    println(before[0]);
+    println(after[1]);
+}

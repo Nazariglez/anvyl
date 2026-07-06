@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn main() {
+    var m: [string: int] = ["a": 1, "b": 2];
+    m["a"] = 3;
+    m.insert("c", 4);
+    let _ = m["a"];
+    println(1);
+}

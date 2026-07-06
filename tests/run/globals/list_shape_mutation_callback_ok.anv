@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 3
+// @match-end
+
+lazy var values: [int] = [1, 2, 3];
+lazy var removed = 2;
+
+fn main() {
+    values.retain(|value| value != removed);
+    for value in values {
+        println(value);
+    }
+}

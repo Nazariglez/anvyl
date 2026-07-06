@@ -1,4 +1,3 @@
-// @frontend: new
 // @mode: check
 // @expect: success
 // @lint: deprecated=allow

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: immutable binding
 
 fn set<T>(ref x: T, value: T) {

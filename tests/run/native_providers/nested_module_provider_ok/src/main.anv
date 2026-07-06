@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 40
+
+import pkg:host.window { open_window };
+import pkg:host.input { read_input };
+
+fn main() {
+    println(open_window() + read_input());
+}

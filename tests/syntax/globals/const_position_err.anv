@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: runtime global 'size' cannot be used where a compile-time constant is required
 
 lazy let size = 4;

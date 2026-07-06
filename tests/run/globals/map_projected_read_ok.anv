@@ -1,0 +1,21 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// 5
+// @match-end
+
+fn make_values() -> [string: int] {
+    println("init");
+    ["a": 5]
+}
+
+lazy var values = make_values();
+
+fn main() {
+    let key = "a";
+    match values[key] {
+        value? => println(value),
+        nil => println(0),
+    };
+}

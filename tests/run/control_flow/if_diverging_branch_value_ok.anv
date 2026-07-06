@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn f(cond: bool) -> int {
+    let x: int = if cond {
+        return 1;
+    } else {
+        2
+    };
+    x
+}
+
+fn main() {
+    println(f(false));
+}

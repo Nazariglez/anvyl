@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Missing field 'y'
 
 extern type Point rep inline {

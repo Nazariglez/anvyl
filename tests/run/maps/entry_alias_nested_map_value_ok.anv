@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn main() {
+    var groups: [string: [string: int]] = ["a": ["x": 1]];
+    if ref inner? = groups["a"] {
+        if ref n? = inner["x"] {
+            n += 2;
+        }
+    }
+    if let inner? = groups["a"] {
+        println(inner["x"] ?? 0);
+    }
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: variant 'Color.Red' is not a struct variant
 
 enum Color { Red }

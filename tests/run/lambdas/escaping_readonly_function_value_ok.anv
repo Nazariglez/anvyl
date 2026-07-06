@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @contains: 12
+
+fn wrap(seed: int) -> fn() -> int {
+    let add: fn(int) -> int = |x: int| seed + x;
+    || add(5)
+}
+
+fn main() {
+    let f = wrap(7);
+    println(f());
+}

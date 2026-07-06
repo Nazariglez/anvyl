@@ -89,6 +89,5 @@ pub(crate) enum TestResult {
 pub(crate) struct RunTestResult {
     pub(crate) result: TestResult,
     pub(crate) mode: Mode,
-    pub(crate) backend: Option<&'static str>,
     pub(crate) duration: Duration,
 }

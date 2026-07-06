@@ -1,0 +1,6 @@
+[project]
+name = "game"
+entry = "src/main.anv"
+
+[dependencies]
+helpers = { path = "helpers" }

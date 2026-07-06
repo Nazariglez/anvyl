@@ -131,9 +131,8 @@ impl TypeVisitor for TypeClosureFacts {
 
     fn visit_array_len(&mut self, len: ArrayLen) -> bool {
         match len {
-            ArrayLen::Infer => {}
             ArrayLen::Named(_) => self.contains_unresolved_const = true,
-            ArrayLen::Fixed(_) | ArrayLen::Param(_) => {}
+            ArrayLen::Infer | ArrayLen::Fixed(_) | ArrayLen::Param(_) => {}
         }
         false
     }

@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// ready
+// ready
+// ready
+// @match-end
+
+import store;
+import facade { title };
+
+fn main() {
+    let direct = store.title;
+    let reexported = title;
+    let via_function = store.get_title();
+    println(direct);
+    println(reexported);
+    println(via_function);
+}

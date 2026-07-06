@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @skip: dynamic downcast execution is not lowered to the Rust backend yet
+// @match: 2
+
+contract Updatable {
+    fn update(ref self);
+}
+
+struct Enemy {
+    hp: int,
+    fn update(ref self) {}
+}
+
+fn main() {
+    var actor: dyn Updatable = Enemy { hp: 1 };
+    if ref enemy = actor as? Enemy {
+        enemy.hp = 2;
+    }
+    if let enemy? = actor as? Enemy {
+        println(enemy.hp);
+    }
+}

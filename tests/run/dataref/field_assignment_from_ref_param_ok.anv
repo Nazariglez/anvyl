@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+dataref Counter {
+    value: int,
+}
+
+fn set(ref src: int, ref c: Counter) {
+    c.value = src;
+}
+
+fn main() {
+    var n = 7;
+    var c = Counter { value: 0 };
+    set(n, c);
+    println(c.value);
+}

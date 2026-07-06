@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 6
+
+fn set(ref x: int) {
+    x = 6;
+}
+
+fn main() {
+    var opt: int? = 1;
+    if ref value? = opt {
+        set(value);
+    }
+    println(opt ?? 0);
+}

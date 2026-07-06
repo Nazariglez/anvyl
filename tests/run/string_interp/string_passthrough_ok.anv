@@ -1,9 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: hello world
-
-fn main() {
-    let a = "hello";
-    let b = "world";
-    println(f"{a} {b}");
-}

@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn main() {
+    var counts: [string: int] = ["a": 1];
+    if ref value? = counts["a"] {
+        value = 2;
+    }
+    println(counts["a"] ?? 0);
+}

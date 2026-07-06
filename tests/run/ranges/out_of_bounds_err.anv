@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: range out of bounds
+
+fn main() {
+    let xs = [1, 2];
+    let end = 3;
+    let ys: [int] = xs[0..end];
+    println(ys[0]);
+}

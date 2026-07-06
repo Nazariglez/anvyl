@@ -1,0 +1,35 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 9
+// 7
+// @match-end
+
+dataref Child {
+    value: int,
+}
+
+dataref Parent {
+    child: Child,
+    value: int,
+}
+
+fn inner(c: Child) {
+    var alias = c;
+    alias.value += 4;
+}
+
+fn outer(p: Parent) {
+    let c = p.child;
+    inner(c);
+    var alias = p;
+    alias.value += 5;
+}
+
+fn main() {
+    let child = Child { value: 5 };
+    let parent = Parent { child: child, value: 2 };
+    outer(parent);
+    println(child.value);
+    println(parent.value);
+}

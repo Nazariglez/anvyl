@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+lazy var counts: [string: int] = ["a": 1];
+
+fn nested_alias() {
+    if ref other? = counts["a"] {
+        other = 99;
+    }
+}
+
+fn main() {
+    if ref value? = counts["a"] {
+        nested_alias();
+        value += 1;
+    }
+}

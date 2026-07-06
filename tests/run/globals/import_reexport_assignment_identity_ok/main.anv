@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: changed
+
+import store;
+import facade { names };
+
+fn main() {
+    store.names = ["changed"];
+    let local = names;
+    println(local[0]);
+}

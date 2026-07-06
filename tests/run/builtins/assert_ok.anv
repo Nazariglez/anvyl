@@ -1,0 +1,8 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn main() {
+    assert(1 + 1 == 2);
+    println(1);
+}

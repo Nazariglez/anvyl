@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: ref iteration requires a mutable iterable place
-// @frontend: new
 
 fn main() {
     for i, ref x in 0..10 {

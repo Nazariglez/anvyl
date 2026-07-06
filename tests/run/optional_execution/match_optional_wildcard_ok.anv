@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: seen
+
+fn main() {
+    let value: int? = nil;
+    match value {
+        _ => println("seen"),
+    }
+}

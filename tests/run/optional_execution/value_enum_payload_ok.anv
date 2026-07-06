@@ -1,0 +1,13 @@
+// @mode: run
+// @skip: enum tuple payload matches are not executable yet
+// @expect: success
+// @match: 5
+
+enum Slot { Item(int?) }
+
+fn main() {
+    let slot = Slot.Item(5);
+    match slot {
+        Slot.Item(value) => println(value ?? 0),
+    }
+}

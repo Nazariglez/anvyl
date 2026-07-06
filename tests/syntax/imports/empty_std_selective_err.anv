@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token '{'
+
+import std: { PI };
+
+fn main() {}

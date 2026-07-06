@@ -1,5 +1,0 @@
-// @helper
-
-pub extend<T> [T] {
-    fn label(self) -> string { "generic" }
-}

@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: optional value requires an unwrapping pattern
-// @frontend: new
 
 fn process(opt: int?) -> int {
     let _ = opt else { return 0; }

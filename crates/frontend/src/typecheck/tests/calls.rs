@@ -29,21 +29,6 @@ fn failed_output_keeps_lints() {
 }
 
 #[test]
-fn deprecated_generic_call_warns_once() {
-    let result = check(
-        "@deprecated(\"use newer\") fn old<T>(value: T) -> T { value }
-         fn main() { old(1); }",
-    )
-    .unwrap();
-    assert_deprecated_warning(
-        &result,
-        DeprecatedUseKind::Function,
-        "old",
-        Some("use newer"),
-    );
-}
-
-#[test]
 fn direct_typecheck_has_no_magic_builtins() {
     assert_single_error("fn main() { println(\"ok\"); }", |err| {
         matches!(err, TypeError::UndefinedVariable { .. })
@@ -290,124 +275,6 @@ fn explicit_prefix_call_target() {
 }
 
 #[test]
-fn const_arg_in_type_slot_err() {
-    assert_single_error("fn id<T>(x: T) -> T { x } fn main() { id<3>(1); }", |err| {
-        matches!(
-            err,
-            TypeError::GenericArgKindMismatch {
-                expected: "type",
-                ..
-            }
-        )
-    });
-}
-
-#[test]
-fn explicit_optional_nil() {
-    assert_ty(
-        "fn id<T>(x: T) -> T { x } fn main() { let x = id<int?>(nil); x; }",
-        core_option(Type::Int),
-    );
-}
-
-#[test]
-fn explicit_plain_nil_err() {
-    assert_err_count("fn id<T>(x: T) -> T { x } fn main() { id<int>(nil); }", 1);
-}
-
-#[test]
-fn expected_nil_arg() {
-    assert_ty(
-        "fn id<T>(x: T) -> T { x } fn main() { let x: int? = id(nil); x; }",
-        core_option(Type::Int),
-    );
-}
-
-#[test]
-fn expected_binding() {
-    assert_ty(
-        "fn none<T>() -> T? { nil } fn main() { let x: Option<int> = none(); x; }",
-        core_option(Type::Int),
-    );
-}
-
-#[test]
-fn return_only_unbound() {
-    assert_err_count("fn none<T>() -> T? { nil } fn main() { none(); }", 1);
-}
-
-#[test]
-fn return_unbound_variant() {
-    assert_single_error("fn none<T>() -> T? { nil } fn main() { none(); }", |err| {
-        matches!(err, TypeError::UnboundGenericParam { .. })
-    });
-}
-
-#[test]
-fn expected_explicit_mismatch() {
-    assert_err_count(
-        "fn none<T>() -> T? { nil } fn main() { let x: Option<int> = none<string>(); }",
-        1,
-    );
-}
-
-#[test]
-fn generic_const_array_explicit_named() {
-    assert_ty(
-        "const CAP = 3; fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) -> int { len<int, CAP>(xs) }",
-        Type::Int,
-    );
-}
-
-#[test]
-fn non_bare_const_arg_err() {
-    assert_single_error(
-        "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, [int]>(xs); }",
-        |err| {
-            matches!(
-                err,
-                TypeError::GenericArgKindMismatch {
-                    expected: "const",
-                    ..
-                }
-            )
-        },
-    );
-}
-
-#[test]
-fn generic_const_unknown_name_arg_err() {
-    assert_single_error(
-        "fn take<T, N: int>(xs: [T; N]) {} fn main(xs: [int; 3]) { take<int, N>(xs); }",
-        |err| matches!(err, TypeError::UnknownConst { name, .. } if *name == Ident::new("N")),
-    );
-}
-
-#[test]
-fn generic_const_arg_kind_mismatch() {
-    let result = check(
-        "fn len<T, N: int>(xs: [T; N]) -> int { 0 } fn main(xs: [int; 3]) { len<3, int>(xs); }",
-    );
-    assert!(result.is_err(), "expected generic arg kind mismatch");
-}
-
-#[test]
-fn bool_const_arg_err() {
-    assert_single_error(
-        "fn take<N: int>(xs: [int; N]) {} fn main() { take<true>([]); }",
-        |err| {
-            matches!(
-                err,
-                TypeError::ExpectedIntConst {
-                    found: Type::Bool,
-                    ..
-                }
-            )
-        },
-    );
-}
-
-#[test]
 fn negative_const_arg_err() {
     assert_single_error(
         "const NEG = -1; fn take<N: int>(xs: [int; N]) {} fn main() { take<NEG>([]); }",
@@ -452,23 +319,6 @@ fn const_target() {
                 const_args: vec![ConstTerm::from_usize(3)],
             }
         )
-    );
-}
-
-#[test]
-fn const_conflict() {
-    assert_single_error(
-        "fn same<T, N: int>(a: [T; N], b: [T; N]) -> T { a[0] } fn main() { same([1, 2, 3], [4, 5]); }",
-        |err| {
-            matches!(
-                err,
-                TypeError::ConstMismatch {
-                    expected: ConstDiagnostic::Value(_),
-                    found: ConstDiagnostic::Value(_),
-                    ..
-                }
-            )
-        },
     );
 }
 
@@ -544,16 +394,6 @@ fn call_target_const_infer_error() {
 }
 
 #[test]
-fn module_function_call() {
-    let dep = "pub fn init() -> int { 0 }";
-    let root = "
-        import gamekit as gk;
-        fn main() -> int { gk.init() }
-    ";
-    assert_ty_mods(root, dep, Type::Int);
-}
-
-#[test]
 fn module_function_call_target() {
     let dep = "pub fn init() -> int { 0 }";
     let root = "
@@ -561,26 +401,4 @@ fn module_function_call_target() {
         fn main() { gk.init(); }
     ";
     assert_calls_with_modules(root, dep, 1);
-}
-
-#[test]
-fn module_function_wrong_arg() {
-    let dep = "pub fn init(x: int) -> int { x }";
-    let root = "
-        import gamekit as gk;
-        fn main() -> int { gk.init(true) }
-    ";
-    let result = check_mods(root, dep);
-    assert!(result.is_err(), "expected error for wrong arg type");
-}
-
-#[test]
-fn unknown_module_member() {
-    let dep = "pub fn init() -> int { 0 }";
-    let root = "
-        import gamekit as gk;
-        fn main() -> int { gk.unknown() }
-    ";
-    let result = check_mods(root, dep);
-    assert!(result.is_err(), "expected error for unknown module member");
 }

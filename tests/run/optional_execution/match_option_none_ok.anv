@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 0
+
+fn main() {
+    let value: int? = nil;
+    match value {
+        Option.Some(v) => println(v),
+        Option.None => println(0),
+    }
+}

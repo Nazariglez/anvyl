@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate extern operator 'Vec2.+'
 
 extern type Vec2 {

@@ -480,7 +480,7 @@ impl DynInference {
             let Some(target) = self.solution(pending.hole) else {
                 continue;
             };
-            self.finish_dyn_flow(
+            Self::finish_dyn_flow(
                 tc,
                 pending.site,
                 &pending.source,
@@ -499,7 +499,7 @@ impl DynInference {
             let Some(source) = self.solution(pending.hole) else {
                 continue;
             };
-            self.finish_dyn_flow(
+            Self::finish_dyn_flow(
                 tc,
                 pending.site,
                 &source,
@@ -525,7 +525,7 @@ impl DynInference {
             };
             tc.record_resolved_dyn_call(
                 pending.site,
-                pending.receiver_site,
+                &pending.receiver_site,
                 contract,
                 pending.method,
                 pending.arg_count,
@@ -548,7 +548,7 @@ impl DynInference {
             };
             tc.record_resolved_dyn_downcast(
                 pending.site,
-                pending.source_site,
+                &pending.source_site,
                 source,
                 pending.target,
                 pending.mutable,
@@ -574,7 +574,6 @@ impl DynInference {
     }
 
     fn finish_dyn_flow(
-        &self,
         tc: &mut TypeChecker,
         site: Option<SemanticExprSite>,
         source: &ContractRef,
@@ -598,11 +597,10 @@ impl DynInference {
             });
             return;
         }
-        self.record_weakening(tc, site, source, target, module, source_span);
+        Self::record_weakening(tc, site, source, target, module, source_span);
     }
 
     fn record_weakening(
-        &self,
         tc: &mut TypeChecker,
         site: Option<SemanticExprSite>,
         source: &ContractRef,

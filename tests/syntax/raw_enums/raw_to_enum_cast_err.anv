@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: Invalid cast: cannot cast from 'int' to 'State'
 
 enum State: int {

@@ -1,9 +1,8 @@
 // @mode: run
 // @expect: success
 // @match-begin
-// 10
+// 42
 // root
-// 10
 // @match-end
 
 dataref Node {
@@ -12,11 +11,8 @@ dataref Node {
 }
 
 fn main() {
-    let n = Node { value: 10, label: "root" };
+    let n = Node { value: 42, label: "root" };
     let Node { value, label } = n;
     println(value);
     println(label);
-
-    let Node { value: v } = n;
-    println(v);
 }

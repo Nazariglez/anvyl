@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+lazy let score = 7;
+
+fn set(ref x: int) {
+    x = score;
+}
+
+fn main() {
+    var x = 0;
+    set(x);
+    println(x);
+}

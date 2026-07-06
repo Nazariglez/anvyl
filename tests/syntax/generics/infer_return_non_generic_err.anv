@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: inferred return type is only allowed on generic callables
 
 fn make() -> _ {

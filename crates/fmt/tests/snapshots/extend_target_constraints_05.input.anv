@@ -1,0 +1,1 @@
+extend<T> struct Box<T> { fn tag() -> string { "target" } }

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 lazy let a = b;
 lazy let b = 1;

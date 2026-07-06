@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: expected integer constant
 
 struct FixedBuf<T, N: int> {

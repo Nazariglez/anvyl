@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @skip: optional payload dataref mutable-place projections are future work
+// @match: 2
+
+dataref Box {
+    value: int?,
+}
+
+fn bump(ref value: int) {
+    value += 1;
+}
+
+fn main() {
+    var box = Box { value: 1 };
+    match ref box.value {
+        value? => bump(value),
+        nil => {},
+    }
+    match box.value {
+        value? => println(value),
+        nil => println(0),
+    }
+}

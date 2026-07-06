@@ -1,7 +1,0 @@
-// @helper
-
-import pong { do_pong };
-
-pub fn start_ping(n: int) -> string {
-    if n == 0 { "done" } else { do_pong(n - 1) }
-}

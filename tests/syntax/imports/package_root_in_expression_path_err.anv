@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token ':'
+
+fn main() {
+    pkg:math.make_vec();
+}

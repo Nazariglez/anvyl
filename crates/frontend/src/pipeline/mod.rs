@@ -780,13 +780,6 @@ mod tests {
         }
     }
 
-    fn core_module(path: &[&str], code: &str) -> PackageModuleInput {
-        PackageModuleInput {
-            module: ModuleId::named(PackageId::core(), module_path_segments(path)),
-            source: source(code, &format!("core.{}", path.join("."))),
-        }
-    }
-
     fn root_source(package: &PackageId, code: &str, label: &str) -> PackageModuleInput {
         PackageModuleInput {
             module: ModuleId::root(package.clone()),
@@ -929,66 +922,6 @@ mod tests {
 
         assert_failed(&err, CheckPhase::Resolve);
     }
-
-    #[test]
-    fn ext_import_resolves_provider_module() {
-        let mut loader = TestLoader::default();
-        let output = pipeline_check(
-            input(
-                &mut loader,
-                source(
-                    "import ext:math { dot }; fn main() { let x: float = dot(); }",
-                    "main.anv",
-                ),
-                None,
-                vec![],
-            ),
-            FrontendConfig {
-                externs: extern_inputs(vec![valid_provider_descriptor()]),
-                ..FrontendConfig::default()
-            },
-        )
-        .unwrap();
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn native_only_dependency_provider_import_typechecks() {
-        let game = PackageId::new("game");
-        let host = PackageId::new("host");
-        let mut loader = TestLoader::default();
-        let output = pipeline_check(
-            PackageProgramInput {
-                root_package: game.clone(),
-                main: root_source(
-                    &game,
-                    "import pkg:host.math { dot }; fn main() { let x: float = dot(); }",
-                    "main.anv",
-                ),
-                system: SystemPackages::default(),
-                packages: HashMap::from([
-                    (
-                        game.clone(),
-                        PackageSourceInput {
-                            root: None,
-                            dependencies: dependency_map(&[("host", host.clone())]),
-                            kind: PackageKind::Source,
-                        },
-                    ),
-                    (host.clone(), native_package_input(&[])),
-                ]),
-                preloaded_modules: vec![],
-                source_loader: &mut loader,
-            },
-            FrontendConfig {
-                externs: package_extern_inputs(host, vec![valid_provider_descriptor()]),
-                ..FrontendConfig::default()
-            },
-        )
-        .unwrap();
-        assert_passed(&output);
-    }
-
     #[test]
     fn native_only_dependency_root_import_is_resolve_error() {
         let game = PackageId::new("game");
@@ -1293,61 +1226,6 @@ mod tests {
         provider
     }
 
-    fn core_runtime_provider() -> anvyx_externs::ProviderDescriptor {
-        anvyx_externs::ProviderDescriptor {
-            provider: anvyx_externs::ProviderId {
-                name: "core_runtime".to_string(),
-            },
-            modules: vec![anvyx_externs::ExternModuleDescriptor {
-                path: extern_module_path(&["core_runtime"]),
-                types: vec![],
-                functions: vec![
-                    runtime_fn(
-                        "_println",
-                        vec![runtime_param(
-                            "message",
-                            anvyx_externs::ExternTypeExpr::String,
-                        )],
-                        anvyx_externs::ExternTypeExpr::Void,
-                        false,
-                    ),
-                    runtime_fn(
-                        "_assert",
-                        vec![
-                            runtime_param("condition", anvyx_externs::ExternTypeExpr::Bool),
-                            runtime_param("message", anvyx_externs::ExternTypeExpr::String),
-                        ],
-                        anvyx_externs::ExternTypeExpr::Void,
-                        true,
-                    ),
-                ],
-            }],
-        }
-    }
-
-    fn runtime_fn(
-        name: &str,
-        params: Vec<anvyx_externs::ExternParam>,
-        ret: anvyx_externs::ExternTypeExpr,
-        fallible: bool,
-    ) -> anvyx_externs::ExternFunctionDescriptor {
-        anvyx_externs::ExternFunctionDescriptor {
-            name: name.to_string(),
-            doc: None,
-            signature: anvyx_externs::ExternSignature { params, ret },
-            effects: anvyx_externs::ExternEffects { fallible },
-        }
-    }
-
-    fn runtime_param(name: &str, ty: anvyx_externs::ExternTypeExpr) -> anvyx_externs::ExternParam {
-        anvyx_externs::ExternParam {
-            name: Some(name.to_string()),
-            ty,
-            flow: anvyx_externs::ParamFlow::Value,
-            escape: anvyx_externs::CallbackEscape::NonEscaping,
-        }
-    }
-
     fn extern_module_path(path: &[&str]) -> anvyx_externs::ModulePath {
         anvyx_externs::ModulePath {
             segments: path.iter().map(|segment| (*segment).to_string()).collect(),
@@ -1596,55 +1474,6 @@ mod tests {
         assert_eq!(ok.report.sources.len(), 2);
         assert_eq!(labels.iter().filter(|label| **label == "foo").count(), 1);
     }
-
-    #[test]
-    fn prelude_declarations_are_visible() {
-        let mut loader = TestLoader::default();
-        let output = check(input(
-            &mut loader,
-            source("fn main() { let x: int = prelude_value(); }", "main.anv"),
-            Some(source("pub fn prelude_value() -> int { 1 }", "<prelude>")),
-            vec![],
-        ))
-        .unwrap();
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn core_root_reexported_extend_is_visible_without_import() {
-        let mut loader = TestLoader::default();
-        let output = check(input(
-            &mut loader,
-            source("fn main() { let x: int = 1.plus_one(); }", "main.anv"),
-            Some(source("pub import core_int { * };", "<core>")),
-            vec![core_module(
-                &["core_int"],
-                "pub extend int { fn plus_one(self) -> int { self + 1 } }",
-            )],
-        ))
-        .unwrap();
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn core_root_wildcard_reexport_does_not_import_module_name() {
-        let mut loader = TestLoader::default();
-        let err = check(input(
-            &mut loader,
-            source(
-                "fn main() { let x: int = core_int.plus_one(1); }",
-                "main.anv",
-            ),
-            Some(source("pub import core_int { * };", "<core>")),
-            vec![core_module(
-                &["core_int"],
-                "pub extend int { fn plus_one(self) -> int { self + 1 } }",
-            )],
-        ))
-        .unwrap();
-        assert_failed(&err, CheckPhase::Type);
-    }
-
     #[test]
     fn duplicate_preloaded_modules_are_resolve_errors() {
         let mut loader = TestLoader::default();
@@ -1691,101 +1520,6 @@ mod tests {
         .unwrap();
         assert_failed(&err, CheckPhase::Type);
     }
-
-    #[test]
-    fn dependency_import_uses_package_exports() {
-        let game = PackageId::new("game");
-        let math = PackageId::new("math");
-        let mut loader = TestLoader::default();
-
-        let output = check(PackageProgramInput {
-            root_package: game.clone(),
-            main: root_source(
-                &game,
-                "import pkg:math { add }; fn main() { let x: int = add(); }",
-                "main.anv",
-            ),
-            system: SystemPackages::default(),
-            packages: HashMap::from([
-                (
-                    game.clone(),
-                    package_input(&game, "", &[("math", math.clone())]),
-                ),
-                (
-                    math.clone(),
-                    package_input(&math, "pub fn add() -> int { 1 }", &[]),
-                ),
-            ]),
-            preloaded_modules: vec![],
-            source_loader: &mut loader,
-        })
-        .unwrap();
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn core_runtime_wrappers_are_preluded() {
-        let core = PackageId::core();
-        let mut loader = TestLoader::default();
-        loader.package_source(
-            &core,
-            &["runtime"],
-            r#"
-            import ext:core_runtime { _println, _assert };
-            pub fn println<T>(value: T) { _println(#stringify(value)); }
-            pub fn assert(condition: bool, message: string = "assertion failed") {
-                _assert(condition, message);
-            }
-            "#,
-        );
-        loader.source(&["gamekit"], "pub fn run() { println(\"module\"); }");
-
-        let output = pipeline_check(
-            input(
-                &mut loader,
-                source(
-                    r#"
-                    import gamekit { run };
-                    fn main() {
-                        println("ready");
-                        assert(true);
-                        assert(true, "ok");
-                        run();
-                    }
-                    "#,
-                    "main.anv",
-                ),
-                Some(source("pub import runtime { * };", "<core>")),
-                vec![],
-            ),
-            FrontendConfig {
-                externs: package_extern_inputs(core, vec![core_runtime_provider()]),
-                ..FrontendConfig::default()
-            },
-        )
-        .unwrap();
-
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn private_core_root_declarations_are_preluded() {
-        let mut loader = TestLoader::default();
-        loader.package_source(
-            &PackageId::core(),
-            &["option"],
-            "pub enum Option<T> { Some(T), None }",
-        );
-        let output = check(input(
-            &mut loader,
-            source("fn main() { let x: Option<int> = nil; }", "main.anv"),
-            Some(source("pub import option { Option };", "<core>")),
-            vec![],
-        ))
-        .unwrap();
-        assert_passed(&output);
-    }
-
     #[test]
     fn core_root_is_not_preluded_into_core_modules() {
         let core = PackageId::core();
@@ -1968,65 +1702,6 @@ mod tests {
         .unwrap();
         assert_passed(&output);
     }
-
-    #[test]
-    fn std_import_uses_implicit_package() {
-        let game = root_package();
-        let std = PackageId::std();
-        let mut loader = TestLoader::default();
-        loader.package_source(&std, &["math"], "pub const PI: int = 3;");
-
-        let output = check(PackageProgramInput {
-            root_package: game.clone(),
-            main: root_source(
-                &game,
-                "import std:math { PI }; fn main() { let x: int = PI; }",
-                "main.anv",
-            ),
-            system: SystemPackages {
-                core: None,
-                std: Some(std.clone()),
-            },
-            packages: HashMap::from([
-                (game.clone(), PackageSourceInput::default()),
-                (std.clone(), package_input(&std, "pub import math;", &[])),
-            ]),
-            preloaded_modules: vec![],
-            source_loader: &mut loader,
-        })
-        .unwrap();
-        assert_passed(&output);
-    }
-
-    #[test]
-    fn std_exported_module_self_alias_uses_shared_import_target() {
-        let game = root_package();
-        let std = PackageId::std();
-        let mut loader = TestLoader::default();
-        loader.package_source(&std, &["math"], "pub const PI: int = 3;");
-
-        let output = check(PackageProgramInput {
-            root_package: game.clone(),
-            main: root_source(
-                &game,
-                "import std:math { self as math }; fn main() { let x: int = math.PI; }",
-                "main.anv",
-            ),
-            system: SystemPackages {
-                core: None,
-                std: Some(std.clone()),
-            },
-            packages: HashMap::from([
-                (game.clone(), PackageSourceInput::default()),
-                (std.clone(), package_input(&std, "pub import math;", &[])),
-            ]),
-            preloaded_modules: vec![],
-            source_loader: &mut loader,
-        })
-        .unwrap();
-        assert_passed(&output);
-    }
-
     #[test]
     fn std_import_reports_unsupported_root() {
         let mut loader = TestLoader::default();

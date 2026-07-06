@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: 4
+
+struct Box { item: int? }
+
+fn main() {
+    let box = Box { item: 4 };
+    println(box.item ?? 0);
+}

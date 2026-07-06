@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires enclosing function to return Result or Option
-// @frontend: new
 
 fn bad<T>(x: T?) -> _ {
     try x

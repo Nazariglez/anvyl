@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+
+struct State {
+    rows: [[int]],
+}
+
+lazy var state = State { rows: [[1]] };
+
+fn main() {
+    let i = 0;
+    state.rows[i].push(2);
+}

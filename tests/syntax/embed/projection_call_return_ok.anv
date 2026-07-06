@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 struct Entity { x: int }
 struct Enemy { @as embed entity: Entity }

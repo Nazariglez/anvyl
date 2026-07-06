@@ -1,5 +1,4 @@
 // @mode: check
-// @frontend: new
 // @expect: success
 
 fn get_id() -> int { 42 }

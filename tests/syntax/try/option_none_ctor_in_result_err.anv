@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires Result
-// @frontend: new
 
 fn bad() -> Result<int, string> {
     let value: int = try <Option<int>>.None;

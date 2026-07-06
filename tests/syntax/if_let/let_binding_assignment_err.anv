@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot assign to immutable value
-// @frontend: new
 
 fn main() {
     var opt: int? = 42;

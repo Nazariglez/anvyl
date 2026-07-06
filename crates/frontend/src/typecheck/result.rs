@@ -56,7 +56,7 @@ pub(crate) struct TypecheckFailure {
     pub(crate) errors: Vec<TypeError>,
     pub(crate) warnings: Vec<CompileWarning>,
     pub(crate) lint_events: Vec<LintEvent>,
-    pub(crate) diagnostic_context: TypeDiagnosticContext,
+    pub(crate) diagnostic_context: Box<TypeDiagnosticContext>,
 }
 
 impl TypecheckFailure {
@@ -65,7 +65,7 @@ impl TypecheckFailure {
             errors,
             warnings: vec![],
             lint_events: vec![],
-            diagnostic_context: TypeDiagnosticContext::from_core_option(None),
+            diagnostic_context: Box::new(TypeDiagnosticContext::from_core_option(None)),
         }
     }
 }

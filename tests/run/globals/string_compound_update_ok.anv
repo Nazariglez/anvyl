@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// cold-ready
+// @match-end
+
+fn make_title() -> string {
+    println("init");
+    "cold"
+}
+
+lazy var title = make_title();
+
+fn main() {
+    title += "-ready";
+    let local = title;
+    println(local);
+}

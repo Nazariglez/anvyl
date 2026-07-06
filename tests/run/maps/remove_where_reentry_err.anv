@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @contains: cannot structurally mutate collection during active iteration or slice view
+
+fn main() {
+    var m: [string: int] = ["a": 1, "b": 2];
+    m.remove_where(|key, value| {
+        m.insert("c", 3);
+        false
+    });
+}

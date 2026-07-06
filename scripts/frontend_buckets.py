@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Summarize new-frontend syntax corpus failures from todo/front.json."""
+"""Summarize syntax corpus failures from a test-runner JSON report."""
 
 import argparse
 import json
 import sys
 from collections import Counter
 from pathlib import Path
+
+
+EXPECTED_SCHEMA_VERSION = 3
 
 
 MESSAGE_BUCKETS = (
@@ -39,19 +42,22 @@ def area_of(path: str) -> str:
 
 def load_issues(report_path: Path) -> tuple[dict, list[dict]]:
     report = json.loads(report_path.read_text())
-    if not report.get("new_frontend"):
-        raise SystemExit(f"{report_path} is not a --new-frontend report")
+    version = report.get("schema_version")
+    if version != EXPECTED_SCHEMA_VERSION:
+        print(
+            f"error: unsupported report schema {version}; expected {EXPECTED_SCHEMA_VERSION}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     return report, report["issues"]
 
 
 def print_summary(report: dict, issues: list[dict], area: str | None) -> None:
-    frontend = "new frontend" if report.get("new_frontend") else "old frontend"
-    backend = report.get("backend", "?")
     if area:
         issues = [issue for issue in issues if area_of(issue["path"]) == area]
-        print(f"report: {area} bucket ({frontend}, backend={backend})")
+        print(f"report: {area} bucket")
     else:
-        print(f"report: full syntax corpus ({frontend}, backend={backend})")
+        print("report: full syntax corpus")
 
     print(f"issues: {len(issues)}")
     if not area:
@@ -87,8 +93,8 @@ def main() -> None:
     parser.add_argument(
         "report",
         nargs="?",
-        default="todo/front.json",
-        help="Path to a test-runner JSON report (default: todo/front.json)",
+        default=".pi/tmp/front.json",
+        help="Path to a test-runner JSON report (default: .pi/tmp/front.json)",
     )
     parser.add_argument(
         "--area",

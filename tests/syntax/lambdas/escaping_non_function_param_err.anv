@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: `escaping` is only valid on function-typed parameters
-// @frontend: new
 
 fn bad(f: escaping int) {
 }

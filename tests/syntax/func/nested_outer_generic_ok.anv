@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn outer<T>(x: T) -> T {
     fn id(y: T) -> T { y }

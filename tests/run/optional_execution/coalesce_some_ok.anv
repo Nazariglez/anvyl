@@ -1,0 +1,8 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn main() {
+    let value: int? = 3;
+    println(value ?? 9);
+}

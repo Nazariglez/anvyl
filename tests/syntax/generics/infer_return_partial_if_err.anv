@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: inferred return type mismatch
 
 fn f<T>(x: T, cond: bool) -> _ {

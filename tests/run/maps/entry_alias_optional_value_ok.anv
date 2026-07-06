@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// true
+// @match-end
+
+fn main() {
+    var scores: [string: int?] = ["a": 1];
+    if ref score? = scores["a"] {
+        println(score ?? 0);
+        score = nil;
+    }
+    let removed = scores.remove("a");
+    if let score? = removed {
+        println(score == nil);
+    }
+}

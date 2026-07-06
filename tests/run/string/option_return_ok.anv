@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 0
+// @match-end
+
+fn present(x: string?) -> int {
+    match x {
+        _? => 1,
+        _ => 0,
+    }
+}
+
+fn main() {
+    println(present("abcd".substring(1, 2)));
+    println(present("xyz".char_at(9)));
+}

@@ -1,0 +1,1 @@
+extern type T { init; ro: int; rw: int; computed cached: int; computed live: int; fn a(self); fn b(shared self); fn c(ref self); }

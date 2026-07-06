@@ -1,0 +1,5 @@
+struct Counter {
+    value: int,
+
+    fn get(self) -> int { self.value }
+}

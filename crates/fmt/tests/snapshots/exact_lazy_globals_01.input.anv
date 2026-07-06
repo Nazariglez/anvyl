@@ -1,0 +1,1 @@
+lazy let Config=load_config();

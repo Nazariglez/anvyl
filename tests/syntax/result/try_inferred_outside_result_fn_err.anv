@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: try requires enclosing function to return Result or Option, found 'int'
-// @frontend: new
 
 fn load() -> int {
     try Result.Ok(1)

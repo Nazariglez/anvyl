@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// b
+// @match-end
+
+fn main() {
+    let parts = "a,b".split(",");
+    println(parts[0]);
+    println(parts[1]);
+}

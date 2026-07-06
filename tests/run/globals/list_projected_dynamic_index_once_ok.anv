@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// init
+// index
+// 1
+// 7
+// @match-end
+
+fn make_values() -> [int] {
+    println("init");
+    [1, 2]
+}
+
+fn index(ref calls: int) -> int {
+    calls += 1;
+    println("index");
+    1
+}
+
+lazy var values = make_values();
+
+fn main() {
+    var calls = 0;
+    values[index(calls)] = 7;
+    let local = values;
+    println(calls);
+    println(local[1]);
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: mismatched types
 
 fn takes_void(f: fn() -> void) {}

@@ -1,7 +1,0 @@
-// @mode: run
-// @expect: success
-// @match: true
-
-fn main() {
-    println(#profile(debug));
-}

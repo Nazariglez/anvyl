@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 // @lint: internal_access=error
 
 import detail { item };

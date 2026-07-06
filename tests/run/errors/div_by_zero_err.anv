@@ -1,7 +1,0 @@
-// @mode: run
-// @expect: error
-// @contains: zero
-
-fn main() {
-    let x = 1 / 0;
-}

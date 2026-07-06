@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: contract method requirements cannot be generic
 
 contract Mapper {

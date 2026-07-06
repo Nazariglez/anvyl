@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+struct Box { n: int }
+
+fn main() {
+    var boxes: [string: Box] = ["a": Box { n: 1 }];
+    if ref box? = boxes["a"] {
+        println(box.n);
+        box.n = 2;
+    }
+    if let box? = boxes["a"] {
+        println(box.n);
+    }
+}

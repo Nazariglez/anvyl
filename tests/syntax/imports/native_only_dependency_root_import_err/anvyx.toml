@@ -1,0 +1,6 @@
+[project]
+name = "game"
+entry = "game/src/main.anv"
+
+[dependencies]
+host = { path = "host" }

@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 100
+// @match-end
+
+dataref Counter {
+    value: int,
+}
+
+fn observe(ref value: int, ignored: Counter) {
+    value += 1;
+}
+
+fn rebind(ref target: Counter) -> Counter {
+    target = Counter { value: 100 };
+    return target;
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    var original = c;
+    observe(c.value, rebind(c));
+    println(original.value);
+    println(c.value);
+}

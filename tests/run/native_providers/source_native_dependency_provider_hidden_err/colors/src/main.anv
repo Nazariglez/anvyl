@@ -1,0 +1,3 @@
+// @helper
+
+pub fn mix() -> int { 1 }

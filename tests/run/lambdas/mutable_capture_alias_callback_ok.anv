@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @contains: 2
+
+fn call_once(f: fn()) {
+    f();
+}
+
+fn main() {
+    var count = 0;
+    let f = || {
+        count += 1;
+    };
+    let g = f;
+    call_once(g);
+    f();
+    println(count);
+}

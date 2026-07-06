@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: 15
+
+fn call(f: fn(int) -> int) -> int {
+    f(5)
+}
+
+fn main() {
+    let base = 10;
+    let add = |x: int| { x + base };
+    let outer = || { call(add) };
+    println(outer());
+}

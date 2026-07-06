@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: b
+
+pub dataref Node {
+    name: string,
+}
+
+lazy var root = Node { name: "a" };
+
+fn main() {
+    root.name = "b";
+    println(root.name);
+}

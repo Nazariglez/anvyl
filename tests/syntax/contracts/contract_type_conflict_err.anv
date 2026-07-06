@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: type 'Thing' is already defined
 
 contract Thing {

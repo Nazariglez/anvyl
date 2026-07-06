@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+dataref Node {
+    value: int,
+}
+
+fn main() {
+    let nodes = [Node { value: 1 }, Node { value: 2 }];
+    let i = 1;
+    println(nodes[i].value);
+}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: cast from declarations cannot return mutable places
 
 struct Target {}

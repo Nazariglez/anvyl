@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn apply(f: fn(int) -> int, x: int) -> int {
+    f(x)
+}
+
+fn make() -> fn() -> int {
+    var count = 0;
+    let add = |x: int| {
+        count = count + x;
+        count
+    };
+    apply(add, 1);
+    || count
+}
+
+fn main() {
+    let f = make();
+    println(f());
+}

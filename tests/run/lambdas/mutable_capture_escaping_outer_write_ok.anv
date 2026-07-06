@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 10
+
+fn make() -> fn() -> int {
+    var count = 0;
+    let f = || count;
+    count = 10;
+    f
+}
+
+fn main() {
+    let f = make();
+    println(f());
+}

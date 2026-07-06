@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 // @warn-contains: use of deprecated runtime global 'old': use new
 
 import assets { old };

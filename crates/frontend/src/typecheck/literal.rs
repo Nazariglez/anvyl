@@ -38,10 +38,11 @@ fn expected_collection(
     tc: &TypeChecker,
 ) -> Option<(TypeHandle, CollectionLiteralKind)> {
     match expected_assignable_type(expected, tc)? {
-        Type::Array { elem, .. } | Type::Slice { elem } => {
-            Some((tc.type_handle(&elem), CollectionLiteralKind::Array))
-        }
-        Type::List { elem } => Some((tc.type_handle(&elem), CollectionLiteralKind::List)),
+        Type::Array { elem, .. } | Type::Slice { elem } => Some((
+            TypeChecker::type_handle(&elem),
+            CollectionLiteralKind::Array,
+        )),
+        Type::List { elem } => Some((TypeChecker::type_handle(&elem), CollectionLiteralKind::List)),
         _ => None,
     }
 }
@@ -53,18 +54,21 @@ fn expected_map(
     let Type::Map { key, value } = expected_assignable_type(expected, tc)? else {
         return None;
     };
-    Some((tc.type_handle(&key), tc.type_handle(&value)))
+    Some((
+        TypeChecker::type_handle(&key),
+        TypeChecker::type_handle(&value),
+    ))
 }
 
 fn collection_literal_handle(
     kind: CollectionLiteralKind,
-    elem: TypeHandle,
+    elem: &TypeHandle,
     len: ArrayLen,
     tc: &mut TypeChecker,
 ) -> TypeHandle {
     match kind {
-        CollectionLiteralKind::Array => tc.array_handle(&elem, &len),
-        CollectionLiteralKind::List => tc.list_handle(&elem),
+        CollectionLiteralKind::Array => tc.array_handle(elem, &len),
+        CollectionLiteralKind::List => tc.list_handle(elem),
     }
 }
 
@@ -80,7 +84,7 @@ fn option_elem_handle(elem: TypeHandle, span: Span, tc: &mut TypeChecker) -> Typ
         return elem;
     }
     let option_ty = tc.core_option_or_infer(ty, span);
-    tc.type_handle(&option_ty)
+    TypeChecker::type_handle(&option_ty)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -122,11 +126,11 @@ fn check_duplicate_map_keys(lit: &MapLiteralNode, tc: &mut TypeChecker) {
 pub(super) fn check_map_lit_hint(
     expr: &ExprNode,
     lit: &MapLiteralNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     check_duplicate_map_keys(lit, tc);
-    let (key, value, has_hint) = match expected_map(expected.as_ref(), tc) {
+    let (key, value, has_hint) = match expected_map(expected, tc) {
         Some((key, value)) => (key, value, true),
         None => (
             tc.fresh_temp_handle(lit.span),
@@ -158,7 +162,7 @@ pub(super) fn check_map_lit_hint(
     }
 
     let map = tc.map_handle(&key, &value);
-    let mut checked = solve_and_checked_from_handle(expr, map, tc);
+    let mut checked = solve_and_checked_from_handle(expr, &map, tc);
     if !has_hint
         && let Type::Map { key, .. } = &checked.ty
         && let Some(err) = map_key_type_error(&tc.decls, key, tc.error_span(lit.span))
@@ -172,10 +176,9 @@ pub(super) fn check_map_lit_hint(
 pub(super) fn check_array_lit_hint(
     expr: &ExprNode,
     lit: &ArrayLiteralNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let expected = expected.as_ref();
     let expected_collection = expected_collection(expected, tc);
     let has_nil = contains_nil(&lit.node.elements);
     if expected_collection.is_none()
@@ -197,12 +200,8 @@ pub(super) fn check_array_lit_hint(
     } else {
         elem
     };
-    let array = collection_literal_handle(
-        kind,
-        elem.clone(),
-        ArrayLen::Fixed(lit.node.elements.len()),
-        tc,
-    );
+    let array =
+        collection_literal_handle(kind, &elem, ArrayLen::Fixed(lit.node.elements.len()), tc);
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for value in &lit.node.elements {
@@ -214,7 +213,7 @@ pub(super) fn check_array_lit_hint(
     if contains_poison {
         return checked_from_type(expr, Type::Infer, tc);
     }
-    let mut checked = solve_and_checked_from_handle(expr, array, tc);
+    let mut checked = solve_and_checked_from_handle(expr, &array, tc);
     checked.contains_extern_any = contains_extern_any;
     checked
 }
@@ -222,7 +221,7 @@ pub(super) fn check_array_lit_hint(
 pub(super) fn check_array_fill_hint(
     expr: &ExprNode,
     fill: &ArrayFillNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let len = match tc.eval_const_expr(&fill.node.len, true) {
@@ -235,18 +234,18 @@ pub(super) fn check_array_fill_hint(
                 }
             }
         }
-        Err(TypeError::NonConstExpression { .. }) => {
-            tc.push_error(TypeError::ArrayFillLengthNotConst {
-                span: tc.error_span(fill.node.len.span),
-            });
-            ArrayLen::Infer
-        }
         Err(err) => {
-            tc.push_error(err);
+            if matches!(*err, TypeError::NonConstExpression { .. }) {
+                tc.push_error(TypeError::ArrayFillLengthNotConst {
+                    span: tc.error_span(fill.node.len.span),
+                });
+            } else {
+                tc.push_error(err);
+            }
             ArrayLen::Infer
         }
     };
-    let (elem, kind) = expected_collection(expected.as_ref(), tc).unwrap_or_else(|| {
+    let (elem, kind) = expected_collection(expected, tc).unwrap_or_else(|| {
         (
             tc.fresh_temp_handle(fill.node.value.span),
             CollectionLiteralKind::Array,
@@ -254,8 +253,8 @@ pub(super) fn check_array_fill_hint(
     });
     let value = check_expected_value_expr(&fill.node.value, elem.clone(), tc);
     tc.record_aggregate_elem_escape(expr.node.id, &fill.node.value);
-    let array = collection_literal_handle(kind, elem, len, tc);
-    let mut checked = solve_and_checked_from_handle(expr, array, tc);
+    let array = collection_literal_handle(kind, &elem, len, tc);
+    let mut checked = solve_and_checked_from_handle(expr, &array, tc);
     checked.contains_extern_any = value.contains_extern_any;
     checked
 }
@@ -267,7 +266,7 @@ fn tuple_hints(
 ) -> Vec<TypeHandle> {
     match expected_assignable_type(expected, tc) {
         Some(Type::Tuple(types)) if types.len() == elems.len() => {
-            types.iter().map(|ty| tc.type_handle(ty)).collect()
+            types.iter().map(TypeChecker::type_handle).collect()
         }
         _ => elems
             .iter()
@@ -279,10 +278,10 @@ fn tuple_hints(
 pub(super) fn check_tuple_checked_with_hint(
     expr: &ExprNode,
     elems: &[ExprNode],
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let hints = tuple_hints(elems, expected.as_ref(), tc);
+    let hints = tuple_hints(elems, expected, tc);
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for (elem, hint) in elems.iter().zip(&hints) {
@@ -295,7 +294,7 @@ pub(super) fn check_tuple_checked_with_hint(
         return checked_from_type(expr, Type::Infer, tc);
     }
     let tuple = tc.tuple_handle(hints);
-    let mut checked = solve_and_checked_from_handle(expr, tuple, tc);
+    let mut checked = solve_and_checked_from_handle(expr, &tuple, tc);
     checked.contains_extern_any = contains_extern_any;
     checked
 }
@@ -357,7 +356,7 @@ impl NominalLiteralSolver<'_> {
         let template = tc
             .solver
             .instantiate_generic_type(&template, self.session.vars());
-        let expected = tc.type_handle(expected);
+        let expected = TypeChecker::type_handle(expected);
         tc.expect_equal(span, template, expected);
         !tc.solve_constraints()
     }
@@ -381,10 +380,10 @@ impl NominalLiteralSolver<'_> {
 pub(super) fn check_struct_lit_hint(
     expr: &ExprNode,
     lit: &StructLiteralNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    if let Some(checked) = check_enum_struct_variant_lit(expr, lit, expected.clone(), tc) {
+    if let Some(checked) = check_enum_struct_variant_lit(expr, lit, expected, tc) {
         return checked;
     }
 
@@ -395,7 +394,7 @@ pub(super) fn check_struct_lit_hint(
     let key = target.key.clone();
 
     if key.kind == NominalKind::Extern {
-        return extern_boundary::check_extern_lit(expr, lit, &key, expected.as_ref(), tc);
+        return extern_boundary::check_extern_lit(expr, lit, &key, expected, tc);
     }
 
     let valid_literal_target = matches!(key.kind, NominalKind::Struct | NominalKind::DataRef);
@@ -425,7 +424,7 @@ pub(super) fn check_struct_lit_hint(
         NominalKind::Enum | NominalKind::Extern => unreachable!("aggregate key checked above"),
     };
     tc.warn_deprecated(&agg.policy, kind, key.name, lit.span);
-    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let expected_ty = expected.map(|handle| tc.handle_type(handle));
     let inf = match &target.seeds {
         Some(seeds) => NominalLiteralSolver::from_seeds(&agg.generics, seeds, lit.span, tc),
         None => {
@@ -463,8 +462,8 @@ pub(super) fn check_struct_lit_hint(
         tc,
     );
     tc.reject_user_any_type(&ty, lit.span);
-    let handle = tc.type_handle(&ty);
-    let mut checked = solve_and_checked_from_handle(expr, handle, tc);
+    let handle = TypeChecker::type_handle(&ty);
+    let mut checked = solve_and_checked_from_handle(expr, &handle, tc);
     checked.contains_extern_any = field_check.contains_extern_any;
     checked
 }
@@ -472,7 +471,7 @@ pub(super) fn check_struct_lit_hint(
 fn check_enum_struct_variant_lit(
     expr: &ExprNode,
     lit: &StructLiteralNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> Option<CheckedType> {
     let qualifier = lit.node.qualifier?;
@@ -499,7 +498,7 @@ fn check_enum_struct_variant_lit(
         return Some(checked_from_type(expr, Type::Infer, tc));
     }
 
-    let expected_ty = expected.as_ref().map(|handle| tc.handle_type(handle));
+    let expected_ty = expected.map(|handle| tc.handle_type(handle));
     let inf = NominalLiteralSolver::without_args(&resolved.generics, lit.span, tc);
     let expected_ok =
         inf.bind_expected(&key, &resolved.generics, expected_ty.as_ref(), lit.span, tc);
@@ -520,8 +519,8 @@ fn check_enum_struct_variant_lit(
         return Some(checked_from_type(expr, Type::Infer, tc));
     };
     tc.reject_user_any_type(&ty, lit.span);
-    let handle = tc.type_handle(&ty);
-    let mut checked = solve_and_checked_from_handle(expr, handle, tc);
+    let handle = TypeChecker::type_handle(&ty);
+    let mut checked = solve_and_checked_from_handle(expr, &handle, tc);
     checked.contains_extern_any = field_check.contains_extern_any;
     Some(checked)
 }
@@ -616,7 +615,7 @@ pub(super) fn check_inferred_enum_hint(
         _ => unreachable!("inferred enum shape was validated before payload checking"),
     }
 
-    let mut checked = solve_and_checked_from_handle(expr, expected, tc);
+    let mut checked = solve_and_checked_from_handle(expr, &expected, tc);
     checked.contains_extern_any = contains_extern_any;
     checked
 }
@@ -653,7 +652,7 @@ fn check_nominal_fields(
         aggregate,
         fields,
         schema,
-        field_check::FieldOwner::Nominal(owner_ty),
+        &field_check::FieldOwner::Nominal(owner_ty),
         field_check::MissingFields::AllowDefaults,
         span,
         inf,
@@ -675,7 +674,7 @@ fn check_variant_literal_fields(
         aggregate,
         fields,
         schema,
-        field_check::FieldOwner::Variant {
+        &field_check::FieldOwner::Variant {
             key: key.clone(),
             variant,
         },
@@ -690,7 +689,7 @@ fn check_expr_fields(
     aggregate: ExprId,
     fields: &[(Ident, ExprNode)],
     schema: &NamedSchemas<FieldSchema>,
-    owner: field_check::FieldOwner,
+    owner: &field_check::FieldOwner,
     missing: field_check::MissingFields,
     span: Span,
     inf: &NominalLiteralSolver,
@@ -699,7 +698,7 @@ fn check_expr_fields(
     let shape = field_check::check_named(
         fields,
         schema,
-        &owner,
+        owner,
         missing,
         Some(span),
         |value| value.span,
@@ -715,7 +714,7 @@ fn check_expr_fields(
     };
     for field in shape.fields {
         let value = &fields[field.index].1;
-        tc.check_matched_field_access_policy(&owner, field.name, &field.policy, value.span);
+        tc.check_matched_field_access_policy(owner, field.name, &field.policy, value.span);
         let hint = inf.instantiate(&field.ty, tc);
         let checked = check_expected_value_expr(value, hint.clone(), tc);
         tc.record_aggregate_elem_escape(aggregate, value);
@@ -743,7 +742,7 @@ fn record_default_fields(
             owner_key.clone(),
             field.name,
             field.slot,
-            field.default,
+            &field.default,
             substitute_aggregate_member(owner, generics, &field.ty),
         );
     }
@@ -823,7 +822,7 @@ fn resolve_struct_target(
             };
             tc.resolve_type_for_tc_at(&ty, lit.span)
         };
-        return struct_literal_target_from_expanded(lit, expanded, tc);
+        return struct_literal_target_from_expanded(lit, &expanded, tc);
     }
 
     let lookup =
@@ -862,7 +861,7 @@ fn resolve_struct_target(
                 };
                 tc.resolve_type_for_tc_at(&ty, lit.span)
             };
-            struct_literal_target_from_expanded(lit, expanded, tc)
+            struct_literal_target_from_expanded(lit, &expanded, tc)
         }
         TypeBinding::Contract(_) => {
             tc.resolve_type_for_tc_at(
@@ -880,13 +879,13 @@ fn resolve_struct_target(
 
 fn struct_literal_target_from_expanded(
     lit: &StructLiteralNode,
-    expanded: Type,
+    expanded: &Type,
     tc: &mut TypeChecker,
 ) -> Option<StructLiteralTarget> {
     if matches!(expanded, Type::Infer) {
         return None;
     }
-    let Some(key) = tc.decls.key_for_type(&expanded) else {
+    let Some(key) = tc.decls.key_for_type(expanded) else {
         tc.push_error(TypeError::InvalidStructLiteral {
             name: lit.node.name,
             kind: expanded.to_string(),
@@ -897,7 +896,7 @@ fn struct_literal_target_from_expanded(
     let seeds = tc
         .decls
         .nominal_generics(&key)
-        .map(|generics| literal_target_seeds(&generics, &expanded));
+        .map(|generics| literal_target_seeds(&generics, expanded));
     Some(StructLiteralTarget { key, seeds })
 }
 
@@ -932,17 +931,17 @@ pub(super) fn type_from_lit(lit: &Lit) -> Type {
 fn expected_range_bound(expected: Option<&TypeHandle>, tc: &TypeChecker) -> Option<TypeHandle> {
     let expected = expected_assignable_type(expected, tc)?;
     let inner = tc.decls.core_range_inner(&expected)?;
-    Some(tc.type_handle(inner))
+    Some(TypeChecker::type_handle(inner))
 }
 
 pub(super) fn check_range_expr(
     expr: &ExprNode,
     range: &RangeNode,
-    expected: Option<TypeHandle>,
+    expected: Option<&TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let bound = expected_range_bound(expected.as_ref(), tc)
-        .unwrap_or_else(|| tc.fresh_temp_handle(range.span));
+    let bound =
+        expected_range_bound(expected, tc).unwrap_or_else(|| tc.fresh_temp_handle(range.span));
     let (kind, contains_extern_any) = match &range.node {
         Range::Bounded {
             start,

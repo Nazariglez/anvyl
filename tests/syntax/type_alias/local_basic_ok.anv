@@ -1,5 +1,4 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn f<T>(x: T) -> T { type Item = T; let y: Item = x; y }

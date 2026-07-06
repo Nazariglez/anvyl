@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match: 0
+
+fn index() -> int {
+    println("index");
+    0
+}
+
+fn main() {
+    let values: [int]? = nil;
+    println(values?[index()] ?? 0);
+}

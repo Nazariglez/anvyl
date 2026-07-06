@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn unwrap_or_default(r: Result<int, string>) -> int {
     match r {

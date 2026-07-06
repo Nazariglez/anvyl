@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: anonymous dynamic contract syntax is not supported
 
 fn take(x: dyn { fn draw(self); }) {}

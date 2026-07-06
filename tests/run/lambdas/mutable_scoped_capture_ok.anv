@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @contains: 2
+
+fn twice(f: fn()) {
+    f();
+    f();
+}
+
+fn main() {
+    var count = 0;
+    twice(|| {
+        count += 1;
+    });
+    println(count);
+}

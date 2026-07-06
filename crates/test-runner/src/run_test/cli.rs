@@ -14,12 +14,11 @@ const RESET: &str = "\x1b[0m";
 
 pub(crate) struct Cli {
     exe: String,
-    new_frontend: bool,
     release: bool,
 }
 
 impl Cli {
-    pub(crate) fn build(release: bool, announce: bool, new_frontend: bool) -> Result<Self, String> {
+    pub(crate) fn build(release: bool, announce: bool) -> Result<Self, String> {
         if announce {
             println!(
                 "{ORANGE}Compiling anvyx{}{RESET}",
@@ -51,15 +50,7 @@ impl Cli {
             .join(exe_name)
             .display()
             .to_string();
-        Ok(Self {
-            exe,
-            new_frontend,
-            release,
-        })
-    }
-
-    pub(crate) fn new_frontend(&self) -> bool {
-        self.new_frontend
+        Ok(Self { exe, release })
     }
 
     pub(crate) fn release(&self) -> bool {
@@ -67,20 +58,15 @@ impl Cli {
     }
 
     pub(crate) fn run(&self, case: &CliCase) -> Result<ProcessOutcome, String> {
-        spawn(&self.exe, case, self.new_frontend, self.release)
+        spawn(&self.exe, case, self.release)
     }
 }
 
-fn spawn(
-    cmd: &str,
-    case: &CliCase,
-    new_frontend: bool,
-    release: bool,
-) -> Result<ProcessOutcome, String> {
+fn spawn(cmd: &str, case: &CliCase, release: bool) -> Result<ProcessOutcome, String> {
     use std::process::Stdio;
 
     let mut command = std::process::Command::new(cmd);
-    command.args(child_args(case, new_frontend, release));
+    command.args(child_args(case, release));
 
     let mut child = command
         .stdin(Stdio::piped())
@@ -114,23 +100,12 @@ fn spawn(
     })
 }
 
-fn child_args(case: &CliCase, new_frontend: bool, release: bool) -> Vec<String> {
+fn child_args(case: &CliCase, release: bool) -> Vec<String> {
     let mut args = vec![case.mode.as_str().to_string()];
-    if new_frontend {
-        debug_assert!(case.mode == Mode::Check || case.backend == Some("rust"));
-        args.push("--new-frontend".to_string());
-    }
-
-    if case.mode == Mode::Run {
-        if release {
-            args.push("--release".to_string());
-        }
-        if let Some(backend) = case.backend {
-            args.extend(["--backend".to_string(), backend.to_string()]);
-        }
+    if case.mode == Mode::Run && release {
+        args.push("--release".to_string());
     }
     case.cli_options.append_args(&mut args);
-
     args.push(case.file.display().to_string());
     args
 }
@@ -181,7 +156,7 @@ mod tests {
         child_args, process_timeout_for_mode, timeout_phase_for_output, write_child_stdin,
     };
     use crate::{
-        directives::{CliFlag, CliOptions},
+        directives::CliOptions,
         model::{FailurePhase, Mode},
         run_test::CliCase,
     };
@@ -193,17 +168,11 @@ mod tests {
                 Mode::Run => "tests/run/basic_ok.anv",
             }),
             mode,
-            backend: None,
             runtime_timeout: Duration::from_millis(2),
             compile_timeout: Duration::from_millis(300),
             cli_options: CliOptions::default(),
             stdin: String::new(),
         }
-    }
-
-    fn has_arg_pair(args: &[String], flag: &str, value: &str) -> bool {
-        args.windows(2)
-            .any(|pair| pair[0] == flag && pair[1] == value)
     }
 
     struct BrokenPipeWriter;
@@ -217,105 +186,11 @@ mod tests {
             Ok(())
         }
     }
-
-    #[test]
-    fn omits_runner_flags() {
-        let mut case = case(Mode::Run);
-        case.backend = Some("vm");
-        case.cli_options.push(CliFlag::Lint, "unused".to_string());
-        case.cli_options.push(CliFlag::Feature, "gc".to_string());
-        case.cli_options.push(CliFlag::Cfg, "debug".to_string());
-        let args = child_args(&case, false, false);
-
-        assert_eq!(args[0], "run");
-        assert!(has_arg_pair(&args, "--backend", "vm"));
-        assert!(has_arg_pair(&args, "--lint", "unused"));
-        assert!(has_arg_pair(&args, "--feature", "gc"));
-        assert!(has_arg_pair(&args, "--cfg", "debug"));
-        assert!(!args.iter().any(|arg| matches!(
-            arg.as_str(),
-            "--quiet"
-                | "--timeout"
-                | "--compile-timeout"
-                | "--jobs"
-                | "--report-json"
-                | "--release"
-                | "--driver"
-                | "--diagnostics"
-                | "--"
-        )));
-    }
-
-    #[test]
-    fn check_omits_backend() {
-        let mut case = case(Mode::Check);
-        case.backend = Some("vm");
-
-        assert_eq!(
-            child_args(&case, false, false),
-            vec!["check", "tests/syntax/basic_ok.anv"]
-        );
-    }
-
-    #[test]
-    fn adds_new_frontend() {
-        assert_eq!(
-            child_args(&case(Mode::Check), true, false),
-            vec!["check", "--new-frontend", "tests/syntax/basic_ok.anv"]
-        );
-    }
-
-    #[test]
-    fn keeps_forwarded_args() {
-        let mut case = case(Mode::Check);
-        case.file = PathBuf::from("tests/syntax/cfg/foo.anv");
-        case.backend = Some("vm");
-        case.cli_options.push(CliFlag::Cfg, "debug".to_string());
-
-        assert_eq!(
-            child_args(&case, true, false),
-            vec![
-                "check",
-                "--new-frontend",
-                "--cfg",
-                "debug",
-                "tests/syntax/cfg/foo.anv"
-            ]
-        );
-    }
-
-    #[test]
-    fn run_adds_new_frontend_for_clean_rust_backend() {
-        let mut case = case(Mode::Run);
-        case.backend = Some("rust");
-
-        assert_eq!(
-            child_args(&case, true, false),
-            vec![
-                "run",
-                "--new-frontend",
-                "--backend",
-                "rust",
-                "tests/run/basic_ok.anv"
-            ]
-        );
-    }
-
     #[test]
     fn run_forwards_release() {
-        let mut case = case(Mode::Run);
-        case.backend = Some("rust");
-
         assert_eq!(
-            child_args(&case, true, true),
-            vec![
-                "run",
-                "--new-frontend",
-                "--release",
-                "--backend",
-                "rust",
-                "tests/run/basic_ok.anv"
-            ]
+            child_args(&case(Mode::Run), true),
+            vec!["run", "--release", "tests/run/basic_ok.anv"]
         );
     }
 
@@ -326,15 +201,6 @@ mod tests {
         write_child_stdin(Some(&mut written), "first\n\nthird\n").unwrap();
 
         assert_eq!(written, b"first\n\nthird\n");
-    }
-
-    #[test]
-    fn writes_empty_stdin() {
-        let mut written = Vec::new();
-
-        write_child_stdin(Some(&mut written), "").unwrap();
-
-        assert!(written.is_empty());
     }
 
     #[test]
@@ -361,18 +227,16 @@ mod tests {
             Duration::from_millis(2),
             Duration::from_millis(300),
         );
-
         assert_eq!(timeout, Duration::from_millis(300));
     }
 
     #[test]
-    fn run_timeout() {
+    fn run_timeout_includes_compile_budget() {
         let timeout = process_timeout_for_mode(
             Mode::Run,
             Duration::from_millis(2),
             Duration::from_millis(300),
         );
-
         assert_eq!(timeout, Duration::from_millis(302));
     }
 }

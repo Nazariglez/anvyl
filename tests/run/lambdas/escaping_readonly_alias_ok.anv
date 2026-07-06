@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// Anvyx
+// Anvyx
+// @match-end
+
+fn make(name: string) -> fn() -> string {
+    || name
+}
+
+fn main() {
+    let first = make("Anvyx");
+    let second = first;
+    println(first());
+    println(second());
+}

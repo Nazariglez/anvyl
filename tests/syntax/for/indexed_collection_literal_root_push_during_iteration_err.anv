@@ -1,7 +1,6 @@
 // @mode: check
 // @expect: error
 // @contains: cannot change list shape while iterating it
-// @frontend: new
 
 fn main() {
     var lists: [[int]] = [[1], [2]];

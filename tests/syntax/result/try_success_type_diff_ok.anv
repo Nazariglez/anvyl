@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn read_int() -> Result<int, string> {
     Result.Ok(1)

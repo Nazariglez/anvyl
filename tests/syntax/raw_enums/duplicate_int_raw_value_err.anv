@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: duplicate raw enum value 1 on variant 'E.B'
 
 enum E: int {

@@ -77,6 +77,10 @@ pub(super) fn scoped_lambda_ctor(args: &str, ret: &str) -> String {
     format!("{}::<'_, 'cx, {args}, {ret}>", rt_path("ScopedLambda"))
 }
 
+pub(super) fn scoped_lambda_from_raw(ctor: &str, state: &str, thunk: &str) -> String {
+    format!("unsafe {{ {ctor}::__anvyx_from_raw(&mut {state}, {thunk}) }}")
+}
+
 pub(super) fn scoped_lambda_thunk() -> &'static str {
     "__anv_scoped_call"
 }
@@ -135,6 +139,34 @@ pub(super) fn anv_callback_ctor_ty(args: &str, ret: &str) -> String {
 
 pub(super) fn callback_key_ty() -> String {
     rt_path("CallbackKey")
+}
+
+pub(super) fn callback_key_new(
+    owner_id: &str,
+    shutdown_generation: &str,
+    table_id: usize,
+    signature_id: usize,
+    index: &str,
+    generation: &str,
+) -> String {
+    format!(
+        "{}::new({owner_id}, {shutdown_generation}, std::num::NonZeroU64::new({table_id}).unwrap(), std::num::NonZeroU64::new({signature_id}).unwrap(), {index}, {generation})",
+        callback_key_ty()
+    )
+}
+
+pub(super) fn escaping_lambda_new(
+    ctor: &str,
+    owner: &str,
+    key: &str,
+    call_thunk: &str,
+    close_thunk: &str,
+) -> String {
+    format!("unsafe {{ {ctor}::__anvyx_new({owner}.clone(), {key}, {call_thunk}, {close_thunk}) }}")
+}
+
+pub(super) fn anv_callback_new(ctor: &str, owner: &str, erased: &str, call_thunk: &str) -> String {
+    format!("unsafe {{ {ctor}::__anvyx_new({owner}.clone(), {erased}, {call_thunk}) }}")
 }
 
 pub(super) fn callback_check_identity(key: &str, table_id: usize, signature_id: usize) -> String {
@@ -363,7 +395,11 @@ pub(super) fn runtime_ctx_ref_ty() -> String {
 }
 
 pub(super) fn runtime_ctx_ty_with(rt_lifetime: &str) -> String {
-    format!("{}<'cx, {rt_lifetime}>", rt_path("Ctx"))
+    runtime_ctx_ty_with_lifetimes("'cx", rt_lifetime)
+}
+
+pub(super) fn runtime_ctx_ty_with_lifetimes(ctx_lifetime: &str, rt_lifetime: &str) -> String {
+    format!("{}<{ctx_lifetime}, {rt_lifetime}>", rt_path("Ctx"))
 }
 
 pub(super) fn safepoint_state_ty() -> String {
@@ -829,6 +865,10 @@ pub(super) fn map_heap_access_error(expr: &str) -> String {
 
 pub(super) fn rt_heap_erase(rt: &str, object: &str) -> String {
     map_heap_access_error(&format!("{rt}.heap().erase({object})"))
+}
+
+pub(super) fn rt_heap_ref_erase(rt: &str, object: &str) -> String {
+    map_heap_access_error(&format!("{rt}.heap_ref().erase({object})"))
 }
 
 pub(super) fn rt_heap_try_with_erased(

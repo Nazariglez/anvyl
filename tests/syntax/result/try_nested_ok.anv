@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 fn nested() -> Result<Result<int, string>, string> {
     let inner: Result<int, string> = Result.Ok(1);

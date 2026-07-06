@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// HI
+// hi
+// Hi
+// b
+// axc
+// @match-end
+
+fn main() {
+    let text = "  Hi  ";
+    assert(text.contains("Hi"));
+    assert(text.starts_with("  "));
+    println(text.find("Hi"));
+    println("hi".to_upper());
+    println("HI".to_lower());
+    println(text.trim());
+    if let ch? = "abc".char_at(1) {
+        println(ch);
+    }
+    println("abc".replace("b", "x"));
+}

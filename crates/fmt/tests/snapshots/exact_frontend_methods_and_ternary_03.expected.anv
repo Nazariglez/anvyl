@@ -1,0 +1,1 @@
+fn f(cond: bool) -> int { cond ? 1 + 2 : 3 * 4 }

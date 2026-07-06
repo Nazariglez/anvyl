@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: success
-// @frontend: new
 
 extern fn app_run(update: fn(float) -> void, draw: fn() -> void);
 

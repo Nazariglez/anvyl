@@ -1,7 +1,0 @@
-// @helper
-
-import ping { start_ping };
-
-pub fn do_pong(n: int) -> string {
-    start_ping(n)
-}

@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: embed field selector 'damage' names a method; use `fn damage`
 
 struct Health {

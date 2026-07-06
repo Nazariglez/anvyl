@@ -1,6 +1,5 @@
 // @mode: check
 // @expect: error
-// @frontend: new
 // @contains: implicit dynamic strengthening is not allowed
 
 contract A {

@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 10
+// 1
+// @match-end
+
+fn zero() -> int {
+    10
+}
+
+fn use_now() -> int {
+    var count = 0;
+    let f = || {
+        count += 1;
+        count
+    };
+    f()
+}
+
+fn main() {
+    let maker = || zero;
+    let g = maker();
+    println(g());
+    println(use_now());
+}

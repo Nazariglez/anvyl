@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn ignore(ref x: int) {}
+
+fn main() {
+    var xs = [1];
+    ignore(xs[0]);
+    println(xs[0]);
+}

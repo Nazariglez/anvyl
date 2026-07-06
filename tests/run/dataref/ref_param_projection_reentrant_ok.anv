@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match: 12
+
+dataref Counter {
+    value: int,
+}
+
+fn apply(ref x: int, cb: fn()) {
+    x += 1;
+    cb();
+    x += 1;
+}
+
+fn main() {
+    var c = Counter { value: 0 };
+    let cb = || { c.value += 10; };
+    apply(c.value, cb);
+    println(c.value);
+}

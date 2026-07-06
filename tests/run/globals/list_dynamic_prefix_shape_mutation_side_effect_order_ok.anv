@@ -1,0 +1,30 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// 2
+// @match-end
+
+struct State {
+    rows: [[int]],
+}
+
+lazy var state = State { rows: [[1]] };
+
+fn choose_row() -> int {
+    state.rows.push([10]);
+    1
+}
+
+fn next_value() -> int {
+    state.rows.push([]);
+    2
+}
+
+fn main() {
+    state.rows[choose_row()].push(next_value());
+    println(state.rows[0][0]);
+    println(state.rows[1][0]);
+    println(state.rows[1][1]);
+}

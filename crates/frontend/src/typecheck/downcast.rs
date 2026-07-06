@@ -209,7 +209,14 @@ pub(super) fn record_fact(
     if let Some(source) =
         contracts::contract_set_key_for_ref(&tc.decls, &tc.current_module, source_contract)
     {
-        tc.record_resolved_dyn_downcast(expr_site, source_site, source, target, mutable, site.span);
+        tc.record_resolved_dyn_downcast(
+            expr_site,
+            &source_site,
+            source,
+            target,
+            mutable,
+            site.span,
+        );
     } else if let Some(hole) = dyn_infer::hole_id(source_contract) {
         tc.dyn_infer.add_downcast(
             tc.current_module.clone(),

@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: seen
+
+fn main() {
+    var opt: int? = 1;
+    if ref _? = opt {
+        println("seen");
+    }
+}
