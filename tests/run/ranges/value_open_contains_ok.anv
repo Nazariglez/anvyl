@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// false
+// true
+// false
+// true
+// @match-end
+
+fn main() {
+    let from = -1..;
+    println(from.contains(10));
+    println(from.contains(-2));
+
+    let to = ..3;
+    println(to.contains(2));
+    println(to.contains(3));
+
+    let to_inclusive = ..=3;
+    println(to_inclusive.contains(3));
+}

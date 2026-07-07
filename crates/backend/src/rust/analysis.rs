@@ -82,6 +82,10 @@ fn stmt_calls_fallible(
                 .any(|operand| operand_has_fallible_place(program, function, operand))
                 || block_calls_fallible(program, fallible, function, &range.body)
         }
+        RirStmt::CollectionFor(for_) => {
+            operand_has_fallible_place(program, function, &for_.step)
+                || block_calls_fallible(program, fallible, function, &for_.body)
+        }
         RirStmt::DataRefSet { object, value, .. } => {
             operand_uses_mut_place_param(function, object)
                 || operand_uses_mut_place_param(function, value)
@@ -448,6 +452,8 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             operands_context_use(program, function, range_for_operands(range))
                 .union(block_context_use(program, function, &range.body))
         }
+        RirStmt::CollectionFor(for_) => operand_context_use(program, function, &for_.step)
+            .union(block_context_use(program, function, &for_.body)),
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);

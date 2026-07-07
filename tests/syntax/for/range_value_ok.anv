@@ -1,0 +1,21 @@
+// @mode: check
+// @expect: success
+
+fn use_range(r: Range<int>) {
+    for n in r {
+        let _: int = n;
+    }
+}
+
+fn main() {
+    let r = 0..3;
+    for n in r {
+        let _: int = n;
+    }
+
+    let inclusive = 0..=3;
+    for i, n in inclusive {
+        let _: int = i;
+        let _: int = n;
+    }
+}

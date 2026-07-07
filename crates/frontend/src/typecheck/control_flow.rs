@@ -957,7 +957,6 @@ fn alias_for_root<'a>(
 fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
     let range_kind = tc.decls.core_range_kind(iterable_ty);
     check_for_range_support(node, iterable_ty, range_kind, tc);
-    check_for_rev(node, iterable_ty, tc);
     check_for_step(node, iterable_ty, range_kind, tc);
 }
 
@@ -970,14 +969,6 @@ fn check_for_range_support(
     let Some(range_kind) = range_kind else {
         return;
     };
-
-    if !matches!(node.iterable.node.kind, ExprKind::Range(_)) {
-        push_for_modifier_error(
-            tc,
-            "range for-loops require range literals",
-            node.iterable.span,
-        );
-    }
 
     if matches!(
         range_kind,
@@ -998,16 +989,6 @@ fn check_for_range_support(
     }
 }
 
-fn check_for_rev(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
-    if node.reversed && matches!(iterable_ty, Type::Map { .. }) {
-        push_for_modifier_error(
-            tc,
-            "rev is not supported for map iteration",
-            node.iterable.span,
-        );
-    }
-}
-
 fn check_for_step(
     node: &For,
     iterable_ty: &Type,
@@ -1017,12 +998,6 @@ fn check_for_step(
     let Some(step) = &node.step else {
         return;
     };
-
-    if matches!(iterable_ty, Type::Map { .. }) {
-        push_for_modifier_error(tc, "step is not supported for map iteration", step.span);
-        check_expr_checked(step, tc);
-        return;
-    }
 
     let step_checked = check_expr_checked(step, tc);
     let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);

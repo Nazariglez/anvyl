@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// false
+// true
+// false
+// true
+// @match-end
+
+fn main() {
+    println((0..1).is_empty());
+    println((1..1).is_empty());
+    println((1..=1).is_empty());
+    println((2..=1).is_empty());
+}

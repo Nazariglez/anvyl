@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: bounded ranges
+
+fn main() {
+    let r = 0..;
+    for n in r {
+        println(n);
+    }
+}

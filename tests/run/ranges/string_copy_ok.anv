@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// b
+// c
+// @match-end
+
+fn main() {
+    let a = "a";
+    let b = "b";
+    let c = "c";
+    var xs: [string] = [a];
+    xs.push(b);
+    xs.push(c);
+    let ys: [string] = xs[1..=2];
+    for value in ys {
+        println(value);
+    }
+}

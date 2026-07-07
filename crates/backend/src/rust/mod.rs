@@ -45,17 +45,17 @@ use self::{
     rep_policy::{AirRustRepPolicy, RustRepPolicy},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
-        RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
-        RirCollectionRootKind, RirCollectionStorage, RirCollectionStorageId,
-        RirCollectionStorageKind, RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirCtxPlan,
-        RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirEnumRepr,
-        RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg,
-        RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig,
-        RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop,
-        RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirCellStorage, RirCollectionAccess, RirCollectionFor, RirCollectionLoanMode,
+        RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
+        RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
+        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
+        RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam,
+        RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
+        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
         RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
         RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
         RirRValue, RirRangeFor, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
@@ -2291,6 +2291,31 @@ impl<'a> PlanCx<'a> {
                 }));
                 Ok(stmts)
             }
+            air::AirStmt::CollectionFor(for_) => {
+                let step = self.plan_operand_read(function, &for_.step, locals);
+                let body = self.plan_loop_body(
+                    function,
+                    for_.id,
+                    &for_.body,
+                    locals,
+                    zero_env_function_values,
+                    initialized_cells,
+                    possible_cells,
+                )?;
+                let mut stmts = step.stmts;
+                stmts.push(RirStmt::CollectionFor(RirCollectionFor {
+                    id: RirLoopId::from_index(for_.id.index()),
+                    len: RirLocalId::from_index(for_.len.index()),
+                    step: step.operand,
+                    reversed: for_.reversed,
+                    index: RirLocalId::from_index(for_.index.index()),
+                    ordinal: for_
+                        .ordinal
+                        .map(|local| RirLocalId::from_index(local.index())),
+                    body,
+                }));
+                Ok(stmts)
+            }
             air::AirStmt::CollectionLoan(loan) => {
                 let root = self.lower_collection_loan_root(function, index, loan, locals)?;
                 let body = self.plan_air_block(
@@ -3546,6 +3571,12 @@ impl<'a> PlanCx<'a> {
                     self.collection_slot_block(function, scope, access, range.body, false)?;
                 range.body = body;
                 (RirStmt::RangeFor(range), updates_slot)
+            }
+            RirStmt::CollectionFor(mut for_) => {
+                let (body, updates_slot) =
+                    self.collection_slot_block(function, scope, access, for_.body, false)?;
+                for_.body = body;
+                (RirStmt::CollectionFor(for_), updates_slot)
             }
             RirStmt::CollectionLoanScope(mut loan) => {
                 let (body, updates_slot) =

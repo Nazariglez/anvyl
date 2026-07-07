@@ -468,6 +468,10 @@ impl ProfileCx<'_> {
                     self.check_operand(site, &range.step);
                     self.check_air_block(function, &range.body);
                 }
+                air::AirStmt::CollectionFor(for_) => {
+                    self.check_operand(site, &for_.step);
+                    self.check_air_block(function, &for_.body);
+                }
                 air::AirStmt::CollectionLoan(loan) => {
                     if let Err(gap) = self.access().collection_loan_plan(function, loan) {
                         self.push(site, profile_gap_kind(gap));
@@ -977,7 +981,7 @@ impl ProfileCx<'_> {
         };
         if source_elem != result_elem {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
-        } else if copied && !self.policy().value_place_shareable(result_elem) {
+        } else if copied && !self.policy().value_from_ref_supported(result_elem) {
             self.push(site, ProfileErrorKind::NonCopyValueRequired);
         }
     }

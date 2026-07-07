@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 26
+
+fn main() {
+    var map = ["a": 1, "b": 2, "c": 3];
+    for k, ref v in rev map step 2 {
+        v += 10;
+    }
+    var sum = 0;
+    for k, v in map {
+        sum += v;
+    }
+    println(sum);
+}

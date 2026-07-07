@@ -1,0 +1,42 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 9
+// 1
+// 3
+// @match-end
+
+fn sum(r: Range<int>) -> int {
+    var total = 0;
+    for n in r {
+        total += n;
+    }
+    total
+}
+
+fn make() -> RangeInclusive<int> {
+    2..=4
+}
+
+fn make_counted(ref calls: int) -> Range<int> {
+    calls += 1;
+    0..3
+}
+
+fn main() {
+    println(sum(0..3));
+    var total = 0;
+    for n in make() {
+        total += n;
+    }
+    println(total);
+
+    var calls = 0;
+    var counted_total = 0;
+    for n in make_counted(calls) {
+        counted_total += n;
+    }
+    println(calls);
+    println(counted_total);
+}

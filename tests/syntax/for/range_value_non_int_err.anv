@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: int bounds
+
+fn main() {
+    let r = 0.0..1.0;
+    for n in r {
+        println(n);
+    }
+}

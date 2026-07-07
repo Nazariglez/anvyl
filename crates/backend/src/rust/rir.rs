@@ -637,6 +637,7 @@ pub enum RirStmt {
     If(RirIf),
     Loop(RirLoop),
     RangeFor(RirRangeFor),
+    CollectionFor(RirCollectionFor),
     CollectionLoanScope(RirCollectionLoanScope),
     CollectionSlotScope(RirStructuredBlock),
     EnumMatch(RirEnumMatch),
@@ -655,6 +656,7 @@ pub(super) fn stmt_child_blocks_any(
         }
         RirStmt::Loop(loop_) => block_matches(&loop_.body),
         RirStmt::RangeFor(range) => block_matches(&range.body),
+        RirStmt::CollectionFor(for_) => block_matches(&for_.body),
         RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
         RirStmt::CollectionSlotScope(block) => block_matches(block),
         RirStmt::OptionMatch(match_) => {
@@ -757,6 +759,17 @@ pub struct RirRangeFor {
     pub reversed: bool,
     pub ordinal: Option<RirLocalId>,
     pub item: RirLocalId,
+    pub body: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirCollectionFor {
+    pub id: RirLoopId,
+    pub len: RirLocalId,
+    pub step: RirOperand,
+    pub reversed: bool,
+    pub index: RirLocalId,
+    pub ordinal: Option<RirLocalId>,
     pub body: RirStructuredBlock,
 }
 
@@ -4081,39 +4094,53 @@ impl VerifyCx<'_> {
             }
             RirStmt::RangeFor(range) => {
                 if let Some(int) = self.type_id(RirType::Int) {
-                    for operand in [&range.start, &range.end, &range.step] {
-                        self.check_value_operand_ty(site, function, operand, int);
-                    }
-                    for local in range.ordinal.into_iter().chain([range.item]) {
-                        self.check_local_id(site, function, local);
-                        if function
-                            .locals
-                            .get(local.index())
-                            .is_some_and(|local| local.ty != int)
-                        {
-                            self.push(
-                                site,
-                                RirVerifyErrorKind::TypeMismatch {
-                                    expected: int,
-                                    found: function.locals[local.index()].ty,
-                                },
-                            );
-                        }
-                    }
+                    self.check_int_operands(
+                        site,
+                        function,
+                        [&range.start, &range.end, &range.step],
+                        int,
+                    );
+                    self.check_int_locals(
+                        site,
+                        function,
+                        range.ordinal.into_iter().chain([range.item]),
+                        int,
+                    );
                 }
                 self.loops.push(range.id);
                 let mut entry = self.block_entry_state();
-                if range.item.index() < entry.definite.len() {
-                    entry.definite[range.item.index()] = true;
-                    entry.possible[range.item.index()] = true;
-                }
-                if let Some(ordinal) = range.ordinal
-                    && ordinal.index() < entry.definite.len()
-                {
-                    entry.definite[ordinal.index()] = true;
-                    entry.possible[ordinal.index()] = true;
-                }
+                Self::init_entry_locals(&mut entry, range.ordinal.into_iter().chain([range.item]));
                 self.check_structured_block(function_id, function, &range.body, entry, None);
+                self.loops.pop();
+            }
+            RirStmt::CollectionFor(for_) => {
+                if let Some(int) = self.type_id(RirType::Int) {
+                    self.check_int_operands(site, function, [&for_.step], int);
+                    self.check_int_locals(
+                        site,
+                        function,
+                        [Some(for_.len), Some(for_.index), for_.ordinal]
+                            .into_iter()
+                            .flatten(),
+                        int,
+                    );
+                    if function.locals.get(for_.len.index()).is_some()
+                        && !self
+                            .initialized
+                            .get(for_.len.index())
+                            .copied()
+                            .unwrap_or(false)
+                    {
+                        self.push(site, RirVerifyErrorKind::UninitializedLocal(for_.len));
+                    }
+                }
+                self.loops.push(for_.id);
+                let mut entry = self.block_entry_state();
+                Self::init_entry_locals(
+                    &mut entry,
+                    [Some(for_.index), for_.ordinal].into_iter().flatten(),
+                );
+                self.check_structured_block(function_id, function, &for_.body, entry, None);
                 self.loops.pop();
             }
             RirStmt::CollectionLoanScope(scope) => {
@@ -5468,6 +5495,54 @@ impl VerifyCx<'_> {
             .any(|loan| loan.root.replaced_by_place(dst))
     }
 
+    fn check_int_operands<'b>(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        operands: impl IntoIterator<Item = &'b RirOperand>,
+        int: RirTypeId,
+    ) {
+        for operand in operands {
+            self.check_value_operand_ty(site, function, operand, int);
+        }
+    }
+
+    fn check_int_locals(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        locals: impl IntoIterator<Item = RirLocalId>,
+        int: RirTypeId,
+    ) {
+        for local in locals {
+            let Some(local_decl) = function.locals.get(local.index()) else {
+                self.push(site, RirVerifyErrorKind::BadId);
+                continue;
+            };
+            if local_decl.ty != int {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::TypeMismatch {
+                        expected: int,
+                        found: local_decl.ty,
+                    },
+                );
+            }
+        }
+    }
+
+    fn init_entry_locals(
+        entry: &mut RirBlockEntryState,
+        locals: impl IntoIterator<Item = RirLocalId>,
+    ) {
+        for local in locals {
+            if local.index() < entry.definite.len() {
+                entry.definite[local.index()] = true;
+                entry.possible[local.index()] = true;
+            }
+        }
+    }
+
     fn block_entry_state(&self) -> RirBlockEntryState {
         RirBlockEntryState {
             definite: self.initialized.clone(),
@@ -5613,6 +5688,7 @@ impl VerifyCx<'_> {
             RirStmt::CollectionSlotScope(block) => self.structured_block_falls_through(block),
             RirStmt::Loop(_)
             | RirStmt::RangeFor(_)
+            | RirStmt::CollectionFor(_)
             | RirStmt::CollectionLoanScope(_)
             | RirStmt::Init { .. }
             | RirStmt::GlobalEnsure { .. }
@@ -6266,7 +6342,7 @@ impl VerifyCx<'_> {
                 };
                 if self.sequence_elem(source.ty) != Some(elem) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                } else if !RustRepPolicy::new(self.program).shareable_value(elem) {
+                } else if !RustRepPolicy::new(self.program).value_from_ref_supported(elem) {
                     self.push(site, RirVerifyErrorKind::NonCopyValueRequired);
                 }
                 Some(*ty)

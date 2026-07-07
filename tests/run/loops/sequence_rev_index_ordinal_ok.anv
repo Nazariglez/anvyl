@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 0
+// 30
+// 1
+// 20
+// 2
+// 10
+// 0
+// 50
+// 1
+// 30
+// 2
+// 10
+// @match-end
+
+fn main() {
+    for i, x in rev [10, 20, 30] {
+        println(i);
+        println(x);
+    }
+    for i, x in rev [10, 20, 30, 40, 50] step 2 {
+        println(i);
+        println(x);
+    }
+}

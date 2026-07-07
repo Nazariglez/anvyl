@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// before
+// a
+// c
+// @match-end
+
+fn step() -> int {
+    println("before");
+    2
+}
+
+fn main() {
+    let map = ["a": 1, "b": 2, "c": 3];
+    for k, v in map step step() {
+        println(k);
+    }
+}

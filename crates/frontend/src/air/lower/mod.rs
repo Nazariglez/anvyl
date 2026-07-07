@@ -3,22 +3,23 @@ use std::collections::{HashMap, HashSet};
 use anvyx_externs::ParamFlow;
 
 use super::{
-    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionLoan,
-    AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
-    AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
-    AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail, BindingId as AirBindingId,
-    CallArg, Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource,
-    ConstData, ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi,
-    ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember,
-    ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
-    ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl,
-    FieldId, Function, FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization,
-    FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect, LambdaCaptureArg,
-    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
-    LocalKind, MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param,
-    ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue,
-    ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType,
-    TypeData, TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
+    AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionFor,
+    AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot,
+    AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop,
+    AirLoopId, AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail,
+    BindingId as AirBindingId, CallArg, Callee, CaptureCellDecl, CaptureCellId,
+    CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId, ConstValue, CoreEnumKind,
+    DynContractData, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl, ExternFieldDecl,
+    ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
+    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
+    ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind,
+    FunctionOwner, FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId,
+    GlobalInitEffect, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
+    LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
+    Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
+    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
+    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
+    VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -35,8 +36,8 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
-        CallableParent, CaptureStorageOrigin, ConstTerm, DeclarationIndex, DefaultArgFact,
-        DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
+        CallableParent, CaptureStorageOrigin, ConstTerm, CoreRangeKind, DeclarationIndex,
+        DefaultArgFact, DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
         FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin, GenericArgs,
         GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect, GlobalKey,
         GlobalSig, LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
@@ -2589,8 +2590,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_for(&mut self, for_: &ast::For) -> Result<(), LowerError> {
-        if let ExprKind::Range(range) = &for_.iterable.node.kind {
-            return self.lower_range_for(for_, &range.node);
+        if let Some(parts) = self.lower_range_for_parts(&for_.iterable)? {
+            return self.lower_range_for(for_, parts);
         }
 
         let plan = self.for_plan(for_)?;
@@ -2611,22 +2612,61 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(())
     }
 
-    fn lower_range_for(&mut self, for_: &ast::For, range: &ast::Range) -> Result<(), LowerError> {
-        let ast::Range::Bounded {
-            start,
-            end,
-            inclusive,
-        } = range
+    fn lower_range_for_parts(
+        &mut self,
+        iterable: &ExprNode,
+    ) -> Result<Option<RangeForParts>, LowerError> {
+        let ty = self.lower_expr_ty(iterable.node.id)?;
+        let Some(kind) = self
+            .cx
+            .decls
+            .as_ref()
+            .and_then(|decls| decls.core_range_kind(&ty))
         else {
-            return Err(LowerError::UnsupportedStmt {
-                kind: "RangeFor",
-                span: Some(self.source_span(for_.iterable.span)),
-            });
+            return Ok(None);
         };
+        if let ExprKind::Range(range) = &iterable.node.kind {
+            let ast::Range::Bounded {
+                start,
+                end,
+                inclusive,
+            } = &range.node
+            else {
+                return Err(LowerError::UnsupportedStmt {
+                    kind: "RangeFor",
+                    span: Some(self.source_span(iterable.span)),
+                });
+            };
+            let int_ty = self.cx.lower_ty(&Type::Int)?;
+            return Ok(Some(RangeForParts {
+                start: self.lower_value_to(start, int_ty, start)?,
+                end: self.lower_value_to(end, int_ty, end)?,
+                inclusive: *inclusive,
+            }));
+        }
+        let inclusive = match kind {
+            CoreRangeKind::Exclusive => false,
+            CoreRangeKind::Inclusive => true,
+            CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive => {
+                return Err(LowerError::UnsupportedStmt {
+                    kind: "RangeFor",
+                    span: Some(self.source_span(iterable.span)),
+                });
+            }
+        };
+        let value = self.lower_value(iterable)?;
+        let place = self.place_from_operand(value, iterable)?;
+        let start = self.project_field(iterable, place.clone(), Ident::new(RANGE_START_FIELD))?;
+        let end = self.project_field(iterable, place, Ident::new(RANGE_END_FIELD))?;
+        Ok(Some(RangeForParts {
+            start: Operand::Place(start),
+            end: Operand::Place(end),
+            inclusive,
+        }))
+    }
 
+    fn lower_range_for(&mut self, for_: &ast::For, parts: RangeForParts) -> Result<(), LowerError> {
         let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let start = self.lower_value_to(start, int_ty, start)?;
-        let end = self.lower_value_to(end, int_ty, end)?;
         let step = self.lower_for_step(for_)?;
         let item = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
         let ordinal = (for_.bindings.len() == 2)
@@ -2646,10 +2686,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.ensure_open()?;
         self.block.stmts.push(AirStmt::RangeFor(AirRangeFor {
             id,
-            start,
-            end,
+            start: parts.start,
+            end: parts.end,
             step,
-            inclusive: *inclusive,
+            inclusive: parts.inclusive,
             reversed: for_.reversed,
             ordinal,
             item,
@@ -2747,9 +2787,20 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let item = match for_.bindings.as_slice() {
             [item] => item,
             [index_binding, item] => {
-                bindings.push(ForBindingPlan::OwnedIndex {
-                    pattern: index_binding.pattern.clone(),
-                });
+                if !matches!(&index_binding.pattern.node, Pattern::Wildcard) {
+                    let int_ty = self.cx.lower_ty(&Type::Int)?;
+                    let local = self.push_local(
+                        None,
+                        None,
+                        int_ty,
+                        AirMutability::Mutable,
+                        LocalKind::Temp,
+                    );
+                    bindings.push(ForBindingPlan::OwnedIndex {
+                        pattern: index_binding.pattern.clone(),
+                        local,
+                    });
+                }
                 item
             }
             _ => return Err(unsupported_pattern_stmt(&for_.bindings[0].pattern)),
@@ -2871,63 +2922,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 source: plan.root.clone(),
             },
         )?;
-        self.init_for_index(for_.reversed, plan)?;
-        let body = self.with_nested_block(|this| this.lower_for_loop_body(id, for_, plan))?;
+        let body = self.with_nested_block(|this| this.lower_for_iteration_scope(id, for_, plan))?;
         self.ensure_open()?;
-        self.block.stmts.push(AirStmt::Loop(AirLoop { id, body }));
-        Ok(())
-    }
-
-    fn init_for_index(&mut self, reversed: bool, plan: &ForPlan) -> Result<(), LowerError> {
-        let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let init = if reversed {
-            let one = self.int_const(1)?;
-            let offset = self.emit_typed_temp(
-                int_ty,
-                RValue::Binary {
-                    op: BinaryOp::Sub,
-                    lhs: plan.step.clone(),
-                    rhs: one,
-                    ty: int_ty,
-                },
-            )?;
-            RValue::Binary {
-                op: BinaryOp::Add,
-                lhs: Operand::Place(self.local_place(plan.len)),
-                rhs: offset,
-                ty: int_ty,
-            }
-        } else {
-            RValue::Binary {
-                op: BinaryOp::Sub,
-                lhs: self.int_const(0)?,
-                rhs: plan.step.clone(),
-                ty: int_ty,
-            }
-        };
-        self.emit_init(plan.index, init)
-    }
-
-    fn lower_for_loop_body(
-        &mut self,
-        id: AirLoopId,
-        for_: &ast::For,
-        plan: &ForPlan,
-    ) -> Result<(), LowerError> {
-        self.advance_for_index(for_.reversed, plan)?;
-        let cond = self.for_loop_cond(for_.reversed, plan)?;
-        let then_block =
-            self.with_nested_block(|this| this.lower_for_iteration_scope(id, for_, plan))?;
-        let else_block = AirBlock {
-            stmts: vec![],
-            tail: AirTail::Break(id),
-        };
-        self.ensure_open()?;
-        self.block.stmts.push(AirStmt::If(AirIf {
-            cond,
-            then_block,
-            else_block: Some(else_block),
-        }));
+        self.block
+            .stmts
+            .push(AirStmt::CollectionFor(AirCollectionFor {
+                id,
+                len: plan.len,
+                step: plan.step.clone(),
+                reversed: for_.reversed,
+                index: plan.index,
+                ordinal: plan.ordinal(),
+                body,
+            }));
         Ok(())
     }
 
@@ -2989,50 +2996,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .collect()
     }
 
-    fn advance_for_index(&mut self, reversed: bool, plan: &ForPlan) -> Result<(), LowerError> {
-        let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let op = if reversed {
-            BinaryOp::Sub
-        } else {
-            BinaryOp::Add
-        };
-        self.emit_assign(
-            self.local_place(plan.index),
-            RValue::Binary {
-                op,
-                lhs: Operand::Place(self.local_place(plan.index)),
-                rhs: plan.step.clone(),
-                ty: int_ty,
-            },
-        )
-    }
-
-    fn for_loop_cond(&mut self, reversed: bool, plan: &ForPlan) -> Result<Operand, LowerError> {
-        let bool_ty = self.cx.lower_ty(&Type::Bool)?;
-        let cond = RValue::Binary {
-            op: if reversed {
-                BinaryOp::GreaterThanEq
-            } else {
-                BinaryOp::LessThan
-            },
-            lhs: Operand::Place(self.local_place(plan.index)),
-            rhs: if reversed {
-                self.int_const(0)?
-            } else {
-                Operand::Place(self.local_place(plan.len))
-            },
-            ty: bool_ty,
-        };
-        self.emit_typed_temp(bool_ty, cond)
-    }
-
     fn lower_for_iteration_bindings(&mut self, plan: &ForPlan) -> Result<(), LowerError> {
         let mut map_entry = None;
         for binding in &plan.bindings {
             match binding {
-                ForBindingPlan::OwnedIndex { pattern } => self.lower_for_pattern_binding(
+                ForBindingPlan::OwnedIndex { pattern, local } => self.lower_for_pattern_binding(
                     pattern,
-                    Operand::Place(self.local_place(plan.index)),
+                    Operand::Place(self.local_place(*local)),
                     false,
                 )?,
                 ForBindingPlan::OwnedElement { pattern, ty } => {
@@ -4574,6 +4544,66 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn lower_range_value(
+        &mut self,
+        expr: &ExprNode,
+        range: &ast::Range,
+    ) -> Result<Operand, LowerError> {
+        let source_ty = self.lower_expr_ty(expr.node.id)?;
+        if self
+            .cx
+            .decls
+            .as_ref()
+            .and_then(|decls| decls.core_range_kind(&source_ty))
+            .is_none()
+        {
+            return Err(unsupported_expr(expr));
+        }
+        let ty = self.cx.lower_ty(&source_ty)?;
+        let aggregate = match self.cx.program.type_data(ty) {
+            TypeData::Aggregate(aggregate) => *aggregate,
+            _ => return Err(unsupported_expr(expr)),
+        };
+        let aggregate_fields = self.cx.program.aggregate(aggregate).fields.clone();
+        let field_ty = |name: &str| {
+            aggregate_fields
+                .iter()
+                .find(|field| field.name.as_str() == name)
+                .map(|field| field.ty)
+                .ok_or_else(|| unsupported_expr(expr))
+        };
+        let (start, end) = match range {
+            ast::Range::Bounded { start, end, .. } => (
+                Some(self.lower_value_to(start, field_ty(RANGE_START_FIELD)?, start)?),
+                Some(self.lower_value_to(end, field_ty(RANGE_END_FIELD)?, end)?),
+            ),
+            ast::Range::From { start } => (
+                Some(self.lower_value_to(start, field_ty(RANGE_START_FIELD)?, start)?),
+                None,
+            ),
+            ast::Range::To { end, .. } => (
+                None,
+                Some(self.lower_value_to(end, field_ty(RANGE_END_FIELD)?, end)?),
+            ),
+        };
+        let fields = aggregate_fields
+            .iter()
+            .map(|field| match field.name.as_str() {
+                RANGE_START_FIELD => start.clone().ok_or_else(|| unsupported_expr(expr)),
+                RANGE_END_FIELD => end.clone().ok_or_else(|| unsupported_expr(expr)),
+                _ => Err(unsupported_expr(expr)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind: AggregateCtor::Struct(aggregate),
+                fields,
+                ty,
+            },
+        )
+    }
+
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         if let Some(value) = self.facts.const_values.get(&expr.node.id).cloned() {
             return self.lower_const_value(expr, &value);
@@ -4618,6 +4648,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 self.project_tuple_index_operand(value, expr, tuple.node.index)
             }
             ExprKind::Index(index) => self.lower_index_value(expr, index),
+            ExprKind::Range(range) => self.lower_range_value(expr, &range.node),
             ExprKind::Block(block) => self.lower_block_value(expr, block),
             ExprKind::If(if_expr) => self.lower_if_value(expr, if_expr),
             ExprKind::IfLet(if_let) => self.lower_if_let_value(expr, if_let),
@@ -9506,6 +9537,15 @@ impl OptionalSubject {
     }
 }
 
+const RANGE_START_FIELD: &str = "start";
+const RANGE_END_FIELD: &str = "end";
+
+struct RangeForParts {
+    start: Operand,
+    end: Operand,
+    inclusive: bool,
+}
+
 struct ForPlan {
     root_kind: AirCollectionRootKind,
     mode: AirCollectionLoanMode,
@@ -9516,9 +9556,19 @@ struct ForPlan {
     bindings: Vec<ForBindingPlan>,
 }
 
+impl ForPlan {
+    fn ordinal(&self) -> Option<LocalId> {
+        self.bindings.iter().find_map(|binding| match binding {
+            ForBindingPlan::OwnedIndex { local, .. } => Some(*local),
+            _ => None,
+        })
+    }
+}
+
 enum ForBindingPlan {
     OwnedIndex {
         pattern: ast::PatternNode,
+        local: LocalId,
     },
     OwnedElement {
         pattern: ast::PatternNode,
@@ -12547,114 +12597,6 @@ mod tests {
     }
 
     #[test]
-    fn sequence_for_lowers_to_collection_loan_loop() {
-        let air = lower_root("fn f(xs: [int]) { for x in xs { x; } }", "f").expect("lower failed");
-        let function = air
-            .functions
-            .iter()
-            .find(|function| function.name == Ident::new("f"))
-            .expect("missing f");
-
-        assert!(function.body.block.stmts.iter().any(|stmt| matches!(
-            stmt,
-            AirStmt::CollectionLoan(AirCollectionLoan {
-                root_kind: AirCollectionRootKind::List,
-                mode: AirCollectionLoanMode::ReadonlySequence,
-                body,
-                ..
-            }) if matches!(body.stmts.as_slice(), [AirStmt::Init { .. }, AirStmt::Init { .. }, AirStmt::Loop(_)])
-        )));
-    }
-
-    #[test]
-    fn sequence_for_ref_lowers_slot_inside_collection_loan() {
-        let air = lower_root("fn f(ref xs: [int]) { for ref x in xs { x += 1; } }", "f")
-            .expect("lower failed");
-
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::CollectionSlotScope(AirCollectionSlotScope { slots, .. })
-                    if matches!(slots.as_slice(), [AirCollectionSlot { kind: AirCollectionSlotKind::SequenceElement, mutable: true, .. }])
-            )
-        }));
-    }
-
-    #[test]
-    fn sequence_for_with_index_lowers_owned_index_and_item() {
-        let air =
-            lower_root("fn f(xs: [int]) { for i, x in xs { i; x; } }", "f").expect("lower failed");
-
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::Use(Operand::Place(place)),
-                    ..
-                } if matches!(place.projection.as_slice(), [crate::air::Projection::Index(_)])
-            )
-        }));
-    }
-
-    #[test]
-    fn sequence_for_tuple_pattern_lowers() {
-        lower_root(
-            "fn f(xs: [(int, string)]) { for (a, b) in xs { a; b; } }",
-            "f",
-        )
-        .expect("lower failed");
-    }
-
-    #[test]
-    fn reverse_step_sequence_for_starts_from_last_index() {
-        let air = lower_root("fn f(xs: [int]) { for x in rev xs step 2 { x; } }", "f")
-            .expect("lower failed");
-
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::Binary {
-                        op: BinaryOp::Add,
-                        ..
-                    },
-                    ..
-                }
-            )
-        }));
-    }
-
-    #[test]
-    fn map_for_lowers_entry_index_loop() {
-        let air = lower_root("fn f(m: [string: int]) { for k, v in m { k; v; } }", "f")
-            .expect("lower failed");
-
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::MapEntryAt { .. },
-                    ..
-                }
-            )
-        }));
-        let function = air
-            .functions
-            .iter()
-            .find(|function| function.name == Ident::new("f"))
-            .expect("missing f");
-        assert!(function.body.block.stmts.iter().any(|statement| {
-            matches!(
-                statement,
-                AirStmt::CollectionLoan(AirCollectionLoan {
-                    mode: AirCollectionLoanMode::ReadonlyMap,
-                    ..
-                })
-            )
-        }));
-    }
-
-    #[test]
     fn map_for_tuple_entry_pattern_lowers() {
         lower_root("fn f(m: [string: int]) { for (k, v) in m { k; v; } }", "f")
             .expect("lower failed");
@@ -15592,6 +15534,10 @@ fn main() {}
                 AirStmt::RangeFor(range) => {
                     statements.push(AirStmt::RangeFor(range.clone()));
                     collect_block_statements(&range.body, statements);
+                }
+                AirStmt::CollectionFor(for_) => {
+                    statements.push(AirStmt::CollectionFor(for_.clone()));
+                    collect_block_statements(&for_.body, statements);
                 }
                 AirStmt::CollectionLoan(loan) => {
                     collect_block_statements(&loan.body, statements);

@@ -197,6 +197,11 @@ impl CompileCx<'_> {
                     self.check_operand(function, &range.step);
                     self.check_block(function, &range.body, calls);
                 }
+                AirStmt::CollectionFor(for_) => {
+                    self.push_collection_gap(function);
+                    self.check_operand(function, &for_.step);
+                    self.check_block(function, &for_.body, calls);
+                }
                 AirStmt::CollectionLoan(loan) => {
                     self.push_collection_gap(function);
                     self.check_place(function, &loan.root);

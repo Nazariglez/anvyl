@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// 1
+// c
+// 3
+// @match-end
+
+fn main() {
+    let map = ["a": 1, "b": 2, "c": 3, "d": 4];
+    for k, v in map step 2 {
+        println(k);
+        println(v);
+    }
+}

@@ -82,6 +82,7 @@ impl DataRefPlaceDescriptors {
             }
             RirStmt::Loop(loop_) => self.collect_block(program, function, &loop_.body),
             RirStmt::RangeFor(range) => self.collect_block(program, function, &range.body),
+            RirStmt::CollectionFor(for_) => self.collect_block(program, function, &for_.body),
             RirStmt::CollectionLoanScope(scope) => {
                 self.collect_block(program, function, &scope.body);
             }

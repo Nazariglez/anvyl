@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 6
+
+fn main() {
+    let r = 0..4;
+    var sum = 0;
+    for n in r {
+        sum += n;
+    }
+    println(sum);
+}

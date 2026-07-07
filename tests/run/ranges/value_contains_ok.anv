@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// true
+// false
+// true
+// true
+// true
+// false
+// @match-end
+
+fn main() {
+    let r = -2..3;
+    println(r.contains(-2));
+    println(r.contains(0));
+    println(r.contains(3));
+
+    let inclusive = -2..=3;
+    println(inclusive.contains(-2));
+    println(inclusive.contains(0));
+    println(inclusive.contains(3));
+    println(inclusive.contains(4));
+}

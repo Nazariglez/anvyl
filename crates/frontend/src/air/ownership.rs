@@ -378,6 +378,15 @@ impl ParamUseAnalyzer<'_> {
                 }
                 self.observe_air_block(&range.body);
             }
+            AirStmt::CollectionFor(for_) => {
+                self.observe_local(for_.len, ParamUse::ReadOnly);
+                self.observe_operand(&for_.step, ValueContext::Read);
+                self.observe_local(for_.index, ParamUse::ReadOnly);
+                if let Some(ordinal) = for_.ordinal {
+                    self.observe_local(ordinal, ParamUse::ReadOnly);
+                }
+                self.observe_air_block(&for_.body);
+            }
             AirStmt::CollectionLoan(loan) => {
                 let root_use = match loan.mode {
                     AirCollectionLoanMode::ReadonlySequence
@@ -997,6 +1006,17 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
                 block.stmts.push(AirStmt::RangeFor(range));
+            }
+            AirStmt::CollectionFor(mut for_) => {
+                rewrite_air_block_call_args(
+                    &mut for_.body,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::CollectionFor(for_));
             }
             AirStmt::CollectionLoan(mut loan) => {
                 rewrite_air_block_call_args(

@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// c
+// a
+// @match-end
+
+fn main() {
+    let map = ["a": 1, "b": 2, "c": 3];
+    for k, v in rev map step 1 {
+        if k == "b" { continue; }
+        println(k);
+        if k == "a" { break; }
+    }
+}

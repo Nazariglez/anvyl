@@ -286,7 +286,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
         match self {
             Self::Local(list, _) => {
                 let list = unsafe { &**list };
-                let range = crate::checked_range(start, end, inclusive, list.len());
+                let range = crate::checked_range(start, end, inclusive, list.len())?;
                 AnvSlice::from_list(list, range.start, range.len())
             }
             Self::StackCell(..)
@@ -310,7 +310,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
         match self {
             Self::Local(list, _) => {
                 let list = unsafe { &mut **list };
-                let range = crate::checked_range(start, end, inclusive, list.len());
+                let range = crate::checked_range(start, end, inclusive, list.len())?;
                 AnvSlice::from_list_mut(ctx, list, range.start, range.len())
             }
             Self::StackCell(..)
@@ -336,7 +336,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
         match self {
             Self::Local(array, _) => {
                 let array = unsafe { &**array };
-                let range = crate::checked_range(start, end, inclusive, N);
+                let range = crate::checked_range(start, end, inclusive, N)?;
                 Ok(
                     unsafe {
                         AnvSlice::from_raw_parts(array.as_ptr(), N, range.start, range.len())
@@ -365,7 +365,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
         match self {
             Self::Local(array, _) => {
                 let array = unsafe { &mut **array };
-                let range = crate::checked_range(start, end, inclusive, N);
+                let range = crate::checked_range(start, end, inclusive, N)?;
                 Ok(unsafe {
                     AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
                 })

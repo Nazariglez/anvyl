@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: negative range bound
+
+fn main() {
+    let xs = [1, 2];
+    let end = 0 - 1;
+    let ys: [int] = xs[0..end];
+    println(ys[0]);
+}

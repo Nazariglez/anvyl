@@ -20,18 +20,30 @@ pub fn checked_index_result(index: i64, len: usize, kind: &str) -> Result<usize,
     }
 }
 
-pub fn checked_range(start: i64, end: i64, inclusive: bool, len: usize) -> Range<usize> {
-    assert!(start >= 0 && end >= 0, "negative range bound");
-    assert!(start <= end, "invalid range");
+pub fn checked_range(
+    start: i64,
+    end: i64,
+    inclusive: bool,
+    len: usize,
+) -> RuntimeResult<Range<usize>> {
+    if start < 0 || end < 0 {
+        return Err(RuntimeError::new("negative range bound"));
+    }
+    if start > end {
+        return Err(RuntimeError::new("invalid range"));
+    }
     let end = if inclusive {
-        end.checked_add(1).expect("range end overflow")
+        end.checked_add(1)
+            .ok_or_else(|| RuntimeError::new("range end overflow"))?
     } else {
         end
     };
-    let start = usize::try_from(start).expect("non-negative range start must fit usize");
-    let end = usize::try_from(end).expect("non-negative range end must fit usize");
-    assert!(end <= len, "range out of bounds");
-    start..end
+    let start = usize::try_from(start).map_err(|_| RuntimeError::new("range out of bounds"))?;
+    let end = usize::try_from(end).map_err(|_| RuntimeError::new("range out of bounds"))?;
+    if end > len {
+        return Err(RuntimeError::new("range out of bounds"));
+    }
+    Ok(start..end)
 }
 
 pub fn checked_for_step(step: i64) -> RuntimeResult<i64> {
@@ -39,6 +51,23 @@ pub fn checked_for_step(step: i64) -> RuntimeResult<i64> {
         Ok(step)
     } else {
         Err(RuntimeError::new("for-loop step must be positive"))
+    }
+}
+
+pub struct AnvCollectionIter(AnvRangeIter);
+
+impl AnvCollectionIter {
+    pub fn new(len: i64, reversed: bool, step: i64) -> Self {
+        debug_assert!(len >= 0);
+        Self(AnvRangeIter::new(0, len, false, reversed, step))
+    }
+}
+
+impl Iterator for AnvCollectionIter {
+    type Item = (i64, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
     }
 }
 
@@ -103,9 +132,9 @@ impl Iterator for AnvRangeIter {
 
 #[cfg(test)]
 mod tests {
-    use super::AnvRangeIter;
+    use super::{AnvCollectionIter, AnvRangeIter};
 
-    fn items(iter: AnvRangeIter) -> Vec<(i64, i64)> {
+    fn items(iter: impl Iterator<Item = (i64, i64)>) -> Vec<(i64, i64)> {
         iter.collect()
     }
 
@@ -128,6 +157,24 @@ mod tests {
         assert_eq!(
             items(AnvRangeIter::new(0, 5, false, true, 20)),
             vec![(0, 4)]
+        );
+    }
+
+    #[test]
+    fn collection_iter_handles_order_step_and_empty() {
+        assert_eq!(items(AnvCollectionIter::new(0, false, 1)), vec![]);
+        assert_eq!(
+            items(AnvCollectionIter::new(5, false, 2)),
+            vec![(0, 0), (1, 2), (2, 4)]
+        );
+        assert_eq!(
+            items(AnvCollectionIter::new(5, true, 2)),
+            vec![(0, 4), (1, 2), (2, 0)]
+        );
+        assert_eq!(items(AnvCollectionIter::new(3, true, 10)), vec![(0, 2)]);
+        assert_eq!(
+            items(AnvCollectionIter::new(3, false, i64::MAX)),
+            vec![(0, 0)]
         );
     }
 }

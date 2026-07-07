@@ -3,7 +3,11 @@ pub struct Range<T> {
     end: T,
 
     fn contains(self, value: T) -> bool {
-        value >= self.start && value < self.end
+        if value >= self.start { value < self.end } else { false }
+    }
+
+    fn is_empty(self) -> bool {
+        self.start >= self.end
     }
 }
 
@@ -12,7 +16,11 @@ pub struct RangeInclusive<T> {
     end: T,
 
     fn contains(self, value: T) -> bool {
-        value >= self.start && value <= self.end
+        if value >= self.start { value <= self.end } else { false }
+    }
+
+    fn is_empty(self) -> bool {
+        self.start > self.end
     }
 }
 

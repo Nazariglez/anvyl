@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: error
+// @contains: for-loop step must be positive
+
+fn zero() -> int { 0 }
+
+fn main() {
+    let map: [string: int] = [:];
+    for k, v in map step zero() {
+        println(k);
+    }
+}

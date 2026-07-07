@@ -1,10 +1,10 @@
 // @mode: check
-// @expect: error
-// @contains: step is not supported for map iteration
+// @expect: success
 
 fn main() {
     let m = ["a": 1, "b": 2];
     for k, v in m step 2 {
-        println(k);
+        let _: string = k;
+        let _: int = v;
     }
 }

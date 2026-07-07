@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 20
+// 50
+// 30
+// inner
+// @match-end
+
+fn main() {
+    for x in [10, 20, 30, 40] {
+        if x == 10 { continue; }
+        println(x);
+        if x == 20 { break; }
+    }
+    for x in rev [10, 20, 30, 40, 50] step 2 {
+        println(x);
+        if x == 30 { break; }
+    }
+    for x in [1, 2] {
+        for y in [3, 4] {
+            println("inner");
+            break;
+        }
+        break;
+    }
+}

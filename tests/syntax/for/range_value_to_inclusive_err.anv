@@ -1,9 +1,9 @@
 // @mode: check
 // @expect: error
-// @contains: range literals
+// @contains: bounded ranges
 
 fn main() {
-    let r = 0..3;
+    let r = ..=10;
     for n in r {
         println(n);
     }

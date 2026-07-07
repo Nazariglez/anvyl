@@ -7,18 +7,18 @@ use super::{
     retained_callbacks::{RetainedCallbackEmitter, RetainedCallbackSigPlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
-        RirCollectionAccess, RirCollectionLoanScope, RirCollectionStorageKind, RirCoreEnumKind,
-        RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumRepr, RirExternKind, RirFormatAlign,
-        RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind, RirLambdaEnvId,
-        RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId, RirLambdaStorage,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg,
-        RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi,
-        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt,
-        RirStructuredBlock, RirTerm, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram, native_arg_facts, native_ty_is_resource_ref,
-        stmt_child_blocks_any,
+        RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope, RirCollectionStorageKind,
+        RirCoreEnumKind, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumRepr,
+        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
+        RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
+        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject,
+        RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef,
+        RirStmt, RirStructuredBlock, RirTerm, RirTupleId, RirType, RirTypeId, RirVariant,
+        RirVariantId, RirVariantKind, VerifiedRirProgram, native_arg_facts,
+        native_ty_is_resource_ref, stmt_child_blocks_any,
     },
     runtime_owner::RuntimeOwnerEmit,
     syntax::{
@@ -83,6 +83,12 @@ struct EmitCx<'a> {
 struct ActiveCollectionLoan {
     root: RirCollectionAccess,
     version: String,
+}
+
+#[derive(Clone, Copy)]
+enum IterFor<'a> {
+    Range(&'a RirRangeFor),
+    Collection(&'a RirCollectionFor),
 }
 
 impl EmitCx<'_> {
@@ -1428,6 +1434,7 @@ impl EmitCx<'_> {
                     RirStmt::If(_)
                         | RirStmt::Loop(_)
                         | RirStmt::RangeFor(_)
+                        | RirStmt::CollectionFor(_)
                         | RirStmt::CollectionLoanScope(_)
                         | RirStmt::CollectionSlotScope(_)
                         | RirStmt::EnumMatch(_)
@@ -1681,7 +1688,12 @@ impl EmitCx<'_> {
             }
             RirStmt::If(branch) => self.emit_if(function, branch, predeclared),
             RirStmt::Loop(loop_) => self.emit_loop(function, loop_, predeclared),
-            RirStmt::RangeFor(range) => self.emit_range_for(function, range, predeclared),
+            RirStmt::RangeFor(range) => {
+                self.emit_iter_for(function, &IterFor::Range(range), predeclared);
+            }
+            RirStmt::CollectionFor(for_) => {
+                self.emit_iter_for(function, &IterFor::Collection(for_), predeclared);
+            }
             RirStmt::CollectionLoanScope(scope) => {
                 self.emit_collection_loan_scope(function, scope, predeclared);
             }
@@ -1705,35 +1717,57 @@ impl EmitCx<'_> {
         self.w.line("}");
     }
 
-    fn emit_range_for(&mut self, function: &RirFunction, range: &RirRangeFor, predeclared: bool) {
+    fn emit_iter_for(&mut self, function: &RirFunction, for_: &IterFor<'_>, predeclared: bool) {
         let values = RustValues::new(self.program, function);
-        let start = values.value_operand(&range.start);
-        let end = values.value_operand(&range.end);
-        let step = values.value_operand(&range.step);
-        let iter = format!("__anv_range_{}", range.id.index());
+        let (id, name, iter_new, item_name, item, ordinal, body) = match *for_ {
+            IterFor::Range(range) => {
+                let start = values.value_operand(&range.start);
+                let end = values.value_operand(&range.end);
+                let step = values.value_operand(&range.step);
+                (
+                    range.id,
+                    "range",
+                    target::range_iter_new(&start, &end, range.inclusive, range.reversed, &step),
+                    "__anv_item",
+                    range.item,
+                    range.ordinal,
+                    &range.body,
+                )
+            }
+            IterFor::Collection(for_) => {
+                let len = function.locals[for_.len.index()].symbol.as_str();
+                let step = values.value_operand(&for_.step);
+                (
+                    for_.id,
+                    "collection",
+                    target::collection_iter_new(len, for_.reversed, &step),
+                    "__anv_index",
+                    for_.index,
+                    for_.ordinal,
+                    &for_.body,
+                )
+            }
+        };
+        let iter = format!("__anv_{name}_{}", id.index());
         self.w.line("{");
         self.indented(|this| {
-            this.w.line(format_args!(
-                "let mut {iter} = {};",
-                target::range_iter_new(&start, &end, range.inclusive, range.reversed, &step)
-            ));
-            this.w
-                .line(format_args!("{}: loop {{", loop_label(range.id)));
+            this.w.line(format_args!("let mut {iter} = {iter_new};"));
+            this.w.line(format_args!("{}: loop {{", loop_label(id)));
             this.indented(|this| {
                 this.w.line(format_args!(
-                    "let Some((__anv_ordinal, __anv_item)) = {iter}.next() else {{ break; }};"
+                    "let Some((__anv_ordinal, {item_name})) = {iter}.next() else {{ break; }};"
                 ));
                 this.w.line(format_args!(
-                    "{} = __anv_item;",
-                    function.locals[range.item.index()].symbol.as_str()
+                    "{} = {item_name};",
+                    function.locals[item.index()].symbol.as_str()
                 ));
-                if let Some(ordinal) = range.ordinal {
+                if let Some(ordinal) = ordinal {
                     this.w.line(format_args!(
                         "{} = __anv_ordinal;",
                         function.locals[ordinal.index()].symbol.as_str()
                     ));
                 }
-                this.emit_structured_block(function, &range.body, predeclared);
+                this.emit_structured_block(function, body, predeclared);
             });
             this.w.line("}");
         });
@@ -4362,14 +4396,15 @@ impl EmitCx<'_> {
         let item = "item";
         let body = values.value_from_ref(elem, item);
         let storage_ty = self.collection_storage_heap_type(ty);
-        match source_kind {
+        let lines = vec![format!("let __anv_range = {range};")];
+        let copy = match source_kind {
             RangeCopySource::Slice => format!(
                 "{}?",
                 target::anv_slice_copy_range_with(
                     &source_expr,
                     target::runtime_param_name(),
                     &storage_ty,
-                    &range,
+                    "__anv_range",
                     item,
                     &body,
                 )
@@ -4378,16 +4413,17 @@ impl EmitCx<'_> {
                 target::runtime_param_name(),
                 &storage_ty,
                 &format!(
-                    "({source_expr}.to_vec({})?)[{range}].iter().map(|{item}| {body})",
+                    "({source_expr}.to_vec({})?)[__anv_range].iter().map(|{item}| {body})",
                     target::runtime_param_name()
                 ),
             ),
             RangeCopySource::Array => target::anv_list_from_iter(
                 target::runtime_param_name(),
                 &storage_ty,
-                &format!("{source_expr}[{range}].iter().map(|{item}| {body})"),
+                &format!("{source_expr}[__anv_range].iter().map(|{item}| {body})"),
             ),
-        }
+        };
+        block_expr(lines, Some(copy))
     }
 
     fn string_concat(&self, function: &RirFunction, parts: &[RirOperand]) -> String {
@@ -5060,6 +5096,9 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
                 || operand_uses_local(program, end, local)
                 || operand_uses_local(program, step, local)
         }
+        RirStmt::CollectionFor(for_) => {
+            for_.len == local || operand_uses_local(program, &for_.step, local)
+        }
         RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
         RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
         RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
@@ -5323,6 +5362,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::If(_)
         | RirStmt::Loop(_)
         | RirStmt::RangeFor(_)
+        | RirStmt::CollectionFor(_)
         | RirStmt::CollectionLoanScope(_)
         | RirStmt::CollectionSlotScope(_)
         | RirStmt::EnumMatch(_)

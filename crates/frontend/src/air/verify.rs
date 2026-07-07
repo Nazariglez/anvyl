@@ -13,9 +13,9 @@ use super::{
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
-        AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail, CallArg, Callee,
-        GlobalInitEffect, LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal,
-        PlaceRoot, Projection, RValue,
+        AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, GlobalInitEffect,
+        LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection,
+        RValue,
     },
     ids::*,
     place_model,
@@ -2205,6 +2205,17 @@ fn verify_loop_capture_cell_block(
                     in_loop || range.id == loop_id,
                 );
             }
+            AirStmt::CollectionFor(for_) => {
+                found_loop |= for_.id == loop_id;
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &for_.body,
+                    cell,
+                    loop_id,
+                    in_loop || for_.id == loop_id,
+                );
+            }
             AirStmt::CollectionLoan(loan) => {
                 found_loop |= verify_loop_capture_cell_block(
                     cx,
@@ -2315,6 +2326,7 @@ fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
                 || operand_uses_capture_cell(&range.end, cell)
                 || operand_uses_capture_cell(&range.step, cell)
         }
+        AirStmt::CollectionFor(for_) => operand_uses_capture_cell(&for_.step, cell),
         AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
         AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
         AirStmt::EnumMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
@@ -3592,21 +3604,46 @@ fn verify_air_stmt(
             verify_air_operand_read(cx, function_id, index, &range.start, state);
             verify_air_operand_read(cx, function_id, index, &range.end, state);
             verify_air_operand_read(cx, function_id, index, &range.step, state);
-            verify_range_for_stmt(cx, function_id, block_id, index, range);
-            loops.push(LoopCtx {
-                id: range.id,
-                breaks: Vec::new(),
-            });
-            let mut body_state = state.clone();
-            body_state.init(range.item);
-            body_state.set_local_value(range.item, FunctionValueState::non_function());
-            if let Some(ordinal) = range.ordinal {
-                body_state.init(ordinal);
-                body_state.set_local_value(ordinal, FunctionValueState::non_function());
-            }
-            verify_air_block(cx, function_id, &range.body, &mut body_state, loops);
-            let loop_ctx = loops.pop().unwrap();
-            LocalInit::join(std::iter::once(state.clone()).chain(loop_ctx.breaks))
+            verify_loop_int_parts(
+                cx,
+                function_id,
+                block_id,
+                index,
+                [&range.start, &range.end, &range.step],
+                range.ordinal.into_iter().chain([range.item]),
+            );
+            verify_air_for_body(
+                cx,
+                function_id,
+                range.id,
+                &range.body,
+                state,
+                loops,
+                range.ordinal.into_iter().chain([range.item]),
+            )
+        }
+        AirStmt::CollectionFor(for_) => {
+            verify_air_local_read(cx, function_id, index, for_.len, state);
+            verify_air_operand_read(cx, function_id, index, &for_.step, state);
+            verify_loop_int_parts(
+                cx,
+                function_id,
+                block_id,
+                index,
+                [&for_.step],
+                [Some(for_.len), Some(for_.index), for_.ordinal]
+                    .into_iter()
+                    .flatten(),
+            );
+            verify_air_for_body(
+                cx,
+                function_id,
+                for_.id,
+                &for_.body,
+                state,
+                loops,
+                [Some(for_.index), for_.ordinal].into_iter().flatten(),
+            )
         }
         AirStmt::CollectionLoan(loan) => {
             verify_collection_loan(cx, function_id, block_id, index, loan, state, loops)
@@ -3624,6 +3661,29 @@ fn verify_air_stmt(
             verify_air_map_entry_match(cx, function_id, index, match_, state, loops)
         }
     }
+}
+
+fn verify_air_for_body(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    id: AirLoopId,
+    body: &AirBlock,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+    locals: impl IntoIterator<Item = LocalId>,
+) -> Option<LocalInit> {
+    loops.push(LoopCtx {
+        id,
+        breaks: Vec::new(),
+    });
+    let mut body_state = state.clone();
+    for local in locals {
+        body_state.init(local);
+        body_state.set_local_value(local, FunctionValueState::non_function());
+    }
+    verify_air_block(cx, function_id, body, &mut body_state, loops);
+    let loop_ctx = loops.pop().unwrap();
+    LocalInit::join(std::iter::once(state.clone()).chain(loop_ctx.breaks))
 }
 
 fn verify_collection_loan(
@@ -3913,6 +3973,9 @@ fn collect_collection_loan_slot_locals(
             AirStmt::RangeFor(range) => {
                 collect_collection_loan_slot_locals(&range.body, slot_locals);
             }
+            AirStmt::CollectionFor(for_) => {
+                collect_collection_loan_slot_locals(&for_.body, slot_locals);
+            }
             AirStmt::EnumMatch(match_) => {
                 for arm in &match_.arms {
                     collect_collection_loan_slot_locals(&arm.block, slot_locals);
@@ -4079,6 +4142,24 @@ fn verify_collection_loan_contract_stmt(
                 cx,
                 function_id,
                 &range.body,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
+        AirStmt::CollectionFor(for_) => {
+            verify_collection_loan_contract_operand(
+                cx,
+                function_id,
+                &for_.step,
+                slot_locals,
+                active_slots,
+                false,
+            );
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &for_.body,
                 slot_locals,
                 active_slots,
                 active_loans,
@@ -5516,12 +5597,13 @@ fn verify_promoted_local_not_used(
     }
 }
 
-fn verify_range_for_stmt(
+fn verify_loop_int_parts<'a>(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
     block_id: BlockId,
     index: usize,
-    range: &AirRangeFor,
+    operands: impl IntoIterator<Item = &'a Operand>,
+    locals: impl IntoIterator<Item = LocalId>,
 ) {
     let site = VerifyCx::stmt_site(function_id, block_id, index);
     let Some(int_ty) = cx.primitives.int() else {
@@ -5531,7 +5613,7 @@ fn verify_range_for_stmt(
         );
         return;
     };
-    for operand in [&range.start, &range.end, &range.step] {
+    for operand in operands {
         if let Some(found) = typing::operand_ty(cx.program, operand)
             && !same_type(cx, int_ty, found)
         {
@@ -5544,7 +5626,7 @@ fn verify_range_for_stmt(
             );
         }
     }
-    for local in range.ordinal.into_iter().chain([range.item]) {
+    for local in locals {
         let Some(local_decl) = cx.program.function(function_id).locals.get(local.index()) else {
             cx.push(
                 site.clone(),
