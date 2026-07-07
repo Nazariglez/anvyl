@@ -32,7 +32,9 @@ pub use anvyx_macros::{
 pub use callback_registry::{
     CallbackCloseResult, CallbackInvocationGuard, CallbackSlot, CallbackSlotState,
 };
-pub use check::{checked_index, checked_index_result, checked_range};
+pub use check::{
+    AnvRangeIter, checked_for_step, checked_index, checked_index_result, checked_range,
+};
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};
 pub use ctx::{Ctx, HeapBorrowMut, HeapBorrowRef, TraceRootSet};
