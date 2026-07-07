@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: ref iteration requires a mutable iterable place
+// @contains: range loop bindings cannot be ref
 
 fn main() {
     for i, ref x in 0..10 {

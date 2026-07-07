@@ -368,6 +368,16 @@ impl ParamUseAnalyzer<'_> {
                 }
             }
             AirStmt::Loop(loop_) => self.observe_air_block(&loop_.body),
+            AirStmt::RangeFor(range) => {
+                self.observe_operand(&range.start, ValueContext::Read);
+                self.observe_operand(&range.end, ValueContext::Read);
+                self.observe_operand(&range.step, ValueContext::Read);
+                self.observe_local(range.item, ParamUse::ReadOnly);
+                if let Some(ordinal) = range.ordinal {
+                    self.observe_local(ordinal, ParamUse::ReadOnly);
+                }
+                self.observe_air_block(&range.body);
+            }
             AirStmt::CollectionLoan(loan) => {
                 let root_use = match loan.mode {
                     AirCollectionLoanMode::ReadonlySequence
@@ -492,6 +502,7 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_place(map, ParamUse::ReborrowMut);
                 self.observe_operand(key, ValueContext::Read);
             }
+            RValue::CheckedForStep { step } => self.observe_operand(step, ValueContext::Read),
         }
     }
 
@@ -975,6 +986,17 @@ fn rewrite_air_block_call_args(
                     locals,
                 );
                 block.stmts.push(AirStmt::Loop(loop_));
+            }
+            AirStmt::RangeFor(mut range) => {
+                rewrite_air_block_call_args(
+                    &mut range.body,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::RangeFor(range));
             }
             AirStmt::CollectionLoan(mut loan) => {
                 rewrite_air_block_call_args(

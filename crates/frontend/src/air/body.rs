@@ -40,6 +40,7 @@ pub enum AirStmt {
     },
     If(AirIf),
     Loop(AirLoop),
+    RangeFor(AirRangeFor),
     CollectionLoan(AirCollectionLoan),
     CollectionSlotScope(AirCollectionSlotScope),
     EnumMatch(AirEnumMatch),
@@ -73,6 +74,19 @@ pub struct AirIf {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AirLoop {
     pub id: AirLoopId,
+    pub body: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirRangeFor {
+    pub id: AirLoopId,
+    pub start: Operand,
+    pub end: Operand,
+    pub step: Operand,
+    pub inclusive: bool,
+    pub reversed: bool,
+    pub ordinal: Option<LocalId>,
+    pub item: LocalId,
     pub body: AirBlock,
 }
 
@@ -404,6 +418,9 @@ pub enum RValue {
         key: Operand,
         ty: TypeId,
     },
+    CheckedForStep {
+        step: Operand,
+    },
     MapEntryAt {
         map: Place,
         index: LocalId,
@@ -475,6 +492,7 @@ impl AirStmt {
                 }
             }
             Self::Loop(loop_) => loop_.body.for_each_rvalue(f),
+            Self::RangeFor(range) => range.body.for_each_rvalue(f),
             Self::CollectionLoan(loan) => loan.body.for_each_rvalue(f),
             Self::CollectionSlotScope(scope) => scope.body.for_each_rvalue(f),
             Self::EnumMatch(match_) => {

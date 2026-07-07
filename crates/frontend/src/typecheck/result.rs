@@ -7,7 +7,7 @@ use super::{
     semantic_use::map_delta,
 };
 use crate::{
-    ast::Visibility,
+    ast::{ExprId, Visibility},
     diagnostic::DiagnosticTag,
     externs::catalog::ExternCatalog,
     lint::{LintEvent, LintId},
@@ -167,9 +167,8 @@ impl TypecheckFacts {
         &self.capture_cell_requirements
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_step_runtime_checks(&self) -> &ForStepRuntimeCheckMap {
-        &self.for_step_runtime_checks
+    pub(crate) fn requires_for_step_runtime_check(&self, expr_id: ExprId) -> bool {
+        self.for_step_runtime_checks.contains_key(&expr_id)
     }
 
     pub(crate) fn unused_import_events(&self) -> Vec<LintEvent> {

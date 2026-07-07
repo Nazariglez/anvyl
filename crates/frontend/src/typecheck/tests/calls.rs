@@ -1,14 +1,14 @@
 use super::support::{
-    assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_err_count,
-    assert_expected_projection, assert_expr_type, assert_single_error, assert_ty, assert_ty_mods,
-    assert_typecheck_closed, check, check_mods, core_option, generic_body, nominal_struct, output,
+    assert_calls, assert_calls_with_modules, assert_deprecated_warning, assert_expected_projection,
+    assert_expr_type, assert_single_error, assert_ty, assert_typecheck_closed, check, generic_body,
+    nominal_struct, output,
 };
 use crate::{
     ast::{Ident, Type},
     lint::LintId,
     typecheck::{
-        CallTarget, CallableId, ConstDiagnostic, DeprecatedUseKind, GenericArgs, ModuleScope,
-        TypeError, call_target_closure_facts,
+        CallTarget, CallableId, DeprecatedUseKind, GenericArgs, ModuleScope, TypeError,
+        call_target_closure_facts,
         const_term::{ConstInferVarId, ConstTerm},
     },
 };

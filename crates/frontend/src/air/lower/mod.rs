@@ -6,9 +6,9 @@ use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionLoan,
     AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
     AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
-    AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, BindingId as AirBindingId, CallArg,
-    Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData,
-    ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi,
+    AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail, BindingId as AirBindingId,
+    CallArg, Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource,
+    ConstData, ConstId, ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi,
     ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember,
     ExternMethodDecl, ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep,
     ExternStaticDecl, ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl,
@@ -987,6 +987,11 @@ impl LowerCx<'_> {
     fn binding_requires_capture_cell(&self, binding: BindingId) -> bool {
         self.typecheck_facts
             .is_some_and(|facts| facts.capture_cell_requirements().contains_key(&binding))
+    }
+
+    fn requires_for_step_runtime_check(&self, expr_id: ExprId) -> bool {
+        self.typecheck_facts
+            .is_some_and(|facts| facts.requires_for_step_runtime_check(expr_id))
     }
 
     fn ordered_lambda_capture_facts(
@@ -2584,6 +2589,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_for(&mut self, for_: &ast::For) -> Result<(), LowerError> {
+        if let ExprKind::Range(range) = &for_.iterable.node.kind {
+            return self.lower_range_for(for_, &range.node);
+        }
+
         let plan = self.for_plan(for_)?;
         let id = self.alloc_loop();
         self.active_loops.push(id);
@@ -2600,6 +2609,82 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 body,
             }));
         Ok(())
+    }
+
+    fn lower_range_for(&mut self, for_: &ast::For, range: &ast::Range) -> Result<(), LowerError> {
+        let ast::Range::Bounded {
+            start,
+            end,
+            inclusive,
+        } = range
+        else {
+            return Err(LowerError::UnsupportedStmt {
+                kind: "RangeFor",
+                span: Some(self.source_span(for_.iterable.span)),
+            });
+        };
+
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let start = self.lower_value_to(start, int_ty, start)?;
+        let end = self.lower_value_to(end, int_ty, end)?;
+        let step = self.lower_for_step(for_)?;
+        let item = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
+        let ordinal = (for_.bindings.len() == 2)
+            .then(|| self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp));
+        let id = self.alloc_loop();
+        self.active_loops.push(id);
+        let body = self.with_nested_block(|this| {
+            this.lower_range_for_iteration_bindings(for_, ordinal, item)?;
+            this.lower_block_effect(&for_.body)?;
+            if !this.terminated {
+                this.terminate(AirTail::Continue(id))?;
+            }
+            Ok(())
+        });
+        self.active_loops.pop();
+        let body = body?;
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::RangeFor(AirRangeFor {
+            id,
+            start,
+            end,
+            step,
+            inclusive: *inclusive,
+            reversed: for_.reversed,
+            ordinal,
+            item,
+            body,
+        }));
+        Ok(())
+    }
+
+    fn lower_range_for_iteration_bindings(
+        &mut self,
+        for_: &ast::For,
+        ordinal: Option<LocalId>,
+        item: LocalId,
+    ) -> Result<(), LowerError> {
+        match for_.bindings.as_slice() {
+            [binding] => self.lower_for_pattern_binding(
+                &binding.pattern,
+                Operand::Place(self.local_place(item)),
+                false,
+            ),
+            [index, binding] => {
+                let ordinal = ordinal.ok_or_else(|| unsupported_pattern_stmt(&index.pattern))?;
+                self.lower_for_pattern_binding(
+                    &index.pattern,
+                    Operand::Place(self.local_place(ordinal)),
+                    false,
+                )?;
+                self.lower_for_pattern_binding(
+                    &binding.pattern,
+                    Operand::Place(self.local_place(item)),
+                    false,
+                )
+            }
+            _ => Err(unsupported_pattern_stmt(&for_.bindings[0].pattern)),
+        }
     }
 
     fn for_plan(&mut self, for_: &ast::For) -> Result<ForPlan, LowerError> {
@@ -2750,11 +2835,17 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
 
     fn lower_for_step(&mut self, for_: &ast::For) -> Result<Operand, LowerError> {
         let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let value = match &for_.step {
-            Some(step) => self.lower_value_to(step, int_ty, step)?,
-            None => self.int_const(1)?,
+        let Some(step) = &for_.step else {
+            return self.int_const(1);
         };
-        self.emit_typed_temp(int_ty, RValue::Use(value))
+
+        let value = self.lower_value_to(step, int_ty, step)?;
+        let rvalue = if self.cx.requires_for_step_runtime_check(step.node.id) {
+            RValue::CheckedForStep { step: value }
+        } else {
+            RValue::Use(value)
+        };
+        self.emit_typed_temp(int_ty, rvalue)
     }
 
     fn for_len_local(&mut self) -> Result<LocalId, LowerError> {
@@ -15498,6 +15589,10 @@ fn main() {}
                     }
                 }
                 AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
+                AirStmt::RangeFor(range) => {
+                    statements.push(AirStmt::RangeFor(range.clone()));
+                    collect_block_statements(&range.body, statements);
+                }
                 AirStmt::CollectionLoan(loan) => {
                     collect_block_statements(&loan.body, statements);
                 }

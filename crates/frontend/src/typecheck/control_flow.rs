@@ -829,7 +829,7 @@ fn for_slots(
         }
         ([_], Type::Infer, _) => infer_for_slots(1),
         ([binding], _, Some(inner)) => {
-            reject_for_ref_binding(binding, tc);
+            reject_range_for_ref_binding(binding, tc);
             vec![ForSlot::Owned(inner)]
         }
         ([_], _, None) => unsupported_for_slots(1, iterable_ty, iterable_span, tc),
@@ -852,7 +852,7 @@ fn for_slots(
         ([_, _], Type::Infer, _) => infer_for_slots(2),
         ([index, binding], _, Some(inner)) => {
             for binding in [index, binding] {
-                reject_for_ref_binding(binding, tc);
+                reject_range_for_ref_binding(binding, tc);
             }
             vec![ForSlot::Owned(Type::Int), ForSlot::Owned(inner)]
         }
@@ -887,6 +887,16 @@ fn reject_for_ref_binding(binding: &ForBinding, tc: &mut TypeChecker) {
     }
 }
 
+fn reject_range_for_ref_binding(binding: &ForBinding, tc: &mut TypeChecker) {
+    if binding.access.is_ref() {
+        push_for_modifier_error(
+            tc,
+            "range loop bindings cannot be ref",
+            binding.pattern.span,
+        );
+    }
+}
+
 fn for_slot_root<'a>(
     binding: &'a ForBinding,
     slot: ForSlot,
@@ -906,7 +916,9 @@ fn owned_for_root(binding: &ForBinding, ty: Type) -> PatternRoot<'_> {
     PatternRoot {
         pattern: &binding.pattern,
         input: PatternRootInput::Owned(ty),
-        mode: PatternBindMode::Owned { mutable: false },
+        mode: PatternBindMode::Owned {
+            mutable: binding.access.is_ref(),
+        },
     }
 }
 
@@ -944,33 +956,53 @@ fn alias_for_root<'a>(
 
 fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
     let range_kind = tc.decls.core_range_kind(iterable_ty);
-    check_for_rev(node, iterable_ty, range_kind, tc);
+    check_for_range_support(node, iterable_ty, range_kind, tc);
+    check_for_rev(node, iterable_ty, tc);
     check_for_step(node, iterable_ty, range_kind, tc);
 }
 
-fn check_for_rev(
+fn check_for_range_support(
     node: &For,
     iterable_ty: &Type,
     range_kind: Option<CoreRangeKind>,
     tc: &mut TypeChecker,
 ) {
-    if !node.reversed {
+    let Some(range_kind) = range_kind else {
         return;
-    }
+    };
 
-    if matches!(iterable_ty, Type::Map { .. }) {
+    if !matches!(node.iterable.node.kind, ExprKind::Range(_)) {
         push_for_modifier_error(
             tc,
-            "rev is not supported for map iteration",
+            "range for-loops require range literals",
             node.iterable.span,
         );
-    } else if matches!(
+    }
+
+    if matches!(
         range_kind,
-        Some(CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive)
+        CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive
     ) {
         push_for_modifier_error(
             tc,
-            "reverse is not supported for open-ended ranges",
+            "range for-loops require bounded ranges",
+            node.iterable.span,
+        );
+    }
+
+    if !matches!(
+        tc.decls.core_range_inner(iterable_ty),
+        Some(Type::Int | Type::Infer)
+    ) {
+        push_for_modifier_error(tc, "range for-loops require int bounds", node.iterable.span);
+    }
+}
+
+fn check_for_rev(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
+    if node.reversed && matches!(iterable_ty, Type::Map { .. }) {
+        push_for_modifier_error(
+            tc,
+            "rev is not supported for map iteration",
             node.iterable.span,
         );
     }

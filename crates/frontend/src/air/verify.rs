@@ -13,9 +13,9 @@ use super::{
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
-        AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, GlobalInitEffect,
-        LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection,
-        RValue,
+        AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail, CallArg, Callee,
+        GlobalInitEffect, LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal,
+        PlaceRoot, Projection, RValue,
     },
     ids::*,
     place_model,
@@ -2194,6 +2194,17 @@ fn verify_loop_capture_cell_block(
                     in_loop || loop_.id == loop_id,
                 );
             }
+            AirStmt::RangeFor(range) => {
+                found_loop |= range.id == loop_id;
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    &range.body,
+                    cell,
+                    loop_id,
+                    in_loop || range.id == loop_id,
+                );
+            }
             AirStmt::CollectionLoan(loan) => {
                 found_loop |= verify_loop_capture_cell_block(
                     cx,
@@ -2299,6 +2310,11 @@ fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
             place_uses_capture_cell(dst, cell) || rvalue_uses_capture_cell(value, cell)
         }
         AirStmt::If(if_) => operand_uses_capture_cell(&if_.cond, cell),
+        AirStmt::RangeFor(range) => {
+            operand_uses_capture_cell(&range.start, cell)
+                || operand_uses_capture_cell(&range.end, cell)
+                || operand_uses_capture_cell(&range.step, cell)
+        }
         AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
         AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
         AirStmt::EnumMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
@@ -2360,6 +2376,7 @@ fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
         RValue::MapRemove { map, key, .. } => {
             place_uses_capture_cell(map, cell) || operand_uses_capture_cell(key, cell)
         }
+        RValue::CheckedForStep { step } => operand_uses_capture_cell(step, cell),
         RValue::MakeLambda { captures, .. } => captures
             .iter()
             .any(|capture| lambda_capture_arg_uses_capture_cell(capture, cell)),
@@ -3571,6 +3588,26 @@ fn verify_air_stmt(
             let loop_ctx = loops.pop().unwrap();
             LocalInit::join(loop_ctx.breaks)
         }
+        AirStmt::RangeFor(range) => {
+            verify_air_operand_read(cx, function_id, index, &range.start, state);
+            verify_air_operand_read(cx, function_id, index, &range.end, state);
+            verify_air_operand_read(cx, function_id, index, &range.step, state);
+            verify_range_for_stmt(cx, function_id, block_id, index, range);
+            loops.push(LoopCtx {
+                id: range.id,
+                breaks: Vec::new(),
+            });
+            let mut body_state = state.clone();
+            body_state.init(range.item);
+            body_state.set_local_value(range.item, FunctionValueState::non_function());
+            if let Some(ordinal) = range.ordinal {
+                body_state.init(ordinal);
+                body_state.set_local_value(ordinal, FunctionValueState::non_function());
+            }
+            verify_air_block(cx, function_id, &range.body, &mut body_state, loops);
+            let loop_ctx = loops.pop().unwrap();
+            LocalInit::join(std::iter::once(state.clone()).chain(loop_ctx.breaks))
+        }
         AirStmt::CollectionLoan(loan) => {
             verify_collection_loan(cx, function_id, block_id, index, loan, state, loops)
         }
@@ -3873,6 +3910,9 @@ fn collect_collection_loan_slot_locals(
                 }
             }
             AirStmt::Loop(loop_) => collect_collection_loan_slot_locals(&loop_.body, slot_locals),
+            AirStmt::RangeFor(range) => {
+                collect_collection_loan_slot_locals(&range.body, slot_locals);
+            }
             AirStmt::EnumMatch(match_) => {
                 for arm in &match_.arms {
                     collect_collection_loan_slot_locals(&arm.block, slot_locals);
@@ -4024,6 +4064,26 @@ fn verify_collection_loan_contract_stmt(
             active_slots,
             active_loans,
         ),
+        AirStmt::RangeFor(range) => {
+            for operand in [&range.start, &range.end, &range.step] {
+                verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    operand,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &range.body,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
         AirStmt::CollectionLoan(loan) => {
             verify_collection_loan_contract_place(
                 cx,
@@ -4466,6 +4526,14 @@ fn verify_collection_loan_contract_rvalue(
                 false,
             );
         }
+        RValue::CheckedForStep { step } => verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            step,
+            slot_locals,
+            active_slots,
+            false,
+        ),
         RValue::FunctionRef { .. } => {}
         RValue::MakeLambda {
             lambda, captures, ..
@@ -5264,6 +5332,9 @@ fn verify_air_rvalue_reads(
             verify_air_operand_read(cx, function_id, index, key, state);
             verify_air_operand_read(cx, function_id, index, value, state);
         }
+        RValue::CheckedForStep { step } => {
+            verify_air_operand_read(cx, function_id, index, step, state);
+        }
         RValue::FunctionRef { .. } => {}
         RValue::MakeLambda { captures, .. } => {
             for capture in captures {
@@ -5439,6 +5510,54 @@ fn verify_promoted_local_not_used(
                     binding: decl.binding,
                     borrow: ScopedBorrowId::from_index(borrow_index),
                     local,
+                }),
+            );
+        }
+    }
+}
+
+fn verify_range_for_stmt(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    index: usize,
+    range: &AirRangeFor,
+) {
+    let site = VerifyCx::stmt_site(function_id, block_id, index);
+    let Some(int_ty) = cx.primitives.int() else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::MissingPrimitive(PrimitiveKind::Int)),
+        );
+        return;
+    };
+    for operand in [&range.start, &range.end, &range.step] {
+        if let Some(found) = typing::operand_ty(cx.program, operand)
+            && !same_type(cx, int_ty, found)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                    expected: int_ty,
+                    found,
+                }),
+            );
+        }
+    }
+    for local in range.ordinal.into_iter().chain([range.item]) {
+        let Some(local_decl) = cx.program.function(function_id).locals.get(local.index()) else {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidLocal(local)),
+            );
+            continue;
+        };
+        if !same_type(cx, int_ty, local_decl.ty) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                    expected: int_ty,
+                    found: local_decl.ty,
                 }),
             );
         }
@@ -6045,6 +6164,22 @@ fn verify_rvalue(
                         source.ty,
                     )),
                 ),
+            }
+        }
+        RValue::CheckedForStep { step } => {
+            verify_operand(cx, function_id, block_id, stmt_index, step);
+            required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Int);
+            if let Some(found) = typing::operand_ty(cx.program, step)
+                && cx.primitives.int() != Some(found)
+            {
+                let expected = cx.primitives.int().unwrap_or(found);
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                        expected,
+                        found,
+                    }),
+                );
             }
         }
         RValue::FunctionRef { function, ty } => {

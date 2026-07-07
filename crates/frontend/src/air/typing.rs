@@ -312,7 +312,7 @@ pub(crate) fn rvalue_ty(
         RValue::Stringify { .. } | RValue::StringConcat { .. } | RValue::Format { .. } => {
             primitives.string()
         }
-        RValue::Len { .. } => primitives.int(),
+        RValue::Len { .. } | RValue::CheckedForStep { .. } => primitives.int(),
         RValue::ListPush { .. } | RValue::MapInsert { .. } => primitives.void(),
     }
 }

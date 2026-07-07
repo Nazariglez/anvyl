@@ -6,10 +6,7 @@ use crate::{
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
     span::Span,
-    test_support::{
-        core_option_type, parse_program, resolved_modules_with_core_option,
-        resolved_with_core_option,
-    },
+    test_support::{parse_program, resolved_modules_with_core_option, resolved_with_core_option},
     typecheck::{
         self, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey, CaptureCellRequirementMap,
         ConstValueMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
@@ -117,10 +114,6 @@ impl TypecheckTestResult {
         &self.flat_facts.global_accesses
     }
 
-    pub(crate) fn for_step_runtime_checks(&self) -> &typecheck::ForStepRuntimeCheckMap {
-        self.public_facts.for_step_runtime_checks()
-    }
-
     pub(crate) fn lambda_escapes(&self) -> &LambdaEscapeMap {
         self.public_facts.lambda_escapes()
     }
@@ -163,10 +156,6 @@ impl TypecheckTestResult {
 
 pub(crate) fn nominal_struct(name: &str) -> Type {
     Type::nominal(NominalKind::Struct, Ident::new(name), vec![], vec![], None)
-}
-
-pub(crate) fn core_option(inner: Type) -> Type {
-    core_option_type(inner)
 }
 
 pub(crate) fn generic_body(name: &str, type_args: Vec<Type>) -> BodyInstanceKey {
@@ -389,28 +378,6 @@ pub(crate) fn ty_of(source: &str) -> Type {
 pub(crate) fn assert_ty(source: &str, expected: Type) {
     let ty = ty_of(source);
     assert_eq!(ty, expected, "source: {source}");
-}
-
-pub(crate) fn assert_err_count(source: &str, count: usize) {
-    match check(source) {
-        Ok(_) if count == 0 => {}
-        Ok(_) => panic!("expected {count} errors in: {source}, got Ok"),
-        Err(errors) => assert_eq!(
-            errors.len(),
-            count,
-            "expected {count} errors in: {source}, got {errors:?}"
-        ),
-    }
-}
-
-pub(crate) fn assert_ty_mods(root: &str, dep: &str, expected: Type) {
-    assert_ty_named(root, &[("gamekit", dep)], expected);
-}
-
-pub(crate) fn assert_ty_named(root: &str, modules: &[(&str, &str)], expected: Type) {
-    let result = check_named(root, modules).expect("typecheck failed");
-    let ty = last_expr_type(&result).unwrap_or(Type::Void);
-    assert_eq!(ty, expected, "root: {root}");
 }
 
 pub(crate) fn assert_calls(source: &str, count: usize) {

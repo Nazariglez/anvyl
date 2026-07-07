@@ -3,7 +3,7 @@
 // @contains: bounded ranges
 
 fn main() {
-    for n in rev (0..) {
-        break;
+    for n in (..=10) {
+        println(n);
     }
 }

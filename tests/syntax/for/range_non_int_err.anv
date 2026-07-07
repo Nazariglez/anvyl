@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: int bounds
+
+fn main() {
+    for n in 0.0..1.0 {
+        println(n);
+    }
+}
