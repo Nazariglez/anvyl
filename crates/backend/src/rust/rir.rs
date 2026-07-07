@@ -636,6 +636,7 @@ pub enum RirStmt {
     Eval(RirRValue),
     If(RirIf),
     Loop(RirLoop),
+    RangeFor(RirRangeFor),
     CollectionLoanScope(RirCollectionLoanScope),
     CollectionSlotScope(RirStructuredBlock),
     EnumMatch(RirEnumMatch),
@@ -653,6 +654,7 @@ pub(super) fn stmt_child_blocks_any(
                 || branch.else_block.as_ref().is_some_and(block_matches)
         }
         RirStmt::Loop(loop_) => block_matches(&loop_.body),
+        RirStmt::RangeFor(range) => block_matches(&range.body),
         RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
         RirStmt::CollectionSlotScope(block) => block_matches(block),
         RirStmt::OptionMatch(match_) => {
@@ -742,6 +744,19 @@ pub struct RirIf {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirLoop {
     pub id: RirLoopId,
+    pub body: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirRangeFor {
+    pub id: RirLoopId,
+    pub start: RirOperand,
+    pub end: RirOperand,
+    pub step: RirOperand,
+    pub inclusive: bool,
+    pub reversed: bool,
+    pub ordinal: Option<RirLocalId>,
+    pub item: RirLocalId,
     pub body: RirStructuredBlock,
 }
 
@@ -925,6 +940,9 @@ pub enum RirRValue {
         map: RirCollectionAccess,
         key: RirOperand,
         ty: RirTypeId,
+    },
+    CheckedForStep {
+        step: RirOperand,
     },
     MapEntryAt {
         map: RirCollectionAccess,
@@ -4061,6 +4079,43 @@ impl VerifyCx<'_> {
                 );
                 self.loops.pop();
             }
+            RirStmt::RangeFor(range) => {
+                if let Some(int) = self.type_id(RirType::Int) {
+                    for operand in [&range.start, &range.end, &range.step] {
+                        self.check_value_operand_ty(site, function, operand, int);
+                    }
+                    for local in range.ordinal.into_iter().chain([range.item]) {
+                        self.check_local_id(site, function, local);
+                        if function
+                            .locals
+                            .get(local.index())
+                            .is_some_and(|local| local.ty != int)
+                        {
+                            self.push(
+                                site,
+                                RirVerifyErrorKind::TypeMismatch {
+                                    expected: int,
+                                    found: function.locals[local.index()].ty,
+                                },
+                            );
+                        }
+                    }
+                }
+                self.loops.push(range.id);
+                let mut entry = self.block_entry_state();
+                if range.item.index() < entry.definite.len() {
+                    entry.definite[range.item.index()] = true;
+                    entry.possible[range.item.index()] = true;
+                }
+                if let Some(ordinal) = range.ordinal
+                    && ordinal.index() < entry.definite.len()
+                {
+                    entry.definite[ordinal.index()] = true;
+                    entry.possible[ordinal.index()] = true;
+                }
+                self.check_structured_block(function_id, function, &range.body, entry, None);
+                self.loops.pop();
+            }
             RirStmt::CollectionLoanScope(scope) => {
                 self.check_collection_loan_scope(function_id, function, site, scope);
             }
@@ -5557,6 +5612,7 @@ impl VerifyCx<'_> {
             }
             RirStmt::CollectionSlotScope(block) => self.structured_block_falls_through(block),
             RirStmt::Loop(_)
+            | RirStmt::RangeFor(_)
             | RirStmt::CollectionLoanScope(_)
             | RirStmt::Init { .. }
             | RirStmt::GlobalEnsure { .. }
@@ -6311,6 +6367,12 @@ impl VerifyCx<'_> {
                     );
                 }
                 Some(*ty)
+            }
+            RirRValue::CheckedForStep { step } => {
+                if let Some(int) = self.type_id(RirType::Int) {
+                    self.check_value_operand_ty(site, function, step, int);
+                }
+                self.type_id(RirType::Int)
             }
             RirRValue::Lambda {
                 lambda,
@@ -8232,8 +8294,8 @@ mod tests {
         }
     }
 
-    fn expect_unsupported_loop_lambda(program: RirProgram) {
-        let errors = verify(&program).expect_err("stack loop-cell lambda must fail");
+    fn expect_unsupported_loop_lambda(program: &RirProgram) {
+        let errors = verify(program).expect_err("stack loop-cell lambda must fail");
         assert!(
             errors
                 .iter()
@@ -8243,7 +8305,7 @@ mod tests {
 
     #[test]
     fn rejects_stack_loop_lambda_in_list_literal() {
-        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::Init {
+        expect_unsupported_loop_lambda(&stack_loop_lambda_program(vec![RirStmt::Init {
             local: local(2),
             value: RirRValue::List {
                 ty: ty(3),
@@ -8254,7 +8316,7 @@ mod tests {
 
     #[test]
     fn rejects_stack_loop_lambda_in_cell_init() {
-        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::CellInit {
+        expect_unsupported_loop_lambda(&stack_loop_lambda_program(vec![RirStmt::CellInit {
             cell: RirCellRef::Owner(RirCellId::from_index(1)),
             value: RirRValue::Use(stack_loop_lambda_value()),
         }]));
@@ -8262,7 +8324,7 @@ mod tests {
 
     #[test]
     fn rejects_stack_loop_lambda_in_sequence_slot() {
-        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![
+        expect_unsupported_loop_lambda(&stack_loop_lambda_program(vec![
             RirStmt::Init {
                 local: local(2),
                 value: RirRValue::List {
@@ -8280,7 +8342,7 @@ mod tests {
 
     #[test]
     fn rejects_stack_loop_lambda_in_map_value() {
-        expect_unsupported_loop_lambda(stack_loop_lambda_program(vec![RirStmt::MapValueSet {
+        expect_unsupported_loop_lambda(&stack_loop_lambda_program(vec![RirStmt::MapValueSet {
             map: RirCollectionAccess::Direct(RirPlace::local(local(3), vec![], ty(4))),
             index: local(4),
             value: stack_loop_lambda_value(),

@@ -58,11 +58,12 @@ use self::{
         RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
         RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
         RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirRValue, RirRangeFor, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram,
     },
 };
 
@@ -2245,51 +2246,50 @@ impl<'a> PlanCx<'a> {
                 Ok(stmts)
             }
             air::AirStmt::Loop(loop_) => {
-                let entry_functions = zero_env_function_values.clone();
-                let entry_cells = initialized_cells.to_vec();
-                let entry_possible = possible_cells.to_vec();
-                let mut body_functions = entry_functions.clone();
-                let mut body_cells = entry_cells.clone();
-                let mut body_possible = entry_possible.clone();
-                let body = self.plan_air_block(
+                let body = self.plan_loop_body(
                     function,
+                    loop_.id,
                     &loop_.body,
                     locals,
-                    &mut body_functions,
-                    &mut body_cells,
-                    &mut body_possible,
-                    true,
-                )?;
-                Self::merge_zero_env_function_values(
                     zero_env_function_values,
-                    locals.len(),
-                    [&entry_functions, &body_functions],
-                );
-                for (dst, (entry, body)) in initialized_cells
-                    .iter_mut()
-                    .zip(entry_cells.iter().zip(&body_cells))
-                {
-                    *dst = *entry && *body;
-                }
-                for (dst, (entry, body)) in possible_cells
-                    .iter_mut()
-                    .zip(entry_possible.iter().zip(&body_possible))
-                {
-                    *dst = *entry || *body;
-                }
-                for (index, cell) in self.air.capture_cells.iter().enumerate() {
-                    if matches!(
-                        cell.lifetime,
-                        air::CaptureCellLifetime::Loop { loop_id } if loop_id == loop_.id
-                    ) {
-                        initialized_cells[index] = entry_cells[index];
-                        possible_cells[index] = entry_possible[index];
-                    }
-                }
+                    initialized_cells,
+                    possible_cells,
+                )?;
                 Ok(vec![RirStmt::Loop(RirLoop {
                     id: RirLoopId::from_index(loop_.id.index()),
                     body,
                 })])
+            }
+            air::AirStmt::RangeFor(range) => {
+                let start = self.plan_operand_read(function, &range.start, locals);
+                let end = self.plan_operand_read(function, &range.end, locals);
+                let step = self.plan_operand_read(function, &range.step, locals);
+                let body = self.plan_loop_body(
+                    function,
+                    range.id,
+                    &range.body,
+                    locals,
+                    zero_env_function_values,
+                    initialized_cells,
+                    possible_cells,
+                )?;
+                let mut stmts = start.stmts;
+                stmts.extend(end.stmts);
+                stmts.extend(step.stmts);
+                stmts.push(RirStmt::RangeFor(RirRangeFor {
+                    id: RirLoopId::from_index(range.id.index()),
+                    start: start.operand,
+                    end: end.operand,
+                    step: step.operand,
+                    inclusive: range.inclusive,
+                    reversed: range.reversed,
+                    ordinal: range
+                        .ordinal
+                        .map(|local| RirLocalId::from_index(local.index())),
+                    item: RirLocalId::from_index(range.item.index()),
+                    body,
+                }));
+                Ok(stmts)
             }
             air::AirStmt::CollectionLoan(loan) => {
                 let root = self.lower_collection_loan_root(function, index, loan, locals)?;
@@ -2916,6 +2916,14 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
+            RValue::CheckedForStep { step } => {
+                let step = self.plan_operand_read(function, step, locals);
+                PlannedRValue {
+                    stmts: step.stmts,
+                    value: RirRValue::CheckedForStep { step: step.operand },
+                    post_stmts: vec![],
+                }
+            }
             RValue::FunctionRef {
                 function: target,
                 ty,
@@ -2960,6 +2968,60 @@ impl<'a> PlanCx<'a> {
                 ));
             }
         };
+        Ok(planned)
+    }
+
+    fn plan_loop_body(
+        &self,
+        function: FunctionId,
+        loop_id: air::AirLoopId,
+        body: &air::AirBlock,
+        locals: &mut Vec<RirLocal>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+    ) -> Result<RirStructuredBlock, RustPlanError> {
+        let entry_functions = zero_env_function_values.clone();
+        let entry_cells = initialized_cells.to_vec();
+        let entry_possible = possible_cells.to_vec();
+        let mut body_functions = entry_functions.clone();
+        let mut body_cells = entry_cells.clone();
+        let mut body_possible = entry_possible.clone();
+        let planned = self.plan_air_block(
+            function,
+            body,
+            locals,
+            &mut body_functions,
+            &mut body_cells,
+            &mut body_possible,
+            true,
+        )?;
+        Self::merge_zero_env_function_values(
+            zero_env_function_values,
+            locals.len(),
+            [&entry_functions, &body_functions],
+        );
+        for (dst, (entry, body)) in initialized_cells
+            .iter_mut()
+            .zip(entry_cells.iter().zip(&body_cells))
+        {
+            *dst = *entry && *body;
+        }
+        for (dst, (entry, body)) in possible_cells
+            .iter_mut()
+            .zip(entry_possible.iter().zip(&body_possible))
+        {
+            *dst = *entry || *body;
+        }
+        for (index, cell) in self.air.capture_cells.iter().enumerate() {
+            if matches!(
+                cell.lifetime,
+                air::CaptureCellLifetime::Loop { loop_id: id } if id == loop_id
+            ) {
+                initialized_cells[index] = entry_cells[index];
+                possible_cells[index] = entry_possible[index];
+            }
+        }
         Ok(planned)
     }
 
@@ -3478,6 +3540,12 @@ impl<'a> PlanCx<'a> {
                     self.collection_slot_block(function, scope, access, loop_.body, false)?;
                 loop_.body = body;
                 (RirStmt::Loop(loop_), updates_slot)
+            }
+            RirStmt::RangeFor(mut range) => {
+                let (body, updates_slot) =
+                    self.collection_slot_block(function, scope, access, range.body, false)?;
+                range.body = body;
+                (RirStmt::RangeFor(range), updates_slot)
             }
             RirStmt::CollectionLoanScope(mut loan) => {
                 let (body, updates_slot) =

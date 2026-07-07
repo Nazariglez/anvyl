@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn main() {
+    let bounds = [0, 3];
+    var sum = 0;
+    for n in bounds[0]..bounds[1] {
+        sum += n;
+    }
+    println(sum);
+}

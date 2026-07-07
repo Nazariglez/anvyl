@@ -5,9 +5,9 @@ use super::{
         RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirCollectionAccess,
         RirCollectionLoanScope, RirCollectionRootKind, RirExternKind, RirFunction,
         RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
-        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirStmt,
-        RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId, native_arg_facts,
-        native_return_adopts_resource, stmt_child_blocks_any,
+        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirRangeFor,
+        RirStmt, RirStringifyReqKind, RirStruct, RirStructuredBlock, RirType, RirTypeId,
+        native_arg_facts, native_return_adopts_resource, stmt_child_blocks_any,
     },
 };
 
@@ -76,6 +76,12 @@ fn stmt_calls_fallible(
             block_calls_fallible(program, fallible, function, &scope.body)
                 || loan_scope_is_fallible(program, scope)
         }
+        RirStmt::RangeFor(range) => {
+            range_for_operands(range)
+                .into_iter()
+                .any(|operand| operand_has_fallible_place(program, function, operand))
+                || block_calls_fallible(program, fallible, function, &range.body)
+        }
         RirStmt::DataRefSet { object, value, .. } => {
             operand_uses_mut_place_param(function, object)
                 || operand_uses_mut_place_param(function, value)
@@ -133,7 +139,8 @@ fn rvalue_calls_fallible(
             | RirRValue::SliceView { .. }
             | RirRValue::CellGetCopy { .. }
             | RirRValue::ScopedPlaceCellGet { .. }
-            | RirRValue::MutPlaceGetCopy { .. } => true,
+            | RirRValue::MutPlaceGetCopy { .. }
+            | RirRValue::CheckedForStep { .. } => true,
             RirRValue::Call { callee, args, .. } => {
                 args.iter()
                     .any(|arg| call_arg_preparation_fallible(program, arg))
@@ -176,7 +183,8 @@ fn rvalue_uses_fallible_place(
         | RirRValue::Format { value: operand, .. }
         | RirRValue::ListPush { value: operand, .. }
         | RirRValue::MapGet { key: operand, .. }
-        | RirRValue::MapRemove { key: operand, .. } => {
+        | RirRValue::MapRemove { key: operand, .. }
+        | RirRValue::CheckedForStep { step: operand } => {
             operand_has_fallible_place(program, function, operand)
         }
         RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
@@ -436,6 +444,10 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             program, function, scope,
         )
         .union(block_context_use(program, function, &scope.body)),
+        RirStmt::RangeFor(range) => {
+            operands_context_use(program, function, range_for_operands(range))
+                .union(block_context_use(program, function, &range.body))
+        }
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);
@@ -616,6 +628,7 @@ fn rvalue_operand_context_use(
         RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
             collection_access_context_use(program, function, map)
         }
+        RirRValue::CheckedForStep { step } => operand_context_use(program, function, step),
         RirRValue::Call { .. }
         | RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }
@@ -765,6 +778,10 @@ fn option_subject_context_use(
             ContextUse::rt().union(mut_place_context_use(program, function, place))
         }
     }
+}
+
+fn range_for_operands(range: &RirRangeFor) -> [&RirOperand; 3] {
+    [&range.start, &range.end, &range.step]
 }
 
 fn operands_context_use<'a>(
@@ -934,7 +951,8 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }
         | RirRValue::Stringify { value: operand, .. }
-        | RirRValue::Format { value: operand, .. } => {
+        | RirRValue::Format { value: operand, .. }
+        | RirRValue::CheckedForStep { step: operand } => {
             operand_uses_mut_place_param(function, operand)
         }
         RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {

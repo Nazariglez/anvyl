@@ -15,7 +15,7 @@ use super::{
         RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess, RirMutPlaceArg,
         RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParamAbi,
         RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt,
+        RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt,
         RirStructuredBlock, RirTerm, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
         RirVariantKind, VerifiedRirProgram, native_arg_facts, native_ty_is_resource_ref,
         stmt_child_blocks_any,
@@ -1427,6 +1427,7 @@ impl EmitCx<'_> {
                     stmt,
                     RirStmt::If(_)
                         | RirStmt::Loop(_)
+                        | RirStmt::RangeFor(_)
                         | RirStmt::CollectionLoanScope(_)
                         | RirStmt::CollectionSlotScope(_)
                         | RirStmt::EnumMatch(_)
@@ -1680,6 +1681,7 @@ impl EmitCx<'_> {
             }
             RirStmt::If(branch) => self.emit_if(function, branch, predeclared),
             RirStmt::Loop(loop_) => self.emit_loop(function, loop_, predeclared),
+            RirStmt::RangeFor(range) => self.emit_range_for(function, range, predeclared),
             RirStmt::CollectionLoanScope(scope) => {
                 self.emit_collection_loan_scope(function, scope, predeclared);
             }
@@ -1700,6 +1702,41 @@ impl EmitCx<'_> {
         self.w
             .line(format_args!("{}: loop {{", loop_label(loop_.id)));
         self.indented(|this| this.emit_structured_block(function, &loop_.body, predeclared));
+        self.w.line("}");
+    }
+
+    fn emit_range_for(&mut self, function: &RirFunction, range: &RirRangeFor, predeclared: bool) {
+        let values = RustValues::new(self.program, function);
+        let start = values.value_operand(&range.start);
+        let end = values.value_operand(&range.end);
+        let step = values.value_operand(&range.step);
+        let iter = format!("__anv_range_{}", range.id.index());
+        self.w.line("{");
+        self.indented(|this| {
+            this.w.line(format_args!(
+                "let mut {iter} = {};",
+                target::range_iter_new(&start, &end, range.inclusive, range.reversed, &step)
+            ));
+            this.w
+                .line(format_args!("{}: loop {{", loop_label(range.id)));
+            this.indented(|this| {
+                this.w.line(format_args!(
+                    "let Some((__anv_ordinal, __anv_item)) = {iter}.next() else {{ break; }};"
+                ));
+                this.w.line(format_args!(
+                    "{} = __anv_item;",
+                    function.locals[range.item.index()].symbol.as_str()
+                ));
+                if let Some(ordinal) = range.ordinal {
+                    this.w.line(format_args!(
+                        "{} = __anv_ordinal;",
+                        function.locals[ordinal.index()].symbol.as_str()
+                    ));
+                }
+                this.emit_structured_block(function, &range.body, predeclared);
+            });
+            this.w.line("}");
+        });
         self.w.line("}");
     }
 
@@ -2385,6 +2422,7 @@ impl EmitCx<'_> {
                     &target::map_remove_region("__anv_key"),
                 )
             }
+            RirRValue::CheckedForStep { step } => target::checked_for_step(&values.operand(step)),
             RirRValue::MapEntryAt { map, index, ty } => {
                 self.map_entry_at(function, map, *index, *ty)
             }
@@ -5015,6 +5053,13 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
             map.uses_local(local) || *index == local || operand_uses_local(program, value, local)
         }
         RirStmt::If(RirIf { cond, .. }) => operand_uses_local(program, cond, local),
+        RirStmt::RangeFor(RirRangeFor {
+            start, end, step, ..
+        }) => {
+            operand_uses_local(program, start, local)
+                || operand_uses_local(program, end, local)
+                || operand_uses_local(program, step, local)
+        }
         RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
         RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
         RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
@@ -5054,7 +5099,10 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
         | RirRValue::Cast { value: operand, .. }
         | RirRValue::OptionalSome { value: operand, .. }
         | RirRValue::Stringify { value: operand, .. }
-        | RirRValue::Format { value: operand, .. } => operand_uses_local(program, operand, local),
+        | RirRValue::Format { value: operand, .. }
+        | RirRValue::CheckedForStep { step: operand } => {
+            operand_uses_local(program, operand, local)
+        }
         RirRValue::Struct { fields, .. }
         | RirRValue::Tuple { fields, .. }
         | RirRValue::Array { elems: fields, .. }
@@ -5274,6 +5322,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::MapValueSet { .. }
         | RirStmt::If(_)
         | RirStmt::Loop(_)
+        | RirStmt::RangeFor(_)
         | RirStmt::CollectionLoanScope(_)
         | RirStmt::CollectionSlotScope(_)
         | RirStmt::EnumMatch(_)

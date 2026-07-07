@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 4
+
+fn main() {
+    var count = 0;
+    for n in 9223372036854775806..=9223372036854775807 {
+        count += 1;
+    }
+    let min = -9223372036854775807 - 1;
+    for n in rev min..=min {
+        count += 1;
+    }
+    for n in rev 0..1 step 10 {
+        count += 1;
+    }
+    println(count);
+}

@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: for-loop step must be positive
+
+fn stride() -> int { 0 }
+
+fn main() {
+    let xs: [int] = [];
+    for n in xs step stride() {
+        return;
+    }
+}

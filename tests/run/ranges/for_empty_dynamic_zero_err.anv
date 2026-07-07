@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: for-loop step must be positive
+
+fn stride() -> int { 0 }
+
+fn main() {
+    for n in 3..3 step stride() {
+        return;
+    }
+}

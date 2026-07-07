@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match: 23
+
+fn main() {
+    var sum = 0;
+    for n in 0..5 {
+        sum += n;
+    }
+    for n in 0..=5 {
+        sum += n;
+    }
+    let start = -2;
+    let end = 2;
+    for n in start..end {
+        sum += n;
+    }
+    for n in 3..3 {
+        sum += 100;
+    }
+    for n in 4..=3 {
+        sum += 100;
+    }
+    println(sum);
+}

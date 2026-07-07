@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// step
+// 4
+// @match-end
+
+fn stride() -> int {
+    println("step");
+    2
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4];
+    var sum = 0;
+    for n in xs step stride() {
+        sum += n;
+    }
+    println(sum);
+}

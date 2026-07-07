@@ -462,6 +462,12 @@ impl ProfileCx<'_> {
                     self.check_air_block(function, &match_.none_block);
                 }
                 air::AirStmt::Loop(loop_) => self.check_air_block(function, &loop_.body),
+                air::AirStmt::RangeFor(range) => {
+                    self.check_operand(site, &range.start);
+                    self.check_operand(site, &range.end);
+                    self.check_operand(site, &range.step);
+                    self.check_air_block(function, &range.body);
+                }
                 air::AirStmt::CollectionLoan(loan) => {
                     if let Err(gap) = self.access().collection_loan_plan(function, loan) {
                         self.push(site, profile_gap_kind(gap));
@@ -785,6 +791,7 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
             }
+            RValue::CheckedForStep { step } => self.check_operand(site, step),
             RValue::MakeLambda {
                 lambda, captures, ..
             } => {

@@ -1041,18 +1041,35 @@ pub(super) fn checked_range(start: &str, end: &str, inclusive: bool, len: &str) 
     )
 }
 
+pub(super) fn checked_for_step(step: &str) -> String {
+    format!("{}({step})?", rt_path("checked_for_step"))
+}
+
+pub(super) fn range_iter_new(
+    start: &str,
+    end: &str,
+    inclusive: bool,
+    reversed: bool,
+    step: &str,
+) -> String {
+    format!(
+        "{}::new({start}, {end}, {inclusive}, {reversed}, {step})",
+        rt_path("AnvRangeIter")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, box_pin_struct_start,
-        callback_check_identity, callback_record_heap_type_field, checked_index, checked_range,
-        dataref_place_heap_type_access, dataref_place_heap_type_field, dataref_place_ops_ty,
-        erased_handle_ty, generated_call, generated_runtime_inner_symbol, generated_runtime_symbol,
-        global_begin_projected_loan, global_set_or_replace_collection, heap_access_error,
-        heap_register, heap_scope, heap_scope_owned, heap_type_access, lambda_cell_ctor,
-        map_heap_access_error, mut_place_access, mut_place_dataref, mut_place_get_copy,
-        mut_place_global, mut_place_heap_cell, mut_place_local, mut_place_local_raw,
-        mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
+        callback_check_identity, callback_record_heap_type_field, checked_for_step, checked_index,
+        checked_range, dataref_place_heap_type_access, dataref_place_heap_type_field,
+        dataref_place_ops_ty, erased_handle_ty, generated_call, generated_runtime_inner_symbol,
+        generated_runtime_symbol, global_begin_projected_loan, global_set_or_replace_collection,
+        heap_access_error, heap_register, heap_scope, heap_scope_owned, heap_type_access,
+        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
+        mut_place_get_copy, mut_place_global, mut_place_heap_cell, mut_place_local,
+        mut_place_local_raw, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
         mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
         non_null_cast_mut, optional_payload_ops_ctor, optional_payload_ops_ty, owner_attach,
         owner_begin_shutdown, owner_enter, owner_enter_current, owner_entry_ptr,
@@ -1204,6 +1221,10 @@ mod tests {
         assert_eq!(
             checked_range("start", "end", true, "xs.len()"),
             "anvyx_runtime::checked_range(start, end, true, xs.len())"
+        );
+        assert_eq!(
+            checked_for_step("stride"),
+            "anvyx_runtime::checked_for_step(stride)?"
         );
     }
 

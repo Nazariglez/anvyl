@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 0
+// 1
+// 1
+// 2
+// 2
+// 3
+// 0
+// 4
+// 1
+// 2
+// 2
+// 0
+// @match-end
+
+fn main() {
+    for i, n in 1..4 {
+        println(i);
+        println(n);
+    }
+    for i, n in rev 0..5 step 2 {
+        println(i);
+        println(n);
+    }
+}

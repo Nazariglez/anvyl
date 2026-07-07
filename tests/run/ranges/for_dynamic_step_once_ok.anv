@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// step
+// 6
+// @match-end
+
+fn stride() -> int {
+    println("step");
+    2
+}
+
+fn main() {
+    var sum = 0;
+    for n in 0..6 step stride() {
+        sum += n;
+    }
+    println(sum);
+}

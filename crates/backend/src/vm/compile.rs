@@ -55,6 +55,7 @@ pub enum VmCompileErrorKind {
     UnsupportedLambdaCell,
     UnsupportedLambdaExternBoundary,
     UnsupportedCollectionLoan,
+    UnsupportedRangeFor,
     UnsupportedGlobal,
     UnsupportedNativeInitField,
     NonCheapValueParam,
@@ -189,6 +190,13 @@ impl CompileCx<'_> {
                     }
                 }
                 AirStmt::Loop(loop_) => self.check_block(function, &loop_.body, calls),
+                AirStmt::RangeFor(range) => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedRangeFor);
+                    self.check_operand(function, &range.start);
+                    self.check_operand(function, &range.end);
+                    self.check_operand(function, &range.step);
+                    self.check_block(function, &range.body, calls);
+                }
                 AirStmt::CollectionLoan(loan) => {
                     self.push_collection_gap(function);
                     self.check_place(function, &loan.root);
@@ -262,7 +270,8 @@ impl CompileCx<'_> {
             | RValue::OptionalSome { value: operand, .. }
             | RValue::Cast { value: operand, .. }
             | RValue::Stringify { value: operand, .. }
-            | RValue::Format { value: operand, .. } => self.check_operand(function, operand),
+            | RValue::Format { value: operand, .. }
+            | RValue::CheckedForStep { step: operand } => self.check_operand(function, operand),
             RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
                 self.check_operand(function, lhs);
                 self.check_operand(function, rhs);
