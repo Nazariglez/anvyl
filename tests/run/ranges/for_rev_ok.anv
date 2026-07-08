@@ -20,19 +20,19 @@
 // @match-end
 
 fn main() {
-    for n in rev 0..5 {
+    for n in iter(0..5).rev() {
         println(n);
     }
-    for n in rev 0..=5 {
+    for n in iter(0..=5).rev() {
         println(n);
     }
-    for n in rev 2..7 {
+    for n in iter(2..7).rev() {
         println(n);
     }
-    for n in rev 3..3 {
+    for n in iter(3..3).rev() {
         println(100);
     }
-    for n in rev 4..3 {
+    for n in iter(4..3).rev() {
         println(100);
     }
 }

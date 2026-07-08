@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn choose(flag: bool, start: int) -> iter {
+    if flag {
+        let s = start;
+        iter(s..3)
+    } else {
+        iter(0..1)
+    }
+}
+
+fn main() {
+    let flag = true;
+    for n in choose(flag, 1) {
+        println(n);
+    }
+}

@@ -1,0 +1,36 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// entries
+// b
+// 2
+// c
+// 3
+// keys
+// c
+// b
+// a
+// values
+// 2
+// 3
+// @match-end
+
+fn main() {
+    var m = ["a": 1, "b": 2, "c": 3];
+
+    println("entries");
+    for key, value in iter(m).skip(1).take(2) {
+        println(key);
+        println(value);
+    }
+
+    println("keys");
+    for key in iter(m).keys().rev() {
+        println(key);
+    }
+
+    println("values");
+    for value in iter(m).values().skip(1) {
+        println(value);
+    }
+}

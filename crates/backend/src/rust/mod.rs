@@ -51,19 +51,19 @@ use self::{
         RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
         RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam,
         RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
-        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
-        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
-        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirRangeFor, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt,
-        RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram,
+        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch,
+        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamEscape,
+        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
+        RirRangeFor, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -2068,6 +2068,43 @@ impl<'a> PlanCx<'a> {
         Ok((stmts, value))
     }
 
+    fn plan_ordinal_plan(
+        &self,
+        function: FunctionId,
+        plan: &air::AirOrdinalPlan,
+        locals: &mut Vec<RirLocal>,
+    ) -> (Vec<RirStmt>, RirOrdinalPlan) {
+        let mut stmts = vec![];
+        let mut adapters = vec![];
+        for adapter in &plan.adapters {
+            match adapter {
+                air::AirOrdinalAdapter::Rev => adapters.push(RirOrdinalAdapter::Rev),
+                air::AirOrdinalAdapter::Skip { count: value } => {
+                    let planned = self.plan_operand_read(function, value, locals);
+                    stmts.extend(planned.stmts);
+                    adapters.push(RirOrdinalAdapter::Skip {
+                        count: planned.operand,
+                    });
+                }
+                air::AirOrdinalAdapter::Take { count: value } => {
+                    let planned = self.plan_operand_read(function, value, locals);
+                    stmts.extend(planned.stmts);
+                    adapters.push(RirOrdinalAdapter::Take {
+                        count: planned.operand,
+                    });
+                }
+                air::AirOrdinalAdapter::StepBy { step: value } => {
+                    let planned = self.plan_operand_read(function, value, locals);
+                    stmts.extend(planned.stmts);
+                    adapters.push(RirOrdinalAdapter::StepBy {
+                        step: planned.operand,
+                    });
+                }
+            }
+        }
+        (stmts, RirOrdinalPlan { adapters })
+    }
+
     fn plan_air_stmt(
         &self,
         function: FunctionId,
@@ -2263,7 +2300,8 @@ impl<'a> PlanCx<'a> {
             air::AirStmt::RangeFor(range) => {
                 let start = self.plan_operand_read(function, &range.start, locals);
                 let end = self.plan_operand_read(function, &range.end, locals);
-                let step = self.plan_operand_read(function, &range.step, locals);
+                let (ordinal_stmts, ordinal_plan) =
+                    self.plan_ordinal_plan(function, &range.ordinal_plan, locals);
                 let body = self.plan_loop_body(
                     function,
                     range.id,
@@ -2275,14 +2313,13 @@ impl<'a> PlanCx<'a> {
                 )?;
                 let mut stmts = start.stmts;
                 stmts.extend(end.stmts);
-                stmts.extend(step.stmts);
+                stmts.extend(ordinal_stmts);
                 stmts.push(RirStmt::RangeFor(RirRangeFor {
                     id: RirLoopId::from_index(range.id.index()),
                     start: start.operand,
                     end: end.operand,
-                    step: step.operand,
+                    ordinal_plan,
                     inclusive: range.inclusive,
-                    reversed: range.reversed,
                     ordinal: range
                         .ordinal
                         .map(|local| RirLocalId::from_index(local.index())),
@@ -2292,7 +2329,8 @@ impl<'a> PlanCx<'a> {
                 Ok(stmts)
             }
             air::AirStmt::CollectionFor(for_) => {
-                let step = self.plan_operand_read(function, &for_.step, locals);
+                let (mut stmts, ordinal_plan) =
+                    self.plan_ordinal_plan(function, &for_.ordinal_plan, locals);
                 let body = self.plan_loop_body(
                     function,
                     for_.id,
@@ -2302,12 +2340,10 @@ impl<'a> PlanCx<'a> {
                     initialized_cells,
                     possible_cells,
                 )?;
-                let mut stmts = step.stmts;
                 stmts.push(RirStmt::CollectionFor(RirCollectionFor {
                     id: RirLoopId::from_index(for_.id.index()),
                     len: RirLocalId::from_index(for_.len.index()),
-                    step: step.operand,
-                    reversed: for_.reversed,
+                    ordinal_plan,
                     index: RirLocalId::from_index(for_.index.index()),
                     ordinal: for_
                         .ordinal
@@ -2941,11 +2977,24 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
-            RValue::CheckedForStep { step } => {
-                let step = self.plan_operand_read(function, step, locals);
+            RValue::CheckedIterCount { count, check } => {
+                let count = self.plan_operand_read(function, count, locals);
                 PlannedRValue {
-                    stmts: step.stmts,
-                    value: RirRValue::CheckedForStep { step: step.operand },
+                    stmts: count.stmts,
+                    value: RirRValue::CheckedIterCount {
+                        count: count.operand,
+                        check: match check {
+                            air::IterCountCheck::SkipNonNegative => {
+                                RirIterCountCheck::SkipNonNegative
+                            }
+                            air::IterCountCheck::TakeNonNegative => {
+                                RirIterCountCheck::TakeNonNegative
+                            }
+                            air::IterCountCheck::StepByPositive => {
+                                RirIterCountCheck::StepByPositive
+                            }
+                        },
+                    },
                     post_stmts: vec![],
                 }
             }
@@ -2979,6 +3028,40 @@ impl<'a> PlanCx<'a> {
                 PlannedRValue {
                     stmts: map.stmts,
                     value: RirRValue::MapEntryAt {
+                        map: map.access,
+                        index: RirLocalId::from_index(index.index()),
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::MapKeyAt { map, index, ty } => {
+                let map = self.plan_collection_access(
+                    function,
+                    map,
+                    CollectionAccessOp::MapEntryRead,
+                    locals,
+                )?;
+                PlannedRValue {
+                    stmts: map.stmts,
+                    value: RirRValue::MapKeyAt {
+                        map: map.access,
+                        index: RirLocalId::from_index(index.index()),
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::MapValueAt { map, index, ty } => {
+                let map = self.plan_collection_access(
+                    function,
+                    map,
+                    CollectionAccessOp::MapEntryRead,
+                    locals,
+                )?;
+                PlannedRValue {
+                    stmts: map.stmts,
+                    value: RirRValue::MapValueAt {
                         map: map.access,
                         index: RirLocalId::from_index(index.index()),
                         ty: self.type_map[ty],

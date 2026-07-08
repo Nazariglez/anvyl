@@ -1,12 +1,12 @@
 // @mode: run
 // @expect: error
-// @contains: for-loop step must be positive
+// @contains: step_by requires a positive count
 
 fn zero() -> int { 0 }
 
 fn main() {
     let map: [string: int] = [:];
-    for k, v in map step zero() {
+    for k, v in iter(map).step_by(zero()) {
         println(k);
     }
 }

@@ -19,16 +19,16 @@
 // @match-end
 
 fn main() {
-    for n in 0..7 step 2 {
+    for n in iter(0..7).step_by(2) {
         println(n);
     }
-    for n in 0..=6 step 2 {
+    for n in iter(0..=6).step_by(2) {
         println(n);
     }
-    for n in rev 0..7 step 2 {
+    for n in iter(0..7).rev().step_by(2) {
         println(n);
     }
-    for n in rev 0..=5 step 2 {
+    for n in iter(0..=5).rev().step_by(2) {
         println(n);
     }
 }

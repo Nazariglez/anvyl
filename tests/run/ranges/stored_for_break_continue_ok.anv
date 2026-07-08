@@ -15,7 +15,7 @@ fn main() {
         if n == 3 { break; }
     }
     let stepped = 0..6;
-    for n in rev stepped step 2 {
+    for n in iter(stepped).rev().step_by(2) {
         println(n);
         break;
     }

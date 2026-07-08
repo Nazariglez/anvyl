@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// rev step
+// 9
+// 7
+// 5
+// 3
+// 1
+// step rev
+// 8
+// 6
+// 4
+// 2
+// 0
+// @match-end
+
+fn main() {
+    println("rev step");
+    for n in iter(0..10).rev().step_by(2) {
+        println(n);
+    }
+
+    println("step rev");
+    for n in iter(0..10).step_by(2).rev() {
+        println(n);
+    }
+}

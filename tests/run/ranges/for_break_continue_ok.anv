@@ -13,7 +13,7 @@ fn main() {
         println(n);
         if n == 3 { break; }
     }
-    for n in rev 0..6 step 2 {
+    for n in iter(0..6).rev().step_by(2) {
         println(n);
         break;
     }

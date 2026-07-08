@@ -136,6 +136,7 @@ impl DataRefPlaceDescriptors {
             | RirRValue::MapInsert { map, .. }
             | RirRValue::MapRemove { map, .. }
             | RirRValue::MapEntryAt { map, .. }
+            | RirRValue::MapKeyAt { map, .. }
             | RirRValue::MapValueAt { map, .. } => self.collect_collection_access(program, map),
             _ => {}
         }

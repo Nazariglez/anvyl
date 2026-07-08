@@ -1,14 +1,16 @@
 // @mode: run
 // @expect: success
 // @match-begin
-// 5
-// 3
+// 0
 // 1
 // @match-end
 
+fn nums() -> iter {
+    iter(0..3).take(2)
+}
+
 fn main() {
-    let r = 0..6;
-    for n in iter(r).rev().step_by(2) {
+    for n in nums() {
         println(n);
     }
 }

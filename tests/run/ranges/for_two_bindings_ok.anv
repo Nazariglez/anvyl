@@ -20,7 +20,7 @@ fn main() {
         println(i);
         println(n);
     }
-    for i, n in rev 0..5 step 2 {
+    for i, n in iter(0..5).rev().step_by(2) {
         println(i);
         println(n);
     }

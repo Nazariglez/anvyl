@@ -16,11 +16,11 @@
 // @match-end
 
 fn main() {
-    for i, x in rev [10, 20, 30] {
+    for i, x in iter([10, 20, 30]).rev() {
         println(i);
         println(x);
     }
-    for i, x in rev [10, 20, 30, 40, 50] step 2 {
+    for i, x in iter([10, 20, 30, 40, 50]).rev().step_by(2) {
         println(i);
         println(x);
     }

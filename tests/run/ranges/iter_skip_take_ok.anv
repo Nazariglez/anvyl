@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 4
+// 7
+// 6
+// 5
+// @match-end
+
+fn main() {
+    for n in iter(0..10).skip(2).take(4).step_by(2) {
+        println(n);
+    }
+
+    for n in iter(0..10).take(9).rev().skip(1).take(3) {
+        println(n);
+    }
+}

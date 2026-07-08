@@ -20,7 +20,7 @@ fn main() {
         println(i);
         println(x);
     }
-    for i, x in [10, 20, 30, 40, 50] step 2 {
+    for i, x in iter([10, 20, 30, 40, 50]).step_by(2) {
         println(i);
         println(x);
     }

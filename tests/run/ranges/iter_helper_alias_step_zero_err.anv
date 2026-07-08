@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: error
+// @contains: step_by requires a positive count
+
+fn nums<S>(source: S) -> iter {
+    let n = 0;
+    iter(source).step_by(n)
+}
+
+fn main() {
+    for n in nums(0..3) {
+        println(n);
+    }
+}

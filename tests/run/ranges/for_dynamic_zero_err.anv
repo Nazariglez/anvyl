@@ -1,11 +1,11 @@
 // @mode: run
 // @expect: error
-// @stderr-contains: for-loop step must be positive
+// @stderr-contains: step_by requires a positive count
 
 fn stride() -> int { 0 }
 
 fn main() {
-    for n in 0..3 step stride() {
+    for n in iter(0..3).step_by(stride()) {
         return;
     }
 }

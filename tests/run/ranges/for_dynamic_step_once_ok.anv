@@ -12,7 +12,7 @@ fn stride() -> int {
 
 fn main() {
     var sum = 0;
-    for n in 0..6 step stride() {
+    for n in iter(0..6).step_by(stride()) {
         sum += n;
     }
     println(sum);

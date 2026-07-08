@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn nums<S>(source: S, count: int) -> iter {
+    let n = count;
+    iter(source).skip(n)
+}
+
+fn main() {
+    for n in nums(0..3, 1) {
+        println(n);
+    }
+}

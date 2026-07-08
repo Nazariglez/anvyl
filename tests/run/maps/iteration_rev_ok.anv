@@ -11,7 +11,7 @@
 
 fn main() {
     let map = ["a": 1, "b": 2, "c": 3];
-    for k, v in rev map {
+    for k, v in iter(map).rev() {
         println(k);
         println(v);
     }

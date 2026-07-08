@@ -465,11 +465,15 @@ impl ProfileCx<'_> {
                 air::AirStmt::RangeFor(range) => {
                     self.check_operand(site, &range.start);
                     self.check_operand(site, &range.end);
-                    self.check_operand(site, &range.step);
+                    for operand in range.ordinal_plan.operands() {
+                        self.check_operand(site, operand);
+                    }
                     self.check_air_block(function, &range.body);
                 }
                 air::AirStmt::CollectionFor(for_) => {
-                    self.check_operand(site, &for_.step);
+                    for operand in for_.ordinal_plan.operands() {
+                        self.check_operand(site, operand);
+                    }
                     self.check_air_block(function, &for_.body);
                 }
                 air::AirStmt::CollectionLoan(loan) => {
@@ -788,14 +792,16 @@ impl ProfileCx<'_> {
                 self.check_place(site, list);
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
-            RValue::MapEntryAt { map, index, ty } => {
+            RValue::MapEntryAt { map, index, ty }
+            | RValue::MapKeyAt { map, index, ty }
+            | RValue::MapValueAt { map, index, ty } => {
                 self.check_collection_access(site, map, CollectionAccessOp::MapEntryRead);
                 self.check_type_ref(site, *ty);
                 if self.current_local(site, *index).is_none() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
             }
-            RValue::CheckedForStep { step } => self.check_operand(site, step),
+            RValue::CheckedIterCount { count, .. } => self.check_operand(site, count),
             RValue::MakeLambda {
                 lambda, captures, ..
             } => {

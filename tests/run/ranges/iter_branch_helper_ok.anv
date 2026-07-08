@@ -1,0 +1,25 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 1
+// 0
+// 0
+// 1
+// 2
+// @match-end
+
+fn maybe(reverse: bool) -> iter {
+    if reverse { iter(0..3).rev() } else { iter(0..3) }
+}
+
+fn main() {
+    let yes = true;
+    for n in maybe(yes) {
+        println(n);
+    }
+    let no = false;
+    for n in maybe(no) {
+        println(n);
+    }
+}

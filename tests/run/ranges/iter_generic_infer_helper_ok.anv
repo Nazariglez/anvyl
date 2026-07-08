@@ -2,17 +2,16 @@
 // @expect: success
 // @match-begin
 // 0
-// 5
-// 1
-// 3
 // 2
-// 1
+// 4
 // @match-end
 
+fn every_other<S>(source: S) -> _ {
+    iter(source).step_by(2)
+}
+
 fn main() {
-    let r = 0..6;
-    for i, n in iter(r).rev().step_by(2) {
-        println(i);
+    for n in every_other(0..6) {
         println(n);
     }
 }

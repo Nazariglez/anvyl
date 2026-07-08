@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @contains: a
+// @contains: b
+// @contains: 2
+// @contains: 3
+
+fn main() {
+    var m = ["a": 1, "b": 2];
+    for key in iter(m).keys() {
+        println(key);
+    }
+    for ref value in iter(m).values() {
+        value += 1;
+    }
+    for _, value in m {
+        println(value);
+    }
+}

@@ -83,7 +83,9 @@ fn stmt_calls_fallible(
                 || block_calls_fallible(program, fallible, function, &range.body)
         }
         RirStmt::CollectionFor(for_) => {
-            operand_has_fallible_place(program, function, &for_.step)
+            for_.ordinal_plan
+                .operands()
+                .any(|operand| operand_has_fallible_place(program, function, operand))
                 || block_calls_fallible(program, fallible, function, &for_.body)
         }
         RirStmt::DataRefSet { object, value, .. } => {
@@ -138,13 +140,14 @@ fn rvalue_calls_fallible(
             | RirRValue::MapInsert { .. }
             | RirRValue::MapRemove { .. }
             | RirRValue::MapEntryAt { .. }
+            | RirRValue::MapKeyAt { .. }
             | RirRValue::MapValueAt { .. }
             | RirRValue::SequenceSlotAt { .. }
             | RirRValue::SliceView { .. }
             | RirRValue::CellGetCopy { .. }
             | RirRValue::ScopedPlaceCellGet { .. }
             | RirRValue::MutPlaceGetCopy { .. }
-            | RirRValue::CheckedForStep { .. } => true,
+            | RirRValue::CheckedIterCount { .. } => true,
             RirRValue::Call { callee, args, .. } => {
                 args.iter()
                     .any(|arg| call_arg_preparation_fallible(program, arg))
@@ -188,7 +191,7 @@ fn rvalue_uses_fallible_place(
         | RirRValue::ListPush { value: operand, .. }
         | RirRValue::MapGet { key: operand, .. }
         | RirRValue::MapRemove { key: operand, .. }
-        | RirRValue::CheckedForStep { step: operand } => {
+        | RirRValue::CheckedIterCount { count: operand, .. } => {
             operand_has_fallible_place(program, function, operand)
         }
         RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
@@ -239,9 +242,9 @@ fn rvalue_uses_fallible_place(
         RirRValue::SliceView { source, .. } | RirRValue::RangeListCopy { source, .. } => {
             place_has_fallible_projection(program, function, source)
         }
-        RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
-            collection_access_fallible(program, function, map)
-        }
+        RirRValue::MapEntryAt { map, .. }
+        | RirRValue::MapKeyAt { map, .. }
+        | RirRValue::MapValueAt { map, .. } => collection_access_fallible(program, function, map),
         RirRValue::CellGetCopy { .. } | RirRValue::ScopedPlaceCellGet { .. } => false,
         RirRValue::MutPlaceGetCopy { place, .. } => mut_place_preparation_fallible(program, place),
     }
@@ -452,8 +455,10 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             operands_context_use(program, function, range_for_operands(range))
                 .union(block_context_use(program, function, &range.body))
         }
-        RirStmt::CollectionFor(for_) => operand_context_use(program, function, &for_.step)
-            .union(block_context_use(program, function, &for_.body)),
+        RirStmt::CollectionFor(for_) => {
+            operands_context_use(program, function, for_.ordinal_plan.operands())
+                .union(block_context_use(program, function, &for_.body))
+        }
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);
@@ -547,6 +552,7 @@ fn rvalue_context_use(
         | RirRValue::MapInsert { .. }
         | RirRValue::MapRemove { .. }
         | RirRValue::MapEntryAt { .. }
+        | RirRValue::MapKeyAt { .. }
         | RirRValue::MapValueAt { .. }
         | RirRValue::ScopedPlaceCellGet { .. } => uses.union(ContextUse::rt()),
         RirRValue::MutPlaceGetCopy { place, .. } => uses
@@ -631,10 +637,12 @@ fn rvalue_operand_context_use(
             function,
             [key, value],
         )),
-        RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
+        RirRValue::MapEntryAt { map, .. }
+        | RirRValue::MapKeyAt { map, .. }
+        | RirRValue::MapValueAt { map, .. } => {
             collection_access_context_use(program, function, map)
         }
-        RirRValue::CheckedForStep { step } => operand_context_use(program, function, step),
+        RirRValue::CheckedIterCount { count, .. } => operand_context_use(program, function, count),
         RirRValue::Call { .. }
         | RirRValue::Lambda { .. }
         | RirRValue::CellGetCopy { .. }
@@ -786,8 +794,10 @@ fn option_subject_context_use(
     }
 }
 
-fn range_for_operands(range: &RirRangeFor) -> [&RirOperand; 3] {
-    [&range.start, &range.end, &range.step]
+fn range_for_operands(range: &RirRangeFor) -> impl Iterator<Item = &RirOperand> {
+    std::iter::once(&range.start)
+        .chain(std::iter::once(&range.end))
+        .chain(range.ordinal_plan.operands())
 }
 
 fn operands_context_use<'a>(
@@ -958,7 +968,7 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
         | RirRValue::OptionalSome { value: operand, .. }
         | RirRValue::Stringify { value: operand, .. }
         | RirRValue::Format { value: operand, .. }
-        | RirRValue::CheckedForStep { step: operand } => {
+        | RirRValue::CheckedIterCount { count: operand, .. } => {
             operand_uses_mut_place_param(function, operand)
         }
         RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
@@ -1007,7 +1017,9 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
             collection_access_uses_mut_place_param(function, map)
                 || operands_use_mut_place_param(function, [key, value])
         }
-        RirRValue::MapEntryAt { map, .. } | RirRValue::MapValueAt { map, .. } => {
+        RirRValue::MapEntryAt { map, .. }
+        | RirRValue::MapKeyAt { map, .. }
+        | RirRValue::MapValueAt { map, .. } => {
             collection_access_uses_mut_place_param(function, map)
         }
         RirRValue::Lambda { .. }

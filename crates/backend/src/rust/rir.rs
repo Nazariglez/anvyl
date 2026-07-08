@@ -749,14 +749,26 @@ pub struct RirLoop {
     pub body: RirStructuredBlock,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RirOrdinalPlan {
+    pub adapters: Vec<RirOrdinalAdapter>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RirOrdinalAdapter {
+    Rev,
+    Skip { count: RirOperand },
+    Take { count: RirOperand },
+    StepBy { step: RirOperand },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RirRangeFor {
     pub id: RirLoopId,
     pub start: RirOperand,
     pub end: RirOperand,
-    pub step: RirOperand,
+    pub ordinal_plan: RirOrdinalPlan,
     pub inclusive: bool,
-    pub reversed: bool,
     pub ordinal: Option<RirLocalId>,
     pub item: RirLocalId,
     pub body: RirStructuredBlock,
@@ -766,11 +778,21 @@ pub struct RirRangeFor {
 pub struct RirCollectionFor {
     pub id: RirLoopId,
     pub len: RirLocalId,
-    pub step: RirOperand,
-    pub reversed: bool,
+    pub ordinal_plan: RirOrdinalPlan,
     pub index: RirLocalId,
     pub ordinal: Option<RirLocalId>,
     pub body: RirStructuredBlock,
+}
+
+impl RirOrdinalPlan {
+    pub fn operands(&self) -> impl Iterator<Item = &RirOperand> {
+        self.adapters.iter().filter_map(|adapter| match adapter {
+            RirOrdinalAdapter::Rev => None,
+            RirOrdinalAdapter::Skip { count }
+            | RirOrdinalAdapter::Take { count }
+            | RirOrdinalAdapter::StepBy { step: count } => Some(count),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -810,6 +832,13 @@ pub struct RirMapEntryMatch {
 pub enum RirOptionSubject {
     Place(RirPlace),
     MutPlace(RirMutPlaceArg),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirIterCountCheck {
+    SkipNonNegative,
+    TakeNonNegative,
+    StepByPositive,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -954,10 +983,16 @@ pub enum RirRValue {
         key: RirOperand,
         ty: RirTypeId,
     },
-    CheckedForStep {
-        step: RirOperand,
+    CheckedIterCount {
+        count: RirOperand,
+        check: RirIterCountCheck,
     },
     MapEntryAt {
+        map: RirCollectionAccess,
+        index: RirLocalId,
+        ty: RirTypeId,
+    },
+    MapKeyAt {
         map: RirCollectionAccess,
         index: RirLocalId,
         ty: RirTypeId,
@@ -4097,7 +4132,9 @@ impl VerifyCx<'_> {
                     self.check_int_operands(
                         site,
                         function,
-                        [&range.start, &range.end, &range.step],
+                        std::iter::once(&range.start)
+                            .chain(std::iter::once(&range.end))
+                            .chain(range.ordinal_plan.operands()),
                         int,
                     );
                     self.check_int_locals(
@@ -4115,7 +4152,7 @@ impl VerifyCx<'_> {
             }
             RirStmt::CollectionFor(for_) => {
                 if let Some(int) = self.type_id(RirType::Int) {
-                    self.check_int_operands(site, function, [&for_.step], int);
+                    self.check_int_operands(site, function, for_.ordinal_plan.operands(), int);
                     self.check_int_locals(
                         site,
                         function,
@@ -4991,6 +5028,7 @@ impl VerifyCx<'_> {
             },
             RirRValue::SequenceSlotAt { ty, .. }
             | RirRValue::MapEntryAt { ty, .. }
+            | RirRValue::MapKeyAt { ty, .. }
             | RirRValue::MapValueAt { ty, .. } => self.source_call_return_state(*ty),
             RirRValue::Struct { fields, .. }
             | RirRValue::Tuple { fields, .. }
@@ -6426,6 +6464,24 @@ impl VerifyCx<'_> {
                 }
                 Some(*ty)
             }
+            RirRValue::MapKeyAt { map, index, ty } => {
+                self.check_type_id(site, *ty);
+                let Some((key, _)) =
+                    self.check_map_slot(site, function_id, function, map, *index, false)
+                else {
+                    return;
+                };
+                if key != *ty {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: key,
+                            found: *ty,
+                        },
+                    );
+                }
+                Some(*ty)
+            }
             RirRValue::MapValueAt { map, index, ty } => {
                 self.check_type_id(site, *ty);
                 let Some((_, value)) =
@@ -6444,9 +6500,9 @@ impl VerifyCx<'_> {
                 }
                 Some(*ty)
             }
-            RirRValue::CheckedForStep { step } => {
+            RirRValue::CheckedIterCount { count, .. } => {
                 if let Some(int) = self.type_id(RirType::Int) {
-                    self.check_value_operand_ty(site, function, step, int);
+                    self.check_value_operand_ty(site, function, count, int);
                 }
                 self.type_id(RirType::Int)
             }

@@ -194,12 +194,16 @@ impl CompileCx<'_> {
                     self.push_function(function, VmCompileErrorKind::UnsupportedRangeFor);
                     self.check_operand(function, &range.start);
                     self.check_operand(function, &range.end);
-                    self.check_operand(function, &range.step);
+                    for operand in range.ordinal_plan.operands() {
+                        self.check_operand(function, operand);
+                    }
                     self.check_block(function, &range.body, calls);
                 }
                 AirStmt::CollectionFor(for_) => {
                     self.push_collection_gap(function);
-                    self.check_operand(function, &for_.step);
+                    for operand in for_.ordinal_plan.operands() {
+                        self.check_operand(function, operand);
+                    }
                     self.check_block(function, &for_.body, calls);
                 }
                 AirStmt::CollectionLoan(loan) => {
@@ -276,7 +280,9 @@ impl CompileCx<'_> {
             | RValue::Cast { value: operand, .. }
             | RValue::Stringify { value: operand, .. }
             | RValue::Format { value: operand, .. }
-            | RValue::CheckedForStep { step: operand } => self.check_operand(function, operand),
+            | RValue::CheckedIterCount { count: operand, .. } => {
+                self.check_operand(function, operand)
+            }
             RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
                 self.check_operand(function, lhs);
                 self.check_operand(function, rhs);
@@ -311,7 +317,9 @@ impl CompileCx<'_> {
                 self.check_operand(function, key);
                 self.check_operand(function, value);
             }
-            RValue::MapEntryAt { map, .. } => self.check_place(function, map),
+            RValue::MapEntryAt { map, .. }
+            | RValue::MapKeyAt { map, .. }
+            | RValue::MapValueAt { map, .. } => self.check_place(function, map),
             RValue::FunctionRef { .. } => {
                 self.push_function(function, VmCompileErrorKind::UnsupportedLambdaValue);
             }

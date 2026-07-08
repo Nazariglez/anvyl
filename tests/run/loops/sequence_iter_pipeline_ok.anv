@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 2
+// 1
+// @match-end
+
+fn print_rev(xs: [int]) {
+    for x in iter(xs).rev() {
+        println(x);
+    }
+}
+
+fn main() {
+    print_rev([1, 2, 3]);
+}

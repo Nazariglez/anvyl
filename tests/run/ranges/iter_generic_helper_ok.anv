@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 0
+// 10
+// 20
+// @match-end
+
+fn every_tenth<S>(source: S) -> iter {
+    iter(source).step_by(10)
+}
+
+fn main() {
+    for n in every_tenth(0..30) {
+        println(n);
+    }
+}

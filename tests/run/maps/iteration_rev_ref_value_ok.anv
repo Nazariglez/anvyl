@@ -4,7 +4,7 @@
 
 fn main() {
     var map = ["a": 1, "b": 2, "c": 3];
-    for k, ref v in rev map step 2 {
+    for k, ref v in iter(map).rev().step_by(2) {
         v += 10;
     }
     var sum = 0;

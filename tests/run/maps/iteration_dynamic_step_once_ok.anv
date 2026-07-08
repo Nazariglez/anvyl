@@ -13,7 +13,7 @@ fn step() -> int {
 
 fn main() {
     let map = ["a": 1, "b": 2, "c": 3];
-    for k, v in map step step() {
+    for k, v in iter(map).step_by(step()) {
         println(k);
     }
 }

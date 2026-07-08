@@ -13,7 +13,7 @@ fn main() {
         println(x);
         if x == 20 { break; }
     }
-    for x in rev [10, 20, 30, 40, 50] step 2 {
+    for x in iter([10, 20, 30, 40, 50]).rev().step_by(2) {
         println(x);
         if x == 30 { break; }
     }

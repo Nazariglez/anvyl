@@ -8,10 +8,10 @@ fn main() {
         count += 1;
     }
     let min = -9223372036854775807 - 1;
-    for n in rev min..=min {
+    for n in iter(min..=min).rev() {
         count += 1;
     }
-    for n in rev 0..1 step 10 {
+    for n in iter(0..1).rev().step_by(10) {
         count += 1;
     }
     println(count);

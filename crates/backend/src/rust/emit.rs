@@ -10,15 +10,15 @@ use super::{
         RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope, RirCollectionStorageKind,
         RirCoreEnumKind, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumRepr,
         RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirIf, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig, RirLambdaSigId,
-        RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject,
-        RirParamAbi, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl, RirScopedPlaceCellRef,
-        RirStmt, RirStructuredBlock, RirTerm, RirTupleId, RirType, RirTypeId, RirVariant,
-        RirVariantId, RirVariantKind, VerifiedRirProgram, native_arg_facts,
-        native_ty_is_resource_ref, stmt_child_blocks_any,
+        RirIf, RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
+        RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
+        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParamAbi, RirParamSemantic,
+        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
+        RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        VerifiedRirProgram, native_arg_facts, native_ty_is_resource_ref, stmt_child_blocks_any,
     },
     runtime_owner::RuntimeOwnerEmit,
     syntax::{
@@ -83,6 +83,23 @@ struct EmitCx<'a> {
 struct ActiveCollectionLoan {
     root: RirCollectionAccess,
     version: String,
+}
+
+fn apply_ordinal_plan(iter: String, plan: &RirOrdinalPlan, values: &RustValues<'_>) -> String {
+    plan.adapters
+        .iter()
+        .fold(iter, |iter, adapter| match adapter {
+            RirOrdinalAdapter::Rev => target::iter_rev(&iter),
+            RirOrdinalAdapter::Skip { count } => {
+                target::iter_skip(&iter, &values.value_operand(count))
+            }
+            RirOrdinalAdapter::Take { count } => {
+                target::iter_take(&iter, &values.value_operand(count))
+            }
+            RirOrdinalAdapter::StepBy { step } => {
+                target::iter_step_by(&iter, &values.value_operand(step))
+            }
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -1723,11 +1740,14 @@ impl EmitCx<'_> {
             IterFor::Range(range) => {
                 let start = values.value_operand(&range.start);
                 let end = values.value_operand(&range.end);
-                let step = values.value_operand(&range.step);
                 (
                     range.id,
                     "range",
-                    target::range_iter_new(&start, &end, range.inclusive, range.reversed, &step),
+                    apply_ordinal_plan(
+                        target::range_iter_new(&start, &end, range.inclusive),
+                        &range.ordinal_plan,
+                        &values,
+                    ),
                     "__anv_item",
                     range.item,
                     range.ordinal,
@@ -1736,11 +1756,14 @@ impl EmitCx<'_> {
             }
             IterFor::Collection(for_) => {
                 let len = function.locals[for_.len.index()].symbol.as_str();
-                let step = values.value_operand(&for_.step);
                 (
                     for_.id,
                     "collection",
-                    target::collection_iter_new(len, for_.reversed, &step),
+                    apply_ordinal_plan(
+                        target::collection_iter_new(len),
+                        &for_.ordinal_plan,
+                        &values,
+                    ),
                     "__anv_index",
                     for_.index,
                     for_.ordinal,
@@ -2456,10 +2479,18 @@ impl EmitCx<'_> {
                     &target::map_remove_region("__anv_key"),
                 )
             }
-            RirRValue::CheckedForStep { step } => target::checked_for_step(&values.operand(step)),
+            RirRValue::CheckedIterCount { count, check } => {
+                let count = values.operand(count);
+                match check {
+                    RirIterCountCheck::SkipNonNegative => target::checked_iter_skip(&count),
+                    RirIterCountCheck::TakeNonNegative => target::checked_iter_take(&count),
+                    RirIterCountCheck::StepByPositive => target::checked_iter_step_by(&count),
+                }
+            }
             RirRValue::MapEntryAt { map, index, ty } => {
                 self.map_entry_at(function, map, *index, *ty)
             }
+            RirRValue::MapKeyAt { map, index, ty } => self.map_key_at(function, map, *index, *ty),
             RirRValue::MapValueAt { map, index, ty } => {
                 self.map_value_at(function, map, *index, *ty)
             }
@@ -3009,6 +3040,18 @@ impl EmitCx<'_> {
             )
         });
         format!("{{ let __anv_map_value = {value}; {set}; }}")
+    }
+
+    fn map_key_at(
+        &self,
+        function: &RirFunction,
+        map: &RirCollectionAccess,
+        index: RirLocalId,
+        _ty: RirTypeId,
+    ) -> String {
+        self.map_index_read(function, map, index, |map, version| {
+            target::map_key_at_shared(map, target::runtime_param_name(), "index", version)
+        })
     }
 
     fn map_value_at(
@@ -5090,14 +5133,17 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
         }
         RirStmt::If(RirIf { cond, .. }) => operand_uses_local(program, cond, local),
         RirStmt::RangeFor(RirRangeFor {
-            start, end, step, ..
+            start,
+            end,
+            ordinal_plan,
+            ..
         }) => {
             operand_uses_local(program, start, local)
                 || operand_uses_local(program, end, local)
-                || operand_uses_local(program, step, local)
+                || ordinal_uses_local(program, ordinal_plan, local)
         }
         RirStmt::CollectionFor(for_) => {
-            for_.len == local || operand_uses_local(program, &for_.step, local)
+            for_.len == local || ordinal_uses_local(program, &for_.ordinal_plan, local)
         }
         RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
         RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
@@ -5139,7 +5185,7 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
         | RirRValue::OptionalSome { value: operand, .. }
         | RirRValue::Stringify { value: operand, .. }
         | RirRValue::Format { value: operand, .. }
-        | RirRValue::CheckedForStep { step: operand } => {
+        | RirRValue::CheckedIterCount { count: operand, .. } => {
             operand_uses_local(program, operand, local)
         }
         RirRValue::Struct { fields, .. }
@@ -5189,6 +5235,9 @@ fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId)
             source, start, end, ..
         } => place_uses_local(source, local) || *start == local || *end == local,
         RirRValue::MapEntryAt {
+            map: source, index, ..
+        }
+        | RirRValue::MapKeyAt {
             map: source, index, ..
         }
         | RirRValue::MapValueAt {
@@ -5318,6 +5367,11 @@ fn operand_uses_local(_program: &RirProgram, operand: &RirOperand, local: RirLoc
         RirOperand::Place(place) => place_uses_local(place, local),
         RirOperand::Const(_) => false,
     }
+}
+
+fn ordinal_uses_local(program: &RirProgram, plan: &RirOrdinalPlan, local: RirLocalId) -> bool {
+    plan.operands()
+        .any(|operand| operand_uses_local(program, operand, local))
 }
 
 fn place_uses_local(place: &RirPlace, local: RirLocalId) -> bool {
