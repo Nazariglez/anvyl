@@ -33,8 +33,8 @@ pub use callback_registry::{
     CallbackCloseResult, CallbackInvocationGuard, CallbackSlot, CallbackSlotState,
 };
 pub use check::{
-    AnvCollectionIter, AnvRangeIter, checked_for_step, checked_index, checked_index_result,
-    checked_range,
+    AnvOrdinalIter, checked_index, checked_index_result, checked_iter_skip, checked_iter_step_by,
+    checked_iter_take, checked_range,
 };
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};

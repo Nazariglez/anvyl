@@ -46,93 +46,150 @@ pub fn checked_range(
     Ok(start..end)
 }
 
-pub fn checked_for_step(step: i64) -> RuntimeResult<i64> {
+pub fn checked_iter_step_by(step: i64) -> RuntimeResult<i64> {
     if step > 0 {
         Ok(step)
     } else {
-        Err(RuntimeError::new("for-loop step must be positive"))
+        Err(RuntimeError::new("step_by requires a positive count"))
     }
 }
 
-pub struct AnvCollectionIter(AnvRangeIter);
+pub fn checked_iter_skip(count: i64) -> RuntimeResult<i64> {
+    if count >= 0 {
+        Ok(count)
+    } else {
+        Err(RuntimeError::new("skip requires a non-negative count"))
+    }
+}
 
-impl AnvCollectionIter {
-    pub fn new(len: i64, reversed: bool, step: i64) -> Self {
+pub fn checked_iter_take(count: i64) -> RuntimeResult<i64> {
+    if count >= 0 {
+        Ok(count)
+    } else {
+        Err(RuntimeError::new("take requires a non-negative count"))
+    }
+}
+
+pub struct AnvOrdinalIter {
+    next: i128,
+    step: i128,
+    len: u128,
+    ordinal: u128,
+}
+
+impl AnvOrdinalIter {
+    #[must_use]
+    pub fn collection(len: i64) -> Self {
         debug_assert!(len >= 0);
-        Self(AnvRangeIter::new(0, len, false, reversed, step))
+        Self::new(0, len as u128)
     }
-}
 
-impl Iterator for AnvCollectionIter {
-    type Item = (i64, i64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
+    #[must_use]
+    pub fn range(start: i64, end: i64, inclusive: bool) -> Self {
+        Self::new(i128::from(start), range_len(start, end, inclusive))
     }
-}
 
-pub struct AnvRangeIter {
-    next: Option<i64>,
-    last: i64,
-    step: i64,
-    ordinal: i64,
-}
-
-impl AnvRangeIter {
-    pub fn new(start: i64, end: i64, inclusive: bool, reversed: bool, step: i64) -> Self {
-        debug_assert!(step > 0);
-        let empty = if inclusive { start > end } else { start >= end };
-        let last = if inclusive || empty {
-            end
-        } else {
-            end.checked_sub(1)
-                .expect("non-empty exclusive range end must have predecessor")
-        };
-        let (next, last, step) = if reversed {
-            (last, start, -step)
-        } else {
-            (start, last, step)
-        };
+    fn new(next: i128, len: u128) -> Self {
         Self {
-            next: (!empty).then_some(next),
-            last,
-            step,
+            next,
+            step: 1,
+            len,
             ordinal: 0,
         }
     }
 
-    fn in_bounds(&self, item: i64) -> bool {
-        if self.step > 0 {
-            item <= self.last
-        } else {
-            item >= self.last
+    #[must_use]
+    pub fn rev(mut self) -> Self {
+        if self.len > 1 {
+            self.advance(self.len - 1);
+            self.step = -self.step;
         }
+        self
+    }
+
+    #[must_use]
+    pub fn skip(mut self, count: i64) -> Self {
+        let count = iter_count(count).min(self.len);
+        self.advance(count);
+        self.len -= count;
+        self
+    }
+
+    #[must_use]
+    pub fn take(mut self, count: i64) -> Self {
+        self.len = self.len.min(iter_count(count));
+        self
+    }
+
+    #[must_use]
+    pub fn step_by(mut self, step: i64) -> Self {
+        let step = iter_count(step);
+        debug_assert!(step > 0);
+        let len = self.len.div_ceil(step);
+        if len > 1 {
+            let step = i128::try_from(step).expect("iterator step must fit i128");
+            self.step = self
+                .step
+                .checked_mul(step)
+                .expect("iterator stride must stay within source bounds");
+        }
+        self.len = len;
+        self
+    }
+
+    fn advance(&mut self, count: u128) {
+        if count == 0 || self.len == 0 {
+            return;
+        }
+        let count = i128::try_from(count).expect("iterator offset must fit i128");
+        let offset = self
+            .step
+            .checked_mul(count)
+            .expect("iterator offset must stay within source bounds");
+        self.next = self
+            .next
+            .checked_add(offset)
+            .expect("iterator item must stay within source bounds");
     }
 }
 
-impl Iterator for AnvRangeIter {
+impl Iterator for AnvOrdinalIter {
     type Item = (i64, i64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let item = self.next?;
-        if !self.in_bounds(item) {
-            self.next = None;
+        if self.len == 0 {
             return None;
         }
-
         let ordinal = self.ordinal;
-        self.next = item.checked_add(self.step);
-        match self.ordinal.checked_add(1) {
-            Some(next) => self.ordinal = next,
-            None => self.next = None,
+        let item = self.next;
+        self.len -= 1;
+        self.ordinal = self.ordinal.checked_add(1)?;
+        if self.len > 0 {
+            self.next = self.next.checked_add(self.step)?;
         }
+        let ordinal = i64::try_from(ordinal).ok()?;
+        let item = i64::try_from(item).ok()?;
         Some((ordinal, item))
     }
 }
 
+fn iter_count(count: i64) -> u128 {
+    debug_assert!(count >= 0);
+    count as u128
+}
+
+fn range_len(start: i64, end: i64, inclusive: bool) -> u128 {
+    if start > end || (!inclusive && start == end) {
+        return 0;
+    }
+    let span = i128::from(end) - i128::from(start);
+    let len = if inclusive { span + 1 } else { span };
+    u128::try_from(len).expect("valid range length must fit u128")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AnvCollectionIter, AnvRangeIter};
+    use super::AnvOrdinalIter;
 
     fn items(iter: impl Iterator<Item = (i64, i64)>) -> Vec<(i64, i64)> {
         iter.collect()
@@ -141,40 +198,73 @@ mod tests {
     #[test]
     fn range_iter_handles_overflow_edges() {
         assert_eq!(
-            items(AnvRangeIter::new(i64::MAX - 1, i64::MAX, true, false, 1)),
+            items(AnvOrdinalIter::range(i64::MAX - 1, i64::MAX, true)),
             vec![(0, i64::MAX - 1), (1, i64::MAX)]
         );
         assert_eq!(
-            items(AnvRangeIter::new(i64::MIN, i64::MIN, true, true, 1)),
+            items(AnvOrdinalIter::range(i64::MIN, i64::MIN, true).rev()),
             vec![(0, i64::MIN)]
         );
     }
 
     #[test]
     fn range_iter_handles_reverse_empty_and_large_step() {
-        assert_eq!(items(AnvRangeIter::new(3, 3, false, true, 1)), vec![]);
-        assert_eq!(items(AnvRangeIter::new(4, 3, false, true, 1)), vec![]);
+        assert_eq!(items(AnvOrdinalIter::range(3, 3, false).rev()), vec![]);
+        assert_eq!(items(AnvOrdinalIter::range(4, 3, false).rev()), vec![]);
         assert_eq!(
-            items(AnvRangeIter::new(0, 5, false, true, 20)),
+            items(AnvOrdinalIter::range(0, 5, false).rev().step_by(20)),
             vec![(0, 4)]
         );
     }
 
     #[test]
     fn collection_iter_handles_order_step_and_empty() {
-        assert_eq!(items(AnvCollectionIter::new(0, false, 1)), vec![]);
+        assert_eq!(items(AnvOrdinalIter::collection(0)), vec![]);
         assert_eq!(
-            items(AnvCollectionIter::new(5, false, 2)),
+            items(AnvOrdinalIter::collection(5).step_by(2)),
             vec![(0, 0), (1, 2), (2, 4)]
         );
         assert_eq!(
-            items(AnvCollectionIter::new(5, true, 2)),
+            items(AnvOrdinalIter::collection(5).rev().step_by(2)),
             vec![(0, 4), (1, 2), (2, 0)]
         );
-        assert_eq!(items(AnvCollectionIter::new(3, true, 10)), vec![(0, 2)]);
         assert_eq!(
-            items(AnvCollectionIter::new(3, false, i64::MAX)),
+            items(AnvOrdinalIter::collection(3).rev().step_by(10)),
+            vec![(0, 2)]
+        );
+        assert_eq!(
+            items(AnvOrdinalIter::collection(3).step_by(i64::MAX)),
             vec![(0, 0)]
+        );
+    }
+
+    #[test]
+    fn adapters_preserve_order() {
+        assert_eq!(
+            items(
+                AnvOrdinalIter::range(0, 10, false)
+                    .step_by(i64::MAX)
+                    .step_by(i64::MAX)
+                    .step_by(i64::MAX)
+            ),
+            vec![(0, 0)]
+        );
+        assert_eq!(
+            items(AnvOrdinalIter::range(0, 10, false).rev().step_by(2)),
+            vec![(0, 9), (1, 7), (2, 5), (3, 3), (4, 1)]
+        );
+        assert_eq!(
+            items(AnvOrdinalIter::range(0, 10, false).step_by(2).rev()),
+            vec![(0, 8), (1, 6), (2, 4), (3, 2), (4, 0)]
+        );
+        assert_eq!(
+            items(
+                AnvOrdinalIter::range(0, 10, false)
+                    .skip(3)
+                    .take(4)
+                    .step_by(2)
+            ),
+            vec![(0, 3), (1, 5)]
         );
     }
 }
