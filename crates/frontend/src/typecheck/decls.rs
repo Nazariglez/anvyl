@@ -1691,7 +1691,7 @@ impl MethodSchema {
         self.mode == (MethodMode::Instance { mutable: false })
             && self.params.is_empty()
             && self.generics.is_empty()
-            && self.ret.ty == Type::String
+            && self.ret.ty() == Type::String
     }
 }
 
@@ -2085,7 +2085,7 @@ impl DeclarationIndex {
                     &type_params,
                     DeclTypeUseKind::MethodReturn,
                 );
-                method.ret.ty = f(site, method.ret.ty.clone());
+                method.ret = method.ret.with_ty(f(site, method.ret.ty()));
             }
         }
 
@@ -2148,7 +2148,7 @@ impl DeclarationIndex {
                 }
                 let site =
                     bare_type_site(&key.module, span.byte(), DeclTypeUseKind::ContractReturn);
-                req.ret.ty = f(site, req.ret.ty.clone());
+                req.ret = req.ret.with_ty(f(site, req.ret.ty()));
             }
         }
 
@@ -2234,7 +2234,7 @@ impl DeclarationIndex {
                     &type_params,
                     DeclTypeUseKind::MethodReturn,
                 );
-                method.ret.ty = f(site, method.ret.ty.clone());
+                method.ret = method.ret.with_ty(f(site, method.ret.ty()));
             }
             for cast in &mut extend.cast_froms {
                 let site = type_site(
@@ -2253,7 +2253,7 @@ impl DeclarationIndex {
                     cast.param.ty.clone(),
                 );
                 if let Some(ret) = &mut cast.ret {
-                    ret.ty = f(site, ret.ty.clone());
+                    *ret = ret.with_ty(f(site, ret.ty()));
                 }
             }
         }
@@ -2442,7 +2442,7 @@ impl DeclarationIndex {
             Some(MethodReceiver::Value) if !sig.params.is_empty() => {
                 Some("to_string method must take no parameters")
             }
-            Some(MethodReceiver::Value) if sig.ret.ty != Type::String => {
+            Some(MethodReceiver::Value) if sig.ret.ty() != Type::String => {
                 Some("to_string method must return 'string'")
             }
             Some(MethodReceiver::Value) => None,
@@ -4434,7 +4434,7 @@ impl DeclarationIndex {
             .collect::<Vec<_>>();
         let template_ret = method
             .ret
-            .with_ty(generic_template_type(&method.ret.ty, &extend.generics));
+            .with_ty(generic_template_type(&method.ret.ty(), &extend.generics));
 
         CallableRef {
             def: CallableDef {
@@ -4625,7 +4625,7 @@ where
             kind: ret_kind,
             ..site.clone()
         },
-        ret.ty.clone(),
+        ret.ty().clone(),
     );
     Type::func(params, ret.with_ty(ret_ty))
 }
@@ -4661,7 +4661,7 @@ pub(crate) fn substitute_return_spec(
     type_subst: &TypeSubst,
     const_subst: &ConstSubst,
 ) -> ReturnSpec {
-    ret.with_ty(substitute(&ret.ty, type_subst, const_subst))
+    ret.with_ty(substitute(&ret.ty(), type_subst, const_subst))
 }
 
 pub(crate) fn required_param_count(params: &[Param]) -> usize {
@@ -5529,7 +5529,7 @@ mod tests {
             instance_ref.def.sig.params,
             vec![FuncParam::immut(Type::Int)]
         );
-        assert_eq!(instance_ref.def.sig.ret.ty, Type::Int);
+        assert_eq!(instance_ref.def.sig.ret.ty(), Type::Int);
     }
 
     #[test]
@@ -5561,7 +5561,7 @@ mod tests {
         assert_eq!(callable.owner_args, owner_args);
         assert_eq!(callable.receiver_ty, Some(Type::Int));
         assert_eq!(callable.def.sig.params, vec![FuncParam::immut(Type::Int)]);
-        assert_eq!(callable.def.sig.ret.ty, Type::Int);
+        assert_eq!(callable.def.sig.ret.ty(), Type::Int);
     }
 
     #[test]

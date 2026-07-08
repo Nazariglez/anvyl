@@ -6,16 +6,16 @@ use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionFor,
     AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot,
     AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop,
-    AirLoopId, AirMapEntryMatch, AirOptionalMatch, AirRangeFor, AirStmt, AirTail,
-    BindingId as AirBindingId, CallArg, Callee, CaptureCellDecl, CaptureCellId,
+    AirLoopId, AirMapEntryMatch, AirOptionalMatch, AirOrdinalAdapter, AirOrdinalPlan, AirRangeFor,
+    AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee, CaptureCellDecl, CaptureCellId,
     CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId, ConstValue, CoreEnumKind,
     DynContractData, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl, ExternFieldDecl,
     ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
     ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind,
     FunctionOwner, FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId,
-    GlobalInitEffect, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
-    LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
+    GlobalInitEffect, IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId,
+    LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
     Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
     Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
     ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
@@ -35,17 +35,18 @@ use crate::{
     source::SourceId,
     span::SourceSpan,
     typecheck::{
-        BindingId, BodyInstanceKey, CallForm, CallableId, CallableInstanceKey, CallableKind,
-        CallableParent, CaptureStorageOrigin, ConstTerm, CoreRangeKind, DeclarationIndex,
-        DefaultArgFact, DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
-        FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin, GenericArgs,
-        GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect, GlobalKey,
-        GlobalSig, LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
-        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
-        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
-        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
-        TypecheckFacts, VariantPayload, generic_args_are_concrete, nominal_generic_args,
-        nominal_key_for_type, substitute_aggregate_member, type_has_unfinished_facts,
+        BindingId, BodyInstanceKey, CallForm, CallTarget, CallableId, CallableInstanceKey,
+        CallableKind, CallableParent, CaptureStorageOrigin, ConstTerm, CoreRangeKind,
+        DeclarationIndex, DefaultArgFact, DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId,
+        ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin,
+        GenericArgs, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect,
+        GlobalKey, GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
+        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
+        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
+        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
+        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
+        VariantPayload, generic_args_are_concrete, nominal_generic_args, nominal_key_for_type,
+        substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
 
@@ -200,6 +201,7 @@ enum FilterCollection {
     Map { key: TypeId, value: TypeId },
 }
 
+#[derive(Debug)]
 struct SemanticCallableFacts<'a> {
     functions: HashMap<CallableInstanceKey, &'a SemanticFunctionInstanceFact>,
 }
@@ -329,12 +331,12 @@ impl TypeLowerer {
                         })
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?,
-                match ret.access {
+                match ret.access() {
                     ReturnAccess::Value => {
-                        ReturnMode::Value(self.lower_with_env(program, &ret.ty, env)?)
+                        ReturnMode::Value(self.lower_with_env(program, &ret.ty(), env)?)
                     }
                     ReturnAccess::Place => {
-                        ReturnMode::Place(self.lower_with_env(program, &ret.ty, env)?)
+                        ReturnMode::Place(self.lower_with_env(program, &ret.ty(), env)?)
                     }
                 },
             )),
@@ -990,9 +992,9 @@ impl LowerCx<'_> {
             .is_some_and(|facts| facts.capture_cell_requirements().contains_key(&binding))
     }
 
-    fn requires_for_step_runtime_check(&self, expr_id: ExprId) -> bool {
+    fn iter_runtime_check(&self, expr_id: ExprId) -> Option<IterRuntimeCheckKind> {
         self.typecheck_facts
-            .is_some_and(|facts| facts.requires_for_step_runtime_check(expr_id))
+            .and_then(|facts| facts.iter_runtime_check(expr_id))
     }
 
     fn ordered_lambda_capture_facts(
@@ -1487,8 +1489,8 @@ impl LowerCx<'_> {
             match &source.source {
                 ReachableSource::Callable { callable, fact } => {
                     let module_scope = &modules.items[callable.module()].scope;
-                    let return_type = self.lower_ty(&fact.ret.ty)?;
-                    let return_mode = match fact.ret.access {
+                    let return_type = self.lower_ty(&fact.ret.ty())?;
+                    let return_mode = match fact.ret.access() {
                         ReturnAccess::Value => ReturnMode::Value(return_type),
                         ReturnAccess::Place => ReturnMode::Place(return_type),
                     };
@@ -1526,8 +1528,8 @@ impl LowerCx<'_> {
                             ty: Box::new(ty.clone()),
                         });
                     };
-                    let return_ty = self.lower_ty(&ret.ty)?;
-                    let return_mode = match ret.access {
+                    let return_ty = self.lower_ty(&ret.ty())?;
+                    let return_mode = match ret.access() {
                         ReturnAccess::Value => ReturnMode::Value(return_ty),
                         ReturnAccess::Place => ReturnMode::Place(return_ty),
                     };
@@ -1864,6 +1866,8 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
     body: BodyInstanceKey,
     facts: &'facts SemanticBodyFacts,
     index: &'facts SourceProgramIndex<'facts>,
+    body_facts: &'facts HashMap<BodyInstanceKey, SemanticBodyFacts>,
+    callable_facts: &'facts SemanticCallableFacts<'facts>,
     default_facts: &'facts DefaultExprFactsIndex<'facts>,
     function_id: FunctionId,
     source: SourceId,
@@ -1922,6 +1926,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             body: body.clone(),
             facts,
             index: functions.index,
+            body_facts: functions.body_facts,
+            callable_facts: functions.callable_facts,
             default_facts: &functions.default_facts,
             function_id,
             source,
@@ -2327,6 +2333,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         value: Operand,
     ) -> Result<(), LowerError> {
         let semantic = self.pattern_binding_semantic(pattern)?;
+        if let Some(place) = self.locals.get(&semantic).cloned() {
+            return self.emit_init_place(place, RValue::Use(value));
+        }
         let def = self.local_def(semantic)?;
         let name = def.name;
         let binding = def.binding_id.map(air_binding_id);
@@ -2590,11 +2599,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_for(&mut self, for_: &ast::For) -> Result<(), LowerError> {
-        if let Some(parts) = self.lower_range_for_parts(&for_.iterable)? {
-            return self.lower_range_for(for_, parts);
+        if let Some(branch) = self.iter_for_branch_source(&for_.iterable)? {
+            return self.lower_for_branch(for_, &branch);
+        }
+        let source = self.iter_for_source(&for_.iterable)?;
+        self.lower_for_source(for_, &source)
+    }
+
+    fn lower_for_source(
+        &mut self,
+        for_: &ast::For,
+        source: &IterForSource<'_>,
+    ) -> Result<(), LowerError> {
+        if let Some(parts) = self.lower_range_for_parts(source)? {
+            return self.lower_range_for(for_, source, parts);
         }
 
-        let plan = self.for_plan(for_)?;
+        let plan = self.for_plan(for_, source)?;
         let id = self.alloc_loop();
         self.active_loops.push(id);
         let body = self.with_nested_block(|this| this.lower_for_loan_body(id, for_, &plan));
@@ -2612,10 +2633,38 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         Ok(())
     }
 
+    fn lower_for_branch(
+        &mut self,
+        for_: &ast::For,
+        branch: &IterForBranch<'_>,
+    ) -> Result<(), LowerError> {
+        let cond = self.lower_if_cond(branch.cond)?;
+        let then_block =
+            self.with_nested_block(|this| this.lower_for_source(for_, &branch.then_source))?;
+        let else_block =
+            self.with_nested_block(|this| this.lower_for_source(for_, &branch.else_source))?;
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::If(AirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }));
+        Ok(())
+    }
+
     fn lower_range_for_parts(
         &mut self,
-        iterable: &ExprNode,
+        source: &IterForSource<'_>,
     ) -> Result<Option<RangeForParts>, LowerError> {
+        let iterable = source.source;
+        if let Some(range) = &source.range {
+            let int_ty = self.cx.lower_ty(&Type::Int)?;
+            return Ok(Some(RangeForParts {
+                start: self.lower_int_expr(range.start, int_ty)?,
+                end: self.lower_int_expr(range.end, int_ty)?,
+                inclusive: range.inclusive,
+            }));
+        }
         let ty = self.lower_expr_ty(iterable.node.id)?;
         let Some(kind) = self
             .cx
@@ -2625,25 +2674,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         else {
             return Ok(None);
         };
-        if let ExprKind::Range(range) = &iterable.node.kind {
-            let ast::Range::Bounded {
-                start,
-                end,
-                inclusive,
-            } = &range.node
-            else {
-                return Err(LowerError::UnsupportedStmt {
-                    kind: "RangeFor",
-                    span: Some(self.source_span(iterable.span)),
-                });
-            };
-            let int_ty = self.cx.lower_ty(&Type::Int)?;
-            return Ok(Some(RangeForParts {
-                start: self.lower_value_to(start, int_ty, start)?,
-                end: self.lower_value_to(end, int_ty, end)?,
-                inclusive: *inclusive,
-            }));
-        }
         let inclusive = match kind {
             CoreRangeKind::Exclusive => false,
             CoreRangeKind::Inclusive => true,
@@ -2665,9 +2695,21 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }))
     }
 
-    fn lower_range_for(&mut self, for_: &ast::For, parts: RangeForParts) -> Result<(), LowerError> {
+    fn lower_int_expr(&mut self, expr: &ExprNode, int_ty: TypeId) -> Result<Operand, LowerError> {
+        if let ExprKind::Lit(Lit::Int(value)) = expr.node.kind {
+            return self.int_const(value);
+        }
+        self.lower_value_to(expr, int_ty, expr)
+    }
+
+    fn lower_range_for(
+        &mut self,
+        for_: &ast::For,
+        source: &IterForSource<'_>,
+        parts: RangeForParts,
+    ) -> Result<(), LowerError> {
         let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let step = self.lower_for_step(for_)?;
+        let ordinal_plan = self.lower_for_ordinal_plan(source)?;
         let item = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
         let ordinal = (for_.bindings.len() == 2)
             .then(|| self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp));
@@ -2688,9 +2730,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             id,
             start: parts.start,
             end: parts.end,
-            step,
+            ordinal_plan,
             inclusive: parts.inclusive,
-            reversed: for_.reversed,
             ordinal,
             item,
             body,
@@ -2727,12 +2768,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
-    fn for_plan(&mut self, for_: &ast::For) -> Result<ForPlan, LowerError> {
-        let root = self.lower_place_arg(&for_.iterable, false)?;
+    fn for_plan(
+        &mut self,
+        for_: &ast::For,
+        source: &IterForSource<'_>,
+    ) -> Result<ForPlan, LowerError> {
+        let root = self.lower_place_arg(source.source, false)?;
         let len = self.for_len_local()?;
         let int_ty = self.cx.lower_ty(&Type::Int)?;
         let index = self.push_local(None, None, int_ty, AirMutability::Mutable, LocalKind::Temp);
-        let step = self.lower_for_step(for_)?;
+        let ordinal_plan = self.lower_for_ordinal_plan(source)?;
         let type_data = self.cx.program.type_data(root.ty).clone();
         match type_data {
             TypeData::List(elem) => self.sequence_for_plan(
@@ -2742,7 +2787,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 elem,
                 len,
                 index,
-                step,
+                ordinal_plan.clone(),
             ),
             TypeData::Array { elem, .. } => self.sequence_for_plan(
                 for_,
@@ -2751,7 +2796,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 elem,
                 len,
                 index,
-                step,
+                ordinal_plan.clone(),
             ),
             TypeData::Slice(elem) => self.sequence_for_plan(
                 for_,
@@ -2760,11 +2805,18 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 elem,
                 len,
                 index,
-                step,
+                ordinal_plan.clone(),
             ),
-            TypeData::Map { key, value, .. } => {
-                self.map_for_plan(for_, root, key, value, len, index, step)
-            }
+            TypeData::Map { key, value, .. } => self.map_for_plan(
+                for_,
+                source.projection,
+                root,
+                key,
+                value,
+                len,
+                index,
+                ordinal_plan,
+            ),
             _ => Err(LowerError::UnsupportedStmt {
                 kind: "For",
                 span: Some(self.source_span(for_.iterable.span)),
@@ -2780,7 +2832,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         elem: TypeId,
         len: LocalId,
         index: LocalId,
-        step: Operand,
+        ordinal_plan: AirOrdinalPlan,
     ) -> Result<ForPlan, LowerError> {
         let mut mode = AirCollectionLoanMode::ReadonlySequence;
         let mut bindings = vec![];
@@ -2825,7 +2877,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             root,
             len,
             index,
-            step,
+            ordinal_plan,
             bindings,
         })
     }
@@ -2833,25 +2885,50 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn map_for_plan(
         &mut self,
         for_: &ast::For,
+        projection: IterForProjection,
         root: Place,
         key: TypeId,
         value: TypeId,
         len: LocalId,
         index: LocalId,
-        step: Operand,
+        ordinal_plan: AirOrdinalPlan,
     ) -> Result<ForPlan, LowerError> {
         let mut mode = AirCollectionLoanMode::ReadonlyMap;
         let mut bindings = vec![];
-        match for_.bindings.as_slice() {
-            [entry] if !entry.access.is_ref() => bindings.push(ForBindingPlan::OwnedMapEntry {
-                pattern: entry.pattern.clone(),
-                ty: self.for_pattern_ty(&entry.pattern)?.unwrap_or_else(|| {
-                    self.cx
-                        .program
-                        .alloc_type(TypeData::Tuple(vec![key, value]))
-                }),
-            }),
-            [key_binding, value_binding] => {
+        match (projection, for_.bindings.as_slice()) {
+            (IterForProjection::MapKeys, [key_binding]) if !key_binding.access.is_ref() => {
+                bindings.push(ForBindingPlan::OwnedMapKey {
+                    pattern: key_binding.pattern.clone(),
+                    ty: key,
+                });
+            }
+            (IterForProjection::MapValues, [value_binding]) => {
+                if value_binding.access.is_ref() {
+                    let local = self.push_for_slot_local(&value_binding.pattern, value)?;
+                    bindings.push(ForBindingPlan::MapValueSlot {
+                        pattern: value_binding.pattern.clone(),
+                        local,
+                        ty: value,
+                    });
+                    mode = AirCollectionLoanMode::MutableMapValue;
+                } else {
+                    bindings.push(ForBindingPlan::OwnedMapValue {
+                        pattern: value_binding.pattern.clone(),
+                        ty: value,
+                    });
+                }
+            }
+            (IterForProjection::Default, [entry]) if !entry.access.is_ref() => {
+                bindings.push(ForBindingPlan::OwnedMapEntry {
+                    pattern: entry.pattern.clone(),
+                    ty: self.for_pattern_ty(&entry.pattern)?.unwrap_or_else(|| {
+                        self.cx
+                            .program
+                            .alloc_type(TypeData::Tuple(vec![key, value]))
+                    }),
+                });
+            }
+            (IterForProjection::Default, [key_binding, value_binding]) => {
                 bindings.push(ForBindingPlan::OwnedMapKey {
                     pattern: key_binding.pattern.clone(),
                     ty: key,
@@ -2879,24 +2956,238 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             root,
             len,
             index,
-            step,
+            ordinal_plan,
             bindings,
         })
     }
 
-    fn lower_for_step(&mut self, for_: &ast::For) -> Result<Operand, LowerError> {
-        let int_ty = self.cx.lower_ty(&Type::Int)?;
-        let Some(step) = &for_.step else {
-            return self.int_const(1);
-        };
+    fn iter_for_source<'a>(&self, iterable: &'a ExprNode) -> Result<IterForSource<'a>, LowerError>
+    where
+        'facts: 'a,
+    {
+        self.iter_for_source_with_subst(iterable, &IterParamSubst::default(), self.facts)
+    }
 
-        let value = self.lower_value_to(step, int_ty, step)?;
-        let rvalue = if self.cx.requires_for_step_runtime_check(step.node.id) {
-            RValue::CheckedForStep { step: value }
-        } else {
-            RValue::Use(value)
+    fn iter_for_source_with_subst<'a>(
+        &self,
+        iterable: &'a ExprNode,
+        subst: &IterParamSubst<'a>,
+        facts: &'facts SemanticBodyFacts,
+    ) -> Result<IterForSource<'a>, LowerError>
+    where
+        'facts: 'a,
+    {
+        let (current, adapters, projection) = Self::peel_iter_for_adapters(iterable, subst);
+        if let ExprKind::IterSource(iter) = &current.node.kind {
+            return Ok(IterForSource {
+                source: subst.expr(&iter.node.source),
+                range: iter_for_range_source(&iter.node.source, subst),
+                adapters,
+                projection,
+            });
+        }
+        if let Some(mut helper) = self.iter_helper_source(current, subst, facts)? {
+            helper.adapters.extend(adapters);
+            if projection != IterForProjection::Default {
+                helper.projection = projection;
+            }
+            return Ok(helper);
+        }
+        if adapters.is_empty() {
+            return Ok(IterForSource {
+                source: subst.expr(iterable),
+                range: iter_for_range_source(iterable, subst),
+                adapters,
+                projection,
+            });
+        }
+        Err(LowerError::UnsupportedStmt {
+            kind: "For",
+            span: None,
+        })
+    }
+
+    fn peel_iter_for_adapters<'a>(
+        iterable: &'a ExprNode,
+        subst: &IterParamSubst<'a>,
+    ) -> (&'a ExprNode, Vec<IterForAdapter<'a>>, IterForProjection) {
+        let mut current = iterable;
+        let mut adapters = vec![];
+        let mut projection = IterForProjection::Default;
+        while let ExprKind::Call(call) = &current.node.kind {
+            if call.node.safe || !call.node.generic_args.is_empty() {
+                break;
+            }
+            let ExprKind::Field(field) = &call.node.func.node.kind else {
+                break;
+            };
+            if field.node.safe {
+                break;
+            }
+            match (field.node.field.as_str(), call.node.args.as_slice()) {
+                ("rev", []) => adapters.push(IterForAdapter::Rev),
+                ("skip", [count]) => adapters.push(IterForAdapter::Skip(subst.expr(count))),
+                ("take", [count]) => adapters.push(IterForAdapter::Take(subst.expr(count))),
+                ("step_by", [step]) => adapters.push(IterForAdapter::StepBy(subst.expr(step))),
+                ("keys", []) => projection = IterForProjection::MapKeys,
+                ("values", []) => projection = IterForProjection::MapValues,
+                _ => break,
+            }
+            current = &field.node.target;
+        }
+        adapters.reverse();
+        (current, adapters, projection)
+    }
+
+    fn iter_for_branch_source<'a>(
+        &self,
+        iterable: &'a ExprNode,
+    ) -> Result<Option<IterForBranch<'a>>, LowerError>
+    where
+        'facts: 'a,
+    {
+        let (current, adapters, projection) =
+            Self::peel_iter_for_adapters(iterable, &IterParamSubst::default());
+        let ExprKind::Call(call) = &current.node.kind else {
+            return Ok(None);
         };
-        self.emit_typed_temp(int_ty, rvalue)
+        let Some(helper) = self.iter_helper_callable(current.node.id, self.facts) else {
+            return Ok(None);
+        };
+        let body = helper.callable.body();
+        let Some(expr) = iter_helper_terminal_expr(body) else {
+            return Ok(None);
+        };
+        let ExprKind::If(if_) = &expr.node.kind else {
+            return Ok(None);
+        };
+        let subst = IterParamSubst {
+            params: helper.callable.params(),
+            args: call.node.args.iter().collect(),
+            locals: iter_helper_locals(body),
+        };
+        let then_subst = subst.with_block_locals(&if_.node.then_block);
+        let Some(else_block) = if_.node.else_block.as_ref() else {
+            return Ok(None);
+        };
+        let else_subst = subst.with_block_locals(else_block);
+        let Some(then_expr) = iter_helper_expr(&if_.node.then_block, &then_subst) else {
+            return Ok(None);
+        };
+        let Some(else_expr) = iter_helper_expr(else_block, &else_subst) else {
+            return Ok(None);
+        };
+        let mut then_source =
+            self.iter_for_source_with_subst(then_expr, &then_subst, helper.facts)?;
+        let mut else_source =
+            self.iter_for_source_with_subst(else_expr, &else_subst, helper.facts)?;
+        then_source.adapters.extend(adapters.iter().copied());
+        else_source.adapters.extend(adapters);
+        if projection != IterForProjection::Default {
+            then_source.projection = projection;
+            else_source.projection = projection;
+        }
+        Ok(Some(IterForBranch {
+            cond: subst.expr(&if_.node.cond),
+            then_source,
+            else_source,
+        }))
+    }
+
+    fn iter_helper_source<'a>(
+        &self,
+        call_expr: &'a ExprNode,
+        outer: &IterParamSubst<'a>,
+        facts: &'facts SemanticBodyFacts,
+    ) -> Result<Option<IterForSource<'a>>, LowerError>
+    where
+        'facts: 'a,
+    {
+        let ExprKind::Call(call) = &call_expr.node.kind else {
+            return Ok(None);
+        };
+        let Some(helper) = self.iter_helper_callable(call_expr.node.id, facts) else {
+            return Ok(None);
+        };
+        let body = helper.callable.body();
+        let subst = IterParamSubst {
+            params: helper.callable.params(),
+            args: call.node.args.iter().map(|arg| outer.expr(arg)).collect(),
+            locals: iter_helper_locals(body),
+        };
+        let Some(expr) = iter_helper_expr(body, &subst) else {
+            return Ok(None);
+        };
+        self.iter_for_source_with_subst(expr, &subst, helper.facts)
+            .map(Some)
+    }
+
+    fn iter_helper_callable(
+        &self,
+        call_id: ExprId,
+        facts: &'facts SemanticBodyFacts,
+    ) -> Option<IterHelper<'facts>> {
+        let target = facts.calls.get(&call_id)?;
+        let key = CallableInstanceKey {
+            target: target.id.clone(),
+            args: target.args.clone(),
+        };
+        let fact = self.callable_facts.get(&key)?;
+        if !fact.ret.is_iter() {
+            return None;
+        }
+        let callable = self.index.callables.get(&target.id).copied()?;
+        let facts = self.body_facts.get(&fact.body)?;
+        Some(IterHelper { callable, facts })
+    }
+
+    fn lower_for_ordinal_plan(
+        &mut self,
+        source: &IterForSource<'_>,
+    ) -> Result<AirOrdinalPlan, LowerError> {
+        let mut adapters = vec![];
+        for adapter in &source.adapters {
+            match adapter {
+                IterForAdapter::Rev => adapters.push(AirOrdinalAdapter::Rev),
+                IterForAdapter::Skip(count) => adapters.push(AirOrdinalAdapter::Skip {
+                    count: self.lower_iter_count(count, IterCountCheck::SkipNonNegative)?,
+                }),
+                IterForAdapter::Take(count) => adapters.push(AirOrdinalAdapter::Take {
+                    count: self.lower_iter_count(count, IterCountCheck::TakeNonNegative)?,
+                }),
+                IterForAdapter::StepBy(step) => adapters.push(AirOrdinalAdapter::StepBy {
+                    step: self.lower_iter_count(step, IterCountCheck::StepByPositive)?,
+                }),
+            }
+        }
+        Ok(AirOrdinalPlan { adapters })
+    }
+
+    fn lower_iter_count(
+        &mut self,
+        expr: &ExprNode,
+        default_check: IterCountCheck,
+    ) -> Result<Operand, LowerError> {
+        if let ExprKind::Lit(Lit::Int(value)) = expr.node.kind
+            && iter_count_check_accepts(default_check, value)
+        {
+            return self.int_const(value);
+        }
+        let int_ty = self.cx.lower_ty(&Type::Int)?;
+        let value = self.lower_value_to(expr, int_ty, expr)?;
+        let check = match self.cx.iter_runtime_check(expr.node.id) {
+            Some(IterRuntimeCheckKind::SkipNonNegative) => IterCountCheck::SkipNonNegative,
+            Some(IterRuntimeCheckKind::TakeNonNegative) => IterCountCheck::TakeNonNegative,
+            Some(IterRuntimeCheckKind::StepByPositive) => IterCountCheck::StepByPositive,
+            None => default_check,
+        };
+        self.emit_typed_temp(
+            int_ty,
+            RValue::CheckedIterCount {
+                count: value,
+                check,
+            },
+        )
     }
 
     fn for_len_local(&mut self) -> Result<LocalId, LowerError> {
@@ -2929,8 +3220,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .push(AirStmt::CollectionFor(AirCollectionFor {
                 id,
                 len: plan.len,
-                step: plan.step.clone(),
-                reversed: for_.reversed,
+                ordinal_plan: plan.ordinal_plan.clone(),
                 index: plan.index,
                 ordinal: plan.ordinal(),
                 body,
@@ -3023,17 +3313,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
                 ForBindingPlan::OwnedMapKey { pattern, ty } => {
                     if !matches!(pattern.node, Pattern::Wildcard) {
-                        let entry =
-                            self.map_entry_operand(plan, &mut map_entry, Self::map_entry_ty)?;
-                        let key = Self::tuple_field_operand(entry, 0, *ty);
+                        let key = self.map_key_operand(plan, *ty)?;
                         self.lower_for_pattern_binding(pattern, key, false)?;
                     }
                 }
                 ForBindingPlan::OwnedMapValue { pattern, ty } => {
                     if !matches!(pattern.node, Pattern::Wildcard) {
-                        let entry =
-                            self.map_entry_operand(plan, &mut map_entry, Self::map_entry_ty)?;
-                        let value = Self::tuple_field_operand(entry, 1, *ty);
+                        let value = self.map_value_operand(plan, *ty)?;
                         self.lower_for_pattern_binding(pattern, value, false)?;
                     }
                 }
@@ -3058,19 +3344,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.cx.lower_ty(&source_ty).map(Some)
     }
 
-    fn map_entry_ty(&mut self, plan: &ForPlan) -> Result<TypeId, LowerError> {
-        let TypeData::Map { key, value, .. } = self.cx.program.type_data(plan.root.ty) else {
-            return Err(LowerError::UnsupportedStmt {
-                kind: "For",
-                span: None,
-            });
-        };
-        Ok(self
-            .cx
-            .program
-            .alloc_type(TypeData::Tuple(vec![*key, *value])))
-    }
-
     fn map_entry_operand(
         &mut self,
         plan: &ForPlan,
@@ -3091,6 +3364,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         )?;
         *entry = Some(value.clone());
         Ok(value)
+    }
+
+    fn map_key_operand(&mut self, plan: &ForPlan, ty: TypeId) -> Result<Operand, LowerError> {
+        self.emit_typed_temp(
+            ty,
+            RValue::MapKeyAt {
+                map: plan.root.clone(),
+                index: plan.index,
+                ty,
+            },
+        )
+    }
+
+    fn map_value_operand(&mut self, plan: &ForPlan, ty: TypeId) -> Result<Operand, LowerError> {
+        self.emit_typed_temp(
+            ty,
+            RValue::MapValueAt {
+                map: plan.root.clone(),
+                index: plan.index,
+                ty,
+            },
+        )
     }
 
     fn tuple_field_operand(tuple: Operand, index: u32, ty: TypeId) -> Operand {
@@ -3208,6 +3503,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     fn push_for_owned_local(&mut self, pattern: &ast::PatternNode) -> Result<LocalId, LowerError> {
         let semantic = self.pattern_binding_semantic(pattern)?;
         let def = self.local_def(semantic)?;
+        if let Some(local) = self.existing_semantic_local(semantic) {
+            return Ok(local);
+        }
         let name = def.name;
         let binding = def.binding_id.map(air_binding_id);
         let source_ty = def.ty.clone();
@@ -3238,6 +3536,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if let Pattern::Ident(_) = &pattern.node {
             let semantic = self.pattern_binding_semantic(pattern)?;
             let def = self.local_def(semantic)?;
+            if let Some(local) = self.existing_semantic_local(semantic) {
+                return Ok(local);
+            }
             let name = def.name;
             let binding = def.binding_id;
             let local = self.push_local(
@@ -3398,6 +3699,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         body: Box::new(self.body.clone()),
                         span: site,
                     })?;
+                let existing = self.locals.get(&semantic).cloned();
                 let def = self.local_def(semantic)?;
                 let name = def.name;
                 let semantic_binding = def.binding_id;
@@ -3413,6 +3715,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         &binding.node.value,
                     )?),
                 };
+                if let Some(place) = existing {
+                    return self.emit_init_place(place, init);
+                }
                 let local = self.push_local(
                     Some(name),
                     binding_id,
@@ -8315,6 +8620,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .map(LambdaCaptureDecl::mutability)
     }
 
+    fn existing_semantic_local(&self, semantic: SemanticLocalId) -> Option<LocalId> {
+        let place = self.locals.get(&semantic)?;
+        place.projection.is_empty().then_some(())?;
+        place.root.local()
+    }
+
     fn push_local(
         &mut self,
         name: Option<Ident>,
@@ -8386,6 +8697,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.ensure_open()?;
         self.block.stmts.push(AirStmt::Init { local, value });
         Ok(())
+    }
+
+    fn emit_init_place(&mut self, place: Place, value: RValue) -> Result<(), LowerError> {
+        match place.root.local().filter(|_| place.projection.is_empty()) {
+            Some(local) => self.emit_init(local, value),
+            None => self.emit_assign(place, value),
+        }
     }
 
     fn emit_assign(&mut self, dst: Place, value: RValue) -> Result<(), LowerError> {
@@ -8724,6 +9042,13 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::Break => "Break",
         Stmt::Continue => "Continue",
         Stmt::Defer(_) => "Defer",
+    }
+}
+
+fn iter_count_check_accepts(check: IterCountCheck, value: i64) -> bool {
+    match check {
+        IterCountCheck::SkipNonNegative | IterCountCheck::TakeNonNegative => value >= 0,
+        IterCountCheck::StepByPositive => value > 0,
     }
 }
 
@@ -9204,9 +9529,6 @@ fn walk_stmt_exprs<'a>(stmt: &'a StmtNode, visit: &mut impl FnMut(&'a ExprNode))
         }
         Stmt::For(for_) => {
             walk_exprs(&for_.node.iterable, visit);
-            if let Some(step) = &for_.node.step {
-                walk_exprs(step, visit);
-            }
             walk_block_exprs(&for_.node.body, visit);
         }
         Stmt::Defer(defer) => match &defer.node.body {
@@ -9239,6 +9561,7 @@ fn walk_exprs<'a>(expr: &'a ExprNode, visit: &mut impl FnMut(&'a ExprNode)) {
                 walk_exprs(arg, visit);
             }
         }
+        ExprKind::IterSource(iter) => walk_exprs(&iter.node.source, visit),
         ExprKind::Binary(binary) => {
             walk_exprs(&binary.node.left, visit);
             walk_exprs(&binary.node.right, visit);
@@ -9379,6 +9702,20 @@ impl<'a> SourceCallable<'a> {
         }
     }
 
+    fn params(self) -> Vec<Ident> {
+        match self {
+            Self::Function { func, .. } => {
+                func.node.params.iter().map(|param| param.name).collect()
+            }
+            Self::AggregateMethod { method, .. } => {
+                method.sig.params.iter().map(|param| param.name).collect()
+            }
+            Self::ExtendMethod { method, .. } => {
+                method.sig.params.iter().map(|param| param.name).collect()
+            }
+        }
+    }
+
     fn has_generics(self) -> bool {
         match self {
             Self::Function { func, .. } => {
@@ -9424,6 +9761,8 @@ impl<'a> SourceCallable<'a> {
 #[derive(Debug)]
 struct ReachableItems<'a> {
     index: &'a SourceProgramIndex<'a>,
+    body_facts: &'a HashMap<BodyInstanceKey, SemanticBodyFacts>,
+    callable_facts: &'a SemanticCallableFacts<'a>,
     default_facts: DefaultExprFactsIndex<'a>,
     items: Vec<ReachableItem<'a>>,
 }
@@ -9540,6 +9879,157 @@ impl OptionalSubject {
 const RANGE_START_FIELD: &str = "start";
 const RANGE_END_FIELD: &str = "end";
 
+struct IterForSource<'a> {
+    source: &'a ExprNode,
+    range: Option<IterForRange<'a>>,
+    adapters: Vec<IterForAdapter<'a>>,
+    projection: IterForProjection,
+}
+
+struct IterForRange<'a> {
+    start: &'a ExprNode,
+    end: &'a ExprNode,
+    inclusive: bool,
+}
+
+struct IterForBranch<'a> {
+    cond: &'a ExprNode,
+    then_source: IterForSource<'a>,
+    else_source: IterForSource<'a>,
+}
+
+struct IterHelper<'a> {
+    callable: SourceCallable<'a>,
+    facts: &'a SemanticBodyFacts,
+}
+
+#[derive(Default)]
+struct IterParamSubst<'a> {
+    params: Vec<Ident>,
+    args: Vec<&'a ExprNode>,
+    locals: Vec<(Ident, &'a ExprNode)>,
+}
+
+impl<'a> IterParamSubst<'a> {
+    fn with_block_locals(&self, block: &'a BlockNode) -> Self {
+        let mut locals = self.locals.clone();
+        locals.extend(iter_helper_locals(block));
+        Self {
+            params: self.params.clone(),
+            args: self.args.clone(),
+            locals,
+        }
+    }
+
+    fn expr(&self, expr: &'a ExprNode) -> &'a ExprNode {
+        let mut current = expr;
+        for _ in 0..=self.locals.len() + self.params.len() {
+            let ExprKind::Ident(name) = current.node.kind else {
+                return current;
+            };
+            let Some(next) = self
+                .locals
+                .iter()
+                .rev()
+                .find_map(|(local, value)| (*local == name).then_some(*value))
+                .or_else(|| {
+                    self.params
+                        .iter()
+                        .position(|param| *param == name)
+                        .and_then(|index| self.args.get(index).copied())
+                })
+            else {
+                return current;
+            };
+            if next.node.id == current.node.id {
+                return current;
+            }
+            current = next;
+        }
+        current
+    }
+}
+
+fn iter_for_range_source<'a>(
+    expr: &'a ExprNode,
+    subst: &IterParamSubst<'a>,
+) -> Option<IterForRange<'a>> {
+    let ExprKind::Range(range) = &expr.node.kind else {
+        return None;
+    };
+    let ast::Range::Bounded {
+        start,
+        end,
+        inclusive,
+    } = &range.node
+    else {
+        return None;
+    };
+    Some(IterForRange {
+        start: subst.expr(start),
+        end: subst.expr(end),
+        inclusive: *inclusive,
+    })
+}
+
+fn iter_helper_locals(body: &BlockNode) -> Vec<(Ident, &ExprNode)> {
+    body.node
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let Stmt::Binding(binding) = &stmt.node else {
+                return None;
+            };
+            let Pattern::Ident(name) = binding.node.pattern.node else {
+                return None;
+            };
+            Some((name, &binding.node.value))
+        })
+        .collect()
+}
+
+fn iter_helper_terminal_expr(body: &BlockNode) -> Option<&ExprNode> {
+    body.node.tail.as_deref().or_else(|| {
+        body.node.stmts.last().and_then(|stmt| match &stmt.node {
+            Stmt::Expr(expr) => Some(expr),
+            Stmt::Return(ret) => ret.node.value.as_ref(),
+            _ => None,
+        })
+    })
+}
+
+fn iter_helper_expr<'a>(body: &'a BlockNode, subst: &IterParamSubst<'a>) -> Option<&'a ExprNode> {
+    let expr = iter_helper_terminal_expr(body)?;
+    if let ExprKind::If(if_) = &expr.node.kind {
+        let ExprKind::Lit(Lit::Bool(cond)) = subst.expr(&if_.node.cond).node.kind else {
+            return None;
+        };
+        let branch = if cond {
+            &if_.node.then_block
+        } else {
+            if_.node.else_block.as_ref()?
+        };
+        let subst = subst.with_block_locals(branch);
+        return iter_helper_expr(branch, &subst);
+    }
+    Some(expr)
+}
+
+#[derive(Clone, Copy)]
+enum IterForAdapter<'a> {
+    Rev,
+    Skip(&'a ExprNode),
+    Take(&'a ExprNode),
+    StepBy(&'a ExprNode),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IterForProjection {
+    Default,
+    MapKeys,
+    MapValues,
+}
+
 struct RangeForParts {
     start: Operand,
     end: Operand,
@@ -9552,7 +10042,7 @@ struct ForPlan {
     root: Place,
     len: LocalId,
     index: LocalId,
-    step: Operand,
+    ordinal_plan: AirOrdinalPlan,
     bindings: Vec<ForBindingPlan>,
 }
 
@@ -10069,7 +10559,7 @@ impl ReachableBodyFacts<'_> {
 fn can_omit_body_facts(fact: &SemanticFunctionInstanceFact, callable: SourceCallable<'_>) -> bool {
     let body = callable.body();
     fact.params.is_empty()
-        && fact.ret.ty == Type::Void
+        && fact.ret.ty() == Type::Void
         && body.node.stmts.is_empty()
         && body.node.tail.is_none()
 }
@@ -10252,7 +10742,7 @@ impl<'a> ReachableItems<'a> {
     fn new(
         index: &'a SourceProgramIndex<'a>,
         semantic: &'a SemanticProgram,
-        semantic_functions: &SemanticCallableFacts<'a>,
+        semantic_functions: &'a SemanticCallableFacts<'a>,
         roots: Vec<CallableInstanceKey>,
     ) -> Result<Self, LowerError> {
         let default_facts = DefaultExprFactsIndex::new(semantic, index);
@@ -10277,6 +10767,7 @@ impl<'a> ReachableItems<'a> {
             };
             enqueue_body_references(
                 index,
+                semantic_functions,
                 &default_facts,
                 semantic,
                 item.body_facts.as_facts(),
@@ -10290,6 +10781,8 @@ impl<'a> ReachableItems<'a> {
 
         Ok(Self {
             index,
+            body_facts: &semantic.facts.bodies,
+            callable_facts: semantic_functions,
             default_facts,
             items,
         })
@@ -10431,6 +10924,7 @@ fn reachable_lambda<'a>(
 
 fn enqueue_body_references(
     index: &SourceProgramIndex<'_>,
+    semantic_functions: &SemanticCallableFacts<'_>,
     default_facts: &DefaultExprFactsIndex<'_>,
     semantic: &SemanticProgram,
     body_facts: &SemanticBodyFacts,
@@ -10439,12 +10933,20 @@ fn enqueue_body_references(
     queued: &mut HashSet<ReachableKey>,
     worklist: &mut Vec<ReachableKey>,
 ) -> Result<(), LowerError> {
-    enqueue_calls(index, body_facts, None, queued, worklist)?;
+    enqueue_calls(
+        index,
+        semantic_functions,
+        body_facts,
+        None,
+        queued,
+        worklist,
+    )?;
     enqueue_global_accesses(body_facts, None, queued, worklist);
     enqueue_function_values(index, body_facts, body, source_id, None, queued, worklist)?;
     enqueue_stringify_overrides(index, semantic, body_facts, None, queued, worklist);
     let mut default_env = DefaultDependencyEnv {
         index,
+        semantic_functions,
         default_facts,
         semantic,
         queued,
@@ -10456,6 +10958,7 @@ fn enqueue_body_references(
 
 struct DefaultDependencyEnv<'a, 'b> {
     index: &'a SourceProgramIndex<'a>,
+    semantic_functions: &'a SemanticCallableFacts<'a>,
     default_facts: &'a DefaultExprFactsIndex<'a>,
     semantic: &'a SemanticProgram,
     queued: &'b mut HashSet<ReachableKey>,
@@ -10538,7 +11041,14 @@ fn enqueue_default_references(
     let exprs = source_expr_ids(expr);
     let facts = env.default_facts.get(site, &default_use.facts_body)?;
 
-    enqueue_calls(env.index, facts, Some(&exprs), env.queued, env.worklist)?;
+    enqueue_calls(
+        env.index,
+        env.semantic_functions,
+        facts,
+        Some(&exprs),
+        env.queued,
+        env.worklist,
+    )?;
     enqueue_global_accesses(facts, Some(&exprs), env.queued, env.worklist);
     enqueue_function_values(
         env.index,
@@ -10563,8 +11073,22 @@ fn enqueue_default_references(
     Ok(())
 }
 
+fn call_target_returns_iter(
+    semantic_functions: &SemanticCallableFacts<'_>,
+    target: &CallTarget,
+) -> bool {
+    let key = CallableInstanceKey {
+        target: target.id.clone(),
+        args: target.args.clone(),
+    };
+    semantic_functions
+        .get(&key)
+        .is_some_and(|fact| fact.ret.is_iter())
+}
+
 fn enqueue_calls(
     index: &SourceProgramIndex<'_>,
+    semantic_functions: &SemanticCallableFacts<'_>,
     body_facts: &SemanticBodyFacts,
     exprs: Option<&HashSet<ExprId>>,
     queued: &mut HashSet<ReachableKey>,
@@ -10579,7 +11103,10 @@ fn enqueue_calls(
         if target.form != CallForm::Normal {
             return Err(LowerError::UnsupportedCallForm { expr_id: *expr });
         }
-        if target.id.kind == CallableKind::EnumVariant || is_lowered_collection_stub(&target.id) {
+        if target.id.kind == CallableKind::EnumVariant
+            || is_lowered_collection_stub(&target.id)
+            || call_target_returns_iter(semantic_functions, target)
+        {
             continue;
         }
         if !generic_args_are_concrete(&target.args) {

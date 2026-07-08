@@ -6,5 +6,5 @@ struct Foo { x: int }
 
 fn main() {
     let xs: [int] = [];
-    for x in xs step Foo { x: 1 } {}
+    for x in iter(xs).step_by(Foo) { x: 1 } {}
 }

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn nums(reverse: bool) -> iter {
+    if reverse { iter(0..3).rev() } else { iter(0..3) }
+}
+
+fn main() {
+    for _ in nums(false) {
+    }
+}

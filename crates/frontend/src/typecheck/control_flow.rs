@@ -1,20 +1,19 @@
 use super::{
-    CallableBody, CheckedType, CoreRangeKind, PatternBindMode, PatternContext, PatternRoot,
-    PatternRootInput, PlaceAccess, PlaceIdentity, ReturnMode, ReturnSpec, TypeChecker, TypeError,
-    TypeHandle,
-    body::check_callable_body_place_return,
+    CallableBody, CheckedType, PatternBindMode, PatternContext, PlaceIdentity, ReturnMode,
+    ReturnSpec, TypeChecker, TypeError, TypeHandle,
+    body::{check_callable_body_iter_return, check_callable_body_place_return},
     check_block_checked, check_block_checked_with_hint, check_expected_value_expr,
     check_expected_value_expr_deferred, check_expr_checked, check_place,
     check_value_expr_checked_with_hint, checked_from_checked, checked_type, checked_void, closure,
-    collection_loan, intrinsic_bool_value, join_checked, match_check, match_coverage,
+    intrinsic_bool_value, join_checked, match_check, match_coverage,
     pattern::{self, check_pattern_scrutinee},
     place, projection,
 };
 use crate::{
     ast::{
-        BlockNode, ConstValue, DeferBody, DeferNode, ExprId, ExprKind, ExprNode, For, ForBinding,
-        ForNode, IfNode, LetElseFallback, LetElseFallbackNode, MatchArmNode, MatchMode, MatchNode,
-        Return, ReturnAccess, ReturnNode, Stmt, StmtNode, TernaryNode, Type, WhileNode,
+        BlockNode, DeferBody, DeferNode, ExprId, ExprKind, ExprNode, ForNode, IfNode,
+        LetElseFallback, LetElseFallbackNode, MatchArmNode, MatchMode, MatchNode, Return,
+        ReturnAccess, ReturnNode, Stmt, StmtNode, TernaryNode, Type, WhileNode,
     },
     span::{SourceSpan, Span},
 };
@@ -189,6 +188,9 @@ fn join_branches_with_hint(
 
 enum BranchBody<'a> {
     Value,
+    IterReturn {
+        ret: &'a ReturnSpec,
+    },
     PlaceReturn {
         ret: &'a ReturnSpec,
         source: Option<&'a PlaceIdentity>,
@@ -208,10 +210,17 @@ impl<'a> BranchPolicy<'a> {
         }
     }
 
+    fn iter_return(ret: &'a ReturnSpec) -> Self {
+        Self {
+            expected: None,
+            body: BranchBody::IterReturn { ret },
+        }
+    }
+
     fn place_return(ret: &'a ReturnSpec, source: Option<&'a PlaceIdentity>) -> Self {
         Self {
-            expected: (!matches!(ret.ty, Type::InferReturn))
-                .then(|| TypeChecker::type_handle(&ret.ty)),
+            expected: (!matches!(ret.ty(), Type::InferReturn))
+                .then(|| TypeChecker::type_handle(&ret.ty())),
             body: BranchBody::PlaceReturn { ret, source },
         }
     }
@@ -219,6 +228,12 @@ impl<'a> BranchPolicy<'a> {
     fn check_block(&self, block: &BlockNode, tc: &mut TypeChecker) -> CheckedType {
         match self.body {
             BranchBody::Value => check_block_checked_with_hint(block, self.expected.clone(), tc),
+            BranchBody::IterReturn { ret } => check_callable_body_iter_return(
+                CallableBody::Block(block),
+                Some(ret),
+                block.span,
+                tc,
+            ),
             BranchBody::PlaceReturn { ret, source } => {
                 check_place_return_block(block, ret, source, tc)
             }
@@ -231,6 +246,7 @@ impl<'a> BranchPolicy<'a> {
                 Some(expected) => check_expected_value_expr(expr, expected, tc),
                 None => check_value_expr_checked_with_hint(expr, None, tc),
             },
+            BranchBody::IterReturn { ret } => check_return_expr(expr, ret, None, tc),
             BranchBody::PlaceReturn { ret, source } => check_return_expr(expr, ret, source, tc),
         }
     }
@@ -246,6 +262,7 @@ impl<'a> BranchPolicy<'a> {
                 Some(expected) => check_expected_value_expr_deferred(expr, expected, tc),
                 None => check_value_expr_checked_with_hint(expr, None, tc),
             },
+            BranchBody::IterReturn { ret } => check_return_expr(expr, ret, None, tc),
             BranchBody::PlaceReturn { ret, source } => check_return_expr(expr, ret, source, tc),
         }
     }
@@ -253,7 +270,7 @@ impl<'a> BranchPolicy<'a> {
     fn match_expected(&self) -> Option<&TypeHandle> {
         match self.body {
             BranchBody::Value => self.expected.as_ref(),
-            BranchBody::PlaceReturn { .. } => None,
+            BranchBody::IterReturn { .. } | BranchBody::PlaceReturn { .. } => None,
         }
     }
 
@@ -265,7 +282,9 @@ impl<'a> BranchPolicy<'a> {
         CheckedBranch {
             diverges: match self.body {
                 BranchBody::Value => diverges,
-                BranchBody::PlaceReturn { .. } => diverges && checked.ty.is_void(),
+                BranchBody::IterReturn { .. } | BranchBody::PlaceReturn { .. } => {
+                    diverges && checked.ty.is_void()
+                }
             },
             checked,
             span,
@@ -291,6 +310,7 @@ impl<'a> BranchPolicy<'a> {
     fn finish(&self, branch: CheckedBranch, tc: &mut TypeChecker) -> CheckedType {
         match self.body {
             BranchBody::Value => branch.checked,
+            BranchBody::IterReturn { .. } => checked_branch_against_expected(branch, None, tc),
             BranchBody::PlaceReturn { ret, .. } if branch.diverges => diverged_place_return(ret),
             BranchBody::PlaceReturn { .. } => {
                 checked_branch_against_expected(branch, self.expected.clone(), tc)
@@ -312,7 +332,7 @@ impl<'a> BranchPolicy<'a> {
                 }
                 finish_match_arms(arms, tc)
             }
-            BranchBody::PlaceReturn { .. } => match arms
+            BranchBody::IterReturn { .. } | BranchBody::PlaceReturn { .. } => match arms
                 .into_iter()
                 .reduce(|left, right| self.join(left, right, tc))
             {
@@ -409,9 +429,19 @@ fn check_if_with_policy(
         };
         return match &policy.body {
             BranchBody::Value => checked_void(),
+            BranchBody::IterReturn { ret } => {
+                tc.push_error(TypeError::MissingReturn {
+                    expected: ret.ty().clone(),
+                    span: tc.error_span(span.to_end()),
+                });
+                match then {
+                    Some(branch) if !branch.checked.ty.is_void() => branch.checked,
+                    _ => checked_type(Type::Infer),
+                }
+            }
             BranchBody::PlaceReturn { ret, .. } => {
                 tc.push_error(TypeError::MissingReturn {
-                    expected: ret.ty.clone(),
+                    expected: ret.ty().clone(),
                     span: tc.error_span(span.to_end()),
                 });
                 match then {
@@ -773,277 +803,16 @@ pub(super) fn check_loop_body(body: &BlockNode, tc: &mut TypeChecker) {
 
 pub(super) fn check_for(for_node: &ForNode, tc: &mut TypeChecker) {
     let node = &for_node.node;
-    let source = check_place(&node.iterable, tc);
-    place::record_value_read(node.iterable.node.id, &source.value, tc);
-    let iterable_ty = source.value.checked.ty.clone();
-    check_for_modifiers(node, &iterable_ty, tc);
-
-    let slots = for_slots(&node.bindings, &iterable_ty, node.iterable.span, tc);
-    let roots = node
-        .bindings
-        .iter()
-        .zip(slots)
-        .map(|(binding, slot)| for_slot_root(binding, slot, &source, &node.iterable, tc))
-        .collect();
+    let plan = super::iterator_plan::check_for_iterable(&node.bindings, &node.iterable, tc);
 
     tc.push_scope();
-    pattern::check_roots(roots, PatternContext::For, tc);
+    pattern::check_roots(plan.roots, PatternContext::For, tc);
     let saved_loan_len = tc.active_collection_loans.len();
-    if let Some(loan) =
-        collection_loan::classify_for_loan(&iterable_ty, source.value.identity.clone())
-    {
-        tc.active_collection_loans.push(loan);
-    }
+    tc.active_collection_loans.extend(plan.loans);
     check_loop_body(&node.body, tc);
     tc.active_collection_loans.truncate(saved_loan_len);
     debug_assert_eq!(tc.active_collection_loans.len(), saved_loan_len);
     tc.pop_scope();
-}
-
-enum ForSlot {
-    Owned(Type),
-    Item(Type),
-}
-
-fn for_slots(
-    bindings: &[ForBinding],
-    iterable_ty: &Type,
-    iterable_span: Span,
-    tc: &mut TypeChecker,
-) -> Vec<ForSlot> {
-    let range_inner = tc.decls.core_range_inner(iterable_ty).cloned();
-    match (bindings, iterable_ty, range_inner) {
-        ([_], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
-            vec![ForSlot::Item((**elem).clone())]
-        }
-        ([binding], Type::Map { key, value }, _) => {
-            if binding.access.is_ref() {
-                tc.push_error(TypeError::ForMutableMapEntry {
-                    span: tc.error_span(binding.pattern.span),
-                });
-            }
-            vec![ForSlot::Owned(Type::Tuple(vec![
-                (**key).clone(),
-                (**value).clone(),
-            ]))]
-        }
-        ([_], Type::Infer, _) => infer_for_slots(1),
-        ([binding], _, Some(inner)) => {
-            reject_range_for_ref_binding(binding, tc);
-            vec![ForSlot::Owned(inner)]
-        }
-        ([_], _, None) => unsupported_for_slots(1, iterable_ty, iterable_span, tc),
-
-        ([index, _], Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem }, _) => {
-            reject_for_ref_binding(index, tc);
-            vec![ForSlot::Owned(Type::Int), ForSlot::Item((**elem).clone())]
-        }
-        ([first, _], Type::Map { key, value }, _) => {
-            if first.access.is_ref() {
-                tc.push_error(TypeError::ForMutableMapKey {
-                    span: tc.error_span(first.pattern.span),
-                });
-            }
-            vec![
-                ForSlot::Owned((**key).clone()),
-                ForSlot::Item((**value).clone()),
-            ]
-        }
-        ([_, _], Type::Infer, _) => infer_for_slots(2),
-        ([index, binding], _, Some(inner)) => {
-            for binding in [index, binding] {
-                reject_range_for_ref_binding(binding, tc);
-            }
-            vec![ForSlot::Owned(Type::Int), ForSlot::Owned(inner)]
-        }
-        ([_, _], _, None) => unsupported_for_slots(2, iterable_ty, iterable_span, tc),
-
-        (bindings, _, _) => infer_for_slots(bindings.len()),
-    }
-}
-
-fn infer_for_slots(count: usize) -> Vec<ForSlot> {
-    (0..count).map(|_| ForSlot::Owned(Type::Infer)).collect()
-}
-
-fn unsupported_for_slots(
-    count: usize,
-    iterable_ty: &Type,
-    iterable_span: Span,
-    tc: &mut TypeChecker,
-) -> Vec<ForSlot> {
-    tc.push_error(TypeError::ForIterableNotSupported {
-        found: iterable_ty.clone(),
-        span: tc.error_span(iterable_span),
-    });
-    infer_for_slots(count)
-}
-
-fn reject_for_ref_binding(binding: &ForBinding, tc: &mut TypeChecker) {
-    if binding.access.is_ref() {
-        tc.push_error(TypeError::ForRefRequiresMutableIterable {
-            span: tc.error_span(binding.pattern.span),
-        });
-    }
-}
-
-fn reject_range_for_ref_binding(binding: &ForBinding, tc: &mut TypeChecker) {
-    if binding.access.is_ref() {
-        push_for_modifier_error(
-            tc,
-            "range loop bindings cannot be ref",
-            binding.pattern.span,
-        );
-    }
-}
-
-fn for_slot_root<'a>(
-    binding: &'a ForBinding,
-    slot: ForSlot,
-    source: &place::CheckedPlace,
-    iterable: &ExprNode,
-    tc: &mut TypeChecker,
-) -> PatternRoot<'a> {
-    match slot {
-        ForSlot::Item(ty) if binding.access.is_ref() => {
-            alias_for_root(binding, ty, source, iterable, tc)
-        }
-        ForSlot::Owned(ty) | ForSlot::Item(ty) => owned_for_root(binding, ty),
-    }
-}
-
-fn owned_for_root(binding: &ForBinding, ty: Type) -> PatternRoot<'_> {
-    PatternRoot {
-        pattern: &binding.pattern,
-        input: PatternRootInput::Owned(ty),
-        mode: PatternBindMode::Owned {
-            mutable: binding.access.is_ref(),
-        },
-    }
-}
-
-fn alias_for_root<'a>(
-    binding: &'a ForBinding,
-    ty: Type,
-    source: &place::CheckedPlace,
-    iterable: &ExprNode,
-    tc: &mut TypeChecker,
-) -> PatternRoot<'a> {
-    let access = place::projected_field_access(source.value.access);
-    let access = if access.can_assign() {
-        access
-    } else {
-        tc.push_error(TypeError::ForRefRequiresMutableIterable {
-            span: tc.error_span(iterable.span),
-        });
-        PlaceAccess::Mutable
-    };
-    let place = pattern::PatternPlace {
-        expected_handle: TypeChecker::type_handle(&ty),
-        expected_ty: ty,
-        access,
-        facts: source.value.facts.clone(),
-        identity: source.value.identity.clone().index(),
-        accepts_extern_any: source.accepts_extern_any(),
-        map_entry_alias: false,
-    };
-    PatternRoot {
-        pattern: &binding.pattern,
-        input: PatternRootInput::Place(Box::new(place), iterable.node.id),
-        mode: PatternBindMode::Alias,
-    }
-}
-
-fn check_for_modifiers(node: &For, iterable_ty: &Type, tc: &mut TypeChecker) {
-    let range_kind = tc.decls.core_range_kind(iterable_ty);
-    check_for_range_support(node, iterable_ty, range_kind, tc);
-    check_for_step(node, iterable_ty, range_kind, tc);
-}
-
-fn check_for_range_support(
-    node: &For,
-    iterable_ty: &Type,
-    range_kind: Option<CoreRangeKind>,
-    tc: &mut TypeChecker,
-) {
-    let Some(range_kind) = range_kind else {
-        return;
-    };
-
-    if matches!(
-        range_kind,
-        CoreRangeKind::From | CoreRangeKind::To | CoreRangeKind::ToInclusive
-    ) {
-        push_for_modifier_error(
-            tc,
-            "range for-loops require bounded ranges",
-            node.iterable.span,
-        );
-    }
-
-    if !matches!(
-        tc.decls.core_range_inner(iterable_ty),
-        Some(Type::Int | Type::Infer)
-    ) {
-        push_for_modifier_error(tc, "range for-loops require int bounds", node.iterable.span);
-    }
-}
-
-fn check_for_step(
-    node: &For,
-    iterable_ty: &Type,
-    range_kind: Option<CoreRangeKind>,
-    tc: &mut TypeChecker,
-) {
-    let Some(step) = &node.step else {
-        return;
-    };
-
-    let step_checked = check_expr_checked(step, tc);
-    let step_is_int = matches!(step_checked.ty, Type::Int | Type::Infer);
-    let range_is_int = matches!(
-        tc.decls.core_range_inner(iterable_ty),
-        Some(Type::Int | Type::Infer)
-    );
-    if range_kind.is_some() && (!range_is_int || !step_is_int) {
-        push_for_modifier_error(tc, "step is only supported for integer ranges", step.span);
-    }
-    let int = TypeChecker::type_handle(&Type::Int);
-    tc.expect_assignable(step.span, step_checked.handle, int);
-
-    if step_is_int {
-        check_positive_step(step, tc);
-    }
-}
-
-fn check_positive_step(step: &ExprNode, tc: &mut TypeChecker) {
-    match known_step_int(step, tc) {
-        Some(value) if value <= 0 => {
-            push_for_modifier_error(tc, "for-loop step must be positive", step.span);
-        }
-        Some(_) => {}
-        None => record_for_step_runtime_check(step, tc),
-    }
-}
-
-fn record_for_step_runtime_check(step: &ExprNode, tc: &mut TypeChecker) {
-    let span = tc.source_span(step.span);
-    let site = tc.current_expr_site(step.node.id);
-    tc.semantic_facts.record_for_step_runtime_check(site, span);
-}
-
-fn known_step_int(step: &ExprNode, tc: &mut TypeChecker) -> Option<i64> {
-    match tc.eval_const_expr(step, false) {
-        Ok(ConstValue::Int(value)) => Some(value),
-        Ok(_) | Err(_) => None,
-    }
-}
-
-fn push_for_modifier_error(tc: &mut TypeChecker, message: &'static str, span: Span) {
-    tc.push_error(TypeError::ForIterationModifier {
-        message,
-        span: tc.error_span(span),
-    });
 }
 
 pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
@@ -1081,9 +850,13 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             check_return_expr(expr, &ret, source.as_ref(), tc);
         }
         (Some(expr), Some(ReturnTarget::Infer { access, source })) => {
-            let ret = ReturnSpec {
-                access,
-                ty: Type::InferReturn,
+            if access == ReturnAccess::Value && super::iterator_plan::may_be_iter_plan(expr, tc) {
+                super::iterator_plan::check_inferred_iter_return_expr(expr, tc);
+                return;
+            }
+            let ret = match access {
+                ReturnAccess::Value => ReturnSpec::infer(),
+                ReturnAccess::Place => ReturnSpec::place(Type::InferReturn),
             };
             let actual = check_return_expr(expr, &ret, source.as_ref(), tc);
             tc.push_inferred_return(expr.span, actual.handle);
@@ -1093,14 +866,17 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
             tc.record_return_escape(expr);
             tc.reject_extern_any_escape(&actual, expr.span);
         }
-        (None, Some(ReturnTarget::Explicit { ret, .. })) if !ret.ty.is_void() => {
+        (None, Some(ReturnTarget::Explicit { ret, .. })) if !ret.is_void() => {
             tc.push_error(TypeError::MissingReturn {
-                expected: ret.ty,
+                expected: ret.ty(),
                 span: tc.error_span(ret_node.span),
             });
         }
         (None, Some(ReturnTarget::Infer { .. })) => {
-            tc.push_inferred_return(ret_node.span, TypeChecker::type_handle(&Type::Void));
+            tc.push_error(TypeError::MissingReturn {
+                expected: Type::InferReturn,
+                span: tc.error_span(ret_node.span),
+            });
         }
         (None, _) => {}
     }
@@ -1108,9 +884,7 @@ pub(super) fn check_return(ret_node: &ReturnNode, tc: &mut TypeChecker) {
 
 fn check_discarded_return_value(ret: &Return, tc: &mut TypeChecker) {
     if let Some(expr) = &ret.value {
-        let actual = check_value_expr_checked_with_hint(expr, None, tc);
-        tc.record_return_escape(expr);
-        tc.reject_extern_any_escape(&actual, expr.span);
+        check_expr_checked(expr, tc);
     }
 }
 
@@ -1120,6 +894,13 @@ pub(super) fn check_return_expr(
     source: Option<&PlaceIdentity>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
+    if ret.is_iter() {
+        if let Some(checked) = check_branch_iter_return_expr(expr, ret, tc) {
+            return checked;
+        }
+        return super::iterator_plan::check_iter_return_expr(expr, tc);
+    }
+
     if ret.is_place() {
         if let Some(checked) = check_branch_place_return_expr(expr, ret, source, tc) {
             return checked_from_checked(expr, &checked, tc);
@@ -1128,15 +909,15 @@ pub(super) fn check_return_expr(
         validate_place_return_expr(&place.value, source, expr.span, tc);
         let checked = place.into_checked();
         tc.reject_extern_any_escape(&checked, expr.span);
-        if !matches!(ret.ty, Type::InferReturn) {
-            let expected = TypeChecker::type_handle(&ret.ty);
+        if !matches!(ret.ty(), Type::InferReturn) {
+            let expected = TypeChecker::type_handle(&ret.ty());
             tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle.clone(), expected);
         }
         return checked;
     }
 
     let expected =
-        (!matches!(ret.ty, Type::InferReturn)).then(|| TypeChecker::type_handle(&ret.ty));
+        (!matches!(ret.ty(), Type::InferReturn)).then(|| TypeChecker::type_handle(&ret.ty()));
     let actual = match expected {
         Some(expected) => check_expected_value_expr(expr, expected, tc),
         None => check_value_expr_checked_with_hint(expr, None, tc),
@@ -1144,6 +925,27 @@ pub(super) fn check_return_expr(
     tc.record_return_escape(expr);
     tc.reject_extern_any_escape(&actual, expr.span);
     actual
+}
+
+fn check_branch_iter_return_expr(
+    expr: &ExprNode,
+    ret: &ReturnSpec,
+    tc: &mut TypeChecker,
+) -> Option<CheckedType> {
+    match &expr.node.kind {
+        ExprKind::Block(block) => Some(check_callable_body_iter_return(
+            CallableBody::Block(block),
+            Some(ret),
+            expr.span,
+            tc,
+        )),
+        ExprKind::If(if_node) => {
+            super::iterator_plan::validate_iter_branch_shapes(expr, tc);
+            let policy = BranchPolicy::iter_return(ret);
+            Some(check_if_with_policy(if_node, expr.span, None, &policy, tc))
+        }
+        _ => None,
+    }
 }
 
 fn check_branch_place_return_expr(
@@ -1186,10 +988,10 @@ fn check_place_return_block(
 }
 
 fn diverged_place_return(ret: &ReturnSpec) -> CheckedType {
-    let ty = if matches!(ret.ty, Type::InferReturn) {
+    let ty = if matches!(ret.ty(), Type::InferReturn) {
         Type::Infer
     } else {
-        ret.ty.clone()
+        ret.ty().clone()
     };
     checked_type(ty)
 }

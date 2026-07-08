@@ -1998,7 +1998,7 @@ fn resolve_return_spec(
     self_type: Option<&ast::Type>,
 ) -> ast::ReturnSpec {
     ret.with_ty(resolve_type_params_with_self(
-        &ret.ty,
+        &ret.ty(),
         type_param_map,
         const_param_map,
         self_type,

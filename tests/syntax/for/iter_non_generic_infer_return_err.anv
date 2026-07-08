@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: inferred return type is only allowed on generic callables
+
+fn nums() -> _ {
+    iter(0..3)
+}

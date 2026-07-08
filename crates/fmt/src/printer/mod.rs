@@ -238,7 +238,11 @@ impl<'a> Printer<'a> {
         if ret.is_place() {
             self.write("ref ");
         }
-        self.format_type(&ret.ty);
+        if ret.is_iter() {
+            self.write("iter");
+        } else {
+            self.format_type(&ret.ty());
+        }
     }
 
     fn format_visibility(&mut self, vis: ast::Visibility) {

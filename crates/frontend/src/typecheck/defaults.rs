@@ -358,6 +358,7 @@ fn validate_expr(
             }
         },
         ExprKind::Block(_)
+        | ExprKind::IterSource(_)
         | ExprKind::Assign(_)
         | ExprKind::If(_)
         | ExprKind::Ternary(_)

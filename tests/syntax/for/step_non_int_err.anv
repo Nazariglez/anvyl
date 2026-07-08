@@ -1,9 +1,9 @@
 // @mode: check
 // @expect: error
-// @contains: step is only supported for integer ranges
+// @contains: expected `int`, found `float`
 
 fn main() {
-    for n in 0..10 step 1.5 {
+    for n in iter(0..10).step_by(1.5) {
         let x = n;
     }
 }

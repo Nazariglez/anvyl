@@ -1497,7 +1497,7 @@ impl<'a> CatalogBuilder<'a> {
                         })
                     })
                     .collect::<Option<Vec<_>>>()?,
-                ret: Box::new(self.abi_from_resolved_ty(&ret.ty)?),
+                ret: Box::new(self.abi_from_resolved_ty(&ret.ty())?),
                 policy: CallbackPolicy {
                     escape: CallbackEscape::NonEscaping,
                     thread: CallbackThread::SameThread,
@@ -1983,7 +1983,7 @@ fn validate_map_keys(
             for param in params {
                 validate_map_keys(context, &param.ty, site, decls, errors);
             }
-            validate_map_keys(context, &ret.ty, site, decls, errors);
+            validate_map_keys(context, &ret.ty(), site, decls, errors);
         }
         Type::List { elem } | Type::Slice { elem } | Type::Array { elem, .. } => {
             validate_map_keys(context, elem, site, decls, errors);

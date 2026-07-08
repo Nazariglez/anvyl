@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn main() {
+    for _ in nums().take(2) {
+    }
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: expected `int`, found `string`
+
+fn main() {
+    let xs = [1, 2, 3];
+    for x in iter(xs).take("bad") {
+        let y = x;
+    }
+}

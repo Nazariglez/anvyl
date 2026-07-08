@@ -542,6 +542,9 @@ fn simple_type_error_message(error: &TypeError) -> Option<String> {
         TypeError::InferReturnValue { .. } => {
             "generic inferred-return callables cannot be used as values".to_string()
         }
+        TypeError::IteratorPlanAsValue { .. } => {
+            "iterator plans cannot be used as values".to_string()
+        }
         TypeError::InferReturnRecursive { .. } => {
             "recursive inferred return type requires an explicit return type".to_string()
         }
@@ -589,6 +592,7 @@ pub(super) fn diagnose_type_error(
         | TypeError::InferReturnNonGeneric { .. }
         | TypeError::InferReturnExtern { .. }
         | TypeError::InferReturnValue { .. }
+        | TypeError::IteratorPlanAsValue { .. }
         | TypeError::InferReturnRecursive { .. }
         | TypeError::CannotInferConst { .. }
         | TypeError::AllNilArrayLiteral { .. }
@@ -1337,7 +1341,7 @@ fn surface_type(ty: &Type, type_ctx: &TypeDiagnosticContext) -> Type {
                     escape: param.escape,
                 })
                 .collect(),
-            ret.with_ty(surface_type(&ret.ty, type_ctx)),
+            ret.with_ty(surface_type(&ret.ty(), type_ctx)),
         ),
         Type::Dyn(contract) => Type::Dyn(surface_contract(contract, type_ctx)),
         Type::UnresolvedNominal {
@@ -1420,7 +1424,7 @@ fn surface_contract(
                             .collect(),
                         ret: requirement
                             .ret
-                            .with_ty(surface_type(&requirement.ret.ty, type_ctx)),
+                            .with_ty(surface_type(&requirement.ret.ty(), type_ctx)),
                     })
                     .collect(),
             })
@@ -1522,7 +1526,7 @@ fn render_detailed_func(params: &[FuncParam], ret: &ReturnSpec) -> String {
         if ret.is_place() {
             rendered.push_str("ref ");
         }
-        rendered.push_str(&render_detailed_type(&ret.ty));
+        rendered.push_str(&render_detailed_type(&ret.ty()));
     }
     rendered
 }

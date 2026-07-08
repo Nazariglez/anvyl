@@ -460,6 +460,10 @@ pub(super) fn check_postfix_chain_place(
                 tc.push_error(TypeError::InferReturnValue {
                     span: tc.error_span(expr.span),
                 });
+            } else if callee.def.sig.ret.is_iter() {
+                tc.push_error(TypeError::IteratorPlanAsValue {
+                    span: tc.error_span(expr.span),
+                });
             }
             let ty = func_type(&callee.def.sig.params, &callee.def.sig.ret);
             tc.record_function_value_expr(
@@ -1663,7 +1667,13 @@ fn call_value(
                     place_source: None,
                 }
             };
-            let ret_handle = TypeChecker::type_handle(&ret.ty);
+            if ret.is_iter() {
+                tc.push_error(TypeError::IteratorPlanAsValue {
+                    span: tc.error_span(call.span),
+                });
+                return CheckedCall::value(checked_type(Type::Infer));
+            }
+            let ret_handle = TypeChecker::type_handle(&ret.ty());
             let _ = constrain_expected_return(call.span, ret_handle.clone(), expected, tc);
             if !args_check.failed {
                 let arg_facts = call
@@ -1689,7 +1699,7 @@ fn call_value(
                 );
             }
             CheckedCall {
-                checked: checked_type(ret.ty.clone()),
+                checked: checked_type(ret.ty().clone()),
                 returns_place: ret.is_place() && !args_check.failed,
                 source: args_check.place_source,
             }
@@ -1819,7 +1829,7 @@ fn check_dyn_method_call(
     }
 
     failed |= check_args(&call.node.args, &requirement.params, call.span, tc);
-    let ret = TypeChecker::type_handle(&requirement.ret.ty);
+    let ret = TypeChecker::type_handle(&requirement.ret.ty());
     let _ = constrain_expected_return(call.span, ret.clone(), expected, tc);
     if !failed {
         tc.record_resolved_dyn_call(
@@ -1832,7 +1842,7 @@ fn check_dyn_method_call(
             tc.source_span(call.span),
         );
     }
-    checked_type(requirement.ret.ty.clone())
+    checked_type(requirement.ret.ty().clone())
 }
 
 struct ExternMethodCall<'a> {
@@ -1893,7 +1903,7 @@ fn solve_generic_call_with(
     }
     if !inferred_ret {
         tc.substitute_checked(
-            &template_ret.ty,
+            &template_ret.ty(),
             &seeds.type_args,
             &seeds.const_args,
             call_span,
@@ -1916,7 +1926,7 @@ fn solve_generic_call_with(
     if !inferred_ret {
         let ret_handle = tc
             .solver
-            .instantiate_generic_type(&template_ret.ty, session.vars());
+            .instantiate_generic_type(&template_ret.ty(), session.vars());
         failed |= constrain_expected_return(call_span, ret_handle, expected, tc).failed();
     }
 
@@ -1932,7 +1942,7 @@ fn solve_generic_call_with(
     let ret = template_ret.with_ty(if inferred_ret {
         Type::InferReturn
     } else {
-        tc.substitute_checked(&template_ret.ty, &type_subst, &const_subst, call_span)
+        tc.substitute_checked(&template_ret.ty(), &type_subst, &const_subst, call_span)
     });
 
     Some(GenericCallInstantiation {
@@ -2350,6 +2360,82 @@ fn check_enum_variant_call(
     checked
 }
 
+pub(super) fn check_iter_helper_call_target(
+    callee: &CallableRef,
+    call: &CallNode,
+    call_id: ExprId,
+    tc: &mut TypeChecker,
+) -> Option<CallTarget> {
+    let mut seeds = bind_prefix_generic_seeds(
+        tc,
+        syntactic_generics(callee),
+        &call.node.generic_args,
+        call.span,
+    )?;
+    seed_owner_args(
+        &mut seeds,
+        &callee.def.sig.owner_generics,
+        &callee.owner_args,
+    );
+    let all_generics =
+        combined_generic_params(&callee.def.sig.owner_generics, &callee.def.sig.generics);
+    let inst = solve_generic_call_with(
+        &all_generics,
+        &seeds,
+        &callee.def.sig.params,
+        callee.def.sig.required_params,
+        &callee.def.sig.ret,
+        GenericCallSource {
+            args: &call.node.args,
+            call_span: call.span,
+            receiver_arg: None,
+            expected: None,
+        },
+        tc,
+        |vars, tc| constrain_callable_owner(callee, vars, call.span, tc),
+    )?;
+    let (owner_args, callable_args) = split_generic_args(
+        &inst.args,
+        &callee.def.sig.owner_generics,
+        &callee.def.sig.generics,
+    );
+    let args = combine_generic_args(&owner_args, &callable_args);
+    let const_bindings = super::callable_const_bindings(
+        &callee.def.sig.owner_generics,
+        &owner_args,
+        &callee.def.sig.generics,
+        &callable_args,
+    );
+    let provided_args = call.node.args.len();
+    let GenericCallInstantiation {
+        type_subst,
+        const_subst,
+        concrete_params,
+        ret,
+        ..
+    } = inst;
+    check_specialized_callable_body(
+        callee,
+        &concrete_params,
+        &ret,
+        &args,
+        type_subst,
+        const_subst,
+        &const_bindings,
+        tc,
+    );
+    let target = CallTarget::new(callee.def.id.clone(), args);
+    tc.record_call(call_id, target.clone());
+    tc.record_default_args(
+        call_id,
+        &target,
+        provided_args,
+        &concrete_params,
+        &callee.def.sig.default_sites,
+    );
+    Some(target)
+}
+
 fn check_callable_call(
     callee: &CallableRef,
     call: &CallNode,
@@ -2472,7 +2558,13 @@ fn check_callable_call_with_args(
         &const_bindings,
         tc,
     ) {
-        ret.ty = inferred_ret;
+        ret = inferred_ret;
+    }
+    if ret.is_iter() {
+        tc.push_error(TypeError::IteratorPlanAsValue {
+            span: tc.error_span(call_span),
+        });
+        return CheckedCall::value(checked_type(Type::Infer));
     }
     let id = callee.def.id.clone();
     let target = match form {
@@ -2489,7 +2581,7 @@ fn check_callable_call_with_args(
     );
     let returns_place = ret.is_place();
     CheckedCall {
-        checked: checked_type(ret.ty),
+        checked: checked_type(ret.ty()),
         returns_place,
         source: place_source,
     }

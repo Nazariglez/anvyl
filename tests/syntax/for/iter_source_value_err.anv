@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn main() {
+    let xs = [1, 2, 3];
+    let it = iter(xs);
+}

@@ -303,6 +303,8 @@ pub(crate) fn rvalue_ty(
         | RValue::MapGet { ty, .. }
         | RValue::MapRemove { ty, .. }
         | RValue::MapEntryAt { ty, .. }
+        | RValue::MapKeyAt { ty, .. }
+        | RValue::MapValueAt { ty, .. }
         | RValue::SliceView { ty, .. }
         | RValue::FunctionRef { ty, .. }
         | RValue::MakeLambda { ty, .. } => Some(*ty),
@@ -312,7 +314,7 @@ pub(crate) fn rvalue_ty(
         RValue::Stringify { .. } | RValue::StringConcat { .. } | RValue::Format { .. } => {
             primitives.string()
         }
-        RValue::Len { .. } | RValue::CheckedForStep { .. } => primitives.int(),
+        RValue::Len { .. } | RValue::CheckedIterCount { .. } => primitives.int(),
         RValue::ListPush { .. } | RValue::MapInsert { .. } => primitives.void(),
     }
 }

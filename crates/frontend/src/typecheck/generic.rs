@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     BodyInstanceKey, CallableInstanceKey, CallableRef, CallableTemplate, ContractWitnessMap,
-    GenericTypeContext, SemanticBodyFacts, TypeChecker, TypecheckFacts,
+    GenericTypeContext, ReturnSpec, SemanticBodyFacts, TypeChecker, TypecheckFacts,
     const_term::ConstTerm,
     decls::CallableId,
     dyn_infer::DynInferenceFacts,
@@ -133,7 +133,7 @@ pub(crate) struct SpecializedBody {
     pub(crate) dyn_infer: DynInferenceFacts,
     pub(crate) params: Vec<FuncParam>,
     pub(crate) return_ty: Type,
-    pub(crate) inferred_ret: Option<Type>,
+    pub(crate) inferred_ret: Option<ReturnSpec>,
 }
 
 #[derive(Clone)]
@@ -204,8 +204,8 @@ pub(super) fn check_with_specialization(
     params: Vec<FuncParam>,
     declared_ret: Type,
     tc: &mut TypeChecker,
-    check_body: impl FnOnce(&mut TypeChecker) -> Option<Type>,
-) -> Option<Type> {
+    check_body: impl FnOnce(&mut TypeChecker) -> Option<ReturnSpec>,
+) -> Option<ReturnSpec> {
     tc.solve_constraints();
     let old_witnesses = tc.semantic_facts.contract_witnesses.clone();
     let old_bodies = tc.semantic_facts.bodies.clone();
@@ -245,7 +245,7 @@ pub(super) fn check_with_specialization(
         .collect();
     let contract_witnesses =
         super::semantic_use::map_delta(&old_witnesses, &tc.semantic_facts.contract_witnesses);
-    let return_ty = inferred_ret.clone().unwrap_or(declared_ret);
+    let return_ty = inferred_ret.as_ref().map_or(declared_ret, ReturnSpec::ty);
     tc.store_specialization(
         key,
         SpecializationState::Done(Box::new(SpecializedBody {
@@ -410,8 +410,14 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
                     .iter()
                     .zip(specific_params)
                     .all(|(a, b)| covers_type(&a.ty, &b.ty, cover))
-                && ret.access == specific_ret.access
-                && covers_type(&ret.ty, &specific_ret.ty, cover)
+                && ret.access() == specific_ret.access()
+                && match (ret.ty_ref(), specific_ret.ty_ref()) {
+                    (Some(ret_ty), Some(specific_ret_ty)) => {
+                        covers_type(ret_ty, specific_ret_ty, cover)
+                    }
+                    (None, None) => ret == specific_ret,
+                    _ => false,
+                }
         }
         (Type::Tuple(a), Type::Tuple(b)) => covers_types(a, b, cover),
         (Type::Nominal(a), Type::Nominal(b)) => {

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: cannot be iterated
+
+fn main() {
+    let m = ["a": 1, "b": 2];
+    for key, value in iter(m).values() {
+        let v = value;
+    }
+}

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: iterator helper statements must be simple aliases
+
+fn nums(offset: int) -> iter {
+    let start = offset + 1;
+    iter(start..4)
+}
+
+fn main() {
+    for _ in nums(1) {
+    }
+}

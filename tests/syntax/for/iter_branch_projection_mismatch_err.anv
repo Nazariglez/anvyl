@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched iterator projections
+
+fn projected(flag: bool, map: [int: int]) -> iter {
+    if flag { iter(map).keys() } else { iter(map).values() }
+}
+
+fn main() {
+    var xs: [int: int] = [1: 2];
+    for _ in projected(true, xs) {
+    }
+}

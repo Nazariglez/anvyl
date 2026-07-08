@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn nums(flag: bool) -> iter {
+    flag ? iter(0..3) : iter(1..4)
+}
+
+fn main() {
+    for _ in nums(true) {
+    }
+}

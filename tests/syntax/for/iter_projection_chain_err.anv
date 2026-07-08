@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: map projection adapters cannot be chained
+
+fn main() {
+    let m = ["a": 1, "b": 2];
+    for key in iter(m).keys().values() {
+        let k = key;
+    }
+}

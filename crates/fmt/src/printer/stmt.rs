@@ -95,10 +95,6 @@ impl Printer<'_> {
             self.format_pattern(&binding.pattern.node);
         }
         self.write(" in ");
-        if f.reversed {
-            self.write("rev ");
-        }
-
         // TODO: ranges should be able to be used witouth parens
         // `x..` needs parens in `for ... in` so the body block doesn't get parsed as its end
         let needs_parens = matches!(
@@ -111,10 +107,6 @@ impl Printer<'_> {
             self.write(")");
         } else {
             self.format_expr(&f.iterable.node);
-        }
-        if let Some(step) = &f.step {
-            self.write(" step ");
-            self.format_expr(&step.node);
         }
         self.write(" ");
         self.format_block(&f.body);

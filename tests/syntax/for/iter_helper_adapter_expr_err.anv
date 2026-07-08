@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: iterator helper adapter arguments must be literals or simple names
+
+fn skip_next<S>(source: S, offset: int) -> iter {
+    iter(source).skip(offset + 1)
+}
+
+fn main() {
+    for _ in skip_next(0..5, 1) {
+    }
+}

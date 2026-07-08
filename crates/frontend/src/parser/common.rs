@@ -207,13 +207,31 @@ pub(super) fn param<'src>(
 pub(super) fn return_spec_tail<'src>() -> BoxedParser<'src, ast::ReturnSpec> {
     let inferred =
         select! { Token::Ident(ident) if ident.0.as_ref() == "_" => ast::Type::InferReturn };
+    let iter = select! { Token::Keyword(Keyword::Iter) => () };
     let access = select! { Token::Keyword(Keyword::Ref) => ast::ReturnAccess::Place }
         .or_not()
         .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
 
     access
-        .then(choice((inferred, type_ident())))
-        .map(|(access, ty)| ast::ReturnSpec { access, ty })
+        .then(choice((
+            iter.to(None),
+            choice((inferred, type_ident())).map(Some),
+        )))
+        .validate(|(access, ty), extra, emitter| match ty {
+            Some(ty) => match access {
+                ast::ReturnAccess::Value => ast::ReturnSpec::value(ty),
+                ast::ReturnAccess::Place => ast::ReturnSpec::place(ty),
+            },
+            None => {
+                if access == ast::ReturnAccess::Place {
+                    emitter.emit(Rich::custom(
+                        extra.span(),
+                        "iterator returns cannot be place returns",
+                    ));
+                }
+                ast::ReturnSpec::iter()
+            }
+        })
         .labelled("return type")
         .as_context()
         .boxed()

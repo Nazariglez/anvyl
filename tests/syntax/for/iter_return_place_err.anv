@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: iterator returns cannot be place returns
+
+fn backwards(xs: [int]) -> ref iter {
+    iter(xs)
+}

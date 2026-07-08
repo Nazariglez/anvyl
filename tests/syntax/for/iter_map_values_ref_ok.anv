@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    var m = ["a": 1, "b": 2];
+    for ref value in iter(m).values() {
+        value += 1;
+    }
+}

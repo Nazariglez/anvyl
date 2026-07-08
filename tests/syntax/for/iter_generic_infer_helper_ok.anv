@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn every_other<S>(source: S) -> _ {
+    iter(source).step_by(2)
+}
+
+fn main() {
+    for _ in every_other(0..6) {
+    }
+}

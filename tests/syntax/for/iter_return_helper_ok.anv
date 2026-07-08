@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn wrapped() -> iter {
+    return nums();
+}
+
+fn main() {
+    for n in wrapped() {
+        let _: int = n;
+    }
+}

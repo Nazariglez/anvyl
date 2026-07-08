@@ -165,6 +165,7 @@ spelled_token! {
         While => "while",
         For => "for",
         In => "in",
+        Iter => "iter",
         Break => "break",
         Continue => "continue",
         Defer => "defer",
@@ -998,6 +999,7 @@ mod tests {
     fn reserved_words_are_keywords() {
         assert_eq!(tokenize_tokens("lazy"), vec![Token::Keyword(Keyword::Lazy)]);
         assert_eq!(tokenize_tokens("ref"), vec![Token::Keyword(Keyword::Ref)]);
+        assert_eq!(tokenize_tokens("iter"), vec![Token::Keyword(Keyword::Iter)]);
     }
 
     #[test]
@@ -1021,6 +1023,7 @@ mod tests {
             "import",
             "lazy",
             "ref",
+            "iter",
             "bad-name",
             "math utils",
             " math",

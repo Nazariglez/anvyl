@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn take_int(n: int) {
+}
+
+fn main() {
+    take_int(nums());
+}

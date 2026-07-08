@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: keys() requires a map iterator
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn main() {
+    for key in nums().keys() {
+    }
+}

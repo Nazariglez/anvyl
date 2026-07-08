@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+fn nums() -> iter {
+    let start = 0;
+    iter(start..3)
+}
+
+fn main() {
+    for _ in nums() {
+    }
+}

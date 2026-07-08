@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: Wrong number of arguments
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn main() {
+    for _ in nums(1) {
+    }
+}

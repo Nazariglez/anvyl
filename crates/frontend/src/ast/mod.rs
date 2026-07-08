@@ -354,23 +354,40 @@ pub enum ReturnAccess {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReturnKind {
+    Value(Type),
+    Place(Type),
+    Infer,
+    Iter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReturnSpec {
-    pub access: ReturnAccess,
-    pub ty: Type,
+    pub kind: ReturnKind,
 }
 
 impl ReturnSpec {
     pub fn value(ty: Type) -> Self {
         Self {
-            access: ReturnAccess::Value,
-            ty,
+            kind: ReturnKind::Value(ty),
         }
     }
 
     pub fn place(ty: Type) -> Self {
         Self {
-            access: ReturnAccess::Place,
-            ty,
+            kind: ReturnKind::Place(ty),
+        }
+    }
+
+    pub fn infer() -> Self {
+        Self {
+            kind: ReturnKind::Infer,
+        }
+    }
+
+    pub fn iter() -> Self {
+        Self {
+            kind: ReturnKind::Iter,
         }
     }
 
@@ -380,26 +397,59 @@ impl ReturnSpec {
 
     #[must_use]
     pub fn with_ty(&self, ty: Type) -> Self {
-        Self {
-            access: self.access,
-            ty,
+        match self.kind {
+            ReturnKind::Value(_) => Self::value(ty),
+            ReturnKind::Place(_) => Self::place(ty),
+            ReturnKind::Infer => Self::infer(),
+            ReturnKind::Iter => Self::iter(),
+        }
+    }
+
+    pub fn access(&self) -> ReturnAccess {
+        match self.kind {
+            ReturnKind::Place(_) => ReturnAccess::Place,
+            ReturnKind::Value(_) | ReturnKind::Infer | ReturnKind::Iter => ReturnAccess::Value,
+        }
+    }
+
+    pub fn ty(&self) -> Type {
+        match &self.kind {
+            ReturnKind::Value(ty) | ReturnKind::Place(ty) => ty.clone(),
+            ReturnKind::Infer => Type::InferReturn,
+            ReturnKind::Iter => Type::Infer,
+        }
+    }
+
+    pub fn ty_ref(&self) -> Option<&Type> {
+        match &self.kind {
+            ReturnKind::Value(ty) | ReturnKind::Place(ty) => Some(ty),
+            ReturnKind::Infer | ReturnKind::Iter => None,
         }
     }
 
     pub fn is_implicit_void(&self) -> bool {
-        self.access == ReturnAccess::Value && self.is_void()
+        self.access() == ReturnAccess::Value && self.is_void()
     }
 
     pub fn is_place(&self) -> bool {
-        self.access == ReturnAccess::Place
+        self.access() == ReturnAccess::Place
+    }
+
+    pub fn is_iter(&self) -> bool {
+        matches!(self.kind, ReturnKind::Iter)
     }
 
     pub fn is_void(&self) -> bool {
-        self.ty == Type::Void
+        matches!(&self.kind, ReturnKind::Value(ty) | ReturnKind::Place(ty) if *ty == Type::Void)
     }
 
     pub fn is_infer(&self) -> bool {
-        self.ty == Type::InferReturn
+        matches!(
+            self.kind,
+            ReturnKind::Infer
+                | ReturnKind::Value(Type::InferReturn)
+                | ReturnKind::Place(Type::InferReturn)
+        )
     }
 }
 
@@ -675,7 +725,11 @@ impl Display for ReturnSpec {
         if self.is_place() {
             write!(f, "ref ")?;
         }
-        write!(f, "{}", self.ty)
+        match &self.kind {
+            ReturnKind::Value(ty) | ReturnKind::Place(ty) => write!(f, "{ty}"),
+            ReturnKind::Infer => write!(f, "_"),
+            ReturnKind::Iter => write!(f, "iter"),
+        }
     }
 }
 
@@ -1326,6 +1380,11 @@ pub struct Call {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct IterSource {
+    pub source: Box<ExprNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Binary {
     pub left: Box<ExprNode>,
     pub op: BinaryOp,
@@ -1397,8 +1456,6 @@ pub struct ForBinding {
 pub struct For {
     pub bindings: Vec<ForBinding>,
     pub iterable: ExprNode,
-    pub step: Option<ExprNode>,
-    pub reversed: bool,
     pub body: BlockNode,
 }
 
@@ -1721,6 +1778,7 @@ pub enum ExprKind {
     Block(BlockNode),
     Lit(Lit),
     Call(CallNode),
+    IterSource(IterSourceNode),
     Binary(BinaryNode),
     Unary(UnaryNode),
     Assign(AssignNode),
@@ -1766,6 +1824,7 @@ impl ExprKind {
             Self::Block(_) => "Block",
             Self::Lit(_) => "Lit",
             Self::Call(_) => "Call",
+            Self::IterSource(_) => "IterSource",
             Self::Binary(_) => "Binary",
             Self::Unary(_) => "Unary",
             Self::Assign(_) => "Assign",
@@ -2016,6 +2075,7 @@ pub type ForNode = Spanned<For>;
 pub type BinaryNode = Spanned<Binary>;
 pub type UnaryNode = Spanned<Unary>;
 pub type CallNode = Spanned<Call>;
+pub type IterSourceNode = Spanned<IterSource>;
 pub type AssignNode = Spanned<Assign>;
 pub type ReturnNode = Spanned<Return>;
 pub type IfNode = Spanned<If>;

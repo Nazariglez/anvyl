@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: ref iteration requires a mutable iterable
+
+fn choose(flag: bool, xs: [int]) -> iter {
+    if flag { iter(xs) } else { iter(0..3) }
+}
+
+fn main() {
+    var xs: [int] = [1];
+    let flag = false;
+    for ref x in choose(flag, xs) {
+        x += 1;
+    }
+}

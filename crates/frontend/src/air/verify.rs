@@ -13,9 +13,9 @@ use super::{
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
         AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
-        AirMapEntryMatch, AirOptionalMatch, AirStmt, AirTail, CallArg, Callee, GlobalInitEffect,
-        LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection,
-        RValue,
+        AirMapEntryMatch, AirOptionalMatch, AirOrdinalPlan, AirStmt, AirTail, CallArg, Callee,
+        GlobalInitEffect, LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal,
+        PlaceRoot, Projection, RValue,
     },
     ids::*,
     place_model,
@@ -2324,9 +2324,9 @@ fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
         AirStmt::RangeFor(range) => {
             operand_uses_capture_cell(&range.start, cell)
                 || operand_uses_capture_cell(&range.end, cell)
-                || operand_uses_capture_cell(&range.step, cell)
+                || ordinal_uses_capture_cell(&range.ordinal_plan, cell)
         }
-        AirStmt::CollectionFor(for_) => operand_uses_capture_cell(&for_.step, cell),
+        AirStmt::CollectionFor(for_) => ordinal_uses_capture_cell(&for_.ordinal_plan, cell),
         AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
         AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
         AirStmt::EnumMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
@@ -2374,6 +2374,8 @@ fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
         | RValue::RangeListCopy { source, .. }
         | RValue::MapGet { map: source, .. }
         | RValue::MapEntryAt { map: source, .. }
+        | RValue::MapKeyAt { map: source, .. }
+        | RValue::MapValueAt { map: source, .. }
         | RValue::SliceView { source, .. } => place_uses_capture_cell(source, cell),
         RValue::ListPush { list, value } => {
             place_uses_capture_cell(list, cell) || operand_uses_capture_cell(value, cell)
@@ -2388,7 +2390,7 @@ fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
         RValue::MapRemove { map, key, .. } => {
             place_uses_capture_cell(map, cell) || operand_uses_capture_cell(key, cell)
         }
-        RValue::CheckedForStep { step } => operand_uses_capture_cell(step, cell),
+        RValue::CheckedIterCount { count, .. } => operand_uses_capture_cell(count, cell),
         RValue::MakeLambda { captures, .. } => captures
             .iter()
             .any(|capture| lambda_capture_arg_uses_capture_cell(capture, cell)),
@@ -2417,6 +2419,11 @@ fn lambda_capture_arg_uses_capture_cell(arg: &LambdaCaptureArg, cell: CaptureCel
         }
         LambdaCaptureArg::NoRuntime => false,
     }
+}
+
+fn ordinal_uses_capture_cell(plan: &AirOrdinalPlan, cell: CaptureCellId) -> bool {
+    plan.operands()
+        .any(|operand| operand_uses_capture_cell(operand, cell))
 }
 
 fn operand_uses_capture_cell(operand: &Operand, cell: CaptureCellId) -> bool {
@@ -3603,13 +3610,17 @@ fn verify_air_stmt(
         AirStmt::RangeFor(range) => {
             verify_air_operand_read(cx, function_id, index, &range.start, state);
             verify_air_operand_read(cx, function_id, index, &range.end, state);
-            verify_air_operand_read(cx, function_id, index, &range.step, state);
+            for operand in range.ordinal_plan.operands() {
+                verify_air_operand_read(cx, function_id, index, operand, state);
+            }
             verify_loop_int_parts(
                 cx,
                 function_id,
                 block_id,
                 index,
-                [&range.start, &range.end, &range.step],
+                std::iter::once(&range.start)
+                    .chain(std::iter::once(&range.end))
+                    .chain(range.ordinal_plan.operands()),
                 range.ordinal.into_iter().chain([range.item]),
             );
             verify_air_for_body(
@@ -3624,13 +3635,15 @@ fn verify_air_stmt(
         }
         AirStmt::CollectionFor(for_) => {
             verify_air_local_read(cx, function_id, index, for_.len, state);
-            verify_air_operand_read(cx, function_id, index, &for_.step, state);
+            for operand in for_.ordinal_plan.operands() {
+                verify_air_operand_read(cx, function_id, index, operand, state);
+            }
             verify_loop_int_parts(
                 cx,
                 function_id,
                 block_id,
                 index,
-                [&for_.step],
+                for_.ordinal_plan.operands(),
                 [Some(for_.len), Some(for_.index), for_.ordinal]
                     .into_iter()
                     .flatten(),
@@ -4128,7 +4141,10 @@ fn verify_collection_loan_contract_stmt(
             active_loans,
         ),
         AirStmt::RangeFor(range) => {
-            for operand in [&range.start, &range.end, &range.step] {
+            for operand in std::iter::once(&range.start)
+                .chain(std::iter::once(&range.end))
+                .chain(range.ordinal_plan.operands())
+            {
                 verify_collection_loan_contract_operand(
                     cx,
                     function_id,
@@ -4148,14 +4164,16 @@ fn verify_collection_loan_contract_stmt(
             );
         }
         AirStmt::CollectionFor(for_) => {
-            verify_collection_loan_contract_operand(
-                cx,
-                function_id,
-                &for_.step,
-                slot_locals,
-                active_slots,
-                false,
-            );
+            for operand in for_.ordinal_plan.operands() {
+                verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    operand,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
             verify_collection_loan_contract_block(
                 cx,
                 function_id,
@@ -4589,7 +4607,9 @@ fn verify_collection_loan_contract_rvalue(
                 CollectionStructuralEffect::Map(MapStructuralEffect::Remove),
             );
         }
-        RValue::MapEntryAt { map, index, .. } => {
+        RValue::MapEntryAt { map, index, .. }
+        | RValue::MapKeyAt { map, index, .. }
+        | RValue::MapValueAt { map, index, .. } => {
             verify_collection_loan_contract_place(
                 cx,
                 function_id,
@@ -4607,10 +4627,10 @@ fn verify_collection_loan_contract_rvalue(
                 false,
             );
         }
-        RValue::CheckedForStep { step } => verify_collection_loan_contract_operand(
+        RValue::CheckedIterCount { count, .. } => verify_collection_loan_contract_operand(
             cx,
             function_id,
-            step,
+            count,
             slot_locals,
             active_slots,
             false,
@@ -5402,6 +5422,12 @@ fn verify_air_rvalue_reads(
         }
         RValue::MapEntryAt {
             map, index: key, ..
+        }
+        | RValue::MapKeyAt {
+            map, index: key, ..
+        }
+        | RValue::MapValueAt {
+            map, index: key, ..
         } => {
             verify_air_place_read(cx, function_id, index, map, state);
             verify_air_local_read(cx, function_id, index, *key, state);
@@ -5413,8 +5439,8 @@ fn verify_air_rvalue_reads(
             verify_air_operand_read(cx, function_id, index, key, state);
             verify_air_operand_read(cx, function_id, index, value, state);
         }
-        RValue::CheckedForStep { step } => {
-            verify_air_operand_read(cx, function_id, index, step, state);
+        RValue::CheckedIterCount { count, .. } => {
+            verify_air_operand_read(cx, function_id, index, count, state);
         }
         RValue::FunctionRef { .. } => {}
         RValue::MakeLambda { captures, .. } => {
@@ -6219,6 +6245,44 @@ fn verify_rvalue(
                 ),
             }
         }
+        RValue::MapKeyAt { map, index, ty } => {
+            verify_place(cx, function_id, block_id, stmt_index, map);
+            verify_slice_index(cx, function_id, block_id, stmt_idx, "index", *index);
+            cx.verify_type_ref(site.clone(), *ty);
+            match typing::map_kv(cx.program, map.ty) {
+                Some((key_ty, _)) if *ty == key_ty => {}
+                Some((_, value_ty)) => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::MapEntryResultTypeMismatch {
+                        expected: value_ty,
+                        found: *ty,
+                    }),
+                ),
+                None => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::MapEntrySourceMustBeMap(map.ty)),
+                ),
+            }
+        }
+        RValue::MapValueAt { map, index, ty } => {
+            verify_place(cx, function_id, block_id, stmt_index, map);
+            verify_slice_index(cx, function_id, block_id, stmt_idx, "index", *index);
+            cx.verify_type_ref(site.clone(), *ty);
+            match typing::map_kv(cx.program, map.ty) {
+                Some((_, value_ty)) if *ty == value_ty => {}
+                Some((_, value_ty)) => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::MapEntryResultTypeMismatch {
+                        expected: value_ty,
+                        found: *ty,
+                    }),
+                ),
+                None => cx.push(
+                    site,
+                    VerifyErrorKind::BadFunction(BadFunction::MapEntrySourceMustBeMap(map.ty)),
+                ),
+            }
+        }
         RValue::SliceView {
             source,
             start,
@@ -6248,10 +6312,10 @@ fn verify_rvalue(
                 ),
             }
         }
-        RValue::CheckedForStep { step } => {
-            verify_operand(cx, function_id, block_id, stmt_index, step);
+        RValue::CheckedIterCount { count, .. } => {
+            verify_operand(cx, function_id, block_id, stmt_index, count);
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Int);
-            if let Some(found) = typing::operand_ty(cx.program, step)
+            if let Some(found) = typing::operand_ty(cx.program, count)
                 && cx.primitives.int() != Some(found)
             {
                 let expected = cx.primitives.int().unwrap_or(found);

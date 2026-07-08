@@ -82,6 +82,7 @@ mod generic;
 mod generic_bind;
 mod globals;
 mod infer;
+mod iterator_plan;
 mod literal;
 mod match_check;
 mod match_coverage;
@@ -280,6 +281,9 @@ pub(crate) enum TypeError {
     },
     TypeUsedAsValue {
         ty: Type,
+        span: Option<SourceSpan>,
+    },
+    IteratorPlanAsValue {
         span: Option<SourceSpan>,
     },
     CannotInferConst {
@@ -871,6 +875,7 @@ impl TypeError {
             | TypeError::UnsupportedPlaceReturn { span, .. }
             | TypeError::UnknownType { span, .. }
             | TypeError::TypeUsedAsValue { span, .. }
+            | TypeError::IteratorPlanAsValue { span, .. }
             | TypeError::CannotInferConst { span, .. }
             | TypeError::NotCallable { span, .. }
             | TypeError::WrongArgCount { span, .. }
@@ -1288,6 +1293,8 @@ impl LocalCallableInfo {
             Some(TypeError::UndefinedVariable { name, span })
         } else if self.callee.def.sig.ret.is_infer() {
             Some(TypeError::InferReturnValue { span })
+        } else if self.callee.def.sig.ret.is_iter() {
+            Some(TypeError::IteratorPlanAsValue { span })
         } else {
             None
         }
@@ -1338,8 +1345,14 @@ enum ReturnMode {
     Infer {
         access: ReturnAccess,
         source: Option<PlaceIdentity>,
-        candidates: Vec<(Span, TypeHandle)>,
+        candidates: Vec<ReturnCandidate>,
     },
+}
+
+#[derive(Clone)]
+enum ReturnCandidate {
+    Value { span: Span, handle: TypeHandle },
+    Iter { span: Span },
 }
 
 struct ReturnFrame {
@@ -1400,6 +1413,7 @@ struct TypeChecker {
     generic_contexts: Vec<GenericTypeContext>,
     generic_owner_frames: Vec<GenericOwnerFrame>,
     active_bodies: Vec<BodyInstanceKey>,
+    iter_return_sigs: HashMap<BodyInstanceKey, Type>,
     local_def_bodies: HashMap<SemanticLocalId, BodyInstanceKey>,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
@@ -1449,6 +1463,7 @@ impl TypeChecker {
             generic_contexts: vec![],
             generic_owner_frames: vec![],
             active_bodies: vec![],
+            iter_return_sigs: HashMap::new(),
             local_def_bodies: HashMap::new(),
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
@@ -1497,6 +1512,14 @@ impl TypeChecker {
             .last()
             .cloned()
             .unwrap_or_else(|| BodyInstanceKey::Module(self.current_module.clone()))
+    }
+
+    fn record_current_iter_return_sig(&mut self, ty: Type) {
+        self.iter_return_sigs.insert(self.current_body(), ty);
+    }
+
+    fn iter_return_sig(&self, body: &BodyInstanceKey) -> Option<&Type> {
+        self.iter_return_sigs.get(body)
     }
 
     fn with_deferred_expected_returns<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -2626,9 +2649,9 @@ impl TypeChecker {
         self.returns.last().map(|frame| &frame.mode)
     }
 
-    fn return_type(&self) -> Option<&Type> {
+    fn return_type(&self) -> Option<Type> {
         match self.return_mode()? {
-            ReturnMode::Explicit { ret, .. } => Some(&ret.ty),
+            ReturnMode::Explicit { ret, .. } => Some(ret.ty()),
             ReturnMode::Infer { .. } => None,
         }
     }
@@ -2640,7 +2663,17 @@ impl TypeChecker {
         let ReturnMode::Infer { candidates, .. } = &mut frame.mode else {
             return;
         };
-        candidates.push((span, handle));
+        candidates.push(ReturnCandidate::Value { span, handle });
+    }
+
+    fn push_inferred_iter_return(&mut self, span: Span) {
+        let Some(frame) = self.returns.last_mut() else {
+            return;
+        };
+        let ReturnMode::Infer { candidates, .. } = &mut frame.mode else {
+            return;
+        };
+        candidates.push(ReturnCandidate::Iter { span });
     }
 
     fn push_error(&mut self, err: impl Into<TypeError>) {
@@ -2880,7 +2913,7 @@ impl TypeChecker {
         exported: bool,
     ) -> Type {
         let resolved_params = self.resolve_callable_params(params, exported);
-        let resolved_ret = ret.with_ty(self.resolve_type_for_tc_at(&ret.ty, span));
+        let resolved_ret = ret.with_ty(self.resolve_type_for_tc_at(&ret.ty(), span));
         Type::func(resolved_params, resolved_ret)
     }
 
@@ -3044,10 +3077,20 @@ impl TypeChecker {
                     Some((
                         key.args.clone(),
                         body.params.clone(),
-                        ReturnSpec {
-                            access: ret.access,
-                            ty: body.return_ty.clone(),
-                        },
+                        body.inferred_ret.clone().unwrap_or_else(|| {
+                            if ret.is_iter() {
+                                ReturnSpec::iter()
+                            } else {
+                                match ret.access() {
+                                    ReturnAccess::Value => {
+                                        ReturnSpec::value(body.return_ty.clone())
+                                    }
+                                    ReturnAccess::Place => {
+                                        ReturnSpec::place(body.return_ty.clone())
+                                    }
+                                }
+                            }
+                        }),
                     ))
                 }
                 SpecializationState::InProgress | SpecializationState::Done(_) => None,
@@ -3314,10 +3357,8 @@ impl TypeChecker {
             return None;
         }
         let mut facts = self.closure.finish(|id| self.solver.local_type_to_type(id));
-        facts.for_step_runtime_checks = self
-            .semantic_facts
-            .flattened_body_facts()
-            .for_step_runtime_checks;
+        let body_facts = self.semantic_facts.flattened_body_facts();
+        facts.iter_runtime_checks = body_facts.iter_runtime_checks;
         facts.import_records = self.decls.import_records().to_vec();
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
@@ -4226,6 +4267,13 @@ fn check_expr_checked_with_hint(
             }
             checked_from_type(expr, Type::Infer, tc)
         }
+        ExprKind::IterSource(iter) => {
+            check_expr_checked(&iter.node.source, tc);
+            tc.push_error(TypeError::IteratorPlanAsValue {
+                span: tc.error_span(expr.span),
+            });
+            checked_from_type(expr, Type::Infer, tc)
+        }
         ExprKind::Ident(name) => {
             match tc.resolve_ident_subject(*name, expr.span, NameSubjectMode::Value) {
                 ResolvedIdentSubject::Local(LocalSymbol::Value(ref info), depth) => {
@@ -4300,6 +4348,12 @@ fn check_expr_checked_with_hint(
                             if let Some(callee) = tc.decls.callable_for_value(&resolved) {
                                 if callee.def.sig.ret.is_infer() {
                                     tc.push_error(TypeError::InferReturnValue {
+                                        span: tc.error_span(expr.span),
+                                    });
+                                    return checked_from_type(expr, Type::Infer, tc);
+                                }
+                                if callee.def.sig.ret.is_iter() {
+                                    tc.push_error(TypeError::IteratorPlanAsValue {
                                         span: tc.error_span(expr.span),
                                     });
                                     return checked_from_type(expr, Type::Infer, tc);
@@ -4789,7 +4843,7 @@ fn check_try(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let return_ty = tc.return_type().cloned();
+    let return_ty = tc.return_type();
     let enclosing = return_ty.as_ref().and_then(|ty| tc.try_carrier_parts(ty));
 
     if tc.in_global_initializer() {

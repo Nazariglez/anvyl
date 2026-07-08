@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use super::{
-    CaptureCellRequirementMap, CompileWarning, ForStepRuntimeCheckMap, ImportId, ImportRecord,
-    LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey, SemanticDeclarations,
-    SemanticFactMaps, TypeError, decls::DeclarationIndex, infer::SourceExprTypes,
-    semantic_use::map_delta,
+    CaptureCellRequirementMap, CompileWarning, ImportId, ImportRecord, IterRuntimeCheckKind,
+    IterRuntimeCheckMap, LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey,
+    SemanticDeclarations, SemanticFactMaps, TypeError, decls::DeclarationIndex,
+    infer::SourceExprTypes, semantic_use::map_delta,
 };
 use crate::{
     ast::{ExprId, Visibility},
@@ -137,7 +137,7 @@ pub struct TypecheckFacts {
     pub(super) lambda_escapes: LambdaEscapeMap,
     pub(super) lambda_captures: LambdaCaptureMap,
     pub(super) capture_cell_requirements: CaptureCellRequirementMap,
-    pub(super) for_step_runtime_checks: ForStepRuntimeCheckMap,
+    pub(super) iter_runtime_checks: IterRuntimeCheckMap,
     pub(super) import_records: Vec<ImportRecord>,
     pub(super) used_imports: std::collections::HashSet<ImportId>,
 }
@@ -167,8 +167,8 @@ impl TypecheckFacts {
         &self.capture_cell_requirements
     }
 
-    pub(crate) fn requires_for_step_runtime_check(&self, expr_id: ExprId) -> bool {
-        self.for_step_runtime_checks.contains_key(&expr_id)
+    pub(crate) fn iter_runtime_check(&self, expr_id: ExprId) -> Option<IterRuntimeCheckKind> {
+        self.iter_runtime_checks.get(&expr_id).map(|fact| fact.kind)
     }
 
     pub(crate) fn unused_import_events(&self) -> Vec<LintEvent> {
@@ -193,10 +193,7 @@ impl TypecheckFacts {
                 &old.capture_cell_requirements,
                 &self.capture_cell_requirements,
             ),
-            for_step_runtime_checks: map_delta(
-                &old.for_step_runtime_checks,
-                &self.for_step_runtime_checks,
-            ),
+            iter_runtime_checks: map_delta(&old.iter_runtime_checks, &self.iter_runtime_checks),
             import_records: self.import_records.clone(),
             used_imports: self.used_imports.clone(),
         }
@@ -211,8 +208,8 @@ impl TypecheckFacts {
             debug_assert_eq!(*lambda_id, fact.lambda_id);
             debug_assert_eq!(*binding_id, fact.binding_id);
         }
-        for span in self.for_step_runtime_checks.values() {
-            debug_assert!(span.span.start <= span.span.end);
+        for (expr_id, fact) in &self.iter_runtime_checks {
+            debug_assert_eq!(*expr_id, fact.expr);
         }
         for (binding_id, fact) in &self.capture_cell_requirements {
             debug_assert_eq!(*binding_id, fact.binding_id);

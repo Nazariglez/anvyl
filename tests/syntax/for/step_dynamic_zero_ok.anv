@@ -4,7 +4,7 @@
 fn stride() -> int { 0 }
 
 fn main() {
-    for n in 0..10 step stride() {
+    for n in iter(0..10).step_by(stride()) {
         let x: int = n;
     }
 }

@@ -1,11 +1,11 @@
 // @mode: check
 // @expect: error
-// @contains: for-loop step must be positive
+// @contains: step_by requires a positive count
 
 const STEP: int = 0;
 
 fn main() {
-    for n in 0..10 step STEP {
+    for n in iter(0..10).step_by(STEP) {
         let x: int = n;
     }
 }

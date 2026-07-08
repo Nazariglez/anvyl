@@ -67,6 +67,7 @@ fn for_header_atom_expr<'src>(
         }),
         array_literal(expr.clone()),
         type_subject_expr(),
+        iter_source_expr(expr.clone()),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = s.byte();
@@ -742,6 +743,27 @@ fn type_subject_expr<'src>() -> BoxedParser<'src, ast::ExprNode> {
         .boxed()
 }
 
+fn iter_source_expr<'src>(
+    expr: impl AnvParser<'src, ast::ExprNode>,
+) -> BoxedParser<'src, ast::ExprNode> {
+    select! { Token::Keyword(Keyword::Iter) => () }
+        .ignore_then(parens(expr))
+        .map_with(|source, e| {
+            let span = e.span().byte();
+            let node = Spanned::new(
+                ast::IterSource {
+                    source: Box::new(source),
+                },
+                span,
+            );
+            let expr_id = new_expr_id();
+            let expr = ast::Expr::new(ast::ExprKind::IterSource(node), expr_id);
+            Spanned::new(expr, span)
+        })
+        .labelled("iterator source")
+        .boxed()
+}
+
 fn atom_expr<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     expr: impl AnvParser<'src, ast::ExprNode>,
@@ -761,6 +783,7 @@ fn atom_expr<'src>(
         struct_literal(expr.clone()),
         array_literal(expr.clone()),
         type_subject_expr(),
+        iter_source_expr(expr.clone()),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = s.byte();
@@ -797,6 +820,7 @@ fn cond_atom_expr<'src>(
         }),
         array_literal(cond_expr.clone()),
         type_subject_expr(),
+        iter_source_expr(cond_expr.clone()),
         identifier().map_with(|ident, e| {
             let s = e.span();
             let span = s.byte();

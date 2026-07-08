@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn nums() -> iter {
+    1
+}

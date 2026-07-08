@@ -560,7 +560,7 @@ impl TypeChecker {
                     }
                     self.validate_type_uses(decls, &param.ty, span, policy);
                 }
-                self.validate_type_uses(decls, &ret.ty, span, policy);
+                self.validate_type_uses(decls, &ret.ty(), span, policy);
             }
             Type::Dyn(contract) => self.validate_contract_ref_uses(decls, contract, span, policy),
             Type::Tuple(elems) => {
@@ -621,7 +621,7 @@ impl TypeChecker {
                         }
                         self.validate_type_uses(decls, &param.ty, span, policy);
                     }
-                    self.validate_type_uses(decls, &req.ret.ty, span, policy);
+                    self.validate_type_uses(decls, &req.ret.ty(), span, policy);
                 }
             }
             ContractRef::Intersection(contracts) => {
@@ -742,7 +742,7 @@ fn type_contains_raw_dyn_infer_func(ty: &Type) -> bool {
                     params
                         .iter()
                         .any(|param| DynInference::has_raw_hole(&param.ty))
-                        || DynInference::has_raw_hole(&ret.ty)
+                        || DynInference::has_raw_hole(&ret.ty())
                 }
                 _ => self.visit_type_children(ty),
             }
@@ -900,7 +900,12 @@ impl<'a> TypeRefResolver<'a> {
                         Ok(param.with_ty(ty))
                     })
                     .collect::<Result<_, _>>()?,
-                ret: Box::new(ret.with_ty(self.finalize_inner(module, generics, &ret.ty, state)?)),
+                ret: Box::new(ret.with_ty(self.finalize_inner(
+                    module,
+                    generics,
+                    &ret.ty(),
+                    state,
+                )?)),
             }),
             Type::Dyn(contract) => self
                 .finalize_contract_ref(module, generics, contract, state)
@@ -1283,7 +1288,7 @@ impl<'a> TypeRefResolver<'a> {
             .collect::<Result<_, _>>()?;
         let ret = req
             .ret
-            .with_ty(self.finalize_inner(module, generics, &req.ret.ty, state)?);
+            .with_ty(self.finalize_inner(module, generics, &req.ret.ty(), state)?);
         Ok(AnonymousContractRequirement {
             receiver: req.receiver,
             name: req.name,

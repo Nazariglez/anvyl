@@ -78,14 +78,26 @@ pub struct AirLoop {
     pub body: AirBlock,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AirOrdinalPlan {
+    pub adapters: Vec<AirOrdinalAdapter>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AirOrdinalAdapter {
+    Rev,
+    Skip { count: Operand },
+    Take { count: Operand },
+    StepBy { step: Operand },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AirRangeFor {
     pub id: AirLoopId,
     pub start: Operand,
     pub end: Operand,
-    pub step: Operand,
+    pub ordinal_plan: AirOrdinalPlan,
     pub inclusive: bool,
-    pub reversed: bool,
     pub ordinal: Option<LocalId>,
     pub item: LocalId,
     pub body: AirBlock,
@@ -95,11 +107,21 @@ pub struct AirRangeFor {
 pub struct AirCollectionFor {
     pub id: AirLoopId,
     pub len: LocalId,
-    pub step: Operand,
-    pub reversed: bool,
+    pub ordinal_plan: AirOrdinalPlan,
     pub index: LocalId,
     pub ordinal: Option<LocalId>,
     pub body: AirBlock,
+}
+
+impl AirOrdinalPlan {
+    pub fn operands(&self) -> impl Iterator<Item = &Operand> {
+        self.adapters.iter().filter_map(|adapter| match adapter {
+            AirOrdinalAdapter::Rev => None,
+            AirOrdinalAdapter::Skip { count }
+            | AirOrdinalAdapter::Take { count }
+            | AirOrdinalAdapter::StepBy { step: count } => Some(count),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -345,6 +367,13 @@ pub enum MapWriteKind {
     StructuralInsert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterCountCheck {
+    SkipNonNegative,
+    TakeNonNegative,
+    StepByPositive,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
@@ -430,10 +459,21 @@ pub enum RValue {
         key: Operand,
         ty: TypeId,
     },
-    CheckedForStep {
-        step: Operand,
+    CheckedIterCount {
+        count: Operand,
+        check: IterCountCheck,
     },
     MapEntryAt {
+        map: Place,
+        index: LocalId,
+        ty: TypeId,
+    },
+    MapKeyAt {
+        map: Place,
+        index: LocalId,
+        ty: TypeId,
+    },
+    MapValueAt {
         map: Place,
         index: LocalId,
         ty: TypeId,

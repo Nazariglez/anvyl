@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let m = ["a": 1, "b": 2];
+    for key in iter(m).keys() {
+        let k = key;
+    }
+}

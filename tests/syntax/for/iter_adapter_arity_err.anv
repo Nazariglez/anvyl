@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: expected 0, found 1
+
+fn main() {
+    let xs = [1, 2, 3];
+    for x in iter(xs).rev(1) {
+        let y = x;
+    }
+}

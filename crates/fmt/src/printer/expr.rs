@@ -79,6 +79,12 @@ impl Printer<'_> {
 
             ast::ExprKind::Call(node) => self.format_call(&node.node),
 
+            ast::ExprKind::IterSource(node) => {
+                self.write("iter(");
+                self.format_expr(&node.node.source.node);
+                self.write(")");
+            }
+
             ast::ExprKind::Field(node) => {
                 self.format_expr_prec(&node.node.target.node, ExprPrecedence::Postfix, Left);
                 self.write(if node.node.safe { "?." } else { "." });

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: keys() requires a map iterator
+
+fn main() {
+    let xs = [1, 2, 3];
+    for key in iter(xs).keys() {
+        let k = key;
+    }
+}

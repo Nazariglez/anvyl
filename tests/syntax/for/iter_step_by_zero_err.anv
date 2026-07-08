@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: step_by requires a positive count
+
+fn main() {
+    let xs = [1, 2, 3];
+    for x in iter(xs).step_by(0) {
+        let y = x;
+    }
+}

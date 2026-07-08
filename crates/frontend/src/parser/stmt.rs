@@ -263,28 +263,6 @@ fn while_let_stmt<'src>(
         .boxed()
 }
 
-// rev key is only valid on for loops
-fn contextual_rev<'src>() -> BoxedParser<'src, bool> {
-    select! {
-        Token::Ident(ident) if ident.0.as_ref() == "rev" => true,
-    }
-    .or_not()
-    .map(|o| o.unwrap_or(false))
-    .boxed()
-}
-
-// step key is only valid on for loops
-fn contextual_step<'src>(
-    stmt: impl AnvParser<'src, ast::StmtNode>,
-) -> BoxedParser<'src, Option<ast::ExprNode>> {
-    select! {
-        Token::Ident(ident) if ident.0.as_ref() == "step" => (),
-    }
-    .ignore_then(for_header_expression(stmt))
-    .or_not()
-    .boxed()
-}
-
 fn for_binding_segment<'src>() -> BoxedParser<'src, ast::ForBinding> {
     select! { Token::Keyword(Keyword::Ref) => ast::RefAccess::Ref }
         .or_not()
@@ -316,19 +294,15 @@ fn for_stmt<'src>(
     .then_ignore(select! {
         Token::Keyword(Keyword::In) => (),
     })
-    .then(contextual_rev())
     .then(for_header_expression(stmt.clone()))
-    .then(contextual_step(stmt.clone()))
     .then(block_stmt(stmt, expr))
-    .map_with(|((((bindings, reversed), iterable), step), body), e| {
+    .map_with(|((bindings, iterable), body), e| {
         let s = e.span();
         let span = s.byte();
         let for_node = Spanned::new(
             ast::For {
                 bindings,
                 iterable,
-                step,
-                reversed,
                 body,
             },
             span,

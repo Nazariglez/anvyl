@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+fn nums(end: int) -> iter {
+    iter(0..end)
+}
+
+fn main() {
+    for _ in nums("bad") {
+    }
+}

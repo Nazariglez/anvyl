@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn nums(flag: bool) -> iter {
+    match flag { true => iter(0..3), false => iter(1..4) }
+}
+
+fn main() {
+    for _ in nums(true) {
+    }
+}

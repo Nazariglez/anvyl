@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: skip requires a non-negative count
+
+fn main() {
+    let xs = [1, 2, 3];
+    for x in iter(xs).skip(-1) {
+        let y = x;
+    }
+}

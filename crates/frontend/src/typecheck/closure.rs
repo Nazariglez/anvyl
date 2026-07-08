@@ -1412,7 +1412,7 @@ pub(super) fn check_lambda_expr(
         .node
         .ret_type
         .as_ref()
-        .map(|ret| ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, lambda.span)));
+        .map(|ret| ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty(), lambda.span)));
     if let Some(ret) = &explicit_ret {
         validate_return_spec(ret, false, has_mutable_func_param(&params), lambda.span, tc);
     }
@@ -1463,7 +1463,7 @@ pub(super) fn check_lambda_expr(
     tc.closure.lambda_value(expr.node.id);
 
     let ret = expected_ret
-        .or_else(|| inferred_ret.map(ReturnSpec::value))
+        .or(inferred_ret)
         .unwrap_or_else(|| ReturnSpec::value(Type::Infer));
     let ty = Type::Func {
         params,

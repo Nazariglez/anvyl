@@ -44,6 +44,7 @@ struct TyFuncParts {
 struct TyReturnSpec {
     access: ReturnAccess,
     ty: Ty,
+    iter: bool,
 }
 
 impl TyReturnSpec {
@@ -51,6 +52,7 @@ impl TyReturnSpec {
         Self {
             access: ReturnAccess::Value,
             ty,
+            iter: false,
         }
     }
 
@@ -58,13 +60,19 @@ impl TyReturnSpec {
         Self {
             access: self.access,
             ty,
+            iter: self.iter,
         }
     }
 
     fn try_to_return_spec_no_infer(&self) -> Option<ReturnSpec> {
-        Some(ReturnSpec {
-            access: self.access,
-            ty: self.ty.try_to_type_no_infer()?,
+        let ty = self.ty.try_to_type_no_infer()?;
+        Some(if self.iter {
+            ReturnSpec::iter()
+        } else {
+            match self.access {
+                ReturnAccess::Value => ReturnSpec::value(ty),
+                ReturnAccess::Place => ReturnSpec::place(ty),
+            }
         })
     }
 }
@@ -233,8 +241,9 @@ impl Ty {
                     })
                     .collect(),
                 ret: Box::new(TyReturnSpec {
-                    access: ret.access,
-                    ty: Self::from_recovery_type(&ret.ty),
+                    access: ret.access(),
+                    ty: Self::from_recovery_type(&ret.ty()),
+                    iter: ret.is_iter(),
                 }),
             },
             Type::Dyn(contract) => Self::Dyn(contract.clone()),
@@ -1024,8 +1033,9 @@ impl Solver {
                     })
                     .collect(),
                 ret: Box::new(TyReturnSpec {
-                    access: ret.access,
-                    ty: self.instantiate_type_template(&ret.ty, vars),
+                    access: ret.access(),
+                    ty: self.instantiate_type_template(&ret.ty(), vars),
+                    iter: ret.is_iter(),
                 }),
             },
             Type::Dyn(contract) => Ty::Dyn(self.instantiate_contract_ref_template(contract, vars)),
@@ -1135,7 +1145,7 @@ impl Solver {
                                 })
                                 .collect(),
                             ret: req.ret.with_ty(
-                                self.instantiate_type_template(&req.ret.ty, vars)
+                                self.instantiate_type_template(&req.ret.ty(), vars)
                                     .try_to_type_no_infer()
                                     .unwrap_or(Type::Infer),
                             ),
@@ -1451,7 +1461,7 @@ impl Solver {
         expected: TyReturnSpec,
         found: TyReturnSpec,
     ) -> Result<TyReturnSpec, SolveError> {
-        if expected.access != found.access {
+        if expected.access != found.access || expected.iter != found.iter {
             return Err(SolveError::type_mismatch(
                 Ty::Func {
                     params: vec![],
@@ -2196,9 +2206,17 @@ impl Solver {
                         escape: param.escape,
                     })
                     .collect(),
-                ret: Box::new(ReturnSpec {
-                    access: ret.access,
-                    ty: self.finalize_ty_inner(&ret.ty, cx),
+                ret: Box::new(if ret.iter {
+                    ReturnSpec::iter()
+                } else {
+                    match ret.access {
+                        ReturnAccess::Value => {
+                            ReturnSpec::value(self.finalize_ty_inner(&ret.ty, cx))
+                        }
+                        ReturnAccess::Place => {
+                            ReturnSpec::place(self.finalize_ty_inner(&ret.ty, cx))
+                        }
+                    }
                 }),
             },
             Ty::Dyn(contract) => Type::Dyn(contract),

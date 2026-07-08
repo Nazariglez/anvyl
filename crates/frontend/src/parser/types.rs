@@ -309,9 +309,13 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
         let return_access = select! { Token::Keyword(Keyword::Ref) => ast::ReturnAccess::Place }
             .or_not()
             .map(|access| access.unwrap_or(ast::ReturnAccess::Value));
-        let fn_return_spec = return_access
-            .then(return_value_type)
-            .map(|(access, ty)| ast::ReturnSpec { access, ty });
+        let fn_return_spec =
+            return_access
+                .then(return_value_type)
+                .map(|(access, ty)| match access {
+                    ast::ReturnAccess::Value => ast::ReturnSpec::value(ty),
+                    ast::ReturnAccess::Place => ast::ReturnSpec::place(ty),
+                });
 
         let fn_type = select! { Token::Keyword(Keyword::Fn) => () }
             .ignore_then(

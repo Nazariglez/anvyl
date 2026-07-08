@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn every_other<S>(source: S) -> iter {
+    iter(source).step_by(2)
+}
+
+fn wrapped<S>(source: S) -> _ {
+    every_other(source).take(2)
+}
+
+fn main() {
+    for n in wrapped(0..6) {
+        let _: int = n;
+    }
+}

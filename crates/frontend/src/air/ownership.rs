@@ -371,7 +371,9 @@ impl ParamUseAnalyzer<'_> {
             AirStmt::RangeFor(range) => {
                 self.observe_operand(&range.start, ValueContext::Read);
                 self.observe_operand(&range.end, ValueContext::Read);
-                self.observe_operand(&range.step, ValueContext::Read);
+                for operand in range.ordinal_plan.operands() {
+                    self.observe_operand(operand, ValueContext::Read);
+                }
                 self.observe_local(range.item, ParamUse::ReadOnly);
                 if let Some(ordinal) = range.ordinal {
                     self.observe_local(ordinal, ParamUse::ReadOnly);
@@ -380,7 +382,9 @@ impl ParamUseAnalyzer<'_> {
             }
             AirStmt::CollectionFor(for_) => {
                 self.observe_local(for_.len, ParamUse::ReadOnly);
-                self.observe_operand(&for_.step, ValueContext::Read);
+                for operand in for_.ordinal_plan.operands() {
+                    self.observe_operand(operand, ValueContext::Read);
+                }
                 self.observe_local(for_.index, ParamUse::ReadOnly);
                 if let Some(ordinal) = for_.ordinal {
                     self.observe_local(ordinal, ParamUse::ReadOnly);
@@ -493,7 +497,9 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_place(map, ParamUse::ReadOnly);
                 self.observe_operand(key, ValueContext::Read);
             }
-            RValue::MapEntryAt { map, index, .. } => {
+            RValue::MapEntryAt { map, index, .. }
+            | RValue::MapKeyAt { map, index, .. }
+            | RValue::MapValueAt { map, index, .. } => {
                 self.observe_place(map, ParamUse::ReadOnly);
                 self.observe_local(*index, ParamUse::ReadOnly);
             }
@@ -511,7 +517,9 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_place(map, ParamUse::ReborrowMut);
                 self.observe_operand(key, ValueContext::Read);
             }
-            RValue::CheckedForStep { step } => self.observe_operand(step, ValueContext::Read),
+            RValue::CheckedIterCount { count, .. } => {
+                self.observe_operand(count, ValueContext::Read);
+            }
         }
     }
 

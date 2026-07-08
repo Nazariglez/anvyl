@@ -428,8 +428,8 @@ fn signature_error(
     }
     if requirement.ret != candidate.ret {
         return Some(RequirementError::Return {
-            expected: Box::new(requirement.ret.ty.clone()),
-            found: Box::new(candidate.ret.ty.clone()),
+            expected: Box::new(requirement.ret.ty().clone()),
+            found: Box::new(candidate.ret.ty().clone()),
         });
     }
     None
@@ -567,7 +567,7 @@ pub(crate) fn finalize_contracts(
                 });
                 continue;
             }
-            if contains_infer_return(&req.ret.ty) {
+            if contains_infer_return(&req.ret.ty()) {
                 errors.push(TypeError::CompileError {
                     message: "contract method requirements cannot use inferred return types"
                         .to_string(),

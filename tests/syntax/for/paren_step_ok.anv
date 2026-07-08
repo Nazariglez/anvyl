@@ -4,5 +4,5 @@
 fn id(n: int) -> int { n }
 
 fn main() {
-    for x in 0..10 step (id(2)) {}
+    for x in iter(0..10).step_by((id(2))) {}
 }

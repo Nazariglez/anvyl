@@ -70,7 +70,7 @@ pub(crate) trait TypeFolder {
     }
 
     fn fold_return_spec(&mut self, ret: &ReturnSpec) -> ReturnSpec {
-        ret.with_ty(self.fold_type(&ret.ty))
+        ret.with_ty(self.fold_type(&ret.ty()))
     }
 
     fn fold_generic_arg(&mut self, arg: &GenericArg) -> GenericArg {
@@ -229,7 +229,7 @@ pub(crate) trait TypeVisitor {
     }
 
     fn visit_return_spec(&mut self, ret: &ReturnSpec) -> bool {
-        self.visit_type(&ret.ty)
+        self.visit_type(&ret.ty())
     }
 
     fn visit_generic_arg(&mut self, arg: &GenericArg) -> bool {

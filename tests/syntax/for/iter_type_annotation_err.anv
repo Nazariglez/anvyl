@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token 'iter'
+
+fn main() {
+    let it: iter = 1;
+}

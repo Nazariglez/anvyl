@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: iterator plans cannot be used as values
+
+fn nums() -> iter {
+    iter(0..3)
+}
+
+fn main() {
+    let pair = (nums(), 1);
+}

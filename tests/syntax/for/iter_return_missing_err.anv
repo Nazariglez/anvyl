@@ -1,0 +1,6 @@
+// @mode: check
+// @expect: error
+// @contains: missing return value
+
+fn nums() -> iter {
+}

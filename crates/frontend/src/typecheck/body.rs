@@ -2,8 +2,8 @@ use std::{collections::HashMap, rc::Rc};
 
 use super::{
     BodyInstanceKey, CallableInstanceKey, CastFromInstanceKey, CheckedType, LocalBindingKind,
-    LocalCallableInfo, LocalConstInfo, LocalDefKind, LocalSymbol, ReturnFrame, ReturnMode,
-    ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
+    LocalCallableInfo, LocalConstInfo, LocalDefKind, LocalSymbol, ReturnCandidate, ReturnFrame,
+    ReturnMode, ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
     check_expr_checked_with_hint, checked_void, const_eval, control_flow,
     decl_validate::{
         check_method_generic_shadows, has_generics, has_mutable_param, is_generic,
@@ -67,10 +67,10 @@ pub(super) struct CallableTemplate {
     mode: MethodMode,
     generics: GenericTypeContext,
     env: CallableTemplateEnv,
-    params: Vec<Param>,
+    pub(super) params: Vec<Param>,
     ret: ReturnSpec,
     ret_span: Span,
-    body: BlockNode,
+    pub(super) body: BlockNode,
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +134,7 @@ pub(super) fn collect_callable_templates(
         match &stmt.node {
             Stmt::Func(func_node) => {
                 let func = &func_node.node;
-                if !is_generic(func) {
+                if !is_generic(func) && !func.ret.is_iter() {
                     continue;
                 }
                 let generics =
@@ -457,7 +457,7 @@ fn callable_sig_has_raw_dyn_infer(params: &[Param], ret: &ReturnSpec) -> bool {
     params
         .iter()
         .any(|param| DynInference::has_raw_hole(&param.ty))
-        || DynInference::has_raw_hole(&ret.ty)
+        || DynInference::has_raw_hole(&ret.ty())
 }
 
 fn resolve_callable_sig_types(
@@ -470,7 +470,7 @@ fn resolve_callable_sig_types(
 ) -> (Vec<FuncParam>, ReturnSpec) {
     tc.push_generic_context(generics);
     let params = tc.resolve_callable_params(params, exported);
-    let ret = ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty, span));
+    let ret = ret.with_ty(tc.resolve_type_for_tc_at(&ret.ty(), span));
     tc.pop_generic_context();
     (params, ret)
 }
@@ -501,7 +501,7 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     let params = tc.resolve_callable_params(&func.params, exported);
     let ret = func
         .ret
-        .with_ty(tc.resolve_type_for_tc_at(&func.ret.ty, span));
+        .with_ty(tc.resolve_type_for_tc_at(&func.ret.ty(), span));
     tc.pop_generic_context();
 
     SourceFuncSig {
@@ -1152,11 +1152,101 @@ fn check_callable_body_with_return(
     if expected_ret.is_some_and(ReturnSpec::is_place) {
         return check_callable_body_place_return(body, expected_ret, source, callable_span, tc);
     }
+    if expected_ret.is_some_and(ReturnSpec::is_iter) {
+        return check_callable_body_iter_return(body, expected_ret, callable_span, tc);
+    }
 
-    let expected = expected_ret.map(|ret| TypeChecker::type_handle(&ret.ty));
+    if expected_ret.is_none()
+        && let Some(checked) = check_callable_body_inferred_iter_return(body, tc)
+    {
+        return checked;
+    }
+
+    let expected = expected_ret.map(|ret| TypeChecker::type_handle(&ret.ty()));
     let checked = body.check_with_hint(expected, tc);
     finish_callable_body_value_return(body, &checked, expected_ret, callable_span, tc);
     checked
+}
+
+fn check_callable_body_inferred_iter_return(
+    body: CallableBody<'_>,
+    tc: &mut TypeChecker,
+) -> Option<CheckedType> {
+    match body {
+        CallableBody::Block(block) => {
+            let tail = block.node.tail.as_deref()?;
+            if !super::iterator_plan::may_be_iter_plan(tail, tc) {
+                return None;
+            }
+            tc.push_scope();
+            let declarations = register_block_declarations(&block.node.stmts, tc);
+            for (stmt, local_const) in block.node.stmts.iter().zip(declarations) {
+                check_stmt(stmt, local_const, tc);
+            }
+            super::iterator_plan::validate_iter_helper_block(block, tc);
+            let checked = super::iterator_plan::check_inferred_iter_return_expr(tail, tc);
+            tc.pop_scope();
+            checked
+        }
+        CallableBody::Expr(expr) => {
+            if !super::iterator_plan::may_be_iter_plan(expr, tc) {
+                return None;
+            }
+            super::iterator_plan::check_inferred_iter_return_expr(expr, tc)
+        }
+    }
+}
+
+pub(super) fn check_callable_body_iter_return(
+    body: CallableBody<'_>,
+    expected_ret: Option<&ReturnSpec>,
+    callable_span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    match body {
+        CallableBody::Block(block) => {
+            tc.push_scope();
+            let declarations = register_block_declarations(&block.node.stmts, tc);
+            for (stmt, local_const) in block.node.stmts.iter().zip(declarations) {
+                check_stmt(stmt, local_const, tc);
+            }
+            super::iterator_plan::validate_iter_helper_block(block, tc);
+            let checked = match &block.node.tail {
+                Some(expr) => control_flow::check_return_expr(
+                    expr,
+                    expected_ret.expect("iter return expected"),
+                    None,
+                    tc,
+                ),
+                None => checked_void(),
+            };
+            if !matches!(checked.ty, Type::Infer | Type::Void) {
+                tc.record_current_iter_return_sig(checked.ty.clone());
+            }
+            finish_callable_body_value_return(
+                CallableBody::Block(block),
+                &checked,
+                expected_ret,
+                callable_span,
+                tc,
+            );
+            tc.pop_scope();
+            checked
+        }
+        CallableBody::Expr(expr) => {
+            let checked = control_flow::check_return_expr(
+                expr,
+                expected_ret.expect("iter return expected"),
+                None,
+                tc,
+            );
+            if !matches!(checked.ty, Type::Infer | Type::Void) {
+                tc.record_current_iter_return_sig(checked.ty.clone());
+            }
+            finish_callable_body_value_return(body, &checked, expected_ret, callable_span, tc);
+            checked
+        }
+    }
 }
 
 pub(super) fn check_callable_body_place_return(
@@ -1228,8 +1318,8 @@ fn finish_missing_place_return(
 ) {
     if checked.ty.is_void() && !diverges {
         match expected_ret {
-            Some(ret) if !ret.ty.is_void() => tc.push_error(TypeError::MissingReturn {
-                expected: ret.ty.clone(),
+            Some(ret) if !ret.ty().is_void() => tc.push_error(TypeError::MissingReturn {
+                expected: ret.ty().clone(),
                 span: tc.error_span(missing_span),
             }),
             None => tc.push_inferred_return(callable_span, TypeChecker::type_handle(&Type::Void)),
@@ -1247,9 +1337,9 @@ fn finish_callable_body_value_return(
 ) {
     if checked.ty.is_void() {
         match expected_ret {
-            Some(ret) if !ret.ty.is_void() && !body.diverges() => {
+            Some(ret) if !ret.ty().is_void() && !body.diverges() => {
                 tc.push_error(TypeError::MissingReturn {
-                    expected: ret.ty.clone(),
+                    expected: ret.ty().clone(),
                     span: tc.error_span(body.span().to_end()),
                 });
             }
@@ -1301,7 +1391,7 @@ pub(super) fn check_callable_body_frame(
     body: CallableBody<'_>,
     span: Span,
     tc: &mut TypeChecker,
-) -> Option<Type> {
+) -> Option<ReturnSpec> {
     for (index, param) in params.iter().enumerate() {
         let kind = LocalBindingKind::from_param(param.ty.mutable, &param.ty.ty);
         let Some(local) = tc.define_value(param.name, &param.ty.ty, kind, None) else {
@@ -1338,6 +1428,31 @@ pub(super) fn check_callable_body_frame(
     frame.and_then(|frame| infer_return_type(frame, tc))
 }
 
+pub(super) fn callable_template_returns_iter_plan_syntax(
+    callee: &CallableRef,
+    tc: &mut TypeChecker,
+) -> bool {
+    let Some((env, expr)) = tc.callable_template(&callee.def.id).and_then(|template| {
+        callable_template_terminal_expr(&template.body)
+            .map(|expr| (template.env.clone(), expr.clone()))
+    }) else {
+        return false;
+    };
+    with_callable_body_env(&callee.def.id.module, &env, tc, |tc| {
+        super::iterator_plan::may_be_iter_plan(&expr, tc)
+    })
+}
+
+fn callable_template_terminal_expr(body: &BlockNode) -> Option<&ExprNode> {
+    body.node.tail.as_deref().or_else(|| {
+        body.node.stmts.last().and_then(|stmt| match &stmt.node {
+            Stmt::Expr(expr) => Some(expr),
+            Stmt::Return(ret) => ret.node.value.as_ref(),
+            _ => None,
+        })
+    })
+}
+
 fn check_func_body(
     self_binding: Option<(MethodReceiver, Type)>,
     params: &[Param],
@@ -1347,7 +1462,7 @@ fn check_func_body(
     span: Span,
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
-) -> Option<Type> {
+) -> Option<ReturnSpec> {
     with_callable_body_scope(
         tc,
         TypeChecker::enter_named_function,
@@ -1392,7 +1507,7 @@ fn check_func_body(
             check_callable_body_frame(
                 &bindings,
                 (!ret.is_infer()).then_some(ret),
-                ret.access,
+                ret.access(),
                 source,
                 param_start,
                 CallableBody::Block(body),
@@ -1404,25 +1519,64 @@ fn check_func_body(
     )
 }
 
-fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<Type> {
-    let ReturnMode::Infer { candidates, .. } = frame.mode else {
+fn infer_return_type(frame: ReturnFrame, tc: &mut TypeChecker) -> Option<ReturnSpec> {
+    let ReturnMode::Infer {
+        access, candidates, ..
+    } = frame.mode
+    else {
         return None;
     };
     let mut candidates = candidates.into_iter();
-    let (_, first) = candidates.next()?;
+    let first = candidates.next()?;
     tc.solve_constraints();
-    let inferred = tc.handle_type(&first);
-    for (span, candidate) in candidates {
-        let found = tc.handle_type(&candidate);
-        if inferred != found && !matches!(inferred, Type::Infer) && !matches!(found, Type::Infer) {
-            tc.push_error(TypeError::InferReturnMismatch {
-                expected: inferred.clone(),
-                found,
-                span: tc.error_span(span),
-            });
+    match first {
+        ReturnCandidate::Iter { span } => {
+            for candidate in candidates {
+                if let ReturnCandidate::Value { handle, .. } = candidate {
+                    tc.push_error(TypeError::InferReturnMismatch {
+                        expected: Type::Infer,
+                        found: tc.handle_type(&handle),
+                        span: tc.error_span(span),
+                    });
+                }
+            }
+            Some(ReturnSpec::iter())
+        }
+        ReturnCandidate::Value {
+            span: first_span,
+            handle,
+        } => {
+            let inferred = tc.handle_type(&handle);
+            for candidate in candidates {
+                match candidate {
+                    ReturnCandidate::Value { span, handle } => {
+                        let found = tc.handle_type(&handle);
+                        if inferred != found
+                            && !matches!(inferred, Type::Infer)
+                            && !matches!(found, Type::Infer)
+                        {
+                            tc.push_error(TypeError::InferReturnMismatch {
+                                expected: inferred.clone(),
+                                found,
+                                span: tc.error_span(span),
+                            });
+                        }
+                    }
+                    ReturnCandidate::Iter { .. } => {
+                        tc.push_error(TypeError::InferReturnMismatch {
+                            expected: inferred.clone(),
+                            found: Type::Infer,
+                            span: tc.error_span(first_span),
+                        });
+                    }
+                }
+            }
+            Some(match access {
+                ReturnAccess::Value => ReturnSpec::value(inferred),
+                ReturnAccess::Place => ReturnSpec::place(inferred),
+            })
         }
     }
-    Some(inferred)
 }
 
 pub(super) fn with_callable_body_env<R>(
@@ -1453,7 +1607,7 @@ pub(super) fn check_specialized_callable_body(
     const_subst: ConstSubst,
     const_bindings: &[(Ident, ConstValue)],
     tc: &mut TypeChecker,
-) -> Option<Type> {
+) -> Option<ReturnSpec> {
     if args.is_empty()
         || matches!(
             callee.def.id.kind,
@@ -1471,7 +1625,7 @@ pub(super) fn check_specialized_callable_body(
             tc.push_error(TypeError::InferReturnRecursive {
                 span: tc.error_span(template.ret_span),
             });
-            return Some(Type::Infer);
+            return Some(ReturnSpec::value(Type::Infer));
         }
         Some(SpecializationState::InProgress) => return None,
         Some(SpecializationState::Done(body)) => {
@@ -1501,7 +1655,7 @@ pub(super) fn check_specialized_callable_body(
         const_subst,
         owner_frame,
         param_types.to_vec(),
-        ret.ty.clone(),
+        ret.ty().clone(),
         tc,
         |tc| {
             with_callable_body_env(&callee.def.id.module, &template.env, tc, |tc| {

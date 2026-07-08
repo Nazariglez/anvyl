@@ -38,7 +38,20 @@ pub(crate) type StringifyMap = HashMap<ExprId, StringifyFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type CaptureCellRequirementMap = HashMap<BindingId, CaptureCellRequirementFact>;
-pub(crate) type ForStepRuntimeCheckMap = HashMap<ExprId, SourceSpan>;
+pub(crate) type IterRuntimeCheckMap = HashMap<ExprId, IterRuntimeCheckFact>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IterRuntimeCheckKind {
+    SkipNonNegative,
+    TakeNonNegative,
+    StepByPositive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IterRuntimeCheckFact {
+    pub(crate) expr: ExprId,
+    pub(crate) kind: IterRuntimeCheckKind,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LocalFacts {
@@ -184,11 +197,13 @@ impl SemanticDeclarations {
                 debug_assert!(param.span.start() <= param.span.end());
                 debug_assert!(!type_has_unfinished_facts(&param.ty));
             }
-            debug_assert!(!type_has_unfinished_facts(&fact.ret.ty));
+            if !fact.ret.is_iter() {
+                debug_assert!(!type_has_unfinished_facts(&fact.ret.ty()));
+            }
             if fact.is_stringify_override {
                 debug_assert_eq!(fact.name, Ident::new("to_string"));
                 debug_assert_eq!(fact.params.len(), 1);
-                debug_assert_eq!(fact.ret.ty, Type::String);
+                debug_assert_eq!(fact.ret.ty(), Type::String);
                 debug_assert!(fact.id.kind.has_receiver_param());
             }
         }
@@ -214,7 +229,7 @@ impl SemanticDeclarations {
         for function in &self.functions {
             let Some(body) = facts.body(&function.body) else {
                 debug_assert!(
-                    function.params.is_empty() && function.ret.ty == Type::Void,
+                    function.params.is_empty() && function.ret.ty() == Type::Void,
                     "semantic function fact missing body facts"
                 );
                 continue;
@@ -356,7 +371,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) global_accesses: GlobalAccessMap,
     pub(crate) stringifies: StringifyMap,
-    pub(crate) for_step_runtime_checks: ForStepRuntimeCheckMap,
+    pub(crate) iter_runtime_checks: IterRuntimeCheckMap,
     pub(crate) locals: LocalFacts,
 }
 
@@ -378,8 +393,7 @@ impl SemanticBodyFacts {
         self.dyn_downcasts.extend(facts.dyn_downcasts);
         self.global_accesses.extend(facts.global_accesses);
         self.stringifies.extend(facts.stringifies);
-        self.for_step_runtime_checks
-            .extend(facts.for_step_runtime_checks);
+        self.iter_runtime_checks.extend(facts.iter_runtime_checks);
     }
 
     pub(crate) fn validate(&self) {
@@ -387,6 +401,9 @@ impl SemanticBodyFacts {
             debug_assert!(fact.span.is_some());
         }
         self.validate_const_values(false);
+        for (expr_id, fact) in &self.iter_runtime_checks {
+            debug_assert_eq!(*expr_id, fact.expr);
+        }
         for (expr_id, fact) in &self.function_values {
             debug_assert_eq!(*expr_id, fact.expr);
         }
@@ -488,7 +505,7 @@ impl SemanticBodyFacts {
                 continue;
             };
             debug_assert!(!type_has_unfinished_facts(&fact.sig));
-            debug_assert!(!type_has_unfinished_facts(&ret.ty));
+            debug_assert!(!type_has_unfinished_facts(&ret.ty()));
             debug_assert_eq!(params.len(), fact.args.len());
             for (arg, param) in fact.args.iter().zip(params) {
                 debug_assert_eq!(arg.param_ty, param.ty);
@@ -670,6 +687,16 @@ impl SemanticFactMaps {
         self.body_mut(site.body).calls.insert(site.expr, target);
     }
 
+    pub(crate) fn record_iter_runtime_check(
+        &mut self,
+        site: SemanticExprSite,
+        fact: IterRuntimeCheckFact,
+    ) {
+        self.body_mut(site.body)
+            .iter_runtime_checks
+            .insert(site.expr, fact);
+    }
+
     pub(crate) fn record_function_value(
         &mut self,
         site: SemanticExprSite,
@@ -811,16 +838,6 @@ impl SemanticFactMaps {
                 .expect("stringify fact missing during finish");
             fact.source_ty = source_ty;
         }
-    }
-
-    pub(crate) fn record_for_step_runtime_check(
-        &mut self,
-        site: SemanticExprSite,
-        span: SourceSpan,
-    ) {
-        self.body_mut(site.body)
-            .for_step_runtime_checks
-            .insert(site.expr, span);
     }
 
     pub(crate) fn validate_finished(&self) {

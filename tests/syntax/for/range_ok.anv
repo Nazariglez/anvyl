@@ -19,37 +19,4 @@ fn main() {
     for n in start..=end {
         let w: int = n;
     }
-
-    for n in rev 0..10 {
-        let a: int = n;
-    }
-
-    for n in rev 0..=10 {
-        let b: int = n;
-    }
-
-    for n in rev start..end {
-        let c: int = n;
-    }
-
-    for n in 0..10 step 2 {
-        let d: int = n;
-    }
-
-    for n in 0..=10 step 3 {
-        let e: int = n;
-    }
-
-    let step_val = 5;
-    for n in 0..100 step step_val {
-        let f: int = n;
-    }
-
-    for n in rev 0..10 step 2 {
-        let g: int = n;
-    }
-
-    for n in rev 0..=10 step 1 {
-        let h: int = n;
-    }
 }

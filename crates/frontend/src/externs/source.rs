@@ -300,7 +300,7 @@ fn signature(
     }
     Ok(ExternSignature {
         params: param_list(source, params, span)?,
-        ret: type_expr(source, &ret.ty, span, SourceTypePosition::Return)?,
+        ret: type_expr(source, &ret.ty(), span, SourceTypePosition::Return)?,
     })
 }
 
@@ -507,7 +507,7 @@ fn type_expr(
                     .collect::<SourceResult<Vec<_>>>()?,
                 ret: Box::new(type_expr(
                     source,
-                    &ret.ty,
+                    &ret.ty(),
                     span,
                     SourceTypePosition::CallbackReturn,
                 )?),

@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: success
+
+fn dynamic() -> int {
+    1
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4];
+    for x in iter(xs).rev().skip(1).take(dynamic()).step_by(2) {
+        let y = x;
+    }
+}

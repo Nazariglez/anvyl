@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let xs = [1, 2, 3];
+    for x in iter(xs) {
+        let y = x;
+    }
+}

@@ -1052,7 +1052,7 @@ fn concrete_surface_type(ty: &Type) -> bool {
         | Type::UnresolvedNominal { .. } => false,
         Type::Func { params, ret } => {
             params.iter().all(|param| concrete_surface_type(&param.ty))
-                && concrete_surface_type(&ret.ty)
+                && concrete_surface_type(&ret.ty())
         }
         Type::Dyn(_)
         | Type::Any

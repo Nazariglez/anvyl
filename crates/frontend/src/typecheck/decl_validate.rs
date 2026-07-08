@@ -354,11 +354,16 @@ fn validate_cast_froms(
             }));
         }
         if let Some(ret) = &cast.ret
-            && !same_extend_target(&ret.ty, &extend.generics, &extend.target, &extend.generics)
+            && !same_extend_target(
+                &ret.ty(),
+                &extend.generics,
+                &extend.target,
+                &extend.generics,
+            )
         {
             errors.push(TypeError::Decl(DeclError::CastFromReturnMismatch {
                 expected: extend.target.clone(),
-                found: ret.ty.clone(),
+                found: ret.ty().clone(),
                 span: Some(cast.span),
             }));
         }
