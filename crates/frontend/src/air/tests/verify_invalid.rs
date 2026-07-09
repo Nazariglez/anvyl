@@ -7,8 +7,10 @@ use verify::{
 use super::{super::verify::verify_structured_body, *};
 use crate::{
     air::{
-        ExternBindingDecl, ExternStaticDecl, ExternTypeId, FunctionSpecialization,
-        FunctionValueCapability, GlobalInitEffect,
+        AirPatternAlternative, AirPatternArm, AirPatternBinding, AirPatternBindingMode,
+        AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest, ExternBindingDecl,
+        ExternStaticDecl, ExternTypeId, FunctionSpecialization, FunctionValueCapability,
+        GlobalInitEffect,
     },
     ast::Ident,
 };
@@ -286,79 +288,6 @@ fn structured_return_and_match_errors() {
 }
 
 #[test]
-fn structured_match_rejects_wrong_discriminant_and_variant() {
-    let mut builder = ProgramBuilder::default();
-    let int_ty = builder.int_ty();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-    let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("Choice"),
-        module,
-        core: None,
-        repr: crate::air::EnumRepr::Adt,
-        raw_type: None,
-        type_args: vec![],
-        const_args: vec![],
-        variants: vec![VariantDecl {
-            name: Ident::new("A"),
-            shape: VariantShape::Unit,
-            raw_value: None,
-        }],
-    });
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-    let mut fb = FunctionBuilder::new("bad_match", module, FunctionKind::Normal, void_ty);
-    let discr = fb.push_param("value", int_ty, ParamRole::Normal);
-    let enum_discr = fb.push_param("enum_value", enum_ty, ParamRole::Normal);
-    fb.push_block(term_return_void());
-    let func_id = builder.alloc_function(fb.finish());
-    let arm = AirEnumMatchArm {
-        variant: VariantId::from_index(99),
-        block: AirBlock {
-            stmts: vec![],
-            tail: AirTail::Return(None),
-        },
-    };
-    let bad_discr = AirBody {
-        block: AirBlock {
-            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
-                discr: place(discr, int_ty),
-                arms: vec![],
-                else_block: Some(AirBlock {
-                    stmts: vec![],
-                    tail: AirTail::Return(None),
-                }),
-            })],
-            tail: AirTail::Unreachable,
-        },
-    };
-    let bad_variant = AirBody {
-        block: AirBlock {
-            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
-                discr: place(enum_discr, enum_ty),
-                arms: vec![arm],
-                else_block: Some(AirBlock {
-                    stmts: vec![],
-                    tail: AirTail::Return(None),
-                }),
-            })],
-            tail: AirTail::Unreachable,
-        },
-    };
-    let program = builder.finish();
-    let errors = verify_structured_body(&program, func_id, &bad_discr).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(found)) if found == int_ty
-    )));
-    let errors = verify_structured_body(&program, func_id, &bad_variant).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadFunction(BadFunction::SwitchArmVariantMismatch { expected_enum, variant })
-            if expected_enum == enum_id && variant == VariantId::from_index(99)
-    )));
-}
-
-#[test]
 fn structured_slice_bounds_must_be_initialized() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -393,41 +322,6 @@ fn structured_slice_bounds_must_be_initialized() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadStatement(BadStatement::ReadUninitializedLocal(found)) if found == end
-    )));
-}
-
-#[test]
-fn switch_invalid_enum_type_does_not_panic() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.alloc_type(TypeData::Void);
-    let enum_id = EnumId::from_index(99);
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("bad_switch_enum", module, FunctionKind::Normal, void_ty);
-    let value = fb.push_param("value", enum_ty, ParamRole::Normal);
-    let block = fb.push_block(term_return_void());
-    fb.add_statement(
-        block,
-        AirStmt::EnumMatch(AirEnumMatch {
-            discr: place(value, enum_ty),
-            arms: vec![AirEnumMatchArm {
-                variant: VariantId::from_index(0),
-                block: AirBlock {
-                    stmts: vec![],
-                    tail: AirTail::Return(None),
-                },
-            }],
-            else_block: None,
-        }),
-    );
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-
-    let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadReference(BadReference::InvalidEnum(id)) if id == enum_id
     )));
 }
 
@@ -6717,5 +6611,704 @@ fn escaping_lambda_cannot_capture_collection_slot() {
     assert!(errors.iter().any(|e| matches!(
         e.kind,
         EK::BadFunction(BadFunction::CollectionLoanSlotEscapesBody(local)) if local == slot
+    )));
+}
+
+#[test]
+fn pattern_match_literal_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let konst = builder.alloc_const(ConstData {
+        ty: bool_ty,
+        value: ConstValue::Bool(true),
+    });
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![AirPatternTest::Literal {
+                            path: AirPatternPath::default(),
+                            value: konst,
+                        }],
+                        bindings: vec![],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadConst(BadConst::TypeMismatch { expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn pattern_match_binding_type_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        bool_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath::default(),
+                            ty: bool_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::InitTypeMismatch { expected, found })
+            if expected == int_ty && found == bool_ty
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_invalid_binding_path() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath {
+                                steps: vec![AirPatternPathStep::TupleField(0)],
+                            },
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::None,
+                    },
+                }],
+            })],
+            tail: AirTail::Return(Some(op_place(binding, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadFunction(BadFunction::PatternPathInvalid)))
+    );
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == binding
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_unguarded_enum_payload_path() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("E"),
+        module,
+        core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
+        type_args: vec![],
+        const_args: vec![],
+        variants: vec![VariantDecl {
+            name: Ident::new("V"),
+            shape: VariantShape::Tuple(vec![int_ty]),
+            raw_value: None,
+        }],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", enum_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, enum_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath {
+                                steps: vec![AirPatternPathStep::EnumTupleField {
+                                    enum_id,
+                                    variant: VariantId::from_index(0),
+                                    field: 0,
+                                }],
+                            },
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PatternPayloadWithoutVariantTest)
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_enum_tuple_path_for_struct_variant() {
+    assert_pattern_payload_shape_mismatch(
+        |int_ty| VariantShape::Struct(vec![field("value", int_ty)]),
+        |enum_id, variant| AirPatternPathStep::EnumTupleField {
+            enum_id,
+            variant,
+            field: 0,
+        },
+    );
+}
+
+#[test]
+fn pattern_match_rejects_enum_struct_path_for_tuple_variant() {
+    assert_pattern_payload_shape_mismatch(
+        |int_ty| VariantShape::Tuple(vec![int_ty]),
+        |enum_id, variant| AirPatternPathStep::EnumStructField {
+            enum_id,
+            variant,
+            field: 0,
+        },
+    );
+}
+
+fn assert_pattern_payload_shape_mismatch(
+    shape: impl FnOnce(TypeId) -> VariantShape,
+    step: impl FnOnce(EnumId, VariantId) -> AirPatternPathStep,
+) {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("Slot"),
+        module,
+        core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
+        type_args: vec![],
+        const_args: vec![],
+        variants: vec![VariantDecl {
+            name: Ident::new("Item"),
+            shape: shape(int_ty),
+            raw_value: None,
+        }],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let variant = VariantId::from_index(0);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", enum_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, enum_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![AirPatternTest::EnumVariant {
+                            path: AirPatternPath::default(),
+                            enum_id,
+                            variant,
+                        }],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath {
+                                steps: vec![step(enum_id, variant)],
+                            },
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadFunction(BadFunction::PatternPathInvalid)))
+    );
+}
+
+#[test]
+fn pattern_match_rejects_alternative_binding_mismatch() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![
+                        AirPatternAlternative {
+                            tests: vec![],
+                            bindings: vec![AirPatternBinding {
+                                local: binding,
+                                path: AirPatternPath::default(),
+                                ty: int_ty,
+                                mode: AirPatternBindingMode::Owned,
+                            }],
+                        },
+                        AirPatternAlternative {
+                            tests: vec![],
+                            bindings: vec![],
+                        },
+                    ],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PatternAlternativeBindingMismatch(local)) if local == binding
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_second_alternative_bad_binding_path() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![
+                        AirPatternAlternative {
+                            tests: vec![],
+                            bindings: vec![AirPatternBinding {
+                                local: binding,
+                                path: AirPatternPath::default(),
+                                ty: int_ty,
+                                mode: AirPatternBindingMode::Owned,
+                            }],
+                        },
+                        AirPatternAlternative {
+                            tests: vec![],
+                            bindings: vec![AirPatternBinding {
+                                local: binding,
+                                path: AirPatternPath {
+                                    steps: vec![AirPatternPathStep::TupleField(0)],
+                                },
+                                ty: int_ty,
+                                mode: AirPatternBindingMode::Owned,
+                            }],
+                        },
+                    ],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, EK::BadFunction(BadFunction::PatternPathInvalid)))
+    );
+}
+
+#[test]
+fn pattern_match_rejects_unguarded_optional_payload_path() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", opt_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, opt_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath {
+                                steps: vec![AirPatternPathStep::OptionalSome],
+                            },
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PatternPayloadWithoutVariantTest)
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_unguarded_optional_payload_test_path() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", opt_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, opt_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![AirPatternTest::Literal {
+                            path: AirPatternPath {
+                                steps: vec![AirPatternPathStep::OptionalSome],
+                            },
+                            value,
+                        }],
+                        bindings: vec![],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PatternPayloadWithoutVariantTest)
+    )));
+}
+
+#[test]
+fn pattern_match_rejects_optional_payload_test_before_guard() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let opt_ty = builder.alloc_type(TypeData::Optional(int_ty));
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let value = builder.alloc_const(ConstData {
+        ty: int_ty,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", opt_ty, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, opt_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![
+                            AirPatternTest::Literal {
+                                path: AirPatternPath {
+                                    steps: vec![AirPatternPathStep::OptionalSome],
+                                },
+                                value,
+                            },
+                            AirPatternTest::OptionalSome {
+                                path: AirPatternPath::default(),
+                            },
+                        ],
+                        bindings: vec![],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::Return(None),
+                    },
+                }],
+            })],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadFunction(BadFunction::PatternPayloadWithoutVariantTest)
+    )));
+}
+
+#[test]
+fn pattern_match_owned_binding_does_not_escape_arm() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", int_ty, ParamRole::Normal);
+    let binding = fb.push_local(
+        None,
+        int_ty,
+        Mutability::Immutable,
+        LocalKind::PatternBinding,
+    );
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, int_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath::default(),
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Owned,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::None,
+                    },
+                }],
+            })],
+            tail: AirTail::Return(Some(op_place(binding, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == binding
+    )));
+}
+
+#[test]
+fn pattern_match_alias_binding_does_not_escape_arm() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let enum_id = builder.alloc_enum(EnumDecl {
+        name: Ident::new("Slot"),
+        module,
+        core: None,
+        repr: crate::air::EnumRepr::Adt,
+        raw_type: None,
+        type_args: vec![],
+        const_args: vec![],
+        variants: vec![VariantDecl {
+            name: Ident::new("Value"),
+            shape: VariantShape::Tuple(vec![int_ty]),
+            raw_value: None,
+        }],
+    });
+    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
+    let mut fb = FunctionBuilder::new("bad_pattern", module, FunctionKind::Normal, void_ty);
+    let subject = fb.push_param("x", enum_ty, ParamRole::Normal);
+    let binding = fb.push_local(None, int_ty, Mutability::Mutable, LocalKind::PatternBinding);
+    fb.push_block(term_return_void());
+    let func_id = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, enum_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![AirPatternTest::EnumVariant {
+                            path: AirPatternPath::default(),
+                            enum_id,
+                            variant: VariantId::from_index(0),
+                        }],
+                        bindings: vec![AirPatternBinding {
+                            local: binding,
+                            path: AirPatternPath {
+                                steps: vec![AirPatternPathStep::EnumTupleField {
+                                    enum_id,
+                                    variant: VariantId::from_index(0),
+                                    field: 0,
+                                }],
+                            },
+                            ty: int_ty,
+                            mode: AirPatternBindingMode::Alias,
+                        }],
+                    }],
+                    block: AirBlock {
+                        stmts: vec![],
+                        tail: AirTail::None,
+                    },
+                }],
+            })],
+            tail: AirTail::Return(Some(op_place(binding, int_ty))),
+        },
+    };
+    let program = builder.finish();
+
+    let errors = verify_structured_body(&program, func_id, &body).unwrap_err();
+    assert!(errors.iter().any(|e| matches!(
+        e.kind,
+        EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == binding
     )));
 }

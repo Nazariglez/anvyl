@@ -9,13 +9,22 @@ use super::{
     downcast::{self, DowncastSite, DowncastSourcePolicy},
     enum_variant, field_check,
     generic::GenericArgs,
+    infer::SemanticLocalId,
     join_checked,
     literal::type_from_lit,
     place,
     place::{MutableUseKind, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee},
-    semantic_use::ExternUseTarget,
+    semantic_use::{
+        CheckedBindingOccurrence, CheckedEnumPayload, CheckedLiteralPattern, CheckedPattern,
+        CheckedPatternAlias, CheckedPatternAlternative, CheckedPatternBinding,
+        CheckedPatternBindingKind, CheckedPatternBindings, CheckedPatternOwner, CheckedPatternPath,
+        CheckedPatternPathSegment, CheckedStructField, ExternUseTarget,
+    },
 };
-use crate::{ast::*, span::Span};
+use crate::{
+    ast::*,
+    span::{SourceSpan, Span},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PatternCover {
@@ -96,6 +105,7 @@ struct PatternInput {
     facts: PlaceUseFacts,
     accepts_extern_any: bool,
     map_entry_alias: bool,
+    path: CheckedPatternPath,
 }
 
 impl PatternInput {
@@ -108,6 +118,7 @@ impl PatternInput {
             facts: PlaceUseFacts::default(),
             accepts_extern_any: false,
             map_entry_alias: false,
+            path: CheckedPatternPath::default(),
         }
     }
 
@@ -120,6 +131,7 @@ impl PatternInput {
             facts: PlaceUseFacts::default(),
             accepts_extern_any: false,
             map_entry_alias: false,
+            path: CheckedPatternPath::default(),
         }
     }
 
@@ -132,6 +144,7 @@ impl PatternInput {
             facts: place.facts,
             accepts_extern_any: place.accepts_extern_any,
             map_entry_alias: place.map_entry_alias,
+            path: CheckedPatternPath::default(),
         }
     }
 
@@ -141,6 +154,7 @@ impl PatternInput {
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
+            CheckedPatternPathSegment::TupleField(index),
             |identity| identity.tuple(index),
         )
     }
@@ -151,28 +165,53 @@ impl PatternInput {
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
+            CheckedPatternPathSegment::OptionalSome,
             |identity| identity.variant(Ident::new("Some")).tuple(0),
         );
         input.map_entry_alias = false;
         input
     }
 
-    fn enum_tuple_field(&self, variant: Ident, index: usize, expected_ty: Type) -> Self {
+    fn enum_tuple_field(
+        &self,
+        owner: NominalKey,
+        variant: Ident,
+        index: usize,
+        expected_ty: Type,
+    ) -> Self {
         self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
+            CheckedPatternPathSegment::EnumTupleField {
+                owner,
+                variant,
+                field: index,
+            },
             |identity| identity.variant(variant).tuple(index),
         )
     }
 
-    fn enum_struct_field(&self, variant: Ident, field: Ident, expected_ty: Type) -> Self {
+    fn enum_struct_field(
+        &self,
+        owner: NominalKey,
+        variant: Ident,
+        field: Ident,
+        slot: usize,
+        expected_ty: Type,
+    ) -> Self {
         self.project(
             expected_ty,
             place::projected_field_access(self.access),
             self.facts.clone(),
             self.accepts_extern_any,
+            CheckedPatternPathSegment::EnumStructField {
+                owner,
+                variant,
+                field,
+                slot,
+            },
             |identity| identity.variant(variant).field(field),
         )
     }
@@ -183,12 +222,19 @@ impl PatternInput {
         expected_ty: Type,
         access: PlaceAccess,
         extern_facts: Option<(PlaceUseFacts, bool)>,
+        owner: NominalKey,
+        slot: usize,
     ) -> Self {
         let (facts, accepts_extern_any) =
             extern_facts.unwrap_or_else(|| (self.facts.clone(), self.accepts_extern_any));
-        self.project(expected_ty, access, facts, accepts_extern_any, |identity| {
-            identity.field(field)
-        })
+        self.project(
+            expected_ty,
+            access,
+            facts,
+            accepts_extern_any,
+            CheckedPatternPathSegment::StructField { owner, field, slot },
+            |identity| identity.field(field),
+        )
     }
 
     fn project(
@@ -197,8 +243,11 @@ impl PatternInput {
         access: PlaceAccess,
         facts: PlaceUseFacts,
         accepts_extern_any: bool,
+        segment: CheckedPatternPathSegment,
         project_identity: impl FnOnce(PlaceIdentity) -> PlaceIdentity,
     ) -> Self {
+        let mut path = self.path.clone();
+        path.segments.push(segment);
         Self {
             expected: TypeChecker::type_handle(&expected_ty),
             expected_ty,
@@ -207,6 +256,7 @@ impl PatternInput {
             facts,
             accepts_extern_any,
             map_entry_alias: false,
+            path,
         }
     }
 }
@@ -266,9 +316,11 @@ fn same_binding_names(left: &BindingEnv, right: &BindingEnv) -> bool {
         && left.iter().all(|(name, _)| right.binding(name).is_some())
 }
 
-struct PatternCheckResult {
-    outcome: PatternOutcome,
+pub(super) struct PatternCheckResult {
+    pub(super) outcome: PatternOutcome,
     bindings: BindingAlternatives,
+    checked_bindings: CheckedPatternBindings,
+    pub(super) checked: CheckedPattern,
 }
 
 #[derive(Clone)]
@@ -285,6 +337,7 @@ struct BindingEnv {
 struct PatternBinding {
     ty: TypeHandle,
     span: Span,
+    path: CheckedPatternPath,
     kind: PatternBindingKind,
 }
 
@@ -295,15 +348,192 @@ enum PatternBindingKind {
 }
 
 impl PatternCheckResult {
-    fn empty(outcome: PatternOutcome) -> Self {
+    pub(super) fn empty(outcome: PatternOutcome) -> Self {
+        Self::empty_checked(outcome, CheckedPattern::Unsupported)
+    }
+
+    fn with_bindings(outcome: PatternOutcome, bindings: BindingAlternatives) -> Self {
+        Self {
+            outcome,
+            bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Unsupported,
+        }
+    }
+
+    fn empty_checked(outcome: PatternOutcome, checked: CheckedPattern) -> Self {
         Self {
             outcome,
             bindings: BindingAlternatives::single_empty(),
+            checked_bindings: CheckedPatternBindings::default(),
+            checked,
+        }
+    }
+
+    pub(super) fn bindings(&self) -> &CheckedPatternBindings {
+        &self.checked_bindings
+    }
+
+    fn canonicalize_bindings(&mut self, tc: &TypeChecker, require_facts: bool) {
+        self.checked_bindings = self.bindings.checked_bindings(tc, require_facts);
+        canonicalize_pattern_bindings(&mut self.checked, &self.checked_bindings);
+    }
+}
+
+fn checked_literal(lit: &Lit) -> CheckedPattern {
+    let Some(value) = const_value(lit) else {
+        return CheckedPattern::Unsupported;
+    };
+    CheckedPattern::Literal(CheckedLiteralPattern {
+        value,
+        ty: type_from_lit(lit),
+    })
+}
+
+fn const_value(lit: &Lit) -> Option<ConstValue> {
+    match lit {
+        Lit::Int(value) => Some(ConstValue::Int(*value)),
+        Lit::Float(value) => Some(ConstValue::Float(*value)),
+        Lit::Bool(value) => Some(ConstValue::Bool(*value)),
+        Lit::String(value) => Some(ConstValue::String(value.clone())),
+        Lit::Nil => None,
+    }
+}
+
+fn checked_binding(
+    name: Ident,
+    binding: &PatternBinding,
+    tc: &TypeChecker,
+    require_fact: bool,
+) -> CheckedPatternBinding {
+    let span = tc.source_span(binding.span);
+    let Some((local, binding_id, ty, mutable)) = binding_fact(span, tc) else {
+        assert!(!require_fact, "pattern binding missing semantic fact");
+        return preliminary_checked_binding(name, binding, tc);
+    };
+    CheckedPatternBinding {
+        name,
+        span,
+        local,
+        binding_id,
+        ty,
+        mutable,
+        kind: checked_binding_kind(binding),
+    }
+}
+
+fn preliminary_checked_binding(
+    name: Ident,
+    binding: &PatternBinding,
+    tc: &TypeChecker,
+) -> CheckedPatternBinding {
+    CheckedPatternBinding {
+        name,
+        span: tc.source_span(binding.span),
+        local: SemanticLocalId::default(),
+        binding_id: None,
+        ty: tc.handle_type(&binding.ty),
+        mutable: matches!(binding.kind, PatternBindingKind::Owned { mutable: true }),
+        kind: checked_binding_kind(binding),
+    }
+}
+
+fn checked_binding_kind(binding: &PatternBinding) -> CheckedPatternBindingKind {
+    match &binding.kind {
+        PatternBindingKind::Owned { .. } => CheckedPatternBindingKind::Owned,
+        PatternBindingKind::Alias(_) => CheckedPatternBindingKind::Alias(CheckedPatternAlias {
+            target: binding.path.clone(),
+        }),
+    }
+}
+
+fn binding_fact(
+    span: SourceSpan,
+    tc: &TypeChecker,
+) -> Option<(SemanticLocalId, Option<super::BindingId>, Type, bool)> {
+    let facts = tc.semantic_facts.body(&tc.current_body())?;
+    let local = *facts.locals.binding_defs.get(&span)?;
+    let fact = facts.locals.defs.get(&local)?;
+    Some((local, fact.binding_id, fact.ty.clone(), fact.mutable))
+}
+
+fn canonicalize_pattern_bindings(pattern: &mut CheckedPattern, bindings: &CheckedPatternBindings) {
+    match pattern {
+        CheckedPattern::Binding(binding) => {
+            if let Some(canonical) = bindings
+                .bindings
+                .iter()
+                .find(|item| item.name == binding.name)
+            {
+                binding.local = canonical.local;
+                binding.binding_id = canonical.binding_id;
+                binding.ty = canonical.ty.clone();
+                binding.mutable = canonical.mutable;
+            }
+        }
+        CheckedPattern::OptionalSome(inner) => canonicalize_pattern_bindings(inner, bindings),
+        CheckedPattern::Tuple(fields) => {
+            for field in fields {
+                canonicalize_pattern_bindings(field, bindings);
+            }
+        }
+        CheckedPattern::Struct { fields, .. } => {
+            for field in fields {
+                canonicalize_pattern_bindings(&mut field.pattern, bindings);
+            }
+        }
+        CheckedPattern::Enum { payload, .. } => canonicalize_payload_bindings(payload, bindings),
+        CheckedPattern::Or(alternatives) => {
+            for alternative in alternatives {
+                canonicalize_pattern_bindings(&mut alternative.pattern, bindings);
+                canonicalize_bindings(&mut alternative.bindings, bindings);
+            }
+        }
+        CheckedPattern::Wildcard
+        | CheckedPattern::Literal(_)
+        | CheckedPattern::Nil
+        | CheckedPattern::Unsupported => {}
+    }
+}
+
+fn canonicalize_payload_bindings(
+    payload: &mut CheckedEnumPayload,
+    bindings: &CheckedPatternBindings,
+) {
+    match payload {
+        CheckedEnumPayload::Unit => {}
+        CheckedEnumPayload::Tuple(fields) => {
+            for field in fields {
+                canonicalize_pattern_bindings(field, bindings);
+            }
+        }
+        CheckedEnumPayload::Struct(fields) => {
+            for field in fields {
+                canonicalize_pattern_bindings(&mut field.pattern, bindings);
+            }
+        }
+    }
+}
+
+fn canonicalize_bindings(bindings: &mut CheckedPatternBindings, root: &CheckedPatternBindings) {
+    for binding in &mut bindings.bindings {
+        if let Some(canonical) = root.bindings.iter().find(|item| item.name == binding.name) {
+            binding.local = canonical.local;
+            binding.binding_id = canonical.binding_id;
+            binding.ty = canonical.ty.clone();
+            binding.mutable = canonical.mutable;
         }
     }
 }
 
 impl BindingAlternatives {
+    fn checked_bindings(&self, tc: &TypeChecker, require_facts: bool) -> CheckedPatternBindings {
+        self.envs
+            .first()
+            .map(|env| env.checked_bindings(tc, require_facts))
+            .unwrap_or_default()
+    }
+
     fn single_empty() -> Self {
         Self {
             envs: vec![BindingEnv::default()],
@@ -409,6 +639,24 @@ impl BindingEnv {
         }
         self
     }
+
+    fn checked_bindings(&self, tc: &TypeChecker, require_facts: bool) -> CheckedPatternBindings {
+        CheckedPatternBindings {
+            bindings: self
+                .iter()
+                .map(|(name, binding)| checked_binding(name, binding, tc, require_facts))
+                .collect(),
+        }
+    }
+
+    fn preliminary_checked_bindings(&self, tc: &TypeChecker) -> CheckedPatternBindings {
+        CheckedPatternBindings {
+            bindings: self
+                .iter()
+                .map(|(name, binding)| preliminary_checked_binding(name, binding, tc))
+                .collect(),
+        }
+    }
 }
 
 struct PatternChecker<'tc> {
@@ -489,8 +737,9 @@ impl<'tc> PatternChecker<'tc> {
         env.insert(
             name,
             PatternBinding {
-                ty: input.expected,
+                ty: input.expected.clone(),
                 span,
+                path: input.path.clone(),
                 kind,
             },
             self.tc,
@@ -498,6 +747,15 @@ impl<'tc> PatternChecker<'tc> {
         PatternCheckResult {
             outcome: PatternOutcome::irrefutable(PatternCover::CatchAll),
             bindings: BindingAlternatives::single(env),
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Binding(CheckedBindingOccurrence {
+                name,
+                span: self.tc.source_span(span),
+                local: SemanticLocalId::default(),
+                binding_id: None,
+                ty: input.expected_ty,
+                mutable: matches!(self.mode, PatternBindMode::Owned { mutable: true }),
+            }),
         }
     }
 
@@ -513,15 +771,17 @@ impl<'tc> PatternChecker<'tc> {
                     });
                     outcome.had_error = true;
                 }
-                PatternCheckResult::empty(outcome)
+                PatternCheckResult::empty_checked(outcome, CheckedPattern::Wildcard)
             }
             Pattern::Tuple(elems) => self.check_tuple(elems, pattern.span, input),
-            Pattern::Lit(lit) => {
-                PatternCheckResult::empty(self.check_lit(pattern.span, lit, &input.expected_ty))
-            }
-            Pattern::Nil => {
-                PatternCheckResult::empty(self.check_nil(pattern.span, &input.expected_ty))
-            }
+            Pattern::Lit(lit) => PatternCheckResult::empty_checked(
+                self.check_lit(pattern.span, lit, &input.expected_ty),
+                checked_literal(lit),
+            ),
+            Pattern::Nil => PatternCheckResult::empty_checked(
+                self.check_nil(pattern.span, &input.expected_ty),
+                CheckedPattern::Nil,
+            ),
             Pattern::Optional(inner) => self.check_optional(inner, &input),
             Pattern::Range { start, end, .. } => PatternCheckResult::empty(self.check_range(
                 pattern.span,
@@ -530,7 +790,10 @@ impl<'tc> PatternChecker<'tc> {
                 &input.expected_ty,
             )),
             Pattern::Or(alternatives) => self.check_or(alternatives, pattern.span, &input),
-            Pattern::Rest => PatternCheckResult::empty(self.unsupported_named("..", pattern.span)),
+            Pattern::Rest => PatternCheckResult::empty_checked(
+                self.unsupported_named("..", pattern.span),
+                CheckedPattern::Wildcard,
+            ),
             Pattern::Struct { name, fields } => {
                 self.check_struct(*name, fields, pattern.span, input)
             }
@@ -539,12 +802,15 @@ impl<'tc> PatternChecker<'tc> {
                 variant,
                 payload,
             } => match payload {
-                EnumPatternPayload::Unit => PatternCheckResult::empty(self.check_enum_unit(
-                    *qualifier,
-                    *variant,
-                    pattern.span,
-                    &input.expected_ty,
-                )),
+                EnumPatternPayload::Unit => {
+                    let (outcome, checked) = self.check_enum_unit(
+                        *qualifier,
+                        *variant,
+                        pattern.span,
+                        &input.expected_ty,
+                    );
+                    PatternCheckResult::empty_checked(outcome, checked)
+                }
                 EnumPatternPayload::Tuple(fields) => {
                     self.check_enum_tuple(*qualifier, *variant, fields, pattern.span, &input)
                 }
@@ -577,8 +843,16 @@ impl<'tc> PatternChecker<'tc> {
         had_error |= !valid;
         let refutability = or_refutability(checked.iter().map(|alt| alt.outcome.refutability));
         let covers = checked
+            .iter()
+            .map(|alternative| alternative.outcome.cover.clone())
+            .collect();
+        let alternatives = checked
             .into_iter()
-            .map(|alternative| alternative.outcome.cover)
+            .zip(bindings.envs.iter())
+            .map(|(alternative, env)| CheckedPatternAlternative {
+                pattern: alternative.checked,
+                bindings: env.preliminary_checked_bindings(self.tc),
+            })
             .collect();
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -587,6 +861,8 @@ impl<'tc> PatternChecker<'tc> {
                 refutability,
             },
             bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Or(alternatives),
         }
     }
 
@@ -664,6 +940,7 @@ impl<'tc> PatternChecker<'tc> {
         let mut refutability = Refutability::Irrefutable;
         let mut bindings = BindingAlternatives::single_empty();
         let mut covers = vec![];
+        let mut checked_fields = vec![];
         for (index, (elem, elem_ty)) in elems.iter().zip(elem_tys).enumerate() {
             let elem_input = input.tuple_field(index, elem_ty);
             let result = self.check(elem, elem_input);
@@ -671,6 +948,7 @@ impl<'tc> PatternChecker<'tc> {
             refutability = combine_refutability(refutability, result.outcome.refutability);
             bindings = bindings.product(&result.bindings, self.tc);
             covers.push(result.outcome.cover);
+            checked_fields.push(result.checked);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -679,6 +957,8 @@ impl<'tc> PatternChecker<'tc> {
                 refutability,
             },
             bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Tuple(checked_fields),
         }
     }
 
@@ -729,6 +1009,7 @@ impl<'tc> PatternChecker<'tc> {
                 input.access,
                 input.facts.clone(),
                 input.accepts_extern_any,
+                CheckedPatternPathSegment::OptionalSome,
                 |identity| identity,
             );
             self.check(inner, recovery);
@@ -744,6 +1025,7 @@ impl<'tc> PatternChecker<'tc> {
                 input.access,
                 input.facts.clone(),
                 input.accepts_extern_any,
+                CheckedPatternPathSegment::OptionalSome,
                 |identity| identity,
             );
             self.check(inner, recovery);
@@ -755,6 +1037,7 @@ impl<'tc> PatternChecker<'tc> {
                 input.access,
                 input.facts.clone(),
                 input.accepts_extern_any,
+                CheckedPatternPathSegment::OptionalSome,
                 |identity| identity,
             );
             self.check(inner, recovery);
@@ -771,6 +1054,7 @@ impl<'tc> PatternChecker<'tc> {
                 input.access,
                 input.facts.clone(),
                 input.accepts_extern_any,
+                CheckedPatternPathSegment::OptionalSome,
                 |identity| identity,
             );
             self.check(inner, recovery);
@@ -787,6 +1071,8 @@ impl<'tc> PatternChecker<'tc> {
                 refutability: Refutability::Refutable,
             },
             bindings: result.bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::OptionalSome(Box::new(result.checked)),
         }
     }
 
@@ -939,6 +1225,15 @@ impl<'tc> PatternChecker<'tc> {
         schema: &NamedSchemas<FieldSchema>,
         input: &PatternInput,
     ) -> PatternCheckResult {
+        let owner_key = self
+            .tc
+            .decls
+            .key_for_type(owner_ty)
+            .unwrap_or_else(|| NominalKey {
+                module: self.tc.current_module.clone(),
+                kind: NominalKind::Struct,
+                name: Ident::new("<unknown>"),
+            });
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
             fields,
@@ -954,6 +1249,7 @@ impl<'tc> PatternChecker<'tc> {
             Refutability::Irrefutable
         };
         let mut bindings = BindingAlternatives::single_empty();
+        let mut checked_fields = vec![];
         self.check_bad_field_patterns(fields, &shape, input.access);
         for field in shape.fields {
             let pattern = &fields[field.index].1;
@@ -971,12 +1267,23 @@ impl<'tc> PatternChecker<'tc> {
                 .aggregate_field_type(owner_ty, field.name)
                 .unwrap_or(field.ty);
             let extern_facts = self.extern_field_alias_facts(owner_ty, field.name, &input.facts);
-            let field_input =
-                input.aggregate_field(field.name, field_ty, field_access, extern_facts);
+            let field_input = input.aggregate_field(
+                field.name,
+                field_ty,
+                field_access,
+                extern_facts,
+                owner_key.clone(),
+                field.slot,
+            );
             let result = self.check(pattern, field_input);
             had_error |= result.outcome.had_error;
             refutability = combine_refutability(refutability, result.outcome.refutability);
             bindings = bindings.product(&result.bindings, self.tc);
+            checked_fields.push(CheckedStructField {
+                name: field.name,
+                slot: field.slot,
+                pattern: result.checked,
+            });
         }
         PatternCheckResult {
             outcome: PatternOutcome {
@@ -985,6 +1292,14 @@ impl<'tc> PatternChecker<'tc> {
                 refutability,
             },
             bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Struct {
+                owner: CheckedPatternOwner {
+                    key: owner_key,
+                    ty: owner_ty.clone(),
+                },
+                fields: checked_fields,
+            },
         }
     }
 
@@ -1059,19 +1374,30 @@ impl<'tc> PatternChecker<'tc> {
         variant: Ident,
         span: Span,
         expected: &Type,
-    ) -> PatternOutcome {
+    ) -> (PatternOutcome, CheckedPattern) {
         let Some(resolved) =
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
         else {
-            return PatternOutcome::error();
+            return (PatternOutcome::error(), CheckedPattern::Unsupported);
         };
         if !enum_variant::expect_unit(self.tc, &resolved, span) {
-            return PatternOutcome::error();
+            return (PatternOutcome::error(), CheckedPattern::Unsupported);
         }
-        PatternOutcome::refutable(PatternCover::EnumVariant {
-            key: resolved.key,
-            variant,
-        })
+        let key = resolved.key;
+        (
+            PatternOutcome::refutable(PatternCover::EnumVariant {
+                key: key.clone(),
+                variant,
+            }),
+            CheckedPattern::Enum {
+                owner: CheckedPatternOwner {
+                    key,
+                    ty: expected.clone(),
+                },
+                variant,
+                payload: CheckedEnumPayload::Unit,
+            },
+        )
     }
 
     fn check_enum_tuple(
@@ -1086,17 +1412,11 @@ impl<'tc> PatternChecker<'tc> {
             enum_variant::resolve_pattern(self.tc, qualifier, variant, span, &input.expected_ty)
         else {
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
-            return PatternCheckResult {
-                outcome: PatternOutcome::error(),
-                bindings,
-            };
+            return PatternCheckResult::with_bindings(PatternOutcome::error(), bindings);
         };
         let Some(payloads) = enum_variant::expect_tuple(self.tc, &resolved, span) else {
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
-            return PatternCheckResult {
-                outcome: PatternOutcome::error(),
-                bindings,
-            };
+            return PatternCheckResult::with_bindings(PatternOutcome::error(), bindings);
         };
         if self.tc.decls.semantic_option_key(&input.expected_ty) == Some(resolved.key.clone())
             && variant == Ident::new("Some")
@@ -1104,10 +1424,7 @@ impl<'tc> PatternChecker<'tc> {
             && !self.validate_optional_payload_pattern(&fields[0])
         {
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
-            return PatternCheckResult {
-                outcome: PatternOutcome::error(),
-                bindings,
-            };
+            return PatternCheckResult::with_bindings(PatternOutcome::error(), bindings);
         }
         if payloads.len() != fields.len() {
             self.tc.push_error(TypeError::WrongArgCount {
@@ -1116,30 +1433,39 @@ impl<'tc> PatternChecker<'tc> {
                 span: self.tc.error_span(span),
             });
             let bindings = self.check_tuple_fields_recovery(fields, input.access);
-            return PatternCheckResult {
-                outcome: PatternOutcome::error(),
-                bindings,
-            };
+            return PatternCheckResult::with_bindings(PatternOutcome::error(), bindings);
         }
+        let key = resolved.key.clone();
         let mut had_error = false;
         let mut bindings = BindingAlternatives::single_empty();
+        let mut checked_fields = vec![];
         for (index, (field, payload)) in fields.iter().zip(payloads).enumerate() {
             let ty = self.payload_ty(payload, &resolved, &input.expected_ty, span);
-            let field_input = input.enum_tuple_field(variant, index, ty);
+            let field_input = input.enum_tuple_field(key.clone(), variant, index, ty);
             let result = self.check(field, field_input);
             had_error |= result.outcome.had_error;
             bindings = bindings.product(&result.bindings, self.tc);
+            checked_fields.push(result.checked);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
                 cover: PatternCover::EnumVariant {
-                    key: resolved.key,
+                    key: key.clone(),
                     variant,
                 },
                 had_error,
                 refutability: Refutability::Refutable,
             },
             bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Enum {
+                owner: CheckedPatternOwner {
+                    key,
+                    ty: input.expected_ty.clone(),
+                },
+                variant,
+                payload: CheckedEnumPayload::Tuple(checked_fields),
+            },
         }
     }
 
@@ -1174,8 +1500,10 @@ impl<'tc> PatternChecker<'tc> {
             field_check::MissingFields::AllowRest { has_rest },
             Some(span),
         );
+        let key = resolved.key.clone();
         let mut had_error = shape.failed;
         let mut bindings = BindingAlternatives::single_empty();
+        let mut checked_fields = vec![];
         self.check_bad_field_patterns(fields, &shape, input.access);
         for field in shape.fields {
             self.tc.check_matched_field_access_policy(
@@ -1185,21 +1513,36 @@ impl<'tc> PatternChecker<'tc> {
                 fields[field.index].1.span,
             );
             let ty = self.payload_ty(&field.ty, &resolved, &input.expected_ty, span);
-            let field_input = input.enum_struct_field(variant, field.name, ty);
+            let field_input =
+                input.enum_struct_field(key.clone(), variant, field.name, field.slot, ty);
             let result = self.check(&fields[field.index].1, field_input);
             had_error |= result.outcome.had_error;
             bindings = bindings.product(&result.bindings, self.tc);
+            checked_fields.push(CheckedStructField {
+                name: field.name,
+                slot: field.slot,
+                pattern: result.checked,
+            });
         }
         PatternCheckResult {
             outcome: PatternOutcome {
                 cover: PatternCover::EnumVariant {
-                    key: resolved.key,
+                    key: key.clone(),
                     variant,
                 },
                 had_error,
                 refutability: Refutability::Refutable,
             },
             bindings,
+            checked_bindings: CheckedPatternBindings::default(),
+            checked: CheckedPattern::Enum {
+                owner: CheckedPatternOwner {
+                    key,
+                    ty: input.expected_ty.clone(),
+                },
+                variant,
+                payload: CheckedEnumPayload::Struct(checked_fields),
+            },
         }
     }
 
@@ -1299,7 +1642,18 @@ pub(super) fn check_place_at(
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
-    check_roots(
+    check_place_at_detailed(pattern, place, mode, site, context, tc).outcome
+}
+
+pub(super) fn check_place_at_detailed(
+    pattern: &PatternNode,
+    place: PatternPlace,
+    mode: PatternBindMode,
+    site: ExprId,
+    context: PatternContext,
+    tc: &mut TypeChecker,
+) -> PatternCheckResult {
+    check_roots_detailed(
         vec![PatternRoot {
             pattern,
             input: PatternRootInput::Place(Box::new(place), site),
@@ -1357,14 +1711,26 @@ pub(super) fn check_roots(
     context: PatternContext,
     tc: &mut TypeChecker,
 ) -> PatternOutcome {
+    check_roots_detailed(roots, context, tc).outcome
+}
+
+fn check_roots_detailed(
+    roots: Vec<PatternRoot<'_>>,
+    context: PatternContext,
+    tc: &mut TypeChecker,
+) -> PatternCheckResult {
     let Some(first) = roots.first() else {
-        return PatternOutcome::irrefutable(PatternCover::CatchAll);
+        return PatternCheckResult::empty_checked(
+            PatternOutcome::irrefutable(PatternCover::CatchAll),
+            CheckedPattern::Wildcard,
+        );
     };
     let span = first.pattern.span;
     let mut had_error = false;
     let mut refutability = Refutability::Irrefutable;
     let mut covers = vec![];
     let mut bindings = BindingAlternatives::single_empty();
+    let mut checked_patterns = vec![];
     let mut function_flow_roots = vec![];
 
     for root in roots {
@@ -1396,6 +1762,7 @@ pub(super) fn check_roots(
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
         covers.push(result.outcome.cover);
+        checked_patterns.push(result.checked);
         bindings = bindings.product(&result.bindings, checker.tc);
     }
 
@@ -1417,11 +1784,23 @@ pub(super) fn check_roots(
     } else {
         PatternCover::Tuple(covers)
     };
-    PatternOutcome {
-        cover,
-        had_error,
-        refutability,
-    }
+    let checked = if checked_patterns.len() == 1 {
+        checked_patterns.pop().expect("non-empty checked patterns")
+    } else {
+        CheckedPattern::Tuple(checked_patterns)
+    };
+    let mut result = PatternCheckResult {
+        outcome: PatternOutcome {
+            cover,
+            had_error,
+            refutability,
+        },
+        bindings,
+        checked_bindings: CheckedPatternBindings::default(),
+        checked,
+    };
+    result.canonicalize_bindings(tc, context == PatternContext::Match);
+    result
 }
 
 fn refutable_context_binds_function_flows(context: PatternContext) -> bool {

@@ -1,6 +1,6 @@
 use super::{
     CaptureCellId, FieldId, FunctionId, GlobalId, LambdaCaptureDecl, LocalId, Mutability, Place,
-    PlaceRoot, Program, Projection, ScopedBorrowId, TypeData, TypeId, VariantId, typing,
+    PlaceRoot, Program, Projection, ScopedBorrowId, TypeData, TypeId, typing,
     typing::PrimitiveTypes,
 };
 
@@ -26,11 +26,6 @@ pub enum ProjectionKind {
     DataRefField(FieldId),
     ExternField(FieldId),
     TupleField(u32),
-    VariantField {
-        enum_id: super::EnumId,
-        variant: VariantId,
-        field: u16,
-    },
     ArrayIndex(LocalId),
     ListIndex(LocalId),
     SliceIndex(LocalId),
@@ -144,17 +139,6 @@ pub fn project_ty(program: &Program, source_ty: TypeId, projection: &Projection)
     match *projection {
         Projection::Field(field) => field_step(program, source_ty, field).map(|(_, ty)| ty),
         Projection::TupleField(index) => typing::tuple_field(program, source_ty, index),
-        Projection::VariantField {
-            enum_id,
-            variant,
-            field,
-        } => {
-            let TypeData::Enum(source_enum) = program.type_arena.get(source_ty)? else {
-                return None;
-            };
-            (*source_enum == enum_id)
-                .then(|| typing::enum_variant_field(program, source_ty, variant, field))?
-        }
         Projection::Index(_) => typing::index_elem(program, source_ty),
     }
 }
@@ -199,26 +183,6 @@ pub fn project_step(
             ProjectionKind::TupleField(index),
             typing::tuple_field(program, source_ty, index)?,
         ),
-        Projection::VariantField {
-            enum_id,
-            variant,
-            field,
-        } => {
-            let TypeData::Enum(source_enum) = program.type_arena.get(source_ty)? else {
-                return None;
-            };
-            if *source_enum != enum_id {
-                return None;
-            }
-            (
-                ProjectionKind::VariantField {
-                    enum_id,
-                    variant,
-                    field,
-                },
-                typing::enum_variant_field(program, source_ty, variant, field)?,
-            )
-        }
         Projection::Index(local) => {
             let (kind, ty, expected) = index_step(program, source_ty, local)?;
             local_has_type(program, function, local, expected)?;
@@ -286,9 +250,8 @@ mod tests {
     use super::*;
     use crate::{
         air::{
-            AggregateDecl, AggregateKind, AirBlock, AirBody, EnumDecl, EnumRepr, FieldDecl,
-            Function, FunctionKind, GlobalDecl, Local, LocalKind, ModuleId, Signature, VariantDecl,
-            VariantShape,
+            AggregateDecl, AggregateKind, AirBlock, AirBody, FieldDecl, Function, FunctionKind,
+            GlobalDecl, Local, LocalKind, ModuleId, Signature,
         },
         ast::Ident,
     };
@@ -339,28 +302,6 @@ mod tests {
         let place = Place {
             root: PlaceRoot::Local(LocalId::from_index(0)),
             projection: vec![Projection::Index(LocalId::from_index(1))],
-            ty: int,
-        };
-        assert!(walk_place(&program, FunctionId::from_index(0), &place).is_none());
-    }
-
-    #[test]
-    fn rejects_wrong_variant_enum_id() {
-        let mut program = Program::default();
-        let int = program.type_arena.alloc(TypeData::Int);
-        let first_id = super::super::EnumId::from_index(0);
-        let second_id = super::super::EnumId::from_index(1);
-        let enum_ty = program.type_arena.alloc(TypeData::Enum(first_id));
-        program.enums.push(enum_decl("First", int));
-        program.enums.push(enum_decl("Second", int));
-        program.functions.push(function(vec![local(enum_ty)]));
-        let place = Place {
-            root: PlaceRoot::Local(LocalId::from_index(0)),
-            projection: vec![Projection::VariantField {
-                enum_id: second_id,
-                variant: VariantId::from_index(0),
-                field: 0,
-            }],
             ty: int,
         };
         assert!(walk_place(&program, FunctionId::from_index(0), &place).is_none());
@@ -433,23 +374,6 @@ mod tests {
             }],
             cycle_capable: false,
             stringify_override: None,
-        }
-    }
-
-    fn enum_decl(name: &str, field_ty: TypeId) -> EnumDecl {
-        EnumDecl {
-            name: Ident::new(name),
-            module: ModuleId::from_index(0),
-            type_args: vec![],
-            const_args: vec![],
-            core: None,
-            repr: EnumRepr::Adt,
-            raw_type: None,
-            variants: vec![VariantDecl {
-                name: Ident::new("Some"),
-                shape: VariantShape::Tuple(vec![field_ty]),
-                raw_value: None,
-            }],
         }
     }
 

@@ -8,6 +8,7 @@ use super::{
     intrinsic_bool_value, join_checked, match_check, match_coverage,
     pattern::{self, check_pattern_scrutinee},
     place, projection,
+    semantic_use::{CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan},
 };
 use crate::{
     ast::{
@@ -548,12 +549,12 @@ pub(super) fn check_match_checked_with_hint(
     parent: ExprId,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    check_match_with_policy(match_node, Some(parent), &BranchPolicy::value(expected), tc)
+    check_match_with_policy(match_node, parent, &BranchPolicy::value(expected), tc)
 }
 
 fn check_match_with_policy(
     match_node: &MatchNode,
-    parent: Option<ExprId>,
+    parent: ExprId,
     policy: &BranchPolicy<'_>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
@@ -597,14 +598,14 @@ fn check_match_with_policy(
             PatternBindMode::Owned { mutable: false }
         };
         let scrutinee = check_pattern_scrutinee(&node.scrutinee, mode, tc);
-        let mut outcomes = Vec::with_capacity(node.arms.len());
+        let mut heads = Vec::with_capacity(node.arms.len());
         let arms = check_match_arm_bodies(
             &node.arms,
             policy.match_expected(),
             tc,
             |arm, expected, tc| {
                 tc.push_scope();
-                let outcome = match_check::check_arm_head(
+                let head = match_check::check_arm_head_detailed(
                     &arm.node.head,
                     scrutinee.pattern_place(
                         scrutinee.checked.handle.clone(),
@@ -616,18 +617,48 @@ fn check_match_with_policy(
                 );
                 let body = policy.check_match_arm_body(&arm.node.body, expected, tc);
                 tc.pop_scope();
-                outcomes.push(outcome);
+                heads.push(head);
                 body
             },
         );
+        let outcomes = heads
+            .iter()
+            .map(|head| head.outcome.clone())
+            .collect::<Vec<_>>();
+        record_checked_match_plan(parent, heads, mode, tc);
         match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
         arms
     };
 
-    if let Some(parent) = parent {
-        copy_match_branch_flow(match_node, parent, tc);
-    }
+    copy_match_branch_flow(match_node, parent, tc);
     policy.finish_match(arms, tc)
+}
+
+fn record_checked_match_plan(
+    match_expr: ExprId,
+    heads: Vec<pattern::PatternCheckResult>,
+    mode: PatternBindMode,
+    tc: &mut TypeChecker,
+) {
+    let arms = heads
+        .into_iter()
+        .map(|head| CheckedMatchArm {
+            bindings: head.bindings().clone(),
+            pattern: head.checked,
+        })
+        .collect();
+    let site = tc.current_expr_site(match_expr);
+    tc.semantic_facts.record_match_plan(
+        site,
+        CheckedMatchPlan {
+            expr: match_expr,
+            access: match mode {
+                PatternBindMode::Owned { .. } => CheckedMatchAccess::Owned,
+                PatternBindMode::Alias => CheckedMatchAccess::RefAlias,
+            },
+            arms,
+        },
+    );
 }
 
 fn check_match_arm_bodies(
@@ -966,7 +997,12 @@ fn check_branch_place_return_expr(
         }
         ExprKind::Match(match_node) => {
             let policy = BranchPolicy::place_return(ret, source);
-            Some(check_match_with_policy(match_node, None, &policy, tc))
+            Some(check_match_with_policy(
+                match_node,
+                expr.node.id,
+                &policy,
+                tc,
+            ))
         }
         _ => None,
     }

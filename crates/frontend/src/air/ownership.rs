@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    AggregateKind, AirBlock, AirCollectionLoanMode, AirStmt, AirTail, CallArg, Callee, ConstId,
-    Function, FunctionId, GlobalId, GlobalInitEffect, LambdaCaptureArg, LocalId, Operand,
-    ParamMode, Place, PlaceReadLocal, PlaceRoot, Program, RValue, TypeData, TypeId, VariantShape,
-    typing,
+    AggregateKind, AirBlock, AirCollectionLoanMode, AirPatternBindingMode, AirPatternMatch,
+    AirStmt, AirTail, CallArg, Callee, ConstId, Function, FunctionId, GlobalId, GlobalInitEffect,
+    LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal, PlaceRoot, Program,
+    RValue, TypeData, TypeId, VariantShape, typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -331,6 +331,17 @@ struct ParamUseAnalyzer<'a> {
     uses: Vec<Option<ParamUse>>,
 }
 
+fn pattern_match_has_alias_binding(match_: &AirPatternMatch) -> bool {
+    match_.arms.iter().any(|arm| {
+        arm.alternatives.iter().any(|alternative| {
+            alternative
+                .bindings
+                .iter()
+                .any(|binding| binding.mode == AirPatternBindingMode::Alias)
+        })
+    })
+}
+
 impl ParamUseAnalyzer<'_> {
     fn analyze(mut self) -> Vec<ParamUse> {
         self.observe_air_block(&self.function.body.block);
@@ -406,13 +417,15 @@ impl ParamUseAnalyzer<'_> {
                 self.observe_local(scope.index, ParamUse::ReadOnly);
                 self.observe_air_block(&scope.body);
             }
-            AirStmt::EnumMatch(match_) => {
-                self.observe_place(&match_.discr, ParamUse::ReadOnly);
+            AirStmt::PatternMatch(match_) => {
+                let subject_use = if pattern_match_has_alias_binding(match_) {
+                    ParamUse::ReborrowMut
+                } else {
+                    ParamUse::ReadOnly
+                };
+                self.observe_place(&match_.subject, subject_use);
                 for arm in &match_.arms {
                     self.observe_air_block(&arm.block);
-                }
-                if let Some(block) = &match_.else_block {
-                    self.observe_air_block(block);
                 }
             }
             AirStmt::OptionalMatch(match_) => {
@@ -1048,7 +1061,7 @@ fn rewrite_air_block_call_args(
                 );
                 block.stmts.push(AirStmt::CollectionSlotScope(scope));
             }
-            AirStmt::EnumMatch(mut match_) => {
+            AirStmt::PatternMatch(mut match_) => {
                 for arm in &mut match_.arms {
                     rewrite_air_block_call_args(
                         &mut arm.block,
@@ -1059,17 +1072,7 @@ fn rewrite_air_block_call_args(
                         locals,
                     );
                 }
-                if let Some(else_block) = &mut match_.else_block {
-                    rewrite_air_block_call_args(
-                        else_block,
-                        modes,
-                        function_type_modes,
-                        extern_modes,
-                        const_types,
-                        locals,
-                    );
-                }
-                block.stmts.push(AirStmt::EnumMatch(match_));
+                block.stmts.push(AirStmt::PatternMatch(match_));
             }
             AirStmt::OptionalMatch(mut match_) => {
                 rewrite_air_block_call_args(

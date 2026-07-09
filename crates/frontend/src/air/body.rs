@@ -44,7 +44,7 @@ pub enum AirStmt {
     CollectionFor(AirCollectionFor),
     CollectionLoan(AirCollectionLoan),
     CollectionSlotScope(AirCollectionSlotScope),
-    EnumMatch(AirEnumMatch),
+    PatternMatch(AirPatternMatch),
     OptionalMatch(AirOptionalMatch),
     MapEntryMatch(AirMapEntryMatch),
 }
@@ -171,16 +171,76 @@ pub enum AirCollectionSlotKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AirEnumMatch {
-    pub discr: Place,
-    pub arms: Vec<AirEnumMatchArm>,
-    pub else_block: Option<AirBlock>,
+pub struct AirPatternMatch {
+    pub subject: Place,
+    pub arms: Vec<AirPatternArm>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AirEnumMatchArm {
-    pub variant: VariantId,
+pub struct AirPatternArm {
+    pub alternatives: Vec<AirPatternAlternative>,
     pub block: AirBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AirPatternAlternative {
+    pub tests: Vec<AirPatternTest>,
+    pub bindings: Vec<AirPatternBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AirPatternPath {
+    pub steps: Vec<AirPatternPathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AirPatternPathStep {
+    Field(FieldId),
+    TupleField(u32),
+    OptionalSome,
+    EnumTupleField {
+        enum_id: EnumId,
+        variant: VariantId,
+        field: u16,
+    },
+    EnumStructField {
+        enum_id: EnumId,
+        variant: VariantId,
+        field: u16,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AirPatternTest {
+    Literal {
+        path: AirPatternPath,
+        value: ConstId,
+    },
+    Nil {
+        path: AirPatternPath,
+    },
+    OptionalSome {
+        path: AirPatternPath,
+    },
+    EnumVariant {
+        path: AirPatternPath,
+        enum_id: EnumId,
+        variant: VariantId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirPatternBinding {
+    pub local: LocalId,
+    pub path: AirPatternPath,
+    pub ty: TypeId,
+    pub mode: AirPatternBindingMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPatternBindingMode {
+    Owned,
+    Alias,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,9 +305,7 @@ impl Place {
         for projection in &self.projection {
             match projection {
                 Projection::Index(local) => f(PlaceReadLocal::Index(*local)),
-                Projection::Field(_)
-                | Projection::TupleField(_)
-                | Projection::VariantField { .. } => {}
+                Projection::Field(_) | Projection::TupleField(_) => {}
             }
         }
     }
@@ -270,11 +328,6 @@ impl Place {
 pub enum Projection {
     Field(FieldId),
     TupleField(u32),
-    VariantField {
-        enum_id: EnumId,
-        variant: VariantId,
-        field: u16,
-    },
     Index(LocalId),
 }
 
@@ -290,18 +343,6 @@ fn projections_equal(left: &Projection, right: &Projection) -> bool {
     match (left, right) {
         (Projection::Field(left), Projection::Field(right)) => left == right,
         (Projection::TupleField(left), Projection::TupleField(right)) => left == right,
-        (
-            Projection::VariantField {
-                enum_id: left_enum,
-                variant: left_variant,
-                field: left_field,
-            },
-            Projection::VariantField {
-                enum_id: right_enum,
-                variant: right_variant,
-                field: right_field,
-            },
-        ) => left_enum == right_enum && left_variant == right_variant && left_field == right_field,
         (Projection::Index(left), Projection::Index(right)) => left == right,
         _ => false,
     }
@@ -548,12 +589,9 @@ impl AirStmt {
             Self::CollectionFor(for_) => for_.body.for_each_rvalue(f),
             Self::CollectionLoan(loan) => loan.body.for_each_rvalue(f),
             Self::CollectionSlotScope(scope) => scope.body.for_each_rvalue(f),
-            Self::EnumMatch(match_) => {
+            Self::PatternMatch(match_) => {
                 for arm in &match_.arms {
                     arm.block.for_each_rvalue(f);
-                }
-                if let Some(block) = &match_.else_block {
-                    block.for_each_rvalue(f);
                 }
             }
             Self::OptionalMatch(match_) => {

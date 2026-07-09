@@ -9,16 +9,16 @@ pub(super) use support::{
 pub(super) use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionLoan,
     AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind,
-    AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop, AirLoopId,
-    AirOptionalMatch, AirStmt, AirTail, BindingId, BlockId, CallArg, Callee, CaptureCellDecl,
-    CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId, ConstValue,
-    EnumDecl, EnumId, ExternDecl, ExternFieldDecl, ExternMember, ExternParamDecl,
-    ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function, FunctionId,
-    FunctionKind, GlobalDecl, GlobalId, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId,
-    LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapOrder, ModuleId, Mutability,
-    Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program,
-    Projection, RValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource,
-    Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantId, VariantShape, verify,
+    AirCollectionSlotScope, AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail,
+    BindingId, BlockId, CallArg, Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime,
+    CaptureLocalSource, ConstData, ConstId, ConstValue, EnumDecl, EnumId, ExternDecl,
+    ExternFieldDecl, ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl,
+    FieldDecl, FieldId, Function, FunctionId, FunctionKind, GlobalDecl, GlobalId, LambdaCaptureArg,
+    LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId,
+    LocalKind, MapOrder, ModuleId, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole,
+    ParamType, Place, PlaceRoot, Program, Projection, RValue, ReturnMode, ScopedBorrowDecl,
+    ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl,
+    VariantId, VariantShape, verify,
 };
 
 mod structure;

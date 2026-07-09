@@ -3331,6 +3331,7 @@ impl TypeChecker {
                 has_finalize_errors || has_local_finalize_errors || has_expr_finalize_errors;
             has_stringify_errors = false;
             if !has_type_errors {
+                self.semantic_facts.finish_match_plans();
                 self.semantic_facts.finish_stringifies();
                 has_stringify_errors = self.finish_stringify_types();
             }

@@ -12,10 +12,11 @@ use super::{
     ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
         AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
-        AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirIf,
-        AirMapEntryMatch, AirOptionalMatch, AirOrdinalPlan, AirStmt, AirTail, CallArg, Callee,
-        GlobalInitEffect, LambdaCaptureArg, MapWriteKind, Operand, Place, PlaceReadLocal,
-        PlaceRoot, Projection, RValue,
+        AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirIf, AirMapEntryMatch,
+        AirOptionalMatch, AirOrdinalPlan, AirPatternAlternative, AirPatternArm, AirPatternBinding,
+        AirPatternBindingMode, AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest,
+        AirStmt, AirTail, CallArg, Callee, GlobalInitEffect, LambdaCaptureArg, MapWriteKind,
+        Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
     },
     ids::*,
     place_model,
@@ -455,6 +456,9 @@ pub enum BadFunction {
     },
     CollectionLoanSlotOutOfScope(LocalId),
     CollectionLoanSlotEscapesBody(LocalId),
+    PatternPathInvalid,
+    PatternPayloadWithoutVariantTest,
+    PatternAlternativeBindingMismatch(LocalId),
     CollectionLoanStructuralOpConflict {
         mode: AirCollectionLoanMode,
         op: &'static str,
@@ -630,12 +634,6 @@ pub enum BadPlace {
         len: usize,
     },
     TupleProjectionOnNonTuple(TypeId),
-    VariantFieldOutOfRange {
-        ty: TypeId,
-        index: u16,
-        len: usize,
-    },
-    VariantProjectionOnNonEnum(TypeId),
     IndexProjectionOnNonIndexable(TypeId),
     PlaceTypeMismatch {
         expected: TypeId,
@@ -947,10 +945,6 @@ impl FunctionValueState {
                 .get(*field as usize)
                 .cloned()
                 .unwrap_or_else(Self::unknown),
-            Projection::VariantField { field, .. } => fields
-                .get(*field as usize)
-                .cloned()
-                .unwrap_or_else(Self::unknown),
             Projection::Index(_) => fields
                 .iter()
                 .cloned()
@@ -969,7 +963,6 @@ impl FunctionValueState {
         let index = match first {
             Projection::Field(field) => field.index(),
             Projection::TupleField(field) => *field as usize,
-            Projection::VariantField { field, .. } => *field as usize,
             Projection::Index(_) => return None,
         };
         fields.get_mut(index)?.projection_mut(rest)
@@ -2236,22 +2229,12 @@ fn verify_loop_capture_cell_block(
                     in_loop,
                 );
             }
-            AirStmt::EnumMatch(match_) => {
+            AirStmt::PatternMatch(match_) => {
                 for arm in &match_.arms {
                     found_loop |= verify_loop_capture_cell_block(
                         cx,
                         function_id,
                         &arm.block,
-                        cell,
-                        loop_id,
-                        in_loop,
-                    );
-                }
-                if let Some(block) = &match_.else_block {
-                    found_loop |= verify_loop_capture_cell_block(
-                        cx,
-                        function_id,
-                        block,
                         cell,
                         loop_id,
                         in_loop,
@@ -2329,7 +2312,7 @@ fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
         AirStmt::CollectionFor(for_) => ordinal_uses_capture_cell(&for_.ordinal_plan, cell),
         AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
         AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
-        AirStmt::EnumMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
+        AirStmt::PatternMatch(match_) => place_uses_capture_cell(&match_.subject, cell),
         AirStmt::OptionalMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
         AirStmt::MapEntryMatch(match_) => {
             place_uses_capture_cell(&match_.map, cell)
@@ -3664,8 +3647,8 @@ fn verify_air_stmt(
         AirStmt::CollectionSlotScope(scope) => {
             verify_collection_slot_scope(cx, function_id, block_id, index, scope, state, loops)
         }
-        AirStmt::EnumMatch(match_) => {
-            verify_air_match(cx, function_id, index, match_, state, loops)
+        AirStmt::PatternMatch(match_) => {
+            verify_air_pattern_match(cx, function_id, index, match_, state, loops)
         }
         AirStmt::OptionalMatch(match_) => {
             verify_air_optional_match(cx, function_id, index, match_, state, loops)
@@ -3989,12 +3972,9 @@ fn collect_collection_loan_slot_locals(
             AirStmt::CollectionFor(for_) => {
                 collect_collection_loan_slot_locals(&for_.body, slot_locals);
             }
-            AirStmt::EnumMatch(match_) => {
+            AirStmt::PatternMatch(match_) => {
                 for arm in &match_.arms {
                     collect_collection_loan_slot_locals(&arm.block, slot_locals);
-                }
-                if let Some(block) = &match_.else_block {
-                    collect_collection_loan_slot_locals(block, slot_locals);
                 }
             }
             AirStmt::OptionalMatch(match_) => {
@@ -4252,11 +4232,11 @@ fn verify_collection_loan_contract_stmt(
                 active_slots.remove(&slot.local);
             }
         }
-        AirStmt::EnumMatch(match_) => {
+        AirStmt::PatternMatch(match_) => {
             verify_collection_loan_contract_place(
                 cx,
                 function_id,
-                &match_.discr,
+                &match_.subject,
                 slot_locals,
                 active_slots,
                 false,
@@ -4266,16 +4246,6 @@ fn verify_collection_loan_contract_stmt(
                     cx,
                     function_id,
                     &arm.block,
-                    slot_locals,
-                    active_slots,
-                    active_loans,
-                );
-            }
-            if let Some(block) = &match_.else_block {
-                verify_collection_loan_contract_block(
-                    cx,
-                    function_id,
-                    block,
                     slot_locals,
                     active_slots,
                     active_loans,
@@ -4984,72 +4954,450 @@ fn verify_air_if(
     LocalInit::join([then_fallthrough, else_fallthrough].into_iter().flatten())
 }
 
-fn verify_air_match(
+fn verify_air_pattern_match(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
     index: usize,
-    match_: &AirEnumMatch,
+    match_: &AirPatternMatch,
     state: &LocalInit,
     loops: &mut Vec<LoopCtx>,
 ) -> Option<LocalInit> {
     let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
-    verify_air_place_read(cx, function_id, index, &match_.discr, state);
-    let discr_ty = verify_place(
+    verify_air_place_read(cx, function_id, index, &match_.subject, state);
+    let subject_ty = verify_place(
         cx,
         function_id,
         BlockId::from_index(0),
         Some(index),
-        &match_.discr,
+        &match_.subject,
     );
-    let Some(expected_enum) = discr_ty.and_then(|ty| match cx.type_data(ty) {
-        Some(TypeData::Enum(id)) if cx.has_enum(*id) => Some(*id),
-        Some(TypeData::Enum(_)) | None => None,
-        Some(_) => {
-            cx.push(
-                site.clone(),
-                VerifyErrorKind::BadFunction(BadFunction::SwitchDiscriminantMustBeEnum(ty)),
-            );
-            None
-        }
-    }) else {
+    let Some(subject_ty) = subject_ty else {
         return Some(state.clone());
     };
 
-    let mut seen = std::collections::HashSet::new();
-    let mut fallthrough = Vec::new();
+    let mut fallthrough = vec![];
     for arm in &match_.arms {
-        if !seen.insert(arm.variant) {
-            cx.push(
-                site.clone(),
-                VerifyErrorKind::BadFunction(BadFunction::DuplicateSwitchArm(arm.variant)),
-            );
+        for alternative in &arm.alternatives {
+            verify_air_pattern_alternative(cx, &site, function_id, subject_ty, alternative);
         }
-        if !cx.variant_belongs_to_enum(expected_enum, arm.variant) {
-            cx.push(
-                site.clone(),
-                VerifyErrorKind::BadFunction(BadFunction::SwitchArmVariantMismatch {
-                    expected_enum,
-                    variant: arm.variant,
-                }),
-            );
+        verify_pattern_alternative_binding_sets(cx, &site, arm);
+        for alternative in &arm.alternatives {
+            let guards = enum_variant_guards(alternative);
+            let optional_guards = optional_some_guards(alternative);
+            let mut alternative_state = state.clone();
+            for binding in &alternative.bindings {
+                verify_pattern_binding(
+                    cx,
+                    &site,
+                    function_id,
+                    subject_ty,
+                    &guards,
+                    &optional_guards,
+                    binding,
+                    &mut alternative_state,
+                );
+            }
         }
         let mut arm_state = state.clone();
-        if let Some(state) = verify_air_block(cx, function_id, &arm.block, &mut arm_state, loops) {
+        if let Some(alternative) = arm.alternatives.first() {
+            let guards = enum_variant_guards(alternative);
+            let optional_guards = optional_some_guards(alternative);
+            for binding in &alternative.bindings {
+                verify_pattern_binding(
+                    cx,
+                    &site,
+                    function_id,
+                    subject_ty,
+                    &guards,
+                    &optional_guards,
+                    binding,
+                    &mut arm_state,
+                );
+            }
+        }
+        if let Some(mut state) =
+            verify_air_block(cx, function_id, &arm.block, &mut arm_state, loops)
+        {
+            clear_pattern_binding_locals(&mut state, arm);
             fallthrough.push(state);
         }
-    }
-    if let Some(else_block) = &match_.else_block {
-        let mut else_state = state.clone();
-        if let Some(state) = verify_air_block(cx, function_id, else_block, &mut else_state, loops) {
-            fallthrough.push(state);
-        }
-    } else if seen.len() < cx.program.enum_decl(expected_enum).variants.len() {
-        cx.push(
-            site,
-            VerifyErrorKind::BadFunction(BadFunction::MatchNotExhaustive(expected_enum)),
-        );
     }
     LocalInit::join(fallthrough)
+}
+
+fn clear_pattern_binding_locals(state: &mut LocalInit, arm: &AirPatternArm) {
+    for alternative in &arm.alternatives {
+        for binding in &alternative.bindings {
+            state.clear(binding.local);
+        }
+    }
+}
+
+fn verify_air_pattern_alternative(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    function_id: FunctionId,
+    subject_ty: TypeId,
+    alternative: &AirPatternAlternative,
+) {
+    let guards = enum_variant_guards(alternative);
+    let mut optional_guards = Vec::new();
+    for test in &alternative.tests {
+        match test {
+            AirPatternTest::Literal { path, value } => {
+                if !cx.has_const(*value) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadReference(BadReference::InvalidConst(*value)),
+                    );
+                    continue;
+                }
+                let Some(path_ty) =
+                    verify_pattern_path(cx, site, subject_ty, &guards, &optional_guards, path)
+                else {
+                    continue;
+                };
+                let const_ty = cx.program.const_data(*value).ty;
+                if !same_type(cx, path_ty, const_ty) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadConst(BadConst::TypeMismatch {
+                            expected: path_ty,
+                            found: const_ty,
+                        }),
+                    );
+                }
+            }
+            AirPatternTest::Nil { path } | AirPatternTest::OptionalSome { path } => {
+                if let Some(path_ty) =
+                    verify_pattern_path(cx, site, subject_ty, &guards, &optional_guards, path)
+                    && typing::optional_inner(cx.program, path_ty).is_none()
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadConst(BadConst::NilMustBeOptional(path_ty)),
+                    );
+                }
+                if matches!(test, AirPatternTest::OptionalSome { .. }) {
+                    optional_guards.push(path.clone());
+                }
+            }
+            AirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } => {
+                if let Some(path_ty) =
+                    verify_pattern_path(cx, site, subject_ty, &guards, &optional_guards, path)
+                {
+                    match cx.type_data(path_ty) {
+                        Some(TypeData::Enum(found)) if found == enum_id => {
+                            if !cx.variant_belongs_to_enum(*enum_id, *variant) {
+                                cx.push(
+                                    site.clone(),
+                                    VerifyErrorKind::BadReference(BadReference::InvalidVariant {
+                                        enum_id: *enum_id,
+                                        variant: *variant,
+                                    }),
+                                );
+                            }
+                        }
+                        _ => cx.push(
+                            site.clone(),
+                            VerifyErrorKind::BadFunction(
+                                BadFunction::SwitchDiscriminantMustBeEnum(path_ty),
+                            ),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    let _ = function_id;
+}
+
+#[derive(Clone)]
+struct AirPatternVariantGuard {
+    path: AirPatternPath,
+    enum_id: EnumId,
+    variant: VariantId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AirPatternBindingSignature {
+    local: LocalId,
+    ty: TypeId,
+    mode: AirPatternBindingMode,
+}
+
+impl AirPatternBindingSignature {
+    fn sort_key(self) -> (usize, usize, u8) {
+        (
+            self.local.index(),
+            self.ty.index(),
+            u8::from(self.mode == AirPatternBindingMode::Alias),
+        )
+    }
+}
+
+fn enum_variant_guards(alternative: &AirPatternAlternative) -> Vec<AirPatternVariantGuard> {
+    alternative
+        .tests
+        .iter()
+        .filter_map(|test| match test {
+            AirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } => Some(AirPatternVariantGuard {
+                path: path.clone(),
+                enum_id: *enum_id,
+                variant: *variant,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn optional_some_guards(alternative: &AirPatternAlternative) -> Vec<AirPatternPath> {
+    alternative
+        .tests
+        .iter()
+        .filter_map(|test| match test {
+            AirPatternTest::OptionalSome { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn verify_pattern_alternative_binding_sets(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    arm: &AirPatternArm,
+) {
+    let Some(first) = arm.alternatives.first() else {
+        return;
+    };
+    let expected = pattern_binding_signatures(cx, site, first);
+    for alternative in &arm.alternatives[1..] {
+        let found = pattern_binding_signatures(cx, site, alternative);
+        if expected != found {
+            report_pattern_binding_mismatch(cx, site, &expected, &found);
+        }
+    }
+}
+
+fn pattern_binding_signatures(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    alternative: &AirPatternAlternative,
+) -> Vec<AirPatternBindingSignature> {
+    let mut signatures = vec![];
+    for binding in &alternative.bindings {
+        if signatures
+            .iter()
+            .any(|signature: &AirPatternBindingSignature| signature.local == binding.local)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::PatternAlternativeBindingMismatch(
+                    binding.local,
+                )),
+            );
+        }
+        signatures.push(AirPatternBindingSignature {
+            local: binding.local,
+            ty: binding.ty,
+            mode: binding.mode,
+        });
+    }
+    signatures.sort_by_key(|signature| signature.sort_key());
+    signatures
+}
+
+fn report_pattern_binding_mismatch(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    expected: &[AirPatternBindingSignature],
+    found: &[AirPatternBindingSignature],
+) {
+    if let Some(signature) = expected
+        .iter()
+        .chain(found)
+        .find(|signature| expected.contains(signature) != found.contains(signature))
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFunction(BadFunction::PatternAlternativeBindingMismatch(
+                signature.local,
+            )),
+        );
+    }
+}
+
+fn verify_pattern_binding(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    function_id: FunctionId,
+    subject_ty: TypeId,
+    guards: &[AirPatternVariantGuard],
+    optional_guards: &[AirPatternPath],
+    binding: &AirPatternBinding,
+    state: &mut LocalInit,
+) {
+    let Some(local) = cx
+        .program
+        .function(function_id)
+        .locals
+        .get(binding.local.index())
+    else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidLocal(binding.local)),
+        );
+        return;
+    };
+    let Some(path_ty) =
+        verify_pattern_path(cx, site, subject_ty, guards, optional_guards, &binding.path)
+    else {
+        return;
+    };
+    if !same_type(cx, path_ty, binding.ty) || !same_type(cx, local.ty, binding.ty) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::InitTypeMismatch {
+                expected: path_ty,
+                found: binding.ty,
+            }),
+        );
+    }
+    state.init(binding.local);
+    state.set_local_value(binding.local, FunctionValueState::non_function());
+}
+
+fn verify_pattern_path(
+    cx: &mut VerifyCx<'_>,
+    site: &VerifySite,
+    subject_ty: TypeId,
+    guards: &[AirPatternVariantGuard],
+    optional_guards: &[AirPatternPath],
+    path: &AirPatternPath,
+) -> Option<TypeId> {
+    let mut ty = subject_ty;
+    let mut prefix = AirPatternPath::default();
+    for step in &path.steps {
+        if let Some((enum_id, variant)) = pattern_step_enum_payload_guard(step)
+            && !guards.iter().any(|guard| {
+                guard.path == prefix && guard.enum_id == enum_id && guard.variant == variant
+            })
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::PatternPayloadWithoutVariantTest),
+            );
+            return None;
+        }
+        if matches!(step, AirPatternPathStep::OptionalSome)
+            && !optional_guards.iter().any(|guard| guard == &prefix)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::PatternPayloadWithoutVariantTest),
+            );
+            return None;
+        }
+        let Some(next_ty) = pattern_path_step_ty(cx, ty, step) else {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFunction(BadFunction::PatternPathInvalid),
+            );
+            return None;
+        };
+        prefix.steps.push(step.clone());
+        ty = next_ty;
+    }
+    Some(ty)
+}
+
+fn pattern_step_enum_payload_guard(step: &AirPatternPathStep) -> Option<(EnumId, VariantId)> {
+    match step {
+        AirPatternPathStep::EnumTupleField {
+            enum_id, variant, ..
+        }
+        | AirPatternPathStep::EnumStructField {
+            enum_id, variant, ..
+        } => Some((*enum_id, *variant)),
+        AirPatternPathStep::Field(_)
+        | AirPatternPathStep::TupleField(_)
+        | AirPatternPathStep::OptionalSome => None,
+    }
+}
+
+fn pattern_path_step_ty(
+    cx: &mut VerifyCx<'_>,
+    source_ty: TypeId,
+    step: &AirPatternPathStep,
+) -> Option<TypeId> {
+    match step {
+        AirPatternPathStep::Field(field) => typing::field_by_id(cx.program, source_ty, *field),
+        AirPatternPathStep::TupleField(index) => typing::tuple_field(cx.program, source_ty, *index),
+        AirPatternPathStep::OptionalSome => typing::optional_inner(cx.program, source_ty),
+        AirPatternPathStep::EnumTupleField {
+            enum_id,
+            variant,
+            field,
+        } => enum_payload_field_ty(
+            cx,
+            source_ty,
+            *enum_id,
+            *variant,
+            VariantShapeKind::Tuple,
+            *field,
+        ),
+        AirPatternPathStep::EnumStructField {
+            enum_id,
+            variant,
+            field,
+        } => enum_payload_field_ty(
+            cx,
+            source_ty,
+            *enum_id,
+            *variant,
+            VariantShapeKind::Struct,
+            *field,
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariantShapeKind {
+    Tuple,
+    Struct,
+}
+
+fn enum_payload_field_ty(
+    cx: &mut VerifyCx<'_>,
+    source_ty: TypeId,
+    enum_id: EnumId,
+    variant: VariantId,
+    expected_kind: VariantShapeKind,
+    field: u16,
+) -> Option<TypeId> {
+    match cx.type_data(source_ty) {
+        Some(TypeData::Enum(found))
+            if *found == enum_id && cx.variant_belongs_to_enum(enum_id, variant) => {}
+        Some(_) | None => return None,
+    }
+    let variant = &cx.program.enum_decl(enum_id).variants[variant.index()];
+    match (&variant.shape, expected_kind) {
+        (VariantShape::Tuple(fields), VariantShapeKind::Tuple) => {
+            fields.get(field as usize).copied()
+        }
+        (VariantShape::Struct(fields), VariantShapeKind::Struct) => {
+            fields.get(field as usize).map(|field| field.ty)
+        }
+        _ => None,
+    }
 }
 
 fn verify_air_optional_match(
@@ -7163,53 +7511,6 @@ fn verify_place(
                     cx.push(
                         site.clone(),
                         VerifyErrorKind::BadPlace(BadPlace::TupleProjectionOnNonTuple(current_ty)),
-                    );
-                    return None;
-                }
-            },
-            Projection::VariantField {
-                enum_id,
-                variant,
-                field,
-            } => match data {
-                TypeData::Enum(eid) if *eid == *enum_id => {
-                    let Some(enm) = cx.program.enums.get(enum_id.index()) else {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadReference(BadReference::InvalidEnum(*enum_id)),
-                        );
-                        return None;
-                    };
-                    let Some(shape) = enm.variants.get(variant.index()).map(|decl| &decl.shape)
-                    else {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadReference(BadReference::InvalidVariant {
-                                enum_id: *enum_id,
-                                variant: *variant,
-                            }),
-                        );
-                        return None;
-                    };
-                    let Some(ty) =
-                        typing::enum_variant_field(cx.program, current_ty, *variant, *field)
-                    else {
-                        cx.push(
-                            site.clone(),
-                            VerifyErrorKind::BadPlace(BadPlace::VariantFieldOutOfRange {
-                                ty: current_ty,
-                                index: *field,
-                                len: typing::variant_field_count(shape),
-                            }),
-                        );
-                        return None;
-                    };
-                    current_ty = ty;
-                }
-                _ => {
-                    cx.push(
-                        site.clone(),
-                        VerifyErrorKind::BadPlace(BadPlace::VariantProjectionOnNonEnum(current_ty)),
                     );
                     return None;
                 }

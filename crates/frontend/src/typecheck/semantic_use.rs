@@ -39,6 +39,284 @@ pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
 pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFact>;
 pub(crate) type CaptureCellRequirementMap = HashMap<BindingId, CaptureCellRequirementFact>;
 pub(crate) type IterRuntimeCheckMap = HashMap<ExprId, IterRuntimeCheckFact>;
+pub(crate) type CheckedMatchPlanMap = HashMap<ExprId, CheckedMatchPlan>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedMatchPlan {
+    pub(crate) expr: ExprId,
+    pub(crate) access: CheckedMatchAccess,
+    pub(crate) arms: Vec<CheckedMatchArm>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckedMatchAccess {
+    Owned,
+    RefAlias,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedMatchArm {
+    pub(crate) pattern: CheckedPattern,
+    pub(crate) bindings: CheckedPatternBindings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CheckedPatternBindings {
+    pub(crate) bindings: Vec<CheckedPatternBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedPatternBinding {
+    pub(crate) name: Ident,
+    pub(crate) span: SourceSpan,
+    pub(crate) local: SemanticLocalId,
+    pub(crate) binding_id: Option<BindingId>,
+    pub(crate) ty: Type,
+    pub(crate) mutable: bool,
+    pub(crate) kind: CheckedPatternBindingKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckedPatternBindingKind {
+    Owned,
+    Alias(CheckedPatternAlias),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedPatternAlias {
+    pub(crate) target: CheckedPatternPath,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CheckedPatternPath {
+    pub(crate) segments: Vec<CheckedPatternPathSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckedPatternPathSegment {
+    TupleField(usize),
+    StructField {
+        owner: NominalKey,
+        field: Ident,
+        slot: usize,
+    },
+    OptionalSome,
+    EnumTupleField {
+        owner: NominalKey,
+        variant: Ident,
+        field: usize,
+    },
+    EnumStructField {
+        owner: NominalKey,
+        variant: Ident,
+        field: Ident,
+        slot: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckedPattern {
+    Wildcard,
+    Binding(CheckedBindingOccurrence),
+    Literal(CheckedLiteralPattern),
+    Nil,
+    OptionalSome(Box<CheckedPattern>),
+    Tuple(Vec<CheckedPattern>),
+    Struct {
+        owner: CheckedPatternOwner,
+        fields: Vec<CheckedStructField>,
+    },
+    Enum {
+        owner: CheckedPatternOwner,
+        variant: Ident,
+        payload: CheckedEnumPayload,
+    },
+    Or(Vec<CheckedPatternAlternative>),
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedBindingOccurrence {
+    pub(crate) name: Ident,
+    pub(crate) span: SourceSpan,
+    pub(crate) local: SemanticLocalId,
+    pub(crate) binding_id: Option<BindingId>,
+    pub(crate) ty: Type,
+    pub(crate) mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedLiteralPattern {
+    pub(crate) value: ConstValue,
+    pub(crate) ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedPatternOwner {
+    pub(crate) key: NominalKey,
+    pub(crate) ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedStructField {
+    pub(crate) name: Ident,
+    pub(crate) slot: usize,
+    pub(crate) pattern: CheckedPattern,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckedEnumPayload {
+    Unit,
+    Tuple(Vec<CheckedPattern>),
+    Struct(Vec<CheckedStructField>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedPatternAlternative {
+    pub(crate) pattern: CheckedPattern,
+    pub(crate) bindings: CheckedPatternBindings,
+}
+
+impl CheckedMatchPlan {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        for arm in &mut self.arms {
+            arm.finish_types(locals);
+        }
+    }
+
+    fn validate(&self, expr_id: ExprId, finished: bool) {
+        debug_assert_eq!(self.expr, expr_id);
+        for arm in &self.arms {
+            arm.validate(finished);
+        }
+    }
+}
+
+impl CheckedMatchArm {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        self.pattern.finish_types(locals);
+        self.bindings.finish_types(locals);
+    }
+
+    fn validate(&self, finished: bool) {
+        self.pattern.validate(finished);
+    }
+}
+
+impl CheckedPatternBindings {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        for binding in &mut self.bindings {
+            binding.finish_type(locals);
+        }
+    }
+}
+
+impl CheckedPatternBinding {
+    fn finish_type(&mut self, locals: &LocalFacts) {
+        if let Some(fact) = locals.defs.get(&self.local) {
+            self.ty = fact.ty.clone();
+            self.binding_id = fact.binding_id;
+        }
+    }
+}
+
+impl CheckedPattern {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        match self {
+            Self::Wildcard | Self::Literal(_) | Self::Nil | Self::Unsupported => {}
+            Self::Binding(binding) => binding.finish_type(locals),
+            Self::OptionalSome(pattern) => pattern.finish_types(locals),
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.finish_types(locals);
+                }
+            }
+            Self::Struct { fields, .. } => {
+                for field in fields {
+                    field.pattern.finish_types(locals);
+                }
+            }
+            Self::Enum { payload, .. } => payload.finish_types(locals),
+            Self::Or(alternatives) => {
+                for alternative in alternatives {
+                    alternative.pattern.finish_types(locals);
+                    alternative.bindings.finish_types(locals);
+                }
+            }
+        }
+    }
+
+    fn validate(&self, finished: bool) {
+        match self {
+            Self::Wildcard
+            | Self::Binding(_)
+            | Self::Literal(_)
+            | Self::Nil
+            | Self::Unsupported => {}
+            Self::OptionalSome(pattern) => pattern.validate(finished),
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.validate(finished);
+                }
+            }
+            Self::Struct { fields, .. } => {
+                for field in fields {
+                    field.pattern.validate(finished);
+                }
+            }
+            Self::Enum { payload, .. } => payload.validate(finished),
+            Self::Or(alternatives) => {
+                debug_assert!(!alternatives.is_empty());
+                for alternative in alternatives {
+                    alternative.pattern.validate(finished);
+                }
+            }
+        }
+    }
+}
+
+impl CheckedBindingOccurrence {
+    fn finish_type(&mut self, locals: &LocalFacts) {
+        if let Some(fact) = locals.defs.get(&self.local) {
+            self.ty = fact.ty.clone();
+            self.binding_id = fact.binding_id;
+        }
+    }
+}
+
+impl CheckedEnumPayload {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        match self {
+            Self::Unit => {}
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.finish_types(locals);
+                }
+            }
+            Self::Struct(fields) => {
+                for field in fields {
+                    field.pattern.finish_types(locals);
+                }
+            }
+        }
+    }
+
+    fn validate(&self, finished: bool) {
+        match self {
+            Self::Unit => {}
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.validate(finished);
+                }
+            }
+            Self::Struct(fields) => {
+                for field in fields {
+                    field.pattern.validate(finished);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IterRuntimeCheckKind {
@@ -372,6 +650,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) global_accesses: GlobalAccessMap,
     pub(crate) stringifies: StringifyMap,
     pub(crate) iter_runtime_checks: IterRuntimeCheckMap,
+    pub(crate) match_patterns: CheckedMatchPlanMap,
     pub(crate) locals: LocalFacts,
 }
 
@@ -394,6 +673,7 @@ impl SemanticBodyFacts {
         self.global_accesses.extend(facts.global_accesses);
         self.stringifies.extend(facts.stringifies);
         self.iter_runtime_checks.extend(facts.iter_runtime_checks);
+        self.match_patterns.extend(facts.match_patterns);
     }
 
     pub(crate) fn validate(&self) {
@@ -403,6 +683,9 @@ impl SemanticBodyFacts {
         self.validate_const_values(false);
         for (expr_id, fact) in &self.iter_runtime_checks {
             debug_assert_eq!(*expr_id, fact.expr);
+        }
+        for (expr_id, plan) in &self.match_patterns {
+            plan.validate(*expr_id, false);
         }
         for (expr_id, fact) in &self.function_values {
             debug_assert_eq!(*expr_id, fact.expr);
@@ -521,6 +804,9 @@ impl SemanticBodyFacts {
                 continue;
             };
             debug_assert_eq!(callee_fact.ty, fact.sig);
+        }
+        for plan in self.match_patterns.values() {
+            plan.validate(plan.expr, true);
         }
         for fact in self.stringifies.values() {
             debug_assert!(!type_has_unfinished_facts(&fact.source_ty));
@@ -697,6 +983,12 @@ impl SemanticFactMaps {
             .insert(site.expr, fact);
     }
 
+    pub(crate) fn record_match_plan(&mut self, site: SemanticExprSite, plan: CheckedMatchPlan) {
+        self.body_mut(site.body)
+            .match_patterns
+            .insert(site.expr, plan);
+    }
+
     pub(crate) fn record_function_value(
         &mut self,
         site: SemanticExprSite,
@@ -812,6 +1104,19 @@ impl SemanticFactMaps {
                 source_ty: Type::Infer,
             },
         );
+    }
+
+    pub(crate) fn finish_match_plans(&mut self) {
+        for body in self.bodies.values_mut() {
+            let SemanticBodyFacts {
+                locals,
+                match_patterns,
+                ..
+            } = body;
+            for plan in match_patterns.values_mut() {
+                plan.finish_types(locals);
+            }
+        }
     }
 
     pub(crate) fn finish_stringifies(&mut self) {

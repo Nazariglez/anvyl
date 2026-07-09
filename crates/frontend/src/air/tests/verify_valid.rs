@@ -1478,59 +1478,6 @@ fn structured_branch_result_initialized_in_both_arms() {
 }
 
 #[test]
-fn structured_exhaustive_unit_enum_match() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-    let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("Choice"),
-        module,
-        core: None,
-        repr: crate::air::EnumRepr::Adt,
-        raw_type: None,
-        type_args: vec![],
-        const_args: vec![],
-        variants: vec![
-            VariantDecl {
-                name: Ident::new("A"),
-                shape: VariantShape::Unit,
-                raw_value: None,
-            },
-            VariantDecl {
-                name: Ident::new("B"),
-                shape: VariantShape::Unit,
-                raw_value: None,
-            },
-        ],
-    });
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-    let mut fb = FunctionBuilder::new("match_enum", module, FunctionKind::Normal, void_ty);
-    let discr = fb.push_param("value", enum_ty, ParamRole::Normal);
-    fb.push_block(term_return_void());
-    let func_id = builder.alloc_function(fb.finish());
-    let arm = |variant| AirEnumMatchArm {
-        variant,
-        block: AirBlock {
-            stmts: vec![],
-            tail: AirTail::Return(None),
-        },
-    };
-    let body = AirBody {
-        block: AirBlock {
-            stmts: vec![AirStmt::EnumMatch(AirEnumMatch {
-                discr: place(discr, enum_ty),
-                arms: vec![arm(VariantId::from_index(0)), arm(VariantId::from_index(1))],
-                else_block: None,
-            })],
-            tail: AirTail::Unreachable,
-        },
-    };
-    let program = builder.finish();
-
-    verify_structured_body(&program, func_id, &body).unwrap();
-}
-
-#[test]
 fn init_and_assign_mutable_local() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
@@ -1691,75 +1638,6 @@ fn fn_aggregate() {
     fb.add_statement(block0, stmt_eval(RValue::Use(Operand::Place(x_proj))));
     fb.add_statement(block0, stmt_eval(RValue::Use(Operand::Place(y_proj))));
     fb.add_statement(block0, stmt_eval(RValue::Use(op_place(local_agg, agg_ty))));
-
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-    expect_verified(&builder.finish());
-}
-
-#[test]
-fn enum_switch() {
-    let mut builder = ProgramBuilder::default();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-
-    let enum_id = builder.alloc_enum(EnumDecl {
-        name: Ident::new("Color"),
-        module,
-        core: None,
-        repr: crate::air::EnumRepr::Adt,
-        raw_type: None,
-        type_args: vec![],
-        const_args: vec![],
-        variants: vec![
-            VariantDecl {
-                name: Ident::new("Red"),
-                shape: VariantShape::Unit,
-                raw_value: None,
-            },
-            VariantDecl {
-                name: Ident::new("Green"),
-                shape: VariantShape::Unit,
-                raw_value: None,
-            },
-            VariantDecl {
-                name: Ident::new("Blue"),
-                shape: VariantShape::Unit,
-                raw_value: None,
-            },
-        ],
-    });
-    let enum_ty = builder.alloc_type(TypeData::Enum(enum_id));
-
-    let mut fb = FunctionBuilder::new("switch_color", module, FunctionKind::Normal, void_ty);
-    let p_c = fb.push_param("c", enum_ty, ParamRole::Normal);
-    let block = fb.push_block(term_return_void());
-    fb.add_statement(
-        block,
-        AirStmt::EnumMatch(AirEnumMatch {
-            discr: place(p_c, enum_ty),
-            arms: vec![
-                AirEnumMatchArm {
-                    variant: VariantId::from_index(0),
-                    block: AirBlock {
-                        stmts: vec![],
-                        tail: term_return_void(),
-                    },
-                },
-                AirEnumMatchArm {
-                    variant: VariantId::from_index(1),
-                    block: AirBlock {
-                        stmts: vec![],
-                        tail: term_return_void(),
-                    },
-                },
-            ],
-            else_block: Some(AirBlock {
-                stmts: vec![],
-                tail: term_return_void(),
-            }),
-        }),
-    );
 
     let fid = builder.alloc_function(fb.finish());
     builder.set_entry(fid);

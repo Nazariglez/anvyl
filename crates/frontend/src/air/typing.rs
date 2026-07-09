@@ -1,7 +1,7 @@
 use super::{
     ConstValue, Program, TypeData,
     body::{CallArg, Callee, Operand, RValue},
-    ids::{ConstId, ExternId, FieldId, FunctionId, TypeId, VariantId},
+    ids::{ConstId, ExternId, FieldId, FunctionId, TypeId},
 };
 use crate::ast::{Ident, ScalarKind};
 
@@ -471,22 +471,4 @@ pub(crate) fn variant_field_ty(shape: &super::VariantShape, index: usize) -> Opt
         super::VariantShape::Tuple(fields) => fields.get(index).copied(),
         super::VariantShape::Struct(fields) => fields.get(index).map(|field| field.ty),
     }
-}
-
-pub(crate) fn enum_variant_field(
-    program: &Program,
-    ty: TypeId,
-    variant: VariantId,
-    field: u16,
-) -> Option<TypeId> {
-    let TypeData::Enum(enum_id) = program.type_arena.get(ty)? else {
-        return None;
-    };
-    let shape = &program
-        .enums
-        .get(enum_id.index())?
-        .variants
-        .get(variant.index())?
-        .shape;
-    variant_field_ty(shape, field as usize)
 }

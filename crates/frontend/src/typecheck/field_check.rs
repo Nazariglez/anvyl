@@ -21,6 +21,7 @@ pub(super) struct FieldUse {
 pub(super) struct CheckedField {
     pub(super) name: Ident,
     pub(super) index: usize,
+    pub(super) slot: usize,
     pub(super) ty: Type,
     pub(super) policy: AccessPolicy,
 }
@@ -132,11 +133,12 @@ pub(super) fn check(
             continue;
         }
         match schema.get(field.name) {
-            Some(schema) => fields.push(CheckedField {
+            Some(field_schema) => fields.push(CheckedField {
                 name: field.name,
                 index: field.index,
-                ty: schema.ty.clone(),
-                policy: schema.policy.clone(),
+                slot: schema.slot(field.name).expect("field schema exists"),
+                ty: field_schema.ty.clone(),
+                policy: field_schema.policy.clone(),
             }),
             None => {
                 invalid_indices.push(field.index);

@@ -1,21 +1,21 @@
 use super::{
     PatternBindMode, PatternContext, PlaceAccess, TypeChecker, TypeError, downcast,
-    pattern::{self, PatternOutcome, PatternPlace},
+    pattern::{self, PatternCheckResult, PatternOutcome, PatternPlace},
 };
 use crate::{
     ast::{ExprId, Ident, Match, MatchArmHead, MatchArmNode, Type},
     span::Span,
 };
 
-pub(super) fn check_arm_head(
+pub(super) fn check_arm_head_detailed(
     head: &MatchArmHead,
     scrutinee: PatternPlace,
     mode: PatternBindMode,
     scrutinee_id: ExprId,
     tc: &mut TypeChecker,
-) -> PatternOutcome {
+) -> PatternCheckResult {
     match head {
-        MatchArmHead::Pattern(pattern) => pattern::check_place_at(
+        MatchArmHead::Pattern(pattern) => pattern::check_place_at_detailed(
             pattern,
             scrutinee,
             mode,
@@ -23,7 +23,9 @@ pub(super) fn check_arm_head(
             PatternContext::Match,
             tc,
         ),
-        MatchArmHead::DynDowncast(_) | MatchArmHead::DynFallback(_) => PatternOutcome::error(),
+        MatchArmHead::DynDowncast(_) | MatchArmHead::DynFallback(_) => {
+            PatternCheckResult::empty(PatternOutcome::error())
+        }
     }
 }
 

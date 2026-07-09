@@ -5,29 +5,29 @@ use anvyx_externs::ParamFlow;
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionFor,
     AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot,
-    AirCollectionSlotKind, AirCollectionSlotScope, AirEnumMatch, AirEnumMatchArm, AirIf, AirLoop,
-    AirLoopId, AirMapEntryMatch, AirOptionalMatch, AirOrdinalAdapter, AirOrdinalPlan, AirRangeFor,
-    AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee, CaptureCellDecl, CaptureCellId,
-    CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId, ConstValue, CoreEnumKind,
-    DynContractData, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl, ExternFieldDecl,
-    ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
-    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
-    ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function, FunctionId, FunctionKind,
-    FunctionOwner, FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId,
-    GlobalInitEffect, IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId,
-    LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
-    Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
-    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
-    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
-    VerifyError, ownership, place_model,
+    AirCollectionSlotKind, AirCollectionSlotScope, AirIf, AirLoop, AirLoopId, AirMapEntryMatch,
+    AirOptionalMatch, AirOrdinalAdapter, AirOrdinalPlan, AirPatternAlternative, AirPatternArm,
+    AirPatternBinding, AirPatternBindingMode, AirPatternMatch, AirPatternPath, AirPatternPathStep,
+    AirPatternTest, AirRangeFor, AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee,
+    CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId,
+    ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl,
+    ExternDecl, ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl,
+    ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
+    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function,
+    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, FunctionValueCapability,
+    GlobalDecl, GlobalId, GlobalInitEffect, IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl,
+    LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind,
+    MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape,
+    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode,
+    ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData,
+    TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
 use crate::{
     ast::{
-        self, ArrayLen, AssignOp, BinaryOp, BlockNode, EnumPatternPayload, ExprId, ExprKind,
-        ExprNode, Ident, Lit, Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode,
-        Type,
+        self, ArrayLen, AssignOp, BinaryOp, BlockNode, ExprId, ExprKind, ExprNode, Ident, Lit,
+        Mutability as AstMutability, Pattern, ReturnAccess, Stmt, StmtNode, Type,
     },
     collection_effect,
     externs::catalog::{ExternCatalog, ExternLoweringInfo},
@@ -36,17 +36,19 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallTarget, CallableId, CallableInstanceKey,
-        CallableKind, CallableParent, CaptureStorageOrigin, ConstTerm, CoreRangeKind,
-        DeclarationIndex, DefaultArgFact, DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId,
-        ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin,
-        GenericArgs, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect,
-        GlobalKey, GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
-        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
-        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
-        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
-        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
-        VariantPayload, generic_args_are_concrete, nominal_generic_args, nominal_key_for_type,
-        substitute_aggregate_member, type_has_unfinished_facts,
+        CallableKind, CallableParent, CaptureStorageOrigin, CheckedEnumPayload,
+        CheckedLiteralPattern, CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan,
+        CheckedPattern, CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternOwner,
+        ConstTerm, CoreRangeKind, DeclarationIndex, DefaultArgFact, DefaultExprSite,
+        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueEscapeCapability,
+        FunctionValueKind, FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
+        GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, IterRuntimeCheckKind,
+        LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
+        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
+        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
+        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
+        TypecheckFacts, VariantPayload, generic_args_are_concrete, nominal_generic_args,
+        nominal_key_for_type, substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
 
@@ -1829,11 +1831,6 @@ impl LowerCx<'_> {
     }
 }
 
-type EnumMatchArms<'a> = (
-    Vec<(crate::air::VariantId, &'a ast::PatternNode, &'a ExprNode)>,
-    Option<&'a ExprNode>,
-);
-
 type ParamLowerResult = (Vec<Param>, Vec<Local>, HashMap<SemanticLocalId, LocalId>);
 
 struct ParamLowerSpec<'a> {
@@ -2528,43 +2525,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
             return Err(unsupported_expr(expr));
         }
-        if self.is_optional_expr(&match_expr.node.scrutinee)? {
-            return self.lower_optional_match_effect(expr, match_expr);
+        let plan = self.checked_match_plan(expr)?;
+        if match_expr.node.access.is_ref() && self.is_optional_expr(&match_expr.node.scrutinee)? {
+            return self.lower_optional_match_effect(expr, match_expr, &plan);
         }
-        let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
-        let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
-        let mut air_arms = vec![];
-        let mut any_falls = false;
-        for (variant, pattern, body) in arms {
-            let block = self.lower_nested_enum_match_arm(
-                body,
-                pattern,
-                &discr,
-                variant,
-                match_expr.node.access.is_ref(),
-                match_expr.node.scrutinee.node.id,
-                MatchOutput::Effect,
-            )?;
-            any_falls |= air_block_falls_through(&block);
-            air_arms.push(AirEnumMatchArm { variant, block });
-        }
-        let else_block = if let Some(body) = else_arm {
-            let block = self.lower_nested_expr_effect(body)?;
-            any_falls |= air_block_falls_through(&block);
-            Some(block)
-        } else {
-            None
-        };
-        self.ensure_open()?;
-        self.block.stmts.push(AirStmt::EnumMatch(AirEnumMatch {
-            discr,
-            arms: air_arms,
-            else_block,
-        }));
-        if !any_falls {
-            self.terminate(AirTail::Unreachable)?;
-        }
-        Ok(())
+        self.lower_pattern_match_effect(expr, match_expr, &plan)
     }
 
     fn lower_stmt(&mut self, stmt: &StmtNode) -> Result<(), LowerError> {
@@ -6422,62 +6387,30 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
             return Err(unsupported_expr(expr));
         }
-        if self.is_optional_expr(&match_expr.node.scrutinee)? {
+        let plan = self.checked_match_plan(expr)?;
+        if match_expr.node.access.is_ref() && self.is_optional_expr(&match_expr.node.scrutinee)? {
             let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
             let result = self.temp(result_ty);
-            return self.lower_optional_match_value(expr, match_expr, result, result_ty);
+            return self.lower_optional_match_value(expr, match_expr, &plan, result, result_ty);
         }
         let result_ty = match self.lower_expr_ty(expr.node.id)? {
-            ty @ (Type::Int | Type::Float | Type::Bool | Type::String) => self.cx.lower_ty(&ty)?,
-            _ => return Err(unsupported_expr(expr)),
+            Type::Void => return Err(unsupported_expr(expr)),
+            ty => self.cx.lower_ty(&ty)?,
         };
         let result = self.temp(result_ty);
-        let discr = self.lower_enum_match_discr(expr, &match_expr.node.scrutinee)?;
-        let (arms, else_arm) = self.enum_match_arms(expr, discr.ty, &match_expr.node.arms)?;
-        let mut any_falls = false;
-        let mut air_arms = vec![];
-        for (variant, pattern, body) in arms {
-            let block = self.lower_nested_enum_match_arm(
-                body,
-                pattern,
-                &discr,
-                variant,
-                match_expr.node.access.is_ref(),
-                match_expr.node.scrutinee.node.id,
-                MatchOutput::Value { result, result_ty },
-            )?;
-            any_falls |= air_block_falls_through(&block);
-            air_arms.push(AirEnumMatchArm { variant, block });
-        }
-        let else_block = if let Some(body) = else_arm {
-            let block = self.lower_nested_expr_branch_value(body, result)?;
-            any_falls |= air_block_falls_through(&block);
-            Some(block)
-        } else {
-            None
-        };
-        self.ensure_open()?;
-        self.block.stmts.push(AirStmt::EnumMatch(AirEnumMatch {
-            discr,
-            arms: air_arms,
-            else_block,
-        }));
-        if !any_falls {
-            self.terminate(AirTail::Unreachable)?;
-            return self.dummy_operand(result_ty);
-        }
-        Ok(self.operand_place(result))
+        self.lower_pattern_match_value(expr, match_expr, &plan, result, result_ty)
     }
 
     fn lower_optional_match_effect(
         &mut self,
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
+        checked: &CheckedMatchPlan,
     ) -> Result<(), LowerError> {
         let alias = match_expr.node.access.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
-        let plan = optional_match_plan(expr, &match_expr.node.arms)?;
+        let plan = optional_match_plan(expr, &match_expr.node.arms, checked)?;
         let mode = optional_match_payload_mode(&plan, alias);
         let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
         let (some_block, none_block) = self.lower_optional_match_blocks(
@@ -6506,13 +6439,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         &mut self,
         expr: &ExprNode,
         match_expr: &ast::MatchNode,
+        checked: &CheckedMatchPlan,
         result: LocalId,
         result_ty: TypeId,
     ) -> Result<Operand, LowerError> {
         let alias = match_expr.node.access.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&match_expr.node.scrutinee, expr, alias)?;
-        let plan = optional_match_plan(expr, &match_expr.node.arms)?;
+        let plan = optional_match_plan(expr, &match_expr.node.arms, checked)?;
         let mode = optional_match_payload_mode(&plan, alias);
         let payload = mode.needs_payload().then(|| self.temp(subject.inner_ty()));
         let (some_block, none_block) = self.lower_optional_match_blocks(
@@ -6623,172 +6557,529 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn checked_match_plan(&self, expr: &ExprNode) -> Result<CheckedMatchPlan, LowerError> {
+        self.facts
+            .match_patterns
+            .get(&expr.node.id)
+            .cloned()
+            .ok_or(LowerError::MissingTypecheckFacts)
+    }
+
     fn is_optional_expr(&mut self, expr: &ExprNode) -> Result<bool, LowerError> {
         let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         Ok(typing::optional_inner(&self.cx.program, ty).is_some())
     }
 
-    fn lower_enum_match_discr(
+    fn lower_pattern_subject(
         &mut self,
         owner: &ExprNode,
         scrutinee: &ExprNode,
+        access: CheckedMatchAccess,
     ) -> Result<Place, LowerError> {
-        match self.lower_value(scrutinee)? {
-            Operand::Place(place)
-                if matches!(self.cx.program.type_data(place.ty), TypeData::Enum(_)) =>
-            {
-                Ok(place)
+        let subject = match access {
+            CheckedMatchAccess::Owned => self.lower_value(scrutinee)?,
+            CheckedMatchAccess::RefAlias => {
+                let fact = self.local_use(scrutinee, LocalUseMode::MutBorrow)?;
+                Operand::Place(self.lower_place(scrutinee, &fact)?)
             }
-            _ => Err(unsupported_expr(owner)),
+        };
+        let ty = self.operand_ty(&subject);
+        if !matches!(
+            self.cx.program.type_data(ty),
+            TypeData::Bool
+                | TypeData::Int
+                | TypeData::Float
+                | TypeData::String
+                | TypeData::Optional(_)
+                | TypeData::Tuple(_)
+                | TypeData::Enum(_)
+        ) {
+            return Err(unsupported_expr(owner));
+        }
+        match subject {
+            Operand::Place(place) => Ok(place),
+            Operand::Const(value) => {
+                let local = self.temp(ty);
+                self.emit_init(local, RValue::Use(Operand::Const(value)))?;
+                Ok(self.local_place(local))
+            }
         }
     }
 
-    fn enum_match_arms<'a>(
-        &self,
+    fn lower_pattern_match_effect(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+        plan: &CheckedMatchPlan,
+    ) -> Result<(), LowerError> {
+        let subject = self.lower_pattern_subject(expr, &match_expr.node.scrutinee, plan.access)?;
+        let arms = self.lower_pattern_match_arms(expr, match_expr, plan, MatchOutput::Effect)?;
+        self.push_pattern_match(subject, arms)
+    }
+
+    fn lower_pattern_match_value(
+        &mut self,
+        expr: &ExprNode,
+        match_expr: &ast::MatchNode,
+        plan: &CheckedMatchPlan,
+        result: LocalId,
+        result_ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let subject = self.lower_pattern_subject(expr, &match_expr.node.scrutinee, plan.access)?;
+        let arms = self.lower_pattern_match_arms(
+            expr,
+            match_expr,
+            plan,
+            MatchOutput::Value { result, result_ty },
+        )?;
+        self.push_pattern_match(subject, arms)?;
+        if self.terminated {
+            return self.dummy_operand(result_ty);
+        }
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_pattern_match_arms(
+        &mut self,
         owner: &ExprNode,
-        enum_ty: TypeId,
-        arms: &'a [ast::MatchArmNode],
-    ) -> Result<EnumMatchArms<'a>, LowerError> {
-        let TypeData::Enum(enum_id) = self.cx.program.type_data(enum_ty) else {
-            return Err(unsupported_expr(owner));
-        };
-        let mut variants = vec![];
-        let mut else_arm = None;
-        for arm in arms {
-            let ast::MatchArmHead::Pattern(pattern) = &arm.node.head else {
+        match_expr: &ast::MatchNode,
+        plan: &CheckedMatchPlan,
+        output: MatchOutput,
+    ) -> Result<Vec<AirPatternArm>, LowerError> {
+        if match_expr.node.arms.len() != plan.arms.len() {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        let mut arms = vec![];
+        for (arm, checked) in match_expr.node.arms.iter().zip(&plan.arms) {
+            let ast::MatchArmHead::Pattern(_) = &arm.node.head else {
                 return Err(unsupported_expr(owner));
             };
-            match &pattern.node {
-                Pattern::Wildcard | Pattern::Ident(_) => {
-                    if else_arm.is_some() {
-                        return Err(unsupported_expr(owner));
-                    }
-                    else_arm = Some(&arm.node.body);
+            let alternatives = self.lower_pattern_alternatives(owner, checked)?;
+            let block = match output {
+                MatchOutput::Effect => self.lower_nested_expr_effect(&arm.node.body)?,
+                MatchOutput::Value { result, .. } => {
+                    self.lower_nested_expr_branch_value(&arm.node.body, result)?
                 }
-                Pattern::Enum { variant, .. } => {
-                    let Some(id) = self.enum_variant_id(*enum_id, *variant) else {
-                        return Err(unsupported_expr(owner));
-                    };
-                    if variants.iter().any(|(seen, _, _)| *seen == id) {
-                        return Err(unsupported_expr(owner));
-                    }
-                    variants.push((id, pattern, &arm.node.body));
-                }
-                _ => return Err(unsupported_expr(owner)),
-            }
+            };
+            arms.push(AirPatternArm {
+                alternatives,
+                block,
+            });
         }
-        if else_arm.is_none()
-            && variants.len() != self.cx.program.enum_decl(*enum_id).variants.len()
-        {
-            return Err(unsupported_expr(owner));
-        }
-        Ok((variants, else_arm))
+        Ok(arms)
     }
 
-    fn lower_nested_enum_match_arm(
+    fn lower_pattern_alternatives(
         &mut self,
-        body: &ExprNode,
-        pattern: &ast::PatternNode,
-        discr: &Place,
-        variant: crate::air::VariantId,
-        alias: bool,
-        site: ExprId,
-        output: MatchOutput,
-    ) -> Result<AirBlock, LowerError> {
-        self.with_nested_block(|this| {
-            this.lower_enum_match_pattern_bindings(pattern, discr, variant, alias, site)?;
-            this.lower_match_body(body, output)
+        owner: &ExprNode,
+        arm: &CheckedMatchArm,
+    ) -> Result<Vec<AirPatternAlternative>, LowerError> {
+        let alternatives = self.lower_checked_pattern_branches(
+            owner,
+            &arm.pattern,
+            &arm.bindings.bindings,
+            &AirPatternPath::default(),
+            vec![AirPatternAlternative::default()],
+        )?;
+        if alternatives.iter().all(Self::pattern_alternative_supported) {
+            Ok(alternatives)
+        } else {
+            Err(unsupported_expr(owner))
+        }
+    }
+
+    fn lower_checked_pattern_branches(
+        &mut self,
+        owner: &ExprNode,
+        pattern: &CheckedPattern,
+        bindings: &[CheckedPatternBinding],
+        path: &AirPatternPath,
+        alternatives: Vec<AirPatternAlternative>,
+    ) -> Result<Vec<AirPatternAlternative>, LowerError> {
+        match pattern {
+            CheckedPattern::Or(branches) => {
+                let mut lowered = vec![];
+                for alternative in alternatives {
+                    for branch in branches {
+                        lowered.extend(self.lower_checked_pattern_branches(
+                            owner,
+                            &branch.pattern,
+                            &branch.bindings.bindings,
+                            path,
+                            vec![alternative.clone()],
+                        )?);
+                    }
+                }
+                Ok(lowered)
+            }
+            CheckedPattern::Tuple(fields) => {
+                let mut alternatives = alternatives;
+                for (index, field) in fields.iter().enumerate() {
+                    let mut field_path = path.clone();
+                    field_path
+                        .steps
+                        .push(AirPatternPathStep::TupleField(index as u32));
+                    alternatives = self.lower_checked_pattern_branches(
+                        owner,
+                        field,
+                        bindings,
+                        &field_path,
+                        alternatives,
+                    )?;
+                }
+                Ok(alternatives)
+            }
+            CheckedPattern::Struct { fields, .. } => {
+                let mut alternatives = alternatives;
+                for field in fields {
+                    let mut field_path = path.clone();
+                    field_path
+                        .steps
+                        .push(AirPatternPathStep::Field(FieldId::from_index(field.slot)));
+                    alternatives = self.lower_checked_pattern_branches(
+                        owner,
+                        &field.pattern,
+                        bindings,
+                        &field_path,
+                        alternatives,
+                    )?;
+                }
+                Ok(alternatives)
+            }
+            CheckedPattern::OptionalSome(inner) => {
+                let mut some_path = path.clone();
+                some_path.steps.push(AirPatternPathStep::OptionalSome);
+                self.lower_checked_pattern_branches(
+                    owner,
+                    inner,
+                    bindings,
+                    &some_path,
+                    Self::add_optional_some_test(alternatives, path),
+                )
+            }
+            CheckedPattern::Enum {
+                owner: enum_owner,
+                variant,
+                payload,
+            } if self.checked_pattern_owner_is_optional(enum_owner)? => self
+                .lower_optional_enum_pattern_branches(
+                    owner,
+                    *variant,
+                    payload,
+                    bindings,
+                    path,
+                    alternatives,
+                ),
+            CheckedPattern::Enum {
+                owner: enum_owner,
+                variant,
+                payload,
+            } => {
+                let enum_id = self.checked_pattern_enum_id(owner, enum_owner)?;
+                let Some(variant_id) = self.enum_variant_id(enum_id, *variant) else {
+                    return Err(unsupported_expr(owner));
+                };
+                let mut alternatives = alternatives
+                    .into_iter()
+                    .map(|mut alternative| {
+                        alternative.tests.push(AirPatternTest::EnumVariant {
+                            path: path.clone(),
+                            enum_id,
+                            variant: variant_id,
+                        });
+                        alternative
+                    })
+                    .collect::<Vec<_>>();
+                match payload {
+                    CheckedEnumPayload::Unit => Ok(alternatives),
+                    CheckedEnumPayload::Tuple(fields) => {
+                        for (index, field) in fields.iter().enumerate() {
+                            let mut field_path = path.clone();
+                            field_path.steps.push(AirPatternPathStep::EnumTupleField {
+                                enum_id,
+                                variant: variant_id,
+                                field: index as u16,
+                            });
+                            alternatives = self.lower_checked_pattern_branches(
+                                owner,
+                                field,
+                                bindings,
+                                &field_path,
+                                alternatives,
+                            )?;
+                        }
+                        Ok(alternatives)
+                    }
+                    CheckedEnumPayload::Struct(fields) => {
+                        for field in fields {
+                            let mut field_path = path.clone();
+                            field_path.steps.push(AirPatternPathStep::EnumStructField {
+                                enum_id,
+                                variant: variant_id,
+                                field: field.slot as u16,
+                            });
+                            alternatives = self.lower_checked_pattern_branches(
+                                owner,
+                                &field.pattern,
+                                bindings,
+                                &field_path,
+                                alternatives,
+                            )?;
+                        }
+                        Ok(alternatives)
+                    }
+                }
+            }
+            CheckedPattern::Wildcard => Ok(alternatives),
+            CheckedPattern::Binding(binding) => alternatives
+                .into_iter()
+                .map(|mut alternative| {
+                    alternative
+                        .bindings
+                        .push(self.lower_checked_pattern_binding(
+                            owner,
+                            &CheckedPatternBinding {
+                                name: binding.name,
+                                span: binding.span,
+                                local: binding.local,
+                                binding_id: binding.binding_id,
+                                ty: binding.ty.clone(),
+                                mutable: binding.mutable,
+                                kind: Self::checked_pattern_binding_kind(bindings, binding.local),
+                            },
+                            path.clone(),
+                        )?);
+                    Ok(alternative)
+                })
+                .collect(),
+            CheckedPattern::Literal(literal) => alternatives
+                .into_iter()
+                .map(|mut alternative| {
+                    alternative
+                        .tests
+                        .push(self.lower_literal_pattern_test(literal, path.clone())?);
+                    Ok(alternative)
+                })
+                .collect(),
+            CheckedPattern::Nil => Ok(alternatives
+                .into_iter()
+                .map(|mut alternative| {
+                    alternative
+                        .tests
+                        .push(AirPatternTest::Nil { path: path.clone() });
+                    alternative
+                })
+                .collect()),
+            CheckedPattern::Unsupported => Err(LowerError::UnsupportedExpr {
+                expr_id: owner.node.id,
+                kind: "Match",
+            }),
+        }
+    }
+
+    fn add_optional_some_test(
+        alternatives: Vec<AirPatternAlternative>,
+        path: &AirPatternPath,
+    ) -> Vec<AirPatternAlternative> {
+        alternatives
+            .into_iter()
+            .map(|mut alternative| {
+                alternative
+                    .tests
+                    .push(AirPatternTest::OptionalSome { path: path.clone() });
+                alternative
+            })
+            .collect()
+    }
+
+    fn pattern_alternative_supported(alternative: &AirPatternAlternative) -> bool {
+        alternative.tests.iter().all(|test| match test {
+            AirPatternTest::Literal { path, .. }
+            | AirPatternTest::Nil { path }
+            | AirPatternTest::OptionalSome { path } => Self::pattern_path_supported(path),
+            AirPatternTest::EnumVariant { path, .. } => path.steps.is_empty(),
+        }) && alternative
+            .bindings
+            .iter()
+            .all(|binding| Self::pattern_path_supported(&binding.path))
+    }
+
+    fn pattern_path_supported(path: &AirPatternPath) -> bool {
+        path.steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                matches!(
+                    step,
+                    AirPatternPathStep::EnumTupleField { .. }
+                        | AirPatternPathStep::EnumStructField { .. }
+                )
+            })
+            .all(|(index, _)| index == 0)
+    }
+
+    fn checked_pattern_binding_kind(
+        bindings: &[CheckedPatternBinding],
+        local: SemanticLocalId,
+    ) -> CheckedPatternBindingKind {
+        bindings
+            .iter()
+            .find(|binding| binding.local == local)
+            .map_or(CheckedPatternBindingKind::Owned, |binding| {
+                binding.kind.clone()
+            })
+    }
+
+    fn checked_pattern_owner_is_optional(
+        &mut self,
+        owner: &CheckedPatternOwner,
+    ) -> Result<bool, LowerError> {
+        let ty = self.cx.lower_ty(&owner.ty)?;
+        Ok(matches!(
+            self.cx.program.type_data(ty),
+            TypeData::Optional(_)
+        ))
+    }
+
+    fn lower_optional_enum_pattern_branches(
+        &mut self,
+        owner: &ExprNode,
+        variant: Ident,
+        payload: &CheckedEnumPayload,
+        bindings: &[CheckedPatternBinding],
+        path: &AirPatternPath,
+        alternatives: Vec<AirPatternAlternative>,
+    ) -> Result<Vec<AirPatternAlternative>, LowerError> {
+        if variant == Ident::new("None") {
+            return Ok(alternatives
+                .into_iter()
+                .map(|mut alternative| {
+                    alternative
+                        .tests
+                        .push(AirPatternTest::Nil { path: path.clone() });
+                    alternative
+                })
+                .collect());
+        }
+        if variant != Ident::new("Some") {
+            return Err(unsupported_expr(owner));
+        }
+        let CheckedEnumPayload::Tuple(fields) = payload else {
+            return Err(unsupported_expr(owner));
+        };
+        let [field] = fields.as_slice() else {
+            return Err(unsupported_expr(owner));
+        };
+        let mut some_path = path.clone();
+        some_path.steps.push(AirPatternPathStep::OptionalSome);
+        self.lower_checked_pattern_branches(
+            owner,
+            field,
+            bindings,
+            &some_path,
+            Self::add_optional_some_test(alternatives, path),
+        )
+    }
+
+    fn checked_pattern_enum_id(
+        &mut self,
+        expr: &ExprNode,
+        owner: &CheckedPatternOwner,
+    ) -> Result<crate::air::EnumId, LowerError> {
+        let ty = self.cx.lower_ty(&owner.ty)?;
+        let TypeData::Enum(enum_id) = self.cx.program.type_data(ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        Ok(*enum_id)
+    }
+
+    fn lower_literal_pattern_test(
+        &mut self,
+        literal: &CheckedLiteralPattern,
+        path: AirPatternPath,
+    ) -> Result<AirPatternTest, LowerError> {
+        let ty = self.cx.lower_ty(&literal.ty)?;
+        let value = self.cx.program.alloc_const(ConstData {
+            ty,
+            value: lower_const_specialization_value(&literal.value),
+        });
+        Ok(AirPatternTest::Literal { path, value })
+    }
+
+    fn lower_checked_pattern_binding(
+        &mut self,
+        owner: &ExprNode,
+        binding: &CheckedPatternBinding,
+        path: AirPatternPath,
+    ) -> Result<AirPatternBinding, LowerError> {
+        let ty = self.cx.lower_ty(&binding.ty)?;
+        let mode = match &binding.kind {
+            CheckedPatternBindingKind::Owned => AirPatternBindingMode::Owned,
+            CheckedPatternBindingKind::Alias(_) => {
+                if !Self::pattern_alias_path_supported(&path) {
+                    return Err(LowerError::UnsupportedExpr {
+                        expr_id: owner.node.id,
+                        kind: "Match",
+                    });
+                }
+                AirPatternBindingMode::Alias
+            }
+        };
+        let local = match self.existing_semantic_local(binding.local) {
+            Some(local) => local,
+            None => {
+                let def = self.local_def(binding.local)?;
+                let local = self.push_local(
+                    Some(def.name),
+                    def.binding_id.map(air_binding_id),
+                    ty,
+                    match mode {
+                        AirPatternBindingMode::Owned if !def.mutable => AirMutability::Immutable,
+                        AirPatternBindingMode::Owned | AirPatternBindingMode::Alias => {
+                            AirMutability::Mutable
+                        }
+                    },
+                    match mode {
+                        AirPatternBindingMode::Owned => LocalKind::User,
+                        AirPatternBindingMode::Alias => LocalKind::PatternBinding,
+                    },
+                );
+                let place = self.local_place(local);
+                self.locals.insert(binding.local, place.clone());
+                self.insert_capture_source(binding.local, place)?;
+                local
+            }
+        };
+        Ok(AirPatternBinding {
+            local,
+            path,
+            ty,
+            mode,
         })
     }
 
-    fn lower_enum_match_pattern_bindings(
-        &mut self,
-        pattern: &ast::PatternNode,
-        discr: &Place,
-        variant: crate::air::VariantId,
-        alias: bool,
-        site: ExprId,
-    ) -> Result<(), LowerError> {
-        let Pattern::Enum { payload, .. } = &pattern.node else {
-            return Ok(());
-        };
-        let TypeData::Enum(enum_id) = self.cx.program.type_data(discr.ty) else {
-            return Err(unsupported_pattern_stmt(pattern));
-        };
-        let enum_id = *enum_id;
-        let places = {
-            let shape = &self.cx.program.enum_decl(enum_id).variants[variant.index()].shape;
-            match (payload, shape) {
-                (EnumPatternPayload::Unit, VariantShape::Unit) => return Ok(()),
-                (EnumPatternPayload::Tuple(patterns), VariantShape::Tuple(types))
-                    if patterns.len() == types.len() =>
-                {
-                    patterns
-                        .iter()
-                        .zip(types)
-                        .enumerate()
-                        .map(|(index, (pattern, &ty))| {
-                            (
-                                pattern,
-                                Self::enum_variant_field_place(
-                                    discr,
-                                    enum_id,
-                                    variant,
-                                    index as u16,
-                                    ty,
-                                ),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }
-                (EnumPatternPayload::Struct { fields, .. }, VariantShape::Struct(field_decls)) => {
-                    fields
-                        .iter()
-                        .map(|(name, pattern)| {
-                            let Some((index, field)) = field_decls
-                                .iter()
-                                .enumerate()
-                                .find(|(_, field)| field.name == *name)
-                            else {
-                                return Err(unsupported_pattern_stmt(pattern));
-                            };
-                            Ok((
-                                pattern,
-                                Self::enum_variant_field_place(
-                                    discr,
-                                    enum_id,
-                                    variant,
-                                    index as u16,
-                                    field.ty,
-                                ),
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                }
-                _ => return Err(unsupported_pattern_stmt(pattern)),
-            }
-        };
-        for (pattern, place) in places {
-            self.lower_for_pattern_binding_at(pattern, Operand::Place(place), alias, Some(site))?;
-        }
-        Ok(())
+    fn pattern_alias_path_supported(path: &AirPatternPath) -> bool {
+        matches!(
+            path.steps.as_slice(),
+            [AirPatternPathStep::EnumTupleField { .. }
+                | AirPatternPathStep::EnumStructField { .. }]
+        )
     }
 
-    fn enum_variant_field_place(
-        discr: &Place,
-        enum_id: crate::air::EnumId,
-        variant: crate::air::VariantId,
-        field: u16,
-        ty: TypeId,
-    ) -> Place {
-        let mut place = discr.clone();
-        place.projection.push(crate::air::Projection::VariantField {
-            enum_id,
-            variant,
-            field,
-        });
-        place.ty = ty;
-        place
+    fn push_pattern_match(
+        &mut self,
+        subject: Place,
+        arms: Vec<AirPatternArm>,
+    ) -> Result<(), LowerError> {
+        let any_falls = arms.iter().any(|arm| air_block_falls_through(&arm.block));
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::PatternMatch(AirPatternMatch { subject, arms }));
+        if !any_falls {
+            self.terminate(AirTail::Unreachable)?;
+        }
+        Ok(())
     }
 
     fn lower_block_branch_value(
@@ -8929,20 +9220,24 @@ fn classify_optional_pattern(
 fn optional_match_plan<'a>(
     owner: &ExprNode,
     arms: &'a [ast::MatchArmNode],
+    checked: &CheckedMatchPlan,
 ) -> Result<OptionalMatchPlan<'a>, LowerError> {
     let mut plan = OptionalMatchPlan {
         some: None,
         none: None,
         default: None,
     };
-    for arm in arms {
+    if arms.len() != checked.arms.len() {
+        return Err(LowerError::MissingTypecheckFacts);
+    }
+    for (arm, checked_arm) in arms.iter().zip(&checked.arms) {
         if plan.default.is_some() {
             continue;
         }
         let ast::MatchArmHead::Pattern(pattern) = &arm.node.head else {
             return Err(unsupported_expr(owner));
         };
-        match optional_arm(pattern, &arm.node.body)? {
+        match optional_arm(pattern, &checked_arm.pattern, &arm.node.body)? {
             OptionalArm::Some(pattern, body) => {
                 if plan.some.replace((pattern, body)).is_some() {
                     return Err(unsupported_expr(owner));
@@ -8972,14 +9267,28 @@ fn optional_match_plan<'a>(
 
 fn optional_arm<'a>(
     pattern: &'a ast::PatternNode,
+    checked: &CheckedPattern,
     body: &'a ExprNode,
 ) -> Result<OptionalArm<'a>, LowerError> {
-    match &pattern.node {
-        Pattern::Wildcard | Pattern::Ident(_) => Ok(OptionalArm::Default(pattern, body)),
-        _ => match classify_optional_pattern(pattern)? {
+    match checked {
+        CheckedPattern::Wildcard | CheckedPattern::Binding(_) => {
+            Ok(OptionalArm::Default(pattern, body))
+        }
+        CheckedPattern::Nil => Ok(OptionalArm::None(body)),
+        CheckedPattern::OptionalSome(_) => match classify_optional_pattern(pattern)? {
             OptionalPattern::Some(pattern) => Ok(OptionalArm::Some(pattern, body)),
-            OptionalPattern::None => Ok(OptionalArm::None(body)),
+            OptionalPattern::None => Err(unsupported_pattern_stmt(pattern)),
         },
+        CheckedPattern::Enum { variant, .. } if *variant == Ident::new("None") => {
+            Ok(OptionalArm::None(body))
+        }
+        CheckedPattern::Enum { variant, .. } if *variant == Ident::new("Some") => {
+            match classify_optional_pattern(pattern)? {
+                OptionalPattern::Some(pattern) => Ok(OptionalArm::Some(pattern, body)),
+                OptionalPattern::None => Err(unsupported_pattern_stmt(pattern)),
+            }
+        }
+        _ => Err(unsupported_pattern_stmt(pattern)),
     }
 }
 
@@ -13378,10 +13687,7 @@ mod tests {
             .get_mut(&main_body)
             .expect("main body facts")
             .calls
-            .insert(
-                ExprId(u64::MAX),
-                typecheck::CallTarget::new(id.clone(), args.clone()),
-            );
+            .insert(ExprId(u64::MAX), CallTarget::new(id.clone(), args.clone()));
         semantic
             .program
             .declaration_facts
@@ -13584,7 +13890,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_enum_match_lowers_to_structured_match() {
+    fn unit_enum_match_lowers_to_pattern_match() {
         let source = r"
             enum Color { Red, Blue }
             fn f(c: Color) -> int {
@@ -13604,31 +13910,8 @@ mod tests {
         let body = &function.body.block;
         assert!(matches!(
             body.stmts.as_slice(),
-            [.., AirStmt::EnumMatch(match_)] if match_.arms.len() == 2 && match_.else_block.is_none()
+            [.., AirStmt::PatternMatch(match_)] if match_.arms.len() == 2
         ));
-    }
-
-    #[test]
-    fn payload_enum_match_lowers_payload_binding() {
-        let source = r"
-            enum Event { Hit(int), Miss }
-            fn f(e: Event) -> int {
-                match e {
-                    Event.Hit(x) => x,
-                    Event.Miss => 0,
-                }
-            }
-        ";
-        let air = lower_root(source, "f").expect("lower failed");
-        let f = air
-            .functions
-            .iter()
-            .find(|function| function.name == Ident::new("f"))
-            .expect("function missing");
-        assert!(function_statements(f).any(|stmt| {
-            matches!(stmt, AirStmt::Init { value: RValue::Use(Operand::Place(place)), .. }
-                if matches!(place.projection.as_slice(), [crate::air::Projection::VariantField { .. }]))
-        }));
     }
 
     #[test]
@@ -16049,12 +16332,9 @@ fn main() {}
                         collect_block_statements(block, statements);
                     }
                 }
-                AirStmt::EnumMatch(match_) => {
+                AirStmt::PatternMatch(match_) => {
                     for arm in &match_.arms {
                         collect_block_statements(&arm.block, statements);
-                    }
-                    if let Some(block) = &match_.else_block {
-                        collect_block_statements(block, statements);
                     }
                 }
                 AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
