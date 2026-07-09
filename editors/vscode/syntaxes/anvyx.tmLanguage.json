@@ -118,6 +118,10 @@
           ]
         },
         {
+          "name": "constant.character.anvyx",
+          "match": "'(?:[^'\\\\]|\\\\[ntr\\\\'])'"
+        },
+        {
           "name": "string.quoted.double.anvyx",
           "begin": "\"",
           "end": "\"",
@@ -277,7 +281,7 @@
       "patterns": [
         {
           "name": "keyword.control.anvyx",
-          "match": "\\b(if|else|while|for|in|break|continue|match|return|defer|try)\\b"
+          "match": "\\b(if|else|while|for|in|iter|break|continue|match|return|defer|try)\\b"
         },
         {
           "name": "keyword.declaration.anvyx",
@@ -313,7 +317,7 @@
         },
         {
           "name": "storage.type.anvyx",
-          "match": "\\b(int|float|bool|string|void|any)\\b"
+          "match": "\\b(int|float|bool|string|char|void|any)\\b"
         }
       ]
     },

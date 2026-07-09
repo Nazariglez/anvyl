@@ -75,6 +75,7 @@ module.exports = grammar({
       repeat(choice($.escape_sequence, alias($.string_content, $.string_content))),
       '"',
     ),
+    char_literal: $ => token(seq("'", choice(/[^'\\]/, seq('\\', choice('n', 't', 'r', '\\', "'"))), "'")),
     string_content: $ => token.immediate(prec(-1, /[^"\\]+/)),
     escape_sequence: $ => token.immediate(seq('\\', choice('n', 't', 'r', '\\', '"', '{', '}'))),
 
@@ -112,7 +113,7 @@ module.exports = grammar({
       ')',
     ),
     _annotation_value: $ => choice(
-      $.string_literal, $.integer_literal, $.float_literal, 'true', 'false',
+      $.string_literal, $.char_literal, $.integer_literal, $.float_literal, 'true', 'false',
     ),
 
     // visibility
@@ -365,6 +366,7 @@ module.exports = grammar({
       $.integer_literal,
       $.float_literal,
       $.string_literal,
+      $.char_literal,
       $.interpolated_string,
       'true',
       'false',
@@ -522,7 +524,7 @@ module.exports = grammar({
       $.tuple_type,
       seq('(', $._type, ')'),
     ),
-    builtin_type: $ => choice('int', 'float', 'bool', 'string', 'void', 'any'),
+    builtin_type: $ => choice('int', 'float', 'bool', 'string', 'char', 'void', 'any'),
     slice_type: $ => seq('slice', '[', $._type, ']'),
     type_identifier: $ => $.identifier,
     generic_type: $ => prec(1, seq($.identifier, '<', commaSep1($._type), '>')),
@@ -558,6 +560,7 @@ module.exports = grammar({
       $.integer_literal,
       $.float_literal,
       $.string_literal,
+      $.char_literal,
       seq('-', $.integer_literal),
       seq('-', $.float_literal),
       'true',

@@ -34,7 +34,7 @@ TM=$(words_from_tm "$TM_FILE" | grep -vxE 'self')
 TM_CONTEXTUAL=$(printf '%s\n' "$TM" | contextual_from)
 TM_LEXER=$(lexer_words_from "$TM")
 
-SCM_GRAMMAR_HANDLED='int|float|bool|string|void|any|pub'
+SCM_GRAMMAR_HANDLED='int|float|bool|string|char|void|any|pub'
 SCM=$(grep -oE '"[a-z]+"' "$SCM_FILE" \
   | tr -d '"' \
   | grep -vxE 'self' \

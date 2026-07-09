@@ -7,6 +7,7 @@
 (float_literal) @number.float
 
 (string_literal) @string
+(char_literal) @character
 (interpolated_string) @string
 (string_content) @string
 (escape_sequence) @string.escape
@@ -122,7 +123,7 @@
 ; -- Keywords
 ["if" "else" "match"] @keyword.conditional
 ["while" "for"] @keyword.repeat
-"in" @keyword.repeat
+["in" "iter"] @keyword.repeat
 "return" @keyword.return
 "fn" @keyword.function
 "import" @keyword.import
