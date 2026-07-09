@@ -9,5 +9,8 @@ ariadne = "0.6.0"
 chumsky = "0.11.2"
 internment = "0.8.6"
 
+[dev-dependencies]
+anvyx-core = { path = "../core" }
+
 [lints]
 workspace = true

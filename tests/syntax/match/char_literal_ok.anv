@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn classify(c: char) -> string {
+    match c {
+        'a' => "a",
+        'b' => "b",
+        _ => "other",
+    }
+}

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: unterminated char literal
+
+fn main() {
+    let c = 'a;
+}

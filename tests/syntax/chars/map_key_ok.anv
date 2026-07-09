@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let m: [char: int] = ['a': 1, 'b': 2];
+    let a: int? = m['a'];
+}

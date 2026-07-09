@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: expected `string`, found `char`
+
+fn main() {
+    let s: string = 'a';
+}

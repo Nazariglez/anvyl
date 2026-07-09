@@ -92,6 +92,7 @@ enum LiteralMapKey {
     Int(i64),
     Bool(bool),
     String(String),
+    Char(char),
     Tuple(Vec<LiteralMapKey>),
 }
 
@@ -100,6 +101,7 @@ fn literal_map_key(expr: &ExprNode) -> Option<LiteralMapKey> {
         ExprKind::Lit(Lit::Int(value)) => Some(LiteralMapKey::Int(*value)),
         ExprKind::Lit(Lit::Bool(value)) => Some(LiteralMapKey::Bool(*value)),
         ExprKind::Lit(Lit::String(value)) => Some(LiteralMapKey::String(value.clone())),
+        ExprKind::Lit(Lit::Char(value)) => Some(LiteralMapKey::Char(*value)),
         ExprKind::Tuple(elems) => elems
             .iter()
             .map(literal_map_key)
@@ -924,6 +926,7 @@ pub(super) fn type_from_lit(lit: &Lit) -> Type {
         Lit::Float(_) => Type::Float,
         Lit::Bool(_) => Type::Bool,
         Lit::String(_) => Type::String,
+        Lit::Char(_) => Type::Char,
         Lit::Nil => Type::Infer,
     }
 }

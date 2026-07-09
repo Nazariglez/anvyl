@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: Unsupported pattern: range
+
+fn classify(c: char) -> string {
+    match c {
+        'a'..='z' => "lower",
+        _ => "other",
+    }
+}

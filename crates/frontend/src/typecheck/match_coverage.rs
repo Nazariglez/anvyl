@@ -13,6 +13,7 @@ enum MatchSubject {
     Int,
     Float,
     String,
+    Char,
     Enum {
         key: NominalKey,
         variants: Vec<Ident>,
@@ -49,7 +50,7 @@ pub(super) fn check(
     match subject {
         MatchSubject::Bool => check_bool(outcomes, span, tc),
         MatchSubject::Enum { key, variants } => check_enum(&key, &variants, outcomes, span, tc),
-        MatchSubject::Int | MatchSubject::Float | MatchSubject::String => {
+        MatchSubject::Int | MatchSubject::Float | MatchSubject::String | MatchSubject::Char => {
             tc.push_error(TypeError::NonExhaustiveMatch {
                 span: tc.error_span(span),
             });
@@ -65,6 +66,7 @@ fn classify(scrutinee: &Type, tc: &TypeChecker) -> MatchSubject {
         Type::Int => MatchSubject::Int,
         Type::Float => MatchSubject::Float,
         Type::String => MatchSubject::String,
+        Type::Char => MatchSubject::Char,
         Type::Tuple(_) => MatchSubject::Tuple,
         ty => match tc
             .decls

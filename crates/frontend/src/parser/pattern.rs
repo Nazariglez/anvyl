@@ -83,7 +83,7 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
         });
 
         let minus = select! { Token::Op(Op::Sub) => () };
-        let num_lit =
+        let literal_pat =
             minus
                 .or_not()
                 .then(literal())
@@ -99,32 +99,33 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
             Token::RangeEq => true,
         };
 
-        let prefix_range_pat = range_op
-            .then(num_lit.clone())
-            .map_with(|(inclusive, end), e| {
-                let s = e.span();
-                let span = s.byte();
-                Spanned::new(
-                    ast::Pattern::Range {
-                        start: None,
-                        end: Some(end),
-                        inclusive,
-                    },
-                    span,
-                )
-            });
+        let prefix_range_pat =
+            range_op
+                .then(literal_pat.clone())
+                .map_with(|(inclusive, end), e| {
+                    let s = e.span();
+                    let span = s.byte();
+                    Spanned::new(
+                        ast::Pattern::Range {
+                            start: None,
+                            end: Some(end),
+                            inclusive,
+                        },
+                        span,
+                    )
+                });
 
         let range_suffix = choice((
             select! { Token::RangeEq => true }
-                .then(num_lit.clone())
+                .then(literal_pat.clone())
                 .map(|(inc, end)| (inc, Some(end))),
             select! { Token::Range => false }
-                .then(num_lit.clone().or_not())
+                .then(literal_pat.clone().or_not())
                 .map(|(inc, end)| (inc, end)),
         ));
 
         let lit_or_range_pat =
-            num_lit
+            literal_pat
                 .clone()
                 .then(range_suffix.or_not())
                 .map_with(|(start, rest), e| {

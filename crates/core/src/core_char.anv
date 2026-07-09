@@ -1,0 +1,28 @@
+import option { * };
+import ext:core_char {
+    char_codepoint,
+    char_from_codepoint_ext,
+    char_to_string,
+};
+
+pub fn char_from_codepoint(codepoint: int) -> char? { char_from_codepoint_ext(codepoint) }
+
+pub extend char {
+    fn codepoint(self) -> int { char_codepoint(self) }
+    fn to_string(self) -> string { char_to_string(self) }
+
+    fn is_ascii_digit(self) -> bool { if self >= '0' { self <= '9' } else { false } }
+    fn is_ascii_lower(self) -> bool { if self >= 'a' { self <= 'z' } else { false } }
+    fn is_ascii_upper(self) -> bool { if self >= 'A' { self <= 'Z' } else { false } }
+    fn is_ascii_alpha(self) -> bool { if self.is_ascii_lower() { true } else { self.is_ascii_upper() } }
+    fn is_ascii_alphanumeric(self) -> bool { if self.is_ascii_alpha() { true } else { self.is_ascii_digit() } }
+    fn is_ascii_whitespace(self) -> bool {
+        match self {
+            ' ' => true,
+            '\t' => true,
+            '\n' => true,
+            '\r' => true,
+            _ => false,
+        }
+    }
+}

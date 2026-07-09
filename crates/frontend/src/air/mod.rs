@@ -395,6 +395,7 @@ impl Program {
             (_, TypeData::Float) => "float".to_string(),
             (_, TypeData::Bool) => "bool".to_string(),
             (_, TypeData::String) => "string".to_string(),
+            (_, TypeData::Char) => "char".to_string(),
             (_, TypeData::Void) => "void".to_string(),
             (_, TypeData::Any) => "any".to_string(),
             (TypeRender::Display, TypeData::Optional(inner)) => {

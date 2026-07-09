@@ -257,6 +257,7 @@ fn rewrite_type_names(
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
+        | ExternTypeExpr::Char
         | ExternTypeExpr::Any => {}
     }
 }
@@ -887,6 +888,7 @@ fn direct_rust_type_supported(ty: &ExternTypeExpr) -> bool {
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
+        | ExternTypeExpr::Char
         | ExternTypeExpr::Unit => true,
         ExternTypeExpr::Named { args, .. } => args.is_empty(),
         ExternTypeExpr::Option(inner)
@@ -1583,6 +1585,7 @@ fn type_contains_callback(ty: &ExternTypeExpr) -> bool {
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
+        | ExternTypeExpr::Char
         | ExternTypeExpr::Any
         | ExternTypeExpr::Named { .. } => false,
     }
@@ -1611,6 +1614,7 @@ fn type_contains_collection(ty: &ExternTypeExpr) -> bool {
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
+        | ExternTypeExpr::Char
         | ExternTypeExpr::Any
         | ExternTypeExpr::Named { .. } => false,
     }

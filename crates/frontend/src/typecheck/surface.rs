@@ -1060,6 +1060,7 @@ fn concrete_surface_type(ty: &Type) -> bool {
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void => true,
         Type::Tuple(elems) => elems.iter().all(concrete_surface_type),
         Type::Nominal(nominal) => {

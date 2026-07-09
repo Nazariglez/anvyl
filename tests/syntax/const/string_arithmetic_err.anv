@@ -1,0 +1,5 @@
+// @mode: check
+// @expect: error
+// @contains: operator `-` cannot be applied to `string`
+
+const BAD = "a" - "b";

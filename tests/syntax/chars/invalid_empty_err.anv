@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: empty char literal
+
+fn main() {
+    let c = '';
+}

@@ -414,6 +414,7 @@ fn type_expr(
         Type::Int => Ok(ExternTypeExpr::Int),
         Type::Float => Ok(ExternTypeExpr::Float),
         Type::String => Ok(ExternTypeExpr::String),
+        Type::Char => Ok(ExternTypeExpr::Char),
         Type::Any => Ok(ExternTypeExpr::Any),
         Type::Tuple(fields) if fields.is_empty() => Ok(ExternTypeExpr::Unit),
         Type::Tuple(fields) => fields

@@ -1,10 +1,11 @@
 use super::{
     ArityError, GenericArgs, GenericParams, TypeChecker, TypeError,
+    const_eval::const_type,
     const_term::ConstTerm,
     infer::{GenericSolverSeeds, GenericSolverVars},
 };
 use crate::{
-    ast::{ConstParamId, GenericArg, Type, TypeVarId},
+    ast::{ConstParamId, ConstValue, GenericArg, Type, TypeVarId},
     span::Span,
 };
 
@@ -165,6 +166,7 @@ pub(super) fn bind_explicit_generic_args(
         let const_index = index - type_len;
         let term = binder.const_term_arg(arg, span)?;
         let term = binder.eval_const_arg(term, span)?;
+        let term = int_const_arg(term, span, binder)?;
         bindings
             .const_args
             .push((generics.const_params[const_index].id, term));
@@ -179,11 +181,26 @@ fn explicit_const_term(arg: &GenericArg) -> Option<ConstTerm> {
     }
 }
 
+fn int_const_arg(
+    term: ConstTerm,
+    span: Span,
+    binder: &mut impl ExplicitGenericBinder,
+) -> Option<ConstTerm> {
+    match &term {
+        ConstTerm::Value(value) if !matches!(value, ConstValue::Int(_)) => {
+            binder.push_expected_int_const(const_type(value), span);
+            None
+        }
+        _ => Some(term),
+    }
+}
+
 pub(super) trait ExplicitGenericBinder {
     fn resolve_type_arg(&mut self, ty: &Type, span: Span) -> Option<Type>;
     fn eval_const_arg(&mut self, term: ConstTerm, span: Span) -> Option<ConstTerm>;
     fn push_arity_error(&mut self, expected: usize, found: usize, span: Span);
     fn push_kind_error(&mut self, expected: &'static str, span: Span);
+    fn push_expected_int_const(&mut self, found: Type, span: Span);
 
     fn const_term_arg(&mut self, arg: &GenericArg, span: Span) -> Option<ConstTerm> {
         explicit_const_term(arg).or_else(|| {
@@ -217,6 +234,13 @@ impl ExplicitGenericBinder for TypeCheckerGenericBinder<'_> {
     fn push_kind_error(&mut self, expected: &'static str, span: Span) {
         self.tc.push_error(TypeError::GenericArgKindMismatch {
             expected,
+            span: self.tc.error_span(span),
+        });
+    }
+
+    fn push_expected_int_const(&mut self, found: Type, span: Span) {
+        self.tc.push_error(TypeError::ExpectedIntConst {
+            found,
             span: self.tc.error_span(span),
         });
     }

@@ -74,6 +74,7 @@ pub enum LitToken {
     Number(i64),
     Float(Intern<String>),
     String(Intern<String>),
+    Char(char),
 }
 
 impl Display for LitToken {
@@ -81,6 +82,7 @@ impl Display for LitToken {
         match self {
             LitToken::Number(n) => write!(f, "{n}"),
             LitToken::Float(s) | LitToken::String(s) => write!(f, "{s}"),
+            LitToken::Char(c) => write!(f, "{c:?}"),
         }
     }
 }
@@ -148,6 +150,7 @@ spelled_token! {
         Float => "float",
         Bool => "bool",
         String => "string",
+        Char => "char",
         Void => "void",
         Any => "any",
         Nil => "nil",
@@ -299,30 +302,26 @@ fn source_span(source: SourceId, base_offset: usize, span: SimpleSpan<usize>) ->
 fn scan_escape<'src, 'p>(
     input: &mut InputRef<'src, 'p, &'src str, Extra<'src>>,
     char_cursor: &Cursor<'src, 'p, &'src str>,
-    text_buf: &mut String,
     formatted: bool,
-) -> Result<(), LexErr<'src>> {
+    single_quote: bool,
+) -> Result<char, LexErr<'src>> {
     match input.next() {
-        Some('n') => text_buf.push('\n'),
-        Some('t') => text_buf.push('\t'),
-        Some('r') => text_buf.push('\r'),
-        Some('\\') => text_buf.push('\\'),
-        Some('"') => text_buf.push('"'),
-        Some('{') if formatted => text_buf.push('{'),
-        Some('{') => {
-            return Err(Rich::custom(
-                input.span_since(char_cursor),
-                "invalid escape sequence `\\{`; braces are literal in plain strings, use f\"...\" for interpolation",
-            ));
-        }
-        _ => {
-            return Err(Rich::custom(
-                input.span_since(char_cursor),
-                "Unexpected character",
-            ));
-        }
+        Some('n') => Ok('\n'),
+        Some('t') => Ok('\t'),
+        Some('r') => Ok('\r'),
+        Some('\\') => Ok('\\'),
+        Some('"') if !single_quote => Ok('"'),
+        Some('\'') if single_quote => Ok('\''),
+        Some('{') if formatted => Ok('{'),
+        Some('{') => Err(Rich::custom(
+            input.span_since(char_cursor),
+            "invalid escape sequence `\\{`; braces are literal in plain strings, use f\"...\" for interpolation",
+        )),
+        _ => Err(Rich::custom(
+            input.span_since(char_cursor),
+            "Unexpected character",
+        )),
     }
-    Ok(())
 }
 
 fn scan_interp_body<'src, 'p>(
@@ -476,7 +475,9 @@ fn string_literal<'src>(
                         ));
                     }
                     Some('"') => break,
-                    Some('\\') => scan_escape(input, &char_cursor, &mut text_buf, formatted)?,
+                    Some('\\') => {
+                        text_buf.push(scan_escape(input, &char_cursor, formatted, false)?);
+                    }
                     Some('{') if formatted => {
                         is_interpolated = true;
                         let after_brace = input.span_since(&str_open);
@@ -655,8 +656,50 @@ fn try_consume_exponent<'src>(
     buf.push_str(&exp_buf);
 }
 
+fn char_literal<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
+    custom(|input: &mut InputRef<'src, '_, &'src str, Extra<'src>>| {
+        let open = input.cursor();
+        if input.next() != Some('\'') {
+            return Err(Rich::custom(
+                input.span_since(&open),
+                "expected char literal",
+            ));
+        }
+
+        let mut value = None;
+        let mut multiple = false;
+        loop {
+            let cursor = input.cursor();
+            let ch = match input.next() {
+                Some('\'') => break,
+                Some('\\') => scan_escape(input, &cursor, false, true)?,
+                Some(ch) => ch,
+                None => {
+                    return Err(Rich::custom(
+                        input.span_since(&open),
+                        "unterminated char literal",
+                    ));
+                }
+            };
+            multiple |= value.replace(ch).is_some();
+        }
+
+        match (value, multiple) {
+            (None, _) => Err(Rich::custom(input.span_since(&open), "empty char literal")),
+            (Some(_), true) => Err(Rich::custom(
+                input.span_since(&open),
+                "char literal must contain exactly one scalar value",
+            )),
+            (Some(ch), false) => Ok(Token::Literal(LitToken::Char(ch))),
+        }
+    })
+}
+
 fn literal<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
-    lit_number().map(Token::Literal)
+    choice((
+        just("'").rewind().ignore_then(char_literal()),
+        lit_number().map(Token::Literal),
+    ))
 }
 
 fn is_digit_for_radix(c: char, radix: u32) -> bool {

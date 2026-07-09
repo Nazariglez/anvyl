@@ -76,6 +76,7 @@ fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
         Token::Literal(LitToken::String(s)) => {
             ast::ConstArg::Value(ast::ConstValue::String(s.to_string()))
         },
+        Token::Literal(LitToken::Char(c)) => ast::ConstArg::Value(ast::ConstValue::Char(c)),
         Token::Keyword(Keyword::True) => ast::ConstArg::Value(ast::ConstValue::Bool(true)),
         Token::Keyword(Keyword::False) => ast::ConstArg::Value(ast::ConstValue::Bool(false)),
     }
@@ -169,6 +170,7 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             Token::Keyword(Keyword::Float) => Type::Float,
             Token::Keyword(Keyword::Bool) => Type::Bool,
             Token::Keyword(Keyword::String) => Type::String,
+            Token::Keyword(Keyword::Char) => Type::Char,
             Token::Keyword(Keyword::Void) => Type::Void,
             Token::Keyword(Keyword::Any) => Type::Any,
         };

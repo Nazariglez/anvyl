@@ -73,6 +73,7 @@ fn contains_slice_view(ty: &Type, stored: bool) -> bool {
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void
         | Type::Dyn(_)
         | Type::Var(_)
@@ -164,6 +165,7 @@ pub(super) fn type_contains_dyn_value(
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void
         | Type::Var(_)
         | Type::UnresolvedName(_)

@@ -4039,6 +4039,7 @@ impl DeclarationIndex {
             Type::Int
             | Type::Bool
             | Type::String
+            | Type::Char
             | Type::Infer
             | Type::InferReturn
             | Type::Var(_)

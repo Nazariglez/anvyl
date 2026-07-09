@@ -44,6 +44,7 @@ pub enum TypeData {
     Float,
     Bool,
     String,
+    Char,
     Void,
     Any,
     Optional(TypeId),
@@ -202,5 +203,6 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
     String(Box<str>),
+    Char(char),
     Nil,
 }

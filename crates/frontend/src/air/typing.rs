@@ -11,6 +11,7 @@ pub enum PrimitiveKind {
     Float,
     Bool,
     String,
+    Char,
     Void,
     Any,
 }
@@ -113,6 +114,7 @@ impl PrimitiveTypes {
             PrimitiveKind::Float => Some(ScalarKind::Float),
             PrimitiveKind::Bool => Some(ScalarKind::Bool),
             PrimitiveKind::String => Some(ScalarKind::String),
+            PrimitiveKind::Char => Some(ScalarKind::Char),
             PrimitiveKind::Void | PrimitiveKind::Any => None,
         }
     }
@@ -124,10 +126,11 @@ impl PrimitiveKind {
         Self::Float,
         Self::Bool,
         Self::String,
+        Self::Char,
         Self::Void,
         Self::Any,
     ];
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         self as usize
@@ -139,6 +142,7 @@ impl PrimitiveKind {
             TypeData::Float => Some(Self::Float),
             TypeData::Bool => Some(Self::Bool),
             TypeData::String => Some(Self::String),
+            TypeData::Char => Some(Self::Char),
             TypeData::Void => Some(Self::Void),
             TypeData::Any => Some(Self::Any),
             _ => None,

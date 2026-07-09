@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+const LT = "a" < "b";
+const LE = "a" <= "a";
+const GT = "b" > "a";
+const GE = "b" >= "b";
+const EQ = "same" == "same";
+const NE = "a" != "b";
+const N = LT && LE && GT && GE && EQ && NE ? 2 : 1;
+
+fn main() {
+    let xs: [int; N] = [1, 2];
+}

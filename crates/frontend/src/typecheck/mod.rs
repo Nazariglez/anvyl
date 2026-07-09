@@ -3505,6 +3505,7 @@ impl TypeChecker {
             | Type::Float
             | Type::Bool
             | Type::String
+            | Type::Char
             | Type::Void
             | Type::Dyn(_)
             | Type::Var(_)
@@ -5107,7 +5108,13 @@ fn check_binary_checked(
         return checked_type(Type::Infer);
     }
 
-    if op == BinaryOp::Add && (left.ty.is_str() || right.ty.is_str()) {
+    if op == BinaryOp::Add
+        && (left.ty.is_str() || right.ty.is_str())
+        && !matches!(
+            (&left.ty, &right.ty),
+            (Type::String, Type::Char) | (Type::Char, Type::String)
+        )
+    {
         record_binary_stringify_conversions(left_expr, &left, right_expr, &right, tc);
         return checked_type(Type::String);
     }
@@ -5294,6 +5301,7 @@ fn type_from_scalar(scalar: ScalarKind) -> Type {
         ScalarKind::Float => Type::Float,
         ScalarKind::Bool => Type::Bool,
         ScalarKind::String => Type::String,
+        ScalarKind::Char => Type::Char,
     }
 }
 

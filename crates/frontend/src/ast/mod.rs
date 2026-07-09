@@ -78,6 +78,19 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
     String(String),
+    Char(char),
+}
+
+impl ConstValue {
+    pub fn ty(&self) -> Type {
+        match self {
+            Self::Int(_) => Type::Int,
+            Self::Float(_) => Type::Float,
+            Self::Bool(_) => Type::Bool,
+            Self::String(_) => Type::String,
+            Self::Char(_) => Type::Char,
+        }
+    }
 }
 
 impl PartialEq for ConstValue {
@@ -87,6 +100,7 @@ impl PartialEq for ConstValue {
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
+            (Self::Char(a), Self::Char(b)) => a == b,
             _ => false,
         }
     }
@@ -102,6 +116,7 @@ impl std::hash::Hash for ConstValue {
             Self::Float(value) => value.to_bits().hash(state),
             Self::Bool(value) => value.hash(state),
             Self::String(value) => value.hash(state),
+            Self::Char(value) => value.hash(state),
         }
     }
 }
@@ -113,6 +128,7 @@ impl Display for ConstValue {
             Self::Float(value) => write!(f, "{value}"),
             Self::Bool(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "{value:?}"),
+            Self::Char(value) => write!(f, "{value:?}"),
         }
     }
 }
@@ -462,6 +478,7 @@ pub enum Type {
     Float,
     Bool,
     String,
+    Char,
     Void,
     Func {
         params: Vec<FuncParam>,
@@ -579,6 +596,7 @@ impl Type {
             Self::Float => Some(ScalarKind::Float),
             Self::Bool => Some(ScalarKind::Bool),
             Self::String => Some(ScalarKind::String),
+            Self::Char => Some(ScalarKind::Char),
             _ => None,
         }
     }
@@ -742,6 +760,7 @@ impl Display for Type {
             Self::Float => write!(f, "float"),
             Self::Bool => write!(f, "bool"),
             Self::String => write!(f, "string"),
+            Self::Char => write!(f, "char"),
             Self::Void => write!(f, "void"),
             Self::Func { params, ret } => {
                 write!(f, "fn(")?;
@@ -809,6 +828,7 @@ pub enum ScalarKind {
     Float,
     Bool,
     String,
+    Char,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -854,7 +874,7 @@ impl BinaryOp {
     }
 
     pub fn scalar_result(self, lhs: ScalarKind, rhs: ScalarKind) -> Option<ScalarKind> {
-        use ScalarKind::{Bool, Float, Int, String};
+        use ScalarKind::{Bool, Char, Float, Int, String};
 
         match self {
             Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Rem
@@ -863,7 +883,7 @@ impl BinaryOp {
                 Some(lhs)
             }
             Self::LessThan | Self::GreaterThan | Self::LessThanEq | Self::GreaterThanEq
-                if lhs == rhs && matches!(lhs, Int | Float | String) =>
+                if lhs == rhs && matches!(lhs, Int | Float | String | Char) =>
             {
                 Some(Bool)
             }
@@ -1858,7 +1878,21 @@ pub enum Lit {
     Float(f64),
     Bool(bool),
     String(String),
+    Char(char),
     Nil,
+}
+
+impl Lit {
+    pub fn const_value(&self) -> Option<ConstValue> {
+        match self {
+            Self::Int(value) => Some(ConstValue::Int(*value)),
+            Self::Float(value) => Some(ConstValue::Float(*value)),
+            Self::Bool(value) => Some(ConstValue::Bool(*value)),
+            Self::String(value) => Some(ConstValue::String(value.clone())),
+            Self::Char(value) => Some(ConstValue::Char(*value)),
+            Self::Nil => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

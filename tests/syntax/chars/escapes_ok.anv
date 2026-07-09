@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let newline: char = '\n';
+    let tab: char = '\t';
+    let ret: char = '\r';
+    let quote: char = '\'';
+    let slash: char = '\\';
+}

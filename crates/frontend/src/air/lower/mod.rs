@@ -290,6 +290,7 @@ impl TypeLowerer {
             Type::Float => TypeData::Float,
             Type::Bool => TypeData::Bool,
             Type::String => TypeData::String,
+            Type::Char => TypeData::Char,
             Type::Void => TypeData::Void,
             Type::Optional { inner } => {
                 let inner = self.lower_with_env(program, inner, env)?;
@@ -6590,6 +6591,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 | TypeData::Int
                 | TypeData::Float
                 | TypeData::String
+                | TypeData::Char
                 | TypeData::Optional(_)
                 | TypeData::Tuple(_)
                 | TypeData::Enum(_)
@@ -8599,27 +8601,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn literal_const_value(lit: &Lit, ty: &Type) -> Option<ConstValue> {
-        match (lit, ty) {
-            (Lit::Int(value), Type::Int) => Some(ConstValue::Int(*value)),
-            (Lit::Float(value), Type::Float) => Some(ConstValue::Float(*value)),
-            (Lit::Bool(value), Type::Bool) => Some(ConstValue::Bool(*value)),
-            (Lit::String(value), Type::String) => {
-                Some(ConstValue::String(value.clone().into_boxed_str()))
-            }
-            _ => None,
-        }
+        let value = lit.const_value()?;
+        source_const_matches_type(&value, ty).then(|| lower_const_specialization_value(&value))
     }
 
     fn literal_air_const_value(lit: &Lit, ty: &TypeData) -> Option<ConstValue> {
-        match (lit, ty) {
-            (Lit::Int(value), TypeData::Int) => Some(ConstValue::Int(*value)),
-            (Lit::Float(value), TypeData::Float) => Some(ConstValue::Float(*value)),
-            (Lit::Bool(value), TypeData::Bool) => Some(ConstValue::Bool(*value)),
-            (Lit::String(value), TypeData::String) => {
-                Some(ConstValue::String(value.clone().into_boxed_str()))
-            }
-            _ => None,
-        }
+        let value = lit.const_value()?;
+        air_const_matches_type(&value, ty).then(|| lower_const_specialization_value(&value))
     }
 
     fn lower_effect(&mut self, expr: &ExprNode) -> Result<(), LowerError> {
@@ -8962,6 +8950,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             TypeData::Float => ConstValue::Float(0.0),
             TypeData::Bool => ConstValue::Bool(false),
             TypeData::String => ConstValue::String("".into()),
+            TypeData::Char => ConstValue::Char('\0'),
             _ => {
                 return Err(LowerError::UnsupportedType {
                     ty: Box::new(Type::Infer),
@@ -8979,6 +8968,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             TypeData::Float => Type::Float,
             TypeData::Bool => Type::Bool,
             TypeData::String => Type::String,
+            TypeData::Char => Type::Char,
             TypeData::Void => Type::Void,
             _ => Type::Infer,
         }
@@ -9740,12 +9730,28 @@ enum SourceDefaultKey {
     },
 }
 
+fn source_const_matches_type(value: &ast::ConstValue, ty: &Type) -> bool {
+    value.ty() == *ty
+}
+
+fn air_const_matches_type(value: &ast::ConstValue, ty: &TypeData) -> bool {
+    matches!(
+        (value, ty),
+        (ast::ConstValue::Int(_), TypeData::Int)
+            | (ast::ConstValue::Float(_), TypeData::Float)
+            | (ast::ConstValue::Bool(_), TypeData::Bool)
+            | (ast::ConstValue::String(_), TypeData::String)
+            | (ast::ConstValue::Char(_), TypeData::Char)
+    )
+}
+
 fn lower_const_specialization_value(value: &ast::ConstValue) -> ConstValue {
     match value {
         ast::ConstValue::Int(value) => ConstValue::Int(*value),
         ast::ConstValue::Float(value) => ConstValue::Float(*value),
         ast::ConstValue::Bool(value) => ConstValue::Bool(*value),
         ast::ConstValue::String(value) => ConstValue::String(value.clone().into_boxed_str()),
+        ast::ConstValue::Char(value) => ConstValue::Char(*value),
     }
 }
 
@@ -11597,6 +11603,7 @@ fn enqueue_type_stringify_overrides(
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void
         | Type::Dyn(_)
         | Type::Var(_)
@@ -11881,6 +11888,7 @@ mod tests {
                 vec!["core_int"],
                 vec!["core_float"],
                 vec!["core_string"],
+                vec!["core_char"],
             ]
         );
         let core_root = crate::resolve::ModuleId::root(PackageId::core());
@@ -11897,6 +11905,7 @@ mod tests {
                 "core_int",
                 "core_float",
                 "core_string",
+                "core_char",
                 "runtime",
                 "option",
                 "result",

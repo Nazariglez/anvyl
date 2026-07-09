@@ -105,12 +105,7 @@ pub(super) fn check_const(const_node: &ConstDeclNode, tc: &mut TypeChecker) {
 }
 
 pub(super) fn const_type(value: &ConstValue) -> Type {
-    match value {
-        ConstValue::Int(_) => Type::Int,
-        ConstValue::Float(_) => Type::Float,
-        ConstValue::Bool(_) => Type::Bool,
-        ConstValue::String(_) => Type::String,
-    }
+    value.ty()
 }
 
 pub(super) fn const_usize(value: &ConstValue, span: Option<SourceSpan>) -> ConstEvalResult<usize> {
@@ -667,15 +662,11 @@ impl TypeChecker {
     }
 
     fn eval_const_lit(&self, lit: &Lit, span: Span) -> ConstEvalResult<ConstValue> {
-        match lit {
-            Lit::Int(value) => Ok(ConstValue::Int(*value)),
-            Lit::Float(value) => Ok(ConstValue::Float(*value)),
-            Lit::Bool(value) => Ok(ConstValue::Bool(*value)),
-            Lit::String(value) => Ok(ConstValue::String(value.clone())),
-            Lit::Nil => const_error(TypeError::NonConstExpression {
+        lit.const_value().ok_or_else(|| {
+            Box::new(TypeError::NonConstExpression {
                 span: self.error_span(span),
-            }),
-        }
+            })
+        })
     }
 
     fn eval_const_cast(
@@ -749,6 +740,7 @@ fn eval_const_decl(
 fn const_string(value: &ConstValue) -> String {
     match value {
         ConstValue::String(value) => value.clone(),
+        ConstValue::Char(value) => value.to_string(),
         ConstValue::Int(_) | ConstValue::Float(_) | ConstValue::Bool(_) => format!("{value}"),
     }
 }
@@ -800,6 +792,17 @@ fn eval_binary(
         (ConstValue::Float(a), ConstValue::Float(b)) => eval_float_binary(op, a, b, span),
         (ConstValue::Bool(a), ConstValue::Bool(b)) => eval_bool_binary(op, a, b, span),
         (ConstValue::String(a), ConstValue::String(b)) => eval_string_binary(op, &a, &b, span),
+        (ConstValue::Char(a), ConstValue::Char(b)) => eval_char_binary(op, a, b, span),
+        (ConstValue::String(_), ConstValue::Char(_))
+        | (ConstValue::Char(_), ConstValue::String(_))
+            if op == BinaryOp::Add =>
+        {
+            const_error(TypeError::InvalidOperand {
+                op: format!("{op}"),
+                operand_type: Type::Char,
+                span,
+            })
+        }
         (ConstValue::String(a), value) if op == BinaryOp::Add => {
             Ok(ConstValue::String(format!("{a}{}", const_string(&value))))
         }
@@ -904,6 +907,37 @@ fn eval_bool_binary(
     }
 }
 
+fn eval_ordered_binary<T: PartialEq + PartialOrd + ?Sized>(
+    op: BinaryOp,
+    a: &T,
+    b: &T,
+    operand_type: Type,
+    span: Option<SourceSpan>,
+) -> ConstEvalResult<ConstValue> {
+    match op {
+        BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
+        BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
+        BinaryOp::LessThan => Ok(ConstValue::Bool(a < b)),
+        BinaryOp::GreaterThan => Ok(ConstValue::Bool(a > b)),
+        BinaryOp::LessThanEq => Ok(ConstValue::Bool(a <= b)),
+        BinaryOp::GreaterThanEq => Ok(ConstValue::Bool(a >= b)),
+        _ => const_error(TypeError::InvalidOperand {
+            op: format!("{op}"),
+            operand_type,
+            span,
+        }),
+    }
+}
+
+fn eval_char_binary(
+    op: BinaryOp,
+    a: char,
+    b: char,
+    span: Option<SourceSpan>,
+) -> ConstEvalResult<ConstValue> {
+    eval_ordered_binary(op, &a, &b, Type::Char, span)
+}
+
 fn eval_string_binary(
     op: BinaryOp,
     a: &str,
@@ -912,12 +946,6 @@ fn eval_string_binary(
 ) -> ConstEvalResult<ConstValue> {
     match op {
         BinaryOp::Add => Ok(ConstValue::String(format!("{a}{b}"))),
-        BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
-        BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
-        _ => const_error(TypeError::InvalidOperand {
-            op: format!("{op}"),
-            operand_type: Type::String,
-            span,
-        }),
+        _ => eval_ordered_binary(op, a, b, Type::String, span),
     }
 }

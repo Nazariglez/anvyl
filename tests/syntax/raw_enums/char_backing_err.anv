@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: raw enum 'E' must use literal int or string backing
+
+enum E: char {
+    A = 'a',
+}

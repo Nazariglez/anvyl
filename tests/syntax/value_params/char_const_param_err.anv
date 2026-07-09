@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token 'char'
+
+struct Fixed<N: char> {
+    value: int,
+}

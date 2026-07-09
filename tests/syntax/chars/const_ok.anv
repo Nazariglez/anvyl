@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+const A = 'a';
+const ORDER = A < 'z';
+const N = ORDER ? 2 : 1;
+
+fn main() {
+    let xs: [int; N] = [1, 2];
+}

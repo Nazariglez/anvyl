@@ -91,6 +91,7 @@ mod tests {
                 path(&["core_int"]),
                 path(&["core_float"]),
                 path(&["core_string"]),
+                path(&["core_char"]),
             ]
         );
         assert_eq!(std_paths, [path(&["mem"])]);

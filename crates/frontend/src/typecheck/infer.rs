@@ -131,6 +131,7 @@ enum Ty {
     Float,
     Bool,
     String,
+    Char,
     Void,
     Func {
         params: Vec<TyFuncParam>,
@@ -229,6 +230,7 @@ impl Ty {
             Type::Float => Self::Float,
             Type::Bool => Self::Bool,
             Type::String => Self::String,
+            Type::Char => Self::Char,
             Type::Void => Self::Void,
             Type::Func { params, ret } => Self::Func {
                 params: params
@@ -313,6 +315,7 @@ impl Ty {
             Self::Float => Some(Type::Float),
             Self::Bool => Some(Type::Bool),
             Self::String => Some(Type::String),
+            Self::Char => Some(Type::Char),
             Self::Void => Some(Type::Void),
             Self::Func { params, ret } => Some(Type::Func {
                 params: params
@@ -599,6 +602,7 @@ fn rewrite_ty_contract_refs(ty: &mut Ty, f: &mut impl FnMut(&ContractRef) -> Con
         | Ty::Float
         | Ty::Bool
         | Ty::String
+        | Ty::Char
         | Ty::Void
         | Ty::Var(_)
         | Ty::UnresolvedName(_) => {}
@@ -1021,6 +1025,7 @@ impl Solver {
             Type::Float => Ty::Float,
             Type::Bool => Ty::Bool,
             Type::String => Ty::String,
+            Type::Char => Ty::Char,
             Type::Void => Ty::Void,
             Type::Func { params, ret } => Ty::Func {
                 params: params
@@ -2106,6 +2111,7 @@ impl Solver {
             | Ty::Float
             | Ty::Bool
             | Ty::String
+            | Ty::Char
             | Ty::Void
             | Ty::Var(_)
             | Ty::UnresolvedName(_) => ty.clone(),
@@ -2158,6 +2164,7 @@ impl Solver {
             | Ty::Float
             | Ty::Bool
             | Ty::String
+            | Ty::Char
             | Ty::Void
             | Ty::Var(_)
             | Ty::UnresolvedName(_) => false,
@@ -2195,6 +2202,7 @@ impl Solver {
             Ty::Float => Type::Float,
             Ty::Bool => Type::Bool,
             Ty::String => Type::String,
+            Ty::Char => Type::Char,
             Ty::Void => Type::Void,
             Ty::Func { params, ret } => Type::Func {
                 params: params

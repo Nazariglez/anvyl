@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let a: char = 'a';
+    let smile: char = '😀';
+}

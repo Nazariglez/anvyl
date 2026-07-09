@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+extern fn echo_char(c: char) -> char;
+extern fn maybe_char(c: char?) -> char?;
+extern fn with_char_callback(callback: fn(char) -> char);
+
+fn bump(c: char) -> char { c }
+
+fn main() {
+    let c = echo_char('a');
+    let maybe = maybe_char(c);
+    with_char_callback(bump);
+}

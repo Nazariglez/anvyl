@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    let eq: bool = 'a' == 'a';
+    let ne: bool = 'a' != 'b';
+    let lt: bool = 'a' < 'z';
+    let le: bool = 'a' <= 'a';
+    let gt: bool = 'z' > 'a';
+    let ge: bool = 'z' >= 'z';
+}

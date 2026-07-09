@@ -181,6 +181,9 @@ pub(crate) enum TypeRefError {
     GenericArgKindMismatch {
         expected: &'static str,
     },
+    ExpectedIntConst {
+        found: Type,
+    },
     AliasCycle {
         name: Ident,
     },
@@ -231,6 +234,7 @@ impl TypeRefError {
             | Self::PrivateModuleMember { import, .. } => import.as_deref(),
             Self::GenericArity { .. }
             | Self::GenericArgKindMismatch { .. }
+            | Self::ExpectedIntConst { .. }
             | Self::AliasCycle { .. }
             | Self::ContractAsType { .. }
             | Self::DuplicateContractRequirement { .. }
@@ -259,6 +263,7 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
         TypeRefError::GenericArgKindMismatch { expected } => {
             TypeError::GenericArgKindMismatch { expected, span }
         }
+        TypeRefError::ExpectedIntConst { found } => TypeError::ExpectedIntConst { found, span },
         TypeRefError::AliasCycle { name } => TypeError::CompileError {
             message: format!("type alias '{name}' depends on itself"),
             span,
@@ -586,6 +591,7 @@ impl TypeChecker {
             | Type::Float
             | Type::Bool
             | Type::String
+            | Type::Char
             | Type::Void
             | Type::Var(_)
             | Type::UnresolvedName(_)
@@ -970,6 +976,7 @@ impl<'a> TypeRefResolver<'a> {
             | Type::Float
             | Type::Bool
             | Type::String
+            | Type::Char
             | Type::Void
             | Type::Var(_) => Ok(ty.clone()),
         }
@@ -1473,6 +1480,10 @@ impl ExplicitGenericBinder for TypeRefGenericBinder<'_, '_> {
 
     fn push_kind_error(&mut self, expected: &'static str, _span: Span) {
         self.error = Some(TypeRefError::GenericArgKindMismatch { expected });
+    }
+
+    fn push_expected_int_const(&mut self, found: Type, _span: Span) {
+        self.error = Some(TypeRefError::ExpectedIntConst { found });
     }
 
     fn const_term_arg(&mut self, arg: &GenericArg, _span: Span) -> Option<ConstTerm> {

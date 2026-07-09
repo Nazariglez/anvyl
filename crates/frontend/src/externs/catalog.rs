@@ -1462,6 +1462,7 @@ impl<'a> CatalogBuilder<'a> {
             Type::Int => Some(ExternTypeExpr::Int),
             Type::Float => Some(ExternTypeExpr::Float),
             Type::String => Some(ExternTypeExpr::String),
+            Type::Char => Some(ExternTypeExpr::Char),
             Type::Any => Some(ExternTypeExpr::Any),
             Type::List { elem } => Some(ExternTypeExpr::list(self.abi_from_resolved_ty(elem)?)),
             Type::Map { key, value } => Some(ExternTypeExpr::map(
@@ -1532,6 +1533,7 @@ impl<'a> CatalogBuilder<'a> {
             ExternTypeExpr::Int => Type::Int,
             ExternTypeExpr::Float => Type::Float,
             ExternTypeExpr::String => Type::String,
+            ExternTypeExpr::Char => Type::Char,
             ExternTypeExpr::Any => Type::Any,
             ExternTypeExpr::List(elem) => Type::List {
                 elem: Box::new(self.resolve_ty(ctx, elem).ty),
@@ -1740,6 +1742,16 @@ impl<'a> CatalogBuilder<'a> {
                         context: context.clone(),
                         name: fallback,
                         expected,
+                        site,
+                    });
+                Type::UnresolvedName(fallback)
+            }
+            TypeRefError::ExpectedIntConst { .. } => {
+                self.errors
+                    .push(ExternCatalogError::GenericArgKindMismatch {
+                        context: context.clone(),
+                        name: fallback,
+                        expected: "integer const",
                         site,
                     });
                 Type::UnresolvedName(fallback)
@@ -2008,6 +2020,7 @@ fn validate_map_keys(
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Var(_)
         | Type::UnresolvedName(_)
         | Type::UnresolvedNominal { .. } => {}

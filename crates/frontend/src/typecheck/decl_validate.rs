@@ -132,6 +132,7 @@ fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<Nomina
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void
         | Type::Func { .. }
         | Type::Dyn(_)

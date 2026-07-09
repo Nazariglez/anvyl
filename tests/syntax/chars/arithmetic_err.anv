@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: operator `+` cannot be applied to `char`
+
+fn main() {
+    let bad = 'a' + 'b';
+}

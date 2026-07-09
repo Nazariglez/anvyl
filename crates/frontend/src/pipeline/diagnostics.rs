@@ -1389,6 +1389,7 @@ fn surface_type(ty: &Type, type_ctx: &TypeDiagnosticContext) -> Type {
         | Type::Float
         | Type::Bool
         | Type::String
+        | Type::Char
         | Type::Void
         | Type::Var(_)
         | Type::UnresolvedName(_) => ty.clone(),
@@ -2108,6 +2109,7 @@ fn render_const_value(value: &ConstValue) -> String {
         ConstValue::Float(value) => value.to_string(),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::String(value) => value.clone(),
+        ConstValue::Char(value) => value.to_string(),
     }
 }
 

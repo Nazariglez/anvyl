@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: duplicate key
+
+fn main() {
+    let m = ['a': 1, 'a': 2];
+}

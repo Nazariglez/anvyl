@@ -2515,6 +2515,7 @@ fn verify_const(cx: &mut VerifyCx<'_>, id: ConstId) {
         ConstValue::Float(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Float),
         ConstValue::Bool(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Bool),
         ConstValue::String(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::String),
+        ConstValue::Char(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Char),
         ConstValue::Nil => {
             if typing::optional_inner(cx.program, konst.ty).is_none() {
                 cx.push(
@@ -8612,6 +8613,7 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
         | TypeData::Float
         | TypeData::Bool
         | TypeData::String
+        | TypeData::Char
         | TypeData::Void
         | TypeData::Any => {}
         TypeData::Optional(inner) | TypeData::List(inner) | TypeData::Slice(inner) => {

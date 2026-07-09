@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: non-exhaustive match
+
+fn classify(c: char) -> string {
+    match c {
+        'a' => "a",
+    }
+}

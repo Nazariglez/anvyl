@@ -33,6 +33,7 @@ pub(crate) enum PatternCover {
     Int(i64),
     Float(u64),
     String(String),
+    Char(char),
     EnumVariant { key: NominalKey, variant: Ident },
     Tuple(Vec<PatternCover>),
     Or(Vec<PatternCover>),
@@ -381,23 +382,13 @@ impl PatternCheckResult {
 }
 
 fn checked_literal(lit: &Lit) -> CheckedPattern {
-    let Some(value) = const_value(lit) else {
+    let Some(value) = lit.const_value() else {
         return CheckedPattern::Unsupported;
     };
     CheckedPattern::Literal(CheckedLiteralPattern {
         value,
         ty: type_from_lit(lit),
     })
-}
-
-fn const_value(lit: &Lit) -> Option<ConstValue> {
-    match lit {
-        Lit::Int(value) => Some(ConstValue::Int(*value)),
-        Lit::Float(value) => Some(ConstValue::Float(*value)),
-        Lit::Bool(value) => Some(ConstValue::Bool(*value)),
-        Lit::String(value) => Some(ConstValue::String(value.clone())),
-        Lit::Nil => None,
-    }
 }
 
 fn checked_binding(
@@ -981,6 +972,7 @@ impl<'tc> PatternChecker<'tc> {
             Lit::Int(value) => PatternCover::Int(*value),
             Lit::Float(value) => PatternCover::Float(value.to_bits()),
             Lit::String(value) => PatternCover::String(value.clone()),
+            Lit::Char(value) => PatternCover::Char(*value),
             Lit::Nil => PatternCover::Unsupported,
         };
         PatternOutcome::refutable(cover)

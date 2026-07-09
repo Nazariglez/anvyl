@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: int bounds
+
+fn main() {
+    let r = 'a'..='z';
+    for c in r {
+        println(c);
+    }
+}

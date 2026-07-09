@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: expected `int`, found `char`
+
+fn main() {
+    let n: int = 'a';
+}

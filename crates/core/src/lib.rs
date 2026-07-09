@@ -1,3 +1,4 @@
+pub mod core_char;
 pub mod core_float;
 pub mod core_int;
 pub mod core_runtime;
@@ -5,6 +6,9 @@ pub mod core_string;
 
 #[doc(hidden)]
 pub mod __anvyx_native {
+    pub mod core_char {
+        pub use crate::core_char::__anvyx_native::*;
+    }
     pub mod core_float {
         pub use crate::core_float::__anvyx_native::*;
     }
@@ -72,6 +76,11 @@ pub const MODULES: &[SourceFile] = &[
         label: "crates/core/src/core_string.anv",
         code: include_str!("core_string.anv"),
     },
+    SourceFile {
+        path: &["core_char"],
+        label: "crates/core/src/core_char.anv",
+        code: include_str!("core_char.anv"),
+    },
 ];
 
 pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
@@ -79,6 +88,7 @@ pub fn provider_descriptors() -> Vec<anvyx_externs::ProviderDescriptor> {
         core_int::provider_descriptor(),
         core_float::provider_descriptor(),
         core_string::provider_descriptor(),
+        core_char::provider_descriptor(),
         core_runtime::provider_descriptor(),
     ]
 }
@@ -88,6 +98,7 @@ pub fn rust_provider_supports() -> Vec<anvyx_runtime::RustProviderSupport> {
         provider_support("core_int", core_int::rust_module_support()),
         provider_support("core_float", core_float::rust_module_support()),
         provider_support("core_string", core_string::rust_module_support()),
+        provider_support("core_char", core_char::rust_module_support()),
         provider_support("core_runtime", core_runtime::rust_module_support()),
     ]
 }
@@ -174,7 +185,13 @@ mod tests {
     #[test]
     fn string_provider_metadata_and_support() {
         let providers = provider_descriptors();
-        let string = &providers[2].modules[0].functions;
+        let string = providers
+            .iter()
+            .find(|provider| provider.provider.name == "core_string")
+            .unwrap()
+            .modules[0]
+            .functions
+            .as_slice();
         assert!(
             string
                 .iter()
@@ -184,10 +201,17 @@ mod tests {
         );
 
         let support = rust_provider_supports();
-        assert_eq!(support.len(), 4);
-        assert_eq!(support[0].cargo.manifest_key, "anvyx_core");
-        assert_eq!(support[0].cargo.package.as_deref(), Some("anvyx-core"));
-        let string_support = &support[2].modules[0];
+        let int_support = support
+            .iter()
+            .find(|provider| provider.provider.name == "core_int")
+            .unwrap();
+        assert_eq!(int_support.cargo.manifest_key, "anvyx_core");
+        assert_eq!(int_support.cargo.package.as_deref(), Some("anvyx-core"));
+        let string_support = &support
+            .iter()
+            .find(|provider| provider.provider.name == "core_string")
+            .unwrap()
+            .modules[0];
         assert!(
             string_support
                 .bindings

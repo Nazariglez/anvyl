@@ -729,6 +729,7 @@ fn type_subject_expr<'src>() -> BoxedParser<'src, ast::ExprNode> {
         Token::Keyword(Keyword::Float) => ast::Type::Float,
         Token::Keyword(Keyword::Bool) => ast::Type::Bool,
         Token::Keyword(Keyword::String) => ast::Type::String,
+        Token::Keyword(Keyword::Char) => ast::Type::Char,
     };
 
     choice((explicit, primitive))

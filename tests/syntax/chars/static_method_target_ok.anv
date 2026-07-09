@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+extend char {
+    fn lower_a() -> char { 'a' }
+    fn identity(self) -> char { self }
+}
+
+fn main() {
+    let a: char = char.lower_a();
+    let b: char = a.identity();
+}

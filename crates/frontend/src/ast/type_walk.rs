@@ -13,6 +13,7 @@ pub(crate) trait TypeFolder {
             Type::Float => Type::Float,
             Type::Bool => Type::Bool,
             Type::String => Type::String,
+            Type::Char => Type::Char,
             Type::Void => Type::Void,
             Type::Func { params, ret } => Type::Func {
                 params: params
@@ -200,6 +201,7 @@ pub(crate) trait TypeVisitor {
             | Type::Float
             | Type::Bool
             | Type::String
+            | Type::Char
             | Type::Void
             | Type::Var(_)
             | Type::UnresolvedName(_) => false,

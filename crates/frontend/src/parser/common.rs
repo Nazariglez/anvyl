@@ -151,6 +151,7 @@ pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
                 ast::Lit::Float(value)
             }
             LitToken::String(s) => ast::Lit::String(s.to_string()),
+            LitToken::Char(c) => ast::Lit::Char(c),
         },
         Token::Keyword(Keyword::True) => ast::Lit::Bool(true),
         Token::Keyword(Keyword::False) => ast::Lit::Bool(false),

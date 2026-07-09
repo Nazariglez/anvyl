@@ -76,11 +76,10 @@ pub fn str_substring(s: &str, start: i64, len: i64) -> Option<AnvString> {
 
 #[inline]
 #[function]
-pub fn str_char_at(s: &str, index: i64) -> Option<AnvString> {
+pub fn str_char_at(s: &str, index: i64) -> Option<char> {
     usize::try_from(index)
         .ok()
         .and_then(|index| s.chars().nth(index))
-        .map(|c| AnvString::from(c.to_string()))
 }
 
 #[inline]

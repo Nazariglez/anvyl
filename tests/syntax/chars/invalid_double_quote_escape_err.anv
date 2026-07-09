@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected character
+
+fn main() {
+    let c: char = '\"';
+}

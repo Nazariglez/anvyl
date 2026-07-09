@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: expected 'char', found 'string'
+
+fn classify(c: char) -> string {
+    match c {
+        "a" => "a",
+        _ => "other",
+    }
+}

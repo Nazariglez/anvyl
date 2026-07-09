@@ -100,7 +100,7 @@ impl TypePassClassAnalyzer<'_> {
             return TypePassClass::Opaque;
         };
         match data {
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::Void => {
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::Char | TypeData::Void => {
                 TypePassClass::Immediate
             }
             TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
@@ -225,6 +225,7 @@ impl TypePassClassAnalyzer<'_> {
             TypePassClass::Immediate => LayoutResult::Copy(match self.program.type_arena.get(ty) {
                 Some(TypeData::Int | TypeData::Float) => AirCopyLayout { size: 8, align: 8 },
                 Some(TypeData::Bool) => AirCopyLayout { size: 1, align: 1 },
+                Some(TypeData::Char) => AirCopyLayout { size: 4, align: 4 },
                 Some(TypeData::Void) => AirCopyLayout { size: 0, align: 1 },
                 _ => unreachable!("non-primitive immediate"),
             }),

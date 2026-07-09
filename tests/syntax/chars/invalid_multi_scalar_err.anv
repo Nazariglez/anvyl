@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: char literal must contain exactly one scalar value
+
+fn main() {
+    let c = 'ab';
+}
