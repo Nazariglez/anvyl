@@ -27,19 +27,30 @@ fn expr_has_block(expr: &ast::Expr) -> bool {
     }
 }
 
+fn push_escaped_lit_char(out: &mut String, ch: char, quote: char) {
+    match ch {
+        '\n' => out.push_str("\\n"),
+        '\t' => out.push_str("\\t"),
+        '\r' => out.push_str("\\r"),
+        '\\' => out.push_str("\\\\"),
+        '"' if quote == '"' => out.push_str("\\\""),
+        '\'' if quote == '\'' => out.push_str("\\'"),
+        '\0' if quote == '"' => out.push_str("\\0"),
+        other => out.push(other),
+    }
+}
+
 fn escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\0' => out.push_str("\\0"),
-            other => out.push(other),
-        }
+        push_escaped_lit_char(&mut out, ch, '"');
     }
+    out
+}
+
+fn escape_char(ch: char) -> String {
+    let mut out = String::new();
+    push_escaped_lit_char(&mut out, ch, '\'');
     out
 }
 
@@ -361,6 +372,11 @@ impl<'a> Printer<'a> {
                 self.write("\"");
                 self.write(&escape_string(s));
                 self.write("\"");
+            }
+            ast::Lit::Char(ch) => {
+                self.write("'");
+                self.write(&escape_char(*ch));
+                self.write("'");
             }
             ast::Lit::Nil => self.write("nil"),
         }

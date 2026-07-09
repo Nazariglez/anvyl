@@ -121,6 +121,7 @@ dependencies = [
 name = "anvyx-frontend"
 version = "0.1.0"
 dependencies = [
+ "anvyx-core",
  "anvyx-externs",
  "ariadne",
  "chumsky",
