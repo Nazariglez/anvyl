@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: as? does not use total cast
+
+enum State: int {
+    Idle = 0,
+}
+
+extend State {
+    cast from(raw: int) { State.Idle }
+}
+
+fn main() {
+    let state = 0 as? State;
+}

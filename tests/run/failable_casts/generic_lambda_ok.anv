@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 41
+// hi
+// @match-end
+
+struct Box<T> { item: T }
+
+extend<T> struct Box<T> {
+    cast? from(item: T) {
+        let make: fn(T) -> Box<T> = |value| Box<T> { item: value };
+        make(item)
+    }
+}
+
+fn main() {
+    if let boxed = 41 as? Box<int> {
+        println(boxed.item);
+    }
+    if let boxed = "hi" as? Box<string> {
+        println(boxed.item);
+    }
+}

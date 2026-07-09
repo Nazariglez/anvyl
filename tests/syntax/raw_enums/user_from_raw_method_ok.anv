@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+enum State: int {
+    Idle = 0,
+}
+
+extend State {
+    fn from_raw(raw: int) -> State { State.Idle }
+}
+
+fn main() {
+    let state: State = State.from_raw(0);
+}

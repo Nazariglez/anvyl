@@ -1573,7 +1573,9 @@ impl TypeChecker {
     fn can_record_local_facts(&self) -> bool {
         let body = self.current_body();
         match body {
-            BodyInstanceKey::Lambda(_) | BodyInstanceKey::Global(_) => true,
+            BodyInstanceKey::Lambda(_)
+            | BodyInstanceKey::Global(_)
+            | BodyInstanceKey::CastFrom(_) => true,
             BodyInstanceKey::Callable(key) => {
                 key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
                     || matches!(
@@ -1587,7 +1589,7 @@ impl TypeChecker {
                         )
                     )
             }
-            BodyInstanceKey::Module(_) | BodyInstanceKey::CastFrom(_) => false,
+            BodyInstanceKey::Module(_) => false,
         }
     }
 
@@ -2517,6 +2519,23 @@ impl TypeChecker {
                 requires_mutable,
                 span,
             },
+        );
+    }
+
+    pub(super) fn record_user_cast_conversion(
+        &mut self,
+        expr_id: ExprId,
+        source_id: ExprId,
+        conversion: &CastFromConversion,
+    ) {
+        let site = self.current_expr_site(expr_id);
+        self.semantic_facts.record_user_cast_conversion(
+            site.body,
+            UserCastSite {
+                expr: expr_id,
+                source: source_id,
+            },
+            conversion.instance.clone(),
         );
     }
 
@@ -4454,8 +4473,8 @@ fn check_expr_checked_with_hint(
         ExprKind::IntrinsicCall(call) => check_intrinsic_call(expr, call, tc),
         ExprKind::Range(range) => check_range_expr(expr, range, expected.as_ref(), tc),
         ExprKind::Cast(cast) => convert::check_cast_expr(expr, cast, tc),
-        ExprKind::ExactDowncast(downcast) => {
-            downcast::check_expr(expr, downcast, expected.as_ref(), tc)
+        ExprKind::FailableCast(cast) => {
+            convert::check_failable_cast_expr(expr, cast, expected.as_ref(), tc)
         }
         ExprKind::Lambda(lambda) => closure::check_lambda_expr(expr, lambda, expected.as_ref(), tc),
     }

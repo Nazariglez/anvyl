@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+enum State: int {
+    Idle = 0,
+    Run = 1,
+}
+
+extend State {
+    cast? from(raw: int) {
+        match raw {
+            0 => State.Idle,
+            1 => State.Run,
+            _ => nil,
+        }
+    }
+}
+
+fn main() {
+    if let state = 1 as? State {
+        println(state as int);
+    }
+    if let state = 2 as? State {
+        println(state as int);
+    }
+}

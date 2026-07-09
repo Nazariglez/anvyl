@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: ExactDowncast expressions cannot be used as default initializers
+// @contains: FailableCast expressions cannot be used as default initializers
 
 contract Drawable {
     fn draw(self);

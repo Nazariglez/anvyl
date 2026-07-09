@@ -4,9 +4,9 @@ use super::{
     CheckedType, TypeChecker, TypeError, TypeHandle, check_block_checked_with_hint,
     check_expected_value_expr, check_value_expr_checked_with_hint, checked_from_type, checked_void,
     closure::{self, FunctionFlowMode},
-    collection_loan, control_flow,
+    collection_loan, control_flow, convert,
     decls::{FieldSchema, NamedSchemas, NominalKey, TypeBinding, nominal_type},
-    downcast::{self, DowncastSite, DowncastSourcePolicy},
+    downcast::{self, DowncastSite},
     enum_variant, field_check,
     generic::GenericArgs,
     infer::SemanticLocalId,
@@ -2096,81 +2096,48 @@ pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecke
     tc.pop_scope();
 }
 
-fn check_if_let_exact_downcast(
-    if_let_node: &IfLetNode,
-    downcast_node: &ExactDowncastNode,
+fn check_if_let_ref_downcast_checked(
+    node: &IfLet,
+    binding: Option<Ident>,
+    checked: downcast::CheckedDowncast,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedType {
-    let node = &if_let_node.node;
-    let binding = exact_downcast_binding(node, tc);
-    let policy = match binding {
-        Some(binding) if binding.mutable => DowncastSourcePolicy::MutablePlace,
-        _ => DowncastSourcePolicy::Value,
-    };
-    let site = DowncastSite {
-        id: node.value.node.id,
-        source_id: downcast_node.node.expr.node.id,
-        span: tc.source_span(node.value.span),
-    };
-    let checked = downcast::check_conditional(downcast_node, &policy, binding.map(|_| &site), tc);
-
-    let binding_ty = checked.target.clone().unwrap_or(Type::Infer);
+    let downcast::CheckedDowncast { target, source } = checked;
+    let binding_ty = target.clone().unwrap_or(Type::Infer);
     checked_from_type(&node.value, binding_ty.clone(), tc);
-    let Some(binding) = binding else {
+    let Some(name) = binding else {
         return check_downcast_branches(node, None, &binding_ty, expected, tc);
     };
-    let Some(target) = checked.target.clone() else {
-        return check_downcast_branches(node, Some(binding), &binding_ty, expected, tc);
+    let Some(target) = target else {
+        return check_downcast_branches(node, Some(name), &binding_ty, expected, tc);
     };
-
-    if checked.source.valid_contract().is_none() {
-        return check_downcast_branches(node, Some(binding), &binding_ty, expected, tc);
-    }
+    let Some(alias) = source.valid_alias() else {
+        return check_downcast_branches(node, Some(name), &binding_ty, expected, tc);
+    };
 
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
-        let handle = TypeChecker::type_handle(&target);
-        match (binding.mutable, checked.source.valid_alias()) {
-            (true, Some(alias)) => tc.define_ref_alias_binding_from_handle(
-                binding.name,
-                &handle,
-                alias.target(PlaceAccess::Mutable),
-                PatternContext::IfLet,
-                Some(node.pattern.span),
-            ),
-            _ => {
-                tc.define_pattern_binding_from_handle(
-                    binding.name,
-                    &handle,
-                    false,
-                    Some(node.pattern.span),
-                );
-            }
-        }
-
+        tc.define_ref_alias_binding_from_handle(
+            name,
+            &TypeChecker::type_handle(&target),
+            alias.target(PlaceAccess::Mutable),
+            PatternContext::IfLet,
+            Some(node.pattern.span),
+        );
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
         tc.pop_scope();
         then
     })
 }
 
-#[derive(Clone, Copy)]
-struct ExactDowncastBinding {
-    name: Ident,
-    mutable: bool,
-}
-
-fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDowncastBinding> {
+fn ref_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<Ident> {
     match node.pattern.node {
-        Pattern::Ident(name) => Some(ExactDowncastBinding {
-            name,
-            mutable: node.head.is_ref(),
-        }),
+        Pattern::Ident(name) => Some(name),
         _ => {
             tc.push_error(TypeError::CompileError {
-                message: "exact downcast currently binds a single identifier".to_string(),
+                message: "dynamic downcast binding requires a single identifier".to_string(),
                 span: tc.error_span(node.pattern.span),
             });
             None
@@ -2180,7 +2147,7 @@ fn exact_downcast_binding(node: &IfLet, tc: &mut TypeChecker) -> Option<ExactDow
 
 fn check_downcast_branches(
     node: &IfLet,
-    binding: Option<ExactDowncastBinding>,
+    binding: Option<Ident>,
     binding_ty: &Type,
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
@@ -2188,15 +2155,79 @@ fn check_downcast_branches(
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
-        if let Some(binding) = binding {
-            let handle = TypeChecker::type_handle(binding_ty);
+        if let Some(name) = binding {
             tc.define_pattern_binding_from_handle(
-                binding.name,
-                &handle,
-                binding.mutable,
+                name,
+                &TypeChecker::type_handle(binding_ty),
+                true,
                 Some(node.pattern.span),
             );
         }
+        let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
+        tc.pop_scope();
+        then
+    })
+}
+
+fn check_if_let_ref_failable_cast(
+    if_let_node: &IfLetNode,
+    cast: &FailableCastNode,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let node = &if_let_node.node;
+    let source = place::check_place(&cast.node.expr, tc);
+    let source_ty = source.checked().ty.clone();
+    let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
+    if matches!(source_ty, Type::Infer) || matches!(target, Type::Infer) {
+        return check_downcast_branches(node, None, &Type::Infer, expected, tc);
+    }
+    match convert::resolve_failable_cast(cast, &source_ty, &target, tc) {
+        Some(convert::ResolvedFailableCast::DynamicDowncast) => {
+            let binding = ref_downcast_binding(node, tc);
+            let site = DowncastSite {
+                id: node.value.node.id,
+                source_id: cast.node.expr.node.id,
+                span: tc.source_span(node.value.span),
+            };
+            let checked =
+                downcast::check_conditional_place(cast, target, source, binding.map(|_| &site), tc);
+            check_if_let_ref_downcast_checked(node, binding, checked, expected, tc)
+        }
+        Some(convert::ResolvedFailableCast::CastFrom(_)) => {
+            tc.push_error(TypeError::CompileError {
+                message: "user failable casts cannot be bound with `ref`".to_string(),
+                span: tc.error_span(if_let_node.node.pattern.span),
+            });
+            check_downcast_branches(node, None, &Type::Infer, expected, tc)
+        }
+        None => check_downcast_branches(node, None, &Type::Infer, expected, tc),
+    }
+}
+
+fn check_if_let_failable_payload(
+    node: &IfLet,
+    cast: &FailableCastNode,
+    name: Ident,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let checked = convert::check_failable_cast_expr(&node.value, cast, None, tc);
+    let binding_ty = tc
+        .decls
+        .semantic_option_inner(&checked.ty)
+        .cloned()
+        .unwrap_or(Type::Infer);
+    let then_expected = expected.clone();
+    check_if_let_branches(node, expected, tc, |tc| {
+        tc.push_scope();
+        let handle = TypeChecker::type_handle(&binding_ty);
+        tc.define_pattern_binding_from_handle(
+            name,
+            &handle,
+            matches!(node.head, ConditionalPatternAccess::Var),
+            Some(node.pattern.span),
+        );
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
         tc.pop_scope();
         then
@@ -2231,10 +2262,13 @@ pub(super) fn check_if_let_checked_with_hint(
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let node = &if_let_node.node;
-    if node.head.is_ref()
-        && let ExprKind::ExactDowncast(downcast) = &node.value.node.kind
-    {
-        return check_if_let_exact_downcast(if_let_node, downcast, expected, tc);
+    if let ExprKind::FailableCast(cast) = &node.value.node.kind {
+        if node.head.is_ref() {
+            return check_if_let_ref_failable_cast(if_let_node, cast, expected, tc);
+        }
+        if let Pattern::Ident(name) = node.pattern.node {
+            return check_if_let_failable_payload(node, cast, name, expected, tc);
+        }
     }
 
     let mode = mode_for_conditional_access(node.head);

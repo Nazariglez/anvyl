@@ -1,0 +1,18 @@
+// @mode: check
+// @expect: error
+// @contains: Wrong number of arguments
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}
+
+fn make_token(raw: int) -> Token {
+    Token { raw: raw }
+}
+
+fn main() {
+    let value = make_token() as? Value;
+}

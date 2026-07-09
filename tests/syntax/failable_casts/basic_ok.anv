@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}
+
+fn main() {}

@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+struct Source { n: int }
+struct Target { n: int }
+
+extend Target {
+    cast? from(source: Source) {
+        if source.n == 0 {
+            return nil;
+        }
+        Target { n: source.n }
+    }
+}
+
+fn main() {
+    let seven = Source { n: 7 };
+    let zero = Source { n: 0 };
+    if let target = seven as? Target {
+        println(target.n);
+    }
+    if let target = zero as? Target {
+        println(target.n);
+    }
+}

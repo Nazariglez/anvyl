@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cast? from return type mismatch
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) -> Value { Value { raw: token.raw } }
+}
+
+fn main() {}

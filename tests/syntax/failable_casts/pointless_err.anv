@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: pointless cast from
+
+struct Value { n: int }
+
+extend Value {
+    cast? from(value: Value) { value }
+}
+
+fn main() {}

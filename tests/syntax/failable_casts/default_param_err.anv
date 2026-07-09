@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: cannot have a default value
+
+struct Value { raw: int }
+
+extend Value {
+    cast? from(raw: int = 0) { nil }
+}
+
+fn main() {}

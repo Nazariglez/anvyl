@@ -1,0 +1,8 @@
+// @helper
+
+pub struct Token { raw: int }
+pub struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}

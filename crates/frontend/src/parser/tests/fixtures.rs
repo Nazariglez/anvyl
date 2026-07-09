@@ -1,7 +1,0 @@
-use super::helpers::{parse_program, parse_program_err};
-
-const EMPTY_OK: &str = include_str!("../../../../../tests/syntax/for/empty_ok.anv");
-const PAREN_ITER_OK: &str = include_str!("../../../../../tests/syntax/for/paren_iter_ok.anv");
-const PAREN_STEP_OK: &str = include_str!("../../../../../tests/syntax/for/paren_step_ok.anv");
-const STRUCT_ITER_ERR: &str = include_str!("../../../../../tests/syntax/for/struct_iter_err.anv");
-const STRUCT_STEP_ERR: &str = include_str!("../../../../../tests/syntax/for/struct_step_err.anv");

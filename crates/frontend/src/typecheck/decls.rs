@@ -20,10 +20,10 @@ use super::{
 };
 use crate::{
     ast::{
-        self, AggregateKind, ConstArg, ConstParam, ContractRef, EscapeMode, ExtendTargetConstraint,
-        FuncParam, GenericArg, Ident, ImportItemKind, ImportKind, MethodReceiver, MethodSig,
-        ModuleOrigin, Mutability, NominalKind, Param, Program, ReturnSpec, Stmt, StmtNode, Type,
-        TypeParam, VariantKind, Visibility,
+        self, AggregateKind, CastKind, ConstArg, ConstParam, ContractRef, EscapeMode,
+        ExtendTargetConstraint, FuncParam, GenericArg, Ident, ImportItemKind, ImportKind,
+        MethodReceiver, MethodSig, ModuleOrigin, Mutability, NominalKind, Param, Program,
+        ReturnSpec, Stmt, StmtNode, Type, TypeParam, VariantKind, Visibility,
     },
     externs::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
@@ -555,6 +555,12 @@ pub(crate) enum DeclError {
         span: Option<SourceSpan>,
     },
     DuplicateCastFrom {
+        kind: CastKind,
+        target: Type,
+        source: Type,
+        span: Option<SourceSpan>,
+    },
+    ConflictingCastFrom {
         target: Type,
         source: Type,
         span: Option<SourceSpan>,
@@ -564,6 +570,7 @@ pub(crate) enum DeclError {
         span: Option<SourceSpan>,
     },
     CastFromReturnMismatch {
+        kind: CastKind,
         expected: Type,
         found: Type,
         span: Option<SourceSpan>,
@@ -734,6 +741,7 @@ impl DeclError {
             | DeclError::DuplicateContractRequirement { span, .. }
             | DeclError::DuplicateExtendMethod { span, .. }
             | DeclError::DuplicateCastFrom { span, .. }
+            | DeclError::ConflictingCastFrom { span, .. }
             | DeclError::PointlessCastFrom { span, .. }
             | DeclError::CastFromReturnMismatch { span, .. }
             | DeclError::UnsupportedExtendTarget { span, .. }
@@ -1768,6 +1776,7 @@ pub(crate) struct ExtendSchema {
 
 #[derive(Clone)]
 pub(crate) struct CastConversionSchema {
+    pub(crate) kind: CastKind,
     pub(crate) param: FuncParam,
     pub(crate) param_span: Span,
     pub(crate) ret: Option<ReturnSpec>,
@@ -1791,6 +1800,12 @@ pub(crate) struct CastFromConversion {
     pub(crate) escape: EscapeMode,
     pub(crate) origin: ModuleScope,
     pub(crate) instance: CastFromInstanceKey,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CastFromSignature {
+    pub(crate) source: Type,
+    pub(crate) ret: Type,
 }
 
 pub(crate) enum CastConversionMatch {
@@ -2951,6 +2966,7 @@ impl DeclarationIndex {
                         .cast_froms
                         .iter()
                         .map(|cast| CastConversionSchema {
+                            kind: cast.node.kind,
                             param: cast.node.param.func_param(),
                             param_span: cast.node.param.ty_span,
                             ret: cast.node.ret.clone(),
@@ -4170,8 +4186,31 @@ impl DeclarationIndex {
         self.extends.iter_mut().find(|extend| extend.id == *id)
     }
 
+    pub(crate) fn cast_return_type(&self, kind: CastKind, target: Type) -> Type {
+        match kind {
+            CastKind::Total => target,
+            CastKind::Failable => self.expect_core_option_of(target),
+        }
+    }
+
+    pub(crate) fn cast_from_signature(
+        &self,
+        key: &CastFromInstanceKey,
+    ) -> Option<CastFromSignature> {
+        let extend = self.extend(&key.extend)?;
+        let cast = extend.cast_froms.get(key.index)?;
+        let (types, consts) = extend.generics.substitutions(&key.args);
+        let source = generic_template_type(&cast.param.ty, &extend.generics);
+        let target = generic_template_type(&extend.target, &extend.generics);
+        Some(CastFromSignature {
+            source: substitute(&source, &types, &consts),
+            ret: self.cast_return_type(cast.kind, substitute(&target, &types, &consts)),
+        })
+    }
+
     pub(crate) fn find_cast_conversion(
         &self,
+        kind: CastKind,
         source: &Type,
         target: &Type,
         visible: impl Fn(&ExtendSchema) -> bool,
@@ -4190,6 +4229,9 @@ impl DeclarationIndex {
                 continue;
             };
             for (index, cast) in extend.cast_froms.iter().enumerate() {
+                if cast.kind != kind {
+                    continue;
+                }
                 let source_template = generic_template_type(&cast.param.ty, &extend.generics);
                 let Some(args) = Self::cast_source_args(
                     &extend.generics,

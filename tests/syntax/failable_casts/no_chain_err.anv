@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: error
+// @contains: no failable cast
+
+struct Token { raw: int }
+struct Boxed { token: Token }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}
+
+fn main() {
+    let boxed = Boxed { token: Token { raw: 1 } };
+    let value = boxed as? Value;
+}

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: success
+
+import m { Token, Value };
+
+fn main() {
+    let token = Token { raw: 1 };
+    let value = token as? Value;
+}

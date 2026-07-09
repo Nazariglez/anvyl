@@ -1139,7 +1139,7 @@ fn postfix_expr<'src>(
 
 fn cast_expr<'src>(unary: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'src, ast::ExprNode> {
     let cast_op = select! { Token::Keyword(Keyword::As) => () }
-        .ignore_then(select! { Token::Question => CastOp::Exact }.or_not())
+        .ignore_then(select! { Token::Question => CastOp::Failable }.or_not())
         .then(type_ident())
         .map(|(op, target)| (op.unwrap_or(CastOp::Ordinary), target));
     unary
@@ -1155,7 +1155,7 @@ fn cast_expr<'src>(unary: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'s
                     },
                     span,
                 )),
-                CastOp::Exact => ast::ExprKind::ExactDowncast(Spanned::new(
+                CastOp::Failable => ast::ExprKind::FailableCast(Spanned::new(
                     ast::Cast {
                         expr: Box::new(expr),
                         target,
@@ -1171,7 +1171,7 @@ fn cast_expr<'src>(unary: impl AnvParser<'src, ast::ExprNode>) -> BoxedParser<'s
 #[derive(Clone, Copy)]
 enum CastOp {
     Ordinary,
-    Exact,
+    Failable,
 }
 
 enum PrefixOp {

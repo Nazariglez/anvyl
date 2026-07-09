@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown variant 'from_raw'
+
+enum State: int {
+    Idle = 0,
+}
+
+fn main() {
+    let state = State.from_raw(0);
+}

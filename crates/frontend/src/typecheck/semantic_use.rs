@@ -33,6 +33,7 @@ pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
 pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
 pub(crate) type DynDowncastMap = HashMap<ExprId, DynDowncastFact>;
+pub(crate) type UserCastConversionMap = HashMap<UserCastSite, CastFromInstanceKey>;
 pub(crate) type GlobalAccessMap = HashMap<ExprId, GlobalAccessFact>;
 pub(crate) type StringifyMap = HashMap<ExprId, StringifyFact>;
 pub(crate) type LambdaEscapeMap = HashMap<ExprId, LambdaEscapeFact>;
@@ -584,6 +585,12 @@ pub(crate) struct SemanticExprSite {
     pub(crate) expr: ExprId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UserCastSite {
+    pub(crate) expr: ExprId,
+    pub(crate) source: ExprId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DefaultArgFact {
     pub(crate) call: ExprId,
@@ -647,6 +654,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) dyn_weakenings: DynWeakeningMap,
     pub(crate) dyn_calls: DynCallMap,
     pub(crate) dyn_downcasts: DynDowncastMap,
+    pub(crate) user_cast_conversions: UserCastConversionMap,
     pub(crate) global_accesses: GlobalAccessMap,
     pub(crate) stringifies: StringifyMap,
     pub(crate) iter_runtime_checks: IterRuntimeCheckMap,
@@ -670,6 +678,8 @@ impl SemanticBodyFacts {
         self.dyn_weakenings.extend(facts.dyn_weakenings);
         self.dyn_calls.extend(facts.dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
+        self.user_cast_conversions
+            .extend(facts.user_cast_conversions);
         self.global_accesses.extend(facts.global_accesses);
         self.stringifies.extend(facts.stringifies);
         self.iter_runtime_checks.extend(facts.iter_runtime_checks);
@@ -1088,6 +1098,17 @@ impl SemanticFactMaps {
 
     pub(crate) fn record_dyn_downcast(&mut self, body: BodyInstanceKey, fact: DynDowncastFact) {
         self.body_mut(body).dyn_downcasts.insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_user_cast_conversion(
+        &mut self,
+        body: BodyInstanceKey,
+        site: UserCastSite,
+        instance: CastFromInstanceKey,
+    ) {
+        self.body_mut(body)
+            .user_cast_conversions
+            .insert(site, instance);
     }
 
     pub(crate) fn record_global_access(&mut self, body: BodyInstanceKey, fact: GlobalAccessFact) {

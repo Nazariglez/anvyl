@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: user failable casts cannot be bound with `ref`
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}
+
+fn main() {
+    var token = Token { raw: 1 };
+    if ref value = token as? Value {}
+}

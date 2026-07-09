@@ -1,11 +1,14 @@
 use super::{
     CheckedType, TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint,
     checked_from_type, contracts, convert, dyn_infer,
-    place::{self, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_place, record_mut_borrow},
+    place::{
+        self, CheckedPlace, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_place,
+        record_mut_borrow,
+    },
     type_ops::{type_closure_facts, type_depends_on_generics},
 };
 use crate::{
-    ast::{ContractRef, ExactDowncastNode, ExprId, ExprNode, Type},
+    ast::{ContractRef, ExprId, ExprNode, FailableCastNode, Type},
     span::{SourceSpan, Span},
 };
 
@@ -69,29 +72,52 @@ impl DowncastAliasSource {
     }
 }
 
-pub(super) fn check_conditional(
-    downcast: &ExactDowncastNode,
-    policy: &DowncastSourcePolicy,
+pub(super) fn check_conditional_place(
+    downcast: &FailableCastNode,
+    target: Type,
+    place: CheckedPlace,
     site: Option<&DowncastSite>,
     tc: &mut TypeChecker,
 ) -> CheckedDowncast {
-    let target = check_target(tc, downcast);
-    let source = check_source(
-        &downcast.node.expr,
-        policy,
+    let target = runtime_target(tc, target, downcast.span);
+    let handle = place.checked().handle.clone();
+    let (contract, mut valid) = source_contract(
+        &place.checked().ty,
+        downcast.node.expr.span,
         DowncastSourceContext::ExactDowncast,
         tc,
     );
+    if !place.value.access.can_mut_borrow() {
+        tc.push_error(TypeError::RefPatternRequiresMutablePlace {
+            span: tc.error_span(downcast.node.expr.span),
+        });
+        valid = false;
+    }
+    record_mut_borrow(downcast.node.expr.node.id, &place.value, tc);
+    let accepts_extern_any = place.accepts_extern_any();
+    let source = CheckedDowncastSource {
+        handle,
+        contract,
+        valid,
+        alias: Some(DowncastAliasSource {
+            access: place.value.access,
+            identity: place.value.identity,
+            facts: place.value.facts,
+            accepts_extern_any,
+        }),
+    };
     if let (Some(site), Some(target), Some(contract)) = (site, &target, source.valid_contract()) {
         record_fact(site, contract, target.clone(), source.mutable(), tc);
     }
     CheckedDowncast { target, source }
 }
 
-pub(super) fn check_expr(
+pub(super) fn check_expr_with_source(
     expr: &ExprNode,
-    downcast: &ExactDowncastNode,
+    downcast: &FailableCastNode,
+    target: Type,
     expected: Option<&TypeHandle>,
+    checked_source: CheckedType,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     let site = DowncastSite {
@@ -99,8 +125,12 @@ pub(super) fn check_expr(
         source_id: downcast.node.expr.node.id,
         span: tc.source_span(expr.span),
     };
-    let checked = check_conditional(downcast, &DowncastSourcePolicy::Value, Some(&site), tc);
-    let Some(target) = checked.target else {
+    let target = runtime_target(tc, target, downcast.span);
+    let source = checked_value_source(checked_source, downcast.node.expr.span, tc);
+    if let (Some(target), Some(contract)) = (&target, source.valid_contract()) {
+        record_fact(&site, contract, target.clone(), source.mutable(), tc);
+    }
+    let Some(target) = target else {
         return checked_from_type(expr, Type::Infer, tc);
     };
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
@@ -115,8 +145,19 @@ pub(super) fn check_expr(
     checked_from_type(expr, ty, tc)
 }
 
-pub(super) fn check_target(tc: &mut TypeChecker, downcast: &ExactDowncastNode) -> Option<Type> {
-    check_target_ref(tc, &downcast.node.target, downcast.span)
+fn checked_value_source(
+    checked: CheckedType,
+    span: Span,
+    tc: &mut TypeChecker,
+) -> CheckedDowncastSource {
+    let (contract, valid) =
+        source_contract(&checked.ty, span, DowncastSourceContext::ExactDowncast, tc);
+    CheckedDowncastSource {
+        handle: checked.handle,
+        contract,
+        valid,
+        alias: None,
+    }
 }
 
 pub(super) fn check_target_ref(tc: &mut TypeChecker, target: &Type, span: Span) -> Option<Type> {
@@ -242,13 +283,7 @@ fn runtime_target(tc: &mut TypeChecker, target: Type, span: Span) -> Option<Type
         Type::Infer => return None,
         _ => {}
     }
-    let facts = type_closure_facts(&target);
-    if facts.first_unresolved.is_some()
-        || facts.infer.contains_type
-        || facts.infer.contains_return
-        || facts.contains_unresolved_const
-        || type_depends_on_generics(&target)
-    {
+    if runtime_target_has_unresolved(&target) {
         tc.push_error(TypeError::CompileError {
             message: "exact downcast target must be a fully concrete runtime-identifiable type"
                 .to_string(),
@@ -265,4 +300,19 @@ fn runtime_target(tc: &mut TypeChecker, target: Type, span: Span) -> Option<Type
         });
         None
     }
+}
+
+pub(super) fn runtime_target_valid(tc: &TypeChecker, target: &Type) -> bool {
+    !matches!(target, Type::Dyn(_) | Type::Infer)
+        && !runtime_target_has_unresolved(target)
+        && tc.decls.key_for_type(target).is_some()
+}
+
+fn runtime_target_has_unresolved(target: &Type) -> bool {
+    let facts = type_closure_facts(target);
+    facts.first_unresolved.is_some()
+        || facts.infer.contains_type
+        || facts.infer.contains_return
+        || facts.contains_unresolved_const
+        || type_depends_on_generics(target)
 }

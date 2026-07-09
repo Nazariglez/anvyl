@@ -1058,7 +1058,7 @@ fn check_extend(extend_node: &ExtendDeclNode, tc: &mut TypeChecker) {
             },
             &cast.node.param,
             &cast_schema.param,
-            self_ty.clone(),
+            tc.decls.cast_return_type(cast_schema.kind, self_ty.clone()),
             &cast.node.body,
             cast.span,
             &[],
@@ -1676,25 +1676,29 @@ pub(super) fn check_specialized_callable_body(
 
 pub(super) fn check_cast_from_conversion_body(
     conversion: &CastFromConversion,
-    source: &Type,
-    target: &Type,
     tc: &mut TypeChecker,
 ) {
     let key = conversion.instance.clone();
-    let Some(schema) = tc.decls.extend(&key.extend).cloned() else {
-        return;
-    };
-    let Some(cast_schema) = schema.cast_froms.get(key.index) else {
-        return;
-    };
+    let schema = tc
+        .decls
+        .extend(&key.extend)
+        .cloned()
+        .expect("selected cast missing extend schema");
+    let cast_schema = schema
+        .cast_froms
+        .get(key.index)
+        .cloned()
+        .expect("selected cast missing declaration schema");
+    let signature = tc
+        .decls
+        .cast_from_signature(&key)
+        .expect("selected cast missing signature");
     let module = key.extend.module.clone();
-    let Some((extend_node, cast_node)) = tc
+    let (extend_node, cast_node) = tc
         .module_programs
         .get(&module)
         .and_then(|program| cast_from_node(program, key.extend.index, key.index))
-    else {
-        return;
-    };
+        .expect("selected cast missing AST declaration");
 
     let (type_subst, const_subst) = schema.generics.substitutions(&key.args);
     let const_bindings = callable_const_bindings(
@@ -1704,7 +1708,7 @@ pub(super) fn check_cast_from_conversion_body(
         &GenericArgs::default(),
     );
     let param_ty = FuncParam::new(
-        source.clone(),
+        signature.source,
         cast_schema.param.mutable,
         cast_schema.param.cast_accept,
         cast_schema.param.escape,
@@ -1730,7 +1734,7 @@ pub(super) fn check_cast_from_conversion_body(
             key,
             &cast_node.node.param,
             &param_ty,
-            target.clone(),
+            signature.ret,
             &cast_node.node.body,
             cast_node.span,
             &const_bindings,

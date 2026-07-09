@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: no failable cast
+
+fn main() {
+    let value = 1 as? float;
+}

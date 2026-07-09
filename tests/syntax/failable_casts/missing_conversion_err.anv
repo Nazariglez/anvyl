@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: no failable cast
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+fn main() {
+    let token = Token { raw: 1 };
+    let value = token as? Value;
+}

@@ -2239,10 +2239,10 @@ fn finish_cast_accept_arg(
             super::convert::apply_expected_dyn_plan(tc, arg.span, Some(arg.node.id), plan);
         }
         SourceAcceptance::CastFrom(conversion) => {
-            let target = tc.handle_type(&param.ty);
-            super::body::check_cast_from_conversion_body(&conversion, &checked.ty, &target, tc);
+            super::body::check_cast_from_conversion_body(&conversion, tc);
             tc.mark_activation_imports_used(&conversion.origin);
             tc.record_conversion_escape(arg, conversion.escape);
+            tc.record_user_cast_conversion(arg.node.id, arg.node.id, &conversion);
         }
         SourceAcceptance::ExplicitCast { .. } => unreachable!(),
     }

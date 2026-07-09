@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: as? does not use total cast
+
+import a;
+import b;
+
+struct Wrapper { n: int }
+
+fn main() {
+    let w = [Wrapper { n: 1 }] as? Wrapper;
+}

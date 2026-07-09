@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: as? does not use total cast
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast from(token: Token) { Value { raw: token.raw } }
+}
+
+fn main() {
+    let token = Token { raw: 1 };
+    let value = token as? Value;
+}

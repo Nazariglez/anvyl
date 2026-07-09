@@ -1384,8 +1384,24 @@ pub struct ExtendDecl {
     pub cast_froms: Vec<CastFromNode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastKind {
+    Total,
+    Failable,
+}
+
+impl CastKind {
+    pub fn syntax(self) -> &'static str {
+        match self {
+            Self::Total => "cast from",
+            Self::Failable => "cast? from",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CastFrom {
+    pub kind: CastKind,
     pub param: Param,
     pub ret: Option<ReturnSpec>,
     pub body: BlockNode,
@@ -1817,7 +1833,7 @@ pub enum ExprKind {
     Match(MatchNode),
     StringInterp(Vec<StringPart>),
     Cast(CastNode),
-    ExactDowncast(CastNode),
+    FailableCast(CastNode),
     Try(TryNode),
     Lambda(LambdaNode),
     InferredEnum(InferredEnumNode),
@@ -1829,7 +1845,7 @@ impl ExprKind {
         match self {
             Self::Binary(node) => Some(node.node.op.precedence()),
             Self::Range(_) => Some(ExprPrecedence::Range),
-            Self::Cast(_) | Self::ExactDowncast(_) => Some(ExprPrecedence::Cast),
+            Self::Cast(_) | Self::FailableCast(_) => Some(ExprPrecedence::Cast),
             Self::Unary(_) | Self::Try(_) => Some(ExprPrecedence::Prefix),
             Self::Ternary(_) => Some(ExprPrecedence::Ternary),
             Self::Assign(_) => Some(ExprPrecedence::Assignment),
@@ -1863,7 +1879,7 @@ impl ExprKind {
             Self::Match(_) => "Match",
             Self::StringInterp(_) => "StringInterp",
             Self::Cast(_) => "Cast",
-            Self::ExactDowncast(_) => "ExactDowncast",
+            Self::FailableCast(_) => "FailableCast",
             Self::Try(_) => "Try",
             Self::Lambda(_) => "Lambda",
             Self::InferredEnum(_) => "InferredEnum",
@@ -2143,7 +2159,7 @@ pub type DeferNode = Spanned<Defer>;
 pub type IntrinsicCallNode = Spanned<IntrinsicCall>;
 pub type InferredEnumNode = Spanned<InferredEnum>;
 pub type CastNode = Spanned<Cast>;
-pub type ExactDowncastNode = CastNode;
+pub type FailableCastNode = CastNode;
 pub type TryNode = Spanned<Try>;
 pub type ConstDeclNode = Spanned<ConstDecl>;
 pub type GlobalDeclNode = Spanned<GlobalDecl>;

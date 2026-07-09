@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: duplicate cast? from
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+    cast? from(token: Token) { nil }
+}
+
+fn main() {}

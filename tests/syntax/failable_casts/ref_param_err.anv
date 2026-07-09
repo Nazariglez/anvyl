@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: parameter cannot be `ref`
+
+struct Value { raw: int }
+
+extend Value {
+    cast? from(ref raw: int) { nil }
+}
+
+fn main() {}

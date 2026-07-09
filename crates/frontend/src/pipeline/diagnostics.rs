@@ -1925,8 +1925,19 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
         DeclError::DuplicateExtendMethod { name, surface, .. } => {
             format!("duplicate extend {} method '{name}'", surface.label())
         }
-        DeclError::DuplicateCastFrom { source, target, .. } => format!(
-            "duplicate cast from '{}' to '{}'",
+        DeclError::DuplicateCastFrom {
+            kind,
+            source,
+            target,
+            ..
+        } => format!(
+            "duplicate {} '{}' to '{}'",
+            kind.syntax(),
+            render_surface_type(source, type_ctx),
+            render_surface_type(target, type_ctx)
+        ),
+        DeclError::ConflictingCastFrom { source, target, .. } => format!(
+            "cast from and cast? from conflict for '{}' to '{}'",
             render_surface_type(source, type_ctx),
             render_surface_type(target, type_ctx)
         ),
@@ -1937,9 +1948,13 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
             )
         }
         DeclError::CastFromReturnMismatch {
-            expected, found, ..
+            kind,
+            expected,
+            found,
+            ..
         } => format!(
-            "cast from return type mismatch: expected '{}', found '{}'",
+            "{} return type mismatch: expected '{}', found '{}'",
+            kind.syntax(),
             render_surface_type(expected, type_ctx),
             render_surface_type(found, type_ctx)
         ),

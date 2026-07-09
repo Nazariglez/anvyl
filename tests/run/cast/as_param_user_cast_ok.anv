@@ -1,0 +1,51 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// source-mid
+// mid-target
+// 42
+// float-target
+// 42
+// source-mid
+// mid-target
+// 43
+// @match-end
+
+struct Source { n: int }
+struct Mid { n: int }
+struct Target { n: int }
+
+extend Mid {
+    cast from(source: Source) {
+        println("source-mid");
+        Mid { n: source.n }
+    }
+}
+
+extend Target {
+    cast from(mid: Mid) {
+        println("mid-target");
+        Target { n: mid.n }
+    }
+
+    cast from(value: float) {
+        println("float-target");
+        Target { n: value as int }
+    }
+}
+
+fn take(target: as Target) {
+    println(target.n);
+}
+
+fn take_optional(target: Target?) {
+    if let value? = target {
+        println(value.n);
+    }
+}
+
+fn main() {
+    take(Source { n: 42 } as Mid);
+    take(42 as float);
+    take_optional((Source { n: 43 } as Mid) as Target);
+}

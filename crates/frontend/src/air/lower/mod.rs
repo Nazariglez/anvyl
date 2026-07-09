@@ -36,18 +36,19 @@ use crate::{
     span::SourceSpan,
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallTarget, CallableId, CallableInstanceKey,
-        CallableKind, CallableParent, CaptureStorageOrigin, CheckedEnumPayload,
-        CheckedLiteralPattern, CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan,
-        CheckedPattern, CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternOwner,
-        ConstTerm, CoreRangeKind, DeclarationIndex, DefaultArgFact, DefaultExprSite,
-        EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget, FunctionValueEscapeCapability,
-        FunctionValueKind, FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
-        GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, IterRuntimeCheckKind,
-        LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
-        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
-        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
-        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
-        TypecheckFacts, VariantPayload, generic_args_are_concrete, nominal_generic_args,
+        CallableKind, CallableParent, CaptureStorageOrigin, CastFromInstanceKey, CastFromSignature,
+        CheckedEnumPayload, CheckedLiteralPattern, CheckedMatchAccess, CheckedMatchArm,
+        CheckedMatchPlan, CheckedPattern, CheckedPatternBinding, CheckedPatternBindingKind,
+        CheckedPatternOwner, ConstTerm, CoreRangeKind, DeclarationIndex, DefaultArgFact,
+        DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
+        FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin, GenericArgs,
+        GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect, GlobalKey,
+        GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
+        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
+        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
+        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
+        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
+        UserCastSite, VariantPayload, generic_args_are_concrete, nominal_generic_args,
         nominal_key_for_type, substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
@@ -1608,6 +1609,37 @@ impl LowerCx<'_> {
                         },
                     );
                 }
+                ReachableSource::CastFrom { cast, signature } => {
+                    let module_scope = &modules.items[cast.module].scope;
+                    let return_type = self.lower_ty(&signature.ret)?;
+                    let (params, locals, local_map) = self.lower_params(
+                        source,
+                        [ParamLowerSpec {
+                            name: cast.node.node.param.name,
+                            ty: &signature.source,
+                            mutable: cast.node.node.param.mutability == AstMutability::Mutable,
+                            escape: cast.node.node.param.escape,
+                            role: ParamRole::Normal,
+                        }],
+                    )?;
+                    self.alloc_function_in_module(
+                        module_scope,
+                        source.body.clone(),
+                        local_map,
+                        |module| Function {
+                            name: Ident::new("cast_from"),
+                            module,
+                            kind: FunctionKind::Normal,
+                            owner: None,
+                            specialization: None,
+                            signature: Signature::new(params, return_type),
+                            locals,
+                            body: AirBody {
+                                block: AirBlock::default(),
+                            },
+                        },
+                    );
+                }
             }
         }
         Ok(())
@@ -1825,6 +1857,9 @@ impl LowerCx<'_> {
                 ReachableSource::Global { global, .. } => {
                     lowerer.lower_expr_body(&global.node.node.value)?;
                 }
+                ReachableSource::CastFrom { cast, .. } => {
+                    lowerer.lower_body(&cast.node.node.body)?;
+                }
             }
             lowered.insert(source.body.clone());
         }
@@ -1996,9 +2031,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match &self.body {
             BodyInstanceKey::Callable(key) => key.args.clone(),
             BodyInstanceKey::Lambda(key) => key.specialization.clone(),
-            BodyInstanceKey::Module(_)
-            | BodyInstanceKey::Global(_)
-            | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
+            BodyInstanceKey::CastFrom(key) => key.args.clone(),
+            BodyInstanceKey::Module(_) | BodyInstanceKey::Global(_) => GenericArgs::default(),
         }
     }
 
@@ -2108,8 +2142,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
-        if matches!(if_let.node.value.node.kind, ExprKind::ExactDowncast(_)) {
-            return Err(unsupported_expr(&if_let.node.value));
+        if let Some(pattern) = direct_failable_payload_pattern(if_let)? {
+            let subject = self.lower_optional_subject(&if_let.node.value, &if_let.node.value)?;
+            let payload = self.temp(subject.inner_ty());
+            return self.emit_optional_match_with_payload_ref(
+                subject,
+                Some(payload),
+                false,
+                |this, payload| {
+                    this.lower_optional_payload_binding(pattern, payload, false)?;
+                    this.lower_block_effect(&if_let.node.then_block)
+                },
+                |this| this.lower_optional_else_effect(if_let.node.else_block.as_ref()),
+            );
         }
         let alias = if_let.node.head.is_ref();
         let subject =
@@ -2146,11 +2191,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let Some(else_block) = &if_let.node.else_block else {
             return Err(unsupported_expr(expr));
         };
-        if matches!(if_let.node.value.node.kind, ExprKind::ExactDowncast(_)) {
-            return Err(unsupported_expr(expr));
-        }
         let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         let result = self.temp(result_ty);
+        if let Some(pattern) = direct_failable_payload_pattern(if_let)? {
+            let subject = self.lower_optional_subject(&if_let.node.value, expr)?;
+            let payload = self.temp(subject.inner_ty());
+            self.emit_optional_match_with_payload_ref(
+                subject,
+                Some(payload),
+                false,
+                |this, payload| {
+                    this.lower_optional_payload_binding(pattern, payload, false)?;
+                    this.lower_if_let_result(&if_let.node.then_block, result, result_ty, expr)
+                },
+                |this| this.lower_if_let_result(else_block, result, result_ty, expr),
+            )?;
+            return Ok(Operand::Place(self.local_place(result)));
+        }
         let alias = if_let.node.head.is_ref();
         let subject = self.lower_optional_pattern_subject(&if_let.node.value, expr, alias)?;
         match classify_optional_pattern(&if_let.node.pattern)? {
@@ -4999,7 +5056,17 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ExprKind::ArrayFill(fill) => self.lower_array_fill(expr, fill),
             ExprKind::MapLiteral(literal) => self.lower_map_literal(expr, literal),
             ExprKind::InferredEnum(inferred) => self.lower_inferred_enum(expr, inferred),
-            ExprKind::Cast(cast) => self.lower_cast_expr(expr, cast),
+            ExprKind::Cast(cast) | ExprKind::FailableCast(cast) => {
+                let site = UserCastSite {
+                    expr: expr.node.id,
+                    source: cast.node.expr.node.id,
+                };
+                if let Some(instance) = self.facts.user_cast_conversions.get(&site).cloned() {
+                    self.lower_user_cast_conversion(expr, &cast.node.expr, &instance)
+                } else {
+                    self.lower_cast_expr(expr, cast)
+                }
+            }
             _ => Err(unsupported_expr(expr)),
         }
     }
@@ -5421,6 +5488,29 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }))
     }
 
+    fn lower_user_cast_conversion(
+        &mut self,
+        expr: &ExprNode,
+        source_expr: &ExprNode,
+        instance: &CastFromInstanceKey,
+    ) -> Result<Operand, LowerError> {
+        let body = BodyInstanceKey::CastFrom(instance.clone());
+        let Some(callee) = self.cx.maps.bodies.get(&body).copied() else {
+            return Err(LowerError::MissingLoweredCallee {
+                body: Box::new(body),
+            });
+        };
+        let params = self.callee_params(&Callee::Function(callee))?;
+        let Some(param) = params.get(&self.cx.program, 0) else {
+            return Err(unsupported_expr(expr));
+        };
+        let source = self.lower_expected_value_raw(source_expr, param.ty, expr)?;
+        self.emit_temp(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![CallArg::Value(source)],
+        })
+    }
+
     fn lower_cast_expr(
         &mut self,
         expr: &ExprNode,
@@ -5481,6 +5571,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expected: TypeId,
         site: &ExprNode,
     ) -> Result<Operand, LowerError> {
+        let cast_site = UserCastSite {
+            expr: expr.node.id,
+            source: expr.node.id,
+        };
+        if let Some(instance) = self.facts.user_cast_conversions.get(&cast_site).cloned() {
+            let value = self.lower_user_cast_conversion(expr, expr, &instance)?;
+            if self.operand_ty(&value) == expected {
+                return Ok(value);
+            }
+            return self.optional_some(value, expected, site);
+        }
+        self.lower_expected_value_raw(expr, expected, site)
+    }
+
+    fn lower_expected_value_raw(
+        &mut self,
+        expr: &ExprNode,
+        expected: TypeId,
+        site: &ExprNode,
+    ) -> Result<Operand, LowerError> {
         if let TypeData::Optional(inner) = self.cx.program.type_data(expected).clone()
             && matches!(
                 expr.node.kind,
@@ -5491,7 +5601,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     | ExprKind::StructLiteral(_)
             )
         {
-            let value = self.lower_expected_value(expr, inner, site)?;
+            let value = self.lower_expected_value_raw(expr, inner, site)?;
             return self.optional_some(value, expected, site);
         }
 
@@ -9197,6 +9307,21 @@ fn optional_payload_mode(pattern: &ast::PatternNode, alias: bool) -> PayloadMode
     }
 }
 
+fn direct_failable_payload_pattern(
+    if_let: &ast::IfLetNode,
+) -> Result<Option<&ast::PatternNode>, LowerError> {
+    if !matches!(if_let.node.value.node.kind, ExprKind::FailableCast(_)) {
+        return Ok(None);
+    }
+    if if_let.node.head.is_ref() {
+        return Err(unsupported_expr(&if_let.node.value));
+    }
+    match if_let.node.pattern.node {
+        Pattern::Ident(_) => Ok(Some(&if_let.node.pattern)),
+        _ => Ok(None),
+    }
+}
+
 fn classify_optional_pattern(
     pattern: &ast::PatternNode,
 ) -> Result<OptionalPattern<'_>, LowerError> {
@@ -9710,6 +9835,7 @@ struct SourceProgramIndex<'a> {
     modules: SourceModules<'a>,
     callables: HashMap<CallableId, SourceCallable<'a>>,
     globals: HashMap<GlobalKey, SourceGlobal<'a>>,
+    cast_froms: HashMap<(ExtendId, usize), SourceCastFrom<'a>>,
     lambdas: HashMap<ExprId, &'a ast::LambdaNode>,
     default_exprs: HashMap<SourceDefaultKey, &'a ExprNode>,
 }
@@ -9760,6 +9886,13 @@ struct SourceGlobal<'a> {
     module: usize,
     source: SourceId,
     node: &'a ast::GlobalDeclNode,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceCastFrom<'a> {
+    module: usize,
+    source: SourceId,
+    node: &'a ast::CastFromNode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9957,7 +10090,7 @@ fn walk_exprs<'a>(expr: &'a ExprNode, visit: &mut impl FnMut(&'a ExprNode)) {
                 }
             }
         }
-        ExprKind::Cast(cast) | ExprKind::ExactDowncast(cast) => {
+        ExprKind::Cast(cast) | ExprKind::FailableCast(cast) => {
             walk_exprs(&cast.node.expr, visit);
         }
         ExprKind::Try(try_) => walk_exprs(&try_.node.expr, visit),
@@ -10147,6 +10280,10 @@ enum ReachableSource<'a> {
     Global {
         global: SourceGlobal<'a>,
         sig: GlobalSig,
+    },
+    CastFrom {
+        cast: SourceCastFrom<'a>,
+        signature: CastFromSignature,
     },
 }
 
@@ -10900,6 +11037,7 @@ impl<'a> SourceProgramIndex<'a> {
         let modules = SourceModules::new(root, resolved);
         let mut callables = HashMap::new();
         let mut globals = HashMap::new();
+        let mut cast_froms = HashMap::new();
         let mut lambdas = HashMap::new();
         let mut default_exprs = HashMap::new();
 
@@ -10992,6 +11130,17 @@ impl<'a> SourceProgramIndex<'a> {
                             index: extend_index,
                         };
                         extend_index += 1;
+                        for (cast_index, cast) in extend_node.node.cast_froms.iter().enumerate() {
+                            collect_block_lambdas(&cast.node.body, &mut lambdas);
+                            cast_froms.insert(
+                                (extend_id.clone(), cast_index),
+                                SourceCastFrom {
+                                    module: module_index,
+                                    source: module.source,
+                                    node: cast,
+                                },
+                            );
+                        }
                         for method_node in &extend_node.node.methods {
                             let method = &method_node.node;
                             collect_block_lambdas(&method.body, &mut lambdas);
@@ -11027,6 +11176,7 @@ impl<'a> SourceProgramIndex<'a> {
             modules,
             callables,
             globals,
+            cast_froms,
             lambdas,
             default_exprs,
         }
@@ -11079,6 +11229,7 @@ impl<'a> ReachableItems<'a> {
                     reachable_lambda(index, semantic, *owner, &key, source)?
                 }
                 ReachableKey::Global(key) => reachable_global(index, semantic, &key)?,
+                ReachableKey::CastFrom(key) => reachable_cast_from(index, semantic, &key)?,
             };
             enqueue_body_references(
                 index,
@@ -11108,6 +11259,7 @@ impl<'a> ReachableItems<'a> {
 enum ReachableKey {
     Callable(CallableInstanceKey),
     Global(GlobalKey),
+    CastFrom(CastFromInstanceKey),
     Lambda {
         owner: Box<BodyInstanceKey>,
         key: LambdaBodyKey,
@@ -11194,6 +11346,40 @@ fn reachable_global<'a>(
     })
 }
 
+fn reachable_cast_from<'a>(
+    index: &'a SourceProgramIndex<'a>,
+    semantic: &'a SemanticProgram,
+    key: &CastFromInstanceKey,
+) -> Result<ReachableItem<'a>, LowerError> {
+    let cast = index
+        .cast_froms
+        .get(&(key.extend.clone(), key.index))
+        .copied()
+        .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+            body: Box::new(BodyInstanceKey::CastFrom(key.clone())),
+        })?;
+    let body = BodyInstanceKey::CastFrom(key.clone());
+    let facts =
+        semantic
+            .facts
+            .body(&body)
+            .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+                body: Box::new(body.clone()),
+            })?;
+    let signature = semantic
+        .declarations
+        .cast_from_signature(key)
+        .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
+            body: Box::new(body.clone()),
+        })?;
+    Ok(ReachableItem {
+        source: ReachableSource::CastFrom { cast, signature },
+        body,
+        body_facts: ReachableBodyFacts::Facts(facts),
+        source_id: cast.source,
+    })
+}
+
 fn reachable_lambda<'a>(
     index: &'a SourceProgramIndex<'a>,
     semantic: &'a SemanticProgram,
@@ -11257,6 +11443,7 @@ fn enqueue_body_references(
         worklist,
     )?;
     enqueue_global_accesses(body_facts, None, queued, worklist);
+    enqueue_user_cast_conversions(body_facts, None, queued, worklist);
     enqueue_function_values(index, body_facts, body, source_id, None, queued, worklist)?;
     enqueue_stringify_overrides(index, semantic, body_facts, None, queued, worklist);
     let mut default_env = DefaultDependencyEnv {
@@ -11365,6 +11552,7 @@ fn enqueue_default_references(
         env.worklist,
     )?;
     enqueue_global_accesses(facts, Some(&exprs), env.queued, env.worklist);
+    enqueue_user_cast_conversions(facts, Some(&exprs), env.queued, env.worklist);
     enqueue_function_values(
         env.index,
         facts,
@@ -11466,6 +11654,22 @@ fn enqueue_global_accesses(
     }
 }
 
+fn enqueue_user_cast_conversions(
+    body_facts: &SemanticBodyFacts,
+    exprs: Option<&HashSet<ExprId>>,
+    queued: &mut HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) {
+    let mut conversions = body_facts.user_cast_conversions.iter().collect::<Vec<_>>();
+    conversions.sort_by_key(|(site, _)| (site.expr.0, site.source.0));
+    for (site, instance) in conversions {
+        if exprs.is_some_and(|exprs| !exprs.contains(&site.expr)) {
+            continue;
+        }
+        queue_reachable(queued, worklist, ReachableKey::CastFrom(instance.clone()));
+    }
+}
+
 fn is_lowered_collection_stub(id: &CallableId) -> bool {
     matches!(id.kind, CallableKind::ExtendMethod(MethodSurface::Instance))
         && id.module.is_core_module("collections")
@@ -11526,9 +11730,10 @@ fn enqueue_function_values(
                             specialization: match owner {
                                 BodyInstanceKey::Callable(key) => key.args.clone(),
                                 BodyInstanceKey::Lambda(key) => key.specialization.clone(),
-                                BodyInstanceKey::Module(_)
-                                | BodyInstanceKey::Global(_)
-                                | BodyInstanceKey::CastFrom(_) => GenericArgs::default(),
+                                BodyInstanceKey::CastFrom(key) => key.args.clone(),
+                                BodyInstanceKey::Module(_) | BodyInstanceKey::Global(_) => {
+                                    GenericArgs::default()
+                                }
                             },
                         },
                         source,
@@ -16451,7 +16656,9 @@ fn main() {}
     fn test_reachable_callable<'a>(item: &ReachableItem<'a>) -> SourceCallable<'a> {
         match item.source {
             ReachableSource::Callable { callable, .. } => callable,
-            ReachableSource::Lambda { .. } | ReachableSource::Global { .. } => {
+            ReachableSource::Lambda { .. }
+            | ReachableSource::Global { .. }
+            | ReachableSource::CastFrom { .. } => {
                 panic!("expected callable item")
             }
         }
@@ -16460,7 +16667,9 @@ fn main() {}
     fn test_reachable_fact<'a>(item: &ReachableItem<'a>) -> &'a SemanticFunctionInstanceFact {
         match item.source {
             ReachableSource::Callable { fact, .. } => fact,
-            ReachableSource::Lambda { .. } | ReachableSource::Global { .. } => {
+            ReachableSource::Lambda { .. }
+            | ReachableSource::Global { .. }
+            | ReachableSource::CastFrom { .. } => {
                 panic!("expected callable item")
             }
         }

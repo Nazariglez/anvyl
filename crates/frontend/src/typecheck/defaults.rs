@@ -364,7 +364,7 @@ fn validate_expr(
         | ExprKind::Ternary(_)
         | ExprKind::IfLet(_)
         | ExprKind::Match(_)
-        | ExprKind::ExactDowncast(_)
+        | ExprKind::FailableCast(_)
         | ExprKind::Try(_)
         | ExprKind::Lambda(_)
         | ExprKind::IntrinsicCall(_) => tc.push_error(TypeError::InvalidDefaultExpression {

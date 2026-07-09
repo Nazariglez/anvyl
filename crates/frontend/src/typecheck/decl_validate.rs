@@ -13,9 +13,10 @@ use super::{
 };
 use crate::{
     ast::{
-        AggregateKind, ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef,
-        EscapeMode, Func, FuncParam, Ident, MethodReceiver, MethodSig, Mutability, NominalKind,
-        Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId, TypeVisitor,
+        AggregateKind, ArrayLen, CastKind, ConstArg, ConstParam, ConstParamId, ConstValue,
+        ContractRef, EscapeMode, Func, FuncParam, Ident, MethodReceiver, MethodSig, Mutability,
+        NominalKind, Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
+        TypeVisitor,
     },
     source::SourceId,
     span::{SourceSpan, Span},
@@ -354,22 +355,28 @@ fn validate_cast_froms(
                 span: Some(cast.span),
             }));
         }
+        let expected_ret = decls.cast_return_type(cast.kind, extend.target.clone());
         if let Some(ret) = &cast.ret
-            && !same_extend_target(
-                &ret.ty(),
-                &extend.generics,
-                &extend.target,
-                &extend.generics,
-            )
+            && !same_extend_target(&ret.ty(), &extend.generics, &expected_ret, &extend.generics)
         {
             errors.push(TypeError::Decl(DeclError::CastFromReturnMismatch {
-                expected: extend.target.clone(),
+                kind: cast.kind,
+                expected: expected_ret,
                 found: ret.ty().clone(),
                 span: Some(cast.span),
             }));
         }
-        if has_duplicate_cast_from(decls, extend, cast) {
+        let (duplicate, conflicting) = cast_from_conflicts(decls, extend, cast);
+        if duplicate {
             errors.push(TypeError::Decl(DeclError::DuplicateCastFrom {
+                kind: cast.kind,
+                target: extend.target.clone(),
+                source: cast.param.ty.clone(),
+                span: Some(cast.span),
+            }));
+        }
+        if conflicting {
+            errors.push(TypeError::Decl(DeclError::ConflictingCastFrom {
                 target: extend.target.clone(),
                 source: cast.param.ty.clone(),
                 span: Some(cast.span),
@@ -379,6 +386,12 @@ fn validate_cast_froms(
 }
 
 fn validate_cast_from_param(cast: &CastConversionSchema, errors: &mut Vec<TypeError>) {
+    if cast.param.mutable {
+        errors.push(TypeError::CompileError {
+            message: "cast declaration parameter cannot be `ref`".to_string(),
+            span: Some(cast.span),
+        });
+    }
     validate_param_escape(
         errors,
         cast.param.escape,
@@ -389,48 +402,38 @@ fn validate_cast_from_param(cast: &CastConversionSchema, errors: &mut Vec<TypeEr
     );
 }
 
-fn has_duplicate_cast_from(
+fn cast_from_conflicts(
     decls: &DeclarationIndex,
     extend: &ExtendSchema,
     cast: &CastConversionSchema,
-) -> bool {
+) -> (bool, bool) {
+    let mut duplicate = false;
+    let mut conflicting = false;
+    let pattern = ExtendTargetPattern::from(extend);
     for other_extend in decls.extends() {
-        if other_extend.id == extend.id {
-            for other in &other_extend.cast_froms {
-                if std::ptr::eq(other, cast) {
-                    return false;
-                }
-                if same_extend_target(
-                    &other.param.ty,
-                    &other_extend.generics,
-                    &cast.param.ty,
-                    &extend.generics,
-                ) {
-                    return true;
-                }
-            }
-            continue;
-        }
-        if other_extend.origin != extend.origin
-            || !same_target_pattern(
-                &ExtendTargetPattern::from(other_extend),
-                &ExtendTargetPattern::from(extend),
-            )
+        let same_extend = other_extend.id == extend.id;
+        if !same_extend
+            && (other_extend.origin != extend.origin
+                || !same_target_pattern(&ExtendTargetPattern::from(other_extend), &pattern))
         {
             continue;
         }
-        if other_extend.cast_froms.iter().any(|other| {
-            same_extend_target(
+        for other in &other_extend.cast_froms {
+            if std::ptr::eq(other, cast) {
+                return (duplicate, conflicting);
+            }
+            if same_extend_target(
                 &other.param.ty,
                 &other_extend.generics,
                 &cast.param.ty,
                 &extend.generics,
-            )
-        }) {
-            return true;
+            ) {
+                duplicate |= other.kind == cast.kind;
+                conflicting |= other.kind != cast.kind;
+            }
         }
     }
-    false
+    (duplicate, conflicting)
 }
 
 fn unsupported_extend_target(ty: &Type, facts: &TargetFacts) -> bool {
@@ -670,12 +673,15 @@ pub(super) fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) 
                 }
                 for cast in &extend.cast_froms {
                     if let Some(ret) = &cast.node.ret {
-                        validate_unsupported_return_spec(
-                            ret,
-                            "cast from declarations cannot return mutable places",
-                            cast.span,
-                            tc,
-                        );
+                        let message = match cast.node.kind {
+                            CastKind::Total => {
+                                "cast from declarations cannot return mutable places"
+                            }
+                            CastKind::Failable => {
+                                "cast? from declarations cannot return mutable places"
+                            }
+                        };
+                        validate_unsupported_return_spec(ret, message, cast.span, tc);
                     }
                 }
             }

@@ -1,0 +1,5 @@
+// @helper
+
+pub extend<S> struct S {
+    cast? from(xs: [S; 1]) -> S? { nil }
+}

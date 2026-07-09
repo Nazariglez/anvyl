@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: cast? from declarations cannot return mutable places
+
+struct Source {}
+struct Target {}
+
+extend Target {
+    cast? from(source: Source) -> ref Target? { nil }
+}

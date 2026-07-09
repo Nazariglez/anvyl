@@ -1543,14 +1543,24 @@ fn cast_from_decl<'src>(
     let from_kw = select! { Token::Ident(id) if id.0.as_ref() == "from" => () };
 
     cast_kw
-        .ignore_then(from_kw)
-        .ignore_then(params(stmt.clone()))
+        .ignore_then(select! { Token::Question => () }.or_not())
+        .then_ignore(from_kw)
+        .then(params(stmt.clone()))
         .then(return_spec())
         .then(block_stmt(stmt, tail_expr))
-        .validate(|((param_list, ret), body), extra, emitter| {
+        .validate(|(((failable, param_list), ret), body), extra, emitter| {
             let s = extra.span();
+            let kind = if failable.is_some() {
+                ast::CastKind::Failable
+            } else {
+                ast::CastKind::Total
+            };
+            let label = kind.syntax();
             if param_list.len() != 1 {
-                emitter.emit(Rich::custom(s, "cast from requires exactly one parameter"));
+                emitter.emit(Rich::custom(
+                    s,
+                    format!("{label} requires exactly one parameter"),
+                ));
             }
             let param = param_list.into_iter().next().unwrap_or_else(|| ast::Param {
                 mutability: ast::Mutability::Immutable,
@@ -1564,24 +1574,32 @@ fn cast_from_decl<'src>(
             if param.ty == ast::Type::Infer {
                 emitter.emit(Rich::custom(
                     s,
-                    "cast from parameter must have an explicit type annotation",
+                    format!("{label} parameter must have an explicit type annotation"),
                 ));
             }
             if param.default.is_some() {
                 emitter.emit(Rich::custom(
                     s,
-                    "cast from parameter cannot have a default value",
+                    format!("{label} parameter cannot have a default value"),
                 ));
             }
             if param.cast_accept {
                 emitter.emit(Rich::custom(
                     s,
-                    "cast from parameter cannot use the `as` modifier",
+                    format!("{label} parameter cannot use the `as` modifier"),
                 ));
             }
-            Spanned::new(ast::CastFrom { param, ret, body }, s.byte())
+            Spanned::new(
+                ast::CastFrom {
+                    kind,
+                    param,
+                    ret,
+                    body,
+                },
+                s.byte(),
+            )
         })
-        .labelled("cast from declaration")
+        .labelled("cast declaration")
         .as_context()
         .boxed()
 }

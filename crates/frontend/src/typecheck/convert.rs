@@ -2,13 +2,17 @@ use super::{
     CastConversionMatch, CastFromConversion, CheckedType, DynContainerConversionKind, EnumRepr,
     TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
+    downcast,
     projection::{
         ExpectedFit, ExpectedProjectionMode, SourceAcceptance, apply_value_projection,
         classify_expected_fit,
     },
 };
 use crate::{
-    ast::{CastNode, ContractRef, DynContractHoleId, ExprId, ExprNode, Ident, Type, TypeVisitor},
+    ast::{
+        CastKind, CastNode, ContractRef, DynContractHoleId, ExprId, ExprNode, Ident, Type,
+        TypeVisitor,
+    },
     span::Span,
 };
 
@@ -17,6 +21,11 @@ pub(super) enum ExplicitCast {
     Identity,
     Builtin,
     RawEnum,
+    CastFrom(CastFromConversion),
+}
+
+pub(super) enum ResolvedFailableCast {
+    DynamicDowncast,
     CastFrom(CastFromConversion),
 }
 
@@ -74,8 +83,9 @@ impl TypeChecker {
     ) -> Option<CastFromConversion> {
         match self
             .decls
-            .find_cast_conversion(source, target, |ext| self.extend_visible(ext))
-        {
+            .find_cast_conversion(CastKind::Total, source, target, |ext| {
+                self.extend_visible(ext)
+            }) {
             Some(CastConversionMatch::Match(conversion)) => Some(conversion),
             Some(CastConversionMatch::Ambiguous) | None => None,
         }
@@ -84,10 +94,59 @@ impl TypeChecker {
     pub(super) fn cast_from_ambiguous(&mut self, source: &Type, target: &Type) -> bool {
         matches!(
             self.decls
-                .find_cast_conversion(source, target, |ext| self.extend_visible(ext)),
+                .find_cast_conversion(CastKind::Total, source, target, |ext| self
+                    .extend_visible(ext)),
             Some(CastConversionMatch::Ambiguous)
         )
     }
+}
+
+pub(super) fn resolve_failable_cast(
+    cast: &CastNode,
+    source: &Type,
+    target: &Type,
+    tc: &mut TypeChecker,
+) -> Option<ResolvedFailableCast> {
+    if matches!(source, Type::Dyn(_)) && downcast::runtime_target_valid(tc, target) {
+        return Some(ResolvedFailableCast::DynamicDowncast);
+    }
+
+    let failable = tc
+        .decls
+        .find_cast_conversion(CastKind::Failable, source, target, |ext| {
+            tc.extend_visible(ext)
+        });
+    let message = match failable {
+        Some(CastConversionMatch::Match(conversion)) => {
+            super::body::check_cast_from_conversion_body(&conversion, tc);
+            tc.mark_activation_imports_used(&conversion.origin);
+            tc.record_conversion_escape(&cast.node.expr, conversion.escape);
+            return Some(ResolvedFailableCast::CastFrom(conversion));
+        }
+        Some(CastConversionMatch::Ambiguous) => {
+            format!("ambiguous failable cast from '{source}' to '{target}'")
+        }
+        None if matches!(source, Type::Dyn(_)) => {
+            return Some(ResolvedFailableCast::DynamicDowncast);
+        }
+        None => {
+            let total = tc
+                .decls
+                .find_cast_conversion(CastKind::Total, source, target, |ext| {
+                    tc.extend_visible(ext)
+                });
+            if total.is_some() {
+                format!("as? does not use total cast from '{source}' to '{target}'")
+            } else {
+                format!("no failable cast from '{source}' to '{target}'")
+            }
+        }
+    };
+    tc.push_error(TypeError::CompileError {
+        message,
+        span: tc.error_span(cast.span),
+    });
+    None
 }
 
 fn expect_assignable(
@@ -577,7 +636,7 @@ pub(super) fn check_cast_expr(
         ExpectedProjectionMode::ExplicitCast,
     ) {
         ExpectedFit::SourceAccepted(SourceAcceptance::ExplicitCast { conversion }) => {
-            apply_explicit_cast_effects(expr, cast, conversion, &from, &target, tc);
+            apply_explicit_cast_effects(expr, cast, conversion, tc);
             cast_expr_checked(expr, target, checked.contains_extern_any, tc)
         }
         ExpectedFit::Project {
@@ -586,7 +645,7 @@ pub(super) fn check_cast_expr(
         } => {
             let projected =
                 apply_value_projection(tc, &cast.node.expr, &checked, &from, projection);
-            apply_explicit_cast_effects(expr, cast, conversion, &projected.ty, &target, tc);
+            apply_explicit_cast_effects(expr, cast, conversion, tc);
             cast_expr_checked(expr, target, projected.contains_extern_any, tc)
         }
         ExpectedFit::Deferred if matches!(from, Type::Infer) || matches!(target, Type::Infer) => {
@@ -629,12 +688,37 @@ pub(super) fn check_cast_expr(
     }
 }
 
+pub(super) fn check_failable_cast_expr(
+    expr: &ExprNode,
+    cast: &CastNode,
+    expected: Option<&TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let target = tc.resolve_type_for_tc_at(&cast.node.target, cast.span);
+    let checked = check_value_expr_checked_with_hint(&cast.node.expr, None, tc);
+    let source = checked.ty.clone();
+
+    if matches!(source, Type::Infer) || matches!(target, Type::Infer) {
+        return cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc);
+    }
+
+    let ty = tc.decls.expect_core_option_of(target.clone());
+    match resolve_failable_cast(cast, &source, &target, tc) {
+        Some(ResolvedFailableCast::DynamicDowncast) => {
+            downcast::check_expr_with_source(expr, cast, target, expected, checked, tc)
+        }
+        Some(ResolvedFailableCast::CastFrom(conversion)) => {
+            tc.record_user_cast_conversion(expr.node.id, cast.node.expr.node.id, &conversion);
+            cast_expr_checked(expr, ty, checked.contains_extern_any, tc)
+        }
+        None => cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc),
+    }
+}
+
 fn apply_explicit_cast_effects(
     expr: &ExprNode,
     cast: &CastNode,
     conversion: ExplicitCast,
-    source: &Type,
-    target: &Type,
     tc: &mut TypeChecker,
 ) {
     match conversion {
@@ -642,9 +726,10 @@ fn apply_explicit_cast_effects(
             .closure
             .copy_expr_flow(cast.node.expr.node.id, expr.node.id),
         ExplicitCast::CastFrom(conversion) => {
-            super::body::check_cast_from_conversion_body(&conversion, source, target, tc);
+            super::body::check_cast_from_conversion_body(&conversion, tc);
             tc.mark_activation_imports_used(&conversion.origin);
             tc.record_conversion_escape(&cast.node.expr, conversion.escape);
+            tc.record_user_cast_conversion(expr.node.id, cast.node.expr.node.id, &conversion);
         }
         ExplicitCast::Builtin | ExplicitCast::RawEnum => {}
     }

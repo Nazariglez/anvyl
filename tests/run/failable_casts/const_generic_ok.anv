@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+struct Fixed<N: int> { items: [int; N] }
+
+extend<N: int> struct Fixed<N> {
+    cast? from(items: [int; N]) {
+        let make: fn() -> Fixed<N> = || Fixed<N> { items: items };
+        make()
+    }
+}
+
+fn main() {
+    if let fixed = [1, 2] as? Fixed<2> {
+        println(fixed.items[1]);
+    }
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: exactly one parameter
+
+struct Value { raw: int }
+
+extend Value {
+    cast? from(a: int, b: int) { nil }
+}
+
+fn main() {}

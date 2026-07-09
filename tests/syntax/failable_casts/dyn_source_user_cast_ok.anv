@@ -1,0 +1,30 @@
+// @mode: check
+// @expect: success
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {}
+}
+
+extend int {
+    cast? from(actor: dyn Drawable) { nil }
+}
+
+extend Enemy {
+    cast? from(actor: dyn Drawable) { nil }
+}
+
+fn make_actor() -> dyn Drawable {
+    Enemy {}
+}
+
+fn main() {
+    let raw: int? = make_actor() as? int;
+    var actor = make_actor();
+    if ref enemy = actor as? Enemy {
+        enemy.draw();
+    }
+}

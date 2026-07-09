@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: exact downcast currently binds a single identifier
+// @contains: dynamic downcast binding requires a single identifier
 
 contract Drawable {
     fn draw(self);

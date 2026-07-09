@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: cannot use the `as` modifier
+
+struct Source { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(source: as Source) { nil }
+}
+
+fn main() {}

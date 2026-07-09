@@ -1,6 +1,6 @@
 // @mode: check
 // @expect: error
-// @contains: exact downcast source must be a dynamic value
+// @contains: no failable cast
 
 struct Enemy {}
 

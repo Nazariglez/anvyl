@@ -1,0 +1,51 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// -1
+// 9
+// 8
+// @match-end
+
+struct Source { n: int }
+struct Mid { n: int }
+struct Target { n: int }
+struct Holder { target: Target? }
+
+extend Mid {
+    cast from(source: Source) { Mid { n: source.n } }
+}
+
+extend Target {
+    cast? from(source: Source) {
+        let mid = source as Mid;
+        if mid.n == 0 {
+            return nil;
+        }
+        Target { n: mid.n }
+    }
+}
+
+fn print_target(target: Target?) {
+    if let value? = target {
+        println(value.n);
+    } else {
+        println(-1);
+    }
+}
+
+fn main() {
+    let some: Target? = Source { n: 7 } as? Target;
+    let none: Target? = Source { n: 0 } as? Target;
+    print_target(some);
+    print_target(none);
+
+    let holder = Holder { target: Source { n: 9 } as? Target };
+    print_target(holder.target);
+
+    let source = Source { n: 7 };
+    if var target = source as? Target {
+        target.n = target.n + 1;
+        println(target.n);
+    }
+}

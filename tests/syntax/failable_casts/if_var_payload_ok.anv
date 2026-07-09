@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+struct Token { raw: int }
+struct Value { raw: int }
+
+extend Value {
+    cast? from(token: Token) { nil }
+}
+
+fn main() {
+    let token = Token { raw: 1 };
+    if var value = token as? Value {
+        value = Value { raw: 2 };
+    }
+}

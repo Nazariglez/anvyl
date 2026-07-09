@@ -1,4 +1,4 @@
-use super::helpers::{parse_program, parse_program_err};
+use super::helpers::parse_program;
 use crate::ast;
 
 #[test]

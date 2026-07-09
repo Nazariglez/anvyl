@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: no failable cast
+
+enum State: int {
+    Idle = 0,
+}
+
+fn main() {
+    let raw = State.Idle as? int;
+}

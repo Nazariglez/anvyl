@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: success
+
+enum State: int {
+    Idle = 0,
+}
+
+extend State {
+    cast? from(raw: int) { nil }
+}
+
+fn main() {
+    let state: State? = 0 as? State;
+}
