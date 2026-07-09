@@ -612,7 +612,8 @@ impl Printer<'_> {
 
     fn format_cast_from(&mut self, cf: &ast::CastFrom) {
         self.write_indent();
-        self.write("cast from(");
+        self.write(cf.kind.syntax());
+        self.write("(");
         self.format_param(&cf.param);
         self.write(")");
         if let Some(ret) = &cf.ret {

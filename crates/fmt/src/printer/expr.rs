@@ -173,7 +173,7 @@ impl Printer<'_> {
                 self.format_type(&node.node.target);
             }
 
-            ast::ExprKind::ExactDowncast(node) => {
+            ast::ExprKind::FailableCast(node) => {
                 self.format_expr_prec(&node.node.expr.node, ExprPrecedence::Cast, Left);
                 self.write(" as? ");
                 self.format_type(&node.node.target);

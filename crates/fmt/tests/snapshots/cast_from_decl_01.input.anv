@@ -1,0 +1,6 @@
+struct Value {}
+
+extend Value {
+cast from(raw:int){Value{}}
+cast? from(text:str)->Value?{nil}
+}
