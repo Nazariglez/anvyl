@@ -523,6 +523,7 @@ impl CompileCx<'_> {
             | TypeData::Float
             | TypeData::Bool
             | TypeData::String
+            | TypeData::Char
             | TypeData::Void
             | TypeData::Any
             | TypeData::Dyn(_) => false,

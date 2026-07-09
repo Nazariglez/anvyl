@@ -131,6 +131,7 @@ pub enum ExternTypeExpr {
     Int,
     Float,
     String,
+    Char,
     Any,
     Option(Box<ExternTypeExpr>),
     Result(Box<ExternTypeExpr>, Box<ExternTypeExpr>),
@@ -159,6 +160,7 @@ impl fmt::Display for ExternTypeExpr {
             Self::Int => f.write_str("int"),
             Self::Float => f.write_str("float"),
             Self::String => f.write_str("string"),
+            Self::Char => f.write_str("char"),
             Self::Any => f.write_str("any"),
             Self::Option(inner) => write!(f, "{inner}?"),
             Self::Result(ok, err) => write!(f, "Result<{ok}, {err}>"),
@@ -371,9 +373,13 @@ impl ExternTypeExpr {
                 }
                 AbiTypeClass::ReturnOnly
             }
-            Self::Unit | Self::Bool | Self::Int | Self::Float | Self::String | Self::Any => {
-                AbiTypeClass::Value
-            }
+            Self::Unit
+            | Self::Bool
+            | Self::Int
+            | Self::Float
+            | Self::String
+            | Self::Char
+            | Self::Any => AbiTypeClass::Value,
             Self::Option(inner) | Self::Array { elem: inner, .. } | Self::List(inner) => {
                 inner.classify_nested(violations);
                 AbiTypeClass::Value
@@ -483,7 +489,7 @@ impl ExternTypeExpr {
     }
 
     pub fn callback_wrapper_param_supported(&self) -> bool {
-        matches!(self, Self::Bool | Self::Int | Self::Float)
+        matches!(self, Self::Bool | Self::Int | Self::Float | Self::Char)
     }
 
     pub fn callback_wrapper_return_supported(&self) -> bool {
@@ -534,6 +540,7 @@ mod tests {
             (ExternTypeExpr::Int, "int"),
             (ExternTypeExpr::Float, "float"),
             (ExternTypeExpr::String, "string"),
+            (ExternTypeExpr::Char, "char"),
             (ExternTypeExpr::Any, "any"),
             (ExternTypeExpr::option(ExternTypeExpr::Int), "int?"),
             (

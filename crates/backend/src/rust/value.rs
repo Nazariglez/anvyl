@@ -10,8 +10,8 @@ use super::{
         RirType, RirTypeId, RirVariant, RirVariantKind,
     },
     syntax::{
-        block_expr, comma, field_init, match_expr, rust_string, struct_lit, struct_variant,
-        tuple_variant, variant_path,
+        block_expr, comma, field_init, match_expr, rust_char, rust_string, struct_lit,
+        struct_variant, tuple_variant, variant_path,
     },
     target,
 };
@@ -836,6 +836,7 @@ impl<'a> RustValues<'a> {
             }
             RirConstValue::Bool(value) => value.to_string(),
             RirConstValue::String(value) => target::anv_string_from(&rust_string(value)),
+            RirConstValue::Char(value) => rust_char(*value),
             RirConstValue::Nil => "None".into(),
         }
     }
@@ -937,7 +938,7 @@ impl<'a> RustValues<'a> {
 
     fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
         match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool => format!("*({expr})"),
+            RirType::Int | RirType::Float | RirType::Bool | RirType::Char => format!("*({expr})"),
             RirType::Lambda(sig) if self.policy.lambda_sig_copyable(sig) => format!("*({expr})"),
             RirType::Lambda(_) => unreachable!("verified copyable lambda value"),
             RirType::Struct(id) => {

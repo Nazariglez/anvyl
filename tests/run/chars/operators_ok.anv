@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+
+fn main() {
+    assert('a' == 'a');
+    assert('a' != 'b');
+    assert('a' < 'z');
+    assert('a' <= 'a');
+    assert('z' > 'a');
+    assert('z' >= 'z');
+}

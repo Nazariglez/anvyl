@@ -624,6 +624,7 @@ impl<'a> PlanCx<'a> {
                 TypeData::Float => RirType::Float,
                 TypeData::Bool => RirType::Bool,
                 TypeData::String => RirType::String,
+                TypeData::Char => RirType::Char,
                 TypeData::Void => RirType::Void,
                 TypeData::Aggregate(aggregate) => {
                     let struct_id = self.reserve_struct(program, type_id, *aggregate)?;
@@ -1255,7 +1256,13 @@ impl<'a> PlanCx<'a> {
     fn require_stringify(&self, program: &mut RirProgram, ty: TypeId) -> Result<(), RustPlanError> {
         let rir_ty = self.type_map[&ty];
         let kind = match self.air.type_arena.data(ty) {
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String => return Ok(()),
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::Char => {
+                return Ok(());
+            }
             TypeData::Aggregate(aggregate) => {
                 if program.stringify_reqs.iter().any(|req| req.ty == rir_ty) {
                     return Ok(());
@@ -1361,6 +1368,7 @@ impl<'a> PlanCx<'a> {
                 ConstValue::Float(value) => RirConstValue::Float(*value),
                 ConstValue::Bool(value) => RirConstValue::Bool(*value),
                 ConstValue::String(value) => RirConstValue::String(value.to_string()),
+                ConstValue::Char(value) => RirConstValue::Char(*value),
                 ConstValue::Nil => RirConstValue::Nil,
             };
             program.consts.push(RirConst {
@@ -5451,6 +5459,7 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
         RirType::Float => "float".to_string(),
         RirType::Bool => "bool".to_string(),
         RirType::String => "string".to_string(),
+        RirType::Char => "char".to_string(),
         RirType::Void => "void".to_string(),
         RirType::List(elem) => format!("list_{}", type_suffix(program, elem)),
         RirType::Option(inner) => format!("option_{}", type_suffix(program, inner)),
@@ -5498,6 +5507,7 @@ fn const_suffix(value: &ConstValue) -> String {
         ConstValue::Float(value) => sanitize(&format!("f{value}")),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::String(value) => sanitize(value).to_ascii_lowercase(),
+        ConstValue::Char(value) => sanitize(&format!("c{}", *value as u32)),
         ConstValue::Nil => "nil".to_string(),
     }
 }

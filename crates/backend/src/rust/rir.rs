@@ -1466,6 +1466,7 @@ pub enum RirType {
     Float,
     Bool,
     String,
+    Char,
     Void,
     Struct(RirStructId),
     DataRef(RirDataRefId),
@@ -1498,6 +1499,7 @@ pub enum RirConstValue {
     Float(f64),
     Bool(bool),
     String(String),
+    Char(char),
     Nil,
 }
 
@@ -2445,7 +2447,8 @@ fn rir_type_matches_extern(program: &RirProgram, id: RirTypeId, expected: &Exter
         | (RirType::Bool, ExternTypeExpr::Bool)
         | (RirType::Int, ExternTypeExpr::Int)
         | (RirType::Float, ExternTypeExpr::Float)
-        | (RirType::String, ExternTypeExpr::String) => true,
+        | (RirType::String, ExternTypeExpr::String)
+        | (RirType::Char, ExternTypeExpr::Char) => true,
         (RirType::Tuple(tuple), ExternTypeExpr::Unit) => {
             program.tuples[tuple.index()].fields.is_empty()
         }
@@ -3654,10 +3657,10 @@ impl VerifyCx<'_> {
                         continue;
                     };
                     for field in &strukt.fields {
+                        if self.scalar(field.ty).is_some() {
+                            continue;
+                        }
                         match self.ty(field.ty) {
-                            Some(
-                                RirType::Int | RirType::Float | RirType::Bool | RirType::String,
-                            ) => {}
                             Some(RirType::Struct(_))
                                 if self.stringify_req(field.ty).is_some_and(|req| {
                                     matches!(req.kind, RirStringifyReqKind::Structural(helper)
@@ -3685,6 +3688,7 @@ impl VerifyCx<'_> {
                 | (Some(RirType::Float), RirConstValue::Float(_))
                 | (Some(RirType::Bool), RirConstValue::Bool(_))
                 | (Some(RirType::String), RirConstValue::String(_))
+                | (Some(RirType::Char), RirConstValue::Char(_))
                 | (Some(RirType::Option(_)), RirConstValue::Nil)
         );
         if !ok {
@@ -7792,6 +7796,7 @@ impl VerifyCx<'_> {
             Some(RirType::Float) => Some(ScalarKind::Float),
             Some(RirType::Bool) => Some(ScalarKind::Bool),
             Some(RirType::String) => Some(ScalarKind::String),
+            Some(RirType::Char) => Some(ScalarKind::Char),
             _ => None,
         }
     }
@@ -7816,54 +7821,24 @@ impl VerifyCx<'_> {
     }
 
     fn stringify_ok(&self, value: &RirOperand, source_ty: RirTypeId) -> bool {
-        match self.ty(source_ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::String) => true,
-            Some(RirType::Struct(_)) => {
-                matches!(value, RirOperand::Place(_))
-                    && matches!(
-                        self.stringify_req(source_ty).map(|req| req.kind),
-                        Some(
-                            RirStringifyReqKind::Structural(_)
-                                | RirStringifyReqKind::Override { .. }
-                        )
-                    )
-            }
-            Some(
-                RirType::Void
-                | RirType::Tuple(_)
-                | RirType::DataRef(_)
-                | RirType::Enum(_)
-                | RirType::Array { .. }
-                | RirType::List(_)
-                | RirType::Map { .. }
-                | RirType::Option(_)
-                | RirType::Slice(_)
-                | RirType::Lambda(_),
-            )
-            | None => false,
+        if self.scalar(source_ty).is_some() {
+            return true;
         }
+        matches!(self.ty(source_ty), Some(RirType::Struct(_)))
+            && matches!(value, RirOperand::Place(_))
+            && matches!(
+                self.stringify_req(source_ty).map(|req| req.kind),
+                Some(RirStringifyReqKind::Structural(_) | RirStringifyReqKind::Override { .. })
+            )
     }
 
     fn format_ok(&self, source_ty: RirTypeId, spec: RirFormatSpec) -> bool {
-        let Some(ty) = self.ty(source_ty) else {
+        if self.scalar(source_ty).is_none() {
             return false;
-        };
-        match ty {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::String => {}
-            RirType::Void
-            | RirType::Struct(_)
-            | RirType::Tuple(_)
-            | RirType::DataRef(_)
-            | RirType::Enum(_)
-            | RirType::Array { .. }
-            | RirType::List(_)
-            | RirType::Map { .. }
-            | RirType::Option(_)
-            | RirType::Slice(_)
-            | RirType::Lambda(_) => {
-                return false;
-            }
         }
+        let ty = self
+            .ty(source_ty)
+            .expect("scalar type id has RIR type data");
         match spec.kind {
             RirFormatKind::Hex | RirFormatKind::HexUpper | RirFormatKind::Binary
                 if ty != RirType::Int =>
@@ -8496,7 +8471,9 @@ impl VerifyCx<'_> {
 
     fn inherently_copyable_type(&self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::Void) => true,
+            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Void) => {
+                true
+            }
             Some(RirType::Struct(id)) => {
                 self.program.structs.get(id.index()).is_some_and(|strukt| {
                     strukt

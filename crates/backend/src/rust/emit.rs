@@ -957,7 +957,7 @@ impl EmitCx<'_> {
                         let text = Self::default_scalar_display(&format!("value.{field}"), ty);
                         w.line(format_args!("out.push_str({text}.as_str());"));
                     }
-                    RirType::Int | RirType::Bool => {
+                    RirType::Int | RirType::Bool | RirType::Char => {
                         w.line(format_args!(
                             "std::fmt::Write::write_fmt(&mut out, format_args!(\"{{}}\", value.{field})).unwrap();"
                         ));
@@ -2816,7 +2816,7 @@ impl EmitCx<'_> {
             RirRValue::Stringify { value, source_ty } => {
                 match self.program.types[source_ty.index()] {
                     RirType::String => values.value_operand(value),
-                    RirType::Int | RirType::Float | RirType::Bool => {
+                    RirType::Int | RirType::Float | RirType::Bool | RirType::Char => {
                         target::anv_string_from(&Self::default_scalar_display(
                             &values.operand(value),
                             &self.program.types[source_ty.index()],
@@ -5415,7 +5415,7 @@ impl EmitCx<'_> {
     fn default_scalar_display(value: &str, ty: &RirType) -> String {
         match ty {
             RirType::Float => target::display_float(value),
-            RirType::Int | RirType::Bool => format!("format!(\"{{}}\", {value})"),
+            RirType::Int | RirType::Bool | RirType::Char => format!("format!(\"{{}}\", {value})"),
             _ => unreachable!("verified scalar display type"),
         }
     }

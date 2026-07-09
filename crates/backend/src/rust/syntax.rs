@@ -168,22 +168,11 @@ pub(super) fn format_fragment(spec: FormatSpec) -> String {
 }
 
 pub(super) fn rust_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                write!(out, "\\u{{{:x}}}", ch as u32).expect("write to string");
-            }
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
+    format!("{text:?}")
+}
+
+pub(super) fn rust_char(ch: char) -> String {
+    format!("{ch:?}")
 }
 
 fn push_format_char(out: &mut String, ch: char) {

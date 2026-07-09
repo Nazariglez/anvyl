@@ -2,7 +2,7 @@
 // @expect: success
 // @match: 25
 
-import pkg:host.host { len2_of, fov_of, Vec2, Camera };
+import pkg:host.host { len2_of, fov_of, Vec2, Camera, Glyph };
 
 fn main() {
     let v = Vec2 { x: 3.0, y: 4.0 };
@@ -28,6 +28,11 @@ fn main() {
     assert(fov_of(default_camera) == 45.0);
     assert(fov == 70.0);
     assert(fov_of(camera) == 70.0);
+
+    let glyph = Glyph { ch: 'G' };
+    let Glyph { ch } = glyph;
+    assert(ch == 'G');
+    assert(glyph.ch == 'G');
 
     println(25);
 }

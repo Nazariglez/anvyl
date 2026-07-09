@@ -1,0 +1,13 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// 😀
+// @match-end
+
+fn main() {
+    let a: char = 'a';
+    let smile: char = '😀';
+    println(#stringify(a));
+    println(#stringify(smile));
+}

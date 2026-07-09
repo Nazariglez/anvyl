@@ -246,16 +246,21 @@ impl ProfileCx<'_> {
         match decl.rep {
             air::ExternRep::Shared => true,
             air::ExternRep::Inline => {
-                decl.fields.iter().all(|field| {
-                    matches!(
-                        self.program.type_arena.data(field.ty),
-                        TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
-                    )
-                }) && decl.variants.iter().all(|variant| {
-                    variant_field_tys(variant).all(|ty| self.stored_payload_supported(ty))
-                })
+                decl.fields
+                    .iter()
+                    .all(|field| self.inline_extern_field_supported(field.ty))
+                    && decl.variants.iter().all(|variant| {
+                        variant_field_tys(variant).all(|ty| self.stored_payload_supported(ty))
+                    })
             }
         }
+    }
+
+    fn inline_extern_field_supported(&self, ty: TypeId) -> bool {
+        matches!(
+            self.program.type_arena.data(ty),
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String | TypeData::Char
+        )
     }
 
     fn check_const(&mut self, id: ConstId) {
@@ -1804,7 +1809,7 @@ fn format_source_is_slice1(ty: &TypeData, spec: &FormatSpec) -> bool {
 fn scalar_type_is_slice1(ty: &TypeData) -> bool {
     matches!(
         ty,
-        TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String
+        TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String | TypeData::Char
     )
 }
 
@@ -1816,6 +1821,7 @@ fn const_is_slice1(program: &Program, id: ConstId) -> bool {
             | (TypeData::Float, ConstValue::Float(_))
             | (TypeData::Bool, ConstValue::Bool(_))
             | (TypeData::String, ConstValue::String(_))
+            | (TypeData::Char, ConstValue::Char(_))
             | (TypeData::Optional(_), ConstValue::Nil)
     )
 }

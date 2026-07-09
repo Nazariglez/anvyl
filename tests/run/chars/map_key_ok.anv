@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn main() {
+    let m: [char: int] = ['a': 1, 'b': 2];
+    println(m['a'] ?? 0);
+    println(m['b'] ?? 0);
+}

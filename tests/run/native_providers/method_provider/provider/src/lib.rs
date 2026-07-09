@@ -61,6 +61,11 @@ pub struct Camera {
     fov: f64,
 }
 
+#[derive(Clone, Copy, AnvyxInline)]
+pub struct Glyph {
+    ch: char,
+}
+
 #[methods]
 impl Camera {
     #[anvyx(init)]
@@ -79,6 +84,24 @@ impl Camera {
     }
 }
 
+#[methods]
+impl Glyph {
+    #[anvyx(init)]
+    pub fn new(ch: char) -> Self {
+        Self { ch }
+    }
+
+    #[anvyx(getter)]
+    pub fn ch(&self) -> char {
+        self.ch
+    }
+
+    #[anvyx(setter)]
+    pub fn set_ch(&mut self, value: char) {
+        self.ch = value;
+    }
+}
+
 #[function]
 pub fn len2_of(value: Vec2) -> f64 {
     value.x * value.x + value.y * value.y
@@ -92,5 +115,5 @@ pub fn fov_of(camera: Camera) -> f64 {
 anvyx_runtime::builtin_module! {
     name: "host",
     source: "",
-    exports: [len2_of, fov_of, Vec2, Camera],
+    exports: [len2_of, fov_of, Vec2, Camera, Glyph],
 }

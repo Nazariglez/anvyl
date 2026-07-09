@@ -42,6 +42,7 @@ pub enum BoundaryType {
     Int,
     Float,
     String,
+    Char,
     Named(String),
     Callback(BoundaryCallback),
     Option(Box<BoundaryType>),
@@ -278,7 +279,7 @@ pub fn classify_param(pat_ty: &syn::PatType, has_ctx: bool) -> syn::Result<Bound
     if flow == ParamFlow::MutBorrow && !mut_place_macro_payload_supported(&ty) {
         return Err(syn::Error::new_spanned(
             &pat_ty.ty,
-            "#[function(ctx)] MutPlace parameters only support bool, i64, f64, and Option of those payloads",
+            "#[function(ctx)] MutPlace parameters only support bool, i64, f64, char, and Option of those payloads",
         ));
     }
     if ty == BoundaryType::Void {
@@ -570,6 +571,9 @@ fn classify_path(
     if path_is(path, &["f64"]) {
         return Ok((BoundaryType::Float, ParamFlow::Value));
     }
+    if path_is(path, &["char"]) {
+        return Ok((BoundaryType::Char, ParamFlow::Value));
+    }
     if path_is(path, &["String"]) || path_is(path, &["std", "string", "String"]) {
         return Err(syn::Error::new_spanned(
             path,
@@ -745,6 +749,7 @@ fn extern_type_expr_tokens(ty: &ExternTypeExpr, root: &TokenStream) -> TokenStre
         ExternTypeExpr::Int => quote! { #root::ExternTypeExpr::Int },
         ExternTypeExpr::Float => quote! { #root::ExternTypeExpr::Float },
         ExternTypeExpr::String => quote! { #root::ExternTypeExpr::String },
+        ExternTypeExpr::Char => quote! { #root::ExternTypeExpr::Char },
         ExternTypeExpr::Any => quote! { #root::ExternTypeExpr::Any },
         ExternTypeExpr::Named { module, name, args } => {
             let module = if let Some(module) = module {
@@ -1185,7 +1190,7 @@ pub fn signature_conversion(params: &[BoundaryParam], ret: &BoundaryReturn) -> B
 
 fn mut_place_macro_payload_supported(ty: &BoundaryType) -> bool {
     match ty {
-        BoundaryType::Bool | BoundaryType::Int | BoundaryType::Float => true,
+        BoundaryType::Bool | BoundaryType::Int | BoundaryType::Float | BoundaryType::Char => true,
         BoundaryType::Option(inner) => mut_place_macro_payload_supported(inner),
         BoundaryType::Void
         | BoundaryType::Unit
@@ -1501,6 +1506,7 @@ fn extern_type_expr(ty: &BoundaryType) -> ExternTypeExpr {
         BoundaryType::Int => ExternTypeExpr::Int,
         BoundaryType::Float => ExternTypeExpr::Float,
         BoundaryType::String => ExternTypeExpr::String,
+        BoundaryType::Char => ExternTypeExpr::Char,
         BoundaryType::Named(name) => named_type_expr(name),
         BoundaryType::Callback(callback) => {
             ExternTypeExpr::Callback(extern_callback_signature(callback))
@@ -1567,6 +1573,7 @@ pub fn parse_descriptor_type_expr(
             "int" => BoundaryType::Int,
             "float" => BoundaryType::Float,
             "string" => BoundaryType::String,
+            "char" => BoundaryType::Char,
             _ => {
                 return Err(syn::Error::new_spanned(
                     ident,
@@ -2131,12 +2138,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_types() {
+    fn classifies_supported_and_rejects_unsupported_types() {
         assert!(first_param(quote! { x: f32 }).is_err());
         assert!(first_param(quote! { x: usize }).is_err());
         assert!(first_param(quote! { x: i128 }).is_err());
         assert!(first_param(quote! { x: u128 }).is_err());
-        assert!(first_param(quote! { x: char }).is_err());
+        assert_eq!(
+            first_param(quote! { x: char }).unwrap().ty,
+            BoundaryType::Char
+        );
+        assert_eq!(
+            ret(parse_quote! { -> char }).unwrap().ty,
+            BoundaryType::Char
+        );
+        assert_eq!(
+            first_param(quote! { f: ScopedLambda<'_, '_, (char,), char> })
+                .unwrap()
+                .ty,
+            BoundaryType::Callback(BoundaryCallback {
+                params: vec![BoundaryType::Char],
+                ret: Box::new(BoundaryType::Char),
+                escape: CallbackEscape::NonEscaping,
+            })
+        );
+        assert_eq!(
+            parse_type_expr("fn(char) -> char").unwrap(),
+            BoundaryType::Callback(BoundaryCallback {
+                params: vec![BoundaryType::Char],
+                ret: Box::new(BoundaryType::Char),
+                escape: CallbackEscape::NonEscaping,
+            })
+        );
         assert!(first_param(quote! { x: str }).is_err());
         assert!(first_param(quote! { x: &i64 }).is_err());
         assert_eq!(

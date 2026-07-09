@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+
+fn main() {
+    let c = 'A';
+    assert(c.codepoint() == 65);
+    assert(c.to_string() == "A");
+    assert('7'.is_ascii_digit());
+    assert('a'.is_ascii_lower());
+    assert('Z'.is_ascii_upper());
+    assert('z'.is_ascii_alpha());
+    assert('9'.is_ascii_alphanumeric());
+    assert('\n'.is_ascii_whitespace());
+    assert(!'x'.is_ascii_digit());
+    assert(!'A'.is_ascii_lower());
+    assert(!'a'.is_ascii_upper());
+    assert(!'7'.is_ascii_alpha());
+    assert(!'\n'.is_ascii_alphanumeric());
+    assert(!'x'.is_ascii_whitespace());
+}

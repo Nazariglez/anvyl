@@ -1,0 +1,8 @@
+// @mode: run
+// @expect: success
+
+fn main() {
+    assert(!('a'..'z').is_empty());
+    assert(('z'..'a').is_empty());
+    assert(('z'..='a').is_empty());
+}

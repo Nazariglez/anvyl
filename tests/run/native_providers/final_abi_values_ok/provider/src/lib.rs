@@ -27,6 +27,21 @@ pub fn first_array(values: [i64; 3]) -> i64 {
 }
 
 #[function]
+pub fn echo_char(value: char) -> char {
+    value
+}
+
+#[function]
+pub fn maybe_char(value: Option<char>) -> Option<char> {
+    value
+}
+
+#[function]
+pub fn first_char_array(values: [char; 3]) -> char {
+    values[0]
+}
+
+#[function]
 pub fn visible_result(ok: bool) -> Result<i64, AnvString> {
     if ok { Ok(7) } else { Err(AnvString::from("bad")) }
 }
@@ -78,6 +93,9 @@ anvyx_runtime::builtin_module! {
         swap_pair,
         counted_pair,
         first_array,
+        echo_char,
+        maybe_char,
+        first_char_array,
         visible_result,
         visible_enum_result,
         describe_result,

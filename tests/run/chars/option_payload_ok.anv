@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: a
+
+fn main() {
+    let c: char? = 'a';
+    match c {
+        value? => println(#stringify(value)),
+        nil => println("nil"),
+    }
+}

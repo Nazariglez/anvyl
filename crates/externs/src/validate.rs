@@ -564,6 +564,7 @@ fn check_type_names(ty: &ExternTypeExpr, errors: &mut Vec<ExternDescriptorError>
         | ExternTypeExpr::Int
         | ExternTypeExpr::Float
         | ExternTypeExpr::String
+        | ExternTypeExpr::Char
         | ExternTypeExpr::Any => {}
         ExternTypeExpr::List(item)
         | ExternTypeExpr::Option(item)

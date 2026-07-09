@@ -1,0 +1,9 @@
+// @mode: run
+// @expect: success
+
+fn main() {
+    let lower = 'a'..='z';
+    assert(lower.contains('m'));
+    assert(!lower.contains('A'));
+    assert(('a'..'z').contains('y'));
+}

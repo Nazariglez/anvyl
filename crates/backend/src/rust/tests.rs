@@ -22760,6 +22760,7 @@ fn test_type_abi(program: &Program, ty: air::TypeId) -> anvyx_runtime::ExternTyp
         TypeData::Int => ExternTypeExpr::Int,
         TypeData::Float => ExternTypeExpr::Float,
         TypeData::String => ExternTypeExpr::String,
+        TypeData::Char => ExternTypeExpr::Char,
         TypeData::Any => ExternTypeExpr::Any,
         TypeData::Optional(inner) => {
             ExternTypeExpr::Option(Box::new(test_type_abi(program, *inner)))

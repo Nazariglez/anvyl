@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// vowel
+// other
+// @match-end
+
+fn classify(c: char) -> string {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => "vowel",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(classify('a'));
+    println(classify('x'));
+}

@@ -9,6 +9,10 @@
 // 1
 // 1
 // 5
+// Q
+// z
+// ?
+// x
 // 7
 // bad
 // enum
@@ -21,6 +25,9 @@ import pkg:host.host {
     swap_pair,
     counted_pair,
     first_array,
+    echo_char,
+    maybe_char,
+    first_char_array,
     visible_result,
     visible_enum_result,
     describe_result,
@@ -42,6 +49,10 @@ fn main() {
     println(counted.1);
 
     println(first_array([5, 6, 7]));
+    println(echo_char('Q').to_string());
+    println((maybe_char('z') ?? '?').to_string());
+    println((maybe_char(nil) ?? '?').to_string());
+    println(first_char_array(['x', 'y', 'z']).to_string());
     println(describe_result(visible_result(true)));
     println(describe_result(visible_result(false)));
     println(describe_enum_result(visible_enum_result(false)));

@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// b
+// 😀
+// nil
+// nil
+// @match-end
+
+fn show(c: char?) {
+    match c {
+        value? => println(value.to_string()),
+        nil => println("nil"),
+    }
+}
+
+fn main() {
+    show("abc".char_at(1));
+    show("a😀c".char_at(1));
+    show("abc".char_at(-1));
+    show("abc".char_at(4));
+}

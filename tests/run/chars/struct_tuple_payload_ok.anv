@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// b
+// @match-end
+
+struct Box { c: char }
+
+fn main() {
+    let boxed = Box { c: 'a' };
+    let pair = ('b', 2);
+    println(#stringify(boxed.c));
+    println(#stringify(pair.0));
+}

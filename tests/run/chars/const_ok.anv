@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// a
+// true
+// @match-end
+
+const A = 'a';
+const ORDER = A < 'z';
+
+fn main() {
+    println(#stringify(A));
+    println(ORDER);
+}
