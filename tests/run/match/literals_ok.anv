@@ -1,0 +1,70 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// yes
+// no
+// two
+// other int
+// one point five
+// other float
+// neg zero
+// go
+// other string
+// value 4
+// @match-end
+
+fn bool_name(value: bool) -> string {
+    match value {
+        true => "yes",
+        false => "no",
+    }
+}
+
+fn int_name(value: int) -> string {
+    match value {
+        2 => "two",
+        _ => "other int",
+    }
+}
+
+fn float_name(value: float) -> string {
+    match value {
+        1.5 => "one point five",
+        _ => "other float",
+    }
+}
+
+fn zero_name(value: float) -> string {
+    match value {
+        -0.0 => "neg zero",
+        0.0 => "pos zero",
+        _ => "other zero",
+    }
+}
+
+fn string_name(value: string) -> string {
+    match value {
+        "go" => "go",
+        _ => "other string",
+    }
+}
+
+fn binding_fallback(value: int) -> string {
+    match value {
+        0 => "zero",
+        other => f"value {other}",
+    }
+}
+
+fn main() {
+    println(bool_name(true));
+    println(bool_name(false));
+    println(int_name(2));
+    println(int_name(9));
+    println(float_name(1.5));
+    println(float_name(2.0));
+    println(zero_name(0.0));
+    println(string_name("go"));
+    println(string_name("stop"));
+    println(binding_fallback(4));
+}

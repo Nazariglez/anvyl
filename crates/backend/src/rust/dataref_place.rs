@@ -87,12 +87,9 @@ impl DataRefPlaceDescriptors {
                 self.collect_block(program, function, &scope.body);
             }
             RirStmt::CollectionSlotScope(block) => self.collect_block(program, function, block),
-            RirStmt::EnumMatch(match_) => {
+            RirStmt::PatternMatch(match_) => {
                 for arm in &match_.arms {
                     self.collect_block(program, function, &arm.block);
-                }
-                if let Some(block) = &match_.else_block {
-                    self.collect_block(program, function, block);
                 }
             }
             RirStmt::OptionMatch(match_) => self.collect_option_match(program, function, match_),

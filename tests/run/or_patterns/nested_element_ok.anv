@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// false
+// other
+// @match-end
+
+fn describe(pair: (int, bool)) -> string {
+    match pair {
+        (1 | 2, flag) => f"{flag}",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(describe((1, true)));
+    println(describe((2, false)));
+    println(describe((3, true)));
+}

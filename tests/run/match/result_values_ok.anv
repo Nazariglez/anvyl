@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 9
+// done
+// @match-end
+
+struct Point { x: int, y: int }
+
+enum Choice { A, B }
+
+fn pair(choice: Choice) -> (int, int) {
+    match choice {
+        Choice.A => (1, 1),
+        Choice.B => (2, 2),
+    }
+}
+
+fn point(choice: Choice) -> Point {
+    match choice {
+        Choice.A => Point { x: 7, y: 8 },
+        Choice.B => Point { x: 9, y: 10 },
+    }
+}
+
+fn choice(flag: bool) -> Choice {
+    match flag {
+        true => Choice.A,
+        false => Choice.B,
+    }
+}
+
+fn main() {
+    let pair = pair(Choice.B);
+    println(pair.0);
+    let point = point(Choice.B);
+    println(point.x);
+    match choice(false) {
+        Choice.B => println("done"),
+        Choice.A => println("wrong"),
+    }
+}

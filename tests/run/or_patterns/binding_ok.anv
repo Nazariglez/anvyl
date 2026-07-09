@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// x 4
+// x 9
+// other
+// @match-end
+
+enum Event {
+    A(int),
+    B(int),
+    C,
+}
+
+fn describe(event: Event) -> string {
+    match event {
+        Event.A(x) | Event.B(x) => f"x {x}",
+        Event.C => "other",
+    }
+}
+
+fn main() {
+    println(describe(Event.A(4)));
+    println(describe(Event.B(9)));
+    println(describe(Event.C));
+}

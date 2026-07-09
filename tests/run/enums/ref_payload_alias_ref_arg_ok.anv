@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: mutable enum tuple payload aliases are not executable yet
 // @match: 2
 
 enum Slot {

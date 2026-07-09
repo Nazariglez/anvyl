@@ -1,0 +1,46 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// four 5
+// pair 2,3
+// some 7
+// none
+// point 6,7
+// maybe point 8,9
+// maybe nil
+// other
+// @match-end
+
+struct Point { x: int, y: int }
+
+enum Event {
+    Pair((int, int)),
+    Maybe(int?),
+    MaybePoint(Point?),
+    At(Point),
+    Other,
+}
+
+fn describe(event: Event) -> string {
+    match event {
+        Event.Pair((4, y)) => f"four {y}",
+        Event.Pair((x, y)) => f"pair {x},{y}",
+        Event.Maybe(value?) => f"some {value}",
+        Event.Maybe(nil) => "none",
+        Event.At(Point { x, y }) => f"point {x},{y}",
+        Event.MaybePoint(point?) => f"maybe point {point.x},{point.y}",
+        Event.MaybePoint(nil) => "maybe nil",
+        Event.Other => "other",
+    }
+}
+
+fn main() {
+    println(describe(Event.Pair((4, 5))));
+    println(describe(Event.Pair((2, 3))));
+    println(describe(Event.Maybe(7)));
+    println(describe(Event.Maybe(nil)));
+    println(describe(Event.At(Point { x: 6, y: 7 })));
+    println(describe(Event.MaybePoint(Point { x: 8, y: 9 })));
+    println(describe(Event.MaybePoint(nil)));
+    println(describe(Event.Other));
+}

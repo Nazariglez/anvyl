@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// present
+// missing or present
+// missing or present
+// @match-end
+
+fn describe(value: int?) -> string {
+    match value {
+        _? => "present",
+        nil => "missing",
+    }
+}
+
+fn collapsed(value: int?) -> string {
+    match value {
+        nil | _? => "missing or present",
+    }
+}
+
+fn main() {
+    println(describe(1));
+    println(collapsed(nil));
+    println(collapsed(2));
+}

@@ -1,0 +1,53 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 11
+// 22
+// done
+// @match-end
+
+enum Slot {
+    Empty,
+    First(int),
+    Second { value: int },
+}
+
+fn bump(ref value: int) {
+    value += 1;
+}
+
+fn bump_local_first() -> Slot {
+    var slot = Slot.First(10);
+    match ref slot {
+        Slot.First(value) => bump(value),
+        Slot.Second { value } => bump(value),
+        Slot.Empty => {},
+    };
+    slot
+}
+
+fn bump_local_second() -> Slot {
+    var slot = Slot.Second { value: 21 };
+    match ref slot {
+        Slot.First(value) => bump(value),
+        Slot.Second { value } => bump(value),
+        Slot.Empty => {},
+    };
+    slot
+}
+
+fn print_slot(slot: Slot) {
+    match slot {
+        Slot.First(value) => println(value),
+        Slot.Second { value } => println(value),
+        Slot.Empty => println("empty"),
+    }
+}
+
+fn main() {
+    let first = bump_local_first();
+    let second = bump_local_second();
+    print_slot(first);
+    print_slot(second);
+    println("done");
+}

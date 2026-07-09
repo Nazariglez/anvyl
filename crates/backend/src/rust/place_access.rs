@@ -212,7 +212,6 @@ pub enum PlaceProjectionKind {
     DataRefField(air::FieldId),
     ExternField(air::FieldId),
     TupleField(u32),
-    VariantField,
     ArrayIndex(LocalId),
     ListIndex(LocalId),
     SliceIndex(LocalId),
@@ -872,7 +871,6 @@ fn convert_projection(step: &air_place::ProjectionStep) -> PlaceProjection {
                 PlaceProjectionKind::ExternField(field)
             }
             air_place::ProjectionKind::TupleField(index) => PlaceProjectionKind::TupleField(index),
-            air_place::ProjectionKind::VariantField { .. } => PlaceProjectionKind::VariantField,
             air_place::ProjectionKind::ArrayIndex(local) => PlaceProjectionKind::ArrayIndex(local),
             air_place::ProjectionKind::ListIndex(local) => PlaceProjectionKind::ListIndex(local),
             air_place::ProjectionKind::SliceIndex(local) => PlaceProjectionKind::SliceIndex(local),

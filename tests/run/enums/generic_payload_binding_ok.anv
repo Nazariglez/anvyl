@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// some 8
+// none
+// @match-end
+
+enum Boxed<T> {
+    Some(T),
+    None,
+}
+
+fn describe(value: Boxed<int>) -> string {
+    match value {
+        Boxed.Some(item) => f"some {item}",
+        Boxed.None => "none",
+    }
+}
+
+fn main() {
+    println(describe(Boxed.Some(8)));
+    println(describe(Boxed.None));
+}

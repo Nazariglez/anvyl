@@ -56,6 +56,7 @@ pub enum VmCompileErrorKind {
     UnsupportedLambdaExternBoundary,
     UnsupportedCollectionLoan,
     UnsupportedRangeFor,
+    UnsupportedPatternMatch,
     UnsupportedGlobal,
     UnsupportedNativeInitField,
     NonCheapValueParam,
@@ -216,13 +217,11 @@ impl CompileCx<'_> {
                     self.check_place(function, &scope.root);
                     self.check_block(function, &scope.body, calls);
                 }
-                AirStmt::EnumMatch(match_) => {
-                    self.check_place(function, &match_.discr);
+                AirStmt::PatternMatch(match_) => {
+                    self.push_function(function, VmCompileErrorKind::UnsupportedPatternMatch);
+                    self.check_place(function, &match_.subject);
                     for arm in &match_.arms {
                         self.check_block(function, &arm.block, calls);
-                    }
-                    if let Some(block) = &match_.else_block {
-                        self.check_block(function, block, calls);
                     }
                 }
                 AirStmt::OptionalMatch(match_) => {
@@ -281,7 +280,7 @@ impl CompileCx<'_> {
             | RValue::Stringify { value: operand, .. }
             | RValue::Format { value: operand, .. }
             | RValue::CheckedIterCount { count: operand, .. } => {
-                self.check_operand(function, operand)
+                self.check_operand(function, operand);
             }
             RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
                 self.check_operand(function, lhs);

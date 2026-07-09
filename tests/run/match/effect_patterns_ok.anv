@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// small 2
+// vertical 5
+// other
+// @match-end
+
+enum Event {
+    Move { x: int, y: int },
+    Hit(int),
+    Quit,
+}
+
+fn print(event: Event) {
+    match event {
+        Event.Hit(1 | 2 | 3) => println("small 2"),
+        Event.Move { x: 0, y } => println(f"vertical {y}"),
+        _ => println("other"),
+    }
+}
+
+fn main() {
+    print(Event.Hit(2));
+    print(Event.Move { x: 0, y: 5 });
+    print(Event.Quit);
+}

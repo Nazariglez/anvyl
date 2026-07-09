@@ -48,22 +48,24 @@ use self::{
         RirCellStorage, RirCollectionAccess, RirCollectionFor, RirCollectionLoanMode,
         RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
         RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
-        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch,
-        RirEnumMatchArm, RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam,
-        RirField, RirFieldId, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec,
-        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch,
-        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamEscape,
-        RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue,
-        RirRangeFor, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr,
+        RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
+        RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject,
+        RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamEscape, RirParamSemantic,
+        RirPatternAlternative, RirPatternArm, RirPatternBinding, RirPatternBindingMode,
+        RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
+        RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
+        RirScopedPlaceSource, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -2105,6 +2107,194 @@ impl<'a> PlanCx<'a> {
         (stmts, RirOrdinalPlan { adapters })
     }
 
+    fn plan_pattern_match(
+        &self,
+        function: FunctionId,
+        match_: &air::AirPatternMatch,
+        locals: &mut Vec<RirLocal>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
+    ) -> Result<Vec<RirStmt>, RustPlanError> {
+        let aliases = Self::pattern_alias_locals(match_);
+        let (mut stmts, subject_place) = if aliases.is_empty() {
+            let subject = self.lower_place_read(function, &match_.subject, locals);
+            let RirOperand::Place(subject_place) = subject.operand else {
+                unreachable!("place read returns a place operand")
+            };
+            (subject.stmts, subject_place)
+        } else {
+            (
+                vec![],
+                self.plan_place_in_function(function, &match_.subject),
+            )
+        };
+        for local in aliases {
+            if let Some(local) = locals.get_mut(local.index()) {
+                local.payload_ref = true;
+            }
+        }
+        let entry_functions = zero_env_function_values.clone();
+        let entry_cells = initialized_cells.to_vec();
+        let entry_possible = possible_cells.to_vec();
+        let mut states = vec![];
+        let mut cell_states = vec![];
+        let mut possible_states = vec![];
+        let arms = match_
+            .arms
+            .iter()
+            .map(|arm| {
+                let mut arm_functions = entry_functions.clone();
+                let mut arm_cells = entry_cells.clone();
+                let mut arm_possible = entry_possible.clone();
+                let block = self.plan_air_block(
+                    function,
+                    &arm.block,
+                    locals,
+                    &mut arm_functions,
+                    &mut arm_cells,
+                    &mut arm_possible,
+                    in_loop,
+                )?;
+                states.push(arm_functions);
+                cell_states.push(arm_cells);
+                possible_states.push(arm_possible);
+                Ok(RirPatternArm {
+                    alternatives: arm
+                        .alternatives
+                        .iter()
+                        .map(|alternative| self.plan_pattern_alternative(alternative))
+                        .collect(),
+                    block,
+                })
+            })
+            .collect::<Result<Vec<_>, RustPlanError>>()?;
+        if !states.is_empty() {
+            Self::merge_zero_env_function_values(
+                zero_env_function_values,
+                locals.len(),
+                states.iter(),
+            );
+            for index in 0..initialized_cells.len() {
+                initialized_cells[index] = cell_states.iter().all(|state| state[index]);
+                possible_cells[index] = possible_states.iter().any(|state| state[index]);
+            }
+        }
+        stmts.push(RirStmt::PatternMatch(RirPatternMatch {
+            subject: subject_place,
+            arms,
+        }));
+        Ok(stmts)
+    }
+
+    fn pattern_alias_locals(match_: &air::AirPatternMatch) -> Vec<RirLocalId> {
+        let mut locals = vec![];
+        for arm in &match_.arms {
+            for alternative in &arm.alternatives {
+                for binding in &alternative.bindings {
+                    if binding.mode == air::AirPatternBindingMode::Alias {
+                        let local = RirLocalId::from_index(binding.local.index());
+                        if !locals.contains(&local) {
+                            locals.push(local);
+                        }
+                    }
+                }
+            }
+        }
+        locals
+    }
+
+    fn plan_pattern_alternative(
+        &self,
+        alternative: &air::AirPatternAlternative,
+    ) -> RirPatternAlternative {
+        RirPatternAlternative {
+            tests: alternative
+                .tests
+                .iter()
+                .map(|test| self.plan_pattern_test(test))
+                .collect(),
+            bindings: alternative
+                .bindings
+                .iter()
+                .map(|binding| self.plan_pattern_binding(binding))
+                .collect(),
+        }
+    }
+
+    fn plan_pattern_test(&self, test: &air::AirPatternTest) -> RirPatternTest {
+        match test {
+            air::AirPatternTest::Literal { path, value } => RirPatternTest::Literal {
+                path: self.plan_pattern_path(path),
+                value: self.const_map[value],
+            },
+            air::AirPatternTest::Nil { path } => RirPatternTest::Nil {
+                path: self.plan_pattern_path(path),
+            },
+            air::AirPatternTest::OptionalSome { path } => RirPatternTest::OptionalSome {
+                path: self.plan_pattern_path(path),
+            },
+            air::AirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } => RirPatternTest::EnumVariant {
+                path: self.plan_pattern_path(path),
+                enum_id: self.enum_map[enum_id],
+                variant: RirVariantId::from_index(variant.index()),
+            },
+        }
+    }
+
+    fn plan_pattern_binding(&self, binding: &air::AirPatternBinding) -> RirPatternBinding {
+        RirPatternBinding {
+            local: RirLocalId::from_index(binding.local.index()),
+            path: self.plan_pattern_path(&binding.path),
+            ty: self.type_map[&binding.ty],
+            mode: match binding.mode {
+                air::AirPatternBindingMode::Owned => RirPatternBindingMode::Owned,
+                air::AirPatternBindingMode::Alias => RirPatternBindingMode::Alias,
+            },
+        }
+    }
+
+    fn plan_pattern_path(&self, path: &air::AirPatternPath) -> RirPatternPath {
+        RirPatternPath {
+            steps: path
+                .steps
+                .iter()
+                .map(|step| match *step {
+                    air::AirPatternPathStep::Field(field) => {
+                        RirPatternPathStep::Field(RirFieldId::from_index(field.index()))
+                    }
+                    air::AirPatternPathStep::TupleField(field) => {
+                        RirPatternPathStep::TupleField(field)
+                    }
+                    air::AirPatternPathStep::OptionalSome => RirPatternPathStep::OptionalSome,
+                    air::AirPatternPathStep::EnumTupleField {
+                        enum_id,
+                        variant,
+                        field,
+                    } => RirPatternPathStep::EnumTupleField {
+                        enum_id: self.enum_map[&enum_id],
+                        variant: RirVariantId::from_index(variant.index()),
+                        field,
+                    },
+                    air::AirPatternPathStep::EnumStructField {
+                        enum_id,
+                        variant,
+                        field,
+                    } => RirPatternPathStep::EnumStructField {
+                        enum_id: self.enum_map[&enum_id],
+                        variant: RirVariantId::from_index(variant.index()),
+                        field,
+                    },
+                })
+                .collect(),
+        }
+    }
+
     fn plan_air_stmt(
         &self,
         function: FunctionId,
@@ -2379,82 +2569,15 @@ impl<'a> PlanCx<'a> {
                 possible_cells,
                 in_loop,
             ),
-            air::AirStmt::EnumMatch(match_) => {
-                let discr = self.lower_place_read(function, &match_.discr, locals);
-                let RirOperand::Place(discr_place) = discr.operand else {
-                    unreachable!("place read returns a place operand")
-                };
-                let mut stmts = discr.stmts;
-                let entry_functions = zero_env_function_values.clone();
-                let entry_cells = initialized_cells.to_vec();
-                let entry_possible = possible_cells.to_vec();
-                let mut states = vec![];
-                let mut cell_states = vec![];
-                let mut possible_states = vec![];
-                let arms = match_
-                    .arms
-                    .iter()
-                    .map(|arm| {
-                        let mut arm_functions = entry_functions.clone();
-                        let mut arm_cells = entry_cells.clone();
-                        let mut arm_possible = entry_possible.clone();
-                        let block = self.plan_air_block(
-                            function,
-                            &arm.block,
-                            locals,
-                            &mut arm_functions,
-                            &mut arm_cells,
-                            &mut arm_possible,
-                            in_loop,
-                        )?;
-                        states.push(arm_functions);
-                        cell_states.push(arm_cells);
-                        possible_states.push(arm_possible);
-                        Ok(RirEnumMatchArm {
-                            variant: RirVariantId::from_index(arm.variant.index()),
-                            block,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, RustPlanError>>()?;
-                let else_block = match &match_.else_block {
-                    Some(block) => {
-                        let mut else_functions = entry_functions.clone();
-                        let mut else_cells = entry_cells.clone();
-                        let mut else_possible = entry_possible.clone();
-                        let block = self.plan_air_block(
-                            function,
-                            block,
-                            locals,
-                            &mut else_functions,
-                            &mut else_cells,
-                            &mut else_possible,
-                            in_loop,
-                        )?;
-                        states.push(else_functions);
-                        cell_states.push(else_cells);
-                        possible_states.push(else_possible);
-                        Some(block)
-                    }
-                    None => None,
-                };
-                if !states.is_empty() {
-                    Self::merge_zero_env_function_values(
-                        zero_env_function_values,
-                        locals.len(),
-                        states.iter(),
-                    );
-                    for index in 0..initialized_cells.len() {
-                        initialized_cells[index] = cell_states.iter().all(|state| state[index]);
-                        possible_cells[index] = possible_states.iter().any(|state| state[index]);
-                    }
-                }
-                stmts.push(RirStmt::EnumMatch(RirEnumMatch {
-                    discr: discr_place,
-                    arms,
-                    else_block,
-                }));
-                Ok(stmts)
-            }
+            air::AirStmt::PatternMatch(match_) => self.plan_pattern_match(
+                function,
+                match_,
+                locals,
+                zero_env_function_values,
+                initialized_cells,
+                possible_cells,
+                in_loop,
+            ),
             air::AirStmt::OptionalMatch(match_) => {
                 let (mut stmts, subject) = self.plan_option_subject(function, match_, locals)?;
                 let payload = match_
@@ -3671,27 +3794,6 @@ impl<'a> PlanCx<'a> {
                 let (block, updates_slot) =
                     self.collection_slot_block(function, scope, access, block, false)?;
                 (RirStmt::CollectionSlotScope(block), updates_slot)
-            }
-            RirStmt::EnumMatch(mut match_) => {
-                let mut updates_slot = false;
-                for arm in &mut match_.arms {
-                    let (block, arm_updates_slot) = self.collection_slot_block(
-                        function,
-                        scope,
-                        access,
-                        std::mem::take(&mut arm.block),
-                        false,
-                    )?;
-                    updates_slot |= arm_updates_slot;
-                    arm.block = block;
-                }
-                if let Some(block) = match_.else_block {
-                    let (block, else_updates_slot) =
-                        self.collection_slot_block(function, scope, access, block, false)?;
-                    updates_slot |= else_updates_slot;
-                    match_.else_block = Some(block);
-                }
-                (RirStmt::EnumMatch(match_), updates_slot)
             }
             RirStmt::OptionMatch(mut match_) => {
                 let (some_block, some_updates_slot) =
@@ -5065,9 +5167,6 @@ impl<'a> PlanCx<'a> {
             | PlaceProjectionKind::SliceIndex(local) => {
                 RirProjection::Index(RirLocalId::from_index(local.index()))
             }
-            PlaceProjectionKind::VariantField => {
-                unreachable!("profile rejects unsupported projection")
-            }
         }
     }
 
@@ -5097,9 +5196,6 @@ impl<'a> PlanCx<'a> {
             | place_model::ProjectionKind::ListIndex(local)
             | place_model::ProjectionKind::SliceIndex(local) => {
                 RirProjection::Index(RirLocalId::from_index(local.index()))
-            }
-            place_model::ProjectionKind::VariantField { .. } => {
-                unreachable!("profile rejects unsupported projection")
             }
         }
     }

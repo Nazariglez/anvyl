@@ -1,0 +1,32 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// origin
+// vertical 7
+// pair 3,4
+// nested hit 5
+// fallback
+// @match-end
+
+fn classify(point: (int, int)) -> string {
+    match point {
+        (0, 0) => "origin",
+        (0, y) => f"vertical {y}",
+        (x, y) => f"pair {x},{y}",
+    }
+}
+
+fn classify_nested(value: ((int, int), int)) -> string {
+    match value {
+        ((1, inner), 9) => f"nested hit {inner}",
+        _ => "fallback",
+    }
+}
+
+fn main() {
+    println(classify((0, 0)));
+    println(classify((0, 7)));
+    println(classify((3, 4)));
+    println(classify_nested(((1, 5), 9)));
+    println(classify_nested(((1, 5), 8)));
+}

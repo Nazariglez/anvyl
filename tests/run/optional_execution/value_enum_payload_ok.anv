@@ -1,5 +1,4 @@
 // @mode: run
-// @skip: enum tuple payload matches are not executable yet
 // @expect: success
 // @match: 5
 

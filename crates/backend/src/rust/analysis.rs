@@ -95,6 +95,12 @@ fn stmt_calls_fallible(
                 || operand_has_fallible_place(program, function, value)
                 || operand_ty(program, value).is_some_and(|ty| program.collection_replace_ty(ty))
         }
+        RirStmt::PatternMatch(match_) => {
+            place_has_fallible_projection(program, function, &match_.subject)
+                || stmt_child_blocks_any(stmt, |block| {
+                    block_calls_fallible(program, fallible, function, block)
+                })
+        }
         RirStmt::OptionMatch(match_) => {
             match_.payload_ref
                 || option_subject_fallible(program, function, &match_.subject)
@@ -460,6 +466,8 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
                 .union(block_context_use(program, function, &for_.body))
         }
         RirStmt::CollectionSlotScope(block) => block_context_use(program, function, block),
+        RirStmt::PatternMatch(match_) => place_context_use(program, function, &match_.subject)
+            .union(stmt_child_blocks_context_use(program, function, stmt)),
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);
             let payload = match_.payload_ref.then(ContextUse::rt).unwrap_or_default();

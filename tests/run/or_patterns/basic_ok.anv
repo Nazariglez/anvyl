@@ -1,0 +1,33 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// small
+// quit-ish
+// other
+// @match-end
+
+enum Action {
+    Start,
+    Stop,
+    Quit,
+}
+
+fn classify(value: int) -> string {
+    match value {
+        1 | 2 | 3 => "small",
+        _ => "other",
+    }
+}
+
+fn action_name(action: Action) -> string {
+    match action {
+        Action.Stop | Action.Quit => "quit-ish",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(classify(2));
+    println(action_name(Action.Stop));
+    println(action_name(Action.Start));
+}

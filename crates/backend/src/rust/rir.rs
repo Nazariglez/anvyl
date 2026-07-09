@@ -640,7 +640,7 @@ pub enum RirStmt {
     CollectionFor(RirCollectionFor),
     CollectionLoanScope(RirCollectionLoanScope),
     CollectionSlotScope(RirStructuredBlock),
-    EnumMatch(RirEnumMatch),
+    PatternMatch(RirPatternMatch),
     OptionMatch(RirOptionMatch),
     MapEntryMatch(RirMapEntryMatch),
 }
@@ -659,15 +659,12 @@ pub(super) fn stmt_child_blocks_any(
         RirStmt::CollectionFor(for_) => block_matches(&for_.body),
         RirStmt::CollectionLoanScope(scope) => block_matches(&scope.body),
         RirStmt::CollectionSlotScope(block) => block_matches(block),
+        RirStmt::PatternMatch(match_) => match_.arms.iter().any(|arm| block_matches(&arm.block)),
         RirStmt::OptionMatch(match_) => {
             block_matches(&match_.some_block) || block_matches(&match_.none_block)
         }
         RirStmt::MapEntryMatch(match_) => {
             block_matches(&match_.some_block) || block_matches(&match_.none_block)
-        }
-        RirStmt::EnumMatch(match_) => {
-            match_.arms.iter().any(|arm| block_matches(&arm.block))
-                || match_.else_block.as_ref().is_some_and(block_matches)
         }
         RirStmt::Init { .. }
         | RirStmt::GlobalEnsure { .. }
@@ -796,19 +793,6 @@ impl RirOrdinalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RirEnumMatch {
-    pub discr: RirPlace,
-    pub arms: Vec<RirEnumMatchArm>,
-    pub else_block: Option<RirStructuredBlock>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RirEnumMatchArm {
-    pub variant: RirVariantId,
-    pub block: RirStructuredBlock,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct RirOptionMatch {
     pub subject: RirOptionSubject,
     pub payload: Option<RirLocalId>,
@@ -826,6 +810,96 @@ pub struct RirMapEntryMatch {
     pub payload_escapes: bool,
     pub some_block: RirStructuredBlock,
     pub none_block: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirPatternMatch {
+    pub subject: RirPlace,
+    pub arms: Vec<RirPatternArm>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RirPatternArm {
+    pub alternatives: Vec<RirPatternAlternative>,
+    pub block: RirStructuredBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RirPatternAlternative {
+    pub tests: Vec<RirPatternTest>,
+    pub bindings: Vec<RirPatternBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RirPatternPath {
+    pub steps: Vec<RirPatternPathStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirPatternPathStep {
+    Field(RirFieldId),
+    TupleField(u32),
+    OptionalSome,
+    EnumTupleField {
+        enum_id: RirEnumId,
+        variant: RirVariantId,
+        field: u16,
+    },
+    EnumStructField {
+        enum_id: RirEnumId,
+        variant: RirVariantId,
+        field: u16,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirPatternTest {
+    Literal {
+        path: RirPatternPath,
+        value: RirConstId,
+    },
+    Nil {
+        path: RirPatternPath,
+    },
+    OptionalSome {
+        path: RirPatternPath,
+    },
+    EnumVariant {
+        path: RirPatternPath,
+        enum_id: RirEnumId,
+        variant: RirVariantId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirPatternBinding {
+    pub local: RirLocalId,
+    pub path: RirPatternPath,
+    pub ty: RirTypeId,
+    pub mode: RirPatternBindingMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirPatternBindingMode {
+    Owned,
+    Alias,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RirPatternBindingSignature {
+    local: RirLocalId,
+    ty: RirTypeId,
+    mode: RirPatternBindingMode,
+}
+
+impl RirPatternBindingSignature {
+    fn sort_key(self) -> (usize, usize, u8) {
+        (
+            self.local.index(),
+            self.ty.index(),
+            u8::from(self.mode == RirPatternBindingMode::Alias),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1935,6 +2009,9 @@ pub enum RirVerifyErrorKind {
     LambdaEscapeProofMismatch,
     DuplicateMatchArm,
     MatchNotExhaustive,
+    PatternAlternativeRequired,
+    PatternBindingMismatch,
+    PatternPayloadWithoutVariantTest,
     OptionPayloadEscapeRequiresPayload,
     OptionPayloadEscapeRequiresRef,
     OptionPayloadEscapeNoneMustDiverge,
@@ -3816,6 +3893,446 @@ impl VerifyCx<'_> {
         self.scope_depth = previous_scope_depth;
     }
 
+    fn check_pattern_match(
+        &mut self,
+        function_id: RirFunctionId,
+        function: &RirFunction,
+        site: RirVerifySite,
+        match_: &RirPatternMatch,
+    ) {
+        self.check_place(site, function, &match_.subject);
+        if Self::pattern_match_has_alias_binding(match_) {
+            let RirPlaceRoot::Local(local) = match_.subject.root else {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                return;
+            };
+            if !function
+                .locals
+                .get(local.index())
+                .is_some_and(|local| local.mutable)
+            {
+                self.push(site, RirVerifyErrorKind::ImmutableAssign);
+            }
+        }
+        let subject_ty = match_.subject.ty;
+        let entry = self.block_entry_state();
+        let mut states = vec![];
+        for arm in &match_.arms {
+            if arm.alternatives.is_empty() {
+                self.push(site, RirVerifyErrorKind::PatternAlternativeRequired);
+            }
+            let mut arm_entry = entry.clone();
+            let mut expected_bindings: Option<Vec<RirPatternBindingSignature>> = None;
+            for alternative in &arm.alternatives {
+                let bindings = self.check_pattern_alternative(
+                    site,
+                    function,
+                    subject_ty,
+                    alternative,
+                    &entry,
+                    &mut arm_entry,
+                );
+                match &expected_bindings {
+                    Some(expected) if expected != &bindings => {
+                        self.push(site, RirVerifyErrorKind::PatternBindingMismatch);
+                    }
+                    Some(_) => {}
+                    None => expected_bindings = Some(bindings),
+                }
+            }
+            let mut state =
+                self.check_structured_block(function_id, function, &arm.block, arm_entry, None);
+            Self::clear_pattern_binding_locals(&mut state, arm);
+            states.push(state);
+        }
+        self.merge_structured_states(states);
+    }
+
+    fn clear_pattern_binding_locals(state: &mut Option<RirBlockState>, arm: &RirPatternArm) {
+        let Some(state) = state else {
+            return;
+        };
+        for alternative in &arm.alternatives {
+            for binding in &alternative.bindings {
+                if binding.local.index() < state.definite.len() {
+                    state.definite[binding.local.index()] = false;
+                    state.possible[binding.local.index()] = false;
+                    state.lambda_escapes[binding.local.index()] = None;
+                    state.lambda_values[binding.local.index()] = RirFunctionValueState::Unknown;
+                    state.loop_lambda_scopes[binding.local.index()] = None;
+                }
+            }
+        }
+    }
+
+    fn check_pattern_alternative(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        subject_ty: RirTypeId,
+        alternative: &RirPatternAlternative,
+        entry: &RirBlockEntryState,
+        arm_entry: &mut RirBlockEntryState,
+    ) -> Vec<RirPatternBindingSignature> {
+        let guards = Self::pattern_variant_guards(alternative);
+        self.check_pattern_variant_guards(site, &guards);
+        let mut optional_guards = Vec::new();
+        for test in &alternative.tests {
+            self.check_pattern_test(site, subject_ty, &guards, &optional_guards, test);
+            if let RirPatternTest::OptionalSome { path } = test {
+                optional_guards.push(path.steps.clone());
+            }
+        }
+        let mut bindings = Vec::new();
+        for binding in &alternative.bindings {
+            if bindings
+                .iter()
+                .any(|signature: &RirPatternBindingSignature| signature.local == binding.local)
+            {
+                self.push(site, RirVerifyErrorKind::PatternBindingMismatch);
+            }
+            self.check_pattern_binding(
+                site,
+                function,
+                subject_ty,
+                &guards,
+                &optional_guards,
+                binding,
+                entry,
+            );
+            if let Some(slot) = arm_entry.definite.get_mut(binding.local.index()) {
+                *slot = true;
+            }
+            if let Some(slot) = arm_entry.possible.get_mut(binding.local.index()) {
+                *slot = true;
+            }
+            let value = self.source_call_return_state(binding.ty);
+            if let Some(slot) = arm_entry.lambda_escapes.get_mut(binding.local.index()) {
+                *slot = value.escape();
+            }
+            if let Some(slot) = arm_entry.lambda_values.get_mut(binding.local.index()) {
+                *slot = value;
+            }
+            if let Some(slot) = arm_entry.loop_lambda_scopes.get_mut(binding.local.index()) {
+                *slot = None;
+            }
+            bindings.push(RirPatternBindingSignature {
+                local: binding.local,
+                ty: binding.ty,
+                mode: binding.mode,
+            });
+        }
+        bindings.sort_by_key(|signature| signature.sort_key());
+        bindings
+    }
+
+    fn check_pattern_variant_guards(
+        &mut self,
+        site: RirVerifySite,
+        guards: &[(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)],
+    ) {
+        for (index, (path, enum_id, variant)) in guards.iter().enumerate() {
+            if guards[..index]
+                .iter()
+                .any(|(seen_path, seen_enum, seen_variant)| {
+                    seen_path == path && (seen_enum != enum_id || seen_variant != variant)
+                })
+            {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
+        }
+    }
+
+    fn check_pattern_test(
+        &mut self,
+        site: RirVerifySite,
+        subject_ty: RirTypeId,
+        guards: &[(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)],
+        optional_guards: &[Vec<RirPatternPathStep>],
+        test: &RirPatternTest,
+    ) {
+        match test {
+            RirPatternTest::Literal { path, value } => {
+                self.check_const_id(site, *value);
+                let Some(path_ty) =
+                    self.pattern_path_ty(site, subject_ty, guards, optional_guards, path)
+                else {
+                    return;
+                };
+                if let Some(konst) = self.program.consts.get(value.index())
+                    && konst.ty != path_ty
+                {
+                    self.push(
+                        site,
+                        RirVerifyErrorKind::TypeMismatch {
+                            expected: path_ty,
+                            found: konst.ty,
+                        },
+                    );
+                }
+            }
+            RirPatternTest::Nil { path } | RirPatternTest::OptionalSome { path } => {
+                if let Some(path_ty) =
+                    self.pattern_path_ty(site, subject_ty, guards, optional_guards, path)
+                    && !matches!(self.ty(path_ty), Some(RirType::Option(_)))
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+            }
+            RirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } => {
+                let Some(path_ty) =
+                    self.pattern_path_ty(site, subject_ty, guards, optional_guards, path)
+                else {
+                    return;
+                };
+                if !self.variant_belongs_to_enum(*enum_id, *variant) {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                }
+                if !matches!(self.ty(path_ty), Some(RirType::Enum(found)) if found == *enum_id) {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+            }
+        }
+    }
+
+    fn check_pattern_binding(
+        &mut self,
+        site: RirVerifySite,
+        function: &RirFunction,
+        subject_ty: RirTypeId,
+        guards: &[(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)],
+        optional_guards: &[Vec<RirPatternPathStep>],
+        binding: &RirPatternBinding,
+        entry: &RirBlockEntryState,
+    ) {
+        self.check_local_id(site, function, binding.local);
+        if function
+            .params
+            .iter()
+            .any(|param| param.local == binding.local)
+            || entry
+                .possible
+                .get(binding.local.index())
+                .copied()
+                .unwrap_or(false)
+        {
+            self.push(site, RirVerifyErrorKind::InitParamLocal);
+        }
+        let Some(path_ty) =
+            self.pattern_path_ty(site, subject_ty, guards, optional_guards, &binding.path)
+        else {
+            return;
+        };
+        if path_ty != binding.ty {
+            self.push(
+                site,
+                RirVerifyErrorKind::TypeMismatch {
+                    expected: path_ty,
+                    found: binding.ty,
+                },
+            );
+        }
+        if let Some(local) = function.locals.get(binding.local.index()) {
+            if local.ty != binding.ty {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::TypeMismatch {
+                        expected: local.ty,
+                        found: binding.ty,
+                    },
+                );
+            }
+            match binding.mode {
+                RirPatternBindingMode::Alias if !local.mutable || !local.payload_ref => {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
+                }
+                RirPatternBindingMode::Owned if local.payload_ref => {
+                    self.push(site, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
+                }
+                RirPatternBindingMode::Alias | RirPatternBindingMode::Owned => {}
+            }
+        }
+        if matches!(binding.mode, RirPatternBindingMode::Alias) {
+            if !Self::pattern_alias_path_supported(&binding.path) {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+            }
+            if let Some(slot) = self.payload_ref_owned.get_mut(binding.local.index()) {
+                *slot = true;
+            }
+        }
+    }
+
+    fn pattern_match_has_alias_binding(match_: &RirPatternMatch) -> bool {
+        match_.arms.iter().any(|arm| {
+            arm.alternatives.iter().any(|alternative| {
+                alternative
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.mode == RirPatternBindingMode::Alias)
+            })
+        })
+    }
+
+    fn pattern_alias_path_supported(path: &RirPatternPath) -> bool {
+        matches!(
+            path.steps.as_slice(),
+            [RirPatternPathStep::EnumTupleField { .. }
+                | RirPatternPathStep::EnumStructField { .. }]
+        )
+    }
+
+    fn pattern_path_ty(
+        &mut self,
+        site: RirVerifySite,
+        subject_ty: RirTypeId,
+        guards: &[(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)],
+        optional_guards: &[Vec<RirPatternPathStep>],
+        path: &RirPatternPath,
+    ) -> Option<RirTypeId> {
+        let mut ty = subject_ty;
+        let mut prefix = Vec::new();
+        for step in &path.steps {
+            ty = self.pattern_path_step_ty(site, ty, guards, optional_guards, &prefix, step)?;
+            prefix.push(step.clone());
+        }
+        Some(ty)
+    }
+
+    fn pattern_path_step_ty(
+        &mut self,
+        site: RirVerifySite,
+        source_ty: RirTypeId,
+        guards: &[(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)],
+        optional_guards: &[Vec<RirPatternPathStep>],
+        prefix: &[RirPatternPathStep],
+        step: &RirPatternPathStep,
+    ) -> Option<RirTypeId> {
+        match *step {
+            RirPatternPathStep::Field(field) => match self.ty(source_ty) {
+                Some(RirType::Struct(strukt)) => self
+                    .program
+                    .structs
+                    .get(strukt.index())
+                    .and_then(|strukt| strukt.fields.get(field.index()))
+                    .map(|field| field.ty),
+                _ => None,
+            },
+            RirPatternPathStep::TupleField(field) => match self.ty(source_ty) {
+                Some(RirType::Tuple(tuple)) => self
+                    .program
+                    .tuples
+                    .get(tuple.index())
+                    .and_then(|tuple| tuple.fields.get(field as usize))
+                    .map(|field| field.ty),
+                _ => None,
+            },
+            RirPatternPathStep::OptionalSome => {
+                if !optional_guards.iter().any(|guard| guard == prefix) {
+                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
+                    return None;
+                }
+                match self.ty(source_ty) {
+                    Some(RirType::Option(inner)) => Some(inner),
+                    _ => None,
+                }
+            }
+            RirPatternPathStep::EnumTupleField {
+                enum_id,
+                variant,
+                field,
+            } => {
+                if !guards.iter().any(|(path, guard_enum, guard_variant)| {
+                    path == prefix && *guard_enum == enum_id && *guard_variant == variant
+                }) {
+                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
+                    return None;
+                }
+                self.enum_payload_field_ty(
+                    source_ty,
+                    enum_id,
+                    variant,
+                    RirVariantKind::Tuple,
+                    field,
+                )
+            }
+            RirPatternPathStep::EnumStructField {
+                enum_id,
+                variant,
+                field,
+            } => {
+                if !guards.iter().any(|(path, guard_enum, guard_variant)| {
+                    path == prefix && *guard_enum == enum_id && *guard_variant == variant
+                }) {
+                    self.push(site, RirVerifyErrorKind::PatternPayloadWithoutVariantTest);
+                    return None;
+                }
+                self.enum_payload_field_ty(
+                    source_ty,
+                    enum_id,
+                    variant,
+                    RirVariantKind::Struct,
+                    field,
+                )
+            }
+        }
+        .or_else(|| {
+            self.push(site, RirVerifyErrorKind::BadId);
+            None
+        })
+    }
+
+    fn enum_payload_field_ty(
+        &self,
+        source_ty: RirTypeId,
+        enum_id: RirEnumId,
+        variant: RirVariantId,
+        expected_kind: RirVariantKind,
+        field: u16,
+    ) -> Option<RirTypeId> {
+        match self.ty(source_ty) {
+            Some(RirType::Enum(found)) if found == enum_id => {}
+            _ => return None,
+        }
+        let variant = self
+            .program
+            .enums
+            .get(enum_id.index())?
+            .variants
+            .get(variant.index())?;
+        if variant.kind != expected_kind {
+            return None;
+        }
+        variant.fields.get(field as usize).map(|field| field.ty)
+    }
+
+    fn pattern_variant_guards(
+        alternative: &RirPatternAlternative,
+    ) -> Vec<(Vec<RirPatternPathStep>, RirEnumId, RirVariantId)> {
+        alternative
+            .tests
+            .iter()
+            .filter_map(|test| match test {
+                RirPatternTest::EnumVariant {
+                    path,
+                    enum_id,
+                    variant,
+                } => Some((path.steps.clone(), *enum_id, *variant)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn variant_belongs_to_enum(&self, enum_id: RirEnumId, variant: RirVariantId) -> bool {
+        self.program
+            .enums
+            .get(enum_id.index())
+            .is_some_and(|enm| variant.index() < enm.variants.len())
+    }
+
     fn check_stmt(
         &mut self,
         function_id: RirFunctionId,
@@ -4193,49 +4710,8 @@ impl VerifyCx<'_> {
                 );
                 self.merge_structured_states([state]);
             }
-            RirStmt::EnumMatch(match_) => {
-                self.check_place(site, function, &match_.discr);
-                let enum_id = match self.ty(match_.discr.ty) {
-                    Some(RirType::Enum(id)) => Some(id),
-                    _ => {
-                        self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                        None
-                    }
-                };
-                let variant_count = enum_id
-                    .and_then(|id| self.program.enums.get(id.index()))
-                    .map(|enm| enm.variants.len());
-                let mut seen = Vec::new();
-                let entry = self.block_entry_state();
-                let mut states = vec![];
-                for arm in &match_.arms {
-                    if variant_count.is_none_or(|len| arm.variant.index() >= len) {
-                        self.push(site, RirVerifyErrorKind::BadId);
-                    } else if seen.contains(&arm.variant) {
-                        self.push(site, RirVerifyErrorKind::DuplicateMatchArm);
-                    } else {
-                        seen.push(arm.variant);
-                    }
-                    states.push(self.check_structured_block(
-                        function_id,
-                        function,
-                        &arm.block,
-                        entry.clone(),
-                        None,
-                    ));
-                }
-                if let Some(else_block) = &match_.else_block {
-                    states.push(self.check_structured_block(
-                        function_id,
-                        function,
-                        else_block,
-                        entry.clone(),
-                        None,
-                    ));
-                } else if variant_count.is_some_and(|len| seen.len() < len) {
-                    self.push(site, RirVerifyErrorKind::MatchNotExhaustive);
-                }
-                self.merge_structured_states(states);
+            RirStmt::PatternMatch(match_) => {
+                self.check_pattern_match(function_id, function, site, match_);
             }
             RirStmt::MapEntryMatch(match_) => {
                 let map_ty = self.check_mut_place_arg(
@@ -5705,16 +6181,10 @@ impl VerifyCx<'_> {
                     .is_none_or(|block| self.structured_block_falls_through(block))
                     || self.structured_block_falls_through(&branch.then_block)
             }
-            RirStmt::EnumMatch(match_) => {
-                let arm_falls = match_
-                    .arms
-                    .iter()
-                    .any(|arm| self.structured_block_falls_through(&arm.block));
-                match &match_.else_block {
-                    Some(block) => arm_falls || self.structured_block_falls_through(block),
-                    None => arm_falls || !self.enum_match_is_exhaustive(match_),
-                }
-            }
+            RirStmt::PatternMatch(match_) => match_
+                .arms
+                .iter()
+                .any(|arm| self.structured_block_falls_through(&arm.block)),
             RirStmt::OptionMatch(match_) => {
                 self.structured_block_falls_through(&match_.some_block)
                     || self.structured_block_falls_through(&match_.none_block)
@@ -5743,23 +6213,6 @@ impl VerifyCx<'_> {
             | RirStmt::MapValueSet { .. }
             | RirStmt::Eval(_) => true,
         }
-    }
-
-    fn enum_match_is_exhaustive(&self, match_: &RirEnumMatch) -> bool {
-        let Some(RirType::Enum(enum_id)) = self.ty(match_.discr.ty) else {
-            return false;
-        };
-        let Some(enm) = self.program.enums.get(enum_id.index()) else {
-            return false;
-        };
-        let mut seen = Vec::new();
-        for arm in &match_.arms {
-            if arm.variant.index() >= enm.variants.len() || seen.contains(&arm.variant) {
-                return false;
-            }
-            seen.push(arm.variant);
-        }
-        seen.len() == enm.variants.len()
     }
 
     fn merge_structured_states(&mut self, states: impl IntoIterator<Item = Option<RirBlockState>>) {

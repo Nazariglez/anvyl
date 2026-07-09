@@ -8,17 +8,19 @@ use super::{
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
         RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope, RirCollectionStorageKind,
-        RirCoreEnumKind, RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumRepr,
-        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirIf, RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirCoreEnumKind, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirExternKind,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
+        RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
         RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
         RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch,
         RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
         RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParamAbi, RirParamSemantic,
-        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
-        RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
-        RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        VerifiedRirProgram, native_arg_facts, native_ty_is_resource_ref, stmt_child_blocks_any,
+        RirPatternAlternative, RirPatternBinding, RirPatternBindingMode, RirPatternMatch,
+        RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace, RirPlaceRoot, RirProgram,
+        RirProjection, RirRValue, RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl,
+        RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram, native_arg_facts,
+        native_ty_is_resource_ref, stmt_child_blocks_any,
     },
     runtime_owner::RuntimeOwnerEmit,
     syntax::{
@@ -1454,7 +1456,7 @@ impl EmitCx<'_> {
                         | RirStmt::CollectionFor(_)
                         | RirStmt::CollectionLoanScope(_)
                         | RirStmt::CollectionSlotScope(_)
-                        | RirStmt::EnumMatch(_)
+                        | RirStmt::PatternMatch(_)
                         | RirStmt::OptionMatch(_)
                         | RirStmt::MapEntryMatch(_)
                 )
@@ -1717,7 +1719,9 @@ impl EmitCx<'_> {
             RirStmt::CollectionSlotScope(block) => {
                 self.emit_lexical_block(function, block, predeclared);
             }
-            RirStmt::EnumMatch(match_) => self.emit_match(function, match_, predeclared),
+            RirStmt::PatternMatch(match_) => {
+                self.emit_pattern_match(function, index, match_, predeclared);
+            }
             RirStmt::OptionMatch(match_) => {
                 self.emit_option_match(function, index, match_, predeclared);
             }
@@ -1858,40 +1862,468 @@ impl EmitCx<'_> {
         self.w.line("}");
     }
 
-    fn emit_match(&mut self, function: &RirFunction, match_: &RirEnumMatch, predeclared: bool) {
-        let RirType::Enum(enum_id) = self.program.types[match_.discr.ty.index()] else {
-            unreachable!("verified enum match")
-        };
-        let enm = &self.program.enums[enum_id.index()];
-        let patterns = match_
-            .arms
-            .iter()
-            .map(|arm| {
-                let variant = &enm.variants[arm.variant.index()];
-                Self::variant_pattern(enm, variant)
-            })
-            .collect::<Vec<_>>();
-        self.w.line(format_args!(
-            "match &{} {{",
-            RustPlaces::new(self.program, function).local_place(&match_.discr)
-        ));
+    fn emit_pattern_match(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        match_: &RirPatternMatch,
+        predeclared: bool,
+    ) {
+        let label = format!("'__anv_match_{index}");
+        self.w.line(format_args!("{label}: {{"));
         self.indented(|this| {
-            for (arm, pattern) in match_.arms.iter().zip(patterns.iter()) {
-                this.w.line(format_args!("{pattern} => {{"));
-                this.indented(|this| {
-                    this.emit_structured_block(function, &arm.block, predeclared);
-                });
-                this.w.line("}");
+            let mut alternative_index = 0;
+            for arm in &match_.arms {
+                for alternative in &arm.alternatives {
+                    this.emit_pattern_alternative(
+                        function,
+                        match_,
+                        alternative,
+                        alternative_index,
+                        &arm.block,
+                        predeclared,
+                        &label,
+                    );
+                    alternative_index += 1;
+                }
             }
-            if let Some(else_block) = &match_.else_block {
-                this.w.line("_ => {");
-                this.indented(|this| {
-                    this.emit_structured_block(function, else_block, predeclared);
-                });
-                this.w.line("}");
-            }
+            this.w.line("unreachable!();");
         });
         self.w.line("}");
+    }
+
+    fn emit_pattern_alternative(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        alternative: &RirPatternAlternative,
+        alternative_index: usize,
+        block: &RirStructuredBlock,
+        predeclared: bool,
+        label: &str,
+    ) {
+        if let Some((enum_id, variant)) = Self::root_enum_variant_test(alternative) {
+            let enm = &self.program.enums[enum_id.index()];
+            let variant = &enm.variants[variant.index()];
+            let pattern = Self::variant_payload_pattern(enm, variant, alternative_index);
+            let subject = RustPlaces::new(self.program, function).local_place(&match_.subject);
+            let borrow = if Self::pattern_alternative_has_alias(alternative) {
+                "&mut"
+            } else {
+                "&"
+            };
+            self.w
+                .line(format_args!("if let {pattern} = {borrow} {subject} {{"));
+            self.indented(|this| {
+                this.emit_pattern_alternative_body(
+                    function,
+                    match_,
+                    alternative,
+                    alternative_index,
+                    block,
+                    predeclared,
+                    label,
+                    true,
+                );
+            });
+            self.w.line("}");
+            return;
+        }
+        self.emit_pattern_alternative_body(
+            function,
+            match_,
+            alternative,
+            alternative_index,
+            block,
+            predeclared,
+            label,
+            false,
+        );
+    }
+
+    fn emit_pattern_alternative_body(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        alternative: &RirPatternAlternative,
+        alternative_index: usize,
+        block: &RirStructuredBlock,
+        predeclared: bool,
+        label: &str,
+        skip_root_variant_test: bool,
+    ) {
+        let condition = self.pattern_alternative_condition(
+            function,
+            match_,
+            alternative,
+            alternative_index,
+            skip_root_variant_test,
+        );
+        if condition == "true" {
+            self.emit_pattern_matched_body(
+                function,
+                match_,
+                alternative,
+                alternative_index,
+                block,
+                predeclared,
+                label,
+            );
+            return;
+        }
+        self.w.line(format_args!("if {condition} {{"));
+        self.indented(|this| {
+            this.emit_pattern_matched_body(
+                function,
+                match_,
+                alternative,
+                alternative_index,
+                block,
+                predeclared,
+                label,
+            );
+        });
+        self.w.line("}");
+    }
+
+    fn emit_pattern_matched_body(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        alternative: &RirPatternAlternative,
+        alternative_index: usize,
+        block: &RirStructuredBlock,
+        predeclared: bool,
+        label: &str,
+    ) {
+        self.emit_pattern_bindings(function, match_, alternative, alternative_index);
+        self.emit_structured_block(function, block, predeclared);
+        if matches!(block.term, RirTerm::None) {
+            self.w.line(format_args!("break {label};"));
+        }
+    }
+
+    fn pattern_alternative_has_alias(alternative: &RirPatternAlternative) -> bool {
+        alternative
+            .bindings
+            .iter()
+            .any(|binding| binding.mode == RirPatternBindingMode::Alias)
+    }
+
+    fn pattern_alternative_condition(
+        &self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        alternative: &RirPatternAlternative,
+        alternative_index: usize,
+        skip_root_variant_test: bool,
+    ) -> String {
+        let conditions = alternative
+            .tests
+            .iter()
+            .filter(|test| {
+                !(skip_root_variant_test
+                    && matches!(test, RirPatternTest::EnumVariant { path, .. } if path.steps.is_empty()))
+            })
+            .map(|test| self.pattern_test_condition(function, match_, test, alternative_index))
+            .collect::<Vec<_>>();
+        if conditions.is_empty() {
+            "true".into()
+        } else {
+            conditions.join(" && ")
+        }
+    }
+
+    fn root_enum_variant_test(
+        alternative: &RirPatternAlternative,
+    ) -> Option<(RirEnumId, RirVariantId)> {
+        alternative.tests.iter().find_map(|test| match test {
+            RirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } if path.steps.is_empty() => Some((*enum_id, *variant)),
+            _ => None,
+        })
+    }
+
+    fn variant_payload_pattern(
+        enm: &RirEnum,
+        variant: &RirVariant,
+        alternative_index: usize,
+    ) -> String {
+        let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
+        match variant.kind {
+            RirVariantKind::Unit => unit_variant_pattern(&path),
+            RirVariantKind::Tuple => {
+                let fields = (0..variant.fields.len())
+                    .map(|field| Self::pattern_payload_tmp(alternative_index, field))
+                    .collect::<Vec<_>>();
+                format!("{path}({})", comma(fields))
+            }
+            RirVariantKind::Struct => {
+                let fields = variant
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        format!(
+                            "{}: {}",
+                            field.symbol.as_str(),
+                            Self::pattern_payload_tmp(alternative_index, index)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                format!("{path} {{ {} }}", comma(fields))
+            }
+        }
+    }
+
+    fn pattern_payload_tmp(alternative_index: usize, field: usize) -> String {
+        format!("__anv_pat_{alternative_index}_{field}")
+    }
+
+    fn pattern_test_condition(
+        &self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        test: &RirPatternTest,
+        alternative_index: usize,
+    ) -> String {
+        match test {
+            RirPatternTest::Literal { path, value } => {
+                let values = RustValues::new(self.program, function);
+                let const_ty = self.program.consts[value.index()].ty;
+                let lhs = if let Some(place) = self.subject_pattern_place_operand(match_, path) {
+                    values.value_operand(&RirOperand::Place(place))
+                } else {
+                    let Some(source) =
+                        self.pattern_path_ref_source(function, match_, path, alternative_index)
+                    else {
+                        return "false".into();
+                    };
+                    values.value_from_ref(const_ty, &source)
+                };
+                let rhs = values.value_operand(&RirOperand::Const(*value));
+                format!("{lhs} == {rhs}")
+            }
+            RirPatternTest::EnumVariant {
+                path,
+                enum_id,
+                variant,
+            } if path.steps.is_empty() => {
+                let RirType::Enum(subject_enum) = self.program.types[match_.subject.ty.index()]
+                else {
+                    return "false".into();
+                };
+                if subject_enum != *enum_id {
+                    return "false".into();
+                }
+                let enm = &self.program.enums[enum_id.index()];
+                let variant = &enm.variants[variant.index()];
+                let pattern = Self::variant_pattern(enm, variant);
+                let subject = RustPlaces::new(self.program, function).local_place(&match_.subject);
+                format!("matches!(&{subject}, {pattern})")
+            }
+            RirPatternTest::Nil { path } => self
+                .pattern_optional_condition(function, match_, path, alternative_index, "is_none")
+                .unwrap_or_else(|| "false".into()),
+            RirPatternTest::OptionalSome { path } => self
+                .pattern_optional_condition(function, match_, path, alternative_index, "is_some")
+                .unwrap_or_else(|| "false".into()),
+            RirPatternTest::EnumVariant { .. } => "false".into(),
+        }
+    }
+
+    fn pattern_optional_condition(
+        &self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        path: &RirPatternPath,
+        alternative_index: usize,
+        method: &str,
+    ) -> Option<String> {
+        let source = self.pattern_path_ref_source(function, match_, path, alternative_index)?;
+        Some(format!("({source}).{method}()"))
+    }
+
+    fn pattern_path_ref_source(
+        &self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        path: &RirPatternPath,
+        alternative_index: usize,
+    ) -> Option<String> {
+        self.enum_payload_binding_source(path, alternative_index)
+            .or_else(|| self.subject_pattern_ref_source(function, match_, path))
+    }
+
+    fn subject_pattern_ref_source(
+        &self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        path: &RirPatternPath,
+    ) -> Option<String> {
+        if let Some(place) = self.subject_pattern_place_operand(match_, path) {
+            return Some(
+                RustValues::new(self.program, function).operand_ref(&RirOperand::Place(place)),
+            );
+        }
+        let source = format!(
+            "&{}",
+            RustPlaces::new(self.program, function).local_place(&match_.subject)
+        );
+        self.pattern_path_ref_steps_source(match_.subject.ty, source, &path.steps)
+    }
+
+    fn pattern_path_ref_steps_source(
+        &self,
+        mut current_ty: RirTypeId,
+        mut source: String,
+        steps: &[RirPatternPathStep],
+    ) -> Option<String> {
+        for step in steps {
+            match *step {
+                RirPatternPathStep::TupleField(field) => {
+                    let RirType::Tuple(tuple) = self.program.types[current_ty.index()] else {
+                        return None;
+                    };
+                    let field = &self.program.tuples[tuple.index()].fields[field as usize];
+                    source = format!("&({source}).{}", field.symbol.as_str());
+                    current_ty = field.ty;
+                }
+                RirPatternPathStep::Field(field) => {
+                    let RirType::Struct(strukt) = self.program.types[current_ty.index()] else {
+                        return None;
+                    };
+                    let field = &self.program.structs[strukt.index()].fields[field.index()];
+                    source = format!("&({source}).{}", field.symbol.as_str());
+                    current_ty = field.ty;
+                }
+                RirPatternPathStep::OptionalSome => {
+                    let RirType::Option(inner) = self.program.types[current_ty.index()] else {
+                        return None;
+                    };
+                    source = format!("({source}).as_ref().unwrap()");
+                    current_ty = inner;
+                }
+                RirPatternPathStep::EnumTupleField { .. }
+                | RirPatternPathStep::EnumStructField { .. } => return None,
+            }
+        }
+        Some(source)
+    }
+
+    fn subject_pattern_place_operand(
+        &self,
+        match_: &RirPatternMatch,
+        path: &RirPatternPath,
+    ) -> Option<RirPlace> {
+        let mut projections = match_.subject.projections.clone();
+        let mut ty = match_.subject.ty;
+        for step in &path.steps {
+            match *step {
+                RirPatternPathStep::TupleField(field) => {
+                    let RirType::Tuple(tuple) = self.program.types[ty.index()] else {
+                        return None;
+                    };
+                    let field = &self.program.tuples[tuple.index()].fields[field as usize];
+                    projections.push(RirProjection::TupleField(field.id));
+                    ty = field.ty;
+                }
+                RirPatternPathStep::Field(field) => {
+                    let RirType::Struct(strukt) = self.program.types[ty.index()] else {
+                        return None;
+                    };
+                    projections.push(RirProjection::Field(field));
+                    ty = self.program.structs[strukt.index()].fields[field.index()].ty;
+                }
+                RirPatternPathStep::OptionalSome
+                | RirPatternPathStep::EnumTupleField { .. }
+                | RirPatternPathStep::EnumStructField { .. } => return None,
+            }
+        }
+        Some(RirPlace {
+            root: match_.subject.root,
+            projections,
+            ty,
+        })
+    }
+
+    fn emit_pattern_bindings(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        alternative: &RirPatternAlternative,
+        alternative_index: usize,
+    ) {
+        for binding in &alternative.bindings {
+            self.emit_pattern_binding(function, match_, binding, alternative_index);
+        }
+    }
+
+    fn emit_pattern_binding(
+        &mut self,
+        function: &RirFunction,
+        match_: &RirPatternMatch,
+        binding: &RirPatternBinding,
+        alternative_index: usize,
+    ) {
+        let local = &function.locals[binding.local.index()];
+        if binding.mode == RirPatternBindingMode::Owned
+            && let Some(place) = self.subject_pattern_place_operand(match_, &binding.path)
+        {
+            let value =
+                RustValues::new(self.program, function).value_operand(&RirOperand::Place(place));
+            self.w
+                .line(format_args!("{} = {value};", local.symbol.as_str()));
+            return;
+        }
+        if let Some(source) =
+            self.pattern_path_ref_source(function, match_, &binding.path, alternative_index)
+        {
+            match binding.mode {
+                RirPatternBindingMode::Owned => {
+                    let value =
+                        RustValues::new(self.program, function).value_from_ref(binding.ty, &source);
+                    self.w
+                        .line(format_args!("{} = {value};", local.symbol.as_str()));
+                }
+                RirPatternBindingMode::Alias => {
+                    self.w
+                        .line(format_args!("let {} = {source};", local.symbol.as_str()));
+                }
+            }
+            return;
+        }
+        self.w.line("unreachable!();");
+    }
+
+    fn enum_payload_binding_source(
+        &self,
+        path: &RirPatternPath,
+        alternative_index: usize,
+    ) -> Option<String> {
+        let (first, rest) = path.steps.split_first()?;
+        let (enum_id, variant, field) = match first {
+            RirPatternPathStep::EnumTupleField {
+                enum_id,
+                variant,
+                field,
+            }
+            | RirPatternPathStep::EnumStructField {
+                enum_id,
+                variant,
+                field,
+            } => (*enum_id, *variant, *field as usize),
+            _ => return None,
+        };
+        let ty = self.program.enums[enum_id.index()].variants[variant.index()].fields[field].ty;
+        self.pattern_path_ref_steps_source(
+            ty,
+            Self::pattern_payload_tmp(alternative_index, field),
+            rest,
+        )
     }
 
     fn emit_map_entry_match(
@@ -5146,7 +5578,7 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
             for_.len == local || ordinal_uses_local(program, &for_.ordinal_plan, local)
         }
         RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
-        RirStmt::EnumMatch(RirEnumMatch { discr, .. }) => place_uses_local(discr, local),
+        RirStmt::PatternMatch(RirPatternMatch { subject, .. }) => place_uses_local(subject, local),
         RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
             option_subject_uses_local(program, subject, local)
         }
@@ -5419,7 +5851,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::CollectionFor(_)
         | RirStmt::CollectionLoanScope(_)
         | RirStmt::CollectionSlotScope(_)
-        | RirStmt::EnumMatch(_)
+        | RirStmt::PatternMatch(_)
         | RirStmt::OptionMatch(_)
         | RirStmt::MapEntryMatch(_) => false,
     }

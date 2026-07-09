@@ -1,0 +1,32 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// move 2,3
+// x 8
+// quit
+// @match-end
+
+enum Event {
+    Move { x: int, y: int },
+    Quit,
+}
+
+fn describe(event: Event) -> string {
+    match event {
+        Event.Move { x, y } => f"move {x},{y}",
+        Event.Quit => "quit",
+    }
+}
+
+fn x_only(event: Event) -> string {
+    match event {
+        Event.Move { x: alias, .. } => f"x {alias}",
+        Event.Quit => "quit",
+    }
+}
+
+fn main() {
+    println(describe(Event.Move { x: 2, y: 3 }));
+    println(x_only(Event.Move { x: 8, y: 9 }));
+    println(describe(Event.Quit));
+}

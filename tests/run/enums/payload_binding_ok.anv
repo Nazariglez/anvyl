@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// hit 5
+// moved 2,3
+// quit
+// @match-end
+
+enum Event {
+    Hit(int),
+    Move(int, int),
+    Quit,
+}
+
+fn describe(event: Event) -> string {
+    match event {
+        Event.Hit(amount) => f"hit {amount}",
+        Event.Move(x, y) => f"moved {x},{y}",
+        Event.Quit => "quit",
+    }
+}
+
+fn main() {
+    println(describe(Event.Hit(5)));
+    println(describe(Event.Move(2, 3)));
+    println(describe(Event.Quit));
+}

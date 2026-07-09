@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// some 4 9
+// none 2,3
+// other
+// @match-end
+
+struct Point { x: int, y: int }
+
+fn describe(input: (int?, Point)) -> string {
+    match input {
+        (value?, Point { x: 1, y }) => f"some {value} {y}",
+        (nil, Point { x, y }) => f"none {x},{y}",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(describe((4, Point { x: 1, y: 9 })));
+    println(describe((nil, Point { x: 2, y: 3 })));
+    println(describe((5, Point { x: 8, y: 9 })));
+}

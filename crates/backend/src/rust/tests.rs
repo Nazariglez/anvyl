@@ -26,20 +26,22 @@ use super::{
         RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
         RirCollectionRootKind, RirCollectionStorage, RirCollectionStorageId,
         RirCollectionStorageKind, RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirDataRef,
-        RirDataRefId, RirEnum, RirEnumId, RirEnumMatch, RirEnumMatchArm, RirExtern, RirExternId,
-        RirExternKind, RirExternParam, RirField, RirFieldId, RirFormatKind, RirFormatSpec,
-        RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirLambda, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
-        RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi,
-        RirParamEscape, RirParamSemantic, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
-        RirRValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
-        RirScopedPlaceSource, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
+        RirDataRefId, RirEnum, RirEnumId, RirExtern, RirExternId, RirExternKind, RirExternParam,
+        RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal,
+        RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
+        RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
+        RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
+        RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
+        RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirPatternAlternative, RirPatternArm, RirPatternBinding,
+        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
+        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource,
+        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
+        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
+        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirVerifyErrorKind, RirVerifySite,
     },
     runtime_owner::RuntimeOwnerEmit,
     source_job::{self, SourceJobStatus},
@@ -3203,61 +3205,6 @@ fn profile_accepts_supported_projected_global_assignment() {
     program.set_entry(id);
 
     check(program);
-}
-
-#[test]
-fn profile_rejects_unsupported_global_projection_by_named_gap() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let module = program.alloc_module(root_module());
-    let enum_id = program.alloc_enum(EnumDecl {
-        name: Ident::new("Slot"),
-        module,
-        type_args: vec![],
-        const_args: vec![],
-        core: None,
-        repr: air::EnumRepr::Adt,
-        raw_type: None,
-        variants: vec![VariantDecl {
-            name: Ident::new("Item"),
-            shape: VariantShape::Tuple(vec![int]),
-            raw_value: None,
-        }],
-    });
-    program.module_mut(module).enums.push(enum_id);
-    let slot = program.alloc_type(TypeData::Enum(enum_id));
-    let global = global_with_init(&mut program, module, "g", slot, Mutability::Mutable);
-    let function = Function {
-        name: Ident::new("f"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![],
-        body: structured_body(
-            vec![],
-            air::AirTail::Return(Some(Operand::Place(Place {
-                root: PlaceRoot::Global(global),
-                projection: vec![Projection::VariantField {
-                    enum_id,
-                    variant: VariantId::from_index(0),
-                    field: 0,
-                }],
-                ty: int,
-            }))),
-        ),
-    };
-    let id = program.alloc_function(function);
-    program.module_mut(module).functions.push(id);
-    program.set_entry(id);
-
-    let errors = profile_errors(program);
-    assert_profile_error(
-        &errors,
-        ProfileSite::Terminator(id),
-        ProfileErrorKind::UnsupportedGlobalProjection,
-    );
 }
 
 #[test]
@@ -12044,47 +11991,595 @@ fn rir_verify_accepts_root_none_after_nonfallthrough_if() {
 }
 
 #[test]
-fn rir_verify_rejects_duplicate_enum_match_arms() {
-    let program = enum_match_rir(
-        vec![
-            RirEnumMatchArm {
-                variant: RirVariantId::from_index(0),
+fn rir_verify_accepts_wildcard_pattern_match() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let subject = RirLocalId::from_index(0);
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, int, false, "subject"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, int),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative::default()],
                 block: RirStructuredBlock {
                     stmts: vec![],
-                    term: RirTerm::None,
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
                 },
-            },
-            RirEnumMatchArm {
-                variant: RirVariantId::from_index(0),
-                block: RirStructuredBlock {
-                    stmts: vec![],
-                    term: RirTerm::None,
-                },
-            },
-        ],
-        Some(RirStructuredBlock {
-            stmts: vec![],
-            term: RirTerm::None,
-        }),
-    );
+            }],
+        })],
+        term: RirTerm::None,
+    };
 
-    assert_rir_error(program, RirVerifyErrorKind::DuplicateMatchArm);
+    rir::verify(&program).expect("RIR verify failed");
 }
 
 #[test]
-fn rir_verify_rejects_nonexhaustive_enum_match() {
-    let program = enum_match_rir(
-        vec![RirEnumMatchArm {
-            variant: RirVariantId::from_index(0),
-            block: RirStructuredBlock {
-                stmts: vec![],
-                term: RirTerm::None,
-            },
+fn rir_verify_rejects_pattern_binding_type_mismatch() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let bool_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    let binding = RirLocalId::from_index(1);
+    program.types.push(RirType::Bool);
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, int, false, "subject"));
+    program.functions[0]
+        .locals
+        .push(rir_local(binding, bool_ty, false, "binding"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, int),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![],
+                    bindings: vec![RirPatternBinding {
+                        local: binding,
+                        path: RirPatternPath::default(),
+                        ty: bool_ty,
+                        mode: RirPatternBindingMode::Owned,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_pattern_literal_type_mismatch() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let bool_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    program.types.push(RirType::Bool);
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(1),
+        ty: bool_ty,
+        value: RirConstValue::Bool(true),
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, int, false, "subject"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, int),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![RirPatternTest::Literal {
+                        path: RirPatternPath::default(),
+                        value: RirConstId::from_index(1),
+                    }],
+                    bindings: vec![],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_type_error(program);
+}
+
+#[test]
+fn rir_verify_rejects_unguarded_pattern_payload_path() {
+    let mut program = empty_rir_function(RirType::Int);
+    let enum_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        native_path: None,
+        native_key: None,
+        core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
+        symbol: RirSymbol::new("Slot"),
+        display: RirSymbol::new("Slot"),
+        copyable: true,
+        variants: vec![RirVariant {
+            id: RirVariantId::from_index(0),
+            symbol: RirSymbol::new("Item"),
+            display: RirSymbol::new("Item"),
+            kind: RirVariantKind::Tuple,
+            raw_value: None,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("0"),
+                ty: RirTypeId::from_index(0),
+            }],
         }],
-        None,
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, enum_ty, false, "subject"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, enum_ty),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![],
+                    bindings: vec![RirPatternBinding {
+                        local: RirLocalId::from_index(1),
+                        path: RirPatternPath {
+                            steps: vec![RirPatternPathStep::EnumTupleField {
+                                enum_id: RirEnumId::from_index(0),
+                                variant: RirVariantId::from_index(0),
+                                field: 0,
+                            }],
+                        },
+                        ty: RirTypeId::from_index(0),
+                        mode: RirPatternBindingMode::Owned,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::PatternPayloadWithoutVariantTest,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_pattern_payload_step_variant_shape_mismatch() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let enum_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    let binding = RirLocalId::from_index(1);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        native_path: None,
+        native_key: None,
+        core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
+        symbol: RirSymbol::new("Slot"),
+        display: RirSymbol::new("Slot"),
+        copyable: true,
+        variants: vec![RirVariant {
+            id: RirVariantId::from_index(0),
+            symbol: RirSymbol::new("Item"),
+            display: RirSymbol::new("Item"),
+            kind: RirVariantKind::Tuple,
+            raw_value: None,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("0"),
+                ty: int,
+            }],
+        }],
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, enum_ty, false, "subject"));
+    program.functions[0]
+        .locals
+        .push(rir_local(binding, int, false, "binding"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, enum_ty),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![RirPatternTest::EnumVariant {
+                        path: RirPatternPath::default(),
+                        enum_id: RirEnumId::from_index(0),
+                        variant: RirVariantId::from_index(0),
+                    }],
+                    bindings: vec![RirPatternBinding {
+                        local: binding,
+                        path: RirPatternPath {
+                            steps: vec![RirPatternPathStep::EnumStructField {
+                                enum_id: RirEnumId::from_index(0),
+                                variant: RirVariantId::from_index(0),
+                                field: 0,
+                            }],
+                        },
+                        ty: int,
+                        mode: RirPatternBindingMode::Owned,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
+}
+
+#[test]
+fn rir_verify_rejects_pattern_owned_binding_after_arm() {
+    let binding = RirLocalId::from_index(1);
+    let int = RirTypeId::from_index(0);
+    let program = root_pattern_binding_program(
+        RirPatternBindingMode::Owned,
+        false,
+        false,
+        RirTerm::None,
+        RirTerm::Return(Some(RirOperand::Place(rir_place(binding, int)))),
     );
 
-    assert_rir_error(program, RirVerifyErrorKind::MatchNotExhaustive);
+    assert_rir_error(program, RirVerifyErrorKind::UninitializedLocal(binding));
+}
+
+#[test]
+fn rir_verify_rejects_owned_pattern_binding_to_payload_ref_local() {
+    let program = root_pattern_binding_program(
+        RirPatternBindingMode::Owned,
+        true,
+        true,
+        RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+        RirTerm::None,
+    );
+
+    assert_rir_error(program, RirVerifyErrorKind::OptionPayloadRefLocalMismatch);
+}
+
+fn root_pattern_binding_program(
+    mode: RirPatternBindingMode,
+    mutable: bool,
+    payload_ref: bool,
+    block_term: RirTerm,
+    term: RirTerm,
+) -> RirProgram {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let subject = RirLocalId::from_index(0);
+    let binding = RirLocalId::from_index(1);
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, int, false, "subject"));
+    let mut binding_local = rir_local(binding, int, mutable, "binding");
+    binding_local.initialized = false;
+    binding_local.payload_ref = payload_ref;
+    program.functions[0].locals.push(binding_local);
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, int),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![],
+                    bindings: vec![RirPatternBinding {
+                        local: binding,
+                        path: RirPatternPath::default(),
+                        ty: int,
+                        mode,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: block_term,
+                },
+            }],
+        })],
+        term,
+    };
+    program
+}
+
+#[test]
+fn rir_verify_rejects_conflicting_root_pattern_variant_tests() {
+    let mut program = empty_rir_function(RirType::Int);
+    let enum_id = RirEnumId::from_index(0);
+    let enum_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    program.types.push(RirType::Enum(enum_id));
+    program.enums.push(RirEnum {
+        id: enum_id,
+        air_id: None,
+        native_path: None,
+        native_key: None,
+        core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
+        symbol: RirSymbol::new("E"),
+        display: RirSymbol::new("E"),
+        copyable: true,
+        variants: vec![
+            RirVariant {
+                id: RirVariantId::from_index(0),
+                symbol: RirSymbol::new("A"),
+                display: RirSymbol::new("A"),
+                kind: RirVariantKind::Unit,
+                raw_value: None,
+                fields: vec![],
+            },
+            RirVariant {
+                id: RirVariantId::from_index(1),
+                symbol: RirSymbol::new("B"),
+                display: RirSymbol::new("B"),
+                kind: RirVariantKind::Unit,
+                raw_value: None,
+                fields: vec![],
+            },
+        ],
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, enum_ty, false, "subject"));
+    program.functions[0].body.stmts = vec![RirStmt::PatternMatch(RirPatternMatch {
+        subject: rir_place(subject, enum_ty),
+        arms: vec![RirPatternArm {
+            alternatives: vec![RirPatternAlternative {
+                tests: vec![
+                    RirPatternTest::EnumVariant {
+                        path: RirPatternPath::default(),
+                        enum_id,
+                        variant: RirVariantId::from_index(0),
+                    },
+                    RirPatternTest::EnumVariant {
+                        path: RirPatternPath::default(),
+                        enum_id,
+                        variant: RirVariantId::from_index(1),
+                    },
+                ],
+                bindings: vec![],
+            }],
+            block: RirStructuredBlock {
+                stmts: vec![],
+                term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+            },
+        }],
+    })];
+
+    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+}
+
+#[test]
+fn rir_verify_rejects_pattern_alias_binding_after_arm() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let enum_ty = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    let binding = RirLocalId::from_index(1);
+    program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    program.enums.push(RirEnum {
+        id: RirEnumId::from_index(0),
+        air_id: None,
+        native_path: None,
+        native_key: None,
+        core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
+        symbol: RirSymbol::new("Slot"),
+        display: RirSymbol::new("Slot"),
+        copyable: true,
+        variants: vec![RirVariant {
+            id: RirVariantId::from_index(0),
+            symbol: RirSymbol::new("Value"),
+            display: RirSymbol::new("Value"),
+            kind: RirVariantKind::Tuple,
+            raw_value: None,
+            fields: vec![RirField {
+                id: RirFieldId::from_index(0),
+                symbol: RirSymbol::new("0"),
+                ty: int,
+            }],
+        }],
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, enum_ty, true, "subject"));
+    let mut binding_local = rir_local(binding, int, true, "binding");
+    binding_local.initialized = false;
+    binding_local.payload_ref = true;
+    program.functions[0].locals.push(binding_local);
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, enum_ty),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![RirPatternTest::EnumVariant {
+                        path: RirPatternPath::default(),
+                        enum_id: RirEnumId::from_index(0),
+                        variant: RirVariantId::from_index(0),
+                    }],
+                    bindings: vec![RirPatternBinding {
+                        local: binding,
+                        path: RirPatternPath {
+                            steps: vec![RirPatternPathStep::EnumTupleField {
+                                enum_id: RirEnumId::from_index(0),
+                                variant: RirVariantId::from_index(0),
+                                field: 0,
+                            }],
+                        },
+                        ty: int,
+                        mode: RirPatternBindingMode::Alias,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::None,
+                },
+            }],
+        })],
+        term: RirTerm::Return(Some(RirOperand::Place(rir_place(binding, int)))),
+    };
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::UninitializedLocal(RirLocalId::from_index(1)),
+    );
+}
+
+#[test]
+fn rir_verify_rejects_unguarded_optional_pattern_binding_path() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let opt = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    let binding = RirLocalId::from_index(1);
+    program.types.push(RirType::Option(int));
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, opt, false, "subject"));
+    program.functions[0]
+        .locals
+        .push(rir_local(binding, int, false, "binding"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, opt),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![],
+                    bindings: vec![RirPatternBinding {
+                        local: binding,
+                        path: RirPatternPath {
+                            steps: vec![RirPatternPathStep::OptionalSome],
+                        },
+                        ty: int,
+                        mode: RirPatternBindingMode::Owned,
+                    }],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::PatternPayloadWithoutVariantTest,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_unguarded_optional_pattern_test_path() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let opt = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    program.types.push(RirType::Option(int));
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(1),
+        ty: int,
+        value: RirConstValue::Int(1),
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, opt, false, "subject"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, opt),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![RirPatternTest::Literal {
+                        path: RirPatternPath {
+                            steps: vec![RirPatternPathStep::OptionalSome],
+                        },
+                        value: RirConstId::from_index(1),
+                    }],
+                    bindings: vec![],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::PatternPayloadWithoutVariantTest,
+    );
+}
+
+#[test]
+fn rir_verify_rejects_optional_pattern_test_before_guard() {
+    let mut program = empty_rir_function(RirType::Int);
+    let int = RirTypeId::from_index(0);
+    let opt = RirTypeId::from_index(1);
+    let subject = RirLocalId::from_index(0);
+    program.types.push(RirType::Option(int));
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(1),
+        ty: int,
+        value: RirConstValue::Int(1),
+    });
+    program.functions[0]
+        .locals
+        .push(rir_local(subject, opt, false, "subject"));
+    program.functions[0].body = RirStructuredBlock {
+        stmts: vec![RirStmt::PatternMatch(RirPatternMatch {
+            subject: rir_place(subject, opt),
+            arms: vec![RirPatternArm {
+                alternatives: vec![RirPatternAlternative {
+                    tests: vec![
+                        RirPatternTest::Literal {
+                            path: RirPatternPath {
+                                steps: vec![RirPatternPathStep::OptionalSome],
+                            },
+                            value: RirConstId::from_index(1),
+                        },
+                        RirPatternTest::OptionalSome {
+                            path: RirPatternPath::default(),
+                        },
+                    ],
+                    bindings: vec![],
+                }],
+                block: RirStructuredBlock {
+                    stmts: vec![],
+                    term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+                },
+            }],
+        })],
+        term: RirTerm::None,
+    };
+
+    assert_rir_error(
+        program,
+        RirVerifyErrorKind::PatternPayloadWithoutVariantTest,
+    );
 }
 
 #[test]
@@ -15766,61 +16261,6 @@ fn dataref_access_place(local: usize, ty: usize) -> RirPlace {
         vec![],
         RirTypeId::from_index(ty),
     )
-}
-
-fn enum_match_rir(
-    arms: Vec<RirEnumMatchArm>,
-    else_block: Option<RirStructuredBlock>,
-) -> RirProgram {
-    let mut program = empty_rir_function(RirType::Enum(RirEnumId::from_index(0)));
-    program.consts.clear();
-    program.enums.push(RirEnum {
-        id: RirEnumId::from_index(0),
-        air_id: None,
-        native_path: None,
-        native_key: None,
-        core: None,
-        repr: rir::RirEnumRepr::Adt,
-        raw_type: None,
-        symbol: RirSymbol::new("E"),
-        display: RirSymbol::new("E"),
-        copyable: true,
-        variants: vec![
-            RirVariant {
-                id: RirVariantId::from_index(0),
-                symbol: RirSymbol::new("A"),
-                display: RirSymbol::new("A"),
-                kind: RirVariantKind::Unit,
-                raw_value: None,
-                fields: vec![],
-            },
-            RirVariant {
-                id: RirVariantId::from_index(1),
-                symbol: RirSymbol::new("B"),
-                display: RirSymbol::new("B"),
-                kind: RirVariantKind::Unit,
-                raw_value: None,
-                fields: vec![],
-            },
-        ],
-    });
-    program.functions[0].locals.push(RirLocal {
-        id: RirLocalId::from_index(0),
-        ty: RirTypeId::from_index(0),
-        mutable: false,
-        symbol: RirSymbol::new("v0"),
-        initialized: true,
-        payload_ref: false,
-    });
-    program.functions[0].body = RirStructuredBlock {
-        stmts: vec![RirStmt::EnumMatch(RirEnumMatch {
-            discr: RirPlace::local(RirLocalId::from_index(0), vec![], RirTypeId::from_index(0)),
-            arms,
-            else_block,
-        })],
-        term: RirTerm::Unreachable,
-    };
-    program
 }
 
 fn valid_tuple_rvalue() -> RirRValue {

@@ -384,6 +384,59 @@ impl ProfileCx<'_> {
         }
     }
 
+    fn pattern_alias_subject_supported(plan: &PlaceAccessPlan) -> bool {
+        plan.payload_alias_direct_place()
+    }
+
+    fn pattern_match_has_alias_binding(match_: &air::AirPatternMatch) -> bool {
+        match_.arms.iter().any(|arm| {
+            arm.alternatives.iter().any(|alternative| {
+                alternative
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.mode == air::AirPatternBindingMode::Alias)
+            })
+        })
+    }
+
+    fn pattern_alternative_supported(alternative: &air::AirPatternAlternative) -> bool {
+        alternative.tests.iter().all(|test| match test {
+            air::AirPatternTest::Literal { path, .. }
+            | air::AirPatternTest::Nil { path }
+            | air::AirPatternTest::OptionalSome { path } => Self::pattern_path_supported(path),
+            air::AirPatternTest::EnumVariant { path, .. } => path.steps.is_empty(),
+        }) && alternative
+            .bindings
+            .iter()
+            .all(|binding| match binding.mode {
+                air::AirPatternBindingMode::Owned => Self::pattern_path_supported(&binding.path),
+                air::AirPatternBindingMode::Alias => {
+                    Self::pattern_alias_path_supported(&binding.path)
+                }
+            })
+    }
+
+    fn pattern_alias_path_supported(path: &air::AirPatternPath) -> bool {
+        matches!(
+            path.steps.as_slice(),
+            [air::AirPatternPathStep::EnumTupleField { .. }
+                | air::AirPatternPathStep::EnumStructField { .. }]
+        )
+    }
+
+    fn pattern_path_supported(path: &air::AirPatternPath) -> bool {
+        path.steps
+            .iter()
+            .enumerate()
+            .all(|(index, step)| match step {
+                air::AirPatternPathStep::Field(_)
+                | air::AirPatternPathStep::TupleField(_)
+                | air::AirPatternPathStep::OptionalSome => true,
+                air::AirPatternPathStep::EnumTupleField { .. }
+                | air::AirPatternPathStep::EnumStructField { .. } => index == 0,
+            })
+    }
+
     fn check_air_block(&mut self, function: FunctionId, body: &air::AirBlock) {
         for (index, stmt) in body.stmts.iter().enumerate() {
             let site = ProfileSite::Statement(function, index);
@@ -420,13 +473,29 @@ impl ProfileCx<'_> {
                         self.check_air_block(function, else_block);
                     }
                 }
-                air::AirStmt::EnumMatch(match_) => {
-                    self.check_place(site, &match_.discr);
-                    for arm in &match_.arms {
-                        self.check_air_block(function, &arm.block);
+                air::AirStmt::PatternMatch(match_) => {
+                    self.check_place(site, &match_.subject);
+                    if Self::pattern_match_has_alias_binding(match_) {
+                        match self.access().plan(
+                            function,
+                            PlaceAccessIntent::PayloadAlias,
+                            &match_.subject,
+                        ) {
+                            Ok(plan) if Self::pattern_alias_subject_supported(&plan) => {}
+                            Ok(_) | Err(_) => {
+                                self.push(site, ProfileErrorKind::UnsupportedPlaceProjection);
+                            }
+                        }
                     }
-                    if let Some(else_block) = &match_.else_block {
-                        self.check_air_block(function, else_block);
+                    for arm in &match_.arms {
+                        if arm
+                            .alternatives
+                            .iter()
+                            .any(|alternative| !Self::pattern_alternative_supported(alternative))
+                        {
+                            self.push(site, ProfileErrorKind::UnsupportedRValue);
+                        }
+                        self.check_air_block(function, &arm.block);
                     }
                 }
                 air::AirStmt::OptionalMatch(match_) => {
