@@ -3,8 +3,8 @@ use std::path::Path;
 use super::{
     CaptureCellRequirementMap, CompileWarning, ImportId, ImportRecord, IterRuntimeCheckKind,
     IterRuntimeCheckMap, LambdaCaptureMap, LambdaEscapeMap, ModuleScope, NominalKey,
-    SemanticDeclarations, SemanticFactMaps, TypeError, decls::DeclarationIndex,
-    infer::SourceExprTypes, semantic_use::map_delta,
+    SemanticDeclarations, SemanticFactMaps, TypeError, contract_surface::ContractSurfaceSchemas,
+    decls::DeclarationIndex, infer::SourceExprTypes, semantic_use::map_delta,
 };
 use crate::{
     ast::{ExprId, Visibility},
@@ -18,6 +18,7 @@ use crate::{
 pub(crate) struct SemanticProgram {
     pub(crate) facts: SemanticFactMaps,
     pub(crate) declaration_facts: SemanticDeclarations,
+    pub(crate) contract_surfaces: ContractSurfaceSchemas,
     pub(crate) declarations: DeclarationIndex,
     pub(crate) externs: ExternCatalog,
 }

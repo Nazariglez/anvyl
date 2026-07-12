@@ -124,20 +124,25 @@ fn collect_contract_ref_requirements(
     requirements: &mut Vec<ContractRequirementSchema>,
 ) -> Result<(), ContractSetError> {
     match contract {
-        ContractRef::Named { .. } => {
+        ContractRef::Named {
+            qualifier,
+            name,
+            origin,
+        } => {
             let resolver = TypeRefResolver::module_only(decls);
             let key = resolver
-                .resolve_contract_ref(module, contract)
+                .resolve_contract_name_with_import(module, *qualifier, *name, origin.as_ref())
+                .map(|(key, _)| key)
                 .map_err(|_| ContractSetError::UnknownContract)?;
             let schema = decls
                 .contract(&key)
                 .ok_or(ContractSetError::UnknownContract)?;
-            merge_effective_requirements(requirements, &schema.requirements)
+            merge_canonical_requirements(decls, requirements, &schema.requirements)
                 .map_err(|req| ContractSetError::ConflictingRequirement(req.name))
         }
         ContractRef::Anonymous(surface) => {
             let anonymous = anonymous_requirements(surface);
-            merge_effective_requirements(requirements, &anonymous)
+            merge_canonical_requirements(decls, requirements, &anonymous)
                 .map_err(|req| ContractSetError::ConflictingRequirement(req.name))
         }
         ContractRef::Intersection(contracts) => {
@@ -184,13 +189,36 @@ pub(super) fn merge_effective_requirements(
     target: &mut Vec<ContractRequirementSchema>,
     source: &[ContractRequirementSchema],
 ) -> Result<(), Box<ContractRequirementSchema>> {
-    for req in source {
-        if let Some(prev) = target.iter().find(|prev| prev.name == req.name) {
-            if !same_requirement_signature(prev, req) {
-                return Err(Box::new(req.clone()));
+    merge_requirements(target, source, same_requirement_signature)
+}
+
+fn merge_canonical_requirements(
+    decls: &DeclarationIndex,
+    target: &mut Vec<ContractRequirementSchema>,
+    source: &[ContractRequirementSchema],
+) -> Result<(), Box<ContractRequirementSchema>> {
+    merge_requirements(target, source, |left, right| {
+        let left = contract_set_key(std::slice::from_ref(left));
+        let right = contract_set_key(std::slice::from_ref(right));
+        contract_set_projection(decls, &left, &right).is_some()
+    })
+}
+
+fn merge_requirements(
+    target: &mut Vec<ContractRequirementSchema>,
+    source: &[ContractRequirementSchema],
+    same: impl Fn(&ContractRequirementSchema, &ContractRequirementSchema) -> bool,
+) -> Result<(), Box<ContractRequirementSchema>> {
+    for requirement in source {
+        match target
+            .iter()
+            .find(|candidate| candidate.name == requirement.name)
+        {
+            Some(candidate) if !same(candidate, requirement) => {
+                return Err(Box::new(requirement.clone()));
             }
-        } else {
-            target.push(req.clone());
+            Some(_) => {}
+            None => target.push(requirement.clone()),
         }
     }
     Ok(())
@@ -206,6 +234,14 @@ pub(crate) fn contract_set_key_for_ref(
         .map(|set| set.key)
 }
 
+pub(crate) fn contract_set_projection(
+    decls: &DeclarationIndex,
+    source: &ContractSetKey,
+    target: &ContractSetKey,
+) -> Option<Vec<usize>> {
+    super::contract_surface::canonical_projection(decls, source, target)
+}
+
 pub(crate) fn contract_ref_subset(
     decls: &DeclarationIndex,
     module: &super::ModuleScope,
@@ -218,11 +254,7 @@ pub(crate) fn contract_ref_subset(
     ) else {
         return false;
     };
-    target
-        .key
-        .requirements
-        .iter()
-        .all(|req| source.key.requirements.contains(req))
+    contract_set_projection(decls, &source.key, &target.key).is_some()
 }
 
 pub(super) fn match_contract(
@@ -418,7 +450,10 @@ fn signature_error(
         });
     }
     for (index, (expected, found)) in requirement.params.iter().zip(&candidate.params).enumerate() {
-        if expected != found {
+        let compatible = expected.ty == found.ty
+            && expected.mutable == found.mutable
+            && expected.escape == found.escape;
+        if !compatible {
             return Some(RequirementError::Param {
                 index,
                 expected: Box::new(expected.clone()),
@@ -688,10 +723,19 @@ fn resolve_included_contracts(
     lint_events: &mut Vec<LintEvent>,
 ) -> Vec<ContractKey> {
     match include {
-        ContractRef::Named { .. } => {
+        ContractRef::Named {
+            qualifier,
+            name,
+            origin,
+        } => {
             let resolved = {
                 let resolver = TypeRefResolver::module_only(decls);
-                resolver.resolve_contract_ref_with_import(&owner.module, include)
+                resolver.resolve_contract_name_with_import(
+                    &owner.module,
+                    *qualifier,
+                    *name,
+                    origin.as_ref(),
+                )
             };
             match resolved {
                 Ok((key, import)) => {

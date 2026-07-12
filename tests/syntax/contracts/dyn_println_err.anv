@@ -1,5 +1,6 @@
 // @mode: check
-// @expect: success
+// @expect: error
+// @contains: dynamic values cannot be formatted
 
 contract Action {
     fn act(self);
@@ -11,6 +12,5 @@ struct Actor {
 
 fn main() {
     let action: dyn Action = Actor {};
-
     println(action);
 }

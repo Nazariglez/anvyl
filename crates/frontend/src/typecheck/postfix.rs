@@ -1832,7 +1832,7 @@ fn check_dyn_method_call(
     let ret = TypeChecker::type_handle(&requirement.ret.ty());
     let _ = constrain_expected_return(call.span, ret.clone(), expected, tc);
     if !failed {
-        tc.record_resolved_dyn_call(
+        tc.record_dyn_call(
             tc.current_expr_site(call_id),
             &tc.current_expr_site(receiver.id),
             contract.clone(),

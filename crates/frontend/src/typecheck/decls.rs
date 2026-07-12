@@ -1849,6 +1849,8 @@ impl DeclTypeUseKind {
             self,
             Self::Field
                 | Self::EnumVariant
+                | Self::ContractParam
+                | Self::ContractReturn
                 | Self::AliasTarget
                 | Self::Const
                 | Self::Global
@@ -5041,6 +5043,9 @@ mod tests {
             name: name.to_string(),
             doc: None,
             rep: ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: Some(false),
             fields: vec![],
             variants: vec![],
             init: None,

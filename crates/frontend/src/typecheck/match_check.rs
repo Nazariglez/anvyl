@@ -1,6 +1,7 @@
 use super::{
     PatternBindMode, PatternContext, PlaceAccess, TypeChecker, TypeError, downcast,
     pattern::{self, PatternCheckResult, PatternOutcome, PatternPlace},
+    semantic_use::{CheckedDynMatchArm, CheckedDynMatchBinding, CheckedDynMatchFallback},
 };
 use crate::{
     ast::{ExprId, Ident, Match, MatchArmHead, MatchArmNode, Type},
@@ -57,6 +58,17 @@ pub(super) fn check_dynamic_source(
     node: &Match,
     tc: &mut TypeChecker,
 ) -> downcast::CheckedDowncastSource {
+    if let Some(local) = tc.direct_local_id(&node.scrutinee) {
+        tc.record_local_use(
+            node.scrutinee.node.id,
+            local,
+            if node.access.is_ref() {
+                super::LocalUseMode::MutBorrow
+            } else {
+                super::LocalUseMode::Read
+            },
+        );
+    }
     let policy = if node.access.is_ref() {
         downcast::DowncastSourcePolicy::MutablePlace
     } else {
@@ -75,6 +87,8 @@ pub(super) fn with_dynamic_arm<R>(
     source: &downcast::CheckedDowncastSource,
     scrutinee_id: ExprId,
     targets: &mut Vec<Type>,
+    plans: &mut Vec<CheckedDynMatchArm>,
+    fallback: &mut Option<CheckedDynMatchFallback>,
     tc: &mut TypeChecker,
     check_body: impl FnOnce(&mut TypeChecker) -> R,
 ) -> R {
@@ -103,16 +117,23 @@ pub(super) fn with_dynamic_arm<R>(
                     );
                 }
             }
-            match (dyn_arm.node.binding, target, source.valid) {
+            let binding = match (dyn_arm.node.binding, target, source.valid) {
                 (Some(name), Some(target), true) => {
-                    define_downcast_binding(name, &target, source, tc);
+                    Some(define_downcast_binding(name, &target, source, tc))
                 }
-                (Some(name), _, _) => define_recovery_binding(name, tc),
-                (None, _, _) => {}
-            }
+                (Some(name), _, _) => Some(define_recovery_binding(name, tc)),
+                (None, _, _) => None,
+            };
+            plans.push(CheckedDynMatchArm {
+                downcast: dyn_arm.node.id,
+                binding,
+            });
         }
-        MatchArmHead::DynFallback(Some(name)) => define_fallback_binding(*name, source, tc),
-        MatchArmHead::DynFallback(None) | MatchArmHead::Pattern(_) => {}
+        MatchArmHead::DynFallback(binding) => {
+            let binding = binding.map(|name| define_fallback_binding(name, source, tc));
+            *fallback = Some(CheckedDynMatchFallback { binding });
+        }
+        MatchArmHead::Pattern(_) => {}
     }
     let body = check_body(tc);
     tc.pop_scope();
@@ -138,44 +159,50 @@ fn define_downcast_binding(
     target: &Type,
     source: &downcast::CheckedDowncastSource,
     tc: &mut TypeChecker,
-) {
+) -> CheckedDynMatchBinding {
     let handle = TypeChecker::type_handle(target);
     let Some(alias) = source.alias.as_ref() else {
-        tc.define_pattern_binding_from_handle(name, &handle, false, None);
-        return;
+        return dyn_binding(tc.define_pattern_binding_from_handle(name, &handle, false, None));
     };
-    tc.define_ref_alias_binding_from_handle(
+    dyn_binding(tc.define_ref_alias_binding_from_handle(
         name,
         &handle,
         alias.target(PlaceAccess::Mutable),
         PatternContext::Match,
         None,
-    );
+    ))
 }
 
 fn define_fallback_binding(
     name: Ident,
     source: &downcast::CheckedDowncastSource,
     tc: &mut TypeChecker,
-) {
+) -> CheckedDynMatchBinding {
     if !source.valid {
-        define_recovery_binding(name, tc);
+        define_recovery_binding(name, tc)
     } else if let Some(alias) = source.alias.as_ref() {
-        tc.define_ref_alias_binding_from_handle(
+        dyn_binding(tc.define_ref_alias_binding_from_handle(
             name,
             &source.handle,
             alias.target(alias.access),
             PatternContext::Match,
             None,
-        );
+        ))
     } else {
-        tc.define_pattern_binding_from_handle(name, &source.handle, false, None);
+        dyn_binding(tc.define_pattern_binding_from_handle(name, &source.handle, false, None))
     }
 }
 
-fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) {
+fn define_recovery_binding(name: Ident, tc: &mut TypeChecker) -> CheckedDynMatchBinding {
     let handle = TypeChecker::type_handle(&Type::Infer);
-    tc.define_pattern_binding_from_handle(name, &handle, false, None);
+    dyn_binding(tc.define_pattern_binding_from_handle(name, &handle, false, None))
+}
+
+fn dyn_binding(local: super::DefinedLocal) -> CheckedDynMatchBinding {
+    CheckedDynMatchBinding {
+        local: local.type_id,
+        binding_id: local.binding_id,
+    }
 }
 
 fn push_duplicate_target(target: &Type, span: Span, tc: &mut TypeChecker) {

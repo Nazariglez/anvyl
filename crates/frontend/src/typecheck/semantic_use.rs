@@ -5,6 +5,9 @@ use std::{
 
 use super::{
     ContractSetKey, GenericArgs, MethodMode, MethodReceiver, ModuleScope, Type, const_eval,
+    contract_surface::{
+        ContractSlotId, ContractSurfaceId, ContractSurfaceSchemas, ContractWeakening,
+    },
     decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_key_for_type},
     infer::{SemanticLocalId, TypeHandle},
     type_ops::type_has_unfinished_facts,
@@ -29,6 +32,7 @@ pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ExpectedProjectionMap = HashMap<ExprId, ExpectedProjectionFact>;
 pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
+pub(crate) type ContractWitnessStructuralKeyMap = HashMap<WitnessId, ContractWitnessStructuralKey>;
 pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
 pub(crate) type DynWeakeningMap = HashMap<ExprId, DynWeakeningFact>;
 pub(crate) type DynCallMap = HashMap<ExprId, DynCallFact>;
@@ -41,6 +45,33 @@ pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFac
 pub(crate) type CaptureCellRequirementMap = HashMap<BindingId, CaptureCellRequirementFact>;
 pub(crate) type IterRuntimeCheckMap = HashMap<ExprId, IterRuntimeCheckFact>;
 pub(crate) type CheckedMatchPlanMap = HashMap<ExprId, CheckedMatchPlan>;
+pub(crate) type CheckedDynMatchPlanMap = HashMap<ExprId, CheckedDynMatchPlan>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedDynMatchPlan {
+    pub(crate) expr: ExprId,
+    pub(crate) source: ExprId,
+    pub(crate) access: CheckedMatchAccess,
+    pub(crate) arms: Vec<CheckedDynMatchArm>,
+    pub(crate) fallback: CheckedDynMatchFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedDynMatchArm {
+    pub(crate) downcast: ExprId,
+    pub(crate) binding: Option<CheckedDynMatchBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckedDynMatchBinding {
+    pub(crate) local: SemanticLocalId,
+    pub(crate) binding_id: BindingId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedDynMatchFallback {
+    pub(crate) binding: Option<CheckedDynMatchBinding>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckedMatchPlan {
@@ -538,7 +569,7 @@ impl SemanticDeclarations {
     }
 }
 
-fn type_contains_dyn_hole(ty: &Type) -> bool {
+pub(super) fn type_contains_dyn_hole(ty: &Type) -> bool {
     struct DynHoleVisitor;
 
     impl TypeVisitor for DynHoleVisitor {
@@ -652,13 +683,16 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) expected_projections: ExpectedProjectionMap,
     pub(crate) dyn_conversions: DynConversionMap,
     pub(crate) dyn_weakenings: DynWeakeningMap,
+    pub(super) pending_dyn_weakenings: HashMap<ExprId, PendingDynWeakeningFact>,
     pub(crate) dyn_calls: DynCallMap,
+    pub(super) pending_dyn_calls: HashMap<ExprId, PendingDynCallFact>,
     pub(crate) dyn_downcasts: DynDowncastMap,
     pub(crate) user_cast_conversions: UserCastConversionMap,
     pub(crate) global_accesses: GlobalAccessMap,
     pub(crate) stringifies: StringifyMap,
     pub(crate) iter_runtime_checks: IterRuntimeCheckMap,
     pub(crate) match_patterns: CheckedMatchPlanMap,
+    pub(crate) dyn_matches: CheckedDynMatchPlanMap,
     pub(crate) locals: LocalFacts,
 }
 
@@ -676,7 +710,10 @@ impl SemanticBodyFacts {
         self.expected_projections.extend(facts.expected_projections);
         self.dyn_conversions.extend(facts.dyn_conversions);
         self.dyn_weakenings.extend(facts.dyn_weakenings);
+        self.pending_dyn_weakenings
+            .extend(facts.pending_dyn_weakenings);
         self.dyn_calls.extend(facts.dyn_calls);
+        self.pending_dyn_calls.extend(facts.pending_dyn_calls);
         self.dyn_downcasts.extend(facts.dyn_downcasts);
         self.user_cast_conversions
             .extend(facts.user_cast_conversions);
@@ -684,6 +721,7 @@ impl SemanticBodyFacts {
         self.stringifies.extend(facts.stringifies);
         self.iter_runtime_checks.extend(facts.iter_runtime_checks);
         self.match_patterns.extend(facts.match_patterns);
+        self.dyn_matches.extend(facts.dyn_matches);
     }
 
     pub(crate) fn validate(&self) {
@@ -696,6 +734,9 @@ impl SemanticBodyFacts {
         }
         for (expr_id, plan) in &self.match_patterns {
             plan.validate(*expr_id, false);
+        }
+        for (expr_id, plan) in &self.dyn_matches {
+            debug_assert_eq!(*expr_id, plan.expr);
         }
         for (expr_id, fact) in &self.function_values {
             debug_assert_eq!(*expr_id, fact.expr);
@@ -740,7 +781,13 @@ impl SemanticBodyFacts {
         for (expr_id, fact) in &self.dyn_weakenings {
             debug_assert_eq!(*expr_id, fact.expr_id);
         }
+        for (expr_id, fact) in &self.pending_dyn_weakenings {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+        }
         for (expr_id, fact) in &self.dyn_calls {
+            debug_assert_eq!(*expr_id, fact.call_id);
+        }
+        for (expr_id, fact) in &self.pending_dyn_calls {
             debug_assert_eq!(*expr_id, fact.call_id);
         }
         for (expr_id, fact) in &self.dyn_downcasts {
@@ -784,6 +831,8 @@ impl SemanticBodyFacts {
         }
         self.validate_const_values(true);
         self.locals.validate_finished();
+        debug_assert!(self.pending_dyn_weakenings.is_empty());
+        debug_assert!(self.pending_dyn_calls.is_empty());
         for fact in self.function_values.values() {
             debug_assert!(matches!(fact.ty, Type::Func { .. }));
             debug_assert!(!type_has_unfinished_facts(&fact.ty));
@@ -849,6 +898,7 @@ impl SemanticBodyFacts {
 pub(crate) struct SemanticFactMaps {
     pub(crate) bodies: HashMap<BodyInstanceKey, SemanticBodyFacts>,
     pub(crate) contract_witnesses: ContractWitnessMap,
+    pub(crate) witness_structural_keys: ContractWitnessStructuralKeyMap,
     witness_keys: HashMap<ContractWitnessKey, WitnessId>,
     next_witness_id: u32,
 }
@@ -999,6 +1049,14 @@ impl SemanticFactMaps {
             .insert(site.expr, plan);
     }
 
+    pub(crate) fn record_dyn_match_plan(
+        &mut self,
+        site: SemanticExprSite,
+        plan: CheckedDynMatchPlan,
+    ) {
+        self.body_mut(site.body).dyn_matches.insert(site.expr, plan);
+    }
+
     pub(crate) fn record_function_value(
         &mut self,
         site: SemanticExprSite,
@@ -1086,14 +1144,20 @@ impl SemanticFactMaps {
             .insert(fact.expr_id, fact);
     }
 
-    pub(crate) fn record_dyn_weakening(&mut self, body: BodyInstanceKey, fact: DynWeakeningFact) {
+    pub(super) fn record_dyn_weakening(
+        &mut self,
+        body: BodyInstanceKey,
+        fact: PendingDynWeakeningFact,
+    ) {
         self.body_mut(body)
-            .dyn_weakenings
+            .pending_dyn_weakenings
             .insert(fact.expr_id, fact);
     }
 
-    pub(crate) fn record_dyn_call(&mut self, body: BodyInstanceKey, fact: DynCallFact) {
-        self.body_mut(body).dyn_calls.insert(fact.call_id, fact);
+    pub(super) fn record_dyn_call(&mut self, body: BodyInstanceKey, fact: PendingDynCallFact) {
+        self.body_mut(body)
+            .pending_dyn_calls
+            .insert(fact.call_id, fact);
     }
 
     pub(crate) fn record_dyn_downcast(&mut self, body: BodyInstanceKey, fact: DynDowncastFact) {
@@ -1166,9 +1230,131 @@ impl SemanticFactMaps {
         }
     }
 
+    pub(crate) fn resolve_witnesses(&mut self, surfaces: &ContractSurfaceSchemas) {
+        let mut ids = self.contract_witnesses.keys().copied().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        let mut canonical = HashMap::new();
+        let mut remap = HashMap::new();
+        let mut witnesses = HashMap::new();
+        let mut structural_keys = HashMap::new();
+
+        for id in ids {
+            let witness = &self.contract_witnesses[&id];
+            let surface = surfaces
+                .id_for_set(&witness.key.contract)
+                .expect("contract witness must have a canonical surface");
+            let schema = surfaces.surface(surface).expect("surface exists");
+            debug_assert_eq!(witness.key.slots.len(), schema.slots.len());
+            for (slot, canonical) in witness.key.slots.iter().zip(&schema.slots) {
+                debug_assert_eq!(slot.name, canonical.name);
+                debug_assert_eq!(slot.required_receiver, canonical.receiver);
+            }
+            let key = ContractWitnessStructuralKey {
+                concrete_ty: witness.key.concrete_ty.clone(),
+                surface,
+                slots: witness
+                    .key
+                    .slots
+                    .iter()
+                    .map(|slot| slot.target.clone())
+                    .collect(),
+            };
+            if let Some(canonical_id) = canonical.get(&key) {
+                remap.insert(id, *canonical_id);
+            } else {
+                canonical.insert(key.clone(), id);
+                witnesses.insert(id, witness.clone());
+                structural_keys.insert(id, key);
+            }
+        }
+
+        for body in self.bodies.values_mut() {
+            for conversion in body.dyn_conversions.values_mut() {
+                if let Some(witness) = remap.get(&conversion.witness) {
+                    conversion.witness = *witness;
+                }
+            }
+        }
+        self.contract_witnesses = witnesses;
+        self.witness_structural_keys = structural_keys;
+        self.witness_keys.clear();
+    }
+
+    pub(crate) fn resolve_dyn_weakenings(&mut self, surfaces: &ContractSurfaceSchemas) {
+        for body in self.bodies.values_mut() {
+            let pending = std::mem::take(&mut body.pending_dyn_weakenings);
+            for (expr_id, fact) in pending {
+                match surfaces
+                    .resolve_weakening(&fact.source, &fact.target, &fact.target_to_source)
+                    .expect("dynamic weakening must have a canonical projection")
+                {
+                    ContractWeakening::Identity => {}
+                    ContractWeakening::Projection {
+                        source,
+                        target,
+                        target_to_source,
+                    } => {
+                        body.dyn_weakenings.insert(
+                            expr_id,
+                            DynWeakeningFact {
+                                expr_id: fact.expr_id,
+                                source,
+                                target,
+                                target_to_source,
+                                span: fact.span,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resolve_dyn_calls(&mut self, surfaces: &ContractSurfaceSchemas) {
+        for body in self.bodies.values_mut() {
+            let pending = std::mem::take(&mut body.pending_dyn_calls);
+            for (call_id, fact) in pending {
+                let (surface, slot) = surfaces
+                    .call_target(&fact.contract, fact.method)
+                    .expect("resolved dynamic call must have a canonical slot");
+                body.dyn_calls.insert(
+                    call_id,
+                    DynCallFact {
+                        call_id: fact.call_id,
+                        receiver_id: fact.receiver_id,
+                        surface,
+                        slot,
+                        arg_count: fact.arg_count,
+                        requires_mutable: fact.requires_mutable,
+                        span: fact.span,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn resolve_dyn_downcasts(&mut self, surfaces: &ContractSurfaceSchemas) {
+        for body in self.bodies.values_mut() {
+            for fact in body.dyn_downcasts.values_mut() {
+                let DynDowncastSource::Pending(source) = &fact.source else {
+                    continue;
+                };
+                let surface = surfaces
+                    .id_for_set(source)
+                    .expect("dynamic downcast must have a canonical surface");
+                fact.source = DynDowncastSource::Resolved(surface);
+            }
+        }
+    }
+
     pub(crate) fn validate_finished(&self) {
+        debug_assert_eq!(
+            self.contract_witnesses.len(),
+            self.witness_structural_keys.len()
+        );
         for (witness_id, fact) in &self.contract_witnesses {
             debug_assert_eq!(*witness_id, fact.id);
+            debug_assert!(self.witness_structural_keys.contains_key(witness_id));
         }
         #[cfg(debug_assertions)]
         let binding_defs = self
@@ -1498,6 +1684,13 @@ pub(crate) struct ContractWitnessKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ContractWitnessStructuralKey {
+    pub(crate) concrete_ty: Type,
+    pub(crate) surface: ContractSurfaceId,
+    pub(crate) slots: Vec<WitnessSlotTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WitnessSlot {
     pub(crate) name: Ident,
     pub(crate) required_receiver: MethodReceiver,
@@ -1539,30 +1732,57 @@ pub(crate) struct DynConversionFact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DynWeakeningFact {
     pub(crate) expr_id: ExprId,
-    pub(crate) source: ContractSetKey,
-    pub(crate) target: ContractSetKey,
+    pub(crate) source: ContractSurfaceId,
+    pub(crate) target: ContractSurfaceId,
+    pub(crate) target_to_source: Vec<ContractSlotId>,
     pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingDynWeakeningFact {
+    pub(super) expr_id: ExprId,
+    pub(super) source: ContractSetKey,
+    pub(super) target: ContractSetKey,
+    pub(super) target_to_source: Vec<usize>,
+    pub(super) span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DynCallFact {
     pub(crate) call_id: ExprId,
     pub(crate) receiver_id: ExprId,
-    pub(crate) contract: ContractSetKey,
-    pub(crate) method: Ident,
+    pub(crate) surface: ContractSurfaceId,
+    pub(crate) slot: ContractSlotId,
     pub(crate) arg_count: usize,
     pub(crate) requires_mutable: bool,
     pub(crate) span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingDynCallFact {
+    pub(super) call_id: ExprId,
+    pub(super) receiver_id: ExprId,
+    pub(super) contract: ContractSetKey,
+    pub(super) method: Ident,
+    pub(super) arg_count: usize,
+    pub(super) requires_mutable: bool,
+    pub(super) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DynDowncastFact {
     pub(crate) expr_id: ExprId,
     pub(crate) source_id: ExprId,
-    pub(crate) source: ContractSetKey,
+    pub(crate) source: DynDowncastSource,
     pub(crate) target: Type,
     pub(crate) mutable: bool,
     pub(crate) span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DynDowncastSource {
+    Pending(ContractSetKey),
+    Resolved(ContractSurfaceId),
 }
 
 impl CallTarget {

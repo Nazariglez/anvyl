@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'name' has an incompatible return type
+
+contract Named {
+    fn name(self) -> string;
+}
+
+struct Enemy {
+    fn name(self) -> int { 1 }
+}
+
+fn main() {
+    let item: dyn Named = Enemy {};
+}

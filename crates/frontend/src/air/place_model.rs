@@ -114,6 +114,15 @@ pub fn root_info(
                 storage: Some(PlaceStorage::ScopedBorrow(borrow)),
             })
         }
+        PlaceRoot::DynBorrowParam(id) => {
+            let decl = program.dyn_borrow_params.get(id.index())?;
+            (decl.owner == function).then_some(PlaceRootInfo {
+                root,
+                ty: decl.ty,
+                mutability: Mutability::Mutable,
+                storage: None,
+            })
+        }
         PlaceRoot::CaptureCell(cell) => {
             let decl = program.capture_cells.get(cell.index())?;
             Some(PlaceRootInfo {

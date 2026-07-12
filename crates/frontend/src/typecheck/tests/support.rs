@@ -1,7 +1,7 @@
 use std::collections::hash_map::{Iter, Values};
 
 use crate::{
-    ast::{ContractRef, ExprId, Ident, NominalKind, Type, TypeVisitor},
+    ast::{ContractRef, ExprId, Ident, NominalKind, Type},
     diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
@@ -9,10 +9,10 @@ use crate::{
     test_support::{parse_program, resolved_modules_with_core_option, resolved_with_core_option},
     typecheck::{
         self, BodyInstanceKey, CallMap, CallableId, CallableInstanceKey, CaptureCellRequirementMap,
-        ConstValueMap, ContractWitnessMap, DeprecatedUseKind, DynCallMap, DynConversionMap,
-        DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact, ExpectedProjectionMap,
-        ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap, MemberPathMap,
-        SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
+        ConstValueMap, ContractWitnessMap, ContractWitnessStructuralKeyMap, DeprecatedUseKind,
+        DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact,
+        ExpectedProjectionMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
+        MemberPathMap, SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
         decls::DeclarationIndex,
     },
 };
@@ -92,6 +92,35 @@ impl TypecheckTestResult {
 
     pub(crate) fn contract_witnesses(&self) -> &ContractWitnessMap {
         &self.program.facts.contract_witnesses
+    }
+
+    pub(crate) fn witness_structural_keys(&self) -> &ContractWitnessStructuralKeyMap {
+        &self.program.facts.witness_structural_keys
+    }
+
+    pub(crate) fn contract_surface_id(
+        &self,
+        contract: &ContractRef,
+    ) -> typecheck::contract_surface::ContractSurfaceId {
+        self.program
+            .contract_surfaces
+            .id_for_ref(
+                &self.program.declarations,
+                &typecheck::ModuleScope::Root,
+                contract,
+            )
+            .unwrap_or_else(|| panic!("contract surface should resolve: {contract:?}"))
+    }
+
+    pub(crate) fn contract_surface(
+        &self,
+        contract: &ContractRef,
+    ) -> &typecheck::contract_surface::ContractSurfaceSchema {
+        let id = self.contract_surface_id(contract);
+        self.program
+            .contract_surfaces
+            .surface(id)
+            .expect("contract surface should exist")
     }
 
     pub(crate) fn dyn_conversions(&self) -> &DynConversionMap {
@@ -274,22 +303,9 @@ fn assert_closed_type(ty: &Type, label: &str) {
         "{label} type contains unresolved const: {ty:?}"
     );
     assert!(
-        !type_contains_dyn_hole(ty),
+        !typecheck::semantic_use::type_contains_dyn_hole(ty),
         "{label} type contains inferred dynamic contract: {ty:?}"
     );
-}
-
-fn type_contains_dyn_hole(ty: &Type) -> bool {
-    struct DynHoleVisitor;
-
-    impl TypeVisitor for DynHoleVisitor {
-        fn visit_contract_ref_leaf(&mut self, contract: &ContractRef) -> bool {
-            matches!(contract, ContractRef::Infer | ContractRef::Hole(_))
-        }
-    }
-
-    let mut visitor = DynHoleVisitor;
-    visitor.visit_type(ty)
 }
 
 pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
@@ -308,6 +324,17 @@ pub(crate) fn output(source: &str) -> typecheck::TypecheckOutput {
 pub(crate) fn check(source: &str) -> Result<TypecheckTestResult, Vec<TypeError>> {
     let program = parse_program(source);
     let resolved = resolved_with_core_option(&program);
+    let raw_externs =
+        externs::prepare_raw_externs(RawExterns::default(), &program, &resolved).unwrap();
+    check_with_raw_externs(&program, &resolved, raw_externs)
+}
+
+pub(crate) fn check_modules(
+    source: &str,
+    modules: &[(&str, &str)],
+) -> Result<TypecheckTestResult, Vec<TypeError>> {
+    let program = parse_program(source);
+    let resolved = resolved_modules_with_core_option(&program, modules);
     let raw_externs =
         externs::prepare_raw_externs(RawExterns::default(), &program, &resolved).unwrap();
     check_with_raw_externs(&program, &resolved, raw_externs)

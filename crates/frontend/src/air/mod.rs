@@ -17,7 +17,8 @@ use std::fmt::Write;
 pub use body::*;
 pub use decl::*;
 pub use ids::{
-    AggregateId, AirLoopId, BindingId, BlockId, CaptureCellId, ConstId, EnumId, ExternId,
+    AggregateId, AirLoopId, BindingId, BlockId, CaptureCellId, ConstId, ContractSlotId,
+    ContractSurfaceId, ContractWeakeningId, ContractWitnessId, DynBorrowParamId, EnumId, ExternId,
     ExternTypeId, FieldId, FunctionId, GlobalId, LambdaCaptureSlotId, LambdaId, LocalId, ModuleId,
     ScopedBorrowId, TypeId, VariantId,
 };
@@ -57,6 +58,7 @@ pub struct Program {
     pub entry: Option<FunctionId>,
     pub functions: Vec<Function>,
     pub lambdas: Vec<LambdaDecl>,
+    pub dyn_borrow_params: Vec<DynBorrowParamDecl>,
     pub scoped_borrows: Vec<ScopedBorrowDecl>,
     pub capture_cells: Vec<CaptureCellDecl>,
     pub globals: Vec<GlobalDecl>,
@@ -64,11 +66,48 @@ pub struct Program {
     pub extern_types: Vec<ExternTypeDecl>,
     pub aggregates: Vec<AggregateDecl>,
     pub enums: Vec<EnumDecl>,
+    pub contract_surfaces: Vec<ContractSurfaceDecl>,
+    pub contract_witnesses: Vec<ContractWitnessDecl>,
+    pub contract_weakenings: Vec<ContractWeakeningDecl>,
     pub type_arena: TypeArena,
     pub const_arena: ConstArena,
 }
 
 impl Program {
+    pub fn alloc_contract_surface(&mut self, decl: ContractSurfaceDecl) -> ContractSurfaceId {
+        let id = ContractSurfaceId::from_index(self.contract_surfaces.len());
+        self.contract_surfaces.push(decl);
+        id
+    }
+
+    pub fn contract_surface(&self, id: ContractSurfaceId) -> &ContractSurfaceDecl {
+        &self.contract_surfaces[id.index()]
+    }
+
+    pub fn contract_surface_mut(&mut self, id: ContractSurfaceId) -> &mut ContractSurfaceDecl {
+        &mut self.contract_surfaces[id.index()]
+    }
+
+    pub fn alloc_contract_witness(&mut self, decl: ContractWitnessDecl) -> ContractWitnessId {
+        let id = ContractWitnessId::from_index(self.contract_witnesses.len());
+        self.contract_witnesses.push(decl);
+        id
+    }
+
+    pub fn contract_witness(&self, id: ContractWitnessId) -> &ContractWitnessDecl {
+        &self.contract_witnesses[id.index()]
+    }
+
+    pub fn alloc_contract_weakening(&mut self, decl: ContractWeakeningDecl) -> ContractWeakeningId {
+        let id = ContractWeakeningId::from_index(self.contract_weakenings.len());
+        self.contract_weakenings.push(decl);
+        id
+    }
+
+    pub fn contract_weakening(&self, id: ContractWeakeningId) -> &ContractWeakeningDecl {
+        &self.contract_weakenings[id.index()]
+    }
+
     pub fn alloc_module(&mut self, module: Module) -> ModuleId {
         let id = ModuleId::from_index(self.modules.len());
         self.modules.push(module);
@@ -109,6 +148,12 @@ impl Program {
     pub fn alloc_lambda(&mut self, decl: LambdaDecl) -> LambdaId {
         let id = LambdaId::from_index(self.lambdas.len());
         self.lambdas.push(decl);
+        id
+    }
+
+    pub fn alloc_dyn_borrow_param(&mut self, decl: DynBorrowParamDecl) -> DynBorrowParamId {
+        let id = DynBorrowParamId::from_index(self.dyn_borrow_params.len());
+        self.dyn_borrow_params.push(decl);
         id
     }
 
@@ -171,7 +216,10 @@ impl Program {
                 LambdaCaptureDecl::CaptureCell { cell, .. } => Some(*cell),
                 _ => None,
             },
-            PlaceRoot::Local(_) | PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_) => None,
+            PlaceRoot::Local(_)
+            | PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::DynBorrowParam(_)
+            | PlaceRoot::Global(_) => None,
         }
     }
 
@@ -186,8 +234,20 @@ impl Program {
                 LambdaCaptureDecl::ScopedBorrow { borrow, .. } => Some(*borrow),
                 _ => None,
             },
-            PlaceRoot::Local(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => None,
+            PlaceRoot::Local(_)
+            | PlaceRoot::DynBorrowParam(_)
+            | PlaceRoot::CaptureCell(_)
+            | PlaceRoot::Global(_) => None,
         }
+    }
+
+    pub fn dyn_borrow_param_place(&self, id: DynBorrowParamId) -> Option<Place> {
+        let decl = self.dyn_borrow_params.get(id.index())?;
+        Some(Place {
+            root: PlaceRoot::DynBorrowParam(id),
+            projection: vec![],
+            ty: decl.ty,
+        })
     }
 
     pub fn scoped_borrow_place(&self, borrow: ScopedBorrowId) -> Option<Place> {
@@ -252,6 +312,25 @@ impl Program {
         Some(source)
     }
 
+    fn resolve_dyn_borrow_param_place(
+        &self,
+        function_id: FunctionId,
+        place: &Place,
+    ) -> Option<Place> {
+        let PlaceRoot::DynBorrowParam(id) = place.root else {
+            return None;
+        };
+        let decl = self.dyn_borrow_params.get(id.index())?;
+        if decl.owner != function_id {
+            return None;
+        }
+        Some(Place {
+            root: PlaceRoot::Local(decl.source),
+            projection: place.projection.clone(),
+            ty: place.ty,
+        })
+    }
+
     fn lambda_capture(
         &self,
         function_id: FunctionId,
@@ -278,10 +357,12 @@ impl Program {
         let left = self
             .resolve_capture_cell_place(function_id, left)
             .or_else(|| self.resolve_scoped_borrow_place(function_id, left))
+            .or_else(|| self.resolve_dyn_borrow_param_place(function_id, left))
             .unwrap_or_else(|| left.clone());
         let right = self
             .resolve_capture_cell_place(function_id, right)
             .or_else(|| self.resolve_scoped_borrow_place(function_id, right))
+            .or_else(|| self.resolve_dyn_borrow_param_place(function_id, right))
             .unwrap_or_else(|| right.clone());
         left.may_overlap(&right)
     }
@@ -468,14 +549,11 @@ impl Program {
                 ),
                 helper_part(&self.render_return_mode(sig.ret, mode))
             ),
-            (TypeRender::Display, TypeData::Dyn(contract)) => {
-                format!("dyn {}", contract.display_name)
+            (TypeRender::Display, TypeData::Dyn(surface)) => {
+                format!("dyn {}", self.contract_surface(*surface).display_name)
             }
-            (TypeRender::HelperKey, TypeData::Dyn(contract)) => {
-                format!(
-                    "dyn_{}",
-                    helper_part(&mangle_segment(&contract.method_table_key))
-                )
+            (TypeRender::HelperKey, TypeData::Dyn(surface)) => {
+                format!("dyn_surface_{}", surface.index())
             }
             (_, TypeData::Aggregate(id) | TypeData::DataRef(id)) => {
                 let decl = self.aggregate(*id);

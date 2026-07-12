@@ -1,0 +1,35 @@
+// @mode: check
+// @expect: success
+
+contract NodeA {
+    fn next(self) -> dyn NodeA;
+}
+
+contract NodeB {
+    fn next(self) -> dyn NodeB;
+}
+
+contract LeftA {
+    fn next(self) -> dyn RightA;
+}
+
+contract RightA {
+    fn next(self) -> dyn LeftA;
+}
+
+contract LeftB {
+    fn next(self) -> dyn RightB;
+}
+
+contract RightB {
+    fn next(self) -> dyn LeftB;
+}
+
+fn self_recursive(value: dyn NodeA, both: dyn NodeA + NodeB) -> dyn NodeB {
+    both;
+    value
+}
+
+fn mutually_recursive(value: dyn LeftA) -> dyn LeftB {
+    value
+}

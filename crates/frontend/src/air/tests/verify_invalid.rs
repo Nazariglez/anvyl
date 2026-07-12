@@ -1,14 +1,17 @@
 use verify::{
-    BadCall, BadConst, BadExtern, BadFunction, BadModule, BadPlace, BadRValue, BadReference,
-    BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError, VerifyErrorKind as EK,
-    VerifySite,
+    BadCall, BadConst, BadContract, BadExtern, BadFunction, BadModule, BadPlace, BadRValue,
+    BadReference, BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError,
+    VerifyErrorKind as EK, VerifySite,
 };
 
 use super::{super::verify::verify_structured_body, *};
 use crate::{
     air::{
         AirPatternAlternative, AirPatternArm, AirPatternBinding, AirPatternBindingMode,
-        AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest, ExternBindingDecl,
+        AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest, ContractParamDecl,
+        ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId,
+        ContractSurfaceDecl, ContractSurfaceId, ContractWeakeningDecl, ContractWitnessDecl,
+        ContractWitnessKey, ContractWitnessSlotDecl, ContractWitnessTarget, ExternBindingDecl,
         ExternStaticDecl, ExternTypeId, FunctionSpecialization, FunctionValueCapability,
         GlobalInitEffect,
     },
@@ -585,6 +588,9 @@ fn extern_member_receiver_mode_mismatch() {
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: None,
         has_init: false,
         init_args: vec![],
         fields: vec![],
@@ -834,6 +840,9 @@ fn escaping_extern_type_params_use_same_invariants() {
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: None,
         has_init: false,
         init_args: vec![],
         fields: vec![],
@@ -4219,6 +4228,486 @@ fn recursive_type_is_invalid() {
 }
 
 #[test]
+fn dynamic_type_must_reference_a_surface() {
+    let mut builder = ProgramBuilder::default();
+    let missing = ContractSurfaceId::from_index(7);
+    builder.alloc_type(TypeData::Dyn(missing));
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadReference(BadReference::InvalidContractSurface(id)) if id == missing
+    )));
+}
+
+#[test]
+fn contract_surface_must_not_be_empty() {
+    let mut builder = ProgramBuilder::default();
+    builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Empty".into(),
+        slots: vec![],
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadContract(BadContract::EmptySurface)))
+    );
+}
+
+#[test]
+fn contract_slot_types_must_exist() {
+    let mut builder = ProgramBuilder::default();
+    let missing = TypeId::from_index(7);
+    builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Bad".into(),
+        slots: vec![ContractSlotDecl {
+            id: ContractSlotId::from_index(0),
+            name: Ident::new("call"),
+            receiver: ContractReceiver::Value,
+            params: vec![ContractParamDecl {
+                ty: missing,
+                mode: ParamMode::SharedBorrow,
+                cast_accept: false,
+                escape: ParamEscape::NonEscaping,
+            }],
+            ret: ContractReturnDecl::Iter,
+        }],
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadReference(BadReference::InvalidType(id)) if id == missing
+    )));
+}
+
+#[test]
+fn malformed_dynamic_rvalues_reject() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let void = builder.void_ty();
+    let module = test_module(&mut builder);
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, void)],
+    });
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(surface));
+    let mut fb = FunctionBuilder::new("bad_dyn", module, FunctionKind::Normal, void);
+    let concrete = fb.push_local(None, int, Mutability::Immutable, LocalKind::User);
+    let dynamic = fb.push_local(None, dyn_ty, Mutability::Mutable, LocalKind::User);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::DynPack {
+            value: op_place(concrete, int),
+            use_: DynOwnedUse::ReusableRead,
+            witness: ContractWitnessId::from_index(99),
+            ty: dyn_ty,
+        }),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::DynWeaken {
+            value: op_place(dynamic, dyn_ty),
+            use_: DynOwnedUse::ReusableRead,
+            weakening: ContractWeakeningId::from_index(99),
+            ty: dyn_ty,
+        }),
+    );
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::DynCall {
+            receiver: crate::air::DynReceiver::Owned(op_place(dynamic, dyn_ty)),
+            surface,
+            slot: ContractSlotId::from_index(99),
+            args: vec![],
+        }),
+    );
+    let function = builder.alloc_function(fb.finish());
+    builder.set_entry(function);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadRValue(BadRValue::InvalidDynPack)))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadRValue(BadRValue::InvalidDynWeaken)))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadRValue(BadRValue::InvalidDynCall)))
+    );
+}
+
+#[test]
+fn dynamic_borrow_args_cannot_alias() {
+    let mut builder = ProgramBuilder::default();
+    let void = builder.void_ty();
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, void)],
+    });
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(surface));
+    let module = test_module(&mut builder);
+    let mut callee = FunctionBuilder::new("callee", module, FunctionKind::Normal, void);
+    callee.push_param_with_mode("left", dyn_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_param_with_mode("right", dyn_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    callee.push_block(term_return_void());
+    let callee = builder.alloc_function(callee.finish());
+
+    let mut caller = FunctionBuilder::new("caller", module, FunctionKind::Normal, void);
+    let source = caller.push_local(None, dyn_ty, Mutability::Mutable, LocalKind::User);
+    let place = place(source, dyn_ty);
+    let borrow = crate::air::DynBorrow {
+        source: crate::air::DynBorrowSource::Owned(place),
+        ty: dyn_ty,
+        surface,
+        weakening: None,
+    };
+    let bb0 = caller.push_block(term_return_void());
+    caller.add_statement(
+        bb0,
+        stmt_eval(RValue::Call {
+            callee: Callee::Function(callee),
+            args: vec![
+                CallArg::DynBorrow(borrow.clone()),
+                CallArg::DynBorrow(borrow),
+            ],
+        }),
+    );
+    let caller = builder.alloc_function(caller.finish());
+    builder.set_entry(caller);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadCall(BadCall::ArgAliasConflict {
+            first: 0,
+            second: 1
+        })
+    )));
+}
+
+#[test]
+fn dynamic_call_checks_escaping_callback_args() {
+    let mut builder = ProgramBuilder::default();
+    let void = builder.void_ty();
+    let callback_ty = builder.alloc_type(TypeData::Function(SignatureType::new(
+        vec![],
+        ReturnMode::Value(void),
+    )));
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![ContractSlotDecl {
+            id: ContractSlotId::from_index(0),
+            name: Ident::new("run"),
+            receiver: ContractReceiver::Value,
+            params: vec![ContractParamDecl {
+                ty: callback_ty,
+                mode: ParamMode::Value,
+                escape: ParamEscape::Escaping,
+                cast_accept: false,
+            }],
+            ret: ContractReturnDecl::Value(void),
+        }],
+    });
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(surface));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_escape", module, FunctionKind::Normal, void);
+    let receiver = fb.push_param_with_mode(
+        "receiver",
+        dyn_ty,
+        ParamMode::SharedBorrow,
+        ParamRole::Normal,
+    );
+    let callback = fb.push_param("callback", callback_ty, ParamRole::Normal);
+    let bb0 = fb.push_block(term_return_void());
+    fb.add_statement(
+        bb0,
+        stmt_eval(RValue::DynCall {
+            receiver: crate::air::DynReceiver::Owned(op_place(receiver, dyn_ty)),
+            surface,
+            slot: ContractSlotId::from_index(0),
+            args: vec![CallArg::Value(op_place(callback, callback_ty))],
+        }),
+    );
+    let function = builder.alloc_function(fb.finish());
+    builder.set_entry(function);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadCall(BadCall::ArgEscapeMismatch {
+            expected: ParamEscape::Escaping,
+            found: ParamEscape::NonEscaping,
+            ..
+        })
+    )));
+}
+
+#[test]
+fn borrowed_dynamic_param_cannot_escape_as_value() {
+    let mut builder = ProgramBuilder::default();
+    let void = builder.void_ty();
+    let module = test_module(&mut builder);
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, void)],
+    });
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(surface));
+    let owner = FunctionId::from_index(0);
+    let mut fb = FunctionBuilder::new("bad_borrow", module, FunctionKind::Normal, dyn_ty);
+    let source = fb.push_param_with_mode("value", dyn_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    let borrow = builder.alloc_dyn_borrow_param(DynBorrowParamDecl {
+        owner,
+        source,
+        ty: dyn_ty,
+        surface,
+    });
+    fb.push_block(term_return(Operand::Place(Place {
+        root: PlaceRoot::DynBorrowParam(borrow),
+        projection: vec![],
+        ty: dyn_ty,
+    })));
+    let function = builder.alloc_function(fb.finish());
+    builder.set_entry(function);
+
+    let mut program = builder.finish();
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadPlace(BadPlace::DynBorrowParamEscapes(id)) if id == borrow
+    )));
+
+    program.function_mut(function).body.block.tail = AirTail::Return(Some(Operand::Place(Place {
+        root: PlaceRoot::Local(source),
+        projection: vec![],
+        ty: dyn_ty,
+    })));
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadPlace(BadPlace::DynBorrowParamEscapes(id)) if id == borrow
+    )));
+
+    let function = program.function_mut(function);
+    function.body.block.tail = AirTail::Unreachable;
+    function
+        .body
+        .block
+        .stmts
+        .push(AirStmt::Eval(RValue::Use(Operand::Place(Place {
+            root: PlaceRoot::Local(source),
+            projection: vec![],
+            ty: dyn_ty,
+        }))));
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadPlace(BadPlace::DynBorrowParamEscapes(id)) if id == borrow
+    )));
+}
+
+#[test]
+fn dynamic_borrow_param_is_unique_and_complete() {
+    let mut builder = ProgramBuilder::default();
+    let void = builder.void_ty();
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, void)],
+    });
+    let dyn_ty = builder.alloc_type(TypeData::Dyn(surface));
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("borrow", module, FunctionKind::Normal, void);
+    let source = fb.push_param_with_mode("value", dyn_ty, ParamMode::MutBorrow, ParamRole::Normal);
+    fb.push_block(term_return_void());
+    let owner = builder.alloc_function(fb.finish());
+    builder.set_entry(owner);
+    let mut program = builder.finish();
+
+    let error = |program: &Program, found| {
+        verify(program).unwrap_err().iter().any(|error| {
+            matches!(
+                error.kind,
+                EK::BadFunction(BadFunction::DynBorrowParamCount { local, found: count })
+                    if local == source && count == found
+            )
+        })
+    };
+    assert!(error(&program, 0));
+
+    let decl = DynBorrowParamDecl {
+        owner,
+        source,
+        ty: dyn_ty,
+        surface,
+    };
+    program.alloc_dyn_borrow_param(decl.clone());
+    program.alloc_dyn_borrow_param(decl);
+    assert!(error(&program, 2));
+}
+
+#[test]
+fn contract_witness_target_must_exist() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, int)],
+    });
+    let slots = vec![ContractWitnessSlotDecl {
+        slot: ContractSlotId::from_index(0),
+        receiver: ParamMode::Value,
+        target: ContractWitnessTarget::Function {
+            function: FunctionId::from_index(7),
+        },
+    }];
+    builder.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: int,
+            surface,
+            slots,
+        },
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadReference(BadReference::InvalidFunction(id)) if id == FunctionId::from_index(7)
+    )));
+}
+
+#[test]
+fn malformed_promoted_witness_does_not_panic() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let missing = TypeId::from_index(99);
+    let surface = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Action".into(),
+        slots: vec![contract_slot("act", 0, int)],
+    });
+    let slots = vec![ContractWitnessSlotDecl {
+        slot: ContractSlotId::from_index(0),
+        receiver: ParamMode::SharedBorrow,
+        target: ContractWitnessTarget::Promoted {
+            fields: vec![],
+            target: Box::new(ContractWitnessTarget::Function {
+                function: FunctionId::from_index(7),
+            }),
+        },
+    }];
+    builder.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: missing,
+            surface,
+            slots,
+        },
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadReference(BadReference::InvalidType(id)) if id == missing
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadContract(BadContract::InvalidWitnessProjection)
+    )));
+}
+
+#[test]
+fn contract_weakening_must_be_proper() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let source = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Source".into(),
+        slots: vec![contract_slot("a", 0, int), contract_slot("b", 1, int)],
+    });
+    builder.alloc_contract_weakening(ContractWeakeningDecl {
+        source,
+        target: source,
+        target_to_source: vec![ContractSlotId::from_index(0), ContractSlotId::from_index(1)],
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadContract(BadContract::WeakeningNotProper)))
+    );
+}
+
+#[test]
+fn contract_weakening_must_be_unique() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let source = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Source".into(),
+        slots: vec![contract_slot("a", 0, int), contract_slot("b", 1, int)],
+    });
+    let target = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Target".into(),
+        slots: vec![contract_slot("a", 0, int)],
+    });
+    let weakening = ContractWeakeningDecl {
+        source,
+        target,
+        target_to_source: vec![ContractSlotId::from_index(0)],
+    };
+    builder.alloc_contract_weakening(weakening.clone());
+    builder.alloc_contract_weakening(weakening);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadContract(BadContract::DuplicateWeakening)))
+    );
+}
+
+#[test]
+fn contract_weakening_must_preserve_slot_name() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let source = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Source".into(),
+        slots: vec![contract_slot("a", 0, int), contract_slot("b", 1, int)],
+    });
+    let target = builder.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Target".into(),
+        slots: vec![contract_slot("c", 0, int)],
+    });
+    builder.alloc_contract_weakening(ContractWeakeningDecl {
+        source,
+        target,
+        target_to_source: vec![ContractSlotId::from_index(0)],
+    });
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadContract(BadContract::WeakeningSlotSignatureMismatch)
+    )));
+}
+
+fn contract_slot(name: &str, index: usize, ret: TypeId) -> ContractSlotDecl {
+    ContractSlotDecl {
+        id: ContractSlotId::from_index(index),
+        name: Ident::new(name),
+        receiver: ContractReceiver::Value,
+        params: vec![],
+        ret: ContractReturnDecl::Value(ret),
+    }
+}
+
+#[test]
 fn constants_must_match_value_type() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.alloc_type(TypeData::Int);
@@ -4457,6 +4946,9 @@ fn module_missing_wrong_and_duplicate_items_are_invalid() {
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: None,
         has_init: false,
         init_args: vec![],
         fields: vec![],

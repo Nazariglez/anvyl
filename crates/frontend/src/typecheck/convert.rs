@@ -705,6 +705,9 @@ pub(super) fn check_failable_cast_expr(
     let ty = tc.decls.expect_core_option_of(target.clone());
     match resolve_failable_cast(cast, &source, &target, tc) {
         Some(ResolvedFailableCast::DynamicDowncast) => {
+            if let Some(local) = tc.direct_local_id(&cast.node.expr) {
+                tc.record_local_use(cast.node.expr.node.id, local, super::LocalUseMode::Read);
+            }
             downcast::check_expr_with_source(expr, cast, target, expected, checked, tc)
         }
         Some(ResolvedFailableCast::CastFrom(conversion)) => {

@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'draw' has an incompatible parameter count
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(self, layer: int = 0) {}
+}
+
+fn main() {
+    let item: dyn Drawable = Sprite {};
+}

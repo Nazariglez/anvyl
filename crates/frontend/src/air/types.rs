@@ -61,7 +61,7 @@ pub enum TypeData {
     },
     Slice(TypeId),
     Function(SignatureType),
-    Dyn(DynContractData),
+    Dyn(ContractSurfaceId),
     Aggregate(AggregateId),
     Enum(EnumId),
     DataRef(AggregateId),
@@ -71,13 +71,6 @@ pub enum TypeData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapOrder {
     Insertion,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynContractData {
-    pub display_name: String,
-    pub method_table_key: String,
-    pub concrete_printer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

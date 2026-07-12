@@ -65,7 +65,13 @@ mod closure;
 mod collection_loan;
 mod const_eval;
 mod const_term;
+mod contract_surface;
 mod contracts;
+
+pub(crate) use contract_surface::{
+    ContractParamSchema, ContractReturnSchema, ContractSurfaceId, ContractSurfaceSchemas,
+    ContractTypeSchema,
+};
 mod control_flow;
 mod convert;
 mod decl_validate;
@@ -1782,7 +1788,7 @@ impl TypeChecker {
         handle: &TypeHandle,
         mutable: bool,
         span: Option<Span>,
-    ) -> SemanticLocalId {
+    ) -> DefinedLocal {
         let local = self
             .define_shadowing_value_from_handle(
                 name,
@@ -1792,18 +1798,18 @@ impl TypeChecker {
                 None,
             )
             .expect("pattern binding requires an active local scope");
+        self.record_local_def(
+            local.type_id,
+            Some(local.binding_id),
+            name,
+            span,
+            mutable,
+            LocalDefKind::Binding,
+        );
         if let Some(span) = span {
-            self.record_local_def(
-                local.type_id,
-                Some(local.binding_id),
-                name,
-                Some(span),
-                mutable,
-                LocalDefKind::Binding,
-            );
             self.record_binding_def(span, local.type_id);
         }
-        local.type_id
+        local
     }
 
     fn define_ref_alias_binding_from_handle(
@@ -1813,14 +1819,14 @@ impl TypeChecker {
         target: place::AliasTarget,
         context: PatternContext,
         span: Option<Span>,
-    ) {
+    ) -> DefinedLocal {
         if matches!(
             context,
             PatternContext::IfLet | PatternContext::WhileLet | PatternContext::Match
         ) {
             self.push_mut_alias_root(target.identity.clone(), name, MUT_ALIAS_ROOT_MESSAGE);
         }
-        self.define_alias_binding_from_handle(name, handle, target, context, span);
+        self.define_alias_binding_from_handle(name, handle, target, context, span)
     }
 
     fn define_alias_binding_from_handle(
@@ -1830,27 +1836,28 @@ impl TypeChecker {
         target: place::AliasTarget,
         context: PatternContext,
         span: Option<Span>,
-    ) {
-        let Some(id) = self.define_shadowing_value_from_handle(
-            name,
-            handle,
-            LocalBindingKind::pattern_alias(context),
-            None,
-            Some(target),
-        ) else {
-            return;
-        };
-        if let Some(span) = span {
-            self.record_local_def(
-                id.type_id,
-                Some(id.binding_id),
+    ) -> DefinedLocal {
+        let id = self
+            .define_shadowing_value_from_handle(
                 name,
-                Some(span),
-                true,
-                LocalDefKind::Binding,
-            );
+                handle,
+                LocalBindingKind::pattern_alias(context),
+                None,
+                Some(target),
+            )
+            .expect("pattern alias requires an active local scope");
+        self.record_local_def(
+            id.type_id,
+            Some(id.binding_id),
+            name,
+            span,
+            true,
+            LocalDefKind::Binding,
+        );
+        if let Some(span) = span {
             self.record_binding_def(span, id.type_id);
         }
+        id
     }
 
     fn push_mut_alias_root(
@@ -1991,6 +1998,13 @@ impl TypeChecker {
 
     fn lookup(&self, name: Ident) -> Option<VarInfo> {
         self.lookup_with_depth(name).map(|(info, _)| info)
+    }
+
+    pub(super) fn direct_local_id(&self, expr: &ExprNode) -> Option<SemanticLocalId> {
+        let ExprKind::Ident(name) = expr.node.kind else {
+            return None;
+        };
+        self.lookup(name).map(|local| local.type_id)
     }
 
     fn lookup_with_depth(&self, name: Ident) -> Option<(VarInfo, usize)> {
@@ -2485,19 +2499,25 @@ impl TypeChecker {
         target: ContractSetKey,
         span: SourceSpan,
     ) {
+        if source == target {
+            return;
+        }
+        let target_to_source = contracts::contract_set_projection(&self.decls, &source, &target)
+            .expect("accepted dynamic weakening must have a complete projection");
         let expr_id = site.expr;
         self.semantic_facts.record_dyn_weakening(
             site.body,
-            DynWeakeningFact {
+            PendingDynWeakeningFact {
                 expr_id,
                 source,
                 target,
+                target_to_source,
                 span,
             },
         );
     }
 
-    fn record_resolved_dyn_call(
+    fn record_dyn_call(
         &mut self,
         site: SemanticExprSite,
         receiver: &SemanticExprSite,
@@ -2510,7 +2530,7 @@ impl TypeChecker {
         let call_id = site.expr;
         self.semantic_facts.record_dyn_call(
             site.body,
-            DynCallFact {
+            PendingDynCallFact {
                 call_id,
                 receiver_id: receiver.expr,
                 contract,
@@ -2554,7 +2574,7 @@ impl TypeChecker {
             DynDowncastFact {
                 expr_id,
                 source_id: source.expr,
-                source: source_contract,
+                source: DynDowncastSource::Pending(source_contract),
                 target,
                 mutable,
                 span,
@@ -3382,19 +3402,34 @@ impl TypeChecker {
         facts.import_records = self.decls.import_records().to_vec();
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
-        self.semantic_facts.validate_finished();
         let declaration_facts = self.build_semantic_declarations();
+        let contract_surfaces = ContractSurfaceSchemas::build(
+            &self.decls,
+            &self.dyn_infer,
+            &self.semantic_facts,
+            &declaration_facts,
+        );
+        self.semantic_facts.resolve_witnesses(&contract_surfaces);
+        self.semantic_facts
+            .resolve_dyn_weakenings(&contract_surfaces);
+        self.semantic_facts.resolve_dyn_calls(&contract_surfaces);
+        self.semantic_facts
+            .resolve_dyn_downcasts(&contract_surfaces);
+        self.semantic_facts.validate_finished();
+        let program = SemanticProgram {
+            facts: self.semantic_facts.clone(),
+            declaration_facts,
+            contract_surfaces,
+            declarations: self.decls.clone(),
+            externs: self.externs.clone(),
+        };
+        program.contract_surfaces.validate(&program.declarations);
         Some(SemanticCheckOutput {
             warnings: std::mem::take(&mut self.warnings),
             lint_events: std::mem::take(&mut self.lint_events),
             public_facts: facts,
             source_types: types,
-            program: SemanticProgram {
-                facts: self.semantic_facts.clone(),
-                declaration_facts,
-                declarations: self.decls.clone(),
-                externs: self.externs.clone(),
-            },
+            program,
         })
     }
 
@@ -4573,7 +4608,9 @@ fn check_default_stringify_conversion(checked: &CheckedType, span: Span, tc: &mu
         tc.reject_extern_any_escape(checked, span);
         return;
     }
-    tc.reject_user_any_type(&checked.ty, span);
+    if !tc.reject_user_any_type(&checked.ty, span) {
+        tc.reject_dyn_format(&checked.ty, span);
+    }
 }
 
 fn intrinsic_ident_arg(

@@ -11,6 +11,85 @@ use super::{
 };
 use crate::ast::{ExprId, Ident};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractSurfaceDecl {
+    pub display_name: String,
+    pub slots: Vec<ContractSlotDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractSlotDecl {
+    pub id: ContractSlotId,
+    pub name: Ident,
+    pub receiver: ContractReceiver,
+    pub params: Vec<ContractParamDecl>,
+    pub ret: ContractReturnDecl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContractReceiver {
+    Value,
+    Ref,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContractParamDecl {
+    pub ty: TypeId,
+    pub mode: ParamMode,
+    pub cast_accept: bool,
+    pub escape: ParamEscape,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContractReturnDecl {
+    Value(TypeId),
+    Place(TypeId),
+    Iter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractWitnessDecl {
+    pub key: ContractWitnessKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractWitnessKey {
+    pub concrete_ty: TypeId,
+    pub surface: ContractSurfaceId,
+    pub slots: Vec<ContractWitnessSlotDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractWitnessSlotDecl {
+    pub slot: ContractSlotId,
+    pub receiver: ParamMode,
+    pub target: ContractWitnessTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ContractWitnessTarget {
+    Function {
+        function: FunctionId,
+    },
+    IteratorFunction {
+        function: FunctionId,
+    },
+    Extern {
+        function: ExternId,
+    },
+    Promoted {
+        fields: Vec<FieldId>,
+        target: Box<ContractWitnessTarget>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContractWeakeningDecl {
+    pub source: ContractSurfaceId,
+    pub target: ContractSurfaceId,
+    pub target_to_source: Vec<ContractSlotId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Module {
     pub path: Vec<Ident>,
@@ -211,6 +290,14 @@ pub enum LocalKind {
     Temp,
     User,
     PatternBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynBorrowParamDecl {
+    pub owner: FunctionId,
+    pub source: LocalId,
+    pub ty: TypeId,
+    pub surface: ContractSurfaceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,6 +568,9 @@ pub struct ExternTypeDecl {
     pub type_args: Vec<TypeId>,
     pub const_args: Vec<String>,
     pub rep: ExternRep,
+    pub layout: Option<anvyx_externs::ExternLayout>,
+    pub materialization: Option<anvyx_externs::ExternMaterialization>,
+    pub owns_heap_edges: Option<bool>,
     pub has_init: bool,
     pub init_args: Vec<ExternInitArgDecl>,
     pub fields: Vec<ExternFieldDecl>,

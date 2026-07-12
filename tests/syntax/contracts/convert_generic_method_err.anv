@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'get' is generic
+
+contract Boxed {
+    fn get(self) -> int;
+}
+
+struct Box {
+    fn get<T>(self) -> int { 1 }
+}
+
+fn main() {
+    let item: dyn Boxed = Box {};
+}

@@ -1,11 +1,13 @@
 use super::super::{
-    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData, EnumDecl,
+    AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData,
+    ContractSurfaceDecl, ContractWeakeningDecl, ContractWitnessDecl, DynBorrowParamDecl, EnumDecl,
     EnumRepr, ExternDecl, ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local,
     LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
     PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, ScopedBorrowSource, Signature,
     TypeData, VariantDecl, VariantShape,
     ids::{
-        AggregateId, BindingId, BlockId, CaptureCellId, ConstId, EnumId, ExternId, ExternTypeId,
+        AggregateId, BindingId, BlockId, CaptureCellId, ConstId, ContractSurfaceId,
+        ContractWeakeningId, ContractWitnessId, DynBorrowParamId, EnumId, ExternId, ExternTypeId,
         FunctionId, GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
     },
 };
@@ -23,6 +25,22 @@ pub struct ProgramBuilder {
 impl ProgramBuilder {
     pub fn alloc_type(&mut self, data: TypeData) -> TypeId {
         self.program.alloc_type(data)
+    }
+
+    pub fn alloc_contract_surface(&mut self, decl: ContractSurfaceDecl) -> ContractSurfaceId {
+        self.program.alloc_contract_surface(decl)
+    }
+
+    pub fn alloc_contract_weakening(&mut self, decl: ContractWeakeningDecl) -> ContractWeakeningId {
+        self.program.alloc_contract_weakening(decl)
+    }
+
+    pub fn alloc_contract_witness(&mut self, decl: ContractWitnessDecl) -> ContractWitnessId {
+        self.program.alloc_contract_witness(decl)
+    }
+
+    pub fn alloc_dyn_borrow_param(&mut self, decl: DynBorrowParamDecl) -> DynBorrowParamId {
+        self.program.alloc_dyn_borrow_param(decl)
     }
 
     pub fn int_ty(&mut self) -> TypeId {

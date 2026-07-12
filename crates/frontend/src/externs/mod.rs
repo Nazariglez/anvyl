@@ -62,11 +62,11 @@ mod tests {
     use anvyx_externs::{
         BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternCallbackParam,
         ExternCallbackSignature, ExternDescriptorError, ExternEffects, ExternFieldDescriptor,
-        ExternFunctionDescriptor, ExternInitDescriptor, ExternMemberSelector,
-        ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
-        ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
-        ExternTypeExpr, ModulePath, OperatorReturn, ParamFlow, ProviderDescriptor, ProviderId,
-        ReceiverMode, TypeContext,
+        ExternFunctionDescriptor, ExternInitDescriptor, ExternLayout, ExternMaterialization,
+        ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator,
+        ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor,
+        ExternTypeDescriptor, ExternTypeExpr, ModulePath, OperatorReturn, ParamFlow,
+        ProviderDescriptor, ProviderId, ReceiverMode, TypeContext,
     };
 
     use super::*;
@@ -170,6 +170,9 @@ mod tests {
             name: name.to_string(),
             doc: None,
             rep: ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: Some(false),
             fields: vec![],
             variants: vec![],
             init: None,
@@ -223,6 +226,9 @@ mod tests {
                         name: "Vec2".to_string(),
                         doc: Some("vector".to_string()),
                         rep: ExternRep::Inline,
+                        layout: Some(ExternLayout { size: 8, align: 8 }),
+                        materialization: Some(ExternMaterialization::Copy),
+                        owns_heap_edges: Some(false),
                         fields: vec![],
                         variants: vec![],
                         init: None,
@@ -1217,6 +1223,9 @@ mod tests {
                         name: "Sprite".to_string(),
                         doc: Some("sprite".to_string()),
                         rep: ExternRep::Shared,
+                        layout: None,
+                        materialization: None,
+                        owns_heap_edges: Some(false),
                         fields: vec![ExternFieldDescriptor {
                             name: "x".to_string(),
                             ty: ExternTypeExpr::Float,

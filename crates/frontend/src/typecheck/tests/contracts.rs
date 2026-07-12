@@ -1,11 +1,13 @@
-use super::support::{assert_typecheck_closed, check, generic_body, nominal_struct};
+use super::support::{assert_typecheck_closed, check, check_modules, generic_body, nominal_struct};
 use crate::{
     ast::{ContractRef, Ident, Type},
     externs,
     span::Span,
     test_support::{empty_resolved, module_path, parse_program, resolved_modules},
     typecheck::{
-        ModuleScope, TypecheckConfig, contracts,
+        ModuleScope, TypecheckConfig,
+        contract_surface::{ContractReturnSchema, ContractTypeSchema},
+        contracts,
         contracts::{ContractMatchError, ContractSlotTarget, RequirementError},
         typechecker_for_modules,
     },
@@ -46,33 +48,11 @@ fn module(name: &str) -> ModuleScope {
 }
 
 #[test]
-fn inclusion_requirements_match() {
-    let matched = assert_matches(
-        "contract Updatable { fn update(ref self, dt: float); }
-        contract Drawable { fn draw(self); }
-        contract Actor { Updatable; Drawable; }
-        struct Enemy {
-            fn update(ref self, dt: float) {}
-            fn draw(self) {}
-        }",
-        "Enemy",
-        "Actor",
-    );
-
-    assert_eq!(matched.slots.len(), 2);
-}
-
-#[test]
-fn inclusion_duplicate_requirement_collapses() {
+fn inclusion_duplicates_collapse() {
     let result = check(
         "contract A { fn draw(self); }
         contract B { fn draw(self); }
-        contract C { A; B; }
-        struct Sprite { fn draw(self) {} }
-        fn render(sprite: Sprite) {
-            let actor: dyn C = sprite;
-            actor.draw();
-        }",
+        contract C { A; B; }",
     )
     .expect("typecheck failed");
 
@@ -87,21 +67,219 @@ fn inclusion_duplicate_requirement_collapses() {
 }
 
 #[test]
+fn contract_surface_slots_preserve_modes() {
+    let result = check(
+        "contract Service {
+            fn z(ref self, ref count: int, callback: escaping fn()) -> int;
+            fn a(self);
+        }",
+    )
+    .expect("typecheck failed");
+
+    let surface = result.contract_surface(&contract("Service"));
+    assert_eq!(surface.slots.len(), 2);
+    assert_eq!(surface.slots[0].name, Ident::new("a"));
+    assert_eq!(surface.slots[1].name, Ident::new("z"));
+    assert_eq!(surface.slots[1].receiver, crate::ast::MethodReceiver::Ref);
+    assert!(surface.slots[1].params[0].mutable);
+    assert_eq!(
+        surface.slots[1].params[1].escape,
+        crate::ast::EscapeMode::Escaping
+    );
+    assert_eq!(
+        surface.slots[1].ret,
+        ContractReturnSchema::Value(ContractTypeSchema::Int)
+    );
+}
+
+#[test]
+fn contract_surface_preserves_iter_return() {
+    let result = check("contract Stream { fn items(self) -> iter; }").expect("typecheck failed");
+
+    let surface = result.contract_surface(&contract("Stream"));
+    assert_eq!(surface.slots[0].ret, ContractReturnSchema::Iter);
+}
+
+#[test]
+fn specialization_type_arguments_seed_surfaces() {
+    let result = check(
+        "contract A { fn a(self); }
+        contract B { fn b(self); }
+        fn marker<T>() {}
+        fn main() { marker<dyn A + B>(); }",
+    )
+    .expect("typecheck failed");
+
+    let composed = ContractRef::Intersection(vec![contract("A"), contract("B")]);
+    assert_eq!(result.contract_surface(&composed).slots.len(), 2);
+}
+
+#[test]
+fn recursive_contract_surfaces_canonicalize() {
+    let result = check(
+        "contract Left { fn next(self) -> (dyn Left)?; }
+        contract Right { fn next(self) -> (dyn Right)?; }
+        contract A { fn next(self) -> dyn B; }
+        contract B { fn prev(self) -> dyn A; }
+        contract X { fn next(self) -> dyn Y; }
+        contract Y { fn prev(self) -> dyn X; }
+        contract Different { fn next(self) -> int; }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(
+        result.contract_surface_id(&contract("Left")),
+        result.contract_surface_id(&contract("Right"))
+    );
+    assert_eq!(
+        result.contract_surface_id(&contract("A")),
+        result.contract_surface_id(&contract("X"))
+    );
+    assert_eq!(
+        result.contract_surface_id(&contract("B")),
+        result.contract_surface_id(&contract("Y"))
+    );
+    let left_id = result.contract_surface_id(&contract("Left"));
+    assert_ne!(left_id, result.contract_surface_id(&contract("Different")));
+    let left = result.contract_surface(&contract("Left"));
+    let ContractReturnSchema::Value(ret) = &left.slots[0].ret else {
+        panic!("expected value return");
+    };
+    let recursive_edge = match ret {
+        ContractTypeSchema::Optional(inner) => inner.as_ref(),
+        ContractTypeSchema::Nominal { type_args, .. } => &type_args[0],
+        other => panic!("expected optional recursive return, found {other:?}"),
+    };
+    assert_eq!(*recursive_edge, ContractTypeSchema::Dyn(left_id));
+    let b_id = result.contract_surface_id(&contract("B"));
+    let a = result.contract_surface(&contract("A"));
+    assert_eq!(
+        a.slots[0].ret,
+        ContractReturnSchema::Value(ContractTypeSchema::Dyn(b_id))
+    );
+}
+
+#[test]
+fn inferred_surface_dependencies_are_canonical() {
+    let result = check(
+        "fn connect(left: dyn _, right: dyn _) {
+            left.link(right);
+            right.draw();
+        }",
+    )
+    .expect("typecheck failed");
+
+    let function = result
+        .function_facts()
+        .iter()
+        .find(|function| function.name == Ident::new("connect"))
+        .expect("missing function");
+    let Type::Dyn(left) = &function.params[0].ty else {
+        panic!("expected left dynamic parameter");
+    };
+    let Type::Dyn(right) = &function.params[1].ty else {
+        panic!("expected right dynamic parameter");
+    };
+    let right_id = result.contract_surface_id(right);
+    let left = result.contract_surface(left);
+    assert_eq!(
+        left.slots[0].params[0].ty,
+        ContractTypeSchema::Dyn(right_id)
+    );
+}
+
+#[test]
+fn mutually_inferred_surfaces_terminate() {
+    let result = check(
+        "fn connect(left: dyn _, right: dyn _) {
+            left.link(right);
+            right.link(left);
+        }",
+    )
+    .expect("typecheck failed");
+
+    let function = result
+        .function_facts()
+        .iter()
+        .find(|function| function.name == Ident::new("connect"))
+        .expect("missing function");
+    let Type::Dyn(left) = &function.params[0].ty else {
+        panic!("expected left dynamic parameter");
+    };
+    let Type::Dyn(right) = &function.params[1].ty else {
+        panic!("expected right dynamic parameter");
+    };
+    let left_id = result.contract_surface_id(left);
+    assert_eq!(left_id, result.contract_surface_id(right));
+    let left = result.contract_surface(left);
+    assert_eq!(left.slots[0].params[0].ty, ContractTypeSchema::Dyn(left_id));
+}
+
+#[test]
+fn contract_surface_ids_ignore_declaration_order() {
+    let forward = check(
+        "contract A { fn next(self) -> dyn B; }
+        contract B { fn prev(self) -> dyn A; }",
+    )
+    .expect("typecheck failed");
+    let reverse = check(
+        "contract B { fn prev(self) -> dyn A; }
+        contract A { fn next(self) -> dyn B; }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(
+        forward.contract_surface_id(&contract("A")),
+        reverse.contract_surface_id(&contract("A"))
+    );
+    assert_eq!(
+        forward.contract_surface_id(&contract("B")),
+        reverse.contract_surface_id(&contract("B"))
+    );
+}
+
+#[test]
+fn storage_only_composed_surface_is_interned() {
+    let result = check(
+        "contract A { fn a(self); }
+        contract B { fn b(self); }
+        struct Holder { item: dyn A + B }",
+    )
+    .expect("typecheck failed");
+
+    let composed = ContractRef::Intersection(vec![contract("A"), contract("B")]);
+    let surface = result.contract_surface(&composed);
+    assert_eq!(surface.slots.len(), 2);
+}
+
+#[test]
 fn dynamic_intersection_matches_and_canonicalizes_order() {
     let result = check(
         "contract A { fn a(self); }
         contract B { fn b(self); }
+        contract Included { A; B; }
         struct Both { fn a(self) {} fn b(self) {} }
+        fn inferred(value: dyn _) { value.a(); value.b(); }
         fn first(x: Both) { let y: dyn A + B = x; y.a(); y.b(); }
         fn second(x: Both) { let y: dyn B + A = x; y.a(); y.b(); }",
     )
     .expect("typecheck failed");
 
-    let dyn_types = result
-        .types()
-        .filter_map(|(_, (_, ty))| matches!(ty, Type::Dyn(_)).then_some(ty))
-        .collect::<Vec<_>>();
-    assert!(dyn_types.windows(2).all(|pair| pair[0] == pair[1]));
+    let composed = ContractRef::Intersection(vec![contract("A"), contract("B")]);
+    let reversed = ContractRef::Intersection(vec![contract("B"), contract("A")]);
+    let included = result.contract_surface_id(&contract("Included"));
+    assert_eq!(result.contract_surface_id(&composed), included);
+    assert_eq!(result.contract_surface_id(&reversed), included);
+
+    let inferred = result
+        .function_facts()
+        .iter()
+        .find(|function| function.name == Ident::new("inferred"))
+        .expect("missing inferred function");
+    let Type::Dyn(inferred) = &inferred.params[0].ty else {
+        panic!("expected inferred dynamic parameter");
+    };
+    assert_eq!(result.contract_surface_id(inferred), included);
 }
 
 #[test]
@@ -126,12 +304,44 @@ fn dynamic_weakening_records_fact() {
         struct Both { fn a(self) {} fn b(self) {} }
         fn main() {
             let both: dyn A + B = Both {};
-            let a: dyn A = both;
+            let b: dyn B = both;
+            let reversed: dyn B + A = Both {};
+            let other: dyn B = reversed;
         }",
     )
     .expect("typecheck failed");
 
-    assert_eq!(result.dyn_weakenings().len(), 1);
+    let source = result.contract_surface(&ContractRef::Intersection(vec![
+        contract("A"),
+        contract("B"),
+    ]));
+    let target = result.contract_surface(&contract("B"));
+    assert_eq!(result.dyn_weakenings().len(), 2);
+    assert!(result.dyn_weakenings().values().all(|weakening| {
+        weakening.source == source.id
+            && weakening.target == target.id
+            && weakening.target_to_source == [source.slots[1].id]
+    }));
+}
+
+#[test]
+fn equal_dynamic_surfaces_do_not_weaken() {
+    let result = check(
+        "contract A { fn a(self); }
+        contract Same { fn a(self); }
+        struct Item { fn a(self) {} }
+        fn main() {
+            let item: dyn A + Same = Item {};
+            let same: dyn Same = item;
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert!(result.dyn_weakenings().is_empty());
+    assert_eq!(
+        result.contract_surface_id(&contract("A")),
+        result.contract_surface_id(&contract("Same"))
+    );
 }
 
 #[test]
@@ -181,7 +391,7 @@ fn cached_generic_specialization_restores_dyn_call_facts() {
         result
             .dyn_calls()
             .values()
-            .all(|fact| fact.method == Ident::new("draw") && !fact.requires_mutable)
+            .all(|fact| !fact.requires_mutable)
     );
 }
 
@@ -264,7 +474,11 @@ fn indexed_dynamic_call_records_fact() {
     )
     .expect("typecheck failed");
 
-    assert_eq!(result.dyn_calls().len(), 1);
+    let surface = result.contract_surface(&contract("Drawable"));
+    let fact = result.dyn_calls().values().next().expect("missing call");
+    assert_eq!(fact.surface, surface.id);
+    assert_eq!(fact.slot, surface.slots[0].id);
+    assert_ne!(fact.call_id, fact.receiver_id);
 }
 
 #[test]
@@ -281,7 +495,12 @@ fn for_ref_dynamic_call_records_fact() {
     )
     .expect("typecheck failed");
 
-    assert_eq!(result.dyn_calls().len(), 1);
+    let surface = result.contract_surface(&contract("Updatable"));
+    let fact = result.dyn_calls().values().next().expect("missing call");
+    assert_eq!(fact.surface, surface.id);
+    assert_eq!(fact.slot, surface.slots[0].id);
+    assert!(fact.requires_mutable);
+    assert_ne!(fact.call_id, fact.receiver_id);
 }
 
 fn assert_matches(source: &str, ty_name: &str, contract_name: &str) -> contracts::ContractMatch {
@@ -309,78 +528,14 @@ fn mismatch(source: &str, ty_name: &str, contract_name: &str) -> RequirementErro
 }
 
 #[test]
-fn direct_method_matches() {
-    let matched = assert_matches(
+fn resolved_target_families_are_preserved() {
+    let direct = assert_matches(
         "contract Drawable { fn draw(self) -> int; }
         struct Sprite { fn draw(self) -> int { 1 } }",
         "Sprite",
         "Drawable",
     );
 
-    assert_eq!(matched.slots.len(), 1);
-    assert!(matches!(
-        matched.slots[0].target,
-        ContractSlotTarget::Direct(_)
-    ));
-}
-
-#[test]
-fn readonly_requirement_rejects_mutating_method() {
-    assert!(matches!(
-        mismatch(
-            "contract Drawable { fn draw(self); }
-            struct Sprite { fn draw(ref self) {} }",
-            "Sprite",
-            "Drawable",
-        ),
-        RequirementError::Receiver { .. }
-    ));
-}
-
-#[test]
-fn parameter_type_mismatch_is_specific() {
-    assert!(matches!(
-        mismatch(
-            "contract Ticks { fn tick(ref self, dt: float); }
-            struct Timer { fn tick(ref self, dt: int) {} }",
-            "Timer",
-            "Ticks",
-        ),
-        RequirementError::Param { index: 0, .. }
-    ));
-}
-
-#[test]
-fn return_type_mismatch_is_specific() {
-    assert!(matches!(
-        mismatch(
-            "contract Named { fn name(self) -> string; }
-            struct Enemy { fn name(self) -> int { 1 } }",
-            "Enemy",
-            "Named",
-        ),
-        RequirementError::Return { .. }
-    ));
-}
-
-#[test]
-fn default_parameter_does_not_reduce_arity() {
-    assert!(matches!(
-        mismatch(
-            "contract Drawable { fn draw(self); }
-            struct Sprite { fn draw(self, layer: int = 0) {} }",
-            "Sprite",
-            "Drawable",
-        ),
-        RequirementError::Arity {
-            expected: 0,
-            found: 1
-        }
-    ));
-}
-
-#[test]
-fn imported_extension_method_matches() {
     let mut tc = checker_with_modules(
         "import ai { Enemy };
         contract Updatable { fn update(ref self, dt: float); }",
@@ -394,96 +549,20 @@ fn imported_extension_method_matches() {
         ],
     );
     let ty = root_type(&mut tc, "Enemy");
-    let matched =
-        match contracts::match_contract(&mut tc, &ty, &contract("Updatable"), Span::default()) {
-            Ok(matched) => matched,
-            Err(
-                ContractMatchError::UnknownContract
-                | ContractMatchError::ConflictingRequirement(_)
-                | ContractMatchError::Unsatisfied(_),
-            ) => panic!("extension should match"),
-        };
-
-    assert!(matches!(
-        matched.slots[0].target,
-        ContractSlotTarget::Extend(_)
-    ));
-}
-
-#[test]
-fn missing_extension_import_is_missing_method() {
-    let mut tc = checker_with_modules(
-        "import enemy { Enemy };
-        contract Updatable { fn update(ref self, dt: float); }",
-        &[
-            ("enemy", "pub struct Enemy { hp: int }"),
-            (
-                "ai",
-                "pub import enemy { Enemy };
-                pub extend Enemy { fn update(ref self, dt: float) {} }",
-            ),
-        ],
-    );
-    let ty = root_type(&mut tc, "Enemy");
-    let Err(ContractMatchError::Unsatisfied(err)) =
+    let Ok(extended) =
         contracts::match_contract(&mut tc, &ty, &contract("Updatable"), Span::default())
     else {
-        panic!("missing import should not match");
+        panic!("extension should match");
     };
 
-    assert_eq!(err.reason, RequirementError::Missing);
-}
-
-#[test]
-fn ambiguous_extension_method_is_ambiguous() {
-    let mut tc = checker_with_modules(
-        "import enemy { Enemy };
-        import aggressive;
-        import passive;
-        contract Updatable { fn update(ref self, dt: float); }",
-        &[
-            ("enemy", "pub struct Enemy { hp: int }"),
-            (
-                "aggressive",
-                "pub import enemy { Enemy };
-                pub extend Enemy { fn update(ref self, dt: float) {} }",
-            ),
-            (
-                "passive",
-                "pub import enemy { Enemy };
-                pub extend Enemy { fn update(ref self, dt: float) {} }",
-            ),
-        ],
-    );
-    let ty = root_type(&mut tc, "Enemy");
-    let Err(ContractMatchError::Unsatisfied(err)) =
-        contracts::match_contract(&mut tc, &ty, &contract("Updatable"), Span::default())
-    else {
-        panic!("ambiguous extensions should not match");
-    };
-
-    assert_eq!(err.reason, RequirementError::Ambiguous);
-}
-
-#[test]
-fn promoted_method_matches() {
-    let matched = assert_matches(
+    let promoted = assert_matches(
         "contract Updatable { fn update(ref self, dt: float); }
         struct Entity { fn update(ref self, dt: float) {} }
         struct Enemy { embed entity: Entity }",
         "Enemy",
         "Updatable",
     );
-
-    assert!(matches!(
-        matched.slots[0].target,
-        ContractSlotTarget::Promoted(_)
-    ));
-}
-
-#[test]
-fn extern_method_matches() {
-    let matched = assert_matches(
+    let external = assert_matches(
         "contract Movable { fn move_by(ref self, dx: float); }
         extern type Point { fn move_by(ref self, dx: float); }",
         "Point",
@@ -491,22 +570,177 @@ fn extern_method_matches() {
     );
 
     assert!(matches!(
-        matched.slots[0].target,
+        direct.slots[0].target,
+        ContractSlotTarget::Direct(_)
+    ));
+    assert!(matches!(
+        extended.slots[0].target,
+        ContractSlotTarget::Extend(_)
+    ));
+    assert!(matches!(
+        promoted.slots[0].target,
+        ContractSlotTarget::Promoted(_)
+    ));
+    assert!(matches!(
+        external.slots[0].target,
         ContractSlotTarget::Extern(_)
     ));
 }
 
 #[test]
-fn generic_method_rejected() {
-    assert!(matches!(
-        mismatch(
+fn signature_mismatches_are_classified() {
+    let cases = [
+        (
+            "contract Drawable { fn draw(self); }
+            struct Sprite { fn draw(ref self) {} }",
+            "Sprite",
+            "Drawable",
+            "receiver",
+        ),
+        (
+            "contract Ticks { fn tick(ref self, dt: float); }
+            struct Timer { fn tick(ref self, dt: int) {} }",
+            "Timer",
+            "Ticks",
+            "param",
+        ),
+        (
+            "contract Named { fn name(self) -> string; }
+            struct Enemy { fn name(self) -> int { 1 } }",
+            "Enemy",
+            "Named",
+            "return",
+        ),
+        (
+            "contract Drawable { fn draw(self); }
+            struct Sprite { fn draw(self, layer: int = 0) {} }",
+            "Sprite",
+            "Drawable",
+            "arity",
+        ),
+        (
             "contract Boxed { fn get(self) -> int; }
             struct Box { fn get<T>(self) -> int { 1 } }",
             "Box",
             "Boxed",
+            "generic",
         ),
-        RequirementError::GenericMethod
-    ));
+    ];
+
+    for (source, ty, contract, expected) in cases {
+        let err = mismatch(source, ty, contract);
+        let classified = match expected {
+            "receiver" => matches!(err, RequirementError::Receiver { .. }),
+            "param" => matches!(err, RequirementError::Param { index: 0, .. }),
+            "return" => matches!(err, RequirementError::Return { .. }),
+            "arity" => matches!(
+                err,
+                RequirementError::Arity {
+                    expected: 0,
+                    found: 1
+                }
+            ),
+            "generic" => matches!(err, RequirementError::GenericMethod),
+            _ => unreachable!(),
+        };
+        assert!(classified, "expected {expected}, found {err:?}");
+    }
+}
+
+#[test]
+fn witness_structural_keys_dedupe_spans() {
+    let result = check(
+        "contract A { fn a(self); }
+        struct Item { fn a(self) {} }
+        fn take(item: dyn A) {}
+        fn main() {
+            take(Item {});
+            take(Item {});
+        }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(result.contract_witnesses().len(), 1);
+    let key = result
+        .witness_structural_keys()
+        .values()
+        .next()
+        .expect("missing structural key");
+    assert_eq!(key.surface, result.contract_surface_id(&contract("A")));
+    assert_eq!(key.slots.len(), 1);
+}
+
+#[test]
+fn witness_structural_keys_ignore_declaration_order() {
+    let forward = check(
+        "contract A { fn a(self); }
+        struct Item { fn a(self) {} }
+        fn main() { let item: dyn A = Item {}; }",
+    )
+    .expect("typecheck failed");
+    let reverse = check(
+        "struct Item { fn a(self) {} }
+        contract A { fn a(self); }
+        fn main() { let item: dyn A = Item {}; }",
+    )
+    .expect("typecheck failed");
+
+    assert_eq!(
+        forward
+            .witness_structural_keys()
+            .values()
+            .next()
+            .expect("missing forward key"),
+        reverse
+            .witness_structural_keys()
+            .values()
+            .next()
+            .expect("missing reverse key")
+    );
+}
+
+#[test]
+fn witness_structural_keys_preserve_lexical_targets() {
+    let result = check_modules(
+        "import aggressive_use;
+        import passive_use;",
+        &[
+            ("api", "pub contract A { fn a(self); }"),
+            ("item", "pub struct Item {}"),
+            (
+                "aggressive_ext",
+                "pub import item { Item };
+                pub extend Item { fn a(self) {} }",
+            ),
+            (
+                "passive_ext",
+                "pub import item { Item };
+                pub extend Item { fn a(self) {} }",
+            ),
+            (
+                "aggressive_use",
+                "pub import api { A };
+                pub import aggressive_ext { Item };
+                pub fn make(item: Item) -> dyn A { item }",
+            ),
+            (
+                "passive_use",
+                "pub import api { A };
+                pub import passive_ext { Item };
+                pub fn make(item: Item) -> dyn A { item }",
+            ),
+        ],
+    )
+    .expect("typecheck failed");
+
+    let keys = result
+        .witness_structural_keys()
+        .values()
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].concrete_ty, keys[1].concrete_ty);
+    assert_eq!(keys[0].surface, keys[1].surface);
+    assert_ne!(keys[0].slots, keys[1].slots);
 }
 
 #[test]

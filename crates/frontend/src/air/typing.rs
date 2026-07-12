@@ -165,6 +165,7 @@ pub(crate) fn call_arg_ty_with(
         CallArg::InitFieldOmitted => None,
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
         CallArg::SharedStringConst(id) => const_lookup(*id),
+        CallArg::DynBorrow(borrow) => Some(borrow.ty),
     }
 }
 
@@ -298,7 +299,10 @@ pub(crate) fn rvalue_ty(
 ) -> Option<TypeId> {
     match value {
         RValue::Use(op) | RValue::FunctionValue { value: op, .. } => operand_ty(program, op),
-        RValue::Unary { ty, .. }
+        RValue::DynPack { ty, .. }
+        | RValue::DynWeaken { ty, .. }
+        | RValue::DynDowncast { ty, .. }
+        | RValue::Unary { ty, .. }
         | RValue::Binary { ty, .. }
         | RValue::Aggregate { ty, .. }
         | RValue::OptionalSome { ty, .. }
@@ -314,6 +318,17 @@ pub(crate) fn rvalue_ty(
         | RValue::MakeLambda { ty, .. } => Some(*ty),
         RValue::Cast { target, .. } => Some(*target),
         RValue::Call { callee, .. } => callee_return_ty(program, callee),
+        RValue::DynCall { surface, slot, .. } => program
+            .contract_surfaces
+            .get(surface.index())?
+            .slots
+            .get(slot.index())
+            .and_then(|slot| match slot.ret {
+                super::ContractReturnDecl::Value(ty) | super::ContractReturnDecl::Place(ty) => {
+                    Some(ty)
+                }
+                super::ContractReturnDecl::Iter => primitives.void(),
+            }),
         RValue::SharedRefEq { .. } => primitives.bool(),
         RValue::Stringify { .. } | RValue::StringConcat { .. } | RValue::Format { .. } => {
             primitives.string()

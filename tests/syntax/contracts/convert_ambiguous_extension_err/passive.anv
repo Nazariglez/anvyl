@@ -1,0 +1,7 @@
+// @helper
+
+pub import enemy { Enemy };
+
+pub extend Enemy {
+    fn update(ref self, dt: float) {}
+}

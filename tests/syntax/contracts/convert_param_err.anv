@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'tick' has an incompatible parameter at position 1
+
+contract Ticks {
+    fn tick(ref self, dt: float);
+}
+
+struct Timer {
+    fn tick(ref self, dt: int) {}
+}
+
+fn main() {
+    let item: dyn Ticks = Timer {};
+}

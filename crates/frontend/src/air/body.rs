@@ -45,6 +45,7 @@ pub enum AirStmt {
     CollectionLoan(AirCollectionLoan),
     CollectionSlotScope(AirCollectionSlotScope),
     PatternMatch(AirPatternMatch),
+    DynMatch(AirDynMatch),
     OptionalMatch(AirOptionalMatch),
     MapEntryMatch(AirMapEntryMatch),
 }
@@ -171,6 +172,82 @@ pub enum AirCollectionSlotKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AirDynMatch {
+    pub source: AirDynMatchSource,
+    pub surface: ContractSurfaceId,
+    pub arms: Vec<AirDynMatchArm>,
+    pub fallback: AirDynMatchFallback,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AirDynMatchSource {
+    Owned { value: Operand, use_: DynOwnedUse },
+    Borrowed(DynBorrow),
+    Mutable(Place),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynOwnedUse {
+    ConsumeTemporary,
+    ReusableRead,
+}
+
+impl DynOwnedUse {
+    fn value_use(self) -> ValueUse {
+        match self {
+            Self::ConsumeTemporary => ValueUse::Consume,
+            Self::ReusableRead => ValueUse::Read,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirDynMatchArm {
+    pub target: TypeId,
+    pub binding: AirDynMatchTargetBinding,
+    pub block: AirBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirDynMatchTargetBinding {
+    Discard,
+    Take(LocalId),
+    Materialize(LocalId),
+    Alias(LocalId),
+}
+
+impl AirDynMatchTargetBinding {
+    pub fn local(self) -> Option<LocalId> {
+        match self {
+            Self::Discard => None,
+            Self::Take(local) | Self::Materialize(local) | Self::Alias(local) => Some(local),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AirDynMatchFallback {
+    pub binding: AirDynMatchFallbackBinding,
+    pub block: AirBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirDynMatchFallbackBinding {
+    Discard,
+    Preserve(LocalId),
+    Alias(LocalId),
+}
+
+impl AirDynMatchFallbackBinding {
+    pub fn local(self) -> Option<LocalId> {
+        match self {
+            Self::Discard => None,
+            Self::Preserve(local) | Self::Alias(local) => Some(local),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AirPatternMatch {
     pub subject: Place,
     pub arms: Vec<AirPatternArm>,
@@ -275,6 +352,7 @@ pub enum PlaceRoot {
     Local(LocalId),
     LambdaCapture(LambdaCaptureSlotId),
     ScopedBorrow(ScopedBorrowId),
+    DynBorrowParam(DynBorrowParamId),
     CaptureCell(CaptureCellId),
     Global(GlobalId),
 }
@@ -285,6 +363,7 @@ impl PlaceRoot {
             Self::Local(local) => Some(local),
             Self::LambdaCapture(_)
             | Self::ScopedBorrow(_)
+            | Self::DynBorrowParam(_)
             | Self::CaptureCell(_)
             | Self::Global(_) => None,
         }
@@ -366,6 +445,7 @@ pub enum CallArg {
     SharedBorrow(Place),
     SharedStringConst(ConstId),
     MutBorrow(Place),
+    DynBorrow(DynBorrow),
 }
 
 impl CallArg {
@@ -375,7 +455,7 @@ impl CallArg {
                 ParamMode::Value
             }
             Self::SharedBorrow(_) | Self::SharedStringConst(_) => ParamMode::SharedBorrow,
-            Self::MutBorrow(_) => ParamMode::MutBorrow,
+            Self::MutBorrow(_) | Self::DynBorrow(_) => ParamMode::MutBorrow,
         }
     }
 
@@ -385,6 +465,7 @@ impl CallArg {
             | Self::InitFieldProvided(Operand::Place(place))
             | Self::SharedBorrow(place)
             | Self::MutBorrow(place) => Some(place),
+            Self::DynBorrow(borrow) => Some(borrow.place()),
             Self::Value(Operand::Const(_))
             | Self::InitFieldProvided(Operand::Const(_))
             | Self::InitFieldOmitted
@@ -418,6 +499,31 @@ pub enum IterCountCheck {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
+    DynPack {
+        value: Operand,
+        use_: DynOwnedUse,
+        witness: ContractWitnessId,
+        ty: TypeId,
+    },
+    DynWeaken {
+        value: Operand,
+        use_: DynOwnedUse,
+        weakening: ContractWeakeningId,
+        ty: TypeId,
+    },
+    DynDowncast {
+        value: Operand,
+        use_: DynOwnedUse,
+        surface: ContractSurfaceId,
+        target: TypeId,
+        ty: TypeId,
+    },
+    DynCall {
+        receiver: DynReceiver,
+        surface: ContractSurfaceId,
+        slot: ContractSlotId,
+        args: Vec<CallArg>,
+    },
     FunctionValue {
         value: Operand,
         capability: FunctionValueCapability,
@@ -537,11 +643,87 @@ pub enum RValue {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynBorrowSource {
+    Concrete {
+        place: Place,
+        witness: ContractWitnessId,
+    },
+    Owned(Place),
+    Borrowed(Place),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynBorrow {
+    pub source: DynBorrowSource,
+    pub ty: TypeId,
+    pub surface: ContractSurfaceId,
+    pub weakening: Option<ContractWeakeningId>,
+}
+
+impl DynBorrow {
+    pub fn place(&self) -> &Place {
+        match &self.source {
+            DynBorrowSource::Concrete { place, .. }
+            | DynBorrowSource::Owned(place)
+            | DynBorrowSource::Borrowed(place) => place,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DynReceiver {
+    Owned(Operand),
+    MutableOwned(Place),
+    Borrowed(DynBorrow),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Callee {
     Function(FunctionId),
     Extern(ExternId),
     Lambda(Operand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueUse {
+    Read,
+    Store,
+    CallValue,
+    Consume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceUse {
+    Read,
+    Mutate,
+    Borrow(ParamMode),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AirChild<'a> {
+    RValue {
+        value: &'a RValue,
+        use_: ValueUse,
+    },
+    Operand {
+        operand: &'a Operand,
+        use_: ValueUse,
+    },
+    Place {
+        place: &'a Place,
+        use_: PlaceUse,
+    },
+    CallArg {
+        callee: Option<&'a Callee>,
+        index: usize,
+        arg: &'a CallArg,
+        mode: ParamMode,
+    },
+    LambdaCapture(&'a LambdaCaptureArg),
+    DynBorrow(&'a DynBorrow),
+    LocalRead(LocalId),
+    Block(&'a AirBlock),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,51 +738,317 @@ pub enum AggregateCtor {
 }
 
 impl AirBody {
+    pub fn walk_children(&self, f: &mut impl FnMut(AirChild<'_>)) {
+        self.block.walk_children(f);
+    }
+
     pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
-        self.block.for_each_rvalue(f);
+        self.walk_children(&mut |child| {
+            if let AirChild::RValue { value, .. } = child {
+                f(value);
+            }
+        });
     }
 }
 
 impl AirBlock {
-    pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
+    pub fn for_each_child(&self, f: &mut impl FnMut(AirChild<'_>)) {
         for stmt in &self.stmts {
-            stmt.for_each_rvalue(f);
+            stmt.for_each_child(f);
         }
+        if let AirTail::Return(Some(operand)) = &self.tail {
+            f(AirChild::Operand {
+                operand,
+                use_: ValueUse::Consume,
+            });
+        }
+    }
+
+    pub fn walk_children(&self, f: &mut impl FnMut(AirChild<'_>)) {
+        self.for_each_child(&mut |child| walk_child(child, f));
+    }
+}
+
+fn walk_child(child: AirChild<'_>, f: &mut impl FnMut(AirChild<'_>)) {
+    f(child);
+    match child {
+        AirChild::RValue { value, use_ } => {
+            value.for_each_child(use_, &mut |child| walk_child(child, f));
+        }
+        AirChild::Block(block) => block.for_each_child(&mut |child| walk_child(child, f)),
+        AirChild::Operand { .. }
+        | AirChild::Place { .. }
+        | AirChild::CallArg { .. }
+        | AirChild::LambdaCapture(_)
+        | AirChild::DynBorrow(_)
+        | AirChild::LocalRead(_) => {}
     }
 }
 
 impl AirStmt {
-    pub fn for_each_rvalue(&self, f: &mut impl FnMut(&RValue)) {
+    pub fn for_each_child(&self, f: &mut impl FnMut(AirChild<'_>)) {
         match self {
             Self::Init { value, .. }
-            | Self::Assign { value, .. }
-            | Self::Eval(value)
             | Self::GlobalSetRoot { value, .. }
-            | Self::GlobalUpdateRoot { value, .. } => f(value),
+            | Self::GlobalUpdateRoot { value, .. } => f(AirChild::RValue {
+                value,
+                use_: ValueUse::Store,
+            }),
+            Self::Assign { dst, value } => {
+                f(AirChild::Place {
+                    place: dst,
+                    use_: PlaceUse::Mutate,
+                });
+                f(AirChild::RValue {
+                    value,
+                    use_: ValueUse::Store,
+                });
+            }
+            Self::Eval(value) => f(AirChild::RValue {
+                value,
+                use_: ValueUse::Read,
+            }),
             Self::GlobalEnsure { .. } => {}
             Self::If(branch) => {
-                branch.then_block.for_each_rvalue(f);
+                f(AirChild::Operand {
+                    operand: &branch.cond,
+                    use_: ValueUse::Read,
+                });
+                f(AirChild::Block(&branch.then_block));
                 if let Some(block) = &branch.else_block {
-                    block.for_each_rvalue(f);
+                    f(AirChild::Block(block));
                 }
             }
-            Self::Loop(loop_) => loop_.body.for_each_rvalue(f),
-            Self::RangeFor(range) => range.body.for_each_rvalue(f),
-            Self::CollectionFor(for_) => for_.body.for_each_rvalue(f),
-            Self::CollectionLoan(loan) => loan.body.for_each_rvalue(f),
-            Self::CollectionSlotScope(scope) => scope.body.for_each_rvalue(f),
-            Self::PatternMatch(match_) => {
-                for arm in &match_.arms {
-                    arm.block.for_each_rvalue(f);
+            Self::Loop(loop_) => f(AirChild::Block(&loop_.body)),
+            Self::RangeFor(range) => {
+                for operand in [&range.start, &range.end] {
+                    f(AirChild::Operand {
+                        operand,
+                        use_: ValueUse::Read,
+                    });
                 }
+                for operand in range.ordinal_plan.operands() {
+                    f(AirChild::Operand {
+                        operand,
+                        use_: ValueUse::Read,
+                    });
+                }
+                f(AirChild::LocalRead(range.item));
+                if let Some(ordinal) = range.ordinal {
+                    f(AirChild::LocalRead(ordinal));
+                }
+                f(AirChild::Block(&range.body));
+            }
+            Self::CollectionFor(for_) => {
+                f(AirChild::LocalRead(for_.len));
+                for operand in for_.ordinal_plan.operands() {
+                    f(AirChild::Operand {
+                        operand,
+                        use_: ValueUse::Read,
+                    });
+                }
+                f(AirChild::LocalRead(for_.index));
+                if let Some(ordinal) = for_.ordinal {
+                    f(AirChild::LocalRead(ordinal));
+                }
+                f(AirChild::Block(&for_.body));
+            }
+            Self::CollectionLoan(loan) => {
+                let mode = match loan.mode {
+                    AirCollectionLoanMode::ReadonlySequence
+                    | AirCollectionLoanMode::ReadonlyMap => ParamMode::SharedBorrow,
+                    AirCollectionLoanMode::MutableSequenceElement
+                    | AirCollectionLoanMode::MutableMapValue => ParamMode::MutBorrow,
+                };
+                f(AirChild::Place {
+                    place: &loan.root,
+                    use_: PlaceUse::Borrow(mode),
+                });
+                f(AirChild::Block(&loan.body));
+            }
+            Self::CollectionSlotScope(scope) => {
+                f(AirChild::Place {
+                    place: &scope.root,
+                    use_: PlaceUse::Read,
+                });
+                f(AirChild::LocalRead(scope.index));
+                f(AirChild::Block(&scope.body));
+            }
+            Self::PatternMatch(match_) => {
+                let has_alias = match_.arms.iter().any(|arm| {
+                    arm.alternatives.iter().any(|alternative| {
+                        alternative
+                            .bindings
+                            .iter()
+                            .any(|binding| binding.mode == AirPatternBindingMode::Alias)
+                    })
+                });
+                f(AirChild::Place {
+                    place: &match_.subject,
+                    use_: if has_alias {
+                        PlaceUse::Borrow(ParamMode::MutBorrow)
+                    } else {
+                        PlaceUse::Read
+                    },
+                });
+                for arm in &match_.arms {
+                    f(AirChild::Block(&arm.block));
+                }
+            }
+            Self::DynMatch(match_) => {
+                match &match_.source {
+                    AirDynMatchSource::Owned { value, use_ } => {
+                        emit_operand(f, value, use_.value_use());
+                    }
+                    AirDynMatchSource::Borrowed(borrow) => f(AirChild::DynBorrow(borrow)),
+                    AirDynMatchSource::Mutable(place) => {
+                        emit_place(f, place, PlaceUse::Borrow(ParamMode::MutBorrow));
+                    }
+                }
+                for arm in &match_.arms {
+                    f(AirChild::Block(&arm.block));
+                }
+                f(AirChild::Block(&match_.fallback.block));
             }
             Self::OptionalMatch(match_) => {
-                match_.some_block.for_each_rvalue(f);
-                match_.none_block.for_each_rvalue(f);
+                f(AirChild::Place {
+                    place: &match_.discr,
+                    use_: if match_.payload_ref {
+                        PlaceUse::Borrow(ParamMode::MutBorrow)
+                    } else {
+                        PlaceUse::Read
+                    },
+                });
+                f(AirChild::Block(&match_.some_block));
+                f(AirChild::Block(&match_.none_block));
             }
             Self::MapEntryMatch(match_) => {
-                match_.some_block.for_each_rvalue(f);
-                match_.none_block.for_each_rvalue(f);
+                f(AirChild::Place {
+                    place: &match_.map,
+                    use_: PlaceUse::Mutate,
+                });
+                f(AirChild::Operand {
+                    operand: &match_.key,
+                    use_: ValueUse::Read,
+                });
+                f(AirChild::Block(&match_.some_block));
+                f(AirChild::Block(&match_.none_block));
+            }
+        }
+    }
+}
+
+fn emit_operand<'a>(f: &mut impl FnMut(AirChild<'a>), operand: &'a Operand, use_: ValueUse) {
+    f(AirChild::Operand { operand, use_ });
+}
+
+fn emit_place<'a>(f: &mut impl FnMut(AirChild<'a>), place: &'a Place, use_: PlaceUse) {
+    f(AirChild::Place { place, use_ });
+}
+
+impl RValue {
+    pub fn for_each_child(&self, use_: ValueUse, f: &mut impl FnMut(AirChild<'_>)) {
+        match self {
+            Self::Use(value) | Self::FunctionValue { value, .. } => emit_operand(f, value, use_),
+            Self::DynPack { value, use_, .. }
+            | Self::DynWeaken { value, use_, .. }
+            | Self::DynDowncast { value, use_, .. } => {
+                emit_operand(f, value, use_.value_use());
+            }
+            Self::DynCall { receiver, args, .. } => {
+                match receiver {
+                    DynReceiver::Owned(value) => emit_operand(f, value, ValueUse::Read),
+                    DynReceiver::MutableOwned(place) => emit_place(f, place, PlaceUse::Mutate),
+                    DynReceiver::Borrowed(borrow) => f(AirChild::DynBorrow(borrow)),
+                }
+                for (index, arg) in args.iter().enumerate() {
+                    f(AirChild::CallArg {
+                        callee: None,
+                        index,
+                        arg,
+                        mode: arg.mode(),
+                    });
+                }
+            }
+            Self::Unary { value, .. }
+            | Self::OptionalSome { value, .. }
+            | Self::Cast { value, .. }
+            | Self::Stringify { value, .. }
+            | Self::Format { value, .. }
+            | Self::CheckedIterCount { count: value, .. } => emit_operand(f, value, ValueUse::Read),
+            Self::Binary { lhs, rhs, .. } | Self::SharedRefEq { lhs, rhs, .. } => {
+                emit_operand(f, lhs, ValueUse::Read);
+                emit_operand(f, rhs, ValueUse::Read);
+            }
+            Self::Aggregate { fields, .. } => {
+                for field in fields {
+                    emit_operand(f, field, ValueUse::Store);
+                }
+            }
+            Self::Call { callee, args } => {
+                if let Callee::Lambda(value) = callee {
+                    emit_operand(f, value, ValueUse::Read);
+                }
+                for (index, arg) in args.iter().enumerate() {
+                    f(AirChild::CallArg {
+                        callee: Some(callee),
+                        index,
+                        arg,
+                        mode: arg.mode(),
+                    });
+                }
+            }
+            Self::StringConcat { parts } => {
+                for part in parts {
+                    emit_operand(f, part, ValueUse::Read);
+                }
+            }
+            Self::Len { source } => emit_place(f, source, PlaceUse::Read),
+            Self::ListPush { list, value } => {
+                emit_place(f, list, PlaceUse::Mutate);
+                emit_operand(f, value, ValueUse::Store);
+            }
+            Self::ListPop { list, .. } => emit_place(f, list, PlaceUse::Mutate),
+            Self::RangeListCopy {
+                source, start, end, ..
+            } => {
+                emit_place(f, source, PlaceUse::Read);
+                f(AirChild::LocalRead(*start));
+                f(AirChild::LocalRead(*end));
+            }
+            Self::SliceView {
+                source, start, end, ..
+            } => {
+                emit_place(f, source, PlaceUse::Borrow(ParamMode::SharedBorrow));
+                f(AirChild::LocalRead(*start));
+                f(AirChild::LocalRead(*end));
+            }
+            Self::MapGet { map, key, .. } => {
+                emit_place(f, map, PlaceUse::Read);
+                emit_operand(f, key, ValueUse::Read);
+            }
+            Self::MapInsert {
+                map, key, value, ..
+            } => {
+                emit_place(f, map, PlaceUse::Mutate);
+                emit_operand(f, key, ValueUse::Store);
+                emit_operand(f, value, ValueUse::Store);
+            }
+            Self::MapRemove { map, key, .. } => {
+                emit_place(f, map, PlaceUse::Mutate);
+                emit_operand(f, key, ValueUse::Read);
+            }
+            Self::MapEntryAt { map, index, .. }
+            | Self::MapKeyAt { map, index, .. }
+            | Self::MapValueAt { map, index, .. } => {
+                emit_place(f, map, PlaceUse::Read);
+                f(AirChild::LocalRead(*index));
+            }
+            Self::FunctionRef { .. } => {}
+            Self::MakeLambda { captures, .. } => {
+                for capture in captures {
+                    f(AirChild::LambdaCapture(capture));
+                }
             }
         }
     }

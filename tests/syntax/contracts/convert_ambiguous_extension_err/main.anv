@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'update' is ambiguous
+
+import enemy { Enemy };
+import aggressive;
+import passive;
+
+contract Updatable {
+    fn update(ref self, dt: float);
+}
+
+fn main() {
+    let actor: dyn Updatable = Enemy { hp: 1 };
+}

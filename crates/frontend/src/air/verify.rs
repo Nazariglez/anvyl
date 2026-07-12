@@ -6,17 +6,21 @@ use anvyx_externs::{
 
 pub use super::typing::PrimitiveKind;
 use super::{
-    AggregateKind, CaptureCellLifetime, CaptureLocalSource, ConstValue, EnumRepr, ExternMember,
-    Function, FunctionKind, FunctionValueCapability, LambdaCaptureDecl, LambdaDecl, LambdaEscape,
-    Local, LocalKind, Mutability, Param, ParamEscape, ParamMode, ParamRole, Program, RawEnumValue,
+    AggregateKind, CaptureCellLifetime, CaptureLocalSource, ConstValue, ContractParamDecl,
+    ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractWitnessKey,
+    ContractWitnessSlotDecl, ContractWitnessTarget, EnumRepr, ExternMember, Function, FunctionKind,
+    FunctionValueCapability, LambdaCaptureDecl, LambdaDecl, LambdaEscape, Local, LocalKind,
+    Mutability, Param, ParamEscape, ParamMode, ParamRole, ParamType, Program, RawEnumValue,
     ReturnMode, ScopedBorrowDecl, ScopedBorrowSource, SignatureType, TypeData, VariantShape,
     body::{
-        AggregateCtor, AirBlock, AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind,
-        AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope, AirIf, AirMapEntryMatch,
-        AirOptionalMatch, AirOrdinalPlan, AirPatternAlternative, AirPatternArm, AirPatternBinding,
-        AirPatternBindingMode, AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest,
-        AirStmt, AirTail, CallArg, Callee, GlobalInitEffect, LambdaCaptureArg, MapWriteKind,
-        Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue,
+        AggregateCtor, AirBlock, AirChild, AirCollectionLoan, AirCollectionLoanMode,
+        AirCollectionRootKind, AirCollectionSlot, AirCollectionSlotKind, AirCollectionSlotScope,
+        AirDynMatch, AirDynMatchFallbackBinding, AirDynMatchSource, AirDynMatchTargetBinding,
+        AirIf, AirMapEntryMatch, AirOptionalMatch, AirPatternAlternative, AirPatternArm,
+        AirPatternBinding, AirPatternBindingMode, AirPatternMatch, AirPatternPath,
+        AirPatternPathStep, AirPatternTest, AirStmt, AirTail, CallArg, Callee, DynBorrow,
+        DynBorrowSource, DynOwnedUse, DynReceiver, GlobalInitEffect, LambdaCaptureArg,
+        MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue, ValueUse,
     },
     ids::*,
     place_model,
@@ -54,9 +58,17 @@ pub enum VerifySite {
     ExternType(ExternTypeId),
     Extern(ExternId),
     Lambda(LambdaId),
+    DynBorrowParam(DynBorrowParamId),
     ScopedBorrow(ScopedBorrowId),
     CaptureCell(CaptureCellId),
     Global(GlobalId),
+    ContractSurface(ContractSurfaceId),
+    ContractSlot {
+        surface: ContractSurfaceId,
+        slot: ContractSlotId,
+    },
+    ContractWitness(ContractWitnessId),
+    ContractWeakening(ContractWeakeningId),
     Function(FunctionId),
     Statement {
         function: FunctionId,
@@ -82,6 +94,29 @@ pub enum VerifyErrorKind {
     BadRValue(BadRValue),
     BadStatement(BadStatement),
     BadExtern(BadExtern),
+    BadContract(BadContract),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadContract {
+    EmptySurface,
+    EmptyDisplayName,
+    EmptySlotName,
+    DuplicateSlotName,
+    DuplicateSurface,
+    SlotIdMismatch,
+    WitnessSlotCountMismatch,
+    WitnessSlotIdMismatch,
+    DuplicateWitnessKey,
+    WitnessReceiverMismatch,
+    WitnessTargetSignatureMismatch,
+    InvalidWitnessProjection,
+    InvalidWitnessConcreteType,
+    MissingProjectedWitness,
+    DuplicateWeakening,
+    WeakeningSlotCountMismatch,
+    WeakeningNotProper,
+    WeakeningSlotSignatureMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +160,6 @@ pub enum BadType {
         first: TypeId,
         duplicate: TypeId,
     },
-    EmptyDynContract,
     Recursive(TypeId),
 }
 
@@ -277,6 +311,11 @@ pub enum BadRValue {
         expected: TypeId,
         found: TypeId,
     },
+    InvalidDynPack,
+    InvalidDynWeaken,
+    InvalidDynDowncast,
+    InvalidDynCall,
+    InvalidDynBorrow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +333,9 @@ pub enum BadStatement {
     AssignUninitializedLocal(LocalId),
     AssignUninitializedCaptureCell(CaptureCellId),
     InitImmutableLocalTwice(LocalId),
+    InvalidDynMatch,
+    DynMatchRootUsed,
+    DynMatchAliasEscapes(LocalId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +363,11 @@ pub enum BadReference {
         variant: VariantId,
     },
     InvalidModule(ModuleId),
+    InvalidContractSurface(ContractSurfaceId),
+    InvalidContractSlot {
+        surface: ContractSurfaceId,
+        slot: ContractSlotId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +527,10 @@ pub enum BadFunction {
         param: usize,
         local: LocalId,
     },
+    DynBorrowParamCount {
+        local: LocalId,
+        found: usize,
+    },
     BreakOutsideLoop(AirLoopId),
     ContinueOutsideLoop(AirLoopId),
     MatchNotExhaustive(EnumId),
@@ -621,6 +672,7 @@ pub enum BadFunction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadPlace {
     UnsupportedRoot(PlaceRoot),
+    InvalidDynBorrowParam(DynBorrowParamId),
     NoRuntimeLambdaCaptureRoot(LambdaCaptureSlotId),
     FieldProjectionOnNonAggregate(TypeId),
     FieldProjectionKindMismatch {
@@ -646,6 +698,7 @@ pub enum BadPlace {
     ImmutableRoot(PlaceRoot),
     UnsupportedCaptureCellProjection(CaptureCellId),
     UnsupportedScopedBorrowProjection(ScopedBorrowId),
+    DynBorrowParamEscapes(DynBorrowParamId),
     PromotedBindingBypassesCell {
         binding: BindingId,
         cell: CaptureCellId,
@@ -709,6 +762,9 @@ pub enum BadCall {
     ArgAliasConflict {
         first: usize,
         second: usize,
+    },
+    ReceiverArgAliasConflict {
+        arg: usize,
     },
     UnexpectedInitFieldArg {
         index: usize,
@@ -849,6 +905,10 @@ impl<'a> VerifyCx<'a> {
 
     fn has_global(&self, id: GlobalId) -> bool {
         id.index() < self.program.globals.len()
+    }
+
+    fn has_contract_surface(&self, id: ContractSurfaceId) -> bool {
+        id.index() < self.program.contract_surfaces.len()
     }
 
     fn verify_module_ref(&mut self, site: VerifySite, module: ModuleId) {
@@ -1090,6 +1150,7 @@ impl LocalInit {
             | PlaceRoot::Global(_)
             | PlaceRoot::LambdaCapture(_)
             | PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::DynBorrowParam(_)
             | PlaceRoot::CaptureCell(_) => {}
         }
     }
@@ -1111,6 +1172,7 @@ impl LocalInit {
             | PlaceRoot::Global(_)
             | PlaceRoot::LambdaCapture(_)
             | PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::DynBorrowParam(_)
             | PlaceRoot::CaptureCell(_) => {}
         }
     }
@@ -1261,6 +1323,7 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
         );
     }
 
+    collect_contract_errors(cx);
     for (id, _) in cx.program.type_arena.iter().enumerate() {
         let ty = TypeId::from_index(id);
         cx.verify_type_ref(VerifySite::Type(ty), ty);
@@ -1287,6 +1350,9 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     for (id, _) in cx.program.lambdas.iter().enumerate() {
         verify_lambda(cx, LambdaId::from_index(id));
     }
+    for (id, _) in cx.program.dyn_borrow_params.iter().enumerate() {
+        verify_dyn_borrow_param(cx, DynBorrowParamId::from_index(id));
+    }
     for (id, _) in cx.program.scoped_borrows.iter().enumerate() {
         verify_scoped_borrow(cx, ScopedBorrowId::from_index(id));
     }
@@ -1300,6 +1366,468 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     }
     for (id, _) in cx.program.functions.iter().enumerate() {
         verify_function(cx, FunctionId::from_index(id));
+    }
+}
+
+fn collect_contract_errors(cx: &mut VerifyCx<'_>) {
+    let mut surface_keys = std::collections::HashSet::new();
+    for (id, surface) in cx.program.contract_surfaces.iter().enumerate() {
+        let id = ContractSurfaceId::from_index(id);
+        if !surface_keys.insert(&surface.slots) {
+            cx.push(
+                VerifySite::ContractSurface(id),
+                VerifyErrorKind::BadContract(BadContract::DuplicateSurface),
+            );
+        }
+        verify_contract_surface(cx, id);
+    }
+    let mut witness_keys = std::collections::HashSet::new();
+    for (id, witness) in cx.program.contract_witnesses.iter().enumerate() {
+        let id = ContractWitnessId::from_index(id);
+        if !witness_keys.insert(&witness.key) {
+            cx.push(
+                VerifySite::ContractWitness(id),
+                VerifyErrorKind::BadContract(BadContract::DuplicateWitnessKey),
+            );
+        }
+        verify_contract_witness(cx, id);
+    }
+    let mut weakening_keys = std::collections::HashSet::new();
+    for (id, weakening) in cx.program.contract_weakenings.iter().enumerate() {
+        let id = ContractWeakeningId::from_index(id);
+        if !weakening_keys.insert(weakening) {
+            cx.push(
+                VerifySite::ContractWeakening(id),
+                VerifyErrorKind::BadContract(BadContract::DuplicateWeakening),
+            );
+        }
+        verify_contract_weakening(cx, id);
+    }
+    verify_projected_contract_witnesses(cx);
+}
+
+#[cfg(test)]
+pub(crate) fn verify_contract_declarations(program: &Program) -> Result<(), Vec<VerifyError>> {
+    let mut cx = VerifyCx::new(program);
+    collect_contract_errors(&mut cx);
+    if cx.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(cx.errors)
+    }
+}
+
+fn verify_contract_surface(cx: &mut VerifyCx<'_>, id: ContractSurfaceId) {
+    let surface = cx.program.contract_surface(id).clone();
+    let site = VerifySite::ContractSurface(id);
+    if surface.display_name.is_empty() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadContract(BadContract::EmptyDisplayName),
+        );
+    }
+    if surface.slots.is_empty() {
+        cx.push(
+            site,
+            VerifyErrorKind::BadContract(BadContract::EmptySurface),
+        );
+    }
+    let mut slot_names = std::collections::HashSet::new();
+    for (index, slot) in surface.slots.iter().enumerate() {
+        let slot_site = VerifySite::ContractSlot {
+            surface: id,
+            slot: slot.id,
+        };
+        if slot.id.index() != index {
+            cx.push(
+                slot_site.clone(),
+                VerifyErrorKind::BadContract(BadContract::SlotIdMismatch),
+            );
+        }
+        if slot.name.as_str().is_empty() {
+            cx.push(
+                slot_site.clone(),
+                VerifyErrorKind::BadContract(BadContract::EmptySlotName),
+            );
+        } else if !slot_names.insert(slot.name) {
+            cx.push(
+                slot_site.clone(),
+                VerifyErrorKind::BadContract(BadContract::DuplicateSlotName),
+            );
+        }
+        for param in &slot.params {
+            cx.verify_type_ref(slot_site.clone(), param.ty);
+        }
+        match slot.ret {
+            ContractReturnDecl::Value(ty) | ContractReturnDecl::Place(ty) => {
+                cx.verify_type_ref(slot_site.clone(), ty);
+            }
+            ContractReturnDecl::Iter => {}
+        }
+    }
+}
+
+fn verify_contract_witness(cx: &mut VerifyCx<'_>, id: ContractWitnessId) {
+    let witness = cx.program.contract_witness(id).clone();
+    let site = VerifySite::ContractWitness(id);
+    cx.verify_type_ref(site.clone(), witness.key.concrete_ty);
+    if matches!(
+        cx.program.type_arena.get(witness.key.concrete_ty),
+        Some(TypeData::Dyn(_))
+    ) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadContract(BadContract::InvalidWitnessConcreteType),
+        );
+    }
+    let Some(surface) = cx
+        .program
+        .contract_surfaces
+        .get(witness.key.surface.index())
+        .cloned()
+    else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidContractSurface(
+                witness.key.surface,
+            )),
+        );
+        return;
+    };
+    if witness.key.slots.len() != surface.slots.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadContract(BadContract::WitnessSlotCountMismatch),
+        );
+    }
+    for (index, slot) in witness.key.slots.iter().enumerate() {
+        let Some(required) = surface.slots.get(slot.slot.index()) else {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidContractSlot {
+                    surface: witness.key.surface,
+                    slot: slot.slot,
+                }),
+            );
+            continue;
+        };
+        if slot.slot.index() != index {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadContract(BadContract::WitnessSlotIdMismatch),
+            );
+        }
+        let receiver_compatible = contract_receiver_mode_matches(required.receiver, slot.receiver);
+        if !receiver_compatible {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadContract(BadContract::WitnessReceiverMismatch),
+            );
+        }
+        verify_contract_witness_target(
+            cx,
+            site.clone(),
+            witness.key.concrete_ty,
+            required,
+            slot,
+            &slot.target,
+            false,
+        );
+    }
+}
+
+fn verify_contract_function_target(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    receiver_ty: TypeId,
+    required: &ContractSlotDecl,
+    witness: &ContractWitnessSlotDecl,
+    function: FunctionId,
+    iter: bool,
+    check_name: bool,
+) {
+    let Some(function) = cx.program.functions.get(function.index()).cloned() else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadReference(BadReference::InvalidFunction(function)),
+        );
+        return;
+    };
+    let Some(receiver) = function
+        .signature
+        .params
+        .first()
+        .filter(|param| param.role == ParamRole::Receiver)
+    else {
+        cx.push(
+            site,
+            VerifyErrorKind::BadContract(BadContract::WitnessTargetSignatureMismatch),
+        );
+        return;
+    };
+    let params_match = contract_params_match(
+        &required.params,
+        function.signature.params[1..].iter().map(Param::param_type),
+    );
+    let return_matches = if iter {
+        matches!(required.ret, ContractReturnDecl::Iter)
+    } else {
+        contract_return_matches(required.ret, function.signature.return_mode)
+    };
+    if (check_name && function.name != required.name)
+        || receiver.ty != receiver_ty
+        || !witness_target_mode_matches(witness.receiver, receiver.mode)
+        || !params_match
+        || !return_matches
+    {
+        cx.push(
+            site,
+            VerifyErrorKind::BadContract(BadContract::WitnessTargetSignatureMismatch),
+        );
+    }
+}
+
+fn verify_contract_witness_target(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    receiver_ty: TypeId,
+    required: &ContractSlotDecl,
+    witness: &ContractWitnessSlotDecl,
+    target: &ContractWitnessTarget,
+    promoted: bool,
+) {
+    match target {
+        ContractWitnessTarget::Function { function } => verify_contract_function_target(
+            cx,
+            site,
+            receiver_ty,
+            required,
+            witness,
+            *function,
+            false,
+            !promoted,
+        ),
+        ContractWitnessTarget::IteratorFunction { function } => verify_contract_function_target(
+            cx,
+            site,
+            receiver_ty,
+            required,
+            witness,
+            *function,
+            true,
+            !promoted,
+        ),
+        ContractWitnessTarget::Extern { function } => {
+            let Some(function) = cx.program.externs.get(function.index()).cloned() else {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidExtern(*function)),
+                );
+                return;
+            };
+            let ExternMember::Method { receiver, .. } = function.member else {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadContract(BadContract::WitnessTargetSignatureMismatch),
+                );
+                return;
+            };
+            let params_match = contract_params_match(
+                &required.params,
+                function.params.iter().map(|param| ParamType {
+                    ty: param.ty,
+                    mode: param.mode,
+                    escape: param.escape,
+                }),
+            );
+            let return_matches = match required.ret {
+                ContractReturnDecl::Value(ty) => function.return_type == ty,
+                ContractReturnDecl::Place(_) | ContractReturnDecl::Iter => false,
+            };
+            if (!promoted && function.name != required.name)
+                || receiver.ty != receiver_ty
+                || !witness_target_mode_matches(witness.receiver, receiver.mode)
+                || !params_match
+                || !return_matches
+            {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadContract(BadContract::WitnessTargetSignatureMismatch),
+                );
+            }
+        }
+        ContractWitnessTarget::Promoted { fields, target } => {
+            if fields.is_empty() {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadContract(BadContract::InvalidWitnessProjection),
+                );
+                return;
+            }
+            let mut ty = receiver_ty;
+            for field in fields {
+                let aggregate = match cx.program.type_arena.get(ty) {
+                    Some(TypeData::Aggregate(id) | TypeData::DataRef(id)) => {
+                        cx.program.aggregates.get(id.index())
+                    }
+                    _ => None,
+                };
+                let Some(aggregate) = aggregate else {
+                    cx.push(
+                        site,
+                        VerifyErrorKind::BadContract(BadContract::InvalidWitnessProjection),
+                    );
+                    return;
+                };
+                let Some(field) = aggregate.fields.get(field.index()) else {
+                    cx.push(
+                        site,
+                        VerifyErrorKind::BadContract(BadContract::InvalidWitnessProjection),
+                    );
+                    return;
+                };
+                ty = field.ty;
+            }
+            verify_contract_witness_target(cx, site, ty, required, witness, target, true);
+        }
+    }
+}
+
+fn contract_receiver_mode_matches(receiver: ContractReceiver, mode: ParamMode) -> bool {
+    match receiver {
+        ContractReceiver::Value => matches!(mode, ParamMode::Value | ParamMode::SharedBorrow),
+        ContractReceiver::Ref => true,
+    }
+}
+
+fn witness_target_mode_matches(witness: ParamMode, target: ParamMode) -> bool {
+    match witness {
+        ParamMode::SharedBorrow => matches!(target, ParamMode::SharedBorrow | ParamMode::Value),
+        ParamMode::Value => target == ParamMode::Value,
+        ParamMode::MutBorrow => target == ParamMode::MutBorrow,
+    }
+}
+
+fn contract_params_match(
+    required: &[ContractParamDecl],
+    actual: impl Iterator<Item = ParamType>,
+) -> bool {
+    let actual = actual.collect::<Vec<_>>();
+    required.len() == actual.len()
+        && required.iter().zip(actual).all(|(required, actual)| {
+            let mode_matches = match required.mode {
+                ParamMode::SharedBorrow => {
+                    matches!(actual.mode, ParamMode::SharedBorrow | ParamMode::Value)
+                }
+                ParamMode::MutBorrow => actual.mode == ParamMode::MutBorrow,
+                ParamMode::Value => actual.mode == ParamMode::Value,
+            };
+            required.ty == actual.ty && required.escape == actual.escape && mode_matches
+        })
+}
+
+fn contract_return_matches(required: ContractReturnDecl, actual: ReturnMode) -> bool {
+    match (required, actual) {
+        (ContractReturnDecl::Value(expected), ReturnMode::Value(actual))
+        | (ContractReturnDecl::Place(expected), ReturnMode::Place(actual)) => expected == actual,
+        _ => false,
+    }
+}
+
+fn verify_contract_weakening(cx: &mut VerifyCx<'_>, id: ContractWeakeningId) {
+    let weakening = cx.program.contract_weakening(id).clone();
+    let site = VerifySite::ContractWeakening(id);
+    let Some(source) = cx.program.contract_surfaces.get(weakening.source.index()) else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidContractSurface(weakening.source)),
+        );
+        return;
+    };
+    let Some(target) = cx.program.contract_surfaces.get(weakening.target.index()) else {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadReference(BadReference::InvalidContractSurface(weakening.target)),
+        );
+        return;
+    };
+    if weakening.target_to_source.len() != target.slots.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadContract(BadContract::WeakeningSlotCountMismatch),
+        );
+        return;
+    }
+    if weakening.source == weakening.target || target.slots.len() >= source.slots.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadContract(BadContract::WeakeningNotProper),
+        );
+        return;
+    }
+    for (target_slot, source_slot) in target.slots.iter().zip(&weakening.target_to_source) {
+        let Some(source_slot) = source.slots.get(source_slot.index()) else {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadReference(BadReference::InvalidContractSlot {
+                    surface: weakening.source,
+                    slot: *source_slot,
+                }),
+            );
+            continue;
+        };
+        let same_signature = source_slot.name == target_slot.name
+            && source_slot.receiver == target_slot.receiver
+            && source_slot.params == target_slot.params
+            && source_slot.ret == target_slot.ret;
+        if !same_signature {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadContract(BadContract::WeakeningSlotSignatureMismatch),
+            );
+        }
+    }
+}
+
+fn verify_projected_contract_witnesses(cx: &mut VerifyCx<'_>) {
+    for (weakening_index, weakening) in cx.program.contract_weakenings.iter().enumerate() {
+        for witness in &cx.program.contract_witnesses {
+            if witness.key.surface != weakening.source {
+                continue;
+            }
+            let slots = weakening
+                .target_to_source
+                .iter()
+                .enumerate()
+                .filter_map(|(target_slot, source_slot)| {
+                    let source = witness.key.slots.get(source_slot.index())?;
+                    Some(ContractWitnessSlotDecl {
+                        slot: ContractSlotId::from_index(target_slot),
+                        receiver: source.receiver,
+                        target: source.target.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if slots.len() != weakening.target_to_source.len() {
+                continue;
+            }
+            let key = ContractWitnessKey {
+                concrete_ty: witness.key.concrete_ty,
+                surface: weakening.target,
+                slots,
+            };
+            if !cx
+                .program
+                .contract_witnesses
+                .iter()
+                .any(|candidate| candidate.key == key)
+            {
+                cx.push(
+                    VerifySite::ContractWeakening(ContractWeakeningId::from_index(weakening_index)),
+                    VerifyErrorKind::BadContract(BadContract::MissingProjectedWitness),
+                );
+            }
+        }
     }
 }
 
@@ -1813,6 +2341,30 @@ fn verify_signature_type(cx: &mut VerifyCx<'_>, site: VerifySite, sig: &Signatur
     cx.verify_type_ref(site, sig.ret.ty());
 }
 
+fn verify_dyn_borrow_param(cx: &mut VerifyCx<'_>, id: DynBorrowParamId) {
+    let decl = cx.program.dyn_borrow_params[id.index()].clone();
+    let site = VerifySite::DynBorrowParam(id);
+    cx.verify_type_ref(site.clone(), decl.ty);
+    let valid = cx
+        .program
+        .functions
+        .get(decl.owner.index())
+        .is_some_and(|function| {
+            function.signature.params.iter().any(|param| {
+                param.local_id == decl.source
+                    && param.mode == ParamMode::MutBorrow
+                    && param.ty == decl.ty
+            })
+        })
+        && matches!(cx.program.type_arena.get(decl.ty), Some(TypeData::Dyn(surface)) if *surface == decl.surface);
+    if !valid {
+        cx.push(
+            site,
+            VerifyErrorKind::BadPlace(BadPlace::InvalidDynBorrowParam(id)),
+        );
+    }
+}
+
 fn verify_scoped_borrow(cx: &mut VerifyCx<'_>, id: ScopedBorrowId) {
     let decl = cx.program.scoped_borrows[id.index()].clone();
     let site = VerifySite::ScopedBorrow(id);
@@ -1933,7 +2485,15 @@ fn verify_pattern_alias_scoped_borrow(
         );
         return;
     };
-    if !function_local_is_any_mut_borrow(function, root_local) {
+    let pattern_binding = function
+        .locals
+        .get(root_local.index())
+        .is_some_and(|local| {
+            local.kind == LocalKind::PatternBinding
+                && local.mutability == Mutability::Mutable
+                && local.binding == Some(decl.binding)
+        });
+    if !pattern_binding && !function_local_is_any_mut_borrow(function, root_local) {
         cx.push(
             site.clone(),
             VerifyErrorKind::BadFunction(BadFunction::ScopedBorrowSourceLocalMustBeMutParam {
@@ -2155,135 +2715,37 @@ fn verify_loop_capture_cell_block(
                 VerifyErrorKind::BadFunction(BadFunction::CaptureCellOutsideLoop { cell, loop_id }),
             );
         }
-        match stmt {
-            AirStmt::If(if_) => {
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &if_.then_block,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-                if let Some(block) = &if_.else_block {
-                    found_loop |= verify_loop_capture_cell_block(
-                        cx,
-                        function_id,
-                        block,
-                        cell,
-                        loop_id,
-                        in_loop,
-                    );
-                }
-            }
-            AirStmt::Loop(loop_) => {
-                found_loop |= loop_.id == loop_id;
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &loop_.body,
-                    cell,
-                    loop_id,
-                    in_loop || loop_.id == loop_id,
-                );
-            }
-            AirStmt::RangeFor(range) => {
-                found_loop |= range.id == loop_id;
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &range.body,
-                    cell,
-                    loop_id,
-                    in_loop || range.id == loop_id,
-                );
-            }
-            AirStmt::CollectionFor(for_) => {
-                found_loop |= for_.id == loop_id;
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &for_.body,
-                    cell,
-                    loop_id,
-                    in_loop || for_.id == loop_id,
-                );
-            }
-            AirStmt::CollectionLoan(loan) => {
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &loan.body,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-            }
-            AirStmt::CollectionSlotScope(scope) => {
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &scope.body,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-            }
-            AirStmt::PatternMatch(match_) => {
-                for arm in &match_.arms {
-                    found_loop |= verify_loop_capture_cell_block(
-                        cx,
-                        function_id,
-                        &arm.block,
-                        cell,
-                        loop_id,
-                        in_loop,
-                    );
-                }
-            }
-            AirStmt::OptionalMatch(match_) => {
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &match_.some_block,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &match_.none_block,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-            }
-            AirStmt::MapEntryMatch(match_) => {
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &match_.some_block,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-                found_loop |= verify_loop_capture_cell_block(
-                    cx,
-                    function_id,
-                    &match_.none_block,
-                    cell,
-                    loop_id,
-                    in_loop,
-                );
-            }
+        let enters_target_loop = match stmt {
+            AirStmt::Loop(loop_) => loop_.id == loop_id,
+            AirStmt::RangeFor(range) => range.id == loop_id,
+            AirStmt::CollectionFor(for_) => for_.id == loop_id,
             AirStmt::Init { .. }
             | AirStmt::Assign { .. }
             | AirStmt::Eval(_)
             | AirStmt::GlobalEnsure { .. }
             | AirStmt::GlobalSetRoot { .. }
-            | AirStmt::GlobalUpdateRoot { .. } => {}
-        }
+            | AirStmt::GlobalUpdateRoot { .. }
+            | AirStmt::If(_)
+            | AirStmt::CollectionLoan(_)
+            | AirStmt::CollectionSlotScope(_)
+            | AirStmt::PatternMatch(_)
+            | AirStmt::DynMatch(_)
+            | AirStmt::OptionalMatch(_)
+            | AirStmt::MapEntryMatch(_) => false,
+        };
+        found_loop |= enters_target_loop;
+        stmt.for_each_child(&mut |child| {
+            if let AirChild::Block(child) = child {
+                found_loop |= verify_loop_capture_cell_block(
+                    cx,
+                    function_id,
+                    child,
+                    cell,
+                    loop_id,
+                    in_loop || enters_target_loop,
+                );
+            }
+        });
     }
     if tail_uses_capture_cell(&block.tail, cell) && !in_loop {
         cx.push(
@@ -2295,89 +2757,32 @@ fn verify_loop_capture_cell_block(
 }
 
 fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
-    match stmt {
-        AirStmt::Init { value, .. }
-        | AirStmt::Eval(value)
-        | AirStmt::GlobalSetRoot { value, .. }
-        | AirStmt::GlobalUpdateRoot { value, .. } => rvalue_uses_capture_cell(value, cell),
-        AirStmt::Assign { dst, value } => {
-            place_uses_capture_cell(dst, cell) || rvalue_uses_capture_cell(value, cell)
-        }
-        AirStmt::If(if_) => operand_uses_capture_cell(&if_.cond, cell),
-        AirStmt::RangeFor(range) => {
-            operand_uses_capture_cell(&range.start, cell)
-                || operand_uses_capture_cell(&range.end, cell)
-                || ordinal_uses_capture_cell(&range.ordinal_plan, cell)
-        }
-        AirStmt::CollectionFor(for_) => ordinal_uses_capture_cell(&for_.ordinal_plan, cell),
-        AirStmt::CollectionLoan(loan) => place_uses_capture_cell(&loan.root, cell),
-        AirStmt::CollectionSlotScope(scope) => place_uses_capture_cell(&scope.root, cell),
-        AirStmt::PatternMatch(match_) => place_uses_capture_cell(&match_.subject, cell),
-        AirStmt::OptionalMatch(match_) => place_uses_capture_cell(&match_.discr, cell),
-        AirStmt::MapEntryMatch(match_) => {
-            place_uses_capture_cell(&match_.map, cell)
-                || operand_uses_capture_cell(&match_.key, cell)
-        }
-        AirStmt::Loop(_) | AirStmt::GlobalEnsure { .. } => false,
-    }
+    let mut found = false;
+    stmt.for_each_child(&mut |child| found |= child_uses_capture_cell(child, cell));
+    found
 }
 
 fn tail_uses_capture_cell(tail: &AirTail, cell: CaptureCellId) -> bool {
-    match tail {
-        AirTail::Return(Some(operand)) => operand_uses_capture_cell(operand, cell),
-        AirTail::None
-        | AirTail::Return(None)
-        | AirTail::Break(_)
-        | AirTail::Continue(_)
-        | AirTail::Unreachable => false,
-    }
+    matches!(tail, AirTail::Return(Some(operand)) if operand_uses_capture_cell(operand, cell))
 }
 
 fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
-    match value {
-        RValue::Use(operand)
-        | RValue::FunctionValue { value: operand, .. }
-        | RValue::Unary { value: operand, .. }
-        | RValue::OptionalSome { value: operand, .. }
-        | RValue::Cast { value: operand, .. }
-        | RValue::Stringify { value: operand, .. }
-        | RValue::Format { value: operand, .. } => operand_uses_capture_cell(operand, cell),
-        RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
-            operand_uses_capture_cell(lhs, cell) || operand_uses_capture_cell(rhs, cell)
-        }
-        RValue::Aggregate { fields, .. } | RValue::StringConcat { parts: fields } => fields
-            .iter()
-            .any(|operand| operand_uses_capture_cell(operand, cell)),
-        RValue::Call { callee, args } => {
-            matches!(callee, Callee::Lambda(operand) if operand_uses_capture_cell(operand, cell))
-                || args.iter().any(|arg| call_arg_uses_capture_cell(arg, cell))
-        }
-        RValue::Len { source }
-        | RValue::ListPop { list: source, .. }
-        | RValue::RangeListCopy { source, .. }
-        | RValue::MapGet { map: source, .. }
-        | RValue::MapEntryAt { map: source, .. }
-        | RValue::MapKeyAt { map: source, .. }
-        | RValue::MapValueAt { map: source, .. }
-        | RValue::SliceView { source, .. } => place_uses_capture_cell(source, cell),
-        RValue::ListPush { list, value } => {
-            place_uses_capture_cell(list, cell) || operand_uses_capture_cell(value, cell)
-        }
-        RValue::MapInsert {
-            map, key, value, ..
-        } => {
-            place_uses_capture_cell(map, cell)
-                || operand_uses_capture_cell(key, cell)
-                || operand_uses_capture_cell(value, cell)
-        }
-        RValue::MapRemove { map, key, .. } => {
-            place_uses_capture_cell(map, cell) || operand_uses_capture_cell(key, cell)
-        }
-        RValue::CheckedIterCount { count, .. } => operand_uses_capture_cell(count, cell),
-        RValue::MakeLambda { captures, .. } => captures
-            .iter()
-            .any(|capture| lambda_capture_arg_uses_capture_cell(capture, cell)),
-        RValue::FunctionRef { .. } => false,
+    let mut found = false;
+    value.for_each_child(ValueUse::Read, &mut |child| {
+        found |= child_uses_capture_cell(child, cell);
+    });
+    found
+}
+
+fn child_uses_capture_cell(child: AirChild<'_>, cell: CaptureCellId) -> bool {
+    match child {
+        AirChild::RValue { value, .. } => rvalue_uses_capture_cell(value, cell),
+        AirChild::Operand { operand, .. } => operand_uses_capture_cell(operand, cell),
+        AirChild::Place { place, .. } => place_uses_capture_cell(place, cell),
+        AirChild::CallArg { arg, .. } => call_arg_uses_capture_cell(arg, cell),
+        AirChild::LambdaCapture(capture) => lambda_capture_arg_uses_capture_cell(capture, cell),
+        AirChild::DynBorrow(borrow) => place_uses_capture_cell(borrow.place(), cell),
+        AirChild::LocalRead(_) | AirChild::Block(_) => false,
     }
 }
 
@@ -2389,6 +2794,7 @@ fn call_arg_uses_capture_cell(arg: &CallArg, cell: CaptureCellId) -> bool {
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             place_uses_capture_cell(place, cell)
         }
+        CallArg::DynBorrow(borrow) => place_uses_capture_cell(borrow.place(), cell),
         CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => false,
     }
 }
@@ -2402,11 +2808,6 @@ fn lambda_capture_arg_uses_capture_cell(arg: &LambdaCaptureArg, cell: CaptureCel
         }
         LambdaCaptureArg::NoRuntime => false,
     }
-}
-
-fn ordinal_uses_capture_cell(plan: &AirOrdinalPlan, cell: CaptureCellId) -> bool {
-    plan.operands()
-        .any(|operand| operand_uses_capture_cell(operand, cell))
 }
 
 fn operand_uses_capture_cell(operand: &Operand, cell: CaptureCellId) -> bool {
@@ -3384,6 +3785,25 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
                     }),
                 );
             }
+            if param.mode == ParamMode::MutBorrow
+                && matches!(cx.type_data(param.ty), Some(TypeData::Dyn(_)))
+            {
+                let found = cx
+                    .program
+                    .dyn_borrow_params
+                    .iter()
+                    .filter(|decl| decl.owner == id && decl.source == param.local_id)
+                    .count();
+                if found != 1 {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFunction(BadFunction::DynBorrowParamCount {
+                            local: param.local_id,
+                            found,
+                        }),
+                    );
+                }
+            }
         }
     }
 
@@ -3427,6 +3847,7 @@ fn verify_function(cx: &mut VerifyCx<'_>, id: FunctionId) {
     let mut state = LocalInit::new(cx.program, func);
     let falls_through = verify_air_block(cx, id, &func.body.block, &mut state, &mut Vec::new());
     verify_collection_loan_contract(cx, id, &func.body.block);
+    verify_dyn_borrow_root_contract(cx, id, &func.body.block);
     if falls_through.is_some()
         && !matches!(
             cx.type_data(func.signature.return_type()),
@@ -3458,6 +3879,7 @@ fn verify_air_block(
 struct LoopCtx {
     id: AirLoopId,
     breaks: Vec<LocalInit>,
+    backedges: Vec<LocalInit>,
 }
 
 fn clear_rvalue_write_state(
@@ -3477,6 +3899,36 @@ fn clear_rvalue_write_state(
         | RValue::MapInsert { map: list, .. }
         | RValue::MapRemove { map: list, .. } => state.clear_place_value(list),
         _ => {}
+    }
+}
+
+fn clear_dyn_consumed_temporary(value: &RValue, state: &mut LocalInit) {
+    let operand = match value {
+        RValue::DynPack {
+            value,
+            use_: DynOwnedUse::ConsumeTemporary,
+            ..
+        }
+        | RValue::DynWeaken {
+            value,
+            use_: DynOwnedUse::ConsumeTemporary,
+            ..
+        }
+        | RValue::DynDowncast {
+            value,
+            use_: DynOwnedUse::ConsumeTemporary,
+            ..
+        } => Some(value),
+        _ => None,
+    };
+    if let Some(Operand::Place(Place {
+        root: PlaceRoot::Local(local),
+        projection,
+        ..
+    })) = operand
+        && projection.is_empty()
+    {
+        state.clear(*local);
     }
 }
 
@@ -3506,6 +3958,7 @@ fn verify_air_stmt(
                     );
                 }
                 let mut next = state.clone();
+                clear_dyn_consumed_temporary(value, &mut next);
                 next.init(*local);
                 next.set_local_value(
                     *local,
@@ -3521,6 +3974,7 @@ fn verify_air_stmt(
             verify_assign_stmt(cx, function_id, block_id, index, dst, value);
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             let mut next = state.clone();
+            clear_dyn_consumed_temporary(value, &mut next);
             if let PlaceRoot::CaptureCell(cell) = dst.root
                 && dst.projection.is_empty()
             {
@@ -3538,6 +3992,7 @@ fn verify_air_stmt(
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             let mut next = state.clone();
             clear_rvalue_write_state(cx.program, function_id, value, &mut next);
+            clear_dyn_consumed_temporary(value, &mut next);
             Some(next)
         }
         AirStmt::GlobalEnsure { global } => {
@@ -3563,6 +4018,7 @@ fn verify_air_stmt(
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_set_root_stmt(cx, function_id, block_id, index, *global, value, *init);
             let mut next = state.clone();
+            clear_dyn_consumed_temporary(value, &mut next);
             next.set_global_value(
                 *global,
                 rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
@@ -3574,6 +4030,7 @@ fn verify_air_stmt(
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_update_root_stmt(cx, function_id, block_id, index, *global, value, state);
             let mut next = state.clone();
+            clear_dyn_consumed_temporary(value, &mut next);
             next.set_global_value(
                 *global,
                 rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
@@ -3584,10 +4041,23 @@ fn verify_air_stmt(
         AirStmt::Loop(loop_) => {
             loops.push(LoopCtx {
                 id: loop_.id,
-                breaks: Vec::new(),
+                breaks: vec![],
+                backedges: vec![],
             });
             let mut body_state = state.clone();
-            verify_air_block(cx, function_id, &loop_.body, &mut body_state, loops);
+            let fallthrough =
+                verify_air_block(cx, function_id, &loop_.body, &mut body_state, loops);
+            let mut backedges = loops
+                .last_mut()
+                .unwrap()
+                .backedges
+                .drain(..)
+                .collect::<Vec<_>>();
+            backedges.extend(fallthrough);
+            if let Some(mut backedge) = LocalInit::join(backedges) {
+                clear_loop_iteration_locals(&mut backedge, &loop_.body);
+                verify_air_block(cx, function_id, &loop_.body, &mut backedge, loops);
+            }
             let loop_ctx = loops.pop().unwrap();
             LocalInit::join(loop_ctx.breaks)
         }
@@ -3651,6 +4121,9 @@ fn verify_air_stmt(
         AirStmt::PatternMatch(match_) => {
             verify_air_pattern_match(cx, function_id, index, match_, state, loops)
         }
+        AirStmt::DynMatch(match_) => {
+            verify_air_dyn_match(cx, function_id, index, match_, state, loops)
+        }
         AirStmt::OptionalMatch(match_) => {
             verify_air_optional_match(cx, function_id, index, match_, state, loops)
         }
@@ -3671,16 +4144,91 @@ fn verify_air_for_body(
 ) -> Option<LocalInit> {
     loops.push(LoopCtx {
         id,
-        breaks: Vec::new(),
+        breaks: vec![],
+        backedges: vec![],
     });
+    let locals = locals.into_iter().collect::<Vec<_>>();
     let mut body_state = state.clone();
-    for local in locals {
-        body_state.init(local);
-        body_state.set_local_value(local, FunctionValueState::non_function());
+    init_loop_locals(&mut body_state, &locals);
+    let fallthrough = verify_air_block(cx, function_id, body, &mut body_state, loops);
+    let mut backedges = loops
+        .last_mut()
+        .unwrap()
+        .backedges
+        .drain(..)
+        .collect::<Vec<_>>();
+    backedges.extend(fallthrough);
+    if let Some(mut backedge) = LocalInit::join(backedges) {
+        clear_loop_iteration_locals(&mut backedge, body);
+        init_loop_locals(&mut backedge, &locals);
+        verify_air_block(cx, function_id, body, &mut backedge, loops);
     }
-    verify_air_block(cx, function_id, body, &mut body_state, loops);
     let loop_ctx = loops.pop().unwrap();
     LocalInit::join(std::iter::once(state.clone()).chain(loop_ctx.breaks))
+}
+
+fn init_loop_locals(state: &mut LocalInit, locals: &[LocalId]) {
+    for local in locals {
+        state.init(*local);
+        state.set_local_value(*local, FunctionValueState::non_function());
+    }
+}
+
+fn clear_loop_iteration_locals(state: &mut LocalInit, block: &AirBlock) {
+    for stmt in &block.stmts {
+        match stmt {
+            AirStmt::Init { local, .. } => state.clear(*local),
+            AirStmt::CollectionSlotScope(scope) => {
+                for slot in &scope.slots {
+                    state.clear(slot.local);
+                }
+            }
+            AirStmt::PatternMatch(match_) => {
+                for arm in &match_.arms {
+                    for alternative in &arm.alternatives {
+                        for binding in &alternative.bindings {
+                            state.clear(binding.local);
+                        }
+                    }
+                }
+            }
+            AirStmt::DynMatch(match_) => {
+                for binding in match_
+                    .arms
+                    .iter()
+                    .filter_map(|arm| arm.binding.local())
+                    .chain(match_.fallback.binding.local())
+                {
+                    state.clear(binding);
+                }
+            }
+            AirStmt::OptionalMatch(match_) => {
+                if let Some(payload) = match_.payload {
+                    state.clear(payload);
+                }
+            }
+            AirStmt::MapEntryMatch(match_) => {
+                if let Some(payload) = match_.payload {
+                    state.clear(payload);
+                }
+            }
+            AirStmt::Assign { .. }
+            | AirStmt::Eval(_)
+            | AirStmt::GlobalEnsure { .. }
+            | AirStmt::GlobalSetRoot { .. }
+            | AirStmt::GlobalUpdateRoot { .. }
+            | AirStmt::If(_)
+            | AirStmt::Loop(_)
+            | AirStmt::RangeFor(_)
+            | AirStmt::CollectionFor(_)
+            | AirStmt::CollectionLoan(_) => {}
+        }
+        stmt.for_each_child(&mut |child| {
+            if let AirChild::Block(block) = child {
+                clear_loop_iteration_locals(state, block);
+            }
+        });
+    }
 }
 
 fn verify_collection_loan(
@@ -3926,6 +4474,132 @@ fn collection_sequence_elem(program: &Program, root_ty: TypeId) -> Option<TypeId
     typing::sequence_elem(program, root_ty)
 }
 
+fn verify_dyn_borrow_root_contract(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block: &AirBlock,
+) {
+    for stmt in &block.stmts {
+        if let AirStmt::DynMatch(match_) = stmt {
+            match &match_.source {
+                AirDynMatchSource::Borrowed(_) => {}
+                AirDynMatchSource::Mutable(place) => {
+                    if !matches!(place.root, PlaceRoot::DynBorrowParam(_)) {
+                        reject_dyn_borrow_place(cx, function_id, place);
+                    }
+                }
+                AirDynMatchSource::Owned { value, .. } => {
+                    reject_dyn_borrow_operand(cx, function_id, value);
+                }
+            }
+            for arm in &match_.arms {
+                verify_dyn_borrow_root_contract(cx, function_id, &arm.block);
+            }
+            verify_dyn_borrow_root_contract(cx, function_id, &match_.fallback.block);
+            continue;
+        }
+        stmt.for_each_child(&mut |child| verify_dyn_borrow_child(cx, function_id, child));
+    }
+    if let AirTail::Return(Some(value)) = &block.tail {
+        reject_dyn_borrow_operand(cx, function_id, value);
+    }
+}
+
+fn verify_dyn_borrow_child(cx: &mut VerifyCx<'_>, function_id: FunctionId, child: AirChild<'_>) {
+    match child {
+        AirChild::Operand { operand, .. } => {
+            reject_dyn_borrow_operand(cx, function_id, operand);
+        }
+        AirChild::Place { place, .. } => reject_dyn_borrow_place(cx, function_id, place),
+        AirChild::CallArg { arg, .. } => match arg {
+            CallArg::DynBorrow(_) | CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
+            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+                reject_dyn_borrow_operand(cx, function_id, operand);
+            }
+            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+                reject_dyn_borrow_place(cx, function_id, place);
+            }
+        },
+        AirChild::LambdaCapture(capture) => match capture {
+            LambdaCaptureArg::ReadonlyLocal { value } => {
+                reject_dyn_borrow_operand(cx, function_id, value);
+            }
+            LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+                reject_dyn_borrow_place(cx, function_id, place);
+            }
+            LambdaCaptureArg::NoRuntime | LambdaCaptureArg::CaptureCell { .. } => {}
+        },
+        AirChild::RValue { value, use_ } => {
+            value.for_each_child(use_, &mut |child| {
+                verify_dyn_borrow_child(cx, function_id, child);
+            });
+        }
+        AirChild::Block(block) => verify_dyn_borrow_root_contract(cx, function_id, block),
+        AirChild::LocalRead(local) => {
+            if let Some(decl) = cx
+                .program
+                .dyn_borrow_params
+                .iter()
+                .find(|decl| decl.owner == function_id && decl.source == local)
+            {
+                reject_dyn_borrow_place(
+                    cx,
+                    function_id,
+                    &Place {
+                        root: PlaceRoot::Local(local),
+                        projection: vec![],
+                        ty: decl.ty,
+                    },
+                );
+            }
+        }
+        AirChild::DynBorrow(_) => {}
+    }
+}
+
+fn reject_dyn_borrow_operand(cx: &mut VerifyCx<'_>, function_id: FunctionId, operand: &Operand) {
+    if let Operand::Place(place) = operand {
+        reject_dyn_borrow_place(cx, function_id, place);
+    }
+}
+
+fn is_dyn_borrow_backing_local(
+    program: &Program,
+    function_id: FunctionId,
+    root: PlaceRoot,
+) -> bool {
+    let PlaceRoot::Local(local) = root else {
+        return false;
+    };
+    program
+        .dyn_borrow_params
+        .iter()
+        .any(|decl| decl.owner == function_id && decl.source == local)
+}
+
+fn reject_dyn_borrow_place(cx: &mut VerifyCx<'_>, function_id: FunctionId, place: &Place) {
+    let borrow = match place.root {
+        PlaceRoot::DynBorrowParam(id) => Some(id),
+        PlaceRoot::Local(local) => cx
+            .program
+            .dyn_borrow_params
+            .iter()
+            .enumerate()
+            .find(|(_, decl)| decl.owner == function_id && decl.source == local)
+            .map(|(index, _)| DynBorrowParamId::from_index(index)),
+        PlaceRoot::ScopedBorrow(_)
+        | PlaceRoot::CaptureCell(_)
+        | PlaceRoot::LambdaCapture(_)
+        | PlaceRoot::Global(_) => None,
+    };
+    if let Some(id) = borrow {
+        cx.push(
+            VerifySite::Function(function_id),
+            VerifyErrorKind::BadPlace(BadPlace::DynBorrowParamEscapes(id)),
+        );
+    }
+}
+
 fn verify_collection_loan_contract(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -3977,6 +4651,12 @@ fn collect_collection_loan_slot_locals(
                 for arm in &match_.arms {
                     collect_collection_loan_slot_locals(&arm.block, slot_locals);
                 }
+            }
+            AirStmt::DynMatch(match_) => {
+                for arm in &match_.arms {
+                    collect_collection_loan_slot_locals(&arm.block, slot_locals);
+                }
+                collect_collection_loan_slot_locals(&match_.fallback.block, slot_locals);
             }
             AirStmt::OptionalMatch(match_) => {
                 collect_collection_loan_slot_locals(&match_.some_block, slot_locals);
@@ -4253,6 +4933,52 @@ fn verify_collection_loan_contract_stmt(
                 );
             }
         }
+        AirStmt::DynMatch(match_) => {
+            match &match_.source {
+                AirDynMatchSource::Owned { value, .. } => verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    value,
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+                AirDynMatchSource::Borrowed(borrow) => verify_collection_loan_contract_place(
+                    cx,
+                    function_id,
+                    borrow.place(),
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+                AirDynMatchSource::Mutable(place) => verify_collection_loan_contract_place(
+                    cx,
+                    function_id,
+                    place,
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+            }
+            for arm in &match_.arms {
+                verify_collection_loan_contract_block(
+                    cx,
+                    function_id,
+                    &arm.block,
+                    slot_locals,
+                    active_slots,
+                    active_loans,
+                );
+            }
+            verify_collection_loan_contract_block(
+                cx,
+                function_id,
+                &match_.fallback.block,
+                slot_locals,
+                active_slots,
+                active_loans,
+            );
+        }
         AirStmt::OptionalMatch(match_) => {
             verify_collection_loan_contract_place(
                 cx,
@@ -4345,6 +5071,9 @@ fn verify_collection_loan_contract_rvalue(
 ) {
     match value {
         RValue::Use(op)
+        | RValue::DynPack { value: op, .. }
+        | RValue::DynWeaken { value: op, .. }
+        | RValue::DynDowncast { value: op, .. }
         | RValue::FunctionValue { value: op, .. }
         | RValue::Unary { value: op, .. }
         | RValue::Cast { value: op, .. }
@@ -4358,6 +5087,44 @@ fn verify_collection_loan_contract_rvalue(
             active_slots,
             false,
         ),
+        RValue::DynCall { receiver, args, .. } => {
+            match receiver {
+                DynReceiver::Owned(op) => verify_collection_loan_contract_operand(
+                    cx,
+                    function_id,
+                    op,
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+                DynReceiver::MutableOwned(place) => verify_collection_loan_contract_place(
+                    cx,
+                    function_id,
+                    place,
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+                DynReceiver::Borrowed(borrow) => verify_collection_loan_contract_place(
+                    cx,
+                    function_id,
+                    borrow.place(),
+                    slot_locals,
+                    active_slots,
+                    false,
+                ),
+            }
+            for arg in args {
+                verify_collection_loan_contract_call_arg(
+                    cx,
+                    function_id,
+                    arg,
+                    slot_locals,
+                    active_slots,
+                    false,
+                );
+            }
+        }
         RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
             verify_collection_loan_contract_operand(
                 cx,
@@ -4791,6 +5558,14 @@ fn verify_collection_loan_contract_call_arg(
                 escapes,
             );
         }
+        CallArg::DynBorrow(borrow) => verify_collection_loan_contract_place(
+            cx,
+            function_id,
+            borrow.place(),
+            slot_locals,
+            active_slots,
+            escapes,
+        ),
         CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
     }
 }
@@ -5024,6 +5799,407 @@ fn verify_air_pattern_match(
         }
     }
     LocalInit::join(fallthrough)
+}
+
+fn clear_taken_place(state: &mut LocalInit, place: &Place) {
+    if let PlaceRoot::Local(local) = place.root
+        && place.projection.is_empty()
+    {
+        state.clear(local);
+    } else {
+        state.clear_place_value(place);
+    }
+}
+
+fn verify_air_dyn_match(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    index: usize,
+    match_: &AirDynMatch,
+    state: &LocalInit,
+    loops: &mut Vec<LoopCtx>,
+) -> Option<LocalInit> {
+    let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
+    let (source_ty, source_place, takes, binding_mutability) = match &match_.source {
+        AirDynMatchSource::Owned { value, use_ } => {
+            verify_air_operand_read(cx, function_id, index, value, state);
+            verify_operand(cx, function_id, BlockId::from_index(0), Some(index), value);
+            (
+                typing::operand_ty(cx.program, value),
+                match value {
+                    Operand::Place(place) => Some(place),
+                    Operand::Const(_) => None,
+                },
+                *use_ == DynOwnedUse::ConsumeTemporary,
+                Mutability::Immutable,
+            )
+        }
+        AirDynMatchSource::Borrowed(borrow) => {
+            verify_dyn_borrow(cx, function_id, BlockId::from_index(0), Some(index), borrow);
+            (
+                Some(borrow.ty),
+                Some(borrow.place()),
+                false,
+                Mutability::Immutable,
+            )
+        }
+        AirDynMatchSource::Mutable(place) => {
+            verify_air_place_write(cx, function_id, index, place, state);
+            verify_mutable_place(cx, function_id, &site, place);
+            (
+                verify_place(cx, function_id, BlockId::from_index(0), Some(index), place),
+                Some(place),
+                false,
+                Mutability::Mutable,
+            )
+        }
+    };
+    let ownership_valid = match &match_.source {
+        AirDynMatchSource::Owned { value, use_ } => {
+            dyn_owned_use_valid(cx.program, function_id, value, *use_)
+        }
+        AirDynMatchSource::Borrowed(_) | AirDynMatchSource::Mutable(_) => true,
+    };
+    let source_matches = ownership_valid && source_ty.is_some_and(|ty| {
+        matches!(cx.program.type_arena.get(ty), Some(TypeData::Dyn(surface)) if *surface == match_.surface)
+    });
+    let mut valid = source_matches;
+    let mut targets = vec![];
+    let mut fallthrough = vec![];
+
+    for arm in &match_.arms {
+        let binding = arm.binding.local();
+        valid &= matches!(
+            (&match_.source, arm.binding),
+            (
+                AirDynMatchSource::Mutable(_),
+                AirDynMatchTargetBinding::Alias(_)
+            ) | (_, AirDynMatchTargetBinding::Discard)
+                | (
+                    AirDynMatchSource::Owned {
+                        use_: DynOwnedUse::ConsumeTemporary,
+                        ..
+                    },
+                    AirDynMatchTargetBinding::Take(_)
+                )
+                | (
+                    AirDynMatchSource::Owned {
+                        use_: DynOwnedUse::ReusableRead,
+                        ..
+                    } | AirDynMatchSource::Borrowed(_),
+                    AirDynMatchTargetBinding::Materialize(_)
+                )
+        );
+        let target_is_nominal = matches!(
+            cx.program.type_arena.get(arm.target),
+            Some(
+                TypeData::Aggregate(_)
+                    | TypeData::DataRef(_)
+                    | TypeData::Enum(_)
+                    | TypeData::Extern(_)
+            )
+        );
+        let duplicate = targets.iter().any(|target| {
+            cx.program.type_arena.get(*target) == cx.program.type_arena.get(arm.target)
+        });
+        valid &= target_is_nominal && !duplicate;
+        targets.push(arm.target);
+
+        let mut arm_state = state.clone();
+        if takes && let Some(place) = source_place {
+            clear_taken_place(&mut arm_state, place);
+        }
+        valid &= verify_dyn_match_binding(
+            cx,
+            function_id,
+            binding,
+            arm.target,
+            binding_mutability,
+            state,
+            &mut arm_state,
+        );
+        if binding_mutability == Mutability::Mutable
+            && binding.is_some()
+            && let Some(place) = source_place
+            && dyn_match_block_uses_root(cx.program, function_id, &arm.block, place, binding)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::DynMatchRootUsed),
+            );
+        }
+        if binding_mutability == Mutability::Mutable
+            && let Some(binding) = binding
+            && matches!(
+                cx.program.function(function_id).signature.return_mode,
+                ReturnMode::Place(_)
+            )
+            && dyn_match_binding_returned(cx.program, function_id, &arm.block, binding)
+        {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::DynMatchAliasEscapes(binding)),
+            );
+            valid = false;
+        }
+        let break_counts = loops
+            .iter()
+            .map(|loop_| (loop_.breaks.len(), loop_.backedges.len()))
+            .collect::<Vec<_>>();
+        if let Some(mut next) = verify_air_block(cx, function_id, &arm.block, &mut arm_state, loops)
+        {
+            if let Some(binding) = binding {
+                next.clear(binding);
+            }
+            fallthrough.push(next);
+        }
+        clear_dyn_match_loop_breaks(loops, &break_counts, binding);
+    }
+
+    let fallback_binding = match_.fallback.binding.local();
+    valid &= matches!(
+        (&match_.source, match_.fallback.binding),
+        (
+            AirDynMatchSource::Mutable(_),
+            AirDynMatchFallbackBinding::Alias(_)
+        ) | (_, AirDynMatchFallbackBinding::Discard)
+            | (
+                AirDynMatchSource::Owned { .. } | AirDynMatchSource::Borrowed(_),
+                AirDynMatchFallbackBinding::Preserve(_)
+            )
+    );
+    let mut fallback_state = state.clone();
+    if takes && let Some(place) = source_place {
+        clear_taken_place(&mut fallback_state, place);
+    }
+    if let Some(source_ty) = source_ty {
+        valid &= verify_dyn_match_binding(
+            cx,
+            function_id,
+            fallback_binding,
+            source_ty,
+            binding_mutability,
+            state,
+            &mut fallback_state,
+        );
+    } else {
+        valid = false;
+    }
+    if binding_mutability == Mutability::Mutable
+        && fallback_binding.is_some()
+        && let Some(place) = source_place
+        && dyn_match_block_uses_root(
+            cx.program,
+            function_id,
+            &match_.fallback.block,
+            place,
+            fallback_binding,
+        )
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::DynMatchRootUsed),
+        );
+    }
+    if binding_mutability == Mutability::Mutable
+        && let Some(binding) = fallback_binding
+        && matches!(
+            cx.program.function(function_id).signature.return_mode,
+            ReturnMode::Place(_)
+        )
+        && dyn_match_binding_returned(cx.program, function_id, &match_.fallback.block, binding)
+    {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadStatement(BadStatement::DynMatchAliasEscapes(binding)),
+        );
+        valid = false;
+    }
+    let break_counts = loops
+        .iter()
+        .map(|loop_| (loop_.breaks.len(), loop_.backedges.len()))
+        .collect::<Vec<_>>();
+    if let Some(mut next) = verify_air_block(
+        cx,
+        function_id,
+        &match_.fallback.block,
+        &mut fallback_state,
+        loops,
+    ) {
+        if let Some(binding) = fallback_binding {
+            next.clear(binding);
+        }
+        fallthrough.push(next);
+    }
+    clear_dyn_match_loop_breaks(loops, &break_counts, fallback_binding);
+    if !valid {
+        cx.push(
+            site,
+            VerifyErrorKind::BadStatement(BadStatement::InvalidDynMatch),
+        );
+    }
+    LocalInit::join(fallthrough)
+}
+
+fn verify_dyn_match_binding(
+    cx: &VerifyCx<'_>,
+    function_id: FunctionId,
+    binding: Option<LocalId>,
+    ty: TypeId,
+    mutability: Mutability,
+    prior: &LocalInit,
+    state: &mut LocalInit,
+) -> bool {
+    let Some(binding) = binding else {
+        return true;
+    };
+    let Some(local) = cx.program.function(function_id).locals.get(binding.index()) else {
+        return false;
+    };
+    let valid = local.kind == LocalKind::PatternBinding
+        && local.ty == ty
+        && local.mutability == mutability
+        && !prior.is_possible(binding);
+    if valid {
+        state.init(binding);
+    }
+    valid
+}
+
+fn clear_dyn_match_loop_breaks(
+    loops: &mut [LoopCtx],
+    prior_counts: &[(usize, usize)],
+    binding: Option<LocalId>,
+) {
+    let Some(binding) = binding else {
+        return;
+    };
+    for (loop_, (breaks, backedges)) in loops.iter_mut().zip(prior_counts) {
+        for state in &mut loop_.breaks[*breaks..] {
+            state.clear(binding);
+        }
+        for state in &mut loop_.backedges[*backedges..] {
+            state.clear(binding);
+        }
+    }
+}
+
+fn dyn_match_binding_returned(
+    program: &Program,
+    function_id: FunctionId,
+    block: &AirBlock,
+    binding: LocalId,
+) -> bool {
+    if matches!(
+        &block.tail,
+        AirTail::Return(Some(Operand::Place(place)))
+            if dyn_match_place_has_binding_origin(program, function_id, place, binding)
+    ) {
+        return true;
+    }
+    let mut returned = false;
+    block.for_each_child(&mut |child| {
+        if let AirChild::Block(block) = child {
+            returned |= dyn_match_binding_returned(program, function_id, block, binding);
+        }
+    });
+    returned
+}
+
+fn dyn_match_place_has_binding_origin(
+    program: &Program,
+    function_id: FunctionId,
+    place: &Place,
+    binding: LocalId,
+) -> bool {
+    if place.root == PlaceRoot::Local(binding) {
+        return true;
+    }
+    let PlaceRoot::ScopedBorrow(id) = place.root else {
+        return false;
+    };
+    let Some(decl) = program.scoped_borrows.get(id.index()) else {
+        return false;
+    };
+    if decl.owner != function_id {
+        return false;
+    }
+    matches!(
+        &decl.source,
+        ScopedBorrowSource::PatternAlias { source }
+            if source.root == PlaceRoot::Local(binding)
+    )
+}
+
+fn dyn_match_block_uses_root(
+    program: &Program,
+    function_id: FunctionId,
+    block: &AirBlock,
+    root: &Place,
+    binding: Option<LocalId>,
+) -> bool {
+    let mut used = block.stmts.iter().any(|stmt| {
+        let global = match stmt {
+            AirStmt::GlobalSetRoot { global, .. } | AirStmt::GlobalUpdateRoot { global, .. } => {
+                Some(*global)
+            }
+            _ => None,
+        };
+        global.is_some_and(|global| root.root == PlaceRoot::Global(global))
+    });
+    block.for_each_child(&mut |child| {
+        used |= dyn_match_child_uses_root(program, function_id, child, root, binding);
+    });
+    used
+}
+
+fn dyn_match_child_uses_root(
+    program: &Program,
+    function_id: FunctionId,
+    child: AirChild<'_>,
+    root: &Place,
+    binding: Option<LocalId>,
+) -> bool {
+    let conflicts = |place: &Place| {
+        let guarded = binding.is_some_and(|binding| place.root == PlaceRoot::Local(binding));
+        !guarded && program.places_may_overlap(function_id, root, place)
+    };
+    match child {
+        AirChild::RValue { value, use_ } => {
+            let mut used = false;
+            value.for_each_child(use_, &mut |child| {
+                used |= dyn_match_child_uses_root(program, function_id, child, root, binding);
+            });
+            used
+        }
+        AirChild::Operand { operand, .. } => {
+            matches!(operand, Operand::Place(place) if conflicts(place))
+        }
+        AirChild::Place { place, .. } => conflicts(place),
+        AirChild::CallArg { arg, .. } => arg.place().is_some_and(conflicts),
+        AirChild::DynBorrow(borrow) => conflicts(borrow.place()),
+        AirChild::LambdaCapture(capture) => match capture {
+            LambdaCaptureArg::ReadonlyLocal { value } => {
+                matches!(value, Operand::Place(place) if conflicts(place))
+            }
+            LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+                conflicts(place)
+            }
+            LambdaCaptureArg::CaptureCell { cell } => {
+                program.capture_cell_root(function_id, root.root) == Some(*cell)
+                    || program
+                        .capture_cell_source_place(function_id, *cell)
+                        .is_some_and(|place| conflicts(&place))
+            }
+            LambdaCaptureArg::NoRuntime => false,
+        },
+        AirChild::Block(block) => {
+            dyn_match_block_uses_root(program, function_id, block, root, binding)
+        }
+        AirChild::LocalRead(local) => {
+            matches!(root.root, PlaceRoot::Local(root) if root == local)
+        }
+    }
 }
 
 fn clear_pattern_binding_locals(state: &mut LocalInit, arm: &AirPatternArm) {
@@ -5693,7 +6869,9 @@ fn verify_air_tail(
             None
         }
         AirTail::Continue(id) => {
-            if !loops.iter().any(|loop_ctx| loop_ctx.id == *id) {
+            if let Some(loop_ctx) = loops.iter_mut().rev().find(|loop_ctx| loop_ctx.id == *id) {
+                loop_ctx.backedges.push(state.clone());
+            } else {
                 cx.push(
                     site,
                     VerifyErrorKind::BadFunction(BadFunction::ContinueOutsideLoop(*id)),
@@ -5713,112 +6891,53 @@ fn verify_air_rvalue_reads(
     state: &LocalInit,
 ) {
     match value {
-        RValue::Use(op)
-        | RValue::FunctionValue { value: op, .. }
-        | RValue::Stringify { value: op, .. }
-        | RValue::Unary { value: op, .. }
-        | RValue::OptionalSome { value: op, .. }
-        | RValue::Cast { value: op, .. }
-        | RValue::Format { value: op, .. } => {
-            verify_air_operand_read(cx, function_id, index, op, state);
-        }
-        RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
-            verify_air_operand_read(cx, function_id, index, lhs, state);
-            verify_air_operand_read(cx, function_id, index, rhs, state);
-        }
-        RValue::Aggregate { fields, .. } | RValue::StringConcat { parts: fields } => {
-            for field in fields {
-                verify_air_operand_read(cx, function_id, index, field, state);
-            }
-        }
         RValue::Call { callee, args } => {
             verify_call_escape_args(cx, function_id, index, callee, args, state);
-            if let Callee::Lambda(op) = callee {
-                verify_air_operand_read(cx, function_id, index, op, state);
-            }
-            for arg in args {
-                match arg {
-                    CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
-                        verify_air_operand_read(cx, function_id, index, op, state);
-                    }
-                    CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
-                        verify_air_place_read(cx, function_id, index, place, state);
-                    }
-                    CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
-                }
-            }
         }
-        RValue::Len { source } | RValue::ListPop { list: source, .. } => {
-            verify_air_place_read(cx, function_id, index, source, state);
-        }
-        RValue::RangeListCopy {
-            source, start, end, ..
-        }
-        | RValue::SliceView {
-            source, start, end, ..
-        } => {
-            verify_air_place_read(cx, function_id, index, source, state);
-            verify_air_local_read(cx, function_id, index, *start, state);
-            verify_air_local_read(cx, function_id, index, *end, state);
-        }
-        RValue::ListPush { list, value } => {
-            verify_air_place_read(cx, function_id, index, list, state);
-            verify_air_operand_read(cx, function_id, index, value, state);
-        }
-        RValue::MapGet { map, key, .. } | RValue::MapRemove { map, key, .. } => {
-            verify_air_place_read(cx, function_id, index, map, state);
-            verify_air_operand_read(cx, function_id, index, key, state);
-        }
-        RValue::MapEntryAt {
-            map, index: key, ..
-        }
-        | RValue::MapKeyAt {
-            map, index: key, ..
-        }
-        | RValue::MapValueAt {
-            map, index: key, ..
-        } => {
-            verify_air_place_read(cx, function_id, index, map, state);
-            verify_air_local_read(cx, function_id, index, *key, state);
-        }
-        RValue::MapInsert {
-            map, key, value, ..
-        } => {
-            verify_air_place_read(cx, function_id, index, map, state);
-            verify_air_operand_read(cx, function_id, index, key, state);
-            verify_air_operand_read(cx, function_id, index, value, state);
-        }
-        RValue::CheckedIterCount { count, .. } => {
-            verify_air_operand_read(cx, function_id, index, count, state);
-        }
-        RValue::FunctionRef { .. } => {}
-        RValue::MakeLambda { captures, .. } => {
-            for capture in captures {
-                verify_air_lambda_capture_read(cx, function_id, index, capture, state);
-            }
-        }
+        RValue::DynCall {
+            surface,
+            slot,
+            args,
+            ..
+        } => verify_dyn_call_escape_args(cx, function_id, index, *surface, *slot, args, state),
+        _ => {}
     }
-}
-
-fn verify_air_lambda_capture_read(
-    cx: &mut VerifyCx<'_>,
-    function_id: FunctionId,
-    index: usize,
-    capture: &LambdaCaptureArg,
-    state: &LocalInit,
-) {
-    match capture {
-        LambdaCaptureArg::NoRuntime => {}
-        LambdaCaptureArg::CaptureCell { cell } => {
-            verify_air_cell_read(cx, function_id, index, *cell, state);
+    value.for_each_child(ValueUse::Read, &mut |child| match child {
+        AirChild::Operand { operand, .. } => {
+            verify_air_operand_read(cx, function_id, index, operand, state);
         }
-        LambdaCaptureArg::ReadonlyLocal { value } => {
-            verify_air_operand_read(cx, function_id, index, value, state);
-        }
-        LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+        AirChild::Place { place, .. } => {
             verify_air_place_read(cx, function_id, index, place, state);
         }
-    }
+        AirChild::CallArg { arg, .. } => match arg {
+            CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
+                verify_air_operand_read(cx, function_id, index, op, state);
+            }
+            CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
+                verify_air_place_read(cx, function_id, index, place, state);
+            }
+            CallArg::DynBorrow(borrow) => {
+                verify_air_place_read(cx, function_id, index, borrow.place(), state);
+            }
+            CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
+        },
+        AirChild::DynBorrow(borrow) => {
+            verify_air_place_read(cx, function_id, index, borrow.place(), state);
+        }
+        AirChild::LocalRead(local) => {
+            verify_air_local_read(cx, function_id, index, local, state);
+        }
+        AirChild::LambdaCapture(capture) => match capture {
+            LambdaCaptureArg::ReadonlyLocal { value } => {
+                verify_air_operand_read(cx, function_id, index, value, state);
+            }
+            LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
+                verify_air_place_read(cx, function_id, index, place, state);
+            }
+            LambdaCaptureArg::NoRuntime | LambdaCaptureArg::CaptureCell { .. } => {}
+        },
+        AirChild::RValue { .. } | AirChild::Block(_) => {}
+    });
 }
 
 fn verify_air_operand_read(
@@ -6273,6 +7392,29 @@ fn verify_stringify(
     }
 }
 
+fn dyn_owned_use_valid(
+    program: &Program,
+    function_id: FunctionId,
+    value: &Operand,
+    use_: DynOwnedUse,
+) -> bool {
+    let temporary = matches!(
+        value,
+        Operand::Place(Place {
+            root: PlaceRoot::Local(local),
+            projection,
+            ..
+        }) if projection.is_empty()
+            && program.function(function_id).locals.get(local.index()).is_some_and(|local| {
+                local.kind == LocalKind::Temp
+            })
+    );
+    match use_ {
+        DynOwnedUse::ConsumeTemporary => temporary,
+        DynOwnedUse::ReusableRead => !temporary,
+    }
+}
+
 fn verify_rvalue(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -6287,6 +7429,101 @@ fn verify_rvalue(
         RValue::Use(op) => {
             verify_operand(cx, function_id, block_id, stmt_index, op);
         }
+        RValue::DynPack {
+            value,
+            use_,
+            witness,
+            ty,
+        } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            let valid = dyn_owned_use_valid(cx.program, function_id, value, *use_)
+                && cx.program.contract_witnesses.get(witness.index()).is_some_and(|decl| {
+                typing::operand_ty(cx.program, value) == Some(decl.key.concrete_ty)
+                    && matches!(cx.program.type_arena.get(*ty), Some(TypeData::Dyn(surface)) if *surface == decl.key.surface)
+            });
+            if !valid {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadRValue(BadRValue::InvalidDynPack),
+                );
+            }
+            cx.verify_type_ref(site, *ty);
+        }
+        RValue::DynWeaken {
+            value,
+            use_,
+            weakening,
+            ty,
+        } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            let source_ty = typing::operand_ty(cx.program, value);
+            let valid = dyn_owned_use_valid(cx.program, function_id, value, *use_)
+                && cx.program.contract_weakenings.get(weakening.index()).is_some_and(|decl| {
+                matches!(source_ty.and_then(|ty| cx.program.type_arena.get(ty)), Some(TypeData::Dyn(surface)) if *surface == decl.source)
+                    && matches!(cx.program.type_arena.get(*ty), Some(TypeData::Dyn(surface)) if *surface == decl.target)
+            });
+            if !valid {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadRValue(BadRValue::InvalidDynWeaken),
+                );
+            }
+            cx.verify_type_ref(site, *ty);
+        }
+        RValue::DynDowncast {
+            value,
+            use_,
+            surface,
+            target,
+            ty,
+        } => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            let source_matches = matches!(
+                typing::operand_ty(cx.program, value)
+                    .and_then(|ty| cx.program.type_arena.get(ty)),
+                Some(TypeData::Dyn(found)) if found == surface
+            );
+            let target_is_nominal = matches!(
+                cx.program.type_arena.get(*target),
+                Some(
+                    TypeData::Aggregate(_)
+                        | TypeData::DataRef(_)
+                        | TypeData::Enum(_)
+                        | TypeData::Extern(_)
+                )
+            );
+            let option_matches = matches!(
+                cx.program.type_arena.get(*ty),
+                Some(TypeData::Optional(found)) if found == target
+            );
+            if !(dyn_owned_use_valid(cx.program, function_id, value, *use_)
+                && source_matches
+                && target_is_nominal
+                && option_matches)
+            {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadRValue(BadRValue::InvalidDynDowncast),
+                );
+            }
+            cx.verify_type_ref(site.clone(), *target);
+            cx.verify_type_ref(site, *ty);
+        }
+        RValue::DynCall {
+            receiver,
+            surface,
+            slot,
+            args,
+        } => verify_dyn_call(
+            cx,
+            function_id,
+            block_id,
+            stmt_index,
+            receiver,
+            *surface,
+            *slot,
+            args,
+        ),
         RValue::FunctionValue { value, .. } => {
             verify_operand(cx, function_id, block_id, stmt_index, value);
             verify_function_value_operand_type(cx, site, value);
@@ -7269,6 +8506,36 @@ fn verify_place_root(
             }
             Some(cx.program.scoped_borrows[id.index()].ty)
         }
+        PlaceRoot::DynBorrowParam(id) => {
+            let Some(decl) = cx.program.dyn_borrow_params.get(id.index()) else {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::InvalidDynBorrowParam(id)),
+                );
+                return None;
+            };
+            let valid = decl.owner == function_id
+                && cx
+                    .program
+                    .function(function_id)
+                    .signature
+                    .params
+                    .iter()
+                    .any(|param| {
+                        param.local_id == decl.source
+                            && param.mode == ParamMode::MutBorrow
+                            && param.ty == decl.ty
+                    })
+                && matches!(cx.program.type_arena.get(decl.ty), Some(TypeData::Dyn(surface)) if *surface == decl.surface);
+            if !valid {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadPlace(BadPlace::InvalidDynBorrowParam(id)),
+                );
+                return None;
+            }
+            Some(decl.ty)
+        }
         PlaceRoot::CaptureCell(id) => {
             if !cx.has_capture_cell(id) {
                 cx.push(
@@ -7844,6 +9111,182 @@ fn verify_enum_ctor(
     );
 }
 
+fn verify_dyn_call(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    stmt_index: Option<usize>,
+    receiver: &DynReceiver,
+    surface: ContractSurfaceId,
+    slot: ContractSlotId,
+    args: &[CallArg],
+) {
+    let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
+    let Some(slot_decl) = cx
+        .program
+        .contract_surfaces
+        .get(surface.index())
+        .and_then(|surface| surface.slots.get(slot.index()))
+        .cloned()
+    else {
+        cx.push(site, VerifyErrorKind::BadRValue(BadRValue::InvalidDynCall));
+        return;
+    };
+    let receiver_valid = match receiver {
+        DynReceiver::Owned(value) => {
+            verify_operand(cx, function_id, block_id, stmt_index, value);
+            slot_decl.receiver != ContractReceiver::Ref
+                && operand_dyn_surface(cx.program, value) == Some(surface)
+        }
+        DynReceiver::MutableOwned(place) => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+            verify_mutable_place(cx, function_id, &site, place);
+            slot_decl.receiver == ContractReceiver::Ref
+                && place_dyn_surface(cx.program, place) == Some(surface)
+        }
+        DynReceiver::Borrowed(borrow) => {
+            verify_dyn_borrow(cx, function_id, block_id, stmt_index, borrow)
+                && borrow.surface == surface
+        }
+    };
+    if !receiver_valid || args.len() != slot_decl.params.len() {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::InvalidDynCall),
+        );
+    }
+    for first in 0..args.len() {
+        for second in first + 1..args.len() {
+            if call_args_conflict(cx.program, function_id, &args[first], &args[second]) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadCall(BadCall::ArgAliasConflict { first, second }),
+                );
+            }
+        }
+    }
+    let receiver_place = match receiver {
+        DynReceiver::Owned(Operand::Place(place)) => Some((ParamMode::SharedBorrow, place)),
+        DynReceiver::MutableOwned(place) => Some((ParamMode::MutBorrow, place)),
+        DynReceiver::Borrowed(borrow) => Some((ParamMode::MutBorrow, borrow.place())),
+        DynReceiver::Owned(Operand::Const(_)) => None,
+    };
+    if let Some((receiver_mode, receiver_place)) = receiver_place {
+        for (index, arg) in args.iter().enumerate() {
+            if arg.place().is_some_and(|place| {
+                call_places_conflict(
+                    cx.program,
+                    function_id,
+                    receiver_mode,
+                    receiver_place,
+                    arg.mode(),
+                    place,
+                )
+            }) {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadCall(BadCall::ReceiverArgAliasConflict { arg: index }),
+                );
+            }
+        }
+    }
+    for (index, arg) in args.iter().enumerate() {
+        verify_call_arg(cx, function_id, block_id, stmt_index, index, arg);
+        let valid = slot_decl.params.get(index).is_some_and(|param| {
+            typing::call_arg_ty(cx.program, arg) == Some(param.ty) && arg.mode() == param.mode
+        });
+        if !valid {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadRValue(BadRValue::InvalidDynCall),
+            );
+        }
+    }
+}
+
+fn operand_dyn_surface(program: &Program, value: &Operand) -> Option<ContractSurfaceId> {
+    let ty = typing::operand_ty(program, value)?;
+    match program.type_arena.get(ty) {
+        Some(TypeData::Dyn(surface)) => Some(*surface),
+        _ => None,
+    }
+}
+
+fn place_dyn_surface(program: &Program, place: &Place) -> Option<ContractSurfaceId> {
+    match program.type_arena.get(place.ty) {
+        Some(TypeData::Dyn(surface)) => Some(*surface),
+        _ => None,
+    }
+}
+
+fn verify_dyn_borrow(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    block_id: BlockId,
+    stmt_index: Option<usize>,
+    borrow: &DynBorrow,
+) -> bool {
+    let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
+    cx.verify_type_ref(site.clone(), borrow.ty);
+    let target_valid = matches!(cx.program.type_arena.get(borrow.ty), Some(TypeData::Dyn(surface)) if *surface == borrow.surface);
+    let (source_surface, source_valid) = match &borrow.source {
+        DynBorrowSource::Concrete { place, witness } => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+            verify_mutable_place(cx, function_id, &site, place);
+            let valid = cx
+                .program
+                .contract_witnesses
+                .get(witness.index())
+                .is_some_and(|decl| decl.key.concrete_ty == place.ty);
+            let surface = cx
+                .program
+                .contract_witnesses
+                .get(witness.index())
+                .map(|decl| decl.key.surface);
+            (surface, valid)
+        }
+        DynBorrowSource::Owned(place) => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+            verify_mutable_place(cx, function_id, &site, place);
+            (
+                place_dyn_surface(cx.program, place),
+                !matches!(place.root, PlaceRoot::DynBorrowParam(_))
+                    && !is_dyn_borrow_backing_local(cx.program, function_id, place.root),
+            )
+        }
+        DynBorrowSource::Borrowed(place) => {
+            verify_place(cx, function_id, block_id, stmt_index, place);
+            let mode_matches = match place.root {
+                PlaceRoot::DynBorrowParam(id) => cx
+                    .program
+                    .dyn_borrow_params
+                    .get(id.index())
+                    .is_some_and(|decl| decl.owner == function_id),
+                _ => false,
+            };
+            (place_dyn_surface(cx.program, place), mode_matches)
+        }
+    };
+    let projection_valid = match borrow.weakening {
+        Some(id) => cx
+            .program
+            .contract_weakenings
+            .get(id.index())
+            .is_some_and(|decl| {
+                Some(decl.source) == source_surface && decl.target == borrow.surface
+            }),
+        None => source_surface == Some(borrow.surface),
+    };
+    let valid = target_valid && source_valid && projection_valid;
+    if !valid {
+        cx.push(
+            site,
+            VerifyErrorKind::BadRValue(BadRValue::InvalidDynBorrow),
+        );
+    }
+    valid
+}
+
 fn verify_call(
     cx: &mut VerifyCx<'_>,
     function_id: FunctionId,
@@ -7931,6 +9374,9 @@ fn verify_call_arg(
             verify_place(cx, function_id, block_id, stmt_index, place);
             verify_mutable_place(cx, function_id, &site, place);
         }
+        CallArg::DynBorrow(borrow) => {
+            verify_dyn_borrow(cx, function_id, block_id, stmt_index, borrow);
+        }
         CallArg::SharedStringConst(id) => {
             let site = VerifyCx::stmt_site(function_id, block_id, stmt_index.unwrap_or(0));
             let Some(konst) = cx.program.const_arena.get_checked(*id) else {
@@ -7950,6 +9396,51 @@ fn verify_call_arg(
                     }),
                 );
             }
+        }
+    }
+}
+
+fn verify_dyn_call_escape_args(
+    cx: &mut VerifyCx<'_>,
+    function_id: FunctionId,
+    stmt_index: usize,
+    surface: ContractSurfaceId,
+    slot: ContractSlotId,
+    args: &[CallArg],
+    state: &LocalInit,
+) {
+    let Some(params) = cx
+        .program
+        .contract_surfaces
+        .get(surface.index())
+        .and_then(|surface| surface.slots.get(slot.index()))
+        .map(|slot| &slot.params)
+    else {
+        return;
+    };
+    for (index, (arg, param)) in args.iter().zip(params).enumerate() {
+        if param.escape != ParamEscape::Escaping
+            || !matches!(cx.type_data(param.ty), Some(TypeData::Function(_)))
+        {
+            continue;
+        }
+        match arg_function_escape(cx.program, function_id, arg, state) {
+            FunctionValueCapability::Escaping => {}
+            FunctionValueCapability::NonEscaping => cx.push(
+                VerifyCx::stmt_site(function_id, BlockId::from_index(0), stmt_index),
+                VerifyErrorKind::BadCall(BadCall::ArgEscapeMismatch {
+                    index,
+                    expected: ParamEscape::Escaping,
+                    found: ParamEscape::NonEscaping,
+                }),
+            ),
+            FunctionValueCapability::Unknown | FunctionValueCapability::NonFunction => cx.push(
+                VerifyCx::stmt_site(function_id, BlockId::from_index(0), stmt_index),
+                VerifyErrorKind::BadCall(BadCall::ArgEscapeUnknown {
+                    index,
+                    expected: ParamEscape::Escaping,
+                }),
+            ),
         }
     }
 }
@@ -8005,10 +9496,15 @@ fn arg_function_escape(
         CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
             operand_function_escape(program, function_id, operand, state)
         }
+        CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)
+            if matches!(program.type_arena.data(place.ty), TypeData::Function(_)) =>
+        {
+            operand_function_escape(program, function_id, &Operand::Place(place.clone()), state)
+        }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             type_function_capability(program, place.ty)
         }
-        CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {
+        CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) | CallArg::DynBorrow(_) => {
             FunctionValueCapability::NonFunction
         }
     }
@@ -8032,9 +9528,10 @@ fn operand_function_escape(
             PlaceRoot::LambdaCapture(slot) => {
                 lambda_capture_function_escape(program, function_id, slot)
             }
-            PlaceRoot::ScopedBorrow(_) | PlaceRoot::CaptureCell(_) | PlaceRoot::Global(_) => {
-                type_function_capability(program, place.ty)
-            }
+            PlaceRoot::ScopedBorrow(_)
+            | PlaceRoot::DynBorrowParam(_)
+            | PlaceRoot::CaptureCell(_)
+            | PlaceRoot::Global(_) => type_function_capability(program, place.ty),
         },
         Operand::Place(place) => type_function_capability(program, place.ty),
     }
@@ -8358,6 +9855,7 @@ fn place_function_state(
         PlaceRoot::Global(_)
         | PlaceRoot::LambdaCapture(_)
         | PlaceRoot::ScopedBorrow(_)
+        | PlaceRoot::DynBorrowParam(_)
         | PlaceRoot::CaptureCell(_) => type_function_state(program, place.ty),
     };
     if let PlaceRoot::LambdaCapture(slot) = place.root
@@ -8561,19 +10059,37 @@ fn call_args_conflict(
     left: &CallArg,
     right: &CallArg,
 ) -> bool {
+    left.place()
+        .zip(right.place())
+        .is_some_and(|(left_place, right_place)| {
+            call_places_conflict(
+                program,
+                function_id,
+                left.mode(),
+                left_place,
+                right.mode(),
+                right_place,
+            )
+        })
+}
+
+fn call_places_conflict(
+    program: &Program,
+    function_id: FunctionId,
+    left_mode: ParamMode,
+    left: &Place,
+    right_mode: ParamMode,
+    right: &Place,
+) -> bool {
     let borrow_conflict = matches!(
-        (left.mode(), right.mode()),
+        (left_mode, right_mode),
         (ParamMode::SharedBorrow, ParamMode::MutBorrow)
             | (
                 ParamMode::MutBorrow,
                 ParamMode::SharedBorrow | ParamMode::MutBorrow
             )
     );
-    borrow_conflict
-        && left
-            .place()
-            .zip(right.place())
-            .is_some_and(|(left, right)| program.places_may_overlap(function_id, left, right))
+    borrow_conflict && program.places_may_overlap(function_id, left, right)
 }
 
 fn verify_slice_index(
@@ -8637,9 +10153,12 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
             }
             cx.verify_type_ref(site, sig.ret.ty());
         }
-        TypeData::Dyn(contract) => {
-            if contract.display_name.is_empty() || contract.method_table_key.is_empty() {
-                cx.push(site, VerifyErrorKind::BadType(BadType::EmptyDynContract));
+        TypeData::Dyn(surface) => {
+            if !cx.has_contract_surface(surface) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadReference(BadReference::InvalidContractSurface(surface)),
+                );
             }
         }
         TypeData::Aggregate(agg_id) | TypeData::DataRef(agg_id) => {

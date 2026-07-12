@@ -523,7 +523,7 @@ impl DynInference {
             else {
                 continue;
             };
-            tc.record_resolved_dyn_call(
+            tc.record_dyn_call(
                 pending.site,
                 &pending.receiver_site,
                 contract,
@@ -569,7 +569,11 @@ impl DynInference {
             });
     }
 
-    fn solution(&self, id: DynContractHoleId) -> Option<ContractRef> {
+    pub(super) fn solutions(&self) -> impl Iterator<Item = (DynContractHoleId, &ContractRef)> {
+        self.solutions.iter().map(|(id, contract)| (*id, contract))
+    }
+
+    pub(super) fn solution(&self, id: DynContractHoleId) -> Option<ContractRef> {
         self.solutions.get(&id).cloned()
     }
 

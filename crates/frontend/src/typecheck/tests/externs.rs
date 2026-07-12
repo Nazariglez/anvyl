@@ -1,10 +1,11 @@
 use anvyx_externs::{
     BinaryOp as ExternBinaryOp, CallbackEscape, CallbackPolicy, CallbackThread,
     ExternCallbackParam, ExternCallbackSignature, ExternEffects, ExternFieldDescriptor,
-    ExternFunctionDescriptor, ExternInitDescriptor, ExternMethodDescriptor, ExternModuleDescriptor,
-    ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-    ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ModulePath as ExternModulePath,
-    ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp,
+    ExternFunctionDescriptor, ExternInitDescriptor, ExternLayout, ExternMaterialization,
+    ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
+    ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
+    ExternTypeExpr, ModulePath as ExternModulePath, ParamFlow, ProviderDescriptor, ProviderId,
+    ReceiverMode, UnaryOp,
 };
 
 use super::support::{
@@ -158,6 +159,9 @@ fn extern_type(name: &str) -> ExternTypeDescriptor {
         name: name.to_string(),
         doc: None,
         rep: ExternRep::Shared,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: Some(false),
         fields: vec![],
         variants: vec![],
         init: None,
@@ -1832,6 +1836,9 @@ mod provider_imports {
                 path: extern_path(&["host"]),
                 types: vec![ExternTypeDescriptor {
                     rep: ExternRep::Inline,
+                    layout: Some(ExternLayout { size: 16, align: 8 }),
+                    materialization: Some(ExternMaterialization::Copy),
+                    owns_heap_edges: Some(false),
                     fields: vec![
                         field("x", ExternTypeExpr::Float),
                         field("y", ExternTypeExpr::Float),

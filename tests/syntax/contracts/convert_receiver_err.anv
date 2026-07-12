@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: method 'draw' has an incompatible receiver
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Sprite {
+    fn draw(ref self) {}
+}
+
+fn main() {
+    let item: dyn Drawable = Sprite {};
+}

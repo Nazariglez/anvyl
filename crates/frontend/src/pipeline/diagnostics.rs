@@ -2209,6 +2209,14 @@ fn render_extern_descriptor_error(
             "extern enum variant '{}.{variant}' cannot mix named and unnamed fields",
             render_extern_type_key(ty, raw_scope)
         ),
+        ExternDescriptorError::InvalidRepresentationMetadata { ty } => format!(
+            "extern type '{}' has incomplete or incompatible representation metadata",
+            render_extern_type_key(ty, raw_scope)
+        ),
+        ExternDescriptorError::InvalidLayout { ty, size, align } => format!(
+            "extern type '{}' has invalid native layout size {size} and alignment {align}",
+            render_extern_type_key(ty, raw_scope)
+        ),
         ExternDescriptorError::VoidType { context } => {
             format!("void type is not allowed in {context}")
         }

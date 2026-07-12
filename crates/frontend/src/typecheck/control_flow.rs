@@ -8,7 +8,7 @@ use super::{
     intrinsic_bool_value, join_checked, match_check, match_coverage,
     pattern::{self, check_pattern_scrutinee},
     place, projection,
-    semantic_use::{CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan},
+    semantic_use::{CheckedDynMatchPlan, CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan},
 };
 use crate::{
     ast::{
@@ -570,7 +570,9 @@ fn check_match_with_policy(
         let valid_arms = match_check::validate_dynamic_arms(&node.arms, tc);
         let source = match_check::check_dynamic_source(node, tc);
         let mut targets = vec![];
-        check_match_arm_bodies(
+        let mut plans = vec![];
+        let mut fallback = None;
+        let arms = check_match_arm_bodies(
             &node.arms,
             policy.match_expected(),
             tc,
@@ -581,6 +583,8 @@ fn check_match_with_policy(
                         &source,
                         node.scrutinee.node.id,
                         &mut targets,
+                        &mut plans,
+                        &mut fallback,
                         tc,
                         |tc| policy.check_match_arm_body(&arm.node.body, expected, tc),
                     )
@@ -590,7 +594,26 @@ fn check_match_with_policy(
                     })
                 }
             },
-        )
+        );
+        if valid_arms && source.valid {
+            let fallback = fallback.expect("valid dynamic match requires fallback");
+            let site = tc.current_expr_site(parent);
+            tc.semantic_facts.record_dyn_match_plan(
+                site,
+                CheckedDynMatchPlan {
+                    expr: parent,
+                    source: node.scrutinee.node.id,
+                    access: if node.access.is_ref() {
+                        CheckedMatchAccess::RefAlias
+                    } else {
+                        CheckedMatchAccess::Owned
+                    },
+                    arms: plans,
+                    fallback,
+                },
+            );
+        }
+        arms
     } else {
         let mode = if node.access.is_ref() {
             PatternBindMode::Alias

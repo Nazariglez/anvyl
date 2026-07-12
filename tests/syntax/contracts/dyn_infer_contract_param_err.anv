@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: inferred dynamic contracts are only allowed as direct parameters of callables with bodies
+
+contract Bad {
+    fn use(self, item: dyn _);
+}

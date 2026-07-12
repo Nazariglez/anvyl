@@ -17,7 +17,7 @@ use super::{
 use crate::{
     ast::{
         AnonymousContractRequirement, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef,
-        GenericArg, Ident, Type, TypeParam, TypeVarId, TypeVisitor,
+        GenericArg, Ident, ModuleOrigin, Type, TypeParam, TypeVarId, TypeVisitor,
     },
     span::{SourceSpan, Span},
 };
@@ -201,7 +201,6 @@ pub(crate) enum TypeRefError {
     ConflictingContractRequirement {
         name: Ident,
     },
-    UnsupportedContractComposition,
     MissingCoreOption,
 }
 
@@ -239,7 +238,6 @@ impl TypeRefError {
             | Self::ContractAsType { .. }
             | Self::DuplicateContractRequirement { .. }
             | Self::ConflictingContractRequirement { .. }
-            | Self::UnsupportedContractComposition
             | Self::MissingCoreOption => None,
         }
     }
@@ -289,10 +287,6 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
         },
         TypeRefError::ConflictingContractRequirement { name } => TypeError::CompileError {
             message: format!("conflicting contract requirement '{name}'"),
-            span,
-        },
-        TypeRefError::UnsupportedContractComposition => TypeError::CompileError {
-            message: "inferred dynamic contracts are not supported yet".to_string(),
             span,
         },
         TypeRefError::MissingCoreOption => TypeError::CompileError {
@@ -1234,19 +1228,22 @@ impl<'a> TypeRefResolver<'a> {
     ) -> Result<(), TypeRefError> {
         match contract {
             ContractRef::Named {
-                name, origin: None, ..
+                qualifier,
+                name,
+                origin,
             } => {
-                let (key, import) = self.resolve_contract_ref_with_import(module, contract)?;
+                let (key, import) = self.resolve_contract_name_with_import(
+                    module,
+                    *qualifier,
+                    *name,
+                    origin.as_ref(),
+                )?;
                 state.mark_import_used(import);
-                if let Some(schema) = self.decls.contract(&key) {
+                if origin.is_none()
+                    && let Some(schema) = self.decls.contract(&key)
+                {
                     state.warn_deprecated_contract(schema, *name);
                 }
-                refs.push(canonical_contract_ref(&key));
-                Ok(())
-            }
-            ContractRef::Named { .. } => {
-                let (key, import) = self.resolve_contract_ref_with_import(module, contract)?;
-                state.mark_import_used(import);
                 refs.push(canonical_contract_ref(&key));
                 Ok(())
             }
@@ -1304,53 +1301,37 @@ impl<'a> TypeRefResolver<'a> {
         })
     }
 
-    pub(crate) fn resolve_contract_ref(
+    pub(crate) fn resolve_contract_name_with_import(
         &self,
         module: &ModuleScope,
-        contract: &ContractRef,
-    ) -> Result<ContractKey, TypeRefError> {
-        self.resolve_contract_ref_with_import(module, contract)
-            .map(|(key, _)| key)
-    }
-
-    pub(crate) fn resolve_contract_ref_with_import(
-        &self,
-        module: &ModuleScope,
-        contract: &ContractRef,
+        qualifier: Option<Ident>,
+        name: Ident,
+        origin: Option<&ModuleOrigin>,
     ) -> Result<(ContractKey, Option<ImportId>), TypeRefError> {
-        let ContractRef::Named {
-            qualifier,
-            name,
-            origin,
-        } = contract
-        else {
-            return Err(TypeRefError::UnsupportedContractComposition);
-        };
-
         if let Some(origin) = origin {
             let module = ModuleScope::from_nominal_origin(origin);
-            return match self.decls.local_type_binding(&module, *name) {
+            return match self.decls.local_type_binding(&module, name) {
                 Some(TypeBinding::Contract(key)) => Ok((key, None)),
                 _ => Err(TypeRefError::UnknownContract {
                     qualifier: None,
-                    name: *name,
+                    name,
                     import: None,
                 }),
             };
         }
 
-        let lookup = self.decls.resolve_type_member(module, *qualifier, *name);
+        let lookup = self.decls.resolve_type_member(module, qualifier, name);
         match lookup.result {
             ModuleMemberLookup::Found(TypeBinding::Contract(key)) => Ok((key, lookup.import)),
             ModuleMemberLookup::Private => Err(TypeRefError::PrivateModuleMember {
                 module: lookup.target.unwrap_or_else(|| module.clone()),
-                name: *name,
+                name,
                 import: lookup.import.map(Box::new),
             }),
             ModuleMemberLookup::Found(_) | ModuleMemberLookup::Missing => {
                 Err(TypeRefError::UnknownContract {
-                    qualifier: *qualifier,
-                    name: *name,
+                    qualifier,
+                    name,
                     import: lookup.import.map(Box::new),
                 })
             }

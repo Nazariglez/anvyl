@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: Enemy does not satisfy Updatable: missing method 'update'
+
+import enemy { Enemy };
+
+contract Updatable {
+    fn update(ref self, dt: float);
+}
+
+fn main() {
+    let actor: dyn Updatable = Enemy { hp: 1 };
+}

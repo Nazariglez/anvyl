@@ -621,6 +621,9 @@ pub(crate) struct ExternType {
     pub(crate) site: RawExternSite,
     pub(crate) doc: Option<String>,
     pub(crate) rep: ExternRep,
+    pub(crate) layout: Option<anvyx_externs::ExternLayout>,
+    pub(crate) materialization: Option<anvyx_externs::ExternMaterialization>,
+    pub(crate) owns_heap_edges: Option<bool>,
     pub(crate) fields: Vec<ExternField>,
     pub(crate) variants: Vec<ExternEnumVariant>,
     pub(crate) init: Option<ExternInit>,
@@ -1069,6 +1072,9 @@ impl<'a> CatalogBuilder<'a> {
                 site: raw_ty.site,
                 doc: raw_ty.doc.clone(),
                 rep: raw_ty.rep,
+                layout: raw_ty.layout,
+                materialization: raw_ty.materialization,
+                owns_heap_edges: raw_ty.owns_heap_edges,
                 fields: vec![],
                 variants: vec![],
                 init: None,
@@ -1796,7 +1802,7 @@ impl<'a> CatalogBuilder<'a> {
                 });
                 Type::UnresolvedName(name)
             }
-            TypeRefError::UnsupportedContractComposition | TypeRefError::MissingCoreOption => {
+            TypeRefError::MissingCoreOption => {
                 self.errors.push(ExternCatalogError::UnknownType {
                     context: context.clone(),
                     module: None,
@@ -2130,6 +2136,9 @@ mod tests {
                 site: RawExternSite::default(),
                 doc: None,
                 rep: ExternRep::Shared,
+                layout: None,
+                materialization: None,
+                owns_heap_edges: None,
                 fields: vec![],
                 variants: vec![],
                 init: None,
@@ -2406,6 +2415,9 @@ mod tests {
             name: name.to_string(),
             doc: None,
             rep: ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: Some(false),
             fields: vec![],
             variants: vec![],
             init: None,

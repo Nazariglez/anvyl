@@ -5,14 +5,20 @@ use anvyx_externs::ParamFlow;
 use super::{
     AggregateCtor, AggregateDecl, AggregateKind, AirBlock, AirBody, AirCollectionFor,
     AirCollectionLoan, AirCollectionLoanMode, AirCollectionRootKind, AirCollectionSlot,
-    AirCollectionSlotKind, AirCollectionSlotScope, AirIf, AirLoop, AirLoopId, AirMapEntryMatch,
-    AirOptionalMatch, AirOrdinalAdapter, AirOrdinalPlan, AirPatternAlternative, AirPatternArm,
-    AirPatternBinding, AirPatternBindingMode, AirPatternMatch, AirPatternPath, AirPatternPathStep,
-    AirPatternTest, AirRangeFor, AirStmt, AirTail, BindingId as AirBindingId, CallArg, Callee,
-    CaptureCellDecl, CaptureCellId, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId,
-    ConstValue, CoreEnumKind, DynContractData, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl,
-    ExternDecl, ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl,
-    ExternOp, ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
+    AirCollectionSlotKind, AirCollectionSlotScope, AirDynMatch, AirDynMatchArm,
+    AirDynMatchFallback, AirDynMatchFallbackBinding, AirDynMatchSource, AirDynMatchTargetBinding,
+    AirIf, AirLoop, AirLoopId, AirMapEntryMatch, AirOptionalMatch, AirOrdinalAdapter,
+    AirOrdinalPlan, AirPatternAlternative, AirPatternArm, AirPatternBinding, AirPatternBindingMode,
+    AirPatternMatch, AirPatternPath, AirPatternPathStep, AirPatternTest, AirRangeFor, AirStmt,
+    AirTail, BindingId as AirBindingId, CallArg, Callee, CaptureCellDecl, CaptureCellId,
+    CaptureCellLifetime, CaptureLocalSource, ConstData, ConstId, ConstValue, ContractParamDecl,
+    ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId, ContractSurfaceDecl,
+    ContractSurfaceId, ContractWeakeningDecl, ContractWeakeningId, ContractWitnessDecl,
+    ContractWitnessId, ContractWitnessKey as AirWitnessKey, ContractWitnessSlotDecl,
+    ContractWitnessTarget, CoreEnumKind, DynBorrow, DynBorrowParamDecl, DynBorrowSource,
+    DynOwnedUse, DynReceiver, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl,
+    ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp,
+    ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
     ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function,
     FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, FunctionValueCapability,
     GlobalDecl, GlobalId, GlobalInitEffect, IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl,
@@ -37,19 +43,22 @@ use crate::{
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallTarget, CallableId, CallableInstanceKey,
         CallableKind, CallableParent, CaptureStorageOrigin, CastFromInstanceKey, CastFromSignature,
-        CheckedEnumPayload, CheckedLiteralPattern, CheckedMatchAccess, CheckedMatchArm,
-        CheckedMatchPlan, CheckedPattern, CheckedPatternBinding, CheckedPatternBindingKind,
-        CheckedPatternOwner, ConstTerm, CoreRangeKind, DeclarationIndex, DefaultArgFact,
-        DefaultExprSite, EnumRepr as TcEnumRepr, ExtendId, ExternUseTarget,
-        FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin, GenericArgs,
-        GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect, GlobalKey,
-        GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
-        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
-        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
-        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
-        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
-        UserCastSite, VariantPayload, generic_args_are_concrete, nominal_generic_args,
-        nominal_key_for_type, substitute_aggregate_member, type_has_unfinished_facts,
+        CheckedDynMatchBinding, CheckedDynMatchPlan, CheckedEnumPayload, CheckedLiteralPattern,
+        CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan, CheckedPattern,
+        CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternOwner, ConstTerm,
+        ContractParamSchema, ContractReturnSchema, ContractSurfaceId as SemanticContractSurfaceId,
+        ContractSurfaceSchemas, ContractTypeSchema, CoreRangeKind, DeclarationIndex,
+        DefaultArgFact, DefaultExprSite, DynCallFact, DynDowncastSource, EnumRepr as TcEnumRepr,
+        ExtendId, ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind,
+        FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
+        GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, IterRuntimeCheckKind,
+        LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
+        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
+        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
+        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
+        TypecheckFacts, UserCastSite, VariantPayload, WitnessId as SemanticWitnessId,
+        WitnessSlotTarget, generic_args_are_concrete, nominal_generic_args, nominal_key_for_type,
+        substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
 
@@ -242,6 +251,8 @@ struct TypeLowerEnv<'a, 'b> {
     modules: &'a mut HashMap<ModuleScope, ModuleId>,
     decls: Option<&'b DeclarationIndex>,
     externs: Option<&'b ExternCatalog>,
+    contract_surfaces: Option<&'b ContractSurfaceSchemas>,
+    contract_surface_ids: Option<&'b HashMap<SemanticContractSurfaceId, ContractSurfaceId>>,
 }
 
 impl TypeLowerer {
@@ -253,6 +264,8 @@ impl TypeLowerer {
                 modules: &mut HashMap::new(),
                 decls: None,
                 externs: None,
+                contract_surfaces: None,
+                contract_surface_ids: None,
             },
         )
     }
@@ -263,6 +276,8 @@ impl TypeLowerer {
         modules: &mut HashMap<ModuleScope, ModuleId>,
         decls: &DeclarationIndex,
         externs: &ExternCatalog,
+        contract_surfaces: &ContractSurfaceSchemas,
+        contract_surface_ids: &HashMap<SemanticContractSurfaceId, ContractSurfaceId>,
         ty: &Type,
     ) -> Result<TypeId, LowerError> {
         self.lower_with_env(
@@ -272,6 +287,8 @@ impl TypeLowerer {
                 modules,
                 decls: Some(decls),
                 externs: Some(externs),
+                contract_surfaces: Some(contract_surfaces),
+                contract_surface_ids: Some(contract_surface_ids),
             },
         )
     }
@@ -344,7 +361,19 @@ impl TypeLowerer {
                     }
                 },
             )),
-            Type::Dyn(contract) => TypeData::Dyn(dyn_contract_data(contract)?),
+            Type::Dyn(contract) => {
+                let surface = env
+                    .contract_surfaces
+                    .zip(env.decls)
+                    .and_then(|(surfaces, decls)| {
+                        surfaces.id_for_ref(decls, &ModuleScope::Root, contract)
+                    })
+                    .and_then(|id| env.contract_surface_ids?.get(&id).copied())
+                    .ok_or_else(|| LowerError::UnsupportedType {
+                        ty: Box::new(ty.clone()),
+                    })?;
+                TypeData::Dyn(surface)
+            }
             Type::Nominal(_) => return self.lower_nominal(program, ty, env),
             _ => {
                 return Err(LowerError::UnsupportedType {
@@ -353,7 +382,7 @@ impl TypeLowerer {
             }
         };
 
-        let id = program.alloc_type(data);
+        let id = intern_structural_type(program, data);
         self.cache.insert(ty.clone(), id);
         Ok(id)
     }
@@ -416,6 +445,32 @@ impl TypeLowerer {
         };
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
         let const_args = nominal_const_args(ty);
+        if let Some(id) = program
+            .aggregates
+            .iter()
+            .enumerate()
+            .find(|(_, decl)| {
+                decl.module == module
+                    && decl.name == key.name
+                    && decl.kind == kind
+                    && decl.type_args == type_args
+                    && decl.const_args == const_args
+            })
+            .and_then(|(index, _)| {
+                let agg = super::AggregateId::from_index(index);
+                program
+                    .type_arena
+                    .iter()
+                    .position(|data| match kind {
+                        AggregateKind::Struct => data == &TypeData::Aggregate(agg),
+                        AggregateKind::DataRef => data == &TypeData::DataRef(agg),
+                    })
+                    .map(TypeId::from_index)
+            })
+        {
+            self.cache.insert(ty.clone(), id);
+            return Ok(id);
+        }
         let agg = program.alloc_aggregate(AggregateDecl {
             name: key.name,
             module,
@@ -459,6 +514,28 @@ impl TypeLowerer {
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
         let const_args = nominal_const_args(ty);
+        if let Some(id) = program
+            .enums
+            .iter()
+            .enumerate()
+            .find(|(_, decl)| {
+                decl.module == module
+                    && decl.name == key.name
+                    && decl.type_args == type_args
+                    && decl.const_args == const_args
+            })
+            .and_then(|(index, _)| {
+                let enum_id = super::EnumId::from_index(index);
+                program
+                    .type_arena
+                    .iter()
+                    .position(|data| data == &TypeData::Enum(enum_id))
+                    .map(TypeId::from_index)
+            })
+        {
+            self.cache.insert(ty.clone(), id);
+            return Ok(id);
+        }
         let raw_type = decls
             .raw_enum_raw_type(key)
             .map(|ty| self.lower_with_env(program, &ty, env.reborrow()))
@@ -550,6 +627,9 @@ impl TypeLowerer {
                 anvyx_externs::ExternRep::Shared => ExternRep::Shared,
                 anvyx_externs::ExternRep::Inline => ExternRep::Inline,
             },
+            layout: source.layout,
+            materialization: source.materialization,
+            owns_heap_edges: source.owns_heap_edges,
             has_init: source.constructor_fields().is_some(),
             init_args: vec![],
             fields: vec![],
@@ -839,6 +919,21 @@ fn extern_receiver_module(module: &ModuleScope) -> Option<anvyx_externs::ModuleP
     }
 }
 
+fn witness_receiver_mode(target: &WitnessSlotTarget) -> ParamMode {
+    match target {
+        WitnessSlotTarget::Direct { receiver_mode, .. }
+        | WitnessSlotTarget::Extend { receiver_mode, .. } => match receiver_mode {
+            MethodMode::Static => {
+                unreachable!("contract witness target must be an instance method")
+            }
+            MethodMode::Instance { mutable: true } => ParamMode::MutBorrow,
+            MethodMode::Instance { mutable: false } => ParamMode::SharedBorrow,
+        },
+        WitnessSlotTarget::Extern { receiver, .. } => receiver_mode(*receiver),
+        WitnessSlotTarget::Promoted { target, .. } => witness_receiver_mode(target),
+    }
+}
+
 fn receiver_mode(mode: anvyx_externs::ReceiverMode) -> ParamMode {
     match mode {
         anvyx_externs::ReceiverMode::Value => ParamMode::Value,
@@ -923,16 +1018,17 @@ fn ensure_module(
     id
 }
 
-fn optional_ty(program: &mut Program, inner: TypeId) -> TypeId {
+fn intern_structural_type(program: &mut Program, data: TypeData) -> TypeId {
     let existing = program
         .type_arena
         .iter()
-        .enumerate()
-        .find_map(|(index, ty)| match ty {
-            TypeData::Optional(found) if *found == inner => Some(TypeId::from_index(index)),
-            _ => None,
-        });
-    existing.unwrap_or_else(|| program.alloc_type(TypeData::Optional(inner)))
+        .position(|existing| existing == &data)
+        .map(TypeId::from_index);
+    existing.unwrap_or_else(|| program.alloc_type(data))
+}
+
+fn optional_ty(program: &mut Program, inner: TypeId) -> TypeId {
+    intern_structural_type(program, TypeData::Optional(inner))
 }
 
 impl TypeLowerEnv<'_, '_> {
@@ -941,6 +1037,8 @@ impl TypeLowerEnv<'_, '_> {
             modules: self.modules,
             decls: self.decls,
             externs: self.externs,
+            contract_surfaces: self.contract_surfaces,
+            contract_surface_ids: self.contract_surface_ids,
         }
     }
 }
@@ -953,6 +1051,9 @@ struct LoweringMaps {
     lambdas: HashMap<LambdaBodyKey, LambdaId>,
     globals: HashMap<GlobalKey, GlobalId>,
     externs: HashMap<ExternUseTarget, ExternId>,
+    contract_surfaces: HashMap<SemanticContractSurfaceId, ContractSurfaceId>,
+    contract_witnesses: HashMap<SemanticWitnessId, ContractWitnessId>,
+    contract_weakenings: HashMap<(BodyInstanceKey, ExprId), ContractWeakeningId>,
 }
 
 #[derive(Default)]
@@ -962,20 +1063,348 @@ struct LowerCx<'facts> {
     maps: LoweringMaps,
     decls: Option<DeclarationIndex>,
     externs: Option<ExternCatalog>,
+    contract_surfaces: Option<ContractSurfaceSchemas>,
+    contract_type_cache: HashMap<ContractTypeSchema, TypeId>,
     typecheck_facts: Option<&'facts TypecheckFacts>,
 }
 
 impl LowerCx<'_> {
     fn lower_ty(&mut self, ty: &Type) -> Result<TypeId, LowerError> {
-        match (&self.decls, &self.externs) {
-            (Some(decls), Some(externs)) => self.types.lower_source(
+        match (&self.decls, &self.externs, &self.contract_surfaces) {
+            (Some(decls), Some(externs), Some(contract_surfaces)) => self.types.lower_source(
                 &mut self.program,
                 &mut self.maps.modules,
                 decls,
                 externs,
+                contract_surfaces,
+                &self.maps.contract_surfaces,
                 ty,
             ),
             _ => self.types.lower(&mut self.program, ty),
+        }
+    }
+
+    fn lower_contract_surfaces(&mut self) -> Result<(), LowerError> {
+        let surfaces = self
+            .contract_surfaces
+            .clone()
+            .expect("semantic contract surfaces are available");
+        for surface in surfaces.iter() {
+            let id = self.program.alloc_contract_surface(ContractSurfaceDecl {
+                display_name: surface.display_name.clone(),
+                slots: vec![],
+            });
+            let old = self.maps.contract_surfaces.insert(surface.id, id);
+            debug_assert!(old.is_none());
+        }
+        for surface in surfaces.iter() {
+            let id = self.maps.contract_surfaces[&surface.id];
+            let slots = surface
+                .slots
+                .iter()
+                .map(|slot| {
+                    let params = slot
+                        .params
+                        .iter()
+                        .map(|param| self.lower_contract_param(param))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ret = match &slot.ret {
+                        ContractReturnSchema::Value(ty) => {
+                            ContractReturnDecl::Value(self.lower_contract_schema_type(ty)?)
+                        }
+                        ContractReturnSchema::Place(ty) => {
+                            ContractReturnDecl::Place(self.lower_contract_schema_type(ty)?)
+                        }
+                        ContractReturnSchema::Iter => ContractReturnDecl::Iter,
+                    };
+                    Ok(ContractSlotDecl {
+                        id: ContractSlotId::from_index(slot.id.0 as usize),
+                        name: slot.name,
+                        receiver: match slot.receiver {
+                            ast::MethodReceiver::Value => ContractReceiver::Value,
+                            ast::MethodReceiver::Ref => ContractReceiver::Ref,
+                        },
+                        params,
+                        ret,
+                    })
+                })
+                .collect::<Result<Vec<_>, LowerError>>()?;
+            self.program.contract_surface_mut(id).slots = slots;
+        }
+        Ok(())
+    }
+
+    fn lower_contract_param(
+        &mut self,
+        param: &ContractParamSchema,
+    ) -> Result<ContractParamDecl, LowerError> {
+        Ok(ContractParamDecl {
+            ty: self.lower_contract_schema_type(&param.ty)?,
+            mode: source_param_mode(param.mutable),
+            cast_accept: param.cast_accept,
+            escape: param.escape.into(),
+        })
+    }
+
+    fn lower_contract_schema_type(
+        &mut self,
+        schema: &ContractTypeSchema,
+    ) -> Result<TypeId, LowerError> {
+        if let Some(id) = self.contract_type_cache.get(schema) {
+            return Ok(*id);
+        }
+        let surfaces = self
+            .contract_surfaces
+            .as_ref()
+            .expect("contract surfaces are available");
+        let ty = contract_schema_source_type(schema, surfaces);
+        let id = self.lower_ty(&ty)?;
+        self.contract_type_cache.insert(schema.clone(), id);
+        Ok(id)
+    }
+
+    fn lower_contract_declarations(
+        &mut self,
+        functions: &ReachableItems<'_>,
+        semantic: &SemanticProgram,
+    ) -> Result<(), LowerError> {
+        let fact_slices = functions.contract_fact_slices()?;
+        let mut witnesses = fact_slices
+            .iter()
+            .flat_map(|slice| {
+                slice
+                    .facts
+                    .dyn_conversions
+                    .values()
+                    .filter(|fact| slice.includes(fact.expr_id))
+            })
+            .map(|conversion| conversion.witness)
+            .collect::<Vec<_>>();
+        witnesses.sort_by_key(|id| id.0);
+        witnesses.dedup();
+        for witness in witnesses {
+            self.lower_contract_witness(witness, semantic)?;
+        }
+
+        let mut weakening_sites = vec![];
+        for slice in &fact_slices {
+            let mut facts = slice
+                .facts
+                .dyn_weakenings
+                .values()
+                .filter(|fact| slice.includes(fact.expr_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            facts.sort_by_key(|fact| fact.expr_id.0);
+            weakening_sites.extend(facts.into_iter().map(|fact| (slice.body.clone(), fact)));
+        }
+        for (body, fact) in weakening_sites {
+            let decl = ContractWeakeningDecl {
+                source: self.maps.contract_surfaces[&fact.source],
+                target: self.maps.contract_surfaces[&fact.target],
+                target_to_source: fact
+                    .target_to_source
+                    .iter()
+                    .map(|slot| ContractSlotId::from_index(slot.0 as usize))
+                    .collect(),
+            };
+            let id = match self
+                .program
+                .contract_weakenings
+                .iter()
+                .position(|existing| existing == &decl)
+            {
+                Some(index) => ContractWeakeningId::from_index(index),
+                None => self.program.alloc_contract_weakening(decl),
+            };
+            self.maps
+                .contract_weakenings
+                .insert((body, fact.expr_id), id);
+        }
+        self.close_projected_contract_witnesses();
+        Ok(())
+    }
+
+    fn lower_contract_witness(
+        &mut self,
+        witness: SemanticWitnessId,
+        semantic: &SemanticProgram,
+    ) -> Result<ContractWitnessId, LowerError> {
+        if let Some(id) = self.maps.contract_witnesses.get(&witness) {
+            return Ok(*id);
+        }
+        let key = semantic
+            .facts
+            .witness_structural_keys
+            .get(&witness)
+            .expect("reachable witness has a finalized structural key")
+            .clone();
+        let concrete_ty = self.lower_ty(&key.concrete_ty)?;
+        let surface = self.maps.contract_surfaces[&key.surface];
+        let slots = key
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let iter = matches!(
+                    self.program.contract_surface(surface).slots[index].ret,
+                    ContractReturnDecl::Iter
+                );
+                Ok(ContractWitnessSlotDecl {
+                    slot: ContractSlotId::from_index(index),
+                    receiver: witness_receiver_mode(target),
+                    target: self.lower_contract_witness_target(concrete_ty, target, iter)?,
+                })
+            })
+            .collect::<Result<Vec<_>, LowerError>>()?;
+        let structural_key = AirWitnessKey {
+            concrete_ty,
+            surface,
+            slots: slots.clone(),
+        };
+        let id = match self
+            .program
+            .contract_witnesses
+            .iter()
+            .position(|existing| existing.key == structural_key)
+        {
+            Some(index) => ContractWitnessId::from_index(index),
+            None => self.program.alloc_contract_witness(ContractWitnessDecl {
+                key: structural_key,
+            }),
+        };
+        self.maps.contract_witnesses.insert(witness, id);
+        Ok(id)
+    }
+
+    fn lower_contract_witness_target(
+        &mut self,
+        receiver_ty: TypeId,
+        target: &WitnessSlotTarget,
+        iter: bool,
+    ) -> Result<ContractWitnessTarget, LowerError> {
+        match target {
+            WitnessSlotTarget::Direct {
+                callable,
+                owner_args,
+                ..
+            }
+            | WitnessSlotTarget::Extend {
+                callable,
+                owner_args,
+                ..
+            } => {
+                let body = BodyInstanceKey::Callable(CallableInstanceKey {
+                    target: callable.clone(),
+                    args: owner_args.clone(),
+                });
+                let function = self.maps.bodies.get(&body).copied().ok_or_else(|| {
+                    LowerError::MissingSpecializedBodyFacts {
+                        body: Box::new(body),
+                    }
+                })?;
+                Ok(if iter {
+                    ContractWitnessTarget::IteratorFunction { function }
+                } else {
+                    ContractWitnessTarget::Function { function }
+                })
+            }
+            WitnessSlotTarget::Extern { method, .. } => {
+                let target = ExternUseTarget::Method(*method);
+                let function = self.maps.externs.get(&target).copied().ok_or(
+                    LowerError::UnsupportedExternUse {
+                        expr_id: ExprId::default(),
+                        kind: UnsupportedExternUseKind::Method,
+                    },
+                )?;
+                Ok(ContractWitnessTarget::Extern { function })
+            }
+            WitnessSlotTarget::Promoted {
+                path,
+                origin_owner,
+                target,
+                ..
+            } => {
+                let mut ty = receiver_ty;
+                let mut fields = vec![];
+                for name in path {
+                    let (field, field_ty) =
+                        self.contract_witness_field(ty, *name).ok_or_else(|| {
+                            LowerError::UnsupportedType {
+                                ty: Box::new(origin_owner.clone()),
+                            }
+                        })?;
+                    fields.push(field);
+                    ty = field_ty;
+                }
+                Ok(ContractWitnessTarget::Promoted {
+                    fields,
+                    target: Box::new(self.lower_contract_witness_target(ty, target, iter)?),
+                })
+            }
+        }
+    }
+
+    fn contract_witness_field(&self, ty: TypeId, name: Ident) -> Option<(FieldId, TypeId)> {
+        let aggregate = match self.program.type_data(ty) {
+            TypeData::Aggregate(id) | TypeData::DataRef(id) => self.program.aggregate(*id),
+            _ => return None,
+        };
+        aggregate
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name == name)
+            .map(|(index, field)| (FieldId::from_index(index), field.ty))
+    }
+
+    fn close_projected_contract_witnesses(&mut self) {
+        loop {
+            let mut projected = vec![];
+            for weakening in &self.program.contract_weakenings {
+                for witness in &self.program.contract_witnesses {
+                    if witness.key.surface != weakening.source {
+                        continue;
+                    }
+                    let slots = weakening
+                        .target_to_source
+                        .iter()
+                        .enumerate()
+                        .map(|(target_slot, source_slot)| {
+                            let source = &witness.key.slots[source_slot.index()];
+                            ContractWitnessSlotDecl {
+                                slot: ContractSlotId::from_index(target_slot),
+                                receiver: source.receiver,
+                                target: source.target.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let structural_key = AirWitnessKey {
+                        concrete_ty: witness.key.concrete_ty,
+                        surface: weakening.target,
+                        slots: slots.clone(),
+                    };
+                    if !self
+                        .program
+                        .contract_witnesses
+                        .iter()
+                        .any(|existing| existing.key == structural_key)
+                        && !projected
+                            .iter()
+                            .any(|candidate: &ContractWitnessDecl| candidate.key == structural_key)
+                    {
+                        projected.push(ContractWitnessDecl {
+                            key: structural_key,
+                        });
+                    }
+                }
+            }
+            if projected.is_empty() {
+                break;
+            }
+            for witness in projected {
+                self.program.alloc_contract_witness(witness);
+            }
         }
     }
 
@@ -1196,22 +1625,37 @@ impl LowerCx<'_> {
         functions: &ReachableItems<'_>,
         semantic: &SemanticProgram,
     ) -> Result<(), LowerError> {
-        for source in &functions.items {
-            let mut externs = source
-                .body_facts
-                .as_facts()
-                .extern_uses
+        let mut externs = vec![];
+        for slice in functions.contract_fact_slices()? {
+            externs.extend(
+                slice
+                    .facts
+                    .extern_uses
+                    .iter()
+                    .filter(|(expr, _)| slice.includes(**expr))
+                    .flat_map(|(_, targets)| targets.iter().copied())
+                    .filter(|target| extern_use_requires_decl(&semantic.externs, *target)),
+            );
+            for conversion in slice
+                .facts
+                .dyn_conversions
                 .values()
-                .flatten()
-                .copied()
-                .filter(|target| extern_use_requires_decl(&semantic.externs, *target))
-                .collect::<Vec<_>>();
-            externs.sort_by_key(|target| extern_sort_key(&semantic.externs, *target));
-            externs.dedup();
-            for target in externs {
-                if self.maps.externs.contains_key(&target) {
-                    continue;
+                .filter(|fact| slice.includes(fact.expr_id))
+            {
+                let key = semantic
+                    .facts
+                    .witness_structural_keys
+                    .get(&conversion.witness)
+                    .expect("finalized witness structural key exists");
+                for target in &key.slots {
+                    collect_witness_extern_targets(target, &mut externs);
                 }
+            }
+        }
+        externs.sort_by_key(|target| extern_sort_key(&semantic.externs, *target));
+        externs.dedup();
+        for target in externs {
+            if !self.maps.externs.contains_key(&target) {
                 self.lower_extern_declaration(&semantic.externs, target)?;
             }
         }
@@ -1493,10 +1937,14 @@ impl LowerCx<'_> {
             match &source.source {
                 ReachableSource::Callable { callable, fact } => {
                     let module_scope = &modules.items[callable.module()].scope;
-                    let return_type = self.lower_ty(&fact.ret.ty())?;
-                    let return_mode = match fact.ret.access() {
-                        ReturnAccess::Value => ReturnMode::Value(return_type),
-                        ReturnAccess::Place => ReturnMode::Place(return_type),
+                    let return_mode = if fact.ret.is_iter() {
+                        ReturnMode::Value(self.lower_ty(&Type::Void)?)
+                    } else {
+                        let return_type = self.lower_ty(&fact.ret.ty())?;
+                        match fact.ret.access() {
+                            ReturnAccess::Value => ReturnMode::Value(return_type),
+                            ReturnAccess::Place => ReturnMode::Place(return_type),
+                        }
                     };
                     let (params, locals, local_map) =
                         self.lower_callable_params(source, *callable, fact)?;
@@ -1943,6 +2391,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let locals = locals
             .into_iter()
             .map(|(semantic, local)| {
+                let ty = function.locals[local.index()].ty;
+                let source_ref_dyn = facts
+                    .locals
+                    .defs
+                    .get(&semantic)
+                    .is_some_and(|def| def.mutable);
+                if source_ref_dyn && let TypeData::Dyn(surface) = cx.program.type_data(ty) {
+                    let borrow = cx.program.alloc_dyn_borrow_param(DynBorrowParamDecl {
+                        owner: function_id,
+                        source: local,
+                        ty,
+                        surface: *surface,
+                    });
+                    return (
+                        semantic,
+                        cx.program
+                            .dyn_borrow_param_place(borrow)
+                            .expect("allocated dynamic borrow parameter"),
+                    );
+                }
                 let place = facts
                     .locals
                     .defs
@@ -2142,6 +2610,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
+        if let Some(pattern) = direct_dyn_failable_alias_pattern(if_let)
+            && self
+                .facts
+                .dyn_downcasts
+                .get(&if_let.node.value.node.id)
+                .is_some_and(|fact| fact.mutable)
+        {
+            return self.lower_dyn_if_let_alias(if_let, pattern, MatchOutput::Effect);
+        }
         if let Some(pattern) = direct_failable_payload_pattern(if_let)? {
             let subject = self.lower_optional_subject(&if_let.node.value, &if_let.node.value)?;
             let payload = self.temp(subject.inner_ty());
@@ -2193,6 +2670,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         let result = self.temp(result_ty);
+        if let Some(pattern) = direct_dyn_failable_alias_pattern(if_let)
+            && self
+                .facts
+                .dyn_downcasts
+                .get(&if_let.node.value.node.id)
+                .is_some_and(|fact| fact.mutable)
+        {
+            self.lower_dyn_if_let_alias(if_let, pattern, MatchOutput::Value { result, result_ty })?;
+            return Ok(Operand::Place(self.local_place(result)));
+        }
         if let Some(pattern) = direct_failable_payload_pattern(if_let)? {
             let subject = self.lower_optional_subject(&if_let.node.value, expr)?;
             let payload = self.temp(subject.inner_ty());
@@ -2278,6 +2765,98 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             none_block,
         )?;
         Ok(())
+    }
+
+    fn lower_dyn_if_let_alias(
+        &mut self,
+        if_let: &ast::IfLetNode,
+        pattern: &ast::PatternNode,
+        output: MatchOutput,
+    ) -> Result<(), LowerError> {
+        let fact = self
+            .facts
+            .dyn_downcasts
+            .get(&if_let.node.value.node.id)
+            .cloned()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let ExprKind::FailableCast(cast) = &if_let.node.value.node.kind else {
+            return Err(unsupported_expr(&if_let.node.value));
+        };
+        let DynDowncastSource::Resolved(surface) = fact.source else {
+            return Err(LowerError::MissingTypecheckFacts);
+        };
+        if fact.source_id != cast.node.expr.node.id || !fact.mutable {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        let surface = self
+            .cx
+            .maps
+            .contract_surfaces
+            .get(&surface)
+            .copied()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let target = self.cx.lower_ty(&fact.target)?;
+        let binding = self.lower_dyn_alias_pattern_binding(pattern, target)?;
+        let some_block = match output {
+            MatchOutput::Effect => self.lower_nested_effect(&if_let.node.then_block)?,
+            MatchOutput::Value { result, result_ty } => self.with_nested_block(|this| {
+                this.lower_if_let_result(
+                    &if_let.node.then_block,
+                    result,
+                    result_ty,
+                    &if_let.node.value,
+                )
+            })?,
+        };
+        let none_block = match (output, if_let.node.else_block.as_ref()) {
+            (MatchOutput::Effect, Some(block)) => self.lower_nested_effect(block)?,
+            (MatchOutput::Effect, None) => AirBlock::default(),
+            (MatchOutput::Value { result, result_ty }, Some(block)) => {
+                self.with_nested_block(|this| {
+                    this.lower_if_let_result(block, result, result_ty, &if_let.node.value)
+                })?
+            }
+            (MatchOutput::Value { .. }, None) => return Err(unsupported_expr(&if_let.node.value)),
+        };
+        let source = self.lower_mut_call_arg(&cast.node.expr)?;
+        self.push_dyn_match(AirDynMatch {
+            source: AirDynMatchSource::Mutable(source),
+            surface,
+            arms: vec![AirDynMatchArm {
+                target,
+                binding: AirDynMatchTargetBinding::Alias(binding),
+                block: some_block,
+            }],
+            fallback: AirDynMatchFallback {
+                binding: AirDynMatchFallbackBinding::Discard,
+                block: none_block,
+            },
+        })
+    }
+
+    fn lower_dyn_alias_pattern_binding(
+        &mut self,
+        pattern: &ast::PatternNode,
+        ty: TypeId,
+    ) -> Result<LocalId, LowerError> {
+        let name = pattern_ident(pattern)?;
+        let semantic = self.pattern_binding_semantic(pattern)?;
+        if let Some(local) = self.existing_semantic_local(semantic) {
+            return Ok(local);
+        }
+        let binding = self.local_def(semantic)?.binding_id;
+        let local = self.push_local(
+            Some(name),
+            binding.map(air_binding_id),
+            ty,
+            AirMutability::Mutable,
+            LocalKind::PatternBinding,
+        );
+        let place = self.local_place(local);
+        self.locals.insert(semantic, place.clone());
+        self.insert_capture_source(semantic, place.clone())?;
+        self.promote_pattern_alias_scoped_borrow(semantic, binding, &place)?;
+        Ok(local)
     }
 
     fn lower_optional_else_effect(
@@ -2568,11 +3147,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let PlaceRoot::Local(local) = source.root else {
             return false;
         };
-        self.function
-            .signature
-            .params
-            .iter()
-            .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
+        self.function.locals[local.index()].kind == LocalKind::PatternBinding
+            || self
+                .function
+                .signature
+                .params
+                .iter()
+                .any(|param| param.local_id == local && param.mode == ParamMode::MutBorrow)
     }
 
     fn lower_match_effect(
@@ -2581,9 +3162,24 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match_expr: &ast::MatchNode,
     ) -> Result<(), LowerError> {
         if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
-            return Err(unsupported_expr(expr));
+            let plan = self.checked_dyn_match_plan(expr)?.clone();
+            return self.lower_dyn_match_effect(expr, match_expr, &plan);
         }
         let plan = self.checked_match_plan(expr)?;
+        if match_expr.node.access.is_ref()
+            && self
+                .facts
+                .dyn_downcasts
+                .get(&match_expr.node.scrutinee.node.id)
+                .is_some_and(|fact| fact.mutable)
+        {
+            return self.lower_dyn_downcast_alias_match(
+                expr,
+                match_expr,
+                &plan,
+                MatchOutput::Effect,
+            );
+        }
         if match_expr.node.access.is_ref() && self.is_optional_expr(&match_expr.node.scrutinee)? {
             return self.lower_optional_match_effect(expr, match_expr, &plan);
         }
@@ -3976,8 +4572,17 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if self.place_is_capture_cell(&root) || self.place_is_scoped_borrow(&root) {
             return self.lower_promoted_mut_arg(expr, root, allow_promoted_root);
         }
-        let Some(root_local) = root.root.local() else {
-            return Err(unsupported_expr(expr));
+        let root_local = match root.root {
+            PlaceRoot::Local(local) => local,
+            PlaceRoot::DynBorrowParam(id) => self
+                .cx
+                .program
+                .dyn_borrow_params
+                .get(id.index())
+                .filter(|decl| decl.owner == self.function_id)
+                .map(|decl| decl.source)
+                .ok_or_else(|| unsupported_expr(expr))?,
+            _ => return Err(unsupported_expr(expr)),
         };
         if self.function.locals[root_local.index()].mutability != AirMutability::Mutable {
             return Err(unsupported_expr(expr));
@@ -4173,12 +4778,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match self.lower_place_arg(expr, false) {
             Ok(place) if place.ty == ty => Ok(CallArg::SharedBorrow(place)),
             Ok(_) => Err(unsupported_expr(expr)),
-            Err(err) if matches!(self.cx.program.type_data(ty), TypeData::Slice(_)) => {
+            Err(err) => {
                 let value = self.lower_value_to(expr, ty, expr).map_err(|_| err)?;
                 self.materialize_shared_operand(expr, value, ty)
                     .map(CallArg::SharedBorrow)
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -4933,6 +5537,252 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        if let Some(fact) = self.facts.dyn_downcasts.get(&expr.node.id).cloned() {
+            if fact.mutable {
+                return Err(unsupported_expr(expr));
+            }
+            let ExprKind::FailableCast(cast) = &expr.node.kind else {
+                return Err(unsupported_expr(expr));
+            };
+            let DynDowncastSource::Resolved(surface) = fact.source else {
+                return Err(unsupported_expr(expr));
+            };
+            if fact.source_id != cast.node.expr.node.id {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let surface = self
+                .cx
+                .maps
+                .contract_surfaces
+                .get(&surface)
+                .copied()
+                .ok_or_else(|| unsupported_expr(expr))?;
+            let target = self.cx.lower_ty(&fact.target)?;
+            let raw_ty = self.cx.lower_ty(&Type::Optional {
+                inner: Box::new(fact.target),
+            })?;
+            let value = self.lower_value(&cast.node.expr)?;
+            let downcast = match value {
+                Operand::Place(place) if matches!(place.root, PlaceRoot::DynBorrowParam(_)) => self
+                    .lower_borrowed_dyn_downcast(&cast.node.expr, place, surface, target, raw_ty)?,
+                value => {
+                    let use_ = self.dyn_owned_use(&value);
+                    self.emit_typed_temp(
+                        raw_ty,
+                        RValue::DynDowncast {
+                            value,
+                            use_,
+                            surface,
+                            target,
+                            ty: raw_ty,
+                        },
+                    )?
+                }
+            };
+            let expected = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+            if expected == raw_ty {
+                return Ok(downcast);
+            }
+            return self.lower_contextual_dyn_downcast(expr, downcast, target, expected);
+        }
+        if let Some(fact) = self.facts.dyn_conversions.get(&expr.node.id).cloned() {
+            let witness = self
+                .cx
+                .maps
+                .contract_witnesses
+                .get(&fact.witness)
+                .copied()
+                .ok_or_else(|| unsupported_expr(expr))?;
+            let concrete_ty = self.cx.program.contract_witness(witness).key.concrete_ty;
+            let value = match &expr.node.kind {
+                ExprKind::StructLiteral(literal) => {
+                    self.lower_struct_literal_as(expr, literal, concrete_ty)?
+                }
+                _ => self.lower_dynamic_source(expr)?,
+            };
+            let surface = self.cx.program.contract_witness(witness).key.surface;
+            let ty = self
+                .cx
+                .program
+                .type_arena
+                .iter()
+                .position(|ty| ty == &TypeData::Dyn(surface))
+                .map(TypeId::from_index)
+                .ok_or_else(|| unsupported_expr(expr))?;
+            let use_ = self.dyn_owned_use(&value);
+            return self.emit_typed_temp(
+                ty,
+                RValue::DynPack {
+                    value,
+                    use_,
+                    witness,
+                    ty,
+                },
+            );
+        }
+        if let Some(_fact) = self.facts.dyn_weakenings.get(&expr.node.id) {
+            let value = self.lower_dynamic_source(expr)?;
+            let use_ = self.dyn_owned_use(&value);
+            let weakening = self
+                .cx
+                .maps
+                .contract_weakenings
+                .get(&(self.body.clone(), expr.node.id))
+                .copied()
+                .ok_or_else(|| unsupported_expr(expr))?;
+            let surface = self.cx.program.contract_weakening(weakening).target;
+            let ty = self
+                .cx
+                .program
+                .type_arena
+                .iter()
+                .position(|ty| ty == &TypeData::Dyn(surface))
+                .map(TypeId::from_index)
+                .ok_or_else(|| unsupported_expr(expr))?;
+            return self.emit_typed_temp(
+                ty,
+                RValue::DynWeaken {
+                    value,
+                    use_,
+                    weakening,
+                    ty,
+                },
+            );
+        }
+        self.lower_plain_value(expr)
+    }
+
+    fn lower_borrowed_dyn_downcast(
+        &mut self,
+        source: &ExprNode,
+        place: Place,
+        surface: ContractSurfaceId,
+        target: TypeId,
+        ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let borrow = self.dyn_reborrow(source, place, surface)?;
+        let payload = self.push_local(
+            None,
+            None,
+            target,
+            AirMutability::Immutable,
+            LocalKind::PatternBinding,
+        );
+        let result = self.temp(ty);
+        let some_block = self.with_nested_block(|this| {
+            let value = this.optional_some(this.operand_place(payload), ty, source)?;
+            this.emit_init(result, RValue::Use(value))
+        })?;
+        let none_block = self.with_nested_block(|this| {
+            let value = this.optional_none(ty, source)?;
+            this.emit_init(result, RValue::Use(value))
+        })?;
+        self.push_dyn_match(AirDynMatch {
+            source: AirDynMatchSource::Borrowed(borrow),
+            surface,
+            arms: vec![AirDynMatchArm {
+                target,
+                binding: AirDynMatchTargetBinding::Materialize(payload),
+                block: some_block,
+            }],
+            fallback: AirDynMatchFallback {
+                binding: AirDynMatchFallbackBinding::Discard,
+                block: none_block,
+            },
+        })?;
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_contextual_dyn_downcast(
+        &mut self,
+        expr: &ExprNode,
+        downcast: Operand,
+        target: TypeId,
+        expected: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let TypeData::Optional(dyn_ty) = self.cx.program.type_data(expected) else {
+            return Err(unsupported_expr(expr));
+        };
+        let dyn_ty = *dyn_ty;
+        let TypeData::Dyn(surface) = self.cx.program.type_data(dyn_ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let surface = *surface;
+        let conversion = self
+            .facts
+            .dyn_conversions
+            .get(&expr.node.id)
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let witness = self
+            .cx
+            .maps
+            .contract_witnesses
+            .get(&conversion.witness)
+            .copied()
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let witness_decl = self.cx.program.contract_witness(witness);
+        if witness_decl.key.concrete_ty != target || witness_decl.key.surface != surface {
+            return Err(unsupported_expr(expr));
+        }
+        let Operand::Place(discr) = downcast else {
+            return Err(unsupported_expr(expr));
+        };
+        let payload = self.temp(target);
+        let result = self.temp(expected);
+        let some_block = self.with_nested_block(|this| {
+            let packed = this.emit_typed_temp(
+                dyn_ty,
+                RValue::DynPack {
+                    value: Operand::Place(this.local_place(payload)),
+                    use_: DynOwnedUse::ConsumeTemporary,
+                    witness,
+                    ty: dyn_ty,
+                },
+            )?;
+            let wrapped = this.optional_some(packed, expected, expr)?;
+            this.emit_init(result, RValue::Use(wrapped))
+        })?;
+        let none_block = self.with_nested_block(|this| {
+            let none = this.optional_none(expected, expr)?;
+            this.emit_init(result, RValue::Use(none))
+        })?;
+        self.ensure_open()?;
+        self.block
+            .stmts
+            .push(AirStmt::OptionalMatch(AirOptionalMatch {
+                discr,
+                payload: Some(payload),
+                payload_ref: false,
+                payload_escapes: false,
+                some_block,
+                none_block,
+            }));
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_dynamic_source(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        if let Some(fact) = self.facts.locals.uses.get(&expr.node.id).cloned() {
+            return self.lower_place(expr, &fact).map(Operand::Place);
+        }
+        self.lower_plain_value(expr)
+    }
+
+    fn dyn_owned_use(&self, value: &Operand) -> DynOwnedUse {
+        match value {
+            Operand::Place(Place {
+                root: PlaceRoot::Local(local),
+                projection,
+                ..
+            }) if projection.is_empty()
+                && self.function.locals[local.index()].kind == LocalKind::Temp =>
+            {
+                DynOwnedUse::ConsumeTemporary
+            }
+            Operand::Const(_) | Operand::Place(_) => DynOwnedUse::ReusableRead,
+        }
+    }
+
+    fn lower_plain_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         if let Some(value) = self.facts.const_values.get(&expr.node.id).cloned() {
             return self.lower_const_value(expr, &value);
         }
@@ -4948,6 +5798,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.lower_lit(expr, lit),
             ExprKind::Ident(_) | ExprKind::Field(_) => {
+                if matches!(self.lower_expr_ty(expr.node.id)?, Type::Dyn(_))
+                    && let Some(fact) = self.facts.locals.uses.get(&expr.node.id).cloned()
+                {
+                    return self.lower_place(expr, &fact).map(Operand::Place);
+                }
                 if !self.facts.locals.uses.contains_key(&expr.node.id)
                     && let Some(value) = self.lower_qualified_unit_enum(expr)?
                 {
@@ -5538,16 +6393,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         literal: &ast::StructLiteralNode,
     ) -> Result<Operand, LowerError> {
         let ty = self.lower_expr_ty(expr.node.id)?;
-        let ty_id = self.cx.lower_ty(&ty)?;
-        match self.cx.program.type_data(ty_id) {
+        let ty = self.cx.lower_ty(&ty)?;
+        self.lower_struct_literal_as(expr, literal, ty)
+    }
+
+    fn lower_struct_literal_as(
+        &mut self,
+        expr: &ExprNode,
+        literal: &ast::StructLiteralNode,
+        ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        match self.cx.program.type_data(ty) {
             TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => {
-                self.lower_struct_aggregate_literal(expr, literal, *aggregate, ty_id)
+                self.lower_struct_aggregate_literal(expr, literal, *aggregate, ty)
             }
-            TypeData::Enum(enum_id) => {
-                self.lower_struct_enum_literal(expr, literal, *enum_id, ty_id)
-            }
+            TypeData::Enum(enum_id) => self.lower_struct_enum_literal(expr, literal, *enum_id, ty),
             TypeData::Extern(extern_id) => {
-                self.lower_struct_extern_literal(expr, literal, *extern_id, ty_id)
+                self.lower_struct_extern_literal(expr, literal, *extern_id, ty)
             }
             _ => Err(unsupported_expr(expr)),
         }
@@ -6496,9 +7358,38 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         match_expr: &ast::MatchNode,
     ) -> Result<Operand, LowerError> {
         if matches!(match_expr.node.mode, ast::MatchMode::Dynamic) {
-            return Err(unsupported_expr(expr));
+            let plan = self.checked_dyn_match_plan(expr)?.clone();
+            let result_ty = match self.lower_expr_ty(expr.node.id)? {
+                Type::Void => return Err(unsupported_expr(expr)),
+                ty => self.cx.lower_ty(&ty)?,
+            };
+            let result = self.temp(result_ty);
+            return self.lower_dyn_match_value(expr, match_expr, &plan, result, result_ty);
         }
         let plan = self.checked_match_plan(expr)?;
+        if match_expr.node.access.is_ref()
+            && self
+                .facts
+                .dyn_downcasts
+                .get(&match_expr.node.scrutinee.node.id)
+                .is_some_and(|fact| fact.mutable)
+        {
+            let result_ty = match self.lower_expr_ty(expr.node.id)? {
+                Type::Void => return Err(unsupported_expr(expr)),
+                ty => self.cx.lower_ty(&ty)?,
+            };
+            let result = self.temp(result_ty);
+            self.lower_dyn_downcast_alias_match(
+                expr,
+                match_expr,
+                &plan,
+                MatchOutput::Value { result, result_ty },
+            )?;
+            if self.terminated {
+                return self.dummy_operand(result_ty);
+            }
+            return Ok(self.operand_place(result));
+        }
         if match_expr.node.access.is_ref() && self.is_optional_expr(&match_expr.node.scrutinee)? {
             let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
             let result = self.temp(result_ty);
@@ -6676,6 +7567,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .ok_or(LowerError::MissingTypecheckFacts)
     }
 
+    fn checked_dyn_match_plan(&self, expr: &ExprNode) -> Result<&CheckedDynMatchPlan, LowerError> {
+        self.facts
+            .dyn_matches
+            .get(&expr.node.id)
+            .ok_or(LowerError::MissingTypecheckFacts)
+    }
+
     fn is_optional_expr(&mut self, expr: &ExprNode) -> Result<bool, LowerError> {
         let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         Ok(typing::optional_inner(&self.cx.program, ty).is_some())
@@ -6749,6 +7647,321 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.dummy_operand(result_ty);
         }
         Ok(self.operand_place(result))
+    }
+
+    fn lower_dyn_match_effect(
+        &mut self,
+        owner: &ExprNode,
+        match_expr: &ast::MatchNode,
+        plan: &CheckedDynMatchPlan,
+    ) -> Result<(), LowerError> {
+        let match_ = self.lower_dyn_match(owner, match_expr, plan, MatchOutput::Effect)?;
+        self.push_dyn_match(match_)
+    }
+
+    fn lower_dyn_match_value(
+        &mut self,
+        owner: &ExprNode,
+        match_expr: &ast::MatchNode,
+        plan: &CheckedDynMatchPlan,
+        result: LocalId,
+        result_ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        let match_ = self.lower_dyn_match(
+            owner,
+            match_expr,
+            plan,
+            MatchOutput::Value { result, result_ty },
+        )?;
+        self.push_dyn_match(match_)?;
+        if self.terminated {
+            return self.dummy_operand(result_ty);
+        }
+        Ok(self.operand_place(result))
+    }
+
+    fn lower_dyn_match(
+        &mut self,
+        owner: &ExprNode,
+        match_expr: &ast::MatchNode,
+        plan: &CheckedDynMatchPlan,
+        output: MatchOutput,
+    ) -> Result<AirDynMatch, LowerError> {
+        if match_expr.node.arms.len() != plan.arms.len() + 1
+            || plan.source != match_expr.node.scrutinee.node.id
+        {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        let source_ty = self
+            .cx
+            .lower_ty(&self.lower_expr_ty(match_expr.node.scrutinee.node.id)?)?;
+        let TypeData::Dyn(surface) = self.cx.program.type_data(source_ty) else {
+            return Err(unsupported_expr(owner));
+        };
+        let surface = *surface;
+        let source = match plan.access {
+            CheckedMatchAccess::RefAlias => {
+                AirDynMatchSource::Mutable(self.lower_mut_call_arg(&match_expr.node.scrutinee)?)
+            }
+            CheckedMatchAccess::Owned => {
+                let source_fact = self
+                    .facts
+                    .locals
+                    .uses
+                    .get(&match_expr.node.scrutinee.node.id)
+                    .cloned();
+                let source_place = match source_fact {
+                    Some(fact) => self.lower_place(&match_expr.node.scrutinee, &fact).ok(),
+                    None => None,
+                };
+                let value = if let Some(place) = source_place {
+                    Operand::Place(place)
+                } else {
+                    self.lower_dynamic_source(&match_expr.node.scrutinee)?
+                };
+                match value {
+                    Operand::Place(place) if matches!(place.root, PlaceRoot::DynBorrowParam(_)) => {
+                        AirDynMatchSource::Borrowed(self.dyn_reborrow(
+                            &match_expr.node.scrutinee,
+                            place,
+                            surface,
+                        )?)
+                    }
+                    value => AirDynMatchSource::Owned {
+                        use_: self.dyn_owned_use(&value),
+                        value,
+                    },
+                }
+            }
+        };
+        let aliases = matches!(source, AirDynMatchSource::Mutable(_));
+        let takes = matches!(
+            source,
+            AirDynMatchSource::Owned {
+                use_: DynOwnedUse::ConsumeTemporary,
+                ..
+            }
+        );
+        let mut arms = Vec::with_capacity(plan.arms.len());
+        for (ast_arm, checked) in match_expr.node.arms.iter().zip(&plan.arms) {
+            let ast::MatchArmHead::DynDowncast(ast_downcast) = &ast_arm.node.head else {
+                return Err(unsupported_expr(owner));
+            };
+            if ast_downcast.node.id != checked.downcast {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let fact = self
+                .facts
+                .dyn_downcasts
+                .get(&checked.downcast)
+                .ok_or(LowerError::MissingTypecheckFacts)?;
+            let DynDowncastSource::Resolved(fact_surface) = fact.source else {
+                return Err(LowerError::MissingTypecheckFacts);
+            };
+            let fact_surface = self
+                .cx
+                .maps
+                .contract_surfaces
+                .get(&fact_surface)
+                .copied()
+                .ok_or(LowerError::MissingTypecheckFacts)?;
+            if fact.source_id != plan.source || fact_surface != surface || fact.mutable != aliases {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let target = self.cx.lower_ty(&fact.target)?;
+            let binding = self.lower_dyn_match_binding(
+                checked.binding,
+                ast_downcast.node.binding,
+                target,
+                plan.access == CheckedMatchAccess::RefAlias,
+            )?;
+            let block = match output {
+                MatchOutput::Effect => self.lower_nested_expr_effect(&ast_arm.node.body)?,
+                MatchOutput::Value { result, .. } => {
+                    self.lower_nested_expr_branch_value(&ast_arm.node.body, result)?
+                }
+            };
+            let binding = match (binding, aliases, takes) {
+                (Some(local), true, _) => AirDynMatchTargetBinding::Alias(local),
+                (Some(local), false, true) => AirDynMatchTargetBinding::Take(local),
+                (Some(local), false, false) => AirDynMatchTargetBinding::Materialize(local),
+                (None, _, _) => AirDynMatchTargetBinding::Discard,
+            };
+            arms.push(AirDynMatchArm {
+                target,
+                binding,
+                block,
+            });
+        }
+        let ast_fallback = match_expr
+            .node
+            .arms
+            .last()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let ast::MatchArmHead::DynFallback(name) = ast_fallback.node.head else {
+            return Err(unsupported_expr(owner));
+        };
+        let binding = self.lower_dyn_match_binding(
+            plan.fallback.binding,
+            name,
+            source_ty,
+            plan.access == CheckedMatchAccess::RefAlias,
+        )?;
+        let block = match output {
+            MatchOutput::Effect => self.lower_nested_expr_effect(&ast_fallback.node.body)?,
+            MatchOutput::Value { result, .. } => {
+                self.lower_nested_expr_branch_value(&ast_fallback.node.body, result)?
+            }
+        };
+        let binding = match (binding, aliases) {
+            (Some(local), true) => AirDynMatchFallbackBinding::Alias(local),
+            (Some(local), false) => AirDynMatchFallbackBinding::Preserve(local),
+            (None, _) => AirDynMatchFallbackBinding::Discard,
+        };
+        Ok(AirDynMatch {
+            source,
+            surface,
+            arms,
+            fallback: AirDynMatchFallback { binding, block },
+        })
+    }
+
+    fn lower_dyn_match_binding(
+        &mut self,
+        semantic: Option<CheckedDynMatchBinding>,
+        name: Option<Ident>,
+        ty: TypeId,
+        mutable: bool,
+    ) -> Result<Option<LocalId>, LowerError> {
+        let Some(binding) = semantic else {
+            if name.is_some() {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            return Ok(None);
+        };
+        let name = name.ok_or(LowerError::MissingTypecheckFacts)?;
+        if let Some(local) = self.existing_semantic_local(binding.local) {
+            return Ok(Some(local));
+        }
+        let local = self.push_local(
+            Some(name),
+            Some(air_binding_id(binding.binding_id)),
+            ty,
+            if mutable {
+                AirMutability::Mutable
+            } else {
+                AirMutability::Immutable
+            },
+            LocalKind::PatternBinding,
+        );
+        let place = self.local_place(local);
+        self.locals.insert(binding.local, place.clone());
+        if self
+            .capture_sources
+            .insert(
+                binding.binding_id,
+                LambdaCaptureSource::Local(place.clone()),
+            )
+            .is_some()
+        {
+            return Err(LowerError::DuplicateBindingBridge {
+                body: Box::new(self.body.clone()),
+                binding: binding.binding_id,
+            });
+        }
+        if mutable {
+            self.promote_pattern_alias_scoped_borrow(
+                binding.local,
+                Some(binding.binding_id),
+                &place,
+            )?;
+        }
+        Ok(Some(local))
+    }
+
+    fn push_dyn_match(&mut self, match_: AirDynMatch) -> Result<(), LowerError> {
+        let any_falls = match_
+            .arms
+            .iter()
+            .map(|arm| &arm.block)
+            .chain(std::iter::once(&match_.fallback.block))
+            .any(air_block_falls_through);
+        self.ensure_open()?;
+        self.block.stmts.push(AirStmt::DynMatch(match_));
+        if !any_falls {
+            self.terminate(AirTail::Unreachable)?;
+        }
+        Ok(())
+    }
+
+    fn lower_dyn_downcast_alias_match(
+        &mut self,
+        owner: &ExprNode,
+        match_expr: &ast::MatchNode,
+        checked: &CheckedMatchPlan,
+        output: MatchOutput,
+    ) -> Result<(), LowerError> {
+        let fact = self
+            .facts
+            .dyn_downcasts
+            .get(&match_expr.node.scrutinee.node.id)
+            .cloned()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let ExprKind::FailableCast(cast) = &match_expr.node.scrutinee.node.kind else {
+            return Err(unsupported_expr(owner));
+        };
+        let DynDowncastSource::Resolved(surface) = fact.source else {
+            return Err(LowerError::MissingTypecheckFacts);
+        };
+        if fact.source_id != cast.node.expr.node.id || !fact.mutable {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        let surface = self
+            .cx
+            .maps
+            .contract_surfaces
+            .get(&surface)
+            .copied()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let target = self.cx.lower_ty(&fact.target)?;
+        let plan = optional_match_plan(owner, &match_expr.node.arms, checked)?;
+        let (_, some_body) = plan.some.ok_or_else(|| unsupported_expr(owner))?;
+        let checked_binding = checked
+            .arms
+            .iter()
+            .flat_map(|arm| &arm.bindings.bindings)
+            .find(|binding| binding.ty == fact.target)
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let binding = self
+            .lower_checked_pattern_binding(owner, checked_binding, AirPatternPath::default())?
+            .local;
+        let some_block = match output {
+            MatchOutput::Effect => self.lower_nested_expr_effect(some_body)?,
+            MatchOutput::Value { result, .. } => {
+                self.lower_nested_expr_branch_value(some_body, result)?
+            }
+        };
+        let none_body = plan.none.ok_or_else(|| unsupported_expr(owner))?;
+        let none_block = match output {
+            MatchOutput::Effect => self.lower_nested_expr_effect(none_body)?,
+            MatchOutput::Value { result, .. } => {
+                self.lower_nested_expr_branch_value(none_body, result)?
+            }
+        };
+        let source = self.lower_mut_call_arg(&cast.node.expr)?;
+        self.push_dyn_match(AirDynMatch {
+            source: AirDynMatchSource::Mutable(source),
+            surface,
+            arms: vec![AirDynMatchArm {
+                target,
+                binding: AirDynMatchTargetBinding::Alias(binding),
+                block: some_block,
+            }],
+            fallback: AirDynMatchFallback {
+                binding: AirDynMatchFallbackBinding::Discard,
+                block: none_block,
+            },
+        })
     }
 
     fn lower_pattern_match_arms(
@@ -7598,12 +8811,62 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         })
     }
 
+    fn lower_dyn_borrow_arg(&mut self, expr: &ExprNode, ty: TypeId) -> Result<CallArg, LowerError> {
+        let TypeData::Dyn(surface) = self.cx.program.type_data(ty) else {
+            return Err(unsupported_expr(expr));
+        };
+        let surface = *surface;
+        let place = self.lower_mut_call_arg(expr)?;
+        let (source, weakening) = if let Some(fact) = self.facts.dyn_conversions.get(&expr.node.id)
+        {
+            let witness = self
+                .cx
+                .maps
+                .contract_witnesses
+                .get(&fact.witness)
+                .copied()
+                .ok_or_else(|| unsupported_expr(expr))?;
+            (DynBorrowSource::Concrete { place, witness }, None)
+        } else {
+            let weakening = self
+                .facts
+                .dyn_weakenings
+                .get(&expr.node.id)
+                .map(|_| {
+                    self.cx
+                        .maps
+                        .contract_weakenings
+                        .get(&(self.body.clone(), expr.node.id))
+                        .copied()
+                        .ok_or_else(|| unsupported_expr(expr))
+                })
+                .transpose()?;
+            let source = if matches!(place.root, PlaceRoot::DynBorrowParam(_)) {
+                DynBorrowSource::Borrowed(place)
+            } else {
+                DynBorrowSource::Owned(place)
+            };
+            (source, weakening)
+        };
+        Ok(CallArg::DynBorrow(DynBorrow {
+            source,
+            ty,
+            surface,
+            weakening,
+        }))
+    }
+
     fn lower_expr_call_arg(
         &mut self,
         expr: &ExprNode,
         param: ParamType,
         capture_dataref_roots: bool,
     ) -> Result<CallArg, LowerError> {
+        if param.mode == ParamMode::MutBorrow
+            && matches!(self.cx.program.type_data(param.ty), TypeData::Dyn(_))
+        {
+            return self.lower_dyn_borrow_arg(expr, param.ty);
+        }
         match param.mode {
             ParamMode::Value
                 if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) =>
@@ -7707,11 +8970,128 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn lower_dyn_call_rvalue(
+        &mut self,
+        expr: &ExprNode,
+        call: &ast::CallNode,
+        fact: &DynCallFact,
+    ) -> Result<RValue, LowerError> {
+        let ExprKind::Field(field) = &call.node.func.node.kind else {
+            return Err(unsupported_expr(expr));
+        };
+        if field.node.target.node.id != fact.receiver_id || call.node.args.len() != fact.arg_count {
+            return Err(unsupported_expr(expr));
+        }
+        let surface = self
+            .cx
+            .maps
+            .contract_surfaces
+            .get(&fact.surface)
+            .copied()
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let surface_decl = self
+            .cx
+            .program
+            .contract_surfaces
+            .get(surface.index())
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let slot_id = ContractSlotId::from_index(fact.slot.0 as usize);
+        let slot = surface_decl
+            .slots
+            .get(slot_id.index())
+            .cloned()
+            .ok_or_else(|| unsupported_expr(expr))?;
+        let receiver = if fact.requires_mutable {
+            let place = self.lower_mut_call_arg(&field.node.target)?;
+            if matches!(place.root, PlaceRoot::DynBorrowParam(_)) {
+                DynReceiver::Borrowed(self.dyn_reborrow(&field.node.target, place, surface)?)
+            } else {
+                DynReceiver::MutableOwned(place)
+            }
+        } else {
+            let value = self.lower_dynamic_source(&field.node.target)?;
+            match &value {
+                Operand::Place(place) if matches!(place.root, PlaceRoot::DynBorrowParam(_)) => {
+                    DynReceiver::Borrowed(self.dyn_reborrow(
+                        &field.node.target,
+                        place.clone(),
+                        surface,
+                    )?)
+                }
+                _ => DynReceiver::Owned(value),
+            }
+        };
+        let args = call
+            .node
+            .args
+            .iter()
+            .zip(&slot.params)
+            .map(|(arg, param)| {
+                self.lower_expr_call_arg(
+                    arg,
+                    ParamType {
+                        ty: param.ty,
+                        mode: param.mode,
+                        escape: param.escape,
+                    },
+                    true,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.len() != slot.params.len() {
+            return Err(unsupported_expr(expr));
+        }
+        Ok(RValue::DynCall {
+            receiver,
+            surface,
+            slot: slot_id,
+            args,
+        })
+    }
+
+    fn dyn_reborrow(
+        &mut self,
+        expr: &ExprNode,
+        place: Place,
+        surface: ContractSurfaceId,
+    ) -> Result<DynBorrow, LowerError> {
+        let weakening = self
+            .facts
+            .dyn_weakenings
+            .get(&expr.node.id)
+            .map(|_| {
+                self.cx
+                    .maps
+                    .contract_weakenings
+                    .get(&(self.body.clone(), expr.node.id))
+                    .copied()
+                    .ok_or_else(|| unsupported_expr(expr))
+            })
+            .transpose()?;
+        let ty = self
+            .cx
+            .program
+            .type_arena
+            .iter()
+            .position(|ty| ty == &TypeData::Dyn(surface))
+            .map(TypeId::from_index)
+            .ok_or_else(|| unsupported_expr(expr))?;
+        Ok(DynBorrow {
+            source: DynBorrowSource::Borrowed(place),
+            ty,
+            surface,
+            weakening,
+        })
+    }
+
     fn lower_call_rvalue(
         &mut self,
         expr: &ExprNode,
         call: &ast::CallNode,
     ) -> Result<RValue, LowerError> {
+        if let Some(fact) = self.facts.dyn_calls.get(&expr.node.id).cloned() {
+            return self.lower_dyn_call_rvalue(expr, call, &fact);
+        }
         let args = &call.node.args;
         if let Some(target) = self.facts.calls.get(&expr.node.id)
             && is_lowered_collection_stub(&target.id)
@@ -8914,10 +10294,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             || self.facts.extern_uses.contains_key(&id)
             || self.facts.member_paths.contains_key(&id)
             || self.facts.expected_projections.contains_key(&id)
-            || self.facts.dyn_conversions.contains_key(&id)
-            || self.facts.dyn_weakenings.contains_key(&id)
-            || self.facts.dyn_calls.contains_key(&id)
-            || self.facts.dyn_downcasts.contains_key(&id)
     }
 
     fn returns_void(&self) -> bool {
@@ -9191,104 +10567,6 @@ fn air_block_falls_through(block: &AirBlock) -> bool {
     matches!(block.tail, AirTail::None)
 }
 
-fn dyn_contract_data(contract: &ast::ContractRef) -> Result<DynContractData, LowerError> {
-    let key = dyn_contract_key(contract)?;
-    Ok(DynContractData {
-        display_name: dyn_contract_name(contract)?,
-        method_table_key: key,
-        concrete_printer: None,
-    })
-}
-
-fn dyn_contract_name(contract: &ast::ContractRef) -> Result<String, LowerError> {
-    match contract {
-        ast::ContractRef::Named {
-            qualifier, name, ..
-        } => Ok(match qualifier {
-            Some(qualifier) => format!("{qualifier}::{name}"),
-            None => name.to_string(),
-        }),
-        ast::ContractRef::Anonymous(contract) => Ok(format!(
-            "contract({})",
-            contract
-                .requirements
-                .iter()
-                .map(|requirement| requirement.name.to_string())
-                .collect::<Vec<_>>()
-                .join(" + ")
-        )),
-        ast::ContractRef::Intersection(parts) => Ok(parts
-            .iter()
-            .map(dyn_contract_name)
-            .collect::<Result<Vec<_>, _>>()?
-            .join(" + ")),
-        ast::ContractRef::Infer | ast::ContractRef::Hole(_) => Err(LowerError::UnsupportedType {
-            ty: Box::new(Type::Dyn(contract.clone())),
-        }),
-    }
-}
-
-fn dyn_contract_key(contract: &ast::ContractRef) -> Result<String, LowerError> {
-    match contract {
-        ast::ContractRef::Named {
-            qualifier,
-            name,
-            origin,
-        } => Ok(format!(
-            "named:{}:{}:{}",
-            origin_key(origin.as_ref()),
-            qualifier
-                .map(|qualifier| qualifier.to_string())
-                .unwrap_or_default(),
-            name
-        )),
-        ast::ContractRef::Anonymous(contract) => Ok(format!(
-            "anon:{}:{}",
-            contract.requirements.len(),
-            contract
-                .requirements
-                .iter()
-                .map(|requirement| format!(
-                    "{:?}:{}:{:?}:{:?}",
-                    requirement.receiver, requirement.name, requirement.params, requirement.ret
-                ))
-                .collect::<Vec<_>>()
-                .join("|")
-        )),
-        ast::ContractRef::Intersection(parts) => Ok(format!(
-            "intersection:{}:{}",
-            parts.len(),
-            parts
-                .iter()
-                .map(dyn_contract_key)
-                .collect::<Result<Vec<_>, _>>()?
-                .join("|")
-        )),
-        ast::ContractRef::Infer | ast::ContractRef::Hole(_) => Err(LowerError::UnsupportedType {
-            ty: Box::new(Type::Dyn(contract.clone())),
-        }),
-    }
-}
-
-fn origin_key(origin: Option<&ast::ModuleOrigin>) -> String {
-    match origin {
-        Some(ast::ModuleOrigin::Module(path)) => format!("module:{}", path.join("::")),
-        Some(ast::ModuleOrigin::SourceFile { package, path }) => {
-            format!("source:{}:{path}", package.as_deref().unwrap_or_default())
-        }
-        Some(ast::ModuleOrigin::Package { package, path }) => format!(
-            "package:{package}:{}",
-            path.as_ref()
-                .map(|path| path.join("::"))
-                .unwrap_or_default()
-        ),
-        Some(ast::ModuleOrigin::Provider { package, path }) => {
-            format!("provider:{package}:{}", path.join("::"))
-        }
-        None => String::new(),
-    }
-}
-
 fn optional_match_payload_mode(plan: &OptionalMatchPlan<'_>, alias: bool) -> PayloadMode {
     match plan.some {
         Some((pattern, body)) if !optional_plan_arm_is_default(plan, pattern, body) => {
@@ -9305,6 +10583,13 @@ fn optional_payload_mode(pattern: &ast::PatternNode, alias: bool) -> PayloadMode
         Pattern::Ident(_) if alias => PayloadMode::Alias,
         _ => PayloadMode::Copy,
     }
+}
+
+fn direct_dyn_failable_alias_pattern(if_let: &ast::IfLetNode) -> Option<&ast::PatternNode> {
+    (matches!(if_let.node.value.node.kind, ExprKind::FailableCast(_))
+        && if_let.node.head.is_ref()
+        && matches!(if_let.node.pattern.node, Pattern::Ident(_)))
+    .then_some(&if_let.node.pattern)
 }
 
 fn direct_failable_payload_pattern(
@@ -9516,6 +10801,87 @@ fn enum_core_kind(decls: &DeclarationIndex, key: &NominalKey) -> Option<CoreEnum
     }
 }
 
+fn contract_schema_source_type(
+    schema: &ContractTypeSchema,
+    surfaces: &ContractSurfaceSchemas,
+) -> Type {
+    match schema {
+        ContractTypeSchema::Any => Type::Any,
+        ContractTypeSchema::Int => Type::Int,
+        ContractTypeSchema::Float => Type::Float,
+        ContractTypeSchema::Bool => Type::Bool,
+        ContractTypeSchema::String => Type::String,
+        ContractTypeSchema::Char => Type::Char,
+        ContractTypeSchema::Void => Type::Void,
+        ContractTypeSchema::Func { params, ret } => Type::Func {
+            params: params
+                .iter()
+                .map(|param| {
+                    ast::FuncParam::new(
+                        contract_schema_source_type(&param.ty, surfaces),
+                        param.mutable,
+                        param.cast_accept,
+                        param.escape,
+                    )
+                })
+                .collect(),
+            ret: Box::new(match ret.as_ref() {
+                ContractReturnSchema::Value(ty) => {
+                    ast::ReturnSpec::value(contract_schema_source_type(ty, surfaces))
+                }
+                ContractReturnSchema::Place(ty) => {
+                    ast::ReturnSpec::place(contract_schema_source_type(ty, surfaces))
+                }
+                ContractReturnSchema::Iter => ast::ReturnSpec::iter(),
+            }),
+        },
+        ContractTypeSchema::Dyn(surface) => Type::Dyn(
+            surfaces
+                .representative_ref(*surface)
+                .expect("canonical dynamic surface has a representative"),
+        ),
+        ContractTypeSchema::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| contract_schema_source_type(item, surfaces))
+                .collect(),
+        ),
+        ContractTypeSchema::Nominal {
+            kind,
+            name,
+            type_args,
+            const_args,
+            origin,
+        } => Type::nominal_with_origin(
+            *kind,
+            *name,
+            type_args
+                .iter()
+                .map(|arg| contract_schema_source_type(arg, surfaces))
+                .collect(),
+            const_args.clone(),
+            origin.clone(),
+        ),
+        ContractTypeSchema::List(elem) => Type::List {
+            elem: Box::new(contract_schema_source_type(elem, surfaces)),
+        },
+        ContractTypeSchema::Array { elem, len } => Type::Array {
+            elem: Box::new(contract_schema_source_type(elem, surfaces)),
+            len: *len,
+        },
+        ContractTypeSchema::Map { key, value } => Type::Map {
+            key: Box::new(contract_schema_source_type(key, surfaces)),
+            value: Box::new(contract_schema_source_type(value, surfaces)),
+        },
+        ContractTypeSchema::Slice(elem) => Type::Slice {
+            elem: Box::new(contract_schema_source_type(elem, surfaces)),
+        },
+        ContractTypeSchema::Optional(inner) => Type::Optional {
+            inner: Box::new(contract_schema_source_type(inner, surfaces)),
+        },
+    }
+}
+
 fn source_param_mode(mutable: bool) -> ParamMode {
     if mutable {
         ParamMode::MutBorrow
@@ -9526,6 +10892,18 @@ fn source_param_mode(mutable: bool) -> ParamMode {
 
 fn air_binding_id(binding: BindingId) -> AirBindingId {
     AirBindingId::from_index(binding.0 as usize)
+}
+
+fn collect_witness_extern_targets(target: &WitnessSlotTarget, externs: &mut Vec<ExternUseTarget>) {
+    match target {
+        WitnessSlotTarget::Extern { method, .. } => {
+            externs.push(ExternUseTarget::Method(*method));
+        }
+        WitnessSlotTarget::Promoted { target, .. } => {
+            collect_witness_extern_targets(target, externs);
+        }
+        WitnessSlotTarget::Direct { .. } | WitnessSlotTarget::Extend { .. } => {}
+    }
 }
 
 fn extern_use_requires_decl(externs: &ExternCatalog, target: ExternUseTarget) -> bool {
@@ -9644,9 +11022,11 @@ pub(crate) fn lower_with_modules(
     let mut cx = LowerCx {
         decls: Some(semantic.declarations.clone()),
         externs: Some(semantic.externs.clone()),
+        contract_surfaces: Some(semantic.contract_surfaces.clone()),
         typecheck_facts: Some(typecheck_facts),
         ..LowerCx::default()
     };
+    cx.lower_contract_surfaces()?;
     cx.lower_function_shells(&index.modules, &functions)?;
     ownership::finalize(&mut cx.program)
         .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
@@ -9655,6 +11035,7 @@ pub(crate) fn lower_with_modules(
         cx.set_entry(entry)?;
     }
     cx.lower_extern_declarations(&functions, semantic)?;
+    cx.lower_contract_declarations(&functions, semantic)?;
     cx.lower_function_bodies(&functions)?;
     ownership::finalize(&mut cx.program)
         .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
@@ -10255,6 +11636,21 @@ impl<'a> DefaultExprFactsIndex<'a> {
             .get(&(site, body.clone()))
             .copied()
             .ok_or(LowerError::MissingDefaultExprFacts { site })
+    }
+}
+
+#[derive(Debug)]
+struct ReachableFactSlice<'a> {
+    body: BodyInstanceKey,
+    facts: &'a SemanticBodyFacts,
+    exprs: Option<HashSet<ExprId>>,
+}
+
+impl ReachableFactSlice<'_> {
+    fn includes(&self, expr: ExprId) -> bool {
+        self.exprs
+            .as_ref()
+            .is_none_or(|exprs| exprs.contains(&expr))
     }
 }
 
@@ -11253,6 +12649,45 @@ impl<'a> ReachableItems<'a> {
             items,
         })
     }
+
+    fn contract_fact_slices(&self) -> Result<Vec<ReachableFactSlice<'_>>, LowerError> {
+        let mut slices = self
+            .items
+            .iter()
+            .map(|item| ReachableFactSlice {
+                body: item.body.clone(),
+                facts: item.body_facts.as_facts(),
+                exprs: None,
+            })
+            .collect::<Vec<_>>();
+        let mut worklist = self
+            .items
+            .iter()
+            .flat_map(|item| default_uses(item.body_facts.as_facts(), None))
+            .collect::<Vec<_>>();
+        let mut visited = HashSet::new();
+        let mut index = 0;
+        while let Some(default_use) = worklist.get(index).cloned() {
+            index += 1;
+            if !visited.insert(default_use.clone()) {
+                continue;
+            }
+            let site = default_use.key.site();
+            let expr = self
+                .index
+                .get_default_expr(&default_use.key)
+                .ok_or(LowerError::MissingDefaultExprFacts { site })?;
+            let exprs = source_expr_ids(expr);
+            let facts = self.default_facts.get(site, &default_use.facts_body)?;
+            worklist.extend(default_uses(facts, Some(&exprs)));
+            slices.push(ReachableFactSlice {
+                body: default_use.facts_body,
+                facts,
+                exprs: Some(exprs),
+            });
+        }
+        Ok(slices)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -11444,6 +12879,7 @@ fn enqueue_body_references(
     )?;
     enqueue_global_accesses(body_facts, None, queued, worklist);
     enqueue_user_cast_conversions(body_facts, None, queued, worklist);
+    enqueue_contract_witness_targets(index, semantic, body_facts, None, queued, worklist)?;
     enqueue_function_values(index, body_facts, body, source_id, None, queued, worklist)?;
     enqueue_stringify_overrides(index, semantic, body_facts, None, queued, worklist);
     let mut default_env = DefaultDependencyEnv {
@@ -11553,6 +12989,14 @@ fn enqueue_default_references(
     )?;
     enqueue_global_accesses(facts, Some(&exprs), env.queued, env.worklist);
     enqueue_user_cast_conversions(facts, Some(&exprs), env.queued, env.worklist);
+    enqueue_contract_witness_targets(
+        env.index,
+        env.semantic,
+        facts,
+        Some(&exprs),
+        env.queued,
+        env.worklist,
+    )?;
     enqueue_function_values(
         env.index,
         facts,
@@ -11668,6 +13112,76 @@ fn enqueue_user_cast_conversions(
         }
         queue_reachable(queued, worklist, ReachableKey::CastFrom(instance.clone()));
     }
+}
+
+fn enqueue_contract_witness_targets(
+    index: &SourceProgramIndex<'_>,
+    semantic: &SemanticProgram,
+    body_facts: &SemanticBodyFacts,
+    exprs: Option<&HashSet<ExprId>>,
+    queued: &mut HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) -> Result<(), LowerError> {
+    let mut conversions = body_facts.dyn_conversions.values().collect::<Vec<_>>();
+    conversions.sort_by_key(|fact| fact.expr_id.0);
+    for conversion in conversions {
+        if exprs.is_some_and(|exprs| !exprs.contains(&conversion.expr_id)) {
+            continue;
+        }
+        let key = semantic
+            .facts
+            .witness_structural_keys
+            .get(&conversion.witness)
+            .expect("finalized witness structural key exists");
+        for target in &key.slots {
+            enqueue_witness_target(index, target, queued, worklist)?;
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_witness_target(
+    index: &SourceProgramIndex<'_>,
+    target: &WitnessSlotTarget,
+    queued: &mut HashSet<ReachableKey>,
+    worklist: &mut Vec<ReachableKey>,
+) -> Result<(), LowerError> {
+    let instance = match target {
+        WitnessSlotTarget::Direct {
+            callable,
+            owner_args,
+            ..
+        }
+        | WitnessSlotTarget::Extend {
+            callable,
+            owner_args,
+            ..
+        } => Some(CallableInstanceKey {
+            target: callable.clone(),
+            args: owner_args.clone(),
+        }),
+        WitnessSlotTarget::Promoted { target, .. } => {
+            enqueue_witness_target(index, target, queued, worklist)?;
+            None
+        }
+        WitnessSlotTarget::Extern { .. } => None,
+    };
+    if let Some(instance) = instance {
+        if !generic_args_are_concrete(&instance.args) {
+            return Err(LowerError::NonConcreteCallableInstance {
+                id: Box::new(instance.target),
+                args: Box::new(instance.args),
+            });
+        }
+        if !index.callables.contains_key(&instance.target) {
+            return Err(LowerError::UnsupportedCallableInstance {
+                id: Box::new(instance.target),
+                args: Box::new(instance.args),
+            });
+        }
+        queue_reachable(queued, worklist, ReachableKey::Callable(instance));
+    }
+    Ok(())
 }
 
 fn is_lowered_collection_stub(id: &CallableId) -> bool {
@@ -11901,6 +13415,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        air::{
+            BadContract, BadPlace, BadStatement, VerifyErrorKind,
+            verify::{verify as verify_air, verify_contract_declarations as verify_contracts},
+        },
         ast, externs,
         externs::{ExternInputs, PackageExternInputs, RawExterns},
         resolve::PackageId,
@@ -11937,7 +13455,7 @@ mod tests {
     }
 
     #[test]
-    fn type_lowerer_lowers_slice_dyn_and_function_types() {
+    fn type_lowerer_lowers_slice_function_types() {
         let mut program = Program::default();
         let mut lowerer = TypeLowerer::default();
         let func = Type::func(
@@ -11949,11 +13467,7 @@ mod tests {
                 false,
                 ast::EscapeMode::NonEscaping,
             )],
-            ast::ReturnSpec::value(Type::Dyn(ast::ContractRef::Named {
-                qualifier: None,
-                name: Ident::new("Drawable"),
-                origin: None,
-            })),
+            ast::ReturnSpec::value(Type::Bool),
         );
 
         let id = lowerer.lower(&mut program, &func).expect("lower failed");
@@ -11965,12 +13479,1076 @@ mod tests {
                 .iter()
                 .any(|data| matches!(data, TypeData::Slice(_)))
         );
-        assert!(
-            program
-                .type_arena
-                .iter()
-                .any(|data| matches!(data, TypeData::Dyn(_)))
+    }
+
+    #[test]
+    fn canonical_contract_surfaces_transfer_to_air() {
+        let air = lower_root(
+            "contract Node { fn next(self) -> dyn Node; }
+             fn use(node: dyn Node) {}",
+            "use",
+        )
+        .expect("lower failed");
+
+        let (surface_id, surface) = air
+            .contract_surfaces
+            .iter()
+            .enumerate()
+            .find(|(_, surface)| surface.display_name == "Node")
+            .expect("missing Node surface");
+        let surface_id = ContractSurfaceId::from_index(surface_id);
+        assert_eq!(surface.slots.len(), 1);
+        assert_eq!(surface.slots[0].name, Ident::new("next"));
+        assert_eq!(
+            surface.slots[0].ret,
+            ContractReturnDecl::Value(
+                air.type_arena
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, ty)| {
+                        (*ty == TypeData::Dyn(surface_id)).then_some(TypeId::from_index(index))
+                    })
+                    .expect("missing recursive dynamic type")
+            )
         );
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("use"))
+            .expect("missing use function");
+        assert_eq!(
+            air.type_data(function.signature.params[0].ty),
+            &TypeData::Dyn(surface_id)
+        );
+        assert_eq!(
+            air.type_helper_key(function.signature.params[0].ty),
+            format!("dyn_surface_{}", surface_id.index())
+        );
+    }
+
+    #[test]
+    fn nested_dynamic_slot_types_share_source_type_identity() {
+        let air = lower_root(
+            "contract Inner { fn call(self); }
+             contract Outer { fn take(self, values: [dyn Inner]); }
+             fn direct(values: [dyn Inner]) {}",
+            "direct",
+        )
+        .expect("lower failed");
+
+        let slot_ty = air
+            .contract_surfaces
+            .iter()
+            .find(|surface| surface.display_name == "Outer")
+            .expect("missing Outer surface")
+            .slots[0]
+            .params[0]
+            .ty;
+        let param_ty = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("direct"))
+            .expect("missing direct function")
+            .signature
+            .params[0]
+            .ty;
+        assert_eq!(slot_ty, param_ty);
+    }
+
+    #[test]
+    fn generic_nominal_dynamic_slot_types_share_source_type_identity() {
+        let air = lower_root(
+            "contract Inner { fn call(self); }
+             struct Box<T> { value: T }
+             contract Outer { fn take(self, value: Box<dyn Inner>); }
+             fn direct(value: Box<dyn Inner>) {}",
+            "direct",
+        )
+        .expect("lower failed");
+
+        let slot_ty = air
+            .contract_surfaces
+            .iter()
+            .find(|surface| surface.display_name == "Outer")
+            .expect("missing Outer surface")
+            .slots[0]
+            .params[0]
+            .ty;
+        let param_ty = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("direct"))
+            .expect("missing direct function")
+            .signature
+            .params[0]
+            .ty;
+        assert_eq!(slot_ty, param_ty);
+    }
+
+    #[test]
+    fn equivalent_compositions_share_air_type_identity() {
+        let air = lower_roots(
+            "contract A { fn a(self); }
+             contract B { fn b(self); }
+             fn left(value: dyn A + B) {}
+             fn right(value: dyn B + A) {}",
+            &["left", "right"],
+        )
+        .expect("lower failed");
+
+        let param_ty = |name: &str| {
+            air.functions
+                .iter()
+                .find(|function| function.name == Ident::new(name))
+                .expect("missing function")
+                .signature
+                .params[0]
+                .ty
+        };
+        assert_eq!(param_ty("left"), param_ty("right"));
+    }
+
+    #[test]
+    fn reachable_contract_witness_lowers_exact_target() {
+        let air = lower_contract_boundary(
+            "contract Action { fn act(self); }
+             struct Item { fn act(self) {} }
+             fn main() { let action: dyn Action = Item {}; }",
+            &["main"],
+        );
+
+        assert_eq!(air.contract_witnesses.len(), 1);
+        let witness = &air.contract_witnesses[0];
+        assert_eq!(air.type_display_name(witness.key.concrete_ty), "Item");
+        assert_eq!(witness.key.slots.len(), 1);
+        let ContractWitnessTarget::Function { function } = witness.key.slots[0].target else {
+            panic!("expected function witness target");
+        };
+        assert_eq!(air.function(function).name, Ident::new("act"));
+    }
+
+    #[test]
+    fn default_expression_contract_facts_enter_air_closure() {
+        let air = lower_contract_boundary(
+            "contract A { fn a(self); }
+             contract B { fn b(self); }
+             struct Both { fn a(self) {} fn b(self) {} }
+             fn make() -> dyn A + B { Both {} }
+             fn use(value: dyn B = make()) {}
+             fn main() { use(); }",
+            &["main"],
+        );
+
+        assert_eq!(air.contract_weakenings.len(), 1);
+        assert_eq!(air.contract_witnesses.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_pack_weaken_and_call_enter_air() {
+        let air = lower_roots(
+            "contract A { fn a(ref self); }
+             contract B { fn b(ref self); }
+             struct Both { fn a(ref self) {} fn b(ref self) {} }
+             fn main() {
+                 var concrete = Both {};
+                 var both: dyn A + B = concrete;
+                 var one: dyn A = both;
+                 one.a();
+             }",
+            &["main"],
+        )
+        .expect("dynamic AIR lowering failed");
+
+        let mut pack = false;
+        let mut weaken = false;
+        let mut call = false;
+        air.functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap()
+            .body
+            .for_each_rvalue(&mut |value| match value {
+                RValue::DynPack { .. } => pack = true,
+                RValue::DynWeaken { .. } => weaken = true,
+                RValue::DynCall { .. } => call = true,
+                _ => {}
+            });
+        assert!(
+            pack && weaken && call,
+            "pack={pack} weaken={weaken} call={call}"
+        );
+    }
+
+    #[test]
+    fn owned_dynamic_params_keep_owned_roots() {
+        let air = lower_roots(
+            "contract A { fn a(self); }
+             struct Item { fn a(self) {} }
+             fn inspect(value: dyn A) { value.a(); }
+             fn keep(value: dyn A) -> dyn A { value }
+             fn main() {
+                 let kept = keep(Item {});
+                 inspect(Item {});
+             }",
+            &["main"],
+        )
+        .expect("owned dynamic parameter lowering failed");
+
+        for name in ["inspect", "keep"] {
+            let function = air
+                .functions
+                .iter()
+                .find(|function| function.name == Ident::new(name))
+                .unwrap();
+            let local = function.signature.params[0].local_id;
+            let mut borrowed_root = false;
+            function.body.walk_children(&mut |child| {
+                let place = match child {
+                    crate::air::AirChild::Operand {
+                        operand: Operand::Place(place),
+                        ..
+                    }
+                    | crate::air::AirChild::Place { place, .. } => Some(place),
+                    _ => None,
+                };
+                borrowed_root |=
+                    place.is_some_and(|place| matches!(place.root, PlaceRoot::DynBorrowParam(_)));
+            });
+            assert!(!borrowed_root);
+            assert!(matches!(
+                function.locals[local.index()].kind,
+                LocalKind::Arg
+            ));
+        }
+        let inspect = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("inspect"))
+            .unwrap();
+        assert!(matches!(
+            inspect.body.block.stmts[0],
+            AirStmt::Eval(RValue::DynCall {
+                receiver: DynReceiver::Owned(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn owned_downcast_and_dynamic_match_enter_air() {
+        let downcast = lower_roots(
+            "contract Drawable { fn draw(self); }
+             struct Enemy { fn draw(self) {} }
+             fn main() -> Enemy? {
+                 let actor: dyn Drawable = Enemy {};
+                 actor as? Enemy
+             }",
+            &["main"],
+        )
+        .expect("dynamic downcast AIR lowering failed");
+        let main = downcast
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        assert!(
+            function_statements(main).any(|stmt| matches!(
+                stmt,
+                AirStmt::Init {
+                    value: RValue::DynDowncast { .. },
+                    ..
+                } | AirStmt::Eval(RValue::DynDowncast { .. })
+            )),
+            "{:#?}",
+            main.body.block.stmts
+        );
+
+        let matched = lower_roots(
+            "contract Drawable { fn draw(self); }
+             struct Enemy { fn draw(self) {} }
+             fn main() {
+                 let actor: dyn Drawable = Enemy {};
+                 match actor as? {
+                     Enemy(enemy) => enemy.draw(),
+                     other => other.draw(),
+                 };
+             }",
+            &["main"],
+        )
+        .expect("dynamic match AIR lowering failed");
+        let main = matched
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        let Some(AirStmt::DynMatch(match_)) = main.body.block.stmts.last() else {
+            panic!("expected structured dynamic match");
+        };
+        assert!(matches!(match_.source, AirDynMatchSource::Owned { .. }));
+        assert_eq!(match_.arms.len(), 1);
+        assert!(match_.arms[0].binding.local().is_some());
+        assert!(match_.fallback.binding.local().is_some());
+    }
+
+    #[test]
+    fn borrowed_and_mutable_dynamic_match_sources_are_explicit() {
+        let borrowed = lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { fn update(ref self) {} }
+             fn inspect(ref actor: dyn Updatable) {
+                 match actor as? {
+                     Enemy(enemy) => {},
+                     other => {},
+                 };
+             }",
+            &["inspect"],
+        )
+        .expect("borrowed dynamic match AIR lowering failed");
+        let inspect = borrowed
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("inspect"))
+            .unwrap();
+        assert!(
+            function_statements(inspect).any(|stmt| matches!(
+                stmt,
+                AirStmt::DynMatch(AirDynMatch {
+                    source: AirDynMatchSource::Borrowed(_),
+                    ..
+                })
+            )),
+            "{:#?}",
+            inspect.body.block.stmts
+        );
+
+        let mutable = lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { hp: int, fn update(ref self) {} }
+             fn main() {
+                 var actor: dyn Updatable = Enemy { hp: 1 };
+                 match ref actor as? {
+                     Enemy(enemy) => enemy.hp = 2,
+                     other => other.update(),
+                 };
+             }",
+            &["main"],
+        )
+        .expect("mutable dynamic match AIR lowering failed");
+        let main = mutable
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        assert!(function_statements(main).any(|stmt| matches!(
+            stmt,
+            AirStmt::DynMatch(AirDynMatch {
+                source: AirDynMatchSource::Mutable(_),
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn mutable_dynamic_match_discard_arms_can_use_root() {
+        lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { fn update(ref self) {} }
+             fn main() {
+                 var actor: dyn Updatable = Enemy {};
+                 match ref actor as? {
+                     Enemy(_) => actor.update(),
+                     _ => actor.update(),
+                 };
+             }",
+            &["main"],
+        )
+        .expect("discard-only mutable dynamic match should not loan the root");
+    }
+
+    #[test]
+    fn malformed_mutable_dynamic_match_rejects_root_reads() {
+        let mut air = lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { hp: int, fn update(ref self) {} }
+             fn main() {
+                 var actor: dyn Updatable = Enemy { hp: 1 };
+                 match ref actor as? {
+                     Enemy(enemy) => {},
+                     other => {},
+                 };
+             }",
+            &["main"],
+        )
+        .expect("mutable dynamic match AIR lowering failed");
+        let function_id = air
+            .functions
+            .iter()
+            .position(|function| function.name == Ident::new("main"))
+            .map(FunctionId::from_index)
+            .unwrap();
+        let mut immutable = air.clone();
+        let AirStmt::DynMatch(AirDynMatch {
+            source:
+                AirDynMatchSource::Mutable(Place {
+                    root: PlaceRoot::Local(root),
+                    ..
+                }),
+            ..
+        }) = immutable
+            .function(function_id)
+            .body
+            .block
+            .stmts
+            .last()
+            .unwrap()
+        else {
+            panic!("expected local mutable dynamic match source");
+        };
+        let root = *root;
+        immutable.function_mut(function_id).locals[root.index()].mutability =
+            AirMutability::Immutable;
+        let errors = verify_air(&immutable).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadPlace(BadPlace::ImmutableRoot(_))
+        )));
+
+        let mut bad_transition = air.clone();
+        let AirStmt::DynMatch(match_) = bad_transition
+            .function_mut(function_id)
+            .body
+            .block
+            .stmts
+            .last_mut()
+            .unwrap()
+        else {
+            panic!("expected dynamic match");
+        };
+        let binding = match_.arms[0].binding.local().unwrap();
+        match_.arms[0].binding = AirDynMatchTargetBinding::Materialize(binding);
+        let errors = verify_air(&bad_transition).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadStatement(BadStatement::InvalidDynMatch)
+        )));
+
+        let main = air.function_mut(function_id);
+        let AirStmt::DynMatch(match_) = main.body.block.stmts.last_mut().unwrap() else {
+            panic!("expected dynamic match");
+        };
+        let AirDynMatchSource::Mutable(root) = &match_.source else {
+            panic!("expected mutable source");
+        };
+        match_.arms[0]
+            .block
+            .stmts
+            .push(AirStmt::Eval(RValue::Use(Operand::Place(root.clone()))));
+
+        let errors = verify_air(&air).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadStatement(BadStatement::DynMatchRootUsed)
+        )));
+    }
+
+    #[test]
+    fn readonly_dynamic_match_preserves_projected_source() {
+        let air = lower_roots(
+            "contract Drawable { fn draw(self); }
+             struct Enemy { fn draw(self) {} }
+             struct Holder { actor: dyn Drawable }
+             fn main() {
+                 let holder = Holder { actor: Enemy {} };
+                 match holder.actor as? {
+                     Enemy(enemy) => {},
+                     other => {},
+                 };
+             }",
+            &["main"],
+        )
+        .expect("projected dynamic match AIR lowering failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        assert!(function_statements(main).any(|stmt| matches!(
+            stmt,
+            AirStmt::DynMatch(AirDynMatch {
+                source: AirDynMatchSource::Owned {
+                    value: Operand::Place(Place { projection, .. }),
+                    ..
+                },
+                ..
+            }) if !projection.is_empty()
+        )));
+    }
+
+    #[test]
+    fn mutable_downcast_alias_supports_non_escaping_capture() {
+        let air = lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { hp: int, fn update(ref self) {} }
+             fn touch(ref actor: dyn Updatable) {
+                 if ref enemy = actor as? Enemy {
+                     let f = || { enemy.hp = 1; };
+                     f();
+                 }
+             }
+             fn main() {
+                 var actor: dyn Updatable = Enemy { hp: 0 };
+                 touch(actor);
+             }",
+            &["main"],
+        )
+        .expect("captured mutable downcast alias AIR lowering failed");
+        assert!(
+            air.scoped_borrows
+                .iter()
+                .any(|borrow| matches!(borrow.source, ScopedBorrowSource::PatternAlias { .. }))
+        );
+
+        let mut forged = air.clone();
+        let borrow = forged
+            .scoped_borrows
+            .iter()
+            .position(|borrow| matches!(borrow.source, ScopedBorrowSource::PatternAlias { .. }))
+            .map(ScopedBorrowId::from_index)
+            .unwrap();
+        let touch = forged
+            .functions
+            .iter()
+            .position(|function| function.name == Ident::new("touch"))
+            .map(FunctionId::from_index)
+            .unwrap();
+        let target = forged.scoped_borrows[borrow.index()].ty;
+        let alias = forged.scoped_borrow_place(borrow).unwrap();
+        let function = forged.function_mut(touch);
+        function.signature.return_mode = ReturnMode::Place(target);
+        let AirStmt::DynMatch(match_) = function.body.block.stmts.first_mut().unwrap() else {
+            panic!("expected captured dynamic match");
+        };
+        match_.arms[0].block.tail = AirTail::Return(Some(Operand::Place(alias)));
+        let errors = verify_air(&forged).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadStatement(BadStatement::DynMatchAliasEscapes(_))
+        )));
+    }
+
+    #[test]
+    fn downcast_preserves_optional_dynamic_expected_context() {
+        let air = lower_roots(
+            "contract Drawable { fn draw(self); }
+             struct Enemy { fn draw(self) {} }
+             fn main() -> dyn Drawable? {
+                 let actor: dyn Drawable = Enemy {};
+                 actor as? Enemy
+             }",
+            &["main"],
+        )
+        .expect("contextual dynamic downcast AIR lowering failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        let values = function_statements(main).collect::<Vec<_>>();
+        assert!(values.iter().any(|stmt| matches!(
+            stmt,
+            AirStmt::Init {
+                value: RValue::DynDowncast { .. },
+                ..
+            }
+        )));
+        assert!(values.iter().any(|stmt| matches!(
+            stmt,
+            AirStmt::Init {
+                value: RValue::DynPack { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn mutable_downcast_alias_uses_structured_match() {
+        let air = lower_roots(
+            "contract Updatable { fn update(ref self); }
+             struct Enemy { hp: int, fn update(ref self) {} }
+             fn main() {
+                 var actor: dyn Updatable = Enemy { hp: 1 };
+                 if ref enemy = actor as? Enemy {
+                     enemy.hp = 2;
+                 }
+             }",
+            &["main"],
+        )
+        .expect("mutable downcast AIR lowering failed");
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        let match_ = function_statements(main)
+            .find_map(|stmt| match stmt {
+                AirStmt::DynMatch(match_) => Some(match_),
+                _ => None,
+            })
+            .expect("expected structured mutable downcast match");
+        assert!(matches!(match_.source, AirDynMatchSource::Mutable(_)));
+        assert_eq!(match_.arms.len(), 1);
+        assert!(match_.arms[0].binding.local().is_some());
+    }
+
+    #[test]
+    fn dynamic_pack_preserves_container_and_optional_contexts() {
+        let air = lower_roots(
+            "contract A { fn a(ref self); }
+             struct Item { fn a(ref self) {} }
+             fn main() {
+                 let items: [dyn A] = [Item {}];
+                 let maybe: (dyn A)? = Item {};
+             }",
+            &["main"],
+        )
+        .expect("contextual dynamic AIR lowering failed");
+
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        let mut packs = 0;
+        let mut optional = false;
+        main.body.for_each_rvalue(&mut |value| match value {
+            RValue::DynPack { .. } => packs += 1,
+            RValue::OptionalSome { .. } => optional = true,
+            _ => {}
+        });
+        assert_eq!(packs, 2);
+        assert!(optional);
+    }
+
+    #[test]
+    fn borrowed_dynamic_forms_are_explicit() {
+        let air = lower_roots(
+            "contract A { fn a(ref self); }
+             contract B { fn b(ref self); }
+             struct Both { fn a(ref self) {} fn b(ref self) {} }
+             fn take_a(ref value: dyn A) { value.a(); }
+             fn take_both(ref value: dyn A + B) { value.a(); }
+             fn forward(ref value: dyn A + B) {
+                 take_a(value);
+                 take_both(value);
+             }
+             fn main() {
+                 var both = Both {};
+                 var actor: dyn A + B = both;
+                 forward(actor);
+                 forward(both);
+             }",
+            &["main"],
+        )
+        .expect("borrowed dynamic AIR lowering failed");
+
+        let take_a = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("take_a"))
+            .unwrap();
+        assert!(matches!(
+            take_a.body.block.stmts[0],
+            AirStmt::Eval(RValue::DynCall {
+                receiver: DynReceiver::Borrowed(_),
+                ..
+            })
+        ));
+        let forward = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("forward"))
+            .unwrap();
+        let AirStmt::Eval(RValue::Call { args, .. }) = &forward.body.block.stmts[0] else {
+            panic!("expected forwarding call");
+        };
+        let CallArg::DynBorrow(borrow) = &args[0] else {
+            panic!("expected borrowed dynamic argument");
+        };
+        assert!(matches!(borrow.source, DynBorrowSource::Borrowed(_)));
+        assert!(borrow.weakening.is_some());
+        let AirStmt::Eval(RValue::Call { args, .. }) = &forward.body.block.stmts[1] else {
+            panic!("expected same-surface forwarding call");
+        };
+        assert!(matches!(
+            args.first(),
+            Some(CallArg::DynBorrow(DynBorrow {
+                source: DynBorrowSource::Borrowed(_),
+                weakening: None,
+                ..
+            }))
+        ));
+        let main = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .unwrap();
+        let mut concrete = false;
+        let mut owned = false;
+        main.body.for_each_rvalue(&mut |value| {
+            if let RValue::Call { args, .. } = value
+                && matches!(
+                    args.first(),
+                    Some(CallArg::DynBorrow(DynBorrow {
+                        source: DynBorrowSource::Concrete { .. },
+                        ..
+                    }))
+                )
+            {
+                concrete = true;
+            }
+            if let RValue::Call { args, .. } = value
+                && matches!(
+                    args.first(),
+                    Some(CallArg::DynBorrow(DynBorrow {
+                        source: DynBorrowSource::Owned(_),
+                        ..
+                    }))
+                )
+            {
+                owned = true;
+            }
+        });
+        assert!(concrete && owned);
+    }
+
+    #[test]
+    fn default_expression_extern_witness_enters_air_closure() {
+        let air = lower_contract_boundary(
+            "contract Movable { fn move_by(ref self, dx: float); }
+             extern type Point {
+                 fn new() -> Self;
+                 fn move_by(ref self, dx: float);
+             }
+             fn use(movable: dyn Movable = Point.new()) {}
+             fn main() { use(); }",
+            &["main"],
+        );
+
+        let ContractWitnessTarget::Extern { function } =
+            air.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected default-expression extern witness");
+        };
+        assert_eq!(air.extern_decl(function).name, Ident::new("move_by"));
+    }
+
+    #[test]
+    fn cached_generic_witness_is_in_reachable_air_closure() {
+        let air = lower_contract_boundary(
+            "contract Drawable { fn draw(self); }
+             struct Enemy { fn draw(self) {} }
+             fn use_actor(actor: dyn Drawable) {}
+             fn wrap<T>(actor: T) { use_actor(actor); }
+             fn main() { wrap(Enemy {}); }",
+            &["main"],
+        );
+
+        assert_eq!(air.contract_witnesses.len(), 1);
+        assert_eq!(
+            air.type_display_name(air.contract_witnesses[0].key.concrete_ty),
+            "Enemy"
+        );
+    }
+
+    #[test]
+    fn lexical_extension_witnesses_remain_distinct_in_air() {
+        let air = lower_contract_boundary_with_modules(
+            "import aggressive_use;
+             import passive_use;
+             import item { Item };
+             fn main(item: Item) {
+                 aggressive_use.make(item);
+                 passive_use.make(item);
+             }",
+            &[
+                ("api", "pub contract A { fn a(self); }"),
+                ("item", "pub struct Item {}"),
+                (
+                    "aggressive_ext",
+                    "pub import item { Item }; pub extend Item { fn a(self) {} }",
+                ),
+                (
+                    "passive_ext",
+                    "pub import item { Item }; pub extend Item { fn a(self) {} }",
+                ),
+                (
+                    "aggressive_use",
+                    "pub import api { A }; pub import aggressive_ext { Item }; pub fn make(item: Item) -> dyn A { item }",
+                ),
+                (
+                    "passive_use",
+                    "pub import api { A }; pub import passive_ext { Item }; pub fn make(item: Item) -> dyn A { item }",
+                ),
+            ],
+            &["main"],
+        );
+
+        assert_eq!(air.contract_witnesses.len(), 2);
+        assert_eq!(
+            air.contract_witnesses[0].key.concrete_ty,
+            air.contract_witnesses[1].key.concrete_ty
+        );
+        assert_eq!(
+            air.contract_witnesses[0].key.surface,
+            air.contract_witnesses[1].key.surface
+        );
+        assert_ne!(
+            air.contract_witnesses[0].key.slots[0].target,
+            air.contract_witnesses[1].key.slots[0].target
+        );
+    }
+
+    #[test]
+    fn ref_requirement_accepts_value_receiver_witness() {
+        let air = lower_contract_boundary(
+            "contract Action { fn act(ref self); }
+             struct Item { fn act(self) {} }
+             fn main() { let action: dyn Action = Item {}; }",
+            &["main"],
+        );
+
+        assert_eq!(air.contract_witnesses.len(), 1);
+        assert_eq!(
+            air.contract_witnesses[0].key.slots[0].receiver,
+            ParamMode::SharedBorrow
+        );
+    }
+
+    #[test]
+    fn consumed_dynamic_temporary_cannot_be_reused() {
+        let mut air = lower_roots(
+            "contract Action { fn act(self); }
+             struct Item { fn act(self) {} }
+             fn main() {
+                 let action: dyn Action = Item {};
+                 action.act();
+             }",
+            &["main"],
+        )
+        .expect("dynamic pack AIR lowering failed");
+        let main = air
+            .functions
+            .iter()
+            .position(|function| function.name == Ident::new("main"))
+            .map(FunctionId::from_index)
+            .unwrap();
+        let source = air
+            .function(main)
+            .body
+            .block
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                AirStmt::Init {
+                    value:
+                        RValue::DynPack {
+                            value:
+                                Operand::Place(Place {
+                                    root: PlaceRoot::Local(local),
+                                    projection,
+                                    ty,
+                                }),
+                            use_: DynOwnedUse::ConsumeTemporary,
+                            ..
+                        },
+                    ..
+                } if projection.is_empty() => Some((*local, *ty)),
+                _ => None,
+            })
+            .expect("expected consumed pack temporary");
+        air.function_mut(main)
+            .body
+            .block
+            .stmts
+            .push(AirStmt::Eval(RValue::Use(Operand::Place(Place {
+                root: PlaceRoot::Local(source.0),
+                projection: vec![],
+                ty: source.1,
+            }))));
+
+        let errors = verify_air(&air).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadStatement(BadStatement::ReadUninitializedLocal(local))
+                if local == source.0
+        )));
+    }
+
+    #[test]
+    fn witness_value_params_accept_finalized_value_mode() {
+        lower_roots(
+            "contract Updatable { fn update(ref self, dt: float); }
+             struct Enemy { fn update(ref self, dt: float) {} }
+             fn main() {
+                 var actor: dyn Updatable = Enemy {};
+                 actor.update(1.0);
+             }",
+            &["main"],
+        )
+        .expect("finalized value parameter should satisfy contract witness");
+    }
+
+    #[test]
+    fn forged_witness_receiver_adjustment_rejects() {
+        let mut air = lower_contract_boundary(
+            "contract Action { fn act(ref self); }
+             struct Item { fn act(self) {} }
+             fn main() { let action: dyn Action = Item {}; }",
+            &["main"],
+        );
+        air.contract_witnesses[0].key.slots[0].receiver = ParamMode::MutBorrow;
+
+        let errors = verify_contracts(&air).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadContract(BadContract::WitnessTargetSignatureMismatch)
+        )));
+
+        let surface = air.contract_witnesses[0].key.surface;
+        let dyn_ty = air.alloc_type(TypeData::Dyn(surface));
+        air.contract_witnesses[0].key.concrete_ty = dyn_ty;
+        let errors = verify_contracts(&air).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            VerifyErrorKind::BadContract(BadContract::InvalidWitnessConcreteType)
+        )));
+    }
+
+    #[test]
+    fn extension_and_promoted_witness_targets_are_resolved() {
+        let extension = lower_contract_boundary(
+            "contract Action { fn act(self); }
+             struct Item {}
+             extend Item { fn act(self) {} }
+             fn main() { let action: dyn Action = Item {}; }",
+            &["main"],
+        );
+        let ContractWitnessTarget::Function { function } =
+            extension.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected extension function target");
+        };
+        assert_eq!(extension.function(function).name, Ident::new("act"));
+
+        let promoted = lower_contract_boundary(
+            "contract Action { fn act(ref self); }
+             struct Entity { fn act(ref self) {} }
+             struct Item { embed entity: Entity }
+             fn main() {
+                 let action: dyn Action = Item { entity: Entity {} };
+             }",
+            &["main"],
+        );
+        let ContractWitnessTarget::Promoted { fields, target } =
+            &promoted.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected promoted target");
+        };
+        assert_eq!(fields, &[FieldId::from_index(0)]);
+        let ContractWitnessTarget::Function { function } = target.as_ref() else {
+            panic!("expected promoted function target");
+        };
+        assert_eq!(promoted.function(*function).name, Ident::new("act"));
+    }
+
+    #[test]
+    fn promoted_witness_keeps_renamed_exposed_slot() {
+        let air = lower_contract_boundary(
+            "contract Hittable { fn hit(self, amount: int) -> int; }
+             struct Health { fn damage(self, amount: int) -> int { amount } }
+             struct Enemy { embed health: Health { fn damage as hit }, }
+             fn main() {
+                 let target: dyn Hittable = Enemy { health: Health {} };
+             }",
+            &["main"],
+        );
+
+        let surface = air.contract_surface(air.contract_witnesses[0].key.surface);
+        assert_eq!(surface.slots[0].name, Ident::new("hit"));
+        let ContractWitnessTarget::Promoted { target, .. } =
+            &air.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected promoted target");
+        };
+        let ContractWitnessTarget::Function { function } = target.as_ref() else {
+            panic!("expected promoted function target");
+        };
+        assert_eq!(air.function(*function).name, Ident::new("damage"));
+    }
+
+    #[test]
+    fn extern_witness_target_reuses_air_extern_declaration() {
+        let air = lower_contract_boundary(
+            "contract Movable { fn move_by(ref self, dx: float); }
+             extern type Point { fn move_by(ref self, dx: float); }
+             fn main(point: Point) { let movable: dyn Movable = point; }",
+            &["main"],
+        );
+
+        let ContractWitnessTarget::Extern { function } =
+            air.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected extern witness target");
+        };
+        assert_eq!(air.extern_decl(function).name, Ident::new("move_by"));
+    }
+
+    #[test]
+    fn iterator_witness_target_is_explicit() {
+        let air = lower_contract_boundary_full_core(
+            "contract Sequence { fn items(self) -> iter; }
+             struct Items { fn items(self) -> iter { iter(0..2) } }
+             fn main() { let sequence: dyn Sequence = Items {}; }",
+            &["main"],
+        );
+
+        let ContractWitnessTarget::IteratorFunction { function } =
+            air.contract_witnesses[0].key.slots[0].target
+        else {
+            panic!("expected iterator function target");
+        };
+        assert_eq!(air.function(function).name, Ident::new("items"));
+    }
+
+    #[test]
+    fn weakening_closes_projected_contract_witnesses() {
+        let air = lower_contract_boundary(
+            "contract A { fn a(self); }
+             contract B { fn b(self); }
+             struct Both { fn a(self) {} fn b(self) {} }
+             fn main() {
+                 let both: dyn A + B = Both {};
+                 let b: dyn B = both;
+             }",
+            &["main"],
+        );
+
+        assert_eq!(air.contract_weakenings.len(), 1);
+        assert_eq!(air.contract_witnesses.len(), 2);
+        let weakening = &air.contract_weakenings[0];
+        let source = air
+            .contract_witnesses
+            .iter()
+            .find(|witness| witness.key.surface == weakening.source)
+            .expect("missing source witness");
+        let target = air
+            .contract_witnesses
+            .iter()
+            .find(|witness| witness.key.surface == weakening.target)
+            .expect("missing projected witness");
+        assert_eq!(source.key.concrete_ty, target.key.concrete_ty);
+        assert_eq!(target.key.slots.len(), 1);
+        assert_eq!(target.key.slots[0].target, source.key.slots[1].target);
     }
 
     #[test]
@@ -11993,6 +14571,8 @@ mod tests {
                 &mut modules,
                 &semantic.program.declarations,
                 &semantic.program.externs,
+                &semantic.program.contract_surfaces,
+                &HashMap::new(),
                 &point,
             )
             .expect("lower failed");
@@ -12026,6 +14606,8 @@ mod tests {
                 &mut modules,
                 &semantic.program.declarations,
                 &semantic.program.externs,
+                &semantic.program.contract_surfaces,
+                &HashMap::new(),
                 &node,
             )
             .expect("lower failed");
@@ -12057,6 +14639,8 @@ mod tests {
                 &mut modules,
                 &semantic.program.declarations,
                 &semantic.program.externs,
+                &semantic.program.contract_surfaces,
+                &HashMap::new(),
                 &choice,
             )
             .expect("lower failed");
@@ -12924,9 +15508,7 @@ mod tests {
         let errors = verify(&program).expect_err("root update without ensure should fail");
         assert!(errors.iter().any(|error| matches!(
             error.kind,
-            crate::air::VerifyErrorKind::BadStatement(
-                crate::air::BadStatement::GlobalUpdateRootWithoutEnsure(GlobalId(0))
-            )
+            VerifyErrorKind::BadStatement(BadStatement::GlobalUpdateRootWithoutEnsure(GlobalId(0)))
         )));
     }
 
@@ -14743,6 +17325,9 @@ mod tests {
                     name: "Sprite".to_string(),
                     doc: None,
                     rep: anvyx_externs::ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: Some(false),
                     fields: vec![anvyx_externs::ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Float,
@@ -14981,6 +17566,9 @@ fn f() {
                     name: "Sprite".to_string(),
                     doc: None,
                     rep: anvyx_externs::ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: Some(false),
                     fields: vec![anvyx_externs::ExternFieldDescriptor {
                         name: "score".to_string(),
                         ty: ExternTypeExpr::Int,
@@ -16349,6 +18937,55 @@ fn main() {}
         assert!(matches!(err, LowerError::AnyTypeEmitted(id) if id == any));
     }
 
+    fn lower_contract_boundary(source: &str, roots: &[&str]) -> Program {
+        let (root, resolved, semantic) = checked(source);
+        lower_checked_contract_boundary(&root, &resolved, &semantic, roots)
+    }
+
+    fn lower_contract_boundary_full_core(source: &str, roots: &[&str]) -> Program {
+        let (root, resolved, semantic) = checked_with_full_core_shape(source);
+        lower_checked_contract_boundary(&root, &resolved, &semantic, roots)
+    }
+
+    fn lower_contract_boundary_with_modules(
+        source: &str,
+        modules: &[(&str, &str)],
+        roots: &[&str],
+    ) -> Program {
+        let (root, resolved, semantic) = checked_with_modules(source, modules);
+        lower_checked_contract_boundary(&root, &resolved, &semantic, roots)
+    }
+
+    fn lower_checked_contract_boundary(
+        root: &ast::Program,
+        resolved: &ResolveResult,
+        semantic: &typecheck::SemanticCheckOutput,
+        roots: &[&str],
+    ) -> Program {
+        let index = SourceProgramIndex::new(root, resolved);
+        let callable_facts = SemanticCallableFacts::new(&semantic.program);
+        let root_keys = roots.iter().map(|name| root_function(name)).collect();
+        let functions = ReachableItems::new(&index, &semantic.program, &callable_facts, root_keys)
+            .expect("reachable closure failed");
+        let mut cx = LowerCx {
+            decls: Some(semantic.program.declarations.clone()),
+            externs: Some(semantic.program.externs.clone()),
+            contract_surfaces: Some(semantic.program.contract_surfaces.clone()),
+            typecheck_facts: Some(&semantic.public_facts),
+            ..LowerCx::default()
+        };
+        cx.lower_contract_surfaces()
+            .expect("surface lowering failed");
+        cx.lower_function_shells(&index.modules, &functions)
+            .expect("function shell lowering failed");
+        cx.lower_extern_declarations(&functions, &semantic.program)
+            .expect("extern lowering failed");
+        cx.lower_contract_declarations(&functions, &semantic.program)
+            .expect("witness lowering failed");
+        verify_contracts(&cx.program).expect("contract declarations should verify");
+        cx.program
+    }
+
     fn root_function(name: &str) -> CallableInstanceKey {
         CallableInstanceKey {
             target: CallableId::function(ModuleScope::Root, Ident::new(name)),
@@ -16550,6 +19187,13 @@ fn main() {}
                     for arm in &match_.arms {
                         collect_block_statements(&arm.block, statements);
                     }
+                }
+                AirStmt::DynMatch(match_) => {
+                    statements.push(AirStmt::DynMatch(match_.clone()));
+                    for arm in &match_.arms {
+                        collect_block_statements(&arm.block, statements);
+                    }
+                    collect_block_statements(&match_.fallback.block, statements);
                 }
                 AirStmt::Loop(loop_) => collect_block_statements(&loop_.body, statements),
                 AirStmt::RangeFor(range) => {

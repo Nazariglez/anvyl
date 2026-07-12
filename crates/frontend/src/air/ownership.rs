@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    AggregateKind, AirBlock, AirCollectionLoanMode, AirPatternBindingMode, AirPatternMatch,
-    AirStmt, AirTail, CallArg, Callee, ConstId, Function, FunctionId, GlobalId, GlobalInitEffect,
-    LambdaCaptureArg, LocalId, Operand, ParamMode, Place, PlaceReadLocal, PlaceRoot, Program,
-    RValue, TypeData, TypeId, VariantShape, typing,
+    AggregateKind, AirBlock, AirChild, AirStmt, CallArg, Callee, ConstId, Function, FunctionId,
+    GlobalId, GlobalInitEffect, LambdaCaptureArg, LocalId, Operand, ParamMode, Place,
+    PlaceReadLocal, PlaceRoot, PlaceUse, Program, RValue, TypeData, TypeId, ValueUse, VariantShape,
+    typing,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,10 +106,8 @@ impl TypePassClassAnalyzer<'_> {
             TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
                 TypePassClass::ManagedBuffer
             }
-            TypeData::DataRef(_) | TypeData::Function(_) | TypeData::Dyn(_) => {
-                TypePassClass::CheapHandle
-            }
-            TypeData::Slice(_) | TypeData::Any => TypePassClass::Opaque,
+            TypeData::DataRef(_) | TypeData::Function(_) => TypePassClass::CheapHandle,
+            TypeData::Slice(_) | TypeData::Any | TypeData::Dyn(_) => TypePassClass::Opaque,
             TypeData::Extern(id) => {
                 match self.program.extern_types.get(id.index()).map(|ty| ty.rep) {
                     Some(super::ExternRep::Shared) => TypePassClass::CheapHandle,
@@ -304,7 +302,8 @@ fn analyze_param_uses_with_modes(
     param_modes: Option<&[Vec<ParamMode>]>,
     classes: &TypePassClasses,
 ) -> Vec<ParamUse> {
-    let function = program.function(function);
+    let function_id = function;
+    let function = program.function(function_id);
     let params_by_local = function
         .signature
         .params
@@ -316,6 +315,7 @@ fn analyze_param_uses_with_modes(
         program,
         classes,
         function,
+        function_id,
         param_modes,
         params_by_local,
         uses: vec![None; function.signature.params.len()],
@@ -327,20 +327,10 @@ struct ParamUseAnalyzer<'a> {
     program: &'a Program,
     classes: &'a TypePassClasses,
     function: &'a Function,
+    function_id: FunctionId,
     param_modes: Option<&'a [Vec<ParamMode>]>,
     params_by_local: HashMap<LocalId, usize>,
     uses: Vec<Option<ParamUse>>,
-}
-
-fn pattern_match_has_alias_binding(match_: &AirPatternMatch) -> bool {
-    match_.arms.iter().any(|arm| {
-        arm.alternatives.iter().any(|alternative| {
-            alternative
-                .bindings
-                .iter()
-                .any(|binding| binding.mode == AirPatternBindingMode::Alias)
-        })
-    })
 }
 
 impl ParamUseAnalyzer<'_> {
@@ -353,223 +343,91 @@ impl ParamUseAnalyzer<'_> {
     }
 
     fn observe_air_block(&mut self, block: &AirBlock) {
-        for stmt in &block.stmts {
-            self.observe_air_stmt(stmt);
-        }
-        self.observe_air_tail(&block.tail);
+        block.for_each_child(&mut |child| self.observe_child(child));
     }
 
-    fn observe_air_stmt(&mut self, stmt: &AirStmt) {
-        match stmt {
-            AirStmt::Init { value, .. }
-            | AirStmt::GlobalSetRoot { value, .. }
-            | AirStmt::GlobalUpdateRoot { value, .. } => {
-                self.observe_rvalue(value, ValueContext::Store);
-            }
-            AirStmt::Assign { dst, value } => {
-                self.observe_place(dst, ParamUse::ReborrowMut);
-                self.observe_rvalue(value, ValueContext::Store);
-            }
-            AirStmt::Eval(value) => self.observe_rvalue(value, ValueContext::Read),
-            AirStmt::GlobalEnsure { .. } => {}
-            AirStmt::If(branch) => {
-                self.observe_operand(&branch.cond, ValueContext::Read);
-                self.observe_air_block(&branch.then_block);
-                if let Some(block) = &branch.else_block {
-                    self.observe_air_block(block);
-                }
-            }
-            AirStmt::Loop(loop_) => self.observe_air_block(&loop_.body),
-            AirStmt::RangeFor(range) => {
-                self.observe_operand(&range.start, ValueContext::Read);
-                self.observe_operand(&range.end, ValueContext::Read);
-                for operand in range.ordinal_plan.operands() {
-                    self.observe_operand(operand, ValueContext::Read);
-                }
-                self.observe_local(range.item, ParamUse::ReadOnly);
-                if let Some(ordinal) = range.ordinal {
-                    self.observe_local(ordinal, ParamUse::ReadOnly);
-                }
-                self.observe_air_block(&range.body);
-            }
-            AirStmt::CollectionFor(for_) => {
-                self.observe_local(for_.len, ParamUse::ReadOnly);
-                for operand in for_.ordinal_plan.operands() {
-                    self.observe_operand(operand, ValueContext::Read);
-                }
-                self.observe_local(for_.index, ParamUse::ReadOnly);
-                if let Some(ordinal) = for_.ordinal {
-                    self.observe_local(ordinal, ParamUse::ReadOnly);
-                }
-                self.observe_air_block(&for_.body);
-            }
-            AirStmt::CollectionLoan(loan) => {
-                let root_use = match loan.mode {
-                    AirCollectionLoanMode::ReadonlySequence
-                    | AirCollectionLoanMode::ReadonlyMap => ParamUse::ReadOnly,
-                    AirCollectionLoanMode::MutableSequenceElement
-                    | AirCollectionLoanMode::MutableMapValue => ParamUse::ReborrowMut,
+    fn observe_child(&mut self, child: AirChild<'_>) {
+        match child {
+            AirChild::RValue { value, use_ } => self.observe_rvalue(value, use_.into()),
+            AirChild::Operand { operand, use_ } => self.observe_operand(operand, use_.into()),
+            AirChild::Place { place, use_ } => {
+                let use_ = match use_ {
+                    PlaceUse::Read | PlaceUse::Borrow(ParamMode::SharedBorrow) => {
+                        ParamUse::ReadOnly
+                    }
+                    PlaceUse::Mutate | PlaceUse::Borrow(ParamMode::MutBorrow) => {
+                        ParamUse::ReborrowMut
+                    }
+                    PlaceUse::Borrow(ParamMode::Value) => ParamUse::ValueRequired,
                 };
-                self.observe_place(&loan.root, root_use);
-                self.observe_air_block(&loan.body);
+                self.observe_place(place, use_);
             }
-            AirStmt::CollectionSlotScope(scope) => {
-                self.observe_place(&scope.root, ParamUse::ReadOnly);
-                self.observe_local(scope.index, ParamUse::ReadOnly);
-                self.observe_air_block(&scope.body);
+            AirChild::CallArg {
+                callee,
+                index,
+                arg,
+                mode,
+            } => self.observe_call_arg(callee, index, arg, mode),
+            AirChild::LambdaCapture(capture) => self.observe_lambda_capture(capture),
+            AirChild::DynBorrow(borrow) => {
+                self.observe_place(borrow.place(), ParamUse::ReborrowMut);
             }
-            AirStmt::PatternMatch(match_) => {
-                let subject_use = if pattern_match_has_alias_binding(match_) {
-                    ParamUse::ReborrowMut
-                } else {
-                    ParamUse::ReadOnly
-                };
-                self.observe_place(&match_.subject, subject_use);
-                for arm in &match_.arms {
-                    self.observe_air_block(&arm.block);
-                }
-            }
-            AirStmt::OptionalMatch(match_) => {
-                let use_ = if match_.payload_ref {
-                    ParamUse::ReborrowMut
-                } else {
-                    ParamUse::ReadOnly
-                };
-                self.observe_place(&match_.discr, use_);
-                self.observe_air_block(&match_.some_block);
-                self.observe_air_block(&match_.none_block);
-            }
-            AirStmt::MapEntryMatch(match_) => {
-                self.observe_place(&match_.map, ParamUse::ReborrowMut);
-                self.observe_operand(&match_.key, ValueContext::Read);
-                self.observe_air_block(&match_.some_block);
-                self.observe_air_block(&match_.none_block);
-            }
-        }
-    }
-
-    fn observe_air_tail(&mut self, tail: &AirTail) {
-        if let AirTail::Return(Some(value)) = tail {
-            self.observe_operand(value, ValueContext::Store);
+            AirChild::LocalRead(local) => self.observe_local(local, ParamUse::ReadOnly),
+            AirChild::Block(block) => self.observe_air_block(block),
         }
     }
 
     fn observe_rvalue(&mut self, value: &RValue, context: ValueContext) {
-        match value {
-            RValue::Use(operand) => self.observe_operand(operand, context),
-            RValue::FunctionValue { value, .. } => self.observe_operand(value, context),
-            RValue::Unary { value, .. }
-            | RValue::Cast { value, .. }
-            | RValue::OptionalSome { value, .. }
-            | RValue::Stringify { value, .. }
-            | RValue::Format { value, .. } => self.observe_operand(value, ValueContext::Read),
-            RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
-                self.observe_operand(lhs, ValueContext::Read);
-                self.observe_operand(rhs, ValueContext::Read);
-            }
-            RValue::Aggregate { fields, .. } => {
-                for field in fields {
-                    self.observe_operand(field, ValueContext::Store);
-                }
-            }
-            RValue::MakeLambda { captures, .. } => {
-                for capture in captures {
-                    self.observe_lambda_capture(capture);
-                }
-            }
-            RValue::FunctionRef { .. } => {}
-            RValue::StringConcat { parts } => {
-                for part in parts {
-                    self.observe_operand(part, ValueContext::Read);
-                }
-            }
-            RValue::Call { callee, args } => {
-                if let Callee::Lambda(operand) = callee {
-                    self.observe_operand(operand, ValueContext::Read);
-                }
-                for (index, arg) in args.iter().enumerate() {
-                    self.observe_call_arg(callee, index, arg);
-                }
-            }
-            RValue::Len { source } => self.observe_place(source, ParamUse::ReadOnly),
-            RValue::ListPush { list, value } => {
-                self.observe_place(list, ParamUse::ReborrowMut);
-                self.observe_operand(value, ValueContext::Store);
-            }
-            RValue::ListPop { list, .. } => self.observe_place(list, ParamUse::ReborrowMut),
-            RValue::RangeListCopy {
-                source, start, end, ..
-            }
-            | RValue::SliceView {
-                source, start, end, ..
-            } => {
-                self.observe_place(source, ParamUse::ReadOnly);
-                self.observe_local(*start, ParamUse::ReadOnly);
-                self.observe_local(*end, ParamUse::ReadOnly);
-            }
-            RValue::MapGet { map, key, .. } => {
-                self.observe_place(map, ParamUse::ReadOnly);
-                self.observe_operand(key, ValueContext::Read);
-            }
-            RValue::MapEntryAt { map, index, .. }
-            | RValue::MapKeyAt { map, index, .. }
-            | RValue::MapValueAt { map, index, .. } => {
-                self.observe_place(map, ParamUse::ReadOnly);
-                self.observe_local(*index, ParamUse::ReadOnly);
-            }
-            RValue::MapInsert {
-                map,
-                key,
-                value,
-                kind: _,
-            } => {
-                self.observe_place(map, ParamUse::ReborrowMut);
-                self.observe_operand(key, ValueContext::Store);
-                self.observe_operand(value, ValueContext::Store);
-            }
-            RValue::MapRemove { map, key, .. } => {
-                self.observe_place(map, ParamUse::ReborrowMut);
-                self.observe_operand(key, ValueContext::Read);
-            }
-            RValue::CheckedIterCount { count, .. } => {
-                self.observe_operand(count, ValueContext::Read);
-            }
-        }
+        value.for_each_child(context.into(), &mut |child| self.observe_child(child));
     }
 
-    fn observe_call_arg(&mut self, callee: &Callee, index: usize, arg: &CallArg) {
-        match self
-            .callee_param_mode(callee, index)
-            .unwrap_or_else(|| arg.mode())
-        {
-            ParamMode::Value => match arg {
-                CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                    self.observe_operand(operand, ValueContext::CallValue);
-                }
-                CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
-                    self.observe_place(place, ParamUse::ValueRequired);
-                }
-                CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
-            },
-            ParamMode::SharedBorrow => match arg {
-                CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                    self.observe_operand(operand, ValueContext::Read);
-                }
-                CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
-                    self.observe_place(place, ParamUse::ReadOnly);
-                }
-                CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
-            },
-            ParamMode::MutBorrow => match arg {
+    fn observe_call_arg(
+        &mut self,
+        callee: Option<&Callee>,
+        index: usize,
+        arg: &CallArg,
+        mode: ParamMode,
+    ) {
+        let mode = callee
+            .and_then(|callee| self.callee_param_mode(callee, index))
+            .unwrap_or(mode);
+        match (mode, arg) {
+            (ParamMode::Value, CallArg::Value(operand) | CallArg::InitFieldProvided(operand)) => {
+                self.observe_operand(operand, ValueContext::CallValue);
+            }
+            (ParamMode::Value, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
+                self.observe_place(place, ParamUse::ValueRequired);
+            }
+            (ParamMode::Value, CallArg::DynBorrow(borrow)) => {
+                self.observe_place(borrow.place(), ParamUse::ValueRequired);
+            }
+            (
+                ParamMode::SharedBorrow,
+                CallArg::Value(operand) | CallArg::InitFieldProvided(operand),
+            ) => self.observe_operand(operand, ValueContext::Read),
+            (ParamMode::SharedBorrow, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
+                self.observe_place(place, ParamUse::ReadOnly);
+            }
+            (ParamMode::SharedBorrow, CallArg::DynBorrow(borrow)) => {
+                self.observe_place(borrow.place(), ParamUse::ReadOnly);
+            }
+            (
+                ParamMode::MutBorrow,
                 CallArg::Value(Operand::Place(place))
                 | CallArg::InitFieldProvided(Operand::Place(place))
                 | CallArg::SharedBorrow(place)
-                | CallArg::MutBorrow(place) => self.observe_place(place, ParamUse::ReborrowMut),
+                | CallArg::MutBorrow(place),
+            ) => self.observe_place(place, ParamUse::ReborrowMut),
+            (ParamMode::MutBorrow, CallArg::DynBorrow(borrow)) => {
+                self.observe_place(borrow.place(), ParamUse::ReborrowMut);
+            }
+            (
+                _,
                 CallArg::Value(Operand::Const(_))
                 | CallArg::InitFieldProvided(Operand::Const(_))
                 | CallArg::InitFieldOmitted
-                | CallArg::SharedStringConst(_) => {}
-            },
+                | CallArg::SharedStringConst(_),
+            ) => {}
         }
     }
 
@@ -613,6 +471,12 @@ impl ParamUseAnalyzer<'_> {
     }
 
     fn observe_place(&mut self, place: &Place, use_: ParamUse) {
+        if let PlaceRoot::DynBorrowParam(id) = place.root
+            && let Some(decl) = self.program.dyn_borrow_params.get(id.index())
+            && decl.owner == self.function_id
+        {
+            self.observe_local(decl.source, use_);
+        }
         place.for_each_read_local(&mut |local| match local {
             PlaceReadLocal::Root(local) => self.observe_local(local, use_),
             PlaceReadLocal::Index(local) => self.observe_local(local, ParamUse::ReadOnly),
@@ -642,6 +506,26 @@ enum ValueContext {
     Read,
     Store,
     CallValue,
+}
+
+impl From<ValueUse> for ValueContext {
+    fn from(use_: ValueUse) -> Self {
+        match use_ {
+            ValueUse::Read => Self::Read,
+            ValueUse::Store | ValueUse::Consume => Self::Store,
+            ValueUse::CallValue => Self::CallValue,
+        }
+    }
+}
+
+impl From<ValueContext> for ValueUse {
+    fn from(context: ValueContext) -> Self {
+        match context {
+            ValueContext::Read => Self::Read,
+            ValueContext::Store => Self::Store,
+            ValueContext::CallValue => Self::CallValue,
+        }
+    }
 }
 
 fn merge_param_use(current: Option<ParamUse>, next: ParamUse) -> ParamUse {
@@ -1075,6 +959,27 @@ fn rewrite_air_block_call_args(
                 }
                 block.stmts.push(AirStmt::PatternMatch(match_));
             }
+            AirStmt::DynMatch(mut match_) => {
+                for arm in &mut match_.arms {
+                    rewrite_air_block_call_args(
+                        &mut arm.block,
+                        modes,
+                        function_type_modes,
+                        extern_modes,
+                        const_types,
+                        locals,
+                    );
+                }
+                rewrite_air_block_call_args(
+                    &mut match_.fallback.block,
+                    modes,
+                    function_type_modes,
+                    extern_modes,
+                    const_types,
+                    locals,
+                );
+                block.stmts.push(AirStmt::DynMatch(match_));
+            }
             AirStmt::OptionalMatch(mut match_) => {
                 rewrite_air_block_call_args(
                     &mut match_.some_block,
@@ -1297,7 +1202,8 @@ mod tests {
     use crate::{
         air::{
             AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CallArg, Callee, ConstData,
-            ConstValue, DynContractData, EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
+            ConstValue, ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId,
+            ContractSurfaceDecl, EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
             FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, MapOrder, Module, ModuleId,
             Mutability, Operand, Param, ParamEscape, ParamRole, Place, RValue, ReturnMode,
             Signature, VariantDecl,
@@ -2174,6 +2080,9 @@ mod tests {
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: None,
             has_init: false,
             init_args: vec![],
             fields: vec![],
@@ -2190,6 +2099,9 @@ mod tests {
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Inline,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: None,
             has_init: false,
             init_args: vec![],
             fields: vec![],
@@ -2205,11 +2117,17 @@ mod tests {
             params: vec![],
             ret: ReturnMode::Value(void),
         }));
-        let dyn_ = program.alloc_type(TypeData::Dyn(DynContractData {
+        let surface = program.alloc_contract_surface(ContractSurfaceDecl {
             display_name: "AnyAction".into(),
-            method_table_key: "AnyAction".into(),
-            concrete_printer: None,
-        }));
+            slots: vec![ContractSlotDecl {
+                id: ContractSlotId::from_index(0),
+                name: Ident::new("call"),
+                receiver: ContractReceiver::Value,
+                params: vec![],
+                ret: ContractReturnDecl::Value(void),
+            }],
+        });
+        let dyn_ = program.alloc_type(TypeData::Dyn(surface));
         let shared_ext = program.alloc_type(TypeData::Extern(shared_ext));
         let inline_ext = program.alloc_type(TypeData::Extern(inline_ext));
         let any = program.alloc_type(TypeData::Any);
@@ -2217,7 +2135,7 @@ mod tests {
         let classes = classes(&program);
         assert_eq!(classes.class(dataref), TypePassClass::CheapHandle);
         assert_eq!(classes.class(function), TypePassClass::CheapHandle);
-        assert_eq!(classes.class(dyn_), TypePassClass::CheapHandle);
+        assert_eq!(classes.class(dyn_), TypePassClass::Opaque);
         assert_eq!(classes.class(shared_ext), TypePassClass::CheapHandle);
         assert_eq!(
             classes.class(inline_ext),
