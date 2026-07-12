@@ -4,9 +4,9 @@ use anvyx_runtime::{methods, AnvInitField, AnvyxRef};
 #[anvyx(name = "Thing")]
 pub struct Thing {
     #[anvyx(field)]
-    value: i64,
+    pub value: i64,
     #[anvyx(field)]
-    tag: Option<i64>,
+    pub tag: std::option::Option<i64>,
     tag_code: i64,
 }
 

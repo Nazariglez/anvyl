@@ -342,6 +342,10 @@ pub(super) fn runtime_error_ty() -> String {
     rt_path("RuntimeError")
 }
 
+pub(super) fn runtime_error(message: &str) -> String {
+    format!("{}::new({message:?})", runtime_error_ty())
+}
+
 pub(super) fn result_ty(ret: &str) -> String {
     format!("Result<{ret}, {}>", runtime_error_ty())
 }
@@ -559,6 +563,10 @@ pub(super) fn visitor_ty(driver: &str) -> String {
     format!("{}<'cx, '_, {driver}>", rt_path("Visitor"))
 }
 
+pub(super) fn dynamic_carrier_repr_attr() -> &'static str {
+    "#[repr(u32)]"
+}
+
 pub(super) fn trace_derive(extra: &[&str]) -> String {
     let mut traits = extra
         .iter()
@@ -756,6 +764,10 @@ pub(super) fn collection_structural_version(collection: &str) -> String {
     format!("{collection}.structural_version()")
 }
 
+pub(super) fn list_elem_at_shared(list: &str, rt: &str, index: &str, version: &str) -> String {
+    format!("{list}.elem_at_shared({rt}, {index}, {version})")
+}
+
 pub(super) fn list_with_elem_shared_short(
     list: &str,
     rt: &str,
@@ -763,10 +775,12 @@ pub(super) fn list_with_elem_shared_short(
     version: &str,
     body: &str,
 ) -> String {
-    format!("{list}.with_elem_shared_short({rt}, {index}, {version}, |value| {{ {body} }})")
+    format!(
+        "unsafe {{ {list}.with_elem_shared_short({rt}, {index}, {version}, |value| {{ {body} }}) }}"
+    )
 }
 
-pub(super) fn list_with_elem_owned_mut_short(
+pub(super) fn list_with_elem_mut_leaf(
     list: &str,
     rt: &str,
     index: &str,
@@ -774,7 +788,7 @@ pub(super) fn list_with_elem_owned_mut_short(
     body: &str,
 ) -> String {
     format!(
-        "{list}.with_elem_owned_mut_ctx_short({rt}, {index}, {version}, |rt, value| {{ {body} }})"
+        "unsafe {{ {list}.with_elem_mut_leaf({rt}, {index}, {version}, |value| {{ {body} }}) }}"
     )
 }
 
@@ -782,13 +796,25 @@ pub(super) fn slice_elem_at_shared(slice: &str, rt: &str, index: &str) -> String
     format!("{slice}.elem_at_shared({rt}, {index})")
 }
 
-pub(super) fn slice_with_elem_owned_mut_short(
+pub(super) fn collection_projection_owner(collection: &str) -> String {
+    format!("({collection}).__anvyx_projection_owner()")
+}
+
+pub(super) fn slice_with_elem_shared_leaf(
     slice: &str,
     rt: &str,
     index: &str,
     body: &str,
 ) -> String {
-    format!("{slice}.with_elem_owned_mut_ctx_short({rt}, {index}, |rt, value| {{ {body} }})")
+    format!("unsafe {{ {slice}.with_elem_shared_leaf({rt}, {index}, |value| {{ {body} }}) }}")
+}
+
+pub(super) fn slice_with_elem_mut_leaf(slice: &str, rt: &str, index: &str, body: &str) -> String {
+    format!("unsafe {{ {slice}.with_elem_mut_leaf({rt}, {index}, |value| {{ {body} }}) }}")
+}
+
+pub(super) fn map_with_value_shared_short(map: &str, rt: &str, key: &str, body: &str) -> String {
+    format!("{map}.with_value_shared_short({rt}, {key}, |value| {{ {body} }})")
 }
 
 pub(super) fn map_key_at_shared(map: &str, rt: &str, index: &str, version: &str) -> String {
@@ -998,11 +1024,11 @@ pub(super) fn mut_place_access(place: &str, runtime: &str, body: &str) -> String
 }
 
 pub(super) fn mut_place_access_ctx(place: &str, runtime: &str, body: &str) -> String {
-    format!("{place}.access_with_ctx({runtime}, |rt, value| {body})?")
+    format!("unsafe {{ {place}.access_with_ctx({runtime}, |rt, value| {body}) }}?")
 }
 
 pub(super) fn mut_place_mutate_ctx(place: &str, runtime: &str, body: &str) -> String {
-    format!("{place}.mutate_with_ctx({runtime}, |rt, value| {body})?")
+    format!("unsafe {{ {place}.mutate_with_ctx({runtime}, |rt, value| {body}) }}?")
 }
 
 pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {
@@ -1010,7 +1036,7 @@ pub(super) fn mut_place_get_copy(place: &str, runtime: &str) -> String {
 }
 
 fn mut_place_region(place: &str, op: &str, runtime: &str, slot: &str, body: &str) -> String {
-    format!("{place}.{op}({runtime}, |{slot}| {body})?")
+    format!("unsafe {{ {place}.{op}({runtime}, |{slot}| {body}) }}?")
 }
 
 #[cfg(test)]
@@ -1340,7 +1366,7 @@ mod tests {
         );
         assert_eq!(
             mut_place_access("place", "rt", "Ok(value.share())"),
-            "place.access(rt, |value| Ok(value.share()))?"
+            "unsafe { place.access(rt, |value| Ok(value.share())) }?"
         );
         assert_eq!(
             global_begin_projected_loan("globals.state"),
@@ -1348,7 +1374,7 @@ mod tests {
         );
         assert_eq!(
             mut_place_replace_collection("place", "rt", "next"),
-            "place.mutate(rt, |slot| slot.replace_with(next))?"
+            "unsafe { place.mutate(rt, |slot| slot.replace_with(next)) }?"
         );
         assert_eq!(mut_place_get_copy("place", "rt"), "place.get_copy(rt)?");
         assert_eq!(heap_scope(), "anvyx_runtime::Heap::scope");

@@ -72,6 +72,13 @@ impl CollectionLoanState {
         Self::with_safepoint(self.inner.safepoint.clone())
     }
 
+    #[must_use]
+    pub fn fresh_for_projection(&self) -> Self {
+        let state = self.fresh_with_same_safepoint();
+        state.inner.structural_version.set(self.current_version());
+        state
+    }
+
     pub fn begin_shape_loan(&self) -> Result<ShapeLoanGuard, RuntimeError> {
         let safepoint_guard = self.inner.safepoint.enter(SafepointGuardKind::Collection)?;
         let active = self

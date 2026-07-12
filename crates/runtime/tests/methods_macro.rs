@@ -7,11 +7,11 @@ use anvyx_runtime::{
     RustReturnAbi, RustWrapperCtx, ScopedLambda, methods,
 };
 
-#[derive(AnvyxInline)]
+#[derive(Clone, Copy, AnvyxInline)]
 #[anvyx(name = "Vector2")]
-struct DerivedVec2 {
+pub struct DerivedVec2 {
     #[anvyx(field)]
-    x: f64,
+    pub x: f64,
 }
 
 #[methods(name = "Vector2")]
@@ -27,7 +27,7 @@ impl DerivedVec2 {
 }
 
 #[derive(AnvyxRef)]
-struct GenericResource<'cx> {
+pub struct GenericResource<'cx> {
     id: i64,
     _brand: std::marker::PhantomData<&'cx ()>,
 }
@@ -74,8 +74,8 @@ impl CtxBox {
     }
 }
 
-#[derive(AnvyxEnum)]
-enum InitError {
+#[derive(Clone, PartialEq, Eq, Hash, AnvyxEnum)]
+pub enum InitError {
     Bad,
 }
 
@@ -131,12 +131,13 @@ impl RuntimeResultInit {
 }
 
 #[derive(AnvyxRef)]
-struct OwnerReturns {
+pub struct OwnerReturns {
     value: i64,
 }
 
 #[methods]
 impl OwnerReturns {
+    #[must_use]
     pub fn duplicate(&self) -> Self {
         Self { value: self.value }
     }
@@ -558,11 +559,11 @@ fn methods_merge_into_derive_owned_type_descriptor() {
     ));
 }
 
-#[derive(AnvyxInline)]
+#[derive(Clone, Copy, AnvyxInline)]
 #[anvyx(name = "NamedOps")]
-struct RenamedOps {
+pub struct RenamedOps {
     #[anvyx(field)]
-    x: f64,
+    pub x: f64,
 }
 
 impl RenamedOps {
@@ -574,6 +575,7 @@ impl RenamedOps {
 #[methods]
 impl RenamedOps {
     #[anvyx(op(Self + Self))]
+    #[must_use]
     pub fn add(&self, rhs: RenamedOps) -> RenamedOps {
         RenamedOps {
             x: self.x + rhs.into_x(),
@@ -652,8 +654,8 @@ fn methods_descriptor_covers_member_roles() {
         }));
 }
 
-#[derive(AnvyxInline)]
-struct DuplicateOps {
+#[derive(Clone, Copy, AnvyxInline)]
+pub struct DuplicateOps {
     x: i64,
 }
 

@@ -1,0 +1,6 @@
+[project]
+name = "final_abi_resource_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

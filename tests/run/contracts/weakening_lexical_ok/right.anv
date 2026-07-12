@@ -1,0 +1,14 @@
+// @helper
+
+import shared { A, Actor };
+
+extend Actor {
+    fn a(self) {
+        println("right");
+    }
+}
+
+pub fn touch(actor: Actor) {
+    let value: dyn A = actor;
+    value.a();
+}

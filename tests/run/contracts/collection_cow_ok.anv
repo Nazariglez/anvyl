@@ -1,0 +1,46 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 42
+// 41
+// 52
+// 51
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct First {
+    fn score(self) -> int { 41 }
+}
+
+struct Second {
+    fn score(self) -> int { 42 }
+}
+
+struct MapFirst {
+    fn score(self) -> int { 51 }
+}
+
+struct MapSecond {
+    fn score(self) -> int { 52 }
+}
+
+fn main() {
+    var list: [dyn Scored] = [First {}];
+    let list_alias = list;
+    list[0] = Second {};
+    println(list[0].score());
+    println(list_alias[0].score());
+
+    var map: [string: dyn Scored] = ["a": MapFirst {}];
+    let map_alias = map;
+    map["a"] = MapSecond {};
+    if let actor? = map["a"] {
+        println(actor.score());
+    }
+    if let actor? = map_alias["a"] {
+        println(actor.score());
+    }
+}

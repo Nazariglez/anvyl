@@ -1,0 +1,47 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 3
+// none
+// 7
+// @match-end
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    points: int,
+
+    fn draw(self) {}
+}
+
+struct Prop {
+    fn draw(self) {}
+}
+
+fn make_enemy() -> dyn Drawable {
+    Enemy { points: 7 }
+}
+
+fn main() {
+    let actor: dyn Drawable = Enemy { points: 3 };
+    if let enemy? = actor as? Enemy {
+        println(enemy.points);
+    }
+    if let enemy? = actor as? Enemy {
+        println(enemy.points);
+    }
+
+    let prop: dyn Drawable = Prop {};
+    if let enemy? = prop as? Enemy {
+        println(enemy.points);
+    } else {
+        println("none");
+    }
+
+    if let enemy? = make_enemy() as? Enemy {
+        println(enemy.points);
+    }
+}

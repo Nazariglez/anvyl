@@ -1,0 +1,9 @@
+// @helper
+
+pub contract Drawable {
+    fn draw(self);
+}
+
+pub struct Actor {
+    score: int,
+}

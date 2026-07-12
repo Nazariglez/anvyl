@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 13
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct Actor {
+    fn score(self) -> int {
+        13
+    }
+}
+
+fn main() {
+    let pair: ((dyn Scored), int) = (Actor {}, 1);
+    println(pair.0.score());
+}

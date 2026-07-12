@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match: a
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct Both {
+    fn a(self) {
+        println("a");
+    }
+
+    fn b(self) {
+        println("b");
+    }
+}
+
+fn main() {
+    let both: dyn A + B = Both {};
+    let only_a: dyn A = both;
+    only_a.a();
+}

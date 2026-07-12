@@ -1,0 +1,79 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 10
+// 2
+// 20
+// @match-end
+
+contract Readable {
+    fn reenter(self) -> int;
+    fn value(self) -> int;
+}
+
+contract Marked {
+    fn mark(self) -> int;
+}
+
+struct First {
+    score: int,
+
+    fn reenter(self) -> int {
+        replace_heap();
+        self.score
+    }
+
+    fn value(self) -> int { self.score }
+    fn mark(self) -> int { 1 }
+}
+
+struct ListFirst {
+    score: int,
+
+    fn reenter(self) -> int {
+        replace_list();
+        self.score
+    }
+
+    fn value(self) -> int { self.score }
+    fn mark(self) -> int { 1 }
+}
+
+struct Second {
+    score: int,
+
+    fn reenter(self) -> int { self.score }
+    fn value(self) -> int { self.score }
+    fn mark(self) -> int { 2 }
+}
+
+dataref HeapHolder {
+    actor: dyn Readable,
+}
+
+lazy var heap = HeapHolder { actor: First { score: 1 } };
+lazy var actors: [dyn Readable + Marked] = [ListFirst { score: 2 }];
+
+fn replace_heap() {
+    heap.actor = Second { score: 10 };
+}
+
+fn replace_list() {
+    actors[0] = Second { score: 20 };
+}
+
+fn inspect(ref actor: dyn Readable) -> int {
+    actor.reenter()
+}
+
+fn inspect_marked(ref actor: dyn Readable + Marked) -> int {
+    inspect(actor)
+}
+
+fn main() {
+    println(inspect(heap.actor));
+    println(heap.actor.value());
+    println(inspect_marked(actors[0]));
+    println(actors[0].value());
+}

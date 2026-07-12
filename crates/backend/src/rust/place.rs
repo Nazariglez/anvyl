@@ -309,7 +309,10 @@ impl<'a> RustPlaces<'a> {
         steps: &[MutPlaceProjectionStep],
     ) -> Option<String> {
         let Some((step, rest)) = steps.split_first() else {
-            return Some(format!("Ok({expr}.structural_version())"));
+            return Some(format!(
+                "Ok({})",
+                target::collection_structural_version(expr)
+            ));
         };
         match step {
             MutPlaceProjectionStep::Field(field) => {
@@ -324,7 +327,14 @@ impl<'a> RustPlaces<'a> {
                 let checked = target::checked_index_result(index, &format!("{expr}.len()"), "list");
                 let body = Self::projection_version_body_from("value", rest)?;
                 Some(format!(
-                    "{{ let index = {checked}; {expr}.with_elem_shared_short(rt, index, {expr}.structural_version(), |value| {{ {body} }}) }}"
+                    "{{ let index = {checked}; {} }}",
+                    target::list_with_elem_shared_short(
+                        expr,
+                        "rt",
+                        "index",
+                        &target::collection_structural_version(expr),
+                        &body,
+                    )
                 ))
             }
             MutPlaceProjectionStep::SliceIndex { .. } => None,
@@ -441,8 +451,13 @@ impl<'a> RustPlaces<'a> {
                             let checked =
                                 target::checked_index_result(index, "__anv_list.len()", "list");
                             rendered.expr = format!(
-                                "{{ let __anv_list = &({list}); let index = {checked}; __anv_list.elem_at_shared({}, index, __anv_list.structural_version())? }}",
-                                target::runtime_param_name()
+                                "{{ let __anv_list = &({list}); let index = {checked}; {}? }}",
+                                target::list_elem_at_shared(
+                                    "__anv_list",
+                                    target::runtime_param_name(),
+                                    "index",
+                                    &target::collection_structural_version("__anv_list"),
+                                )
                             );
                             rendered.ty = elem;
                         }
@@ -474,6 +489,16 @@ fn block_has_mut_place_payload(block: &RirStructuredBlock, local: RirLocalId) ->
 
 fn stmt_has_mut_place_payload(stmt: &RirStmt, local: RirLocalId) -> bool {
     match stmt {
+        RirStmt::DynMatch(match_) => {
+            match_
+                .arms
+                .iter()
+                .any(|arm| arm.binding == super::rir::RirDynMatchBinding::Alias(local))
+                || matches!(
+                    (&match_.source, match_.fallback_binding),
+                    (super::rir::RirDynMatchSource::MutPlace(_), Some(binding)) if binding == local
+                )
+        }
         RirStmt::OptionMatch(match_) => {
             match_.payload == Some(local)
                 && match_.payload_ref

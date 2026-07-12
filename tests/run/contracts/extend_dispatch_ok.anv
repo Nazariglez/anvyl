@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// extension
+// extension
+// @match-end
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Actor {}
+
+extend Actor {
+    fn draw(self) {
+        println("extension");
+    }
+}
+
+fn main() {
+    let actor: dyn Drawable = Actor {};
+    actor.draw();
+    actor.draw();
+}

@@ -1,0 +1,22 @@
+// @mode: run
+// @expect: success
+// @match: 11
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct Actor {
+    fn score(self) -> int {
+        11
+    }
+}
+
+struct Holder {
+    actor: dyn Scored,
+}
+
+fn main() {
+    let holder = Holder { actor: Actor {} };
+    println(holder.actor.score());
+}

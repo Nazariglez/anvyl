@@ -1,0 +1,61 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 7
+// none
+// 7
+// 0
+// @match-end
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    points: int,
+
+    fn draw(self) {}
+}
+
+struct Prop {
+    fn draw(self) {}
+}
+
+fn inspect(ref actor: dyn Drawable) -> Enemy? {
+    actor as? Enemy
+}
+
+fn inspect_direct(ref actor: dyn Drawable) {
+    if let enemy = actor as? Enemy {
+        println(enemy.points);
+    } else {
+        println("none");
+    }
+}
+
+fn inspect_match(ref actor: dyn Drawable) -> int {
+    match actor as? {
+        Enemy(enemy) => enemy.points,
+        other => {
+            other.draw();
+            0
+        },
+    }
+}
+
+fn main() {
+    var enemy = Enemy { points: 7 };
+    if let found? = inspect(enemy) {
+        println(found.points);
+    }
+
+    var owned: dyn Drawable = Enemy { points: 7 };
+    inspect_direct(owned);
+
+    var prop = Prop {};
+    inspect_direct(prop);
+
+    println(inspect_match(enemy));
+    println(inspect_match(prop));
+}

@@ -1,0 +1,5 @@
+error: place receiver payload must be Self
+  --> tests/ui/methods/place_requires_self.rs:13:52
+   |
+13 |         receiver: anvyx_runtime::MutPlace<'_, 'cx, Counter>,
+   |                                                    ^^^^^^^

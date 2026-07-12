@@ -1,0 +1,36 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 92
+// 93
+// @match-end
+
+contract Left {
+    fn score(self) -> int;
+}
+
+contract Right {
+    fn score(self) -> int;
+}
+
+struct LeftNode {
+    right: (dyn Right)?,
+
+    fn score(self) -> int { 92 }
+}
+
+struct RightNode {
+    left: (dyn Left)?,
+
+    fn score(self) -> int { 93 }
+}
+
+fn main() {
+    let left: dyn Left = LeftNode { right: nil };
+    let right: dyn Right = RightNode { left: left };
+    let outer: dyn Left = LeftNode { right: right };
+    println(outer.score());
+
+    let direct: dyn Right = RightNode { left: outer };
+    println(direct.score());
+}

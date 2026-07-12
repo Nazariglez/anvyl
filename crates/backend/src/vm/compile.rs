@@ -16,6 +16,12 @@ pub struct VmCompiler;
 impl VmCompiler {
     pub fn compile(program: VerifiedProgram<'_>) -> Result<VirProgram, Vec<VmCompileError>> {
         let air = program.program();
+        if !air.contract_surfaces.is_empty() {
+            return Err(vec![VmCompileError {
+                site: VmCompileErrorSite::Program,
+                kind: VmCompileErrorKind::UnsupportedContracts,
+            }]);
+        }
         let mut cx = CompileCx {
             program: air,
             classes: TypePassClasses::analyze(air),
@@ -41,6 +47,7 @@ pub struct VmCompileError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmCompileErrorSite {
+    Program,
     Function(FunctionId),
     Global(GlobalId),
     Extern(ExternId),
@@ -48,6 +55,7 @@ pub enum VmCompileErrorSite {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmCompileErrorKind {
+    UnsupportedContracts,
     UnsupportedLambdaType,
     UnsupportedLambdaValue,
     UnsupportedLambdaCall,
@@ -236,6 +244,7 @@ impl CompileCx<'_> {
                     self.check_block(function, &match_.some_block, calls);
                     self.check_block(function, &match_.none_block, calls);
                 }
+                AirStmt::DynMatch(_) => unreachable!("contracts rejected at VM boundary"),
             }
         }
         match &block.tail {
@@ -328,6 +337,10 @@ impl CompileCx<'_> {
                     self.check_lambda_capture(function, capture);
                 }
             }
+            RValue::DynPack { .. }
+            | RValue::DynWeaken { .. }
+            | RValue::DynDowncast { .. }
+            | RValue::DynCall { .. } => unreachable!("contracts rejected at VM boundary"),
         }
     }
 
@@ -352,6 +365,7 @@ impl CompileCx<'_> {
                     VmPlaceRootStatus::LambdaCapture
                 }
             }
+            PlaceRoot::DynBorrowParam(_) => unreachable!("contracts rejected at VM boundary"),
             PlaceRoot::ScopedBorrow(_) => VmPlaceRootStatus::ScopedBorrow,
             PlaceRoot::CaptureCell(_) => VmPlaceRootStatus::CaptureCell,
             PlaceRoot::Global(_) => VmPlaceRootStatus::Global,
@@ -447,6 +461,7 @@ impl CompileCx<'_> {
                 self.check_place(function, place);
                 VirCallArg::MutBorrow(place.clone())
             }
+            CallArg::DynBorrow(_) => unreachable!("contracts rejected at VM boundary"),
         }
     }
 

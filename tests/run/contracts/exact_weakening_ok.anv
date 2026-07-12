@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match: 9
+
+contract Read {
+    fn read(self) -> int;
+}
+
+contract Reset {
+    fn reset(ref self);
+}
+
+struct Counter {
+    value: int,
+
+    fn read(self) -> int { self.value }
+    fn reset(ref self) { self.value = 0; }
+}
+
+fn main() {
+    let full: dyn Read + Reset = Counter { value: 9 };
+    let narrow: dyn Read = full;
+    println(narrow.read());
+}

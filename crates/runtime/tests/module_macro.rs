@@ -8,7 +8,7 @@ use anvyx_runtime::{
 mod root_module {
     use super::{AnvyxInline, function};
 
-    #[derive(AnvyxInline)]
+    #[derive(Clone, Copy, AnvyxInline)]
     pub struct Point {
         #[anvyx(field)]
         pub x: i64,
@@ -47,7 +47,7 @@ mod tree_module {
 mod builtin {
     use super::{AnvyxInline, function};
 
-    #[derive(AnvyxInline)]
+    #[derive(Clone, Copy, AnvyxInline)]
     pub struct Point {
         #[anvyx(field)]
         pub x: i64,
@@ -71,7 +71,7 @@ mod package {
     pub mod window {
         use super::{AnvyxInline, function, methods};
 
-        #[derive(Clone, AnvyxInline)]
+        #[derive(Clone, Copy, AnvyxInline)]
         pub struct WindowConfig {
             #[anvyx(field)]
             pub width: i64,
@@ -79,8 +79,9 @@ mod package {
 
         #[methods]
         impl WindowConfig {
-            pub fn doubled(&self) -> i64 {
-                self.width * 2
+            pub fn doubled(&mut self) -> i64 {
+                self.width *= 2;
+                self.width
             }
         }
 
@@ -140,7 +141,7 @@ mod private_resource_package {
         #[derive(AnvyxRef)]
         pub struct WWin {
             #[anvyx(field)]
-            value: i64,
+            pub value: i64,
         }
 
         #[methods]

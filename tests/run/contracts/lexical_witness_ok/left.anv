@@ -1,0 +1,14 @@
+// @helper
+
+import shared { Actor, Drawable };
+
+extend Actor {
+    fn draw(self) {
+        println("left");
+    }
+}
+
+pub fn call_left(actor: Actor) {
+    let dynamic: dyn Drawable = actor;
+    dynamic.draw();
+}

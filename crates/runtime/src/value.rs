@@ -212,7 +212,11 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         })
     }
 
-    pub fn with_elem_shared_short<'rt, R>(
+    /// # Safety
+    ///
+    /// The callback must not reenter Anvyx or access this list's storage while the element
+    /// reference is live.
+    pub unsafe fn with_elem_shared_short<'rt, R>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
         index: usize,
@@ -234,7 +238,7 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
     /// # Safety
     ///
     /// The callback must not access this list's storage while it receives the element reference.
-    pub unsafe fn with_elem_mut_short<'rt, R>(
+    pub unsafe fn with_elem_mut_leaf<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         index: usize,
@@ -253,37 +257,6 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
                 .expect("list storage length drifted from list length");
             f(elem)
         })
-    }
-
-    pub fn with_elem_owned_mut_ctx_short<'rt, R>(
-        &mut self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        index: usize,
-        expected_version: u64,
-        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        T: Clone,
-    {
-        self.loan.check_stable(expected_version)?;
-        self.check_elem_index(index)?;
-        self.make_unique(ctx)?;
-        let mut elem = self.with_storage(ctx, |storage| {
-            Ok(storage
-                .get(index)
-                .expect("list storage length drifted from list length")
-                .clone())
-        })?;
-        let result = f(ctx, &mut elem)?;
-        self.loan.check_stable(expected_version)?;
-        self.check_elem_index(index)?;
-        self.with_storage_mut(ctx, |storage| {
-            *storage
-                .get_mut(index)
-                .expect("list storage length drifted from list length") = elem;
-            Ok(())
-        })?;
-        Ok(result)
     }
 
     fn check_elem_index(&self, index: usize) -> Result<(), RuntimeError> {
@@ -306,6 +279,17 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         }
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_projection_owner(&self) -> Self {
+        Self {
+            storage: self.storage.share(),
+            storage_ty: self.storage_ty,
+            loan: self.loan.fresh_for_projection(),
+            len: self.len,
+        }
+    }
+
     pub fn elem_at_shared<'rt>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
@@ -315,7 +299,9 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
     where
         T: Clone,
     {
-        self.with_elem_shared_short(ctx, index, expected_version, |elem| Ok(elem.clone()))
+        unsafe {
+            self.with_elem_shared_short(ctx, index, expected_version, |elem| Ok(elem.clone()))
+        }
     }
 
     pub fn push<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>, elem: T) -> Result<(), RuntimeError>
@@ -467,6 +453,15 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         V: Clone,
     {
         self.with_unloaned_storage(ctx, |storage| Ok(storage.get(key).cloned()))
+    }
+
+    pub fn with_value_shared_short<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        key: &K,
+        f: impl FnOnce(Option<&V>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        self.with_unloaned_storage(ctx, |storage| f(storage.get(key)))
     }
 
     pub fn contains_key<'rt>(&self, ctx: &Ctx<'cx, 'rt>, key: &K) -> Result<bool, RuntimeError> {
@@ -851,6 +846,18 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
         )
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_projection_owner(&self) -> Self {
+        Self::new(
+            self.root.clone(),
+            self.start,
+            self.len,
+            self.guard.clone(),
+            self.mutable,
+        )
+    }
+
     #[must_use]
     pub fn slice(&self, start: usize, len: usize) -> Self {
         Self::new(
@@ -936,15 +943,42 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
     ///
     /// The callback must not access, mutate, move, or invalidate the slice root while it receives
     /// the element reference.
-    pub unsafe fn with_elem_mut_short<'rt, R>(
+    pub unsafe fn with_elem_shared_leaf<'rt, R>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: i64,
+        f: impl FnOnce(&T) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        let index = self.check_view_index(index)?;
+        let absolute = self.start + index;
+        match self.root {
+            SliceRoot::Raw { ptr, .. } => unsafe {
+                f(ptr.as_ptr().add(absolute).as_ref().unwrap())
+            },
+            SliceRoot::List { ref storage, .. } => {
+                self.check_stable()?;
+                ctx.heap_ref()
+                    .try_with(storage.handle(), |storage| {
+                        let Some(elem) = storage.get(absolute) else {
+                            return Err(RuntimeError::new("slice index out of bounds"));
+                        };
+                        f(elem)
+                    })
+                    .map_err(heap_access_error)?
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The callback must not access, mutate, move, or invalidate the slice root while it receives
+    /// the element reference.
+    pub unsafe fn with_elem_mut_leaf<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         index: i64,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        T: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         if !self.mutable {
             return Err(RuntimeError::new("cannot mutate readonly slice"));
         }
@@ -966,57 +1000,6 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
                     .map_err(heap_access_error)?
             }
         }
-    }
-
-    pub fn with_elem_owned_mut_ctx_short<'rt, R>(
-        &mut self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        index: i64,
-        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        T: Clone,
-    {
-        if !self.mutable {
-            return Err(RuntimeError::new("cannot mutate readonly slice"));
-        }
-        let index = self.check_view_index(index)?;
-        let absolute = self.start + index;
-        let mut elem = match self.root {
-            SliceRoot::Raw { ptr, .. } => unsafe {
-                ptr.as_ptr().add(absolute).as_ref().unwrap().clone()
-            },
-            SliceRoot::List { ref storage, .. } => {
-                self.check_stable()?;
-                ctx.heap_ref()
-                    .try_with(storage.handle(), |storage| {
-                        storage
-                            .get(absolute)
-                            .cloned()
-                            .ok_or_else(|| RuntimeError::new("slice index out of bounds"))
-                    })
-                    .map_err(heap_access_error)??
-            }
-        };
-        let result = f(ctx, &mut elem)?;
-        match self.root {
-            SliceRoot::Raw { ptr, .. } => unsafe {
-                *ptr.as_ptr().add(absolute) = elem;
-            },
-            SliceRoot::List { ref storage, .. } => {
-                self.check_stable()?;
-                ctx.heap()
-                    .try_with_mut(storage.handle(), |storage| {
-                        let Some(slot) = storage.get_mut(absolute) else {
-                            return Err(RuntimeError::new("slice index out of bounds"));
-                        };
-                        *slot = elem;
-                        Ok(())
-                    })
-                    .map_err(heap_access_error)??;
-            }
-        }
-        Ok(result)
     }
 
     fn check_stable(&self) -> Result<(), RuntimeError> {
@@ -1072,7 +1055,8 @@ mod tests {
 
     use super::{AnvList, AnvMap, AnvSlice, AnvString, display_float};
     use crate::{
-        Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, Trace, TraceDriver, Visitor,
+        Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, RuntimeError, Trace, TraceDriver,
+        Visitor,
     };
 
     fn list_ty<'cx, T: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, ListStorage<'cx, T>> {
@@ -1502,6 +1486,51 @@ mod tests {
     }
 
     #[test]
+    fn projection_owner_preserves_list_version() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
+            list.push(&mut ctx, 2).unwrap();
+            let version = list.structural_version();
+            let mut owner = list.__anvyx_projection_owner();
+
+            unsafe {
+                owner.with_elem_mut_leaf(&mut ctx, 0, version, |value| {
+                    *value = 3;
+                    Ok(())
+                })
+            }
+            .unwrap();
+
+            assert_eq!(owner.elem_at_shared(&ctx, 0, version).unwrap(), 3);
+            assert_eq!(list.elem_at_shared(&ctx, 0, version).unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn projection_owner_preserves_slice_mutability() {
+        Heap::scope(|heap| {
+            let mut ctx = Ctx::new(heap);
+            let mut values = [1_i64];
+            let slice = unsafe {
+                AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 0, values.len())
+            };
+            let mut owner = slice.__anvyx_projection_owner();
+
+            unsafe {
+                owner.with_elem_mut_leaf(&mut ctx, 0, |value| {
+                    *value = 2;
+                    Ok(())
+                })
+            }
+            .unwrap();
+
+            assert_eq!(values[0], 2);
+        });
+    }
+
+    #[test]
     fn list_slice_keeps_storage_alive_after_owner_drops() {
         Heap::scope(|heap| {
             let ty = list_ty::<i64>(heap);
@@ -1516,6 +1545,35 @@ mod tests {
     }
 
     #[test]
+    fn slice_leaf_error_preserves_mutation() {
+        Heap::scope(|heap| {
+            let mut ctx = Ctx::new(heap);
+            let mut values = [1_i64, 2];
+            let mut slice = unsafe {
+                AnvSlice::from_raw_parts_mut(values.as_mut_ptr(), values.len(), 0, values.len())
+            };
+
+            let err = unsafe {
+                slice.with_elem_mut_leaf(&mut ctx, 1, |value| {
+                    *value = 4;
+                    Err::<(), _>(RuntimeError::new("early"))
+                })
+            }
+            .unwrap_err();
+            assert_eq!(err.message(), "early");
+            assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 4);
+            unsafe {
+                slice.with_elem_mut_leaf(&mut ctx, 1, |value| {
+                    *value = 5;
+                    Ok(())
+                })
+            }
+            .unwrap();
+            assert_eq!(values[1], 5);
+        });
+    }
+
+    #[test]
     fn list_slice_keeps_old_storage_after_owner_detaches() {
         Heap::scope(|heap| {
             let ty = list_ty::<i64>(heap);
@@ -1526,7 +1584,7 @@ mod tests {
             let slice = AnvSlice::from_list(&list, 0, 2).unwrap();
 
             unsafe {
-                list.with_elem_mut_short(&mut ctx, 0, version, |value| {
+                list.with_elem_mut_leaf(&mut ctx, 0, version, |value| {
                     *value = 10;
                     Ok(())
                 })

@@ -1,0 +1,45 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 12
+// 15
+// 22
+// @match-end
+
+contract Counter {
+    fn add(ref self, amount: int);
+    fn value(self) -> int;
+}
+
+struct Score {
+    points: int,
+
+    fn add(ref self, amount: int) {
+        self.points += amount;
+    }
+
+    fn value(self) -> int { self.points }
+}
+
+struct BigScore {
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+    points: int,
+
+    fn add(ref self, amount: int) { self.points += amount; }
+    fn value(self) -> int { self.points }
+}
+
+fn main() {
+    var counter: dyn Counter = Score { points: 10 };
+    counter.add(2);
+    println(counter.value());
+    counter.add(3);
+    println(counter.value());
+
+    var boxed: dyn Counter = BigScore { a: 1, b: 2, c: 3, d: 4, points: 20 };
+    boxed.add(2);
+    println(boxed.value());
+}

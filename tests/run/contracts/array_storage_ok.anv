@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 15
+// 16
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct First {
+    fn score(self) -> int { 15 }
+}
+
+struct Second {
+    fn score(self) -> int { 16 }
+}
+
+fn main() {
+    let actors: [dyn Scored; 2] = [First {}, Second {}];
+    println(actors[0].score());
+    println(actors[1].score());
+}

@@ -1,0 +1,38 @@
+// @mode: run
+// @expect: error
+// @contains: dynamic carrier variant changed during projected access
+
+contract Replaceable {
+    fn replace(ref self);
+}
+
+struct First {
+    value: int,
+
+    fn replace(ref self) {
+        replace_actor();
+        self.value += 1;
+    }
+}
+
+struct Second {
+    value: int,
+
+    fn replace(ref self) {
+        self.value += 1;
+    }
+}
+
+struct Holder {
+    actor: dyn Replaceable,
+}
+
+lazy var holder = Holder { actor: First { value: 0 } };
+
+fn replace_actor() {
+    holder.actor = Second { value: 10 };
+}
+
+fn main() {
+    holder.actor.replace();
+}

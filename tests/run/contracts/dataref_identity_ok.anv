@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 101
+// 102
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+dataref Counter {
+    value: int,
+
+    fn score(self) -> int { self.value }
+}
+
+fn main() {
+    var counter = Counter { value: 101 };
+    let actor: dyn Scored = counter;
+    println(actor.score());
+    counter.value = 102;
+    println(actor.score());
+}

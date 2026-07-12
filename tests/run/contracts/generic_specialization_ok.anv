@@ -1,0 +1,40 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// enemy
+// label
+// enemy
+// label
+// @match-end
+
+contract Drawable {
+    fn draw(self);
+}
+
+struct Enemy {
+    fn draw(self) {
+        println("enemy");
+    }
+}
+
+struct Label {
+    fn draw(self) {
+        println("label");
+    }
+}
+
+fn wrap<T>(actor: T) {
+    let dynamic: dyn Drawable = actor;
+    dynamic.draw();
+}
+
+fn static_wrap<T: Drawable>(actor: T) {
+    actor.draw();
+}
+
+fn main() {
+    wrap(Enemy {});
+    wrap(Label {});
+    wrap(Enemy {});
+    static_wrap(Label {});
+}

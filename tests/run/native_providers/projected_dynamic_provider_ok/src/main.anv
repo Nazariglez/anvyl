@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: error
+// @contains: projected provider failure after 3
+
+import pkg:host.host { NativeScore };
+
+contract MutableScore {
+    fn bump(ref self) -> int;
+    fn fail(ref self) -> int;
+    fn number(self) -> int;
+}
+
+struct Wrapper {
+    embed score: NativeScore,
+}
+
+fn main() {
+    var direct: [dyn MutableScore] = [NativeScore { value: 1 }];
+    assert(direct[0].bump() == 2);
+    assert(direct[0].number() == 2);
+
+    var promoted: [dyn MutableScore] = [Wrapper {
+        score: NativeScore { value: 2 },
+    }];
+    assert(promoted[0].bump() == 3);
+    assert(promoted[0].number() == 3);
+
+    direct[0].fail();
+}

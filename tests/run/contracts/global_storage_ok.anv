@@ -1,0 +1,45 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 61
+// 62
+// 71
+// 72
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct First {
+    fn score(self) -> int { 61 }
+}
+
+struct Second {
+    fn score(self) -> int { 62 }
+}
+
+struct ProjectedFirst {
+    fn score(self) -> int { 71 }
+}
+
+struct ProjectedSecond {
+    fn score(self) -> int { 72 }
+}
+
+struct Slot {
+    actor: dyn Scored,
+}
+
+lazy var actor: dyn Scored = First {};
+lazy var slot = Slot { actor: ProjectedFirst {} };
+
+fn main() {
+    println(actor.score());
+    actor = Second {};
+    println(actor.score());
+
+    println(slot.actor.score());
+    slot.actor = ProjectedSecond {};
+    println(slot.actor.score());
+}

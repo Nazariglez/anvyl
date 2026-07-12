@@ -1,0 +1,35 @@
+// @mode: run
+// @expect: success
+// @match: one
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+struct Large {
+    first: string,
+    second: string,
+    third: string,
+    fourth: string,
+
+    fn a(self) {
+        println(self.first);
+    }
+
+    fn b(self) {}
+}
+
+fn main() {
+    let both: dyn A + B = Large {
+        first: "one",
+        second: "two",
+        third: "three",
+        fourth: "four",
+    };
+    let only: dyn A = both;
+    only.a();
+}

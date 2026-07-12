@@ -3,12 +3,14 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, AirBody, AirOptionalMatch, BindingId, CallArg, Callee,
         CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource, ConstData, ConstValue,
-        DynContractData, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl, ExternMember,
-        ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeBindingDecl, ExternTypeDecl,
-        FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization, LambdaDecl,
-        LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape, ParamMode,
-        ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature,
-        TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
+        ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId,
+        ContractSurfaceDecl, ContractWitnessDecl, ContractWitnessKey, ContractWitnessSlotDecl,
+        ContractWitnessTarget, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl,
+        ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeBindingDecl,
+        ExternTypeDecl, FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization,
+        LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape,
+        ParamMode, ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue,
+        Signature, TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -20,7 +22,7 @@ use super::{
     place_access::{PlaceAccessCx, PlaceAccessIntent},
     plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
-    rep_policy::{RustRepPolicy, RustTracePlan},
+    rep_policy::{RirRustRepPolicy, RustTracePlan},
     rir::{
         self, RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
         RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
@@ -230,7 +232,7 @@ fn rir_rejects_forged_retained_callback_live_native_borrow() {
 }
 
 #[test]
-fn rir_rejects_forged_retained_callback_native_mut_place_reentry() {
+fn rir_accepts_retained_callback_native_mut_place_descriptor() {
     let mut program = retained_callback_string_borrow_rir();
     let extern_id = retained_callback_borrow_extern(&program);
     let ext = &mut program.externs[extern_id.index()];
@@ -259,7 +261,7 @@ fn rir_rejects_forged_retained_callback_native_mut_place_reentry() {
         args[0] = RirCallArg::MutPlace(RirMutPlaceArg::local(place.clone()));
     }
 
-    assert_rir_error(program, RirVerifyErrorKind::CallArgMode);
+    rir::verify(&program).expect("mutable-place descriptor should be reentry-safe");
 }
 
 #[test]
@@ -2086,6 +2088,7 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
         let void = RirTypeId::from_index(1);
         program.externs.push(RirExtern {
             id: RirExternId::from_index(0),
+            air_id: None,
             symbol: RirSymbol::new("sink"),
             kind: RirExternKind::Native(rir::RirNativeExtern::new(
                 vec!["host".to_string(), "sink".to_string()],
@@ -2252,11 +2255,6 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
     let int = program.alloc_type(TypeData::Int);
     let slice = program.alloc_type(TypeData::Slice(int));
     let any = program.alloc_type(TypeData::Any);
-    let dyn_ty = program.alloc_type(TypeData::Dyn(DynContractData {
-        display_name: "Drawable".into(),
-        method_table_key: "Drawable".into(),
-        concrete_printer: None,
-    }));
     let module = program.alloc_module(root_module());
     let ext_id = program.alloc_extern_type(ExternTypeDecl {
         name: Ident::new("HostValue"),
@@ -2265,6 +2263,9 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Inline,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: None,
         has_init: false,
         init_args: vec![],
         fields: vec![],
@@ -2287,7 +2288,6 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
         ("slice", slice, ProfileErrorKind::UnsupportedGlobalRooting),
         ("extern", ext, ProfileErrorKind::UnsupportedGlobalRooting),
         ("any", any, ProfileErrorKind::UnsupportedGlobalType),
-        ("dyn", dyn_ty, ProfileErrorKind::UnsupportedGlobalType),
         (
             "list_slice",
             list_slice,
@@ -2311,6 +2311,486 @@ fn profile_rejects_unsupported_exact_root_global_payloads() {
             kind,
         );
     }
+}
+
+#[test]
+fn plan_emits_generated_dynamic_carrier() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let one = program.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let string = program.alloc_type(TypeData::String);
+    let void = program.alloc_type(TypeData::Void);
+    let callback = program.alloc_type(TypeData::Function(air::SignatureType::new(
+        vec![],
+        air::ReturnMode::Value(void),
+    )));
+    let large = program.alloc_type(TypeData::Tuple(vec![string, string, string, string]));
+    let module = program.alloc_module(root_module());
+    let receiver = air::LocalId::from_index(0);
+    let mut draw_receiver = param("value", int, ParamMode::Value, receiver);
+    draw_receiver.role = ParamRole::Receiver;
+    let draw = program.alloc_function(Function {
+        name: Ident::new("draw"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![draw_receiver], void),
+        locals: vec![local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(draw);
+    let large_receiver = air::LocalId::from_index(0);
+    let mut large_param = param("value", large, ParamMode::Value, large_receiver);
+    large_param.role = ParamRole::Receiver;
+    let draw_large = program.alloc_function(Function {
+        name: Ident::new("draw"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![large_param], void),
+        locals: vec![local(large, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(draw_large);
+    let callback_receiver = air::LocalId::from_index(0);
+    let mut callback_param = param("value", callback, ParamMode::Value, callback_receiver);
+    callback_param.role = ParamRole::Receiver;
+    let draw_callback = program.alloc_function(Function {
+        name: Ident::new("draw"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![callback_param], void),
+        locals: vec![local(callback, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(draw_callback);
+    let second_receiver = air::LocalId::from_index(0);
+    let mut second_param = param("value", int, ParamMode::Value, second_receiver);
+    second_param.role = ParamRole::Receiver;
+    let draw_second = program.alloc_function(Function {
+        name: Ident::new("draw"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![second_param], void),
+        locals: vec![local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(draw_second);
+    let other_receiver = air::LocalId::from_index(0);
+    let mut other_param = param("value", int, ParamMode::Value, other_receiver);
+    other_param.role = ParamRole::Receiver;
+    let draw_other = program.alloc_function(Function {
+        name: Ident::new("draw_other"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![other_param], void),
+        locals: vec![local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(draw_other);
+    let slot = ContractSlotId::from_index(0);
+    let surface = program.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Drawable".into(),
+        slots: vec![ContractSlotDecl {
+            id: slot,
+            name: Ident::new("draw"),
+            receiver: ContractReceiver::Value,
+            params: vec![],
+            ret: ContractReturnDecl::Value(void),
+        }],
+    });
+    let dyn_ty = program.alloc_type(TypeData::Dyn(surface));
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: int,
+            surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::Value,
+                target: ContractWitnessTarget::Function { function: draw },
+            }],
+        },
+    });
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: large,
+            surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::Value,
+                target: ContractWitnessTarget::Function {
+                    function: draw_large,
+                },
+            }],
+        },
+    });
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: callback,
+            surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::Value,
+                target: ContractWitnessTarget::Function {
+                    function: draw_callback,
+                },
+            }],
+        },
+    });
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: int,
+            surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::Value,
+                target: ContractWitnessTarget::Function {
+                    function: draw_second,
+                },
+            }],
+        },
+    });
+    let colliding_surface = program.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Drawable".into(),
+        slots: vec![ContractSlotDecl {
+            id: slot,
+            name: Ident::new("draw_other"),
+            receiver: ContractReceiver::Value,
+            params: vec![],
+            ret: ContractReturnDecl::Value(void),
+        }],
+    });
+    program.alloc_type(TypeData::Dyn(colliding_surface));
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: int,
+            surface: colliding_surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::Value,
+                target: ContractWitnessTarget::Function {
+                    function: draw_other,
+                },
+            }],
+        },
+    });
+    let local_id = air::LocalId::from_index(0);
+    let packed_id = air::LocalId::from_index(1);
+    let function = program.alloc_function(Function {
+        name: Ident::new("pack_dyn"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![param("value", int, ParamMode::Value, local_id)], void),
+        locals: vec![local(int, LocalKind::Arg), local(dyn_ty, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: packed_id,
+                value: RValue::DynPack {
+                    value: Operand::Place(place(local_id, int)),
+                    use_: air::DynOwnedUse::ReusableRead,
+                    witness: air::ContractWitnessId::from_index(0),
+                    ty: dyn_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+    let second_arg = air::LocalId::from_index(0);
+    let second_packed = air::LocalId::from_index(1);
+    let pack_second = program.alloc_function(Function {
+        name: Ident::new("pack_second_dyn"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("value", int, ParamMode::Value, second_arg)],
+            void,
+        ),
+        locals: vec![local(int, LocalKind::Arg), local(dyn_ty, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: second_packed,
+                value: RValue::DynPack {
+                    value: Operand::Place(place(second_arg, int)),
+                    use_: air::DynOwnedUse::ReusableRead,
+                    witness: air::ContractWitnessId::from_index(3),
+                    ty: dyn_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(pack_second);
+    let large_arg = air::LocalId::from_index(0);
+    let large_packed = air::LocalId::from_index(1);
+    let pack_large = program.alloc_function(Function {
+        name: Ident::new("pack_large_dyn"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("value", large, ParamMode::Value, large_arg)],
+            void,
+        ),
+        locals: vec![local(large, LocalKind::Arg), local(dyn_ty, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: large_packed,
+                value: RValue::DynPack {
+                    value: Operand::Place(place(large_arg, large)),
+                    use_: air::DynOwnedUse::ReusableRead,
+                    witness: air::ContractWitnessId::from_index(1),
+                    ty: dyn_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(pack_large);
+    let callback_arg = air::LocalId::from_index(0);
+    let callback_packed = air::LocalId::from_index(1);
+    let pack_callback = program.alloc_function(Function {
+        name: Ident::new("pack_callback_dyn"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![param("value", callback, ParamMode::Value, callback_arg)],
+            void,
+        ),
+        locals: vec![
+            local(callback, LocalKind::Arg),
+            local(dyn_ty, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![Statement::Init {
+                local: callback_packed,
+                value: RValue::DynPack {
+                    value: Operand::Place(place(callback_arg, callback)),
+                    use_: air::DynOwnedUse::ReusableRead,
+                    witness: air::ContractWitnessId::from_index(2),
+                    ty: dyn_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(pack_callback);
+    let string_args = (0..4).map(air::LocalId::from_index).collect::<Vec<_>>();
+    let tuple_tmp = air::LocalId::from_index(4);
+    let moved_dyn = air::LocalId::from_index(5);
+    let pack_moved = program.alloc_function(Function {
+        name: Ident::new("pack_moved_dyn"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            string_args
+                .iter()
+                .enumerate()
+                .map(|(index, local)| {
+                    param(&format!("value{index}"), string, ParamMode::Value, *local)
+                })
+                .collect(),
+            void,
+        ),
+        locals: string_args
+            .iter()
+            .map(|_| local(string, LocalKind::Arg))
+            .chain([
+                local(large, LocalKind::Temp),
+                local(dyn_ty, LocalKind::Temp),
+            ])
+            .collect(),
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: tuple_tmp,
+                    value: RValue::Aggregate {
+                        kind: AggregateCtor::Tuple,
+                        fields: string_args
+                            .iter()
+                            .map(|local| Operand::Place(place(*local, string)))
+                            .collect(),
+                        ty: large,
+                    },
+                },
+                Statement::Init {
+                    local: moved_dyn,
+                    value: RValue::DynPack {
+                        value: Operand::Place(place(tuple_tmp, large)),
+                        use_: air::DynOwnedUse::ConsumeTemporary,
+                        witness: air::ContractWitnessId::from_index(1),
+                        ty: dyn_ty,
+                    },
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(pack_moved);
+    let entry_dyn = air::LocalId::from_index(0);
+    let main = program.alloc_function(Function {
+        name: Ident::new("main"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![local(dyn_ty, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: entry_dyn,
+                value: RValue::DynPack {
+                    value: Operand::Const(one),
+                    use_: air::DynOwnedUse::ReusableRead,
+                    witness: air::ContractWitnessId::from_index(3),
+                    ty: dyn_ty,
+                },
+            }],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(main);
+    program.set_entry(main);
+    let verified = air::verify(&program).expect("AIR verify failed");
+
+    let plan = plan(&verified, RustPlanConfig::default()).expect("dynamic carrier plan");
+    let rir = plan.program();
+    assert_eq!(rir.dyn_carriers.len(), 2);
+    assert_eq!(rir.dyn_carriers[0].variants.len(), 4);
+    assert_eq!(rir.dyn_carriers[1].variants.len(), 1);
+    let source = emit::emit(&plan.verified()).into_string();
+    assert!(source.contains("enum anvDynDrawable_0"));
+    assert!(source.contains("Witness0(i64)"));
+    assert!(source.contains("Witness1(Box<"));
+    assert!(source.contains("anvDynDrawable_0::Witness0("));
+    assert!(source.contains("anvDynDrawable_0::Witness1(Box::new("));
+    assert!(source.contains("anvDynDrawable_0::Witness2(Box::new("));
+    assert!(source.contains("anvDynDrawable_0::Witness3("));
+    assert!(source.contains("#[repr(u32)]\nenum anvDynDrawable_0"));
+    assert!(source.contains("#[repr(u32)]\nenum anvDynDrawable_1"));
+    let carrier_prefix = source
+        .split_once("enum anvDynDrawable_0")
+        .expect("dynamic declaration")
+        .0;
+    let carrier_attrs = carrier_prefix
+        .rsplit_once("\n\n")
+        .map_or(carrier_prefix, |(_, attrs)| attrs);
+    assert!(!carrier_attrs.contains("PartialEq"));
+    assert!(!carrier_attrs.contains("Hash"));
+    let output = run_source(emit::RustSource::new(source));
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+}
+
+#[test]
+fn mutable_dyn_call_emits_projected_payload_descriptor() {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let void = program.alloc_type(TypeData::Void);
+    let module = program.alloc_module(root_module());
+    let receiver = air::LocalId::from_index(0);
+    let mut receiver_param = param("self", int, ParamMode::MutBorrow, receiver);
+    receiver_param.role = ParamRole::Receiver;
+    let bump = program.alloc_function(Function {
+        name: Ident::new("bump"),
+        module,
+        kind: FunctionKind::Method,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![receiver_param], void),
+        locals: vec![mut_local(int, LocalKind::Arg)],
+        body: structured_body(vec![], air::AirTail::Return(None)),
+    });
+    program.module_mut(module).functions.push(bump);
+    let slot = ContractSlotId::from_index(0);
+    let surface = program.alloc_contract_surface(ContractSurfaceDecl {
+        display_name: "Counter".into(),
+        slots: vec![ContractSlotDecl {
+            id: slot,
+            name: Ident::new("bump"),
+            receiver: ContractReceiver::Ref,
+            params: vec![],
+            ret: ContractReturnDecl::Value(void),
+        }],
+    });
+    let dyn_ty = program.alloc_type(TypeData::Dyn(surface));
+    program.alloc_contract_witness(ContractWitnessDecl {
+        key: ContractWitnessKey {
+            concrete_ty: int,
+            surface,
+            slots: vec![ContractWitnessSlotDecl {
+                slot,
+                receiver: ParamMode::MutBorrow,
+                target: ContractWitnessTarget::Function { function: bump },
+            }],
+        },
+    });
+    let packed = air::LocalId::from_index(0);
+    let one = int_const(&mut program, int, 1);
+    let caller = program.alloc_function(Function {
+        name: Ident::new("call_bump"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(vec![], void),
+        locals: vec![mut_local(dyn_ty, LocalKind::User)],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: packed,
+                    value: RValue::DynPack {
+                        value: Operand::Const(one),
+                        use_: air::DynOwnedUse::ReusableRead,
+                        witness: air::ContractWitnessId::from_index(0),
+                        ty: dyn_ty,
+                    },
+                },
+                Statement::Eval(RValue::DynCall {
+                    receiver: air::DynReceiver::MutableOwned(place(packed, dyn_ty)),
+                    surface,
+                    slot,
+                    args: vec![],
+                }),
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(caller);
+    program.set_entry(caller);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, RustPlanConfig::default()).expect("dynamic call plan");
+    let source = emit::emit(&plan.verified()).into_string();
+    let probe = source
+        .find(".access_with_ctx(rt, |rt, value|")
+        .expect("short carrier discriminant probe");
+    let target = probe + source[probe..].find("bump(").expect("dynamic target call");
+    assert!(probe < target);
+    assert!(source[probe..target].contains("}) }?;"));
+    assert!(source.contains("struct __AnvDynPayloadOps;"));
+    assert!(source.contains("MutPlace::projected("));
+    assert!(!source.contains(".mutate_with_ctx(rt, |rt, value|"));
+    let output = run_source(emit::RustSource::new(source));
+    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
 }
 
 #[test]
@@ -5910,7 +6390,7 @@ fn rir_rejects_heap_env_lambda_call_signature_mismatch() {
 #[test]
 fn heap_env_lambda_signatures_need_context_and_are_not_copy() {
     let program = valid_heap_env_lambda_rir();
-    let policy = RustRepPolicy::new(&program);
+    let policy = RirRustRepPolicy::new(&program);
     let sig = RirLambdaSigId::from_index(0);
 
     assert!(policy.lambda_sig_has_heap_env(sig));
@@ -6050,6 +6530,7 @@ fn rir_rejects_scoped_place_cell_mut_place_arg_to_native_mut_borrow() {
     let mut program = scoped_place_cell_rir(valid_scoped_place_cell_decl());
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("native_touch"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "touch".to_string()],
@@ -6307,7 +6788,7 @@ fn policy_tracks_heap_cell_payload_lambda_with_heap_cell_capture() {
         lifetime: RirCellLifetime::Function,
         symbol: RirSymbol::new("__cell1"),
     });
-    let policy = RustRepPolicy::new(&program);
+    let policy = RirRustRepPolicy::new(&program);
     let trace = RustTracePlan::build(&program);
 
     let sig = RirLambdaSigId::from_index(0);
@@ -6323,7 +6804,7 @@ fn policy_tracks_heap_cell_payload_lambda_with_heap_cell_capture() {
 fn policy_heap_cell_env_field_uses_lambda_cell_handle_type() {
     let program = valid_heap_cell_lambda_rir();
     rir::verify(&program).expect("RIR rejected heap cell lambda");
-    let policy = RustRepPolicy::new(&program);
+    let policy = RirRustRepPolicy::new(&program);
 
     assert_eq!(
         policy.lambda_env_field_ty(&program.lambda_envs[0].fields[0]),
@@ -8255,7 +8736,7 @@ fn slice_type_uses_runtime_descriptor_not_raw_slice() {
     };
 
     assert_eq!(
-        RustRepPolicy::new(&program).rust_ty(slice),
+        RirRustRepPolicy::new(&program).rust_ty(slice),
         "anvyx_runtime::AnvSlice<'cx, i64>"
     );
 }
@@ -8487,7 +8968,7 @@ fn rir_accepts_copying_stack_cell_lambda_value() {
 fn mut_borrow_lambda_signature_remains_noncopyable() {
     let program = mut_borrow_lambda_rir();
 
-    assert!(!RustRepPolicy::new(&program).lambda_sig_copyable(RirLambdaSigId::from_index(0)));
+    assert!(!RirRustRepPolicy::new(&program).lambda_sig_copyable(RirLambdaSigId::from_index(0)));
 }
 
 #[test]
@@ -8589,7 +9070,7 @@ fn lambda_sig_copyable_rejects_value_capture_cycles() {
         ..RirProgram::default()
     };
 
-    assert!(!RustRepPolicy::new(&program).lambda_sig_copyable(sig));
+    assert!(!RirRustRepPolicy::new(&program).lambda_sig_copyable(sig));
 }
 
 #[test]
@@ -9697,6 +10178,9 @@ fn profile_accepts_bound_extern_members_but_rejects_missing_binding() {
         type_args: vec![],
         const_args: vec![],
         rep: ExternRep::Shared,
+        layout: None,
+        materialization: None,
+        owns_heap_edges: None,
         has_init: false,
         init_args: vec![],
         fields: vec![],
@@ -9763,6 +10247,9 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Inline,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: None,
             has_init: false,
             init_args: vec![],
             fields: vec![field("computed", true), field("direct", false)],
@@ -13398,6 +13885,7 @@ fn rir_verify_rejects_bad_extern_signature() {
     program.types.push(RirType::Void);
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("bad_println"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "println".to_string()],
@@ -13433,6 +13921,7 @@ fn rir_verify_rejects_native_extern_param_type_mismatch() {
     program.types.push(RirType::Void);
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("bad_bool"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "bad_bool".to_string()],
@@ -13862,6 +14351,7 @@ fn rir_verify_accepts_direct_native_collection_carriers() {
             collection_storages: vec![rir_list_storage(list, int)],
             externs: vec![RirExtern {
                 id: RirExternId::from_index(0),
+                air_id: None,
                 symbol: RirSymbol::new(symbol),
                 kind: RirExternKind::Native(rir::RirNativeExtern::new(
                     vec!["host".to_string(), symbol.to_string()],
@@ -13929,6 +14419,7 @@ fn rir_verify_rejects_backend_unsupported_native_collection_shapes() {
             collection_storages: vec![rir_list_storage(list, int)],
             externs: vec![RirExtern {
                 id: RirExternId::from_index(0),
+                air_id: None,
                 symbol: RirSymbol::new("bad"),
                 kind: RirExternKind::Native(rir::RirNativeExtern::new(
                     vec!["host".to_string(), "bad".to_string()],
@@ -14015,6 +14506,7 @@ fn rir_verify_rejects_native_extern_return_type_mismatch() {
     let mut program = empty_rir_function(RirType::Int);
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("bad_return"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "bad_return".to_string()],
@@ -19209,7 +19701,7 @@ mod arrays {
     }
 
     #[test]
-    fn noncopy_array_value_copy_is_target_gap() {
+    fn noncopy_array_value_copy_materializes() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
         let array = program.alloc_type(TypeData::Array {
@@ -19252,8 +19744,10 @@ mod arrays {
         program.module_mut(module).functions.push(main);
         program.set_entry(main);
 
-        let errors = profile_errors(program);
-        assert!(has_error(&errors, ProfileErrorKind::NonCopyValueRequired));
+        let source = plan_source(program);
+        assert!(source.as_str().contains("share()"));
+        let output = run_source(source);
+        assert_eq!(output.status, SourceJobStatus::Success);
     }
 
     #[test]
@@ -20206,6 +20700,7 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
     }
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("substring"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "substring".to_string()],
@@ -20234,6 +20729,7 @@ fn native_string_return_program() -> RirProgram {
     program.consts.clear();
     program.externs.push(RirExtern {
         id: RirExternId::from_index(0),
+        air_id: None,
         symbol: RirSymbol::new("host_string"),
         kind: RirExternKind::Native(rir::RirNativeExtern::new(
             vec!["host".to_string(), "string".to_string()],
@@ -20826,6 +21322,7 @@ fn native_scoped_lambda_rir() -> RirProgram {
         }],
         externs: vec![RirExtern {
             id: RirExternId::from_index(0),
+            air_id: None,
             symbol: RirSymbol::new("apply"),
             kind: RirExternKind::Native(rir::RirNativeExtern::new(
                 vec!["host".to_string(), "apply".to_string()],
@@ -22544,6 +23041,7 @@ fn native_extern_rir(
         types,
         externs: vec![RirExtern {
             id: RirExternId::from_index(0),
+            air_id: None,
             symbol: RirSymbol::new("native"),
             kind: RirExternKind::Native(rir::RirNativeExtern::new(
                 vec!["host".to_string(), "native".to_string()],

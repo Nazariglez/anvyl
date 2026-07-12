@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{cell::Cell, marker::PhantomData, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
 use anvyx_runtime::{
     AnvRef, AnvRefType, AnvyxRef, AnvyxRefExport, ErasedHandle, ExternRep, ExternTypeExpr, Heap,
@@ -9,9 +9,9 @@ use anvyx_runtime::{
 
 #[derive(AnvyxRef)]
 #[anvyx(name = "Counter")]
-struct HostCounter {
+pub struct HostCounter {
     #[anvyx(field)]
-    count: i64,
+    pub count: i64,
 }
 
 struct HostNode<'cx> {
@@ -20,20 +20,27 @@ struct HostNode<'cx> {
 }
 
 #[derive(AnvyxRef)]
-struct EdgeHolder {
+pub struct EdgeHolder {
     edge: Option<ErasedHandle<'static>>,
 }
 
 struct HiddenEdge<'cx>(AnvRef<'cx, HostCounter>);
 
 #[derive(AnvyxRef)]
-struct WrappedEdge<'cx> {
+pub struct WrappedEdge<'cx> {
     edge: Option<HiddenEdge<'cx>>,
 }
 
 #[derive(AnvyxRef)]
-struct BrandedResource<'cx> {
-    _brand: PhantomData<AnvRef<'cx, HostCounter>>,
+pub struct BrandedResource<'cx> {
+    _brand: std::marker::PhantomData<AnvRef<'cx, HostCounter>>,
+}
+
+struct String<'cx>(AnvRef<'cx, HostCounter>);
+
+#[derive(AnvyxRef)]
+pub struct MisleadingName<'cx> {
+    edge: String<'cx>,
 }
 
 unsafe impl AnvyxRefExport for HostNode<'_> {
@@ -67,6 +74,7 @@ fn ref_descriptor_contains_exported_fields_and_name() {
 fn derived_ref_marks_heap_edge_fields() {
     assert!(std::hint::black_box(EdgeHolder::OWNS_ANVYX_HEAP_EDGES));
     assert!(std::hint::black_box(WrappedEdge::OWNS_ANVYX_HEAP_EDGES));
+    assert!(std::hint::black_box(MisleadingName::OWNS_ANVYX_HEAP_EDGES));
 }
 
 #[test]

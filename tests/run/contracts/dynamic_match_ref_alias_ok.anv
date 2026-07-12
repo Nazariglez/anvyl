@@ -1,15 +1,32 @@
 // @mode: run
 // @expect: success
-// @skip: dynamic match execution is not lowered to the Rust backend yet
-// @match: 2
+// @match-begin
+// 2
+// 4
+// 9
+// @match-end
 
 contract Updatable {
     fn update(ref self);
+    fn value(self) -> int;
 }
 
 struct Enemy {
     hp: int,
     fn update(ref self) {}
+    fn value(self) -> int { self.hp }
+}
+
+struct Bullet {
+    speed: int,
+    fn update(ref self) { self.speed += 1; }
+    fn value(self) -> int { self.speed }
+}
+
+struct Prop {
+    score: int,
+    fn update(ref self) {}
+    fn value(self) -> int { self.score }
 }
 
 fn main() {
@@ -20,6 +37,22 @@ fn main() {
     };
     match actor as? {
         Enemy(enemy) => println(enemy.hp),
+        other => println("other"),
+    };
+
+    var bullet: dyn Updatable = Bullet { speed: 3 };
+    match ref bullet as? {
+        Enemy(enemy) => enemy.hp = 0,
         other => other.update(),
+    };
+    match bullet as? {
+        Bullet(value) => println(value.speed),
+        other => println("other"),
+    };
+
+    let prop: dyn Updatable = Prop { score: 9 };
+    match prop as? {
+        Enemy(enemy) => println(enemy.hp),
+        other => println(other.value()),
     };
 }

@@ -2,12 +2,17 @@
 // @expect: success
 // @match: 99
 
-import pkg:host.host { make_surface, trigger_draw, close_draw };
+import pkg:host.host { Surface, make_surface, trigger_draw, close_draw };
+
+contract DrawSource {
+    fn on_draw(self, callback: escaping fn());
+}
 
 fn main() {
     let surface = make_surface(99);
-    surface.on_draw(|| {
-        println(surface.id());
+    let dynamic: dyn DrawSource = surface;
+    dynamic.on_draw(|| {
+        println(99);
     });
     trigger_draw();
     close_draw();

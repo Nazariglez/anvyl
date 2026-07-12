@@ -6,8 +6,8 @@ use anvyx_frontend::air::{
 use super::{
     mut_place::direct_native_mut_borrow_supported,
     rep_policy::{
-        AirRustRepPolicy, RustMaterialGap, RustMaterialIntent, RustMaterialSource,
-        RustMaterialization,
+        RustMaterialGap, RustMaterialIntent, RustMaterialSource, RustMaterialization,
+        RustRepresentationPlan,
     },
 };
 
@@ -438,6 +438,10 @@ impl<'a> PlaceAccessCx<'a> {
                 local,
                 source_mut_param: self.local_is_source_mut_place_param(function, local),
             },
+            PlaceRoot::DynBorrowParam(id) => PlaceAccessRoot::Local {
+                local: self.program.dyn_borrow_params[id.index()].source,
+                source_mut_param: true,
+            },
             PlaceRoot::CaptureCell(cell) => PlaceAccessRoot::CaptureCell(cell),
             PlaceRoot::ScopedBorrow(borrow) => PlaceAccessRoot::ScopedPlaceCell(borrow),
             PlaceRoot::Global(global) => PlaceAccessRoot::Global(global),
@@ -703,8 +707,8 @@ impl<'a> PlaceAccessCx<'a> {
         })
     }
 
-    fn policy(&self) -> AirRustRepPolicy<'_> {
-        AirRustRepPolicy::new(self.program, self.classes)
+    fn policy(&self) -> RustRepresentationPlan<'_> {
+        RustRepresentationPlan::new(self.program, self.classes)
     }
 }
 
@@ -812,7 +816,7 @@ fn dataref_mut_place_payload_supported(
     ty: TypeId,
 ) -> bool {
     !matches!(
-        AirRustRepPolicy::new(program, classes).materialization_for(
+        RustRepresentationPlan::new(program, classes).materialization_for(
             ty,
             RustMaterialSource::DataRefMutPlace,
             RustMaterialIntent::MutPlacePayload,

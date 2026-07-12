@@ -1,0 +1,11 @@
+// @helper
+
+import shared { Actor, Drawable };
+
+extend Actor {
+    fn draw(self) {}
+}
+
+pub fn make_left() -> dyn Drawable {
+    Actor { score: 1 }
+}

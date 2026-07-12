@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+// @match: left
+
+import left { run };
+import right { touch };
+
+fn main() {
+    run();
+}

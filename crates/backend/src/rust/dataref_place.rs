@@ -1,7 +1,7 @@
 use super::rir::{
-    RirCallArg, RirCollectionAccess, RirDataRefId, RirFieldId, RirFunction, RirMutPlaceAccess,
-    RirMutPlaceArg, RirOptionMatch, RirOptionSubject, RirPlaceModel, RirProgram, RirProjection,
-    RirRValue, RirStmt, RirStructuredBlock, RirTypeId,
+    RirCallArg, RirChild, RirCollectionAccess, RirDataRefId, RirDynBorrow, RirDynBorrowSource,
+    RirFieldId, RirMutPlaceAccess, RirMutPlaceArg, RirPlaceModel, RirProgram, RirProjection,
+    RirStructuredBlock, RirTypeId,
 };
 
 impl DataRefPlaceDescriptor {
@@ -31,7 +31,7 @@ impl DataRefPlaceDescriptors {
     pub(super) fn build(program: &RirProgram) -> Self {
         let mut descriptors = Self::default();
         for function in &program.functions {
-            descriptors.collect_block(program, function, &function.body);
+            descriptors.collect_block(program, &function.body);
         }
         descriptors
     }
@@ -40,108 +40,41 @@ impl DataRefPlaceDescriptors {
         &self.descriptors
     }
 
-    fn collect_block(
-        &mut self,
-        program: &RirProgram,
-        function: &RirFunction,
-        block: &RirStructuredBlock,
-    ) {
+    fn collect_block(&mut self, program: &RirProgram, block: &RirStructuredBlock) {
         for stmt in &block.stmts {
-            self.collect_stmt(program, function, stmt);
-        }
-    }
-
-    fn collect_stmt(&mut self, program: &RirProgram, function: &RirFunction, stmt: &RirStmt) {
-        match stmt {
-            RirStmt::Init { value, .. }
-            | RirStmt::Assign { value, .. }
-            | RirStmt::GlobalSetRoot { value, .. }
-            | RirStmt::GlobalUpdateRoot { value, .. }
-            | RirStmt::Eval(value)
-            | RirStmt::CellInit { value, .. }
-            | RirStmt::CellSet { value, .. }
-            | RirStmt::ScopedPlaceCellSet { value, .. } => {
-                self.collect_rvalue(program, value);
-            }
-            RirStmt::MutPlaceSet { place, value } => {
-                self.collect_mut_place_arg(program, place);
-                self.collect_rvalue(program, value);
-            }
-            RirStmt::SequenceSlotSet { collection, .. } => {
-                self.collect_collection_access(program, collection);
-            }
-            RirStmt::MapValueSet { map, .. } => self.collect_collection_access(program, map),
-            RirStmt::GlobalEnsure { .. }
-            | RirStmt::ScopedPlaceCellInit { .. }
-            | RirStmt::DataRefSet { .. } => {}
-            RirStmt::If(branch) => {
-                self.collect_block(program, function, &branch.then_block);
-                if let Some(block) = &branch.else_block {
-                    self.collect_block(program, function, block);
+            stmt.for_each_child(&mut |child| match child {
+                RirChild::MutPlace { place, .. } => self.collect_mut_place_arg(program, place),
+                RirChild::Collection { collection, .. } => {
+                    self.collect_collection_access(program, collection);
                 }
-            }
-            RirStmt::Loop(loop_) => self.collect_block(program, function, &loop_.body),
-            RirStmt::RangeFor(range) => self.collect_block(program, function, &range.body),
-            RirStmt::CollectionFor(for_) => self.collect_block(program, function, &for_.body),
-            RirStmt::CollectionLoanScope(scope) => {
-                self.collect_block(program, function, &scope.body);
-            }
-            RirStmt::CollectionSlotScope(block) => self.collect_block(program, function, block),
-            RirStmt::PatternMatch(match_) => {
-                for arm in &match_.arms {
-                    self.collect_block(program, function, &arm.block);
-                }
-            }
-            RirStmt::OptionMatch(match_) => self.collect_option_match(program, function, match_),
-            RirStmt::MapEntryMatch(match_) => {
-                self.collect_mut_place_arg(program, &match_.map);
-                self.collect_block(program, function, &match_.some_block);
-                self.collect_block(program, function, &match_.none_block);
-            }
-        }
-    }
-
-    fn collect_option_match(
-        &mut self,
-        program: &RirProgram,
-        function: &RirFunction,
-        match_: &RirOptionMatch,
-    ) {
-        if let RirOptionSubject::MutPlace(arg) = &match_.subject {
-            self.collect_mut_place_arg(program, arg);
-        }
-        self.collect_block(program, function, &match_.some_block);
-        self.collect_block(program, function, &match_.none_block);
-    }
-
-    fn collect_rvalue(&mut self, program: &RirProgram, value: &RirRValue) {
-        match value {
-            RirRValue::MutPlaceGetCopy { place, .. } => self.collect_mut_place_arg(program, place),
-            RirRValue::Call { args, .. } => {
-                for arg in args {
-                    if let RirCallArg::MutPlace(arg) = arg {
-                        self.collect_mut_place_arg(program, arg);
-                    }
-                }
-            }
-            RirRValue::CollectionLen { source } => self.collect_collection_access(program, source),
-            RirRValue::SequenceSlotAt { collection, .. } => {
-                self.collect_collection_access(program, collection);
-            }
-            RirRValue::ListPush { list, .. } => self.collect_collection_access(program, list),
-            RirRValue::MapGet { map, .. }
-            | RirRValue::MapInsert { map, .. }
-            | RirRValue::MapRemove { map, .. }
-            | RirRValue::MapEntryAt { map, .. }
-            | RirRValue::MapKeyAt { map, .. }
-            | RirRValue::MapValueAt { map, .. } => self.collect_collection_access(program, map),
-            _ => {}
+                RirChild::CallArg(arg) => match arg {
+                    RirCallArg::MutPlace(place) => self.collect_mut_place_arg(program, place),
+                    RirCallArg::DynBorrow(borrow) => self.collect_dyn_borrow(program, borrow),
+                    _ => {}
+                },
+                RirChild::Block(block) => self.collect_block(program, block),
+                RirChild::Operand { .. }
+                | RirChild::Place { .. }
+                | RirChild::CaptureArg(_)
+                | RirChild::LocalRead(_)
+                | RirChild::Tail(_) => {}
+            });
         }
     }
 
     fn collect_collection_access(&mut self, program: &RirProgram, access: &RirCollectionAccess) {
         if let RirCollectionAccess::MutPlace(arg) = access {
             self.collect_mut_place_arg(program, arg);
+        }
+    }
+
+    fn collect_dyn_borrow(&mut self, program: &RirProgram, borrow: &RirDynBorrow) {
+        match &borrow.source {
+            RirDynBorrowSource::Concrete { place, .. }
+            | RirDynBorrowSource::Owned { place, .. } => {
+                self.collect_mut_place_arg(program, place);
+            }
+            RirDynBorrowSource::Borrowed { .. } | RirDynBorrowSource::Reborrowed { .. } => {}
         }
     }
 

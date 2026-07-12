@@ -1,0 +1,11 @@
+// @helper
+
+pub contract A {
+    fn a(self);
+}
+
+pub contract B {
+    fn b(self);
+}
+
+pub struct Actor {}

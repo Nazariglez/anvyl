@@ -1,0 +1,36 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// enemy
+// 2
+// fallback
+// 7
+// @match-end
+
+contract Actor {
+    fn value(self) -> int;
+}
+
+struct Enemy {
+    score: int,
+    fn value(self) -> int { self.score }
+}
+
+struct Prop {
+    score: int,
+    fn value(self) -> int { self.score }
+}
+
+fn make_enemy() -> dyn Actor { Enemy { score: 2 } }
+fn make_prop() -> dyn Actor { Prop { score: 7 } }
+
+fn main() {
+    match make_enemy() as? {
+        Enemy(enemy) => { println("enemy"); println(enemy.score); },
+        other => { println("fallback"); println(other.value()); },
+    };
+    match make_prop() as? {
+        Enemy(enemy) => { println("enemy"); println(enemy.score); },
+        other => { println("fallback"); println(other.value()); },
+    };
+}

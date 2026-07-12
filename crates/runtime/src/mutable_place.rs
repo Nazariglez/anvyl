@@ -12,6 +12,7 @@ pub enum MutPlace<'place, 'cx, T> {
     HeapCell(Handle<'cx, LambdaCell<T>>),
     Global(GlobalPlace<'place, 'cx, T>),
     Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'place>),
+    ProjectedBorrow(&'place dyn ProjectedPlaceObject<'cx, T>),
     ScopedCell(&'place ScopedMutPlaceCell<'place, 'cx, T>),
 }
 
@@ -35,9 +36,11 @@ pub struct ProjectedPlace<'place, 'cx, R, T> {
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
-pub trait ProjectedPlaceObject<'cx, T> {
-    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a>;
-
+/// # Safety
+///
+/// Implementations must call the leaf callback at most once, exactly once on success, and must not
+/// reenter Anvyx while a projected reference is live.
+pub unsafe trait ProjectedPlaceObject<'cx, T> {
     fn access(
         &self,
         ctx: &mut Ctx<'cx, '_>,
@@ -51,7 +54,11 @@ pub trait ProjectedPlaceObject<'cx, T> {
     ) -> Result<(), RuntimeError>;
 }
 
-pub trait ProjectionOps<'cx, R, T> {
+/// # Safety
+///
+/// Implementations must call the leaf callback at most once, exactly once on success, propagate its
+/// failure, and must not reenter Anvyx while `root` or a projected reference is live.
+pub unsafe trait ProjectionOps<'cx, R, T> {
     fn access(
         &self,
         ctx: &mut Ctx<'cx, '_>,
@@ -86,7 +93,11 @@ impl<K> MapValueOps<K> {
     }
 }
 
-pub trait DataRefPlaceOps<'cx, T> {
+/// # Safety
+///
+/// Implementations must call the leaf callback at most once, exactly once on success, propagate its
+/// failure, and must not reenter Anvyx while a projected reference is live.
+pub unsafe trait DataRefPlaceOps<'cx, T> {
     fn access(
         &self,
         ctx: &mut Ctx<'cx, '_>,
@@ -115,6 +126,7 @@ enum ScopedMutPlaceRoot<'source, 'cx, T> {
     HeapCell(Handle<'cx, LambdaCell<T>>),
     Global(GlobalPlace<'source, 'cx, T>),
     Projected(Box<dyn ProjectedPlaceObject<'cx, T> + 'source>),
+    ProjectedBorrow(&'source dyn ProjectedPlaceObject<'cx, T>),
     ScopedCell(&'source ScopedMutPlaceCell<'source, 'cx, T>),
 }
 
@@ -140,18 +152,15 @@ impl<'place, 'cx, R: 'cx, T: 'cx> ProjectedPlace<'place, 'cx, R, T> {
     }
 }
 
-impl<'cx, R: 'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for ProjectedPlace<'_, 'cx, R, T> {
-    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a> {
-        let root = unsafe { &mut *self.root.get() }.reborrow();
-        Box::new(ProjectedPlace::new(root, self.ops))
-    }
-
+unsafe impl<'cx, R: 'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for ProjectedPlace<'_, 'cx, R, T> {
     fn access(
         &self,
         ctx: &mut Ctx<'cx, '_>,
         f: &mut dyn FnMut(&T) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        unsafe { &*self.root.get() }.access_with_ctx(ctx, |ctx, root| self.ops.access(ctx, root, f))
+        unsafe {
+            (&*self.root.get()).access_with_ctx(ctx, |ctx, root| self.ops.access(ctx, root, f))
+        }
     }
 
     fn mutate(
@@ -159,8 +168,9 @@ impl<'cx, R: 'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for ProjectedPlace<'_, 'c
         ctx: &mut Ctx<'cx, '_>,
         f: &mut dyn FnMut(&mut T) -> Result<(), RuntimeError>,
     ) -> Result<(), RuntimeError> {
-        unsafe { &mut *self.root.get() }
-            .mutate_with_ctx(ctx, |ctx, root| self.ops.mutate(ctx, root, f))
+        unsafe {
+            (&mut *self.root.get()).mutate_with_ctx(ctx, |ctx, root| self.ops.mutate(ctx, root, f))
+        }
     }
 }
 
@@ -194,7 +204,7 @@ fn projected_mutate<'cx, T: 'cx, R>(
     Ok(out.expect("projected place mutation did not invoke callback"))
 }
 
-impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
+unsafe impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
     fn access(
         &self,
         _ctx: &mut Ctx<'cx, '_>,
@@ -220,7 +230,7 @@ impl<'cx, T: 'cx> ProjectionOps<'cx, Option<T>, T> for OptionalPayloadOps<T> {
     }
 }
 
-impl<'cx, K, V> ProjectionOps<'cx, AnvMap<'cx, K, V>, V> for MapValueOps<K>
+unsafe impl<'cx, K, V> ProjectionOps<'cx, AnvMap<'cx, K, V>, V> for MapValueOps<K>
 where
     K: Eq + Hash + 'cx,
     V: 'cx,
@@ -254,11 +264,7 @@ impl<'ops, 'cx, T: 'cx> DataRefPlace<'ops, 'cx, T> {
     }
 }
 
-impl<'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for DataRefPlace<'_, 'cx, T> {
-    fn reborrow<'a>(&'a self) -> Box<dyn ProjectedPlaceObject<'cx, T> + 'a> {
-        Box::new(Self::new(self.object.clone(), self.ops))
-    }
-
+unsafe impl<'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for DataRefPlace<'_, 'cx, T> {
     fn access(
         &self,
         ctx: &mut Ctx<'cx, '_>,
@@ -293,6 +299,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
             | Self::HeapCell(_)
             | Self::Global(_)
             | Self::Projected(_)
+            | Self::ProjectedBorrow(_)
             | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
@@ -317,6 +324,7 @@ impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
             | Self::HeapCell(_)
             | Self::Global(_)
             | Self::Projected(_)
+            | Self::ProjectedBorrow(_)
             | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
@@ -347,6 +355,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
             | Self::HeapCell(_)
             | Self::Global(_)
             | Self::Projected(_)
+            | Self::ProjectedBorrow(_)
             | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
@@ -374,6 +383,7 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
             | Self::HeapCell(_)
             | Self::Global(_)
             | Self::Projected(_)
+            | Self::ProjectedBorrow(_)
             | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
         }
     }
@@ -408,24 +418,6 @@ impl<'cx, T: 'cx> GlobalPlace<'_, 'cx, T> {
     ) -> Result<R, RuntimeError> {
         let mut value = self.slot.write(|| (self.init)(ctx))?;
         f(&mut value)
-    }
-
-    fn access_with_ctx<'rt, R>(
-        &self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError> {
-        let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
-        self.access(ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
-    }
-
-    fn mutate_with_ctx<'rt, R>(
-        &self,
-        ctx: &mut Ctx<'cx, 'rt>,
-        f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError> {
-        let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
-        self.mutate(ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
     }
 }
 
@@ -475,12 +467,16 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::StackCell(cell, _) => MutPlace::stack_cell(cell),
             Self::HeapCell(cell) => MutPlace::heap_cell(cell.clone()),
             Self::Global(global) => MutPlace::Global(*global),
-            Self::Projected(place) => MutPlace::Projected(place.reborrow()),
+            Self::Projected(place) => MutPlace::ProjectedBorrow(&**place),
+            Self::ProjectedBorrow(place) => MutPlace::ProjectedBorrow(*place),
             Self::ScopedCell(cell) => MutPlace::scoped_cell(cell),
         }
     }
 
-    pub fn access<'rt, R>(
+    /// # Safety
+    ///
+    /// The callback must not reenter Anvyx while the place reference is live.
+    pub unsafe fn access<'rt, R>(
         &self,
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&T) -> Result<R, RuntimeError>,
@@ -491,11 +487,15 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.access(f)),
             Self::Global(global) => global.access(ctx, f),
             Self::Projected(place) => projected_access(&**place, ctx, f),
+            Self::ProjectedBorrow(place) => projected_access(*place, ctx, f),
             Self::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
 
-    pub fn mutate<'rt, R>(
+    /// # Safety
+    ///
+    /// The callback must not reenter Anvyx while the place reference is live.
+    pub unsafe fn mutate<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
@@ -506,65 +506,52 @@ impl<'place, 'cx, T: 'cx> MutPlace<'place, 'cx, T> {
             Self::HeapCell(cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
             Self::Global(global) => global.mutate(ctx, f),
             Self::Projected(place) => projected_mutate(&**place, ctx, f),
+            Self::ProjectedBorrow(place) => projected_mutate(*place, ctx, f),
             Self::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
 
-    pub fn access_with_ctx<'rt, R>(
+    /// # Safety
+    ///
+    /// The callback may use the context only for leaf operations that cannot reenter Anvyx.
+    pub unsafe fn access_with_ctx<'rt, R>(
         &self,
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&mut Ctx<'cx, 'rt>, &T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
-        match self {
-            Self::Local(value, _) => f(ctx, unsafe { &**value }),
-            Self::StackCell(cell, _) => cell.access(|value| f(ctx, value)),
-            Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
-                cell.access(|value| f(unsafe { &mut *ctx_ptr }, value))
-            }),
-            Self::Global(global) => global.access_with_ctx(ctx, f),
-            Self::Projected(place) => {
-                projected_access(&**place, ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
-            }
-            Self::ScopedCell(cell) => cell.access(ctx, |value| f(unsafe { &mut *ctx_ptr }, value)),
-        }
+        unsafe { self.access(ctx, |value| f(&mut *ctx_ptr, value)) }
     }
 
-    pub fn mutate_with_ctx<'rt, R>(
+    /// # Safety
+    ///
+    /// The callback may use the context only for leaf operations that cannot reenter Anvyx.
+    pub unsafe fn mutate_with_ctx<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(&mut Ctx<'cx, 'rt>, &mut T) -> Result<R, RuntimeError>,
     ) -> Result<R, RuntimeError> {
         let ctx_ptr = std::ptr::from_mut::<Ctx<'cx, 'rt>>(ctx);
-        match self {
-            Self::Local(value, _) => f(ctx, unsafe { &mut **value }),
-            Self::StackCell(cell, _) => cell.mutate(|value| f(ctx, value)),
-            Self::HeapCell(cell) => heap_access(ctx, cell, |cell| {
-                cell.mutate(|value| f(unsafe { &mut *ctx_ptr }, value))
-            }),
-            Self::Global(global) => global.mutate_with_ctx(ctx, f),
-            Self::Projected(place) => {
-                projected_mutate(&**place, ctx, |value| f(unsafe { &mut *ctx_ptr }, value))
-            }
-            Self::ScopedCell(cell) => cell.mutate(ctx, |value| f(unsafe { &mut *ctx_ptr }, value)),
-        }
+        unsafe { self.mutate(ctx, |value| f(&mut *ctx_ptr, value)) }
     }
 
     pub fn set<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>, value: T) -> Result<(), RuntimeError> {
-        self.mutate(ctx, |slot| {
-            *slot = value;
-            Ok(())
-        })
+        unsafe {
+            self.mutate(ctx, |slot| {
+                *slot = value;
+                Ok(())
+            })
+        }
     }
 
     pub fn replace<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>, value: T) -> Result<T, RuntimeError> {
-        self.mutate(ctx, |slot| Ok(std::mem::replace(slot, value)))
+        unsafe { self.mutate(ctx, |slot| Ok(std::mem::replace(slot, value))) }
     }
 }
 
 impl<'cx, T: Copy + 'cx> MutPlace<'_, 'cx, T> {
     pub fn get_copy<'rt>(&self, ctx: &mut Ctx<'cx, 'rt>) -> Result<T, RuntimeError> {
-        self.access(ctx, |value| Ok(*value))
+        unsafe { self.access(ctx, |value| Ok(*value)) }
     }
 
     pub fn update_copy<'rt>(
@@ -572,10 +559,12 @@ impl<'cx, T: Copy + 'cx> MutPlace<'_, 'cx, T> {
         ctx: &mut Ctx<'cx, 'rt>,
         f: impl FnOnce(T) -> T,
     ) -> Result<(), RuntimeError> {
-        self.mutate(ctx, |value| {
-            *value = f(*value);
-            Ok(())
-        })
+        unsafe {
+            self.mutate(ctx, |value| {
+                *value = f(*value);
+                Ok(())
+            })
+        }
     }
 }
 
@@ -606,6 +595,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.access(f)),
             ScopedMutPlaceRoot::Global(global) => global.access(ctx, f),
             ScopedMutPlaceRoot::Projected(ref place) => projected_access(&**place, ctx, f),
+            ScopedMutPlaceRoot::ProjectedBorrow(place) => projected_access(place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.access(ctx, f),
         }
     }
@@ -623,6 +613,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceCell<'source, 'cx, T> {
             ScopedMutPlaceRoot::HeapCell(ref cell) => heap_access(ctx, cell, |cell| cell.mutate(f)),
             ScopedMutPlaceRoot::Global(global) => global.mutate(ctx, f),
             ScopedMutPlaceRoot::Projected(ref place) => projected_mutate(&**place, ctx, f),
+            ScopedMutPlaceRoot::ProjectedBorrow(place) => projected_mutate(place, ctx, f),
             ScopedMutPlaceRoot::ScopedCell(cell) => cell.mutate(ctx, f),
         }
     }
@@ -647,6 +638,7 @@ impl<'source, 'cx, T: 'cx> ScopedMutPlaceRoot<'source, 'cx, T> {
             MutPlace::HeapCell(cell) => Self::HeapCell(cell),
             MutPlace::Global(global) => Self::Global(global),
             MutPlace::Projected(place) => Self::Projected(place),
+            MutPlace::ProjectedBorrow(place) => Self::ProjectedBorrow(place),
             MutPlace::ScopedCell(cell) => Self::ScopedCell(cell),
         }
     }
@@ -660,7 +652,7 @@ impl<'cx, T: Copy + 'cx> ScopedMutPlaceCell<'_, 'cx, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, mem::ManuallyDrop};
+    use std::mem::ManuallyDrop;
 
     use crate::{
         AnvList, AnvMap, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType,
@@ -722,10 +714,13 @@ mod tests {
             let mut place = MutPlace::global(&slot, &init);
             let guard = slot.read(|| Ok(1)).unwrap();
 
-            let err = place.mutate(&mut ctx, |value| {
-                *value = 2;
-                Ok(())
-            }).expect_err("active read guard should block mutation");
+            let err = unsafe {
+                place.mutate(&mut ctx, |value| {
+                    *value = 2;
+                    Ok(())
+                })
+            }
+            .expect_err("active read guard should block mutation");
             assert!(err.to_string().contains("active borrow"));
             drop(guard);
         );
@@ -758,48 +753,12 @@ mod tests {
         AnvMap::from_entries(ctx, ty, entries)
     }
 
-    struct Pair {
-        x: i64,
-        y: i64,
-    }
-
-    struct PairYOps {
-        access_calls: Cell<usize>,
-        mutate_calls: Cell<usize>,
-    }
-
     struct ListElemOps {
         index: i64,
         version: u64,
     }
 
-    struct SliceElemOps {
-        index: i64,
-    }
-
-    impl ProjectionOps<'_, Pair, i64> for PairYOps {
-        fn access(
-            &self,
-            _ctx: &mut Ctx<'_, '_>,
-            root: &Pair,
-            f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
-        ) -> Result<(), RuntimeError> {
-            self.access_calls.set(self.access_calls.get() + 1);
-            f(&root.y)
-        }
-
-        fn mutate(
-            &self,
-            _ctx: &mut Ctx<'_, '_>,
-            root: &mut Pair,
-            f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
-        ) -> Result<(), RuntimeError> {
-            self.mutate_calls.set(self.mutate_calls.get() + 1);
-            f(&mut root.y)
-        }
-    }
-
-    impl<'cx> ProjectionOps<'cx, AnvList<'cx, i64>, i64> for ListElemOps {
+    unsafe impl<'cx> ProjectionOps<'cx, AnvList<'cx, i64>, i64> for ListElemOps {
         fn access(
             &self,
             ctx: &mut Ctx<'cx, '_>,
@@ -807,7 +766,7 @@ mod tests {
             f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
         ) -> Result<(), RuntimeError> {
             let index = crate::checked_index_result(self.index, root.len(), "list")?;
-            root.with_elem_shared_short(ctx, index, self.version, f)
+            unsafe { root.with_elem_shared_short(ctx, index, self.version, f) }
         }
 
         fn mutate(
@@ -817,28 +776,8 @@ mod tests {
             f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
         ) -> Result<(), RuntimeError> {
             let index = crate::checked_index_result(self.index, root.len(), "list")?;
-            root.with_elem_owned_mut_ctx_short(ctx, index, self.version, |_, value| f(value))
-        }
-    }
-
-    impl<'cx> ProjectionOps<'cx, AnvSlice<'cx, i64>, i64> for SliceElemOps {
-        fn access(
-            &self,
-            ctx: &mut Ctx<'cx, '_>,
-            root: &AnvSlice<'cx, i64>,
-            f: &mut dyn FnMut(&i64) -> Result<(), RuntimeError>,
-        ) -> Result<(), RuntimeError> {
-            let value = root.elem_at_shared(ctx, self.index)?;
-            f(&value)
-        }
-
-        fn mutate(
-            &self,
-            ctx: &mut Ctx<'cx, '_>,
-            root: &mut AnvSlice<'cx, i64>,
-            f: &mut dyn FnMut(&mut i64) -> Result<(), RuntimeError>,
-        ) -> Result<(), RuntimeError> {
-            root.with_elem_owned_mut_ctx_short(ctx, self.index, |_, value| f(value))
+            // SAFETY: Projection callbacks are leaf operations and cannot reenter the list.
+            unsafe { root.with_elem_mut_leaf(ctx, index, self.version, f) }
         }
     }
 
@@ -868,10 +807,15 @@ mod tests {
         };
         let mut place = MutPlace::projected(MutPlace::local(&mut list), &ops);
 
-        let err = place
-            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
-            .unwrap_err();
+        let err = unsafe {
+            place.mutate(&mut ctx, |value| {
+                *value = 4;
+                Err::<(), _>(RuntimeError::new("early"))
+            })
+        }
+        .unwrap_err();
         assert_eq!(err.message(), "early");
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 4);
         place.set(&mut ctx, 5).unwrap();
         drop(place);
         assert_eq!(list.elem_at_shared(&ctx, 1, list.structural_version()).unwrap(), 5);
@@ -897,6 +841,31 @@ mod tests {
 
         assert!(place.get_copy(&mut ctx).is_err());
         assert!(place.set(&mut ctx, 4).is_err());
+            );
+    }
+
+    #[test]
+    fn projected_map_callback_error_preserves_mutation() {
+        with_ctx!(ctx;
+        let mut map = map(&mut ctx, [("a", 1_i64)]);
+        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let ops = MapValueOps::new("a", &guard);
+        {
+            let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
+            let err = unsafe {
+                place.mutate(&mut ctx, |value| {
+                    *value = 4;
+                    Err::<(), _>(RuntimeError::new("early"))
+                })
+            }
+            .unwrap_err();
+
+            assert_eq!(err.message(), "early");
+            assert_eq!(place.get_copy(&mut ctx).unwrap(), 4);
+            place.set(&mut ctx, 5).unwrap();
+        }
+        drop(guard);
+        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(5));
             );
     }
 
@@ -953,9 +922,10 @@ mod tests {
         with_ctx!(ctx;
         let mut value = 1;
         let mut place = MutPlace::local(&mut value);
-        let err = place
-            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
-            .unwrap_err();
+        let err = unsafe {
+            place.mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
+        }
+        .unwrap_err();
 
         assert_eq!(err.message(), "early");
         place.set(&mut ctx, 2).unwrap();
@@ -1002,7 +972,7 @@ mod tests {
         ty: HeapType<'cx, Storage<T>>,
     }
 
-    impl<'cx, T: 'cx> DataRefPlaceOps<'cx, T> for FieldOps<'cx, T> {
+    unsafe impl<'cx, T: 'cx> DataRefPlaceOps<'cx, T> for FieldOps<'cx, T> {
         fn access(
             &self,
             ctx: &mut Ctx<'cx, '_>,
@@ -1034,6 +1004,23 @@ mod tests {
     unsafe fn copy_erased_to_current_heap<'cx>(erased: &ErasedHandle<'_>) -> ErasedHandle<'cx> {
         // SAFETY: this is only for wrong-heap diagnostics. The copied handle is dropped exactly once.
         unsafe { std::mem::transmute_copy(erased) }
+    }
+
+    #[test]
+    fn dataref_descriptor_observes_intervening_alias_write() {
+        with_ctx!(ctx;
+        let ty = ctx.heap().register_untracked::<Storage<i64>>();
+        let object = ctx.heap().alloc(ty, Storage { field: 1 });
+        let erased = ctx.heap().erase(&object).unwrap();
+        let ops = FieldOps { ty };
+        let mut place = MutPlace::dataref(erased, &ops);
+
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 1);
+        ctx.heap().with_mut(&object, |storage| storage.field = 4);
+        assert_eq!(place.get_copy(&mut ctx).unwrap(), 4);
+        place.set(&mut ctx, 5).unwrap();
+        assert_eq!(ctx.heap().with(&object, |storage| storage.field), 5);
+            );
     }
 
     #[test]
@@ -1120,9 +1107,10 @@ mod tests {
         let erased = ctx.heap().erase(&object).unwrap();
         let ops = FieldOps { ty };
         let mut place = MutPlace::dataref(erased, &ops);
-        let err = place
-            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
-            .unwrap_err();
+        let err = unsafe {
+            place.mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
+        }
+        .unwrap_err();
 
         assert_eq!(err.message(), "early");
         place.set(&mut ctx, 2).unwrap();
@@ -1136,9 +1124,10 @@ mod tests {
         let cell_ty = ctx.heap().register_untracked::<LambdaCell<i64>>();
         let cell = ctx.heap().alloc(cell_ty, LambdaCell::new(1));
         let mut place = MutPlace::heap_cell(cell.clone());
-        let err = place
-            .mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
-            .unwrap_err();
+        let err = unsafe {
+            place.mutate(&mut ctx, |_| Err::<(), _>(RuntimeError::new("early")))
+        }
+        .unwrap_err();
 
         assert_eq!(err.message(), "early");
         place.set(&mut ctx, 2).unwrap();
@@ -1201,15 +1190,6 @@ mod tests {
             err.message(),
             "slice view over non-local mutable collection parameter is unsupported"
         );
-    }
-
-    fn set_slice_second<'cx>(ctx: &mut Ctx<'cx, '_>, slice: &mut AnvSlice<'cx, i64>) {
-        slice
-            .with_elem_owned_mut_ctx_short(ctx, 1, |_, value| {
-                *value = 9;
-                Ok(())
-            })
-            .unwrap();
     }
 
     #[test]

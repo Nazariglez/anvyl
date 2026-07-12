@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+contract Actor {
+    fn value(self) -> int;
+    fn update(ref self);
+}
+
+struct Entity {
+    score: int,
+
+    fn value(self) -> int { self.score }
+    fn update(ref self) { self.score += 1; }
+}
+
+struct Enemy {
+    @as embed entity: Entity,
+}
+
+fn main() {
+    var actor: dyn Actor = Enemy { entity: Entity { score: 1 } };
+    println(actor.value());
+    actor.update();
+    println(actor.value());
+}

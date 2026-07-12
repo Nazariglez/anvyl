@@ -1,0 +1,47 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 5
+// @match-end
+
+contract A {
+    fn bump(ref self);
+}
+
+contract B {
+    fn other(self) -> int;
+}
+
+struct Both {
+    points: int,
+
+    fn bump(ref self) { self.points += 1; }
+    fn other(self) -> int { self.points }
+}
+
+fn narrow(ref actor: dyn A) {
+    actor.bump();
+}
+
+fn match_narrow(ref actor: dyn A) {
+    match ref actor as? {
+        Both(value) => value.points += 1,
+        other => other.bump(),
+    };
+}
+
+fn forward(ref actor: dyn A + B) {
+    narrow(actor);
+    match_narrow(actor);
+}
+
+fn main() {
+    var actor = Both { points: 1 };
+    forward(actor);
+    println(actor.points);
+
+    var owned: dyn A + B = Both { points: 3 };
+    forward(owned);
+    println(owned.other());
+}

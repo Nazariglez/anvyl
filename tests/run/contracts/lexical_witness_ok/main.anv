@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// left
+// right
+// left
+// @match-end
+
+import left { call_left };
+import right { call_right };
+import shared { Actor };
+
+fn main() {
+    call_left(Actor {});
+    call_right(Actor {});
+    call_left(Actor {});
+}

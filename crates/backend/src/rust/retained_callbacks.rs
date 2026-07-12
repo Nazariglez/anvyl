@@ -1,5 +1,5 @@
 use super::{
-    rep_policy::{RustRepPolicy, RustTracePlan},
+    rep_policy::{RirRustRepPolicy, RustTracePlan},
     rir::{RirLambdaSig, RirLambdaSigId, RirProgram},
     runtime_owner::RuntimeOwnerEmit,
     syntax::comma,
@@ -26,7 +26,7 @@ impl RetainedCallbackSigPlan {
     }
 
     pub(super) fn args_ty(self, program: &RirProgram) -> String {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         match self.sig(program).params.as_slice() {
             [] => "()".to_string(),
             [param] => format!(
@@ -45,7 +45,7 @@ impl RetainedCallbackSigPlan {
     }
 
     pub(super) fn ret_ty(self, program: &RirProgram) -> String {
-        RustRepPolicy::new(program).callable_ret_ty(self.sig(program).ret)
+        RirRustRepPolicy::new(program).callable_ret_ty(self.sig(program).ret)
     }
 
     pub(super) fn lambda_fallible(self, program: &RirProgram, fallible_functions: &[bool]) -> bool {
@@ -122,7 +122,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         if self.record_sigs.is_empty() {
             return;
         }
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         for sig in self.record_sigs {
             let plan = RetainedCallbackSigPlan::new(*sig);
             let record = plan.record_symbol();
@@ -390,7 +390,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         self.program
             .globals
             .iter()
-            .any(|global| RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty))
+            .any(|global| RirRustRepPolicy::new(self.program).type_owns_heap_edges(global.ty))
     }
 
     fn lambda_call_result(&self, plan: RetainedCallbackSigPlan) -> String {

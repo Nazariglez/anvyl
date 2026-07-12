@@ -2,6 +2,7 @@ mod analysis;
 pub mod cargo_job;
 mod dataref_place;
 pub mod emit;
+mod exact_witness;
 mod mut_place;
 mod native;
 mod native_call;
@@ -42,14 +43,16 @@ use self::{
         PlaceAccessPlan, PlaceAccessRoot, PlaceProjection, PlaceProjectionKind,
     },
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
-    rep_policy::{AirRustRepPolicy, RustRepPolicy},
+    rep_policy::{RirRustRepPolicy, RustRepresentationPlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
         RirCellStorage, RirCollectionAccess, RirCollectionFor, RirCollectionLoanMode,
         RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
         RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
-        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr,
-        RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
+        RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirDynCarrier, RirDynCarrierId,
+        RirDynDispatchArm, RirDynDispatchOrigin, RirDynPayloadAction, RirDynReceiver,
+        RirDynStorage, RirDynVariant, RirDynVariantId, RirDynWitnessOrigin, RirEnum, RirEnumId,
+        RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
         RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
         RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda, RirLambdaCapture,
         RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
@@ -57,15 +60,15 @@ use self::{
         RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
         RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
         RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject,
-        RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamEscape, RirParamSemantic,
+        RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
         RirPatternAlternative, RirPatternArm, RirPatternBinding, RirPatternBindingMode,
         RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace,
         RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
-        RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef,
-        RirScopedPlaceSource, RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq,
-        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
-        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
-        RirVariantKind, VerifiedRirProgram,
+        RirResolvedCallTarget, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
+        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
+        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
+        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -107,8 +110,9 @@ pub fn plan(
 ) -> Result<RirPlan, RustPlanError> {
     let mut cx = PlanCx::new(program, config);
     cx.check_support()?;
-    let rir = cx.plan()?;
-    rir::verify(&rir).map_err(RustPlanError::RirVerify)?;
+    let mut rir = cx.plan()?;
+    exact_witness::propagate(&mut rir);
+    rir::verify_with_air(&rir, program.program()).map_err(RustPlanError::RirVerify)?;
     Ok(RirPlan { program: rir })
 }
 
@@ -182,6 +186,11 @@ pub enum RustTargetGapKind {
     UnsupportedPlaceProjection,
     UnsupportedTerminator,
     UnsupportedRValue,
+    UnsupportedDynamicPlaceReturn,
+    UnsupportedDynamicLayout,
+    UnsupportedDynamicLifecycle,
+    UnsupportedDynamicPayload,
+    PendingDynamicFunctionCapability,
     UnsupportedCallee,
     UnsupportedExtern,
     UnsupportedExternMember,
@@ -334,6 +343,24 @@ struct PlanCx<'a> {
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
+    dynamic_layout: Option<rep_policy::RustDynamicLayoutPlan>,
+    dynamic_types: Vec<(TypeId, air::ContractSurfaceId, RirEnumId)>,
+    dyn_surface_map: HashMap<air::ContractSurfaceId, RirDynCarrierId>,
+    dyn_dispatch_map:
+        HashMap<(air::ContractSurfaceId, air::ContractSlotId), Vec<RirDynDispatchArm>>,
+    dyn_weakening_map: HashMap<
+        air::ContractWeakeningId,
+        (RirDynCarrierId, RirDynCarrierId, Vec<rir::RirDynWeakenArm>),
+    >,
+    dyn_witness_map: HashMap<
+        air::ContractWitnessId,
+        (
+            RirDynCarrierId,
+            RirDynVariantId,
+            RirDynPayloadAction,
+            RirTypeId,
+        ),
+    >,
 }
 
 struct PlannedTypeIds {
@@ -532,6 +559,12 @@ impl<'a> PlanCx<'a> {
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
             tuple_map: HashMap::new(),
+            dynamic_layout: None,
+            dynamic_types: vec![],
+            dyn_surface_map: HashMap::new(),
+            dyn_dispatch_map: HashMap::new(),
+            dyn_weakening_map: HashMap::new(),
+            dyn_witness_map: HashMap::new(),
         }
     }
 
@@ -564,6 +597,7 @@ impl<'a> PlanCx<'a> {
         self.check_lambda_env_storage_support(&program)?;
         self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
+        self.fill_dynamic_carriers(&mut program)?;
         self.finalize_copyable_flags(
             &mut program,
             &type_ids.structs,
@@ -610,7 +644,37 @@ impl<'a> PlanCx<'a> {
                 .insert(TypeId::from_index(index), RirTypeId::from_index(index));
         }
 
+        let dynamic_layout = self
+            .air_policy()
+            .dynamic_layout_plan()
+            .map_err(|_| Self::gap(RustTargetGapSite::Entry, RustTargetGapKind::UnsupportedType))?;
+        let mut dynamic_enums = std::collections::BTreeMap::new();
+        for surface in &dynamic_layout.declaration_order {
+            let id = RirEnumId::from_index(program.enums.len());
+            let display = &self.air.contract_surfaces[surface.index()].display_name;
+            program.enums.push(RirEnum {
+                id,
+                air_id: None,
+                native_path: None,
+                native_key: None,
+                core: None,
+                repr: RirEnumRepr::Adt,
+                raw_type: None,
+                symbol: RirSymbol::new(format!(
+                    "{}Dyn{}_{}",
+                    sanitize(&self.config.symbol_prefix),
+                    sanitize(display),
+                    surface.index()
+                )),
+                display: RirSymbol::new(display.clone()),
+                copyable: false,
+                variants: vec![],
+            });
+            dynamic_enums.insert(*surface, id);
+        }
+
         let mut aggregate_types = vec![];
+        let mut dynamic_types = vec![];
         let mut extern_types = vec![];
         let mut extern_enum_types = vec![];
         let mut enum_types = vec![];
@@ -680,7 +744,12 @@ impl<'a> PlanCx<'a> {
                     self.lambda_sig_map.insert(type_id, sig);
                     RirType::Lambda(sig)
                 }
-                TypeData::Any | TypeData::Map { .. } | TypeData::Dyn(_) => {
+                TypeData::Dyn(surface) => {
+                    let enum_id = dynamic_enums[surface];
+                    dynamic_types.push((type_id, *surface, enum_id));
+                    RirType::Enum(enum_id)
+                }
+                TypeData::Any | TypeData::Map { .. } => {
                     return Err(Self::gap(
                         RustTargetGapSite::Type(type_id),
                         RustTargetGapKind::UnsupportedType,
@@ -704,6 +773,36 @@ impl<'a> PlanCx<'a> {
         for &(type_id, enm, enum_id) in &enum_types {
             self.fill_enum(program, type_id, enm, enum_id)?;
         }
+        program
+            .dyn_origins
+            .surfaces
+            .clone_from(&dynamic_layout.declaration_order);
+        program.dyn_origins.slots = dynamic_layout
+            .declaration_order
+            .iter()
+            .flat_map(|surface| {
+                self.air.contract_surfaces[surface.index()]
+                    .slots
+                    .iter()
+                    .map(|slot| rir::RirDynSlotOrigin {
+                        air_slot: slot.id,
+                        surface: *surface,
+                    })
+            })
+            .collect();
+        program.dyn_origins.weakenings = self
+            .air
+            .contract_weakenings
+            .iter()
+            .enumerate()
+            .map(|(index, weakening)| rir::RirDynWeakeningOrigin {
+                air_weakening: air::ContractWeakeningId::from_index(index),
+                source: weakening.source,
+                target: weakening.target,
+            })
+            .collect();
+        self.dynamic_layout = Some(dynamic_layout);
+        self.dynamic_types.clone_from(&dynamic_types);
         let struct_types = aggregate_types
             .iter()
             .map(|(type_id, _, struct_id)| (*type_id, *struct_id))
@@ -716,6 +815,11 @@ impl<'a> PlanCx<'a> {
         let enum_types = enum_types
             .iter()
             .map(|(type_id, _, enum_id)| (*type_id, *enum_id))
+            .chain(
+                dynamic_types
+                    .iter()
+                    .map(|(type_id, _, enum_id)| (*type_id, *enum_id)),
+            )
             .chain(
                 extern_enum_types
                     .iter()
@@ -745,11 +849,11 @@ impl<'a> PlanCx<'a> {
             .params
             .iter()
             .map(|param| {
-                let semantic = rir::source_param_semantic(param.mode);
+                let semantic = rir::source_param_semantic(self.air, param.ty, param.mode);
                 RirLambdaParam {
                     ty: self.type_map[&param.ty],
                     semantic,
-                    abi: RustRepPolicy::new(program).param_abi(semantic),
+                    abi: RirRustRepPolicy::new(program).param_abi(semantic),
                     escape: rir_param_escape(param.escape),
                 }
             })
@@ -942,6 +1046,10 @@ impl<'a> PlanCx<'a> {
         let id = RirStructId::from_index(program.structs.len());
         let native = self.native_type_binding(type_id, decl)?;
         let native_ref = decl.rep == air::ExternRep::Shared;
+        let copyable = matches!(
+            decl.materialization,
+            Some(anvyx_runtime::ExternMaterialization::Copy)
+        );
         program.structs.push(RirStruct {
             id,
             air_id: None,
@@ -955,7 +1063,7 @@ impl<'a> PlanCx<'a> {
             native_path: Some(native_path(&native.path)),
             native_ref,
             native_key: Some(native.key.clone()),
-            copyable: !native_ref,
+            copyable,
             fields: vec![],
         });
         Ok(id)
@@ -1024,7 +1132,10 @@ impl<'a> PlanCx<'a> {
                 sanitize(decl.name.as_str())
             )),
             display: RirSymbol::new(decl.name.as_str()),
-            copyable: true,
+            copyable: matches!(
+                decl.materialization,
+                Some(anvyx_runtime::ExternMaterialization::Copy)
+            ),
             variants: vec![],
         });
         Ok(id)
@@ -1158,6 +1269,315 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
+    fn plan_dynamic_weakenings(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        for (index, weakening) in self.air.contract_weakenings.iter().enumerate() {
+            let air_id = air::ContractWeakeningId::from_index(index);
+            let (Some(&source), Some(&target)) = (
+                self.dyn_surface_map.get(&weakening.source),
+                self.dyn_surface_map.get(&weakening.target),
+            ) else {
+                continue;
+            };
+            let source_carrier = &program.dyn_carriers[source.index()];
+            let target_carrier = &program.dyn_carriers[target.index()];
+            let mut arms = Vec::with_capacity(source_carrier.variants.len());
+            for source_variant in &source_carrier.variants {
+                let source_witness =
+                    &self.air.contract_witnesses[source_variant.air_witness.index()];
+                let target_variant = target_carrier
+                    .variants
+                    .iter()
+                    .find(|target_variant| {
+                        let target_witness =
+                            &self.air.contract_witnesses[target_variant.air_witness.index()];
+                        target_witness.key.concrete_ty == source_witness.key.concrete_ty
+                            && target_witness.key.slots.len() == weakening.target_to_source.len()
+                            && target_witness
+                                .key
+                                .slots
+                                .iter()
+                                .zip(&weakening.target_to_source)
+                                .all(|(target_slot, source_slot)| {
+                                    source_witness
+                                        .key
+                                        .slots
+                                        .iter()
+                                        .find(|slot| slot.slot == *source_slot)
+                                        .is_some_and(|source_slot| {
+                                            source_slot.target == target_slot.target
+                                        })
+                                })
+                    })
+                    .expect("representation plan verifies weakening witnesses");
+                if source_variant.storage != target_variant.storage {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Type(source_witness.key.concrete_ty),
+                        RustTargetGapKind::UnsupportedDynamicLayout,
+                    ));
+                }
+                arms.push(rir::RirDynWeakenArm {
+                    source: source_variant.id,
+                    target: target_variant.id,
+                });
+            }
+            program.dyn_weakenings.push(rir::RirDynWeakening {
+                air_id,
+                source,
+                target,
+                arms: arms.clone(),
+            });
+            self.dyn_weakening_map
+                .insert(air_id, (source, target, arms));
+        }
+        Ok(())
+    }
+
+    fn fill_dynamic_carriers(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        let layout = self
+            .dynamic_layout
+            .take()
+            .expect("dynamic layout planned with types");
+        for carrier in &layout.carriers {
+            let (type_id, _, enum_id) = self
+                .dynamic_types
+                .iter()
+                .find(|(_, surface, _)| *surface == carrier.surface)
+                .copied()
+                .ok_or_else(|| {
+                    Self::gap(RustTargetGapSite::Entry, RustTargetGapKind::UnsupportedType)
+                })?;
+            self.fill_dynamic_carrier(program, type_id, enum_id, carrier)?;
+        }
+        self.plan_dynamic_weakenings(program)?;
+        Ok(())
+    }
+
+    fn plan_resolved_call_target(
+        &self,
+        target: &air::ContractWitnessTarget,
+    ) -> RirResolvedCallTarget {
+        match target {
+            air::ContractWitnessTarget::Function { function }
+            | air::ContractWitnessTarget::IteratorFunction { function } => {
+                RirResolvedCallTarget::Function(self.function_map[function])
+            }
+            air::ContractWitnessTarget::Extern { function } => {
+                RirResolvedCallTarget::Extern(self.extern_map[function])
+            }
+            air::ContractWitnessTarget::Promoted { fields, target } => {
+                RirResolvedCallTarget::Promoted {
+                    fields: fields
+                        .iter()
+                        .map(|field| RirFieldId::from_index(field.index()))
+                        .collect(),
+                    target: Box::new(self.plan_resolved_call_target(target)),
+                }
+            }
+        }
+    }
+
+    fn resolved_receiver_abi(
+        program: &RirProgram,
+        target: &RirResolvedCallTarget,
+        fallback: RirParamAbi,
+    ) -> RirParamAbi {
+        match target.base() {
+            RirResolvedCallTarget::Function(_) => fallback,
+            RirResolvedCallTarget::Extern(id) => program.externs[id.index()].params[0].abi,
+            RirResolvedCallTarget::Promoted { .. } => unreachable!(),
+        }
+    }
+
+    fn dyn_target_receiver_mode(&self, target: &air::ContractWitnessTarget) -> ParamMode {
+        match target {
+            air::ContractWitnessTarget::Function { function }
+            | air::ContractWitnessTarget::IteratorFunction { function } => {
+                self.air.functions[function.index()].signature.params[0].mode
+            }
+            air::ContractWitnessTarget::Extern { function } => {
+                let air::ExternMember::Method { receiver, .. } =
+                    &self.air.externs[function.index()].member
+                else {
+                    unreachable!("verified dynamic extern target is a method")
+                };
+                receiver.mode
+            }
+            air::ContractWitnessTarget::Promoted { target, .. } => {
+                self.dyn_target_receiver_mode(target)
+            }
+        }
+    }
+
+    fn fill_dynamic_carrier(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        enum_id: RirEnumId,
+        plan: &rep_policy::RustDynamicCarrierPlan,
+    ) -> Result<(), RustPlanError> {
+        if let Err(gap) = plan.layout
+            && !matches!(gap, rep_policy::RustLayoutGap::FunctionLayoutUnknown(_))
+        {
+            return Err(Self::gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedDynamicLayout,
+            ));
+        }
+        if let Err(gap) = plan.lifecycle
+            && !matches!(
+                gap,
+                rep_policy::RustLifecycleGap::FunctionMetadataUnknown(_)
+            )
+        {
+            return Err(Self::gap(
+                RustTargetGapSite::Type(type_id),
+                RustTargetGapKind::UnsupportedDynamicLifecycle,
+            ));
+        }
+        let carrier_id = RirDynCarrierId::from_index(program.dyn_carriers.len());
+        let mut variants = Vec::with_capacity(plan.variants.len());
+        let mut enum_variants = Vec::with_capacity(plan.variants.len());
+        for (index, variant) in plan.variants.iter().enumerate() {
+            let function_payload = matches!(
+                self.air.type_arena.data(variant.concrete_ty),
+                TypeData::Function(_)
+            );
+            if let Err(gap) = variant.payload_layout
+                && !(function_payload
+                    && matches!(gap, rep_policy::RustLayoutGap::FunctionLayoutUnknown(_)))
+            {
+                return Err(Self::gap(
+                    RustTargetGapSite::Type(variant.concrete_ty),
+                    RustTargetGapKind::UnsupportedDynamicLayout,
+                ));
+            }
+            if let Err(gap) = variant.lifecycle
+                && !(function_payload
+                    && matches!(
+                        gap,
+                        rep_policy::RustLifecycleGap::FunctionMetadataUnknown(_)
+                    ))
+            {
+                return Err(Self::gap(
+                    RustTargetGapSite::Type(variant.concrete_ty),
+                    RustTargetGapKind::UnsupportedDynamicLifecycle,
+                ));
+            }
+            let recipe = match variant.payload {
+                Ok(recipe) => recipe,
+                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_))
+                    if function_payload && self.function_type_copyable[&variant.concrete_ty] =>
+                {
+                    rep_policy::RustPhysicalRecipe::Copy
+                }
+                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_))
+                    if function_payload && self.function_type_shareable[&variant.concrete_ty] =>
+                {
+                    rep_policy::RustPhysicalRecipe::CloneLambda
+                }
+                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_)) => {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Type(variant.concrete_ty),
+                        RustTargetGapKind::PendingDynamicFunctionCapability,
+                    ));
+                }
+                Err(_) => {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Type(variant.concrete_ty),
+                        RustTargetGapKind::UnsupportedDynamicPayload,
+                    ));
+                }
+            };
+            let payload = if variant.recursive {
+                RirDynPayloadAction::CloneRecursive
+            } else {
+                recipe.into()
+            };
+            let storage = if function_payload {
+                RirDynStorage::Boxed
+            } else {
+                match variant.storage {
+                    rep_policy::RustPayloadStorage::Inline => RirDynStorage::Inline,
+                    rep_policy::RustPayloadStorage::Boxed => RirDynStorage::Boxed,
+                }
+            };
+            let concrete_ty = self.type_map[&variant.concrete_ty];
+            let variant_id = RirDynVariantId::from_index(index);
+            variants.push(RirDynVariant {
+                id: variant_id,
+                air_witness: variant.witness,
+                concrete_ty,
+                storage,
+                payload,
+            });
+            enum_variants.push(RirVariant {
+                id: RirVariantId::from_index(index),
+                symbol: RirSymbol::new(format!("Witness{}", variant.witness.index())),
+                display: RirSymbol::new(format!("Witness{}", variant.witness.index())),
+                kind: RirVariantKind::Tuple,
+                raw_value: None,
+                fields: vec![RirField {
+                    id: RirFieldId::from_index(0),
+                    symbol: RirSymbol::new("value"),
+                    ty: concrete_ty,
+                }],
+            });
+            self.dyn_witness_map.insert(
+                variant.witness,
+                (carrier_id, variant_id, payload, self.type_map[&type_id]),
+            );
+            program.dyn_origins.witnesses.push(RirDynWitnessOrigin {
+                air_witness: variant.witness,
+                surface: plan.surface,
+                concrete_ty,
+                storage,
+                payload,
+            });
+        }
+        program.enums[enum_id.index()].variants = enum_variants;
+        self.dyn_surface_map.insert(plan.surface, carrier_id);
+        for slot in &self.air.contract_surfaces[plan.surface.index()].slots {
+            let mut arms = Vec::with_capacity(variants.len());
+            for variant in &variants {
+                let witness = &self.air.contract_witnesses[variant.air_witness.index()];
+                let target = &witness
+                    .key
+                    .slots
+                    .iter()
+                    .find(|witness| witness.slot == slot.id)
+                    .expect("verified witness slot")
+                    .target;
+                let semantic = rir::source_param_semantic(
+                    self.air,
+                    witness.key.concrete_ty,
+                    self.dyn_target_receiver_mode(target),
+                );
+                let fallback = RirRustRepPolicy::new(program).param_abi(semantic);
+                let target = self.plan_resolved_call_target(target);
+                let receiver = Self::resolved_receiver_abi(program, &target, fallback);
+                program.dyn_origins.dispatches.push(RirDynDispatchOrigin {
+                    air_witness: variant.air_witness,
+                    air_slot: slot.id,
+                    receiver,
+                    target: target.clone(),
+                });
+                arms.push(RirDynDispatchArm {
+                    variant: variant.id,
+                    receiver,
+                    target,
+                });
+            }
+            self.dyn_dispatch_map.insert((plan.surface, slot.id), arms);
+        }
+        program.dyn_carriers.push(RirDynCarrier {
+            id: carrier_id,
+            air_surface: plan.surface,
+            storage_ty: self.type_map[&type_id],
+            variants,
+        });
+        Ok(())
+    }
+
     fn finalize_copyable_flags(
         &self,
         program: &mut RirProgram,
@@ -1208,7 +1628,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn fields_copyable(program: &RirProgram, fields: &[RirField]) -> bool {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         fields.iter().all(|field| policy.copyable(field.ty))
     }
 
@@ -1391,6 +1811,7 @@ impl<'a> PlanCx<'a> {
             let kind = Self::extern_kind(&native);
             program.externs.push(RirExtern {
                 id,
+                air_id: Some(air_id),
                 symbol: RirSymbol::new(format!(
                     "{}_extern_{}",
                     self.config.symbol_prefix,
@@ -1661,7 +2082,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn check_lambda_env_storage_support(&self, program: &RirProgram) -> Result<(), RustPlanError> {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         for env in &program.lambda_envs {
             for field in &env.fields {
                 if !policy.lambda_env_field_storage_supported(field) {
@@ -1686,7 +2107,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn check_lambda_value_capture_cycles(&self, program: &RirProgram) -> Result<(), RustPlanError> {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         for lambda in &program.lambdas {
             if policy.lambda_has_recursive_inline_value_capture(lambda) {
                 return Err(Self::gap(
@@ -1721,7 +2142,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_function_type_copyability(&mut self, program: &RirProgram) {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         self.function_type_copyable.clear();
         self.function_type_shareable.clear();
         for (ty, sig) in &self.lambda_sig_map {
@@ -1738,7 +2159,7 @@ impl<'a> PlanCx<'a> {
         lambda: air::LambdaId,
         decl: &air::LambdaDecl,
     ) -> Result<PlannedLambdaCaptures, RustPlanError> {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         let mut captures = vec![];
         let mut env_fields = vec![];
         for (slot, capture) in decl.captures.iter().enumerate() {
@@ -1786,7 +2207,7 @@ impl<'a> PlanCx<'a> {
         escape: air::LambdaEscape,
         capture: &air::LambdaCaptureDecl,
     ) -> Result<Option<RirLambdaCapture>, RustPlanError> {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         match capture {
             air::LambdaCaptureDecl::NoRuntime { .. } => Ok(None),
             air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
@@ -1952,7 +2373,7 @@ impl<'a> PlanCx<'a> {
                 local.initialized = true;
             }
         }
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         let mut params = vec![];
         if let air::FunctionKind::Lambda(lambda) = function.kind {
             for (index, capture) in program.lambdas[self.lambda_map[&lambda].index()]
@@ -1981,7 +2402,7 @@ impl<'a> PlanCx<'a> {
         }
         params.extend(function.signature.params.iter().map(|param| {
             let ty = self.type_map[&param.ty];
-            let semantic = rir::source_param_semantic(param.mode);
+            let semantic = rir::source_param_semantic(self.air, param.ty, param.mode);
             RirParam {
                 local: RirLocalId::from_index(param.local_id.index()),
                 ty,
@@ -2586,6 +3007,15 @@ impl<'a> PlanCx<'a> {
                 possible_cells,
                 in_loop,
             ),
+            air::AirStmt::DynMatch(match_) => self.plan_dyn_match(
+                function,
+                match_,
+                locals,
+                zero_env_function_values,
+                initialized_cells,
+                possible_cells,
+                in_loop,
+            ),
             air::AirStmt::OptionalMatch(match_) => {
                 let (mut stmts, subject) = self.plan_option_subject(function, match_, locals)?;
                 let payload = match_
@@ -2724,6 +3154,311 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn dyn_variants_for_target(
+        &self,
+        surface: air::ContractSurfaceId,
+        target: TypeId,
+    ) -> Vec<RirDynVariantId> {
+        let mut variants = self
+            .air
+            .contract_witnesses
+            .iter()
+            .enumerate()
+            .filter(|(_, witness)| {
+                witness.key.surface == surface && witness.key.concrete_ty == target
+            })
+            .filter_map(|(index, _)| {
+                self.dyn_witness_map
+                    .get(&air::ContractWitnessId::from_index(index))
+                    .map(|(_, variant, _, _)| *variant)
+            })
+            .collect::<Vec<_>>();
+        variants.sort_by_key(|variant| variant.index());
+        variants
+    }
+
+    fn plan_dyn_match(
+        &self,
+        function: FunctionId,
+        match_: &air::AirDynMatch,
+        locals: &mut Vec<RirLocal>,
+        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+        initialized_cells: &mut [bool],
+        possible_cells: &mut [bool],
+        in_loop: bool,
+    ) -> Result<Vec<RirStmt>, RustPlanError> {
+        let aliases = match_
+            .arms
+            .iter()
+            .any(|arm| matches!(arm.binding, air::AirDynMatchTargetBinding::Alias(_)));
+        let (mut stmts, source, mutable, borrowed) = match &match_.source {
+            air::AirDynMatchSource::Mutable(place) => {
+                if let air::PlaceRoot::DynBorrowParam(id) = place.root {
+                    let decl = &self.air.dyn_borrow_params[id.index()];
+                    let carrier = self.dyn_surface_map[&decl.surface];
+                    (
+                        vec![],
+                        rir::RirDynMatchSource::Borrowed(rir::RirDynBorrow {
+                            source: rir::RirDynBorrowSource::Borrowed {
+                                local: RirLocalId::from_index(decl.source.index()),
+                                carrier,
+                            },
+                            target: carrier,
+                            air_weakening: None,
+                        }),
+                        true,
+                        true,
+                    )
+                } else {
+                    let access = self
+                        .access()
+                        .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                        .map_err(|gap| Self::access_gap(function, gap))?;
+                    let source = self.plan_mut_place_arg(function, &access, locals)?;
+                    (
+                        source.stmts,
+                        rir::RirDynMatchSource::MutPlace(source.arg),
+                        true,
+                        false,
+                    )
+                }
+            }
+            air::AirDynMatchSource::Owned { value, use_ } => {
+                let air_local =
+                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
+                        Operand::Place(place) => place
+                            .root
+                            .local()
+                            .expect("verified consumed dynamic match temporary"),
+                        Operand::Const(_) => {
+                            unreachable!("verified consumed dynamic match temporary")
+                        }
+                    });
+                let value = match use_ {
+                    air::DynOwnedUse::ConsumeTemporary => {
+                        PlannedOperand::from_operand(self.plan_operand(function, value))
+                    }
+                    air::DynOwnedUse::ReusableRead => {
+                        self.plan_operand_read(function, value, locals)
+                    }
+                };
+                (
+                    value.stmts,
+                    rir::RirDynMatchSource::Owned {
+                        value: value.operand,
+                        air_use: *use_,
+                        air_local,
+                    },
+                    false,
+                    false,
+                )
+            }
+            air::AirDynMatchSource::Borrowed(borrow) => {
+                let planned = self.plan_dyn_borrow_arg(function, borrow, locals)?;
+                let RirCallArg::DynBorrow(borrow) = planned.arg else {
+                    unreachable!("dynamic match borrow planning")
+                };
+                (
+                    planned.stmts,
+                    rir::RirDynMatchSource::Borrowed(borrow),
+                    aliases,
+                    true,
+                )
+            }
+        };
+        let entry_functions = zero_env_function_values.clone();
+        let entry_cells = initialized_cells.to_vec();
+        let entry_possible = possible_cells.to_vec();
+        let mut arm_states = Vec::with_capacity(match_.arms.len() + 1);
+        let mut arms = Vec::with_capacity(match_.arms.len());
+        for arm in &match_.arms {
+            let binding = match arm.binding {
+                air::AirDynMatchTargetBinding::Discard => rir::RirDynMatchBinding::Discard,
+                air::AirDynMatchTargetBinding::Alias(local) if mutable => {
+                    let local = RirLocalId::from_index(local.index());
+                    locals[local.index()].payload_ref = true;
+                    rir::RirDynMatchBinding::Alias(local)
+                }
+                air::AirDynMatchTargetBinding::Take(local)
+                | air::AirDynMatchTargetBinding::Materialize(local)
+                    if !mutable =>
+                {
+                    rir::RirDynMatchBinding::Owned(RirLocalId::from_index(local.index()))
+                }
+                _ => unreachable!("verified dynamic match target binding"),
+            };
+            let mut functions = entry_functions.clone();
+            let mut cells = entry_cells.clone();
+            let mut possible = entry_possible.clone();
+            let block = self.plan_air_block(
+                function,
+                &arm.block,
+                locals,
+                &mut functions,
+                &mut cells,
+                &mut possible,
+                in_loop,
+            )?;
+            arm_states.push((functions, cells, possible));
+            arms.push(rir::RirDynMatchArm {
+                target: self.type_map[&arm.target],
+                variants: self.dyn_variants_for_target(match_.surface, arm.target),
+                binding,
+                block,
+            });
+        }
+        let fallback_binding = match match_.fallback.binding {
+            air::AirDynMatchFallbackBinding::Discard => None,
+            air::AirDynMatchFallbackBinding::Alias(local) if mutable => {
+                let local = RirLocalId::from_index(local.index());
+                locals[local.index()].payload_ref = !borrowed;
+                Some(local)
+            }
+            air::AirDynMatchFallbackBinding::Preserve(local) if !mutable => {
+                Some(RirLocalId::from_index(local.index()))
+            }
+            _ => unreachable!("verified dynamic match fallback binding"),
+        };
+        let mut fallback_functions = entry_functions;
+        let mut fallback_cells = entry_cells;
+        let mut fallback_possible = entry_possible;
+        let mut fallback = self.plan_air_block(
+            function,
+            &match_.fallback.block,
+            locals,
+            &mut fallback_functions,
+            &mut fallback_cells,
+            &mut fallback_possible,
+            in_loop,
+        )?;
+        if borrowed && let Some(local) = fallback_binding {
+            Self::rebind_dyn_borrow_block(
+                &mut fallback,
+                local,
+                self.dyn_surface_map[&match_.surface],
+            );
+        }
+        arm_states.push((fallback_functions, fallback_cells, fallback_possible));
+        Self::merge_zero_env_function_values(
+            zero_env_function_values,
+            locals.len(),
+            arm_states.iter().map(|(functions, _, _)| functions),
+        );
+        for (index, dst) in initialized_cells.iter_mut().enumerate() {
+            *dst = arm_states.iter().all(|(_, cells, _)| cells[index]);
+        }
+        for (index, dst) in possible_cells.iter_mut().enumerate() {
+            *dst = arm_states.iter().any(|(_, _, possible)| possible[index]);
+        }
+        stmts.push(RirStmt::DynMatch(rir::RirDynMatch {
+            carrier: self.dyn_surface_map[&match_.surface],
+            source,
+            arms,
+            fallback_binding,
+            fallback,
+        }));
+        Ok(stmts)
+    }
+
+    fn rebind_dyn_borrow_block(
+        block: &mut RirStructuredBlock,
+        local: RirLocalId,
+        carrier: RirDynCarrierId,
+    ) {
+        for stmt in &mut block.stmts {
+            match stmt {
+                RirStmt::Init { value, .. }
+                | RirStmt::GlobalSetRoot { value, .. }
+                | RirStmt::GlobalUpdateRoot { value, .. }
+                | RirStmt::MutPlaceSet { value, .. }
+                | RirStmt::Assign { value, .. }
+                | RirStmt::CellInit { value, .. }
+                | RirStmt::CellSet { value, .. }
+                | RirStmt::ScopedPlaceCellSet { value, .. }
+                | RirStmt::Eval(value) => Self::rebind_dyn_borrow_rvalue(value, local, carrier),
+                RirStmt::If(branch) => {
+                    Self::rebind_dyn_borrow_block(&mut branch.then_block, local, carrier);
+                    if let Some(block) = &mut branch.else_block {
+                        Self::rebind_dyn_borrow_block(block, local, carrier);
+                    }
+                }
+                RirStmt::Loop(loop_) => {
+                    Self::rebind_dyn_borrow_block(&mut loop_.body, local, carrier);
+                }
+                RirStmt::RangeFor(for_) => {
+                    Self::rebind_dyn_borrow_block(&mut for_.body, local, carrier);
+                }
+                RirStmt::CollectionFor(for_) => {
+                    Self::rebind_dyn_borrow_block(&mut for_.body, local, carrier);
+                }
+                RirStmt::CollectionLoanScope(scope) => {
+                    Self::rebind_dyn_borrow_block(&mut scope.body, local, carrier);
+                }
+                RirStmt::CollectionSlotScope(block) => {
+                    Self::rebind_dyn_borrow_block(block, local, carrier);
+                }
+                RirStmt::PatternMatch(match_) => {
+                    for arm in &mut match_.arms {
+                        Self::rebind_dyn_borrow_block(&mut arm.block, local, carrier);
+                    }
+                }
+                RirStmt::DynMatch(match_) => {
+                    for arm in &mut match_.arms {
+                        Self::rebind_dyn_borrow_block(&mut arm.block, local, carrier);
+                    }
+                    Self::rebind_dyn_borrow_block(&mut match_.fallback, local, carrier);
+                }
+                RirStmt::OptionMatch(match_) => {
+                    Self::rebind_dyn_borrow_block(&mut match_.some_block, local, carrier);
+                    Self::rebind_dyn_borrow_block(&mut match_.none_block, local, carrier);
+                }
+                RirStmt::MapEntryMatch(match_) => {
+                    Self::rebind_dyn_borrow_block(&mut match_.some_block, local, carrier);
+                    Self::rebind_dyn_borrow_block(&mut match_.none_block, local, carrier);
+                }
+                RirStmt::GlobalEnsure { .. }
+                | RirStmt::ScopedPlaceCellInit { .. }
+                | RirStmt::DataRefSet { .. }
+                | RirStmt::SequenceSlotSet { .. }
+                | RirStmt::MapValueSet { .. } => {}
+            }
+        }
+    }
+
+    fn rebind_dyn_borrow_rvalue(
+        value: &mut RirRValue,
+        local: RirLocalId,
+        carrier: RirDynCarrierId,
+    ) {
+        let RirRValue::DynCall { receiver, .. } = value else {
+            return;
+        };
+        let uses_local = match receiver {
+            RirDynReceiver::MutPlace(place) => {
+                matches!(
+                    &place.access,
+                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local: source, .. })
+                        if *source == local && place.projections.is_empty()
+                )
+            }
+            RirDynReceiver::Owned {
+                value: RirOperand::Place(place),
+                consume: false,
+            } => {
+                matches!(place.root, RirPlaceRoot::Local(source) if source == local)
+                    && place.projections.is_empty()
+            }
+            RirDynReceiver::Owned { .. } | RirDynReceiver::Borrowed(_) => false,
+        };
+        if uses_local {
+            *receiver = RirDynReceiver::Borrowed(rir::RirDynBorrow {
+                source: rir::RirDynBorrowSource::Reborrowed { local, carrier },
+                target: carrier,
+                air_weakening: None,
+            });
+        }
+    }
+
     fn plan_option_subject(
         &self,
         function: FunctionId,
@@ -2842,6 +3577,245 @@ impl<'a> PlanCx<'a> {
         zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let planned = match value {
+            RValue::DynPack {
+                value,
+                use_,
+                witness,
+                ty: _,
+            } => {
+                let &(carrier, variant, action, ty) = self
+                    .dyn_witness_map
+                    .get(witness)
+                    .expect("reachable verified dynamic witness");
+                let action = if *use_ == air::DynOwnedUse::ConsumeTemporary {
+                    RirDynPayloadAction::Move
+                } else {
+                    action
+                };
+                let air_local =
+                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
+                        Operand::Place(place) if place.projection.is_empty() => place
+                            .root
+                            .local()
+                            .expect("verified consumed dynamic pack temporary"),
+                        _ => unreachable!("verified consumed dynamic pack temporary"),
+                    });
+                let value = match use_ {
+                    air::DynOwnedUse::ConsumeTemporary => {
+                        PlannedOperand::from_operand(self.plan_operand(function, value))
+                    }
+                    air::DynOwnedUse::ReusableRead => {
+                        self.plan_operand_read(function, value, locals)
+                    }
+                };
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::DynPack {
+                        carrier,
+                        variant,
+                        air_witness: *witness,
+                        air_use: *use_,
+                        air_local,
+                        value: value.operand,
+                        action,
+                        ty,
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::DynCall {
+                receiver,
+                surface,
+                slot,
+                args,
+            } => {
+                let carrier = self.dyn_surface_map[surface];
+                let (mut stmts, receiver) = match receiver {
+                    air::DynReceiver::Owned(value) => {
+                        if let Operand::Place(place) = value {
+                            let read_plan = self
+                                .access()
+                                .plan(function, PlaceAccessIntent::ReadValue, place)
+                                .expect("profile verifies dynamic receiver place");
+                            if let Some(last) = read_plan.projection.last()
+                                && let PlaceProjectionKind::ListIndex(index) = last.kind
+                            {
+                                let mut root = place.clone();
+                                root.projection.pop();
+                                root.ty = last.source_ty;
+                                let collection = self.plan_collection_access(
+                                    function,
+                                    &root,
+                                    CollectionAccessOp::SequenceSlotRead,
+                                    locals,
+                                )?;
+                                let mut stmts = collection.stmts;
+                                let value = self.rvalue_temp(
+                                    RirRValue::SequenceSlotAt {
+                                        collection: collection.access,
+                                        index: RirLocalId::from_index(index.index()),
+                                        ty: self.type_map[&place.ty],
+                                    },
+                                    place.ty,
+                                    locals,
+                                    &mut stmts,
+                                );
+                                (
+                                    stmts,
+                                    RirDynReceiver::Owned {
+                                        value,
+                                        consume: false,
+                                    },
+                                )
+                            } else {
+                                let planned = self.plan_operand_read(function, value, locals);
+                                (
+                                    planned.stmts,
+                                    RirDynReceiver::Owned {
+                                        value: planned.operand,
+                                        consume: false,
+                                    },
+                                )
+                            }
+                        } else {
+                            let planned = self.plan_operand_read(function, value, locals);
+                            (
+                                planned.stmts,
+                                RirDynReceiver::Owned {
+                                    value: planned.operand,
+                                    consume: false,
+                                },
+                            )
+                        }
+                    }
+                    air::DynReceiver::Borrowed(borrow) => {
+                        let planned = self.plan_dyn_borrow_arg(function, borrow, locals)?;
+                        let RirCallArg::DynBorrow(borrow) = planned.arg else {
+                            unreachable!("dynamic borrow planner returns dynamic borrow argument")
+                        };
+                        (planned.stmts, RirDynReceiver::Borrowed(borrow))
+                    }
+                    air::DynReceiver::MutableOwned(place) => {
+                        let plan = self
+                            .access()
+                            .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                            .map_err(|gap| Self::access_gap(function, gap))?;
+                        let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+                        (planned.stmts, RirDynReceiver::MutPlace(planned.arg))
+                    }
+                };
+                let required = &self.air.contract_surfaces[surface.index()].slots[slot.index()];
+                let mut rir_args = Vec::with_capacity(args.len());
+                for (arg, param) in args.iter().zip(&required.params) {
+                    let expected = rir::source_param_semantic(self.air, param.ty, param.mode);
+                    let planned =
+                        self.plan_arg(function, arg, expected, locals, zero_env_function_values)?;
+                    stmts.extend(planned.stmts);
+                    rir_args.push(planned.arg);
+                }
+                let air::ContractReturnDecl::Value(ret) = required.ret else {
+                    return Err(Self::gap(
+                        RustTargetGapSite::Function(function),
+                        RustTargetGapKind::UnsupportedDynamicPlaceReturn,
+                    ));
+                };
+                PlannedRValue {
+                    stmts,
+                    value: RirRValue::DynCall {
+                        carrier,
+                        air_slot: *slot,
+                        exact_variant: None,
+                        receiver,
+                        args: rir_args,
+                        arms: self.dyn_dispatch_map[&(*surface, *slot)].clone(),
+                        ty: self.type_map[&ret],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::DynWeaken {
+                value,
+                use_,
+                weakening,
+                ty,
+            } => {
+                let (source, target, arms) = self
+                    .dyn_weakening_map
+                    .get(weakening)
+                    .expect("reachable verified dynamic weakening");
+                let air_local =
+                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
+                        Operand::Place(place) if place.projection.is_empty() => place
+                            .root
+                            .local()
+                            .expect("verified consumed dynamic weakening temporary"),
+                        _ => unreachable!("verified consumed dynamic weakening temporary"),
+                    });
+                let value = match use_ {
+                    air::DynOwnedUse::ConsumeTemporary => {
+                        PlannedOperand::from_operand(self.plan_operand(function, value))
+                    }
+                    air::DynOwnedUse::ReusableRead => {
+                        self.plan_operand_read(function, value, locals)
+                    }
+                };
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::DynWeaken {
+                        source: *source,
+                        target: *target,
+                        air_weakening: *weakening,
+                        air_use: *use_,
+                        air_local,
+                        value: value.operand,
+                        arms: arms.clone(),
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::DynDowncast {
+                value,
+                use_,
+                surface,
+                target,
+                ty,
+            } => {
+                let carrier_id = self.dyn_surface_map[surface];
+                let variants = self.dyn_variants_for_target(*surface, *target);
+                let air_local =
+                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
+                        Operand::Place(place) => place
+                            .root
+                            .local()
+                            .expect("verified consumed dynamic downcast temporary"),
+                        Operand::Const(_) => {
+                            unreachable!("verified consumed dynamic downcast temporary")
+                        }
+                    });
+                let value = match use_ {
+                    air::DynOwnedUse::ConsumeTemporary => {
+                        PlannedOperand::from_operand(self.plan_operand(function, value))
+                    }
+                    air::DynOwnedUse::ReusableRead => {
+                        self.plan_operand_read(function, value, locals)
+                    }
+                };
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::DynDowncast {
+                        carrier: carrier_id,
+                        air_surface: *surface,
+                        air_use: *use_,
+                        air_local,
+                        value: value.operand,
+                        target: self.type_map[target],
+                        variants,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
             RValue::Use(operand) => {
                 return self.plan_use(function, operand, locals, zero_env_function_values);
             }
@@ -3355,18 +4329,24 @@ impl<'a> PlanCx<'a> {
         None
     }
 
-    fn unbound_lambda_temp_place(&self, function: FunctionId, place: &Place) -> bool {
-        if !place.projection.is_empty()
-            || !matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
-        {
+    fn compiler_temp_place(&self, function: FunctionId, place: &Place) -> bool {
+        place.projection.is_empty()
+            && place.root.local().is_some_and(|local| {
+                self.air.function(function).locals[local.index()].kind == LocalKind::Temp
+            })
+    }
+
+    fn unbound_movable_temp_place(&self, function: FunctionId, place: &Place) -> bool {
+        if !place.projection.is_empty() {
             return false;
         }
         let Some(local) = place.root.local() else {
             return false;
         };
-        self.air.function(function).locals[local.index()]
-            .binding
-            .is_none()
+        let local = &self.air.function(function).locals[local.index()];
+        local.kind == LocalKind::Temp
+            || (matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
+                && local.binding.is_none())
     }
 
     fn plan_use(
@@ -3416,11 +4396,37 @@ impl<'a> PlanCx<'a> {
         if let Some(value) = self.projected_sequence_read(function, place, &read_plan, locals)? {
             return Ok(value);
         }
+        if let TypeData::Dyn(surface) = self.air.type_arena.data(place.ty) {
+            if self.unbound_movable_temp_place(function, place) {
+                return Ok(PlannedRValue::from_value(RirRValue::MoveValue {
+                    value: self.plan_operand(function, operand),
+                    air_local: place.root.local().expect("checked local temporary"),
+                    ty: self.type_map[&place.ty],
+                }));
+            }
+            let value = self.plan_operand_read(function, operand, locals);
+            return Ok(PlannedRValue {
+                stmts: value.stmts,
+                value: RirRValue::DynCopy {
+                    carrier: self.dyn_surface_map[surface],
+                    value: value.operand,
+                    ty: self.type_map[&place.ty],
+                },
+                post_stmts: vec![],
+            });
+        }
         if !self.air_place_value_readable(place.ty) {
             if let Some(state) = self.zero_env_function_place(place, zero_env_function_values) {
                 return Ok(PlannedRValue::from_value(state.rvalue()));
             }
-            if !self.unbound_lambda_temp_place(function, place) {
+            let reconstructable = matches!(
+                self.air.type_arena.data(place.ty),
+                TypeData::Aggregate(_)
+                    | TypeData::Tuple(_)
+                    | TypeData::Enum(_)
+                    | TypeData::Array { .. }
+            );
+            if !self.unbound_movable_temp_place(function, place) && !reconstructable {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::NonCopyValueRequired,
@@ -3472,13 +4478,16 @@ impl<'a> PlanCx<'a> {
         else {
             return Ok(None);
         };
-        if matches!(
-            read_plan.root,
-            PlaceAccessRoot::Local {
-                source_mut_param: false,
-                ..
-            } | PlaceAccessRoot::Global(_)
-        ) {
+        let dynamic_element = matches!(self.air.type_arena.data(place.ty), TypeData::Dyn(_));
+        if !dynamic_element
+            && matches!(
+                read_plan.root,
+                PlaceAccessRoot::Local {
+                    source_mut_param: false,
+                    ..
+                } | PlaceAccessRoot::Global(_)
+            )
+        {
             return Ok(None);
         }
         let mut root = place.clone();
@@ -3581,7 +4590,7 @@ impl<'a> PlanCx<'a> {
                         .signature
                         .params
                         .iter()
-                        .map(|param| rir::source_param_semantic(param.mode))
+                        .map(|param| rir::source_param_semantic(self.air, param.ty, param.mode))
                         .collect::<Vec<_>>(),
                 )
             }
@@ -3606,7 +4615,7 @@ impl<'a> PlanCx<'a> {
                     sig_ty
                         .params
                         .iter()
-                        .map(|param| rir::source_param_semantic(param.mode))
+                        .map(|param| rir::source_param_semantic(self.air, param.ty, param.mode))
                         .collect::<Vec<_>>(),
                 )
             }
@@ -4212,6 +5221,70 @@ impl<'a> PlanCx<'a> {
             && !self.air_place_value_readable(place.ty)
     }
 
+    fn plan_dyn_borrow_arg(
+        &self,
+        function: FunctionId,
+        borrow: &air::DynBorrow,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedCallArg, RustPlanError> {
+        let (stmts, source) = match &borrow.source {
+            air::DynBorrowSource::Concrete { place, witness } => {
+                let plan = self
+                    .access()
+                    .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                    .map_err(|gap| Self::access_gap(function, gap))?;
+                let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+                let surface = self.air.contract_witnesses[witness.index()].key.surface;
+                (
+                    planned.stmts,
+                    rir::RirDynBorrowSource::Concrete {
+                        place: planned.arg,
+                        carrier: self.dyn_surface_map[&surface],
+                        air_witness: *witness,
+                    },
+                )
+            }
+            air::DynBorrowSource::Owned(place) => {
+                let plan = self
+                    .access()
+                    .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                    .map_err(|gap| Self::access_gap(function, gap))?;
+                let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+                let TypeData::Dyn(surface) = self.air.type_arena.data(place.ty) else {
+                    unreachable!("AIR verifies owned dynamic borrow source")
+                };
+                (
+                    planned.stmts,
+                    rir::RirDynBorrowSource::Owned {
+                        place: planned.arg,
+                        carrier: self.dyn_surface_map[surface],
+                    },
+                )
+            }
+            air::DynBorrowSource::Borrowed(place) => {
+                let air::PlaceRoot::DynBorrowParam(id) = place.root else {
+                    unreachable!("AIR verifies borrowed dynamic source root")
+                };
+                let decl = &self.air.dyn_borrow_params[id.index()];
+                (
+                    vec![],
+                    rir::RirDynBorrowSource::Borrowed {
+                        local: RirLocalId::from_index(decl.source.index()),
+                        carrier: self.dyn_surface_map[&decl.surface],
+                    },
+                )
+            }
+        };
+        Ok(PlannedCallArg {
+            stmts,
+            arg: RirCallArg::DynBorrow(rir::RirDynBorrow {
+                source,
+                target: self.dyn_surface_map[&borrow.surface],
+                air_weakening: borrow.weakening,
+            }),
+        })
+    }
+
     fn plan_arg(
         &self,
         function: FunctionId,
@@ -4221,6 +5294,7 @@ impl<'a> PlanCx<'a> {
         zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
+            CallArg::DynBorrow(borrow) => self.plan_dyn_borrow_arg(function, borrow, locals),
             CallArg::Value(operand)
                 if matches!(
                     expected,
@@ -4264,6 +5338,19 @@ impl<'a> PlanCx<'a> {
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg,
+                })
+            }
+            CallArg::Value(operand @ Operand::Place(place))
+                if self.compiler_temp_place(function, place)
+                    && matches!(self.air.type_arena.data(place.ty), TypeData::Dyn(_)) =>
+            {
+                let planned = self.plan_operand_read(function, operand, locals);
+                Ok(PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::MovedValue {
+                        value: planned.operand,
+                        air_local: place.root.local().expect("checked local temporary"),
+                    },
                 })
             }
             CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
@@ -4313,6 +5400,14 @@ impl<'a> PlanCx<'a> {
                 })
             }
             CallArg::InitFieldOmitted => Ok(PlannedCallArg::from_arg(RirCallArg::InitFieldOmitted)),
+            CallArg::SharedBorrow(place) if expected == RirParamSemantic::Value => {
+                let planned =
+                    self.plan_operand_read(function, &Operand::Place(place.clone()), locals);
+                Ok(PlannedCallArg {
+                    stmts: planned.stmts,
+                    arg: RirCallArg::Value(planned.operand),
+                })
+            }
             CallArg::SharedBorrow(place) => {
                 let planned = self.lower_place_read(function, place, locals);
                 let RirOperand::Place(place) = planned.operand else {
@@ -5137,6 +6232,7 @@ impl<'a> PlanCx<'a> {
                 )
             }
             air::PlaceRoot::ScopedBorrow(_)
+            | air::PlaceRoot::DynBorrowParam(_)
             | air::PlaceRoot::CaptureCell(_)
             | air::PlaceRoot::Global(_) => {
                 unreachable!("Rust backend profile rejects unsupported place roots")
@@ -5247,22 +6343,14 @@ impl<'a> PlanCx<'a> {
 
     fn rust_copyable_air_type(&self, ty: TypeId) -> bool {
         if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
-            return self
-                .function_type_copyable
-                .get(&ty)
-                .copied()
-                .unwrap_or(true);
+            return self.function_type_copyable[&ty];
         }
         self.air_policy().copyable(ty)
     }
 
     fn rust_shareable_air_type(&self, ty: TypeId) -> bool {
         if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
-            return self
-                .function_type_shareable
-                .get(&ty)
-                .copied()
-                .unwrap_or_else(|| self.rust_copyable_air_type(ty));
+            return self.function_type_shareable[&ty];
         }
         self.air_policy().value_place_shareable(ty)
     }
@@ -5271,8 +6359,8 @@ impl<'a> PlanCx<'a> {
         PlaceAccessCx::new(self.air, &self.classes)
     }
 
-    fn air_policy(&self) -> AirRustRepPolicy<'_> {
-        AirRustRepPolicy::new(self.air, &self.classes)
+    fn air_policy(&self) -> RustRepresentationPlan<'_> {
+        RustRepresentationPlan::new(self.air, &self.classes)
     }
 
     fn plan_place_in_function(&self, function: FunctionId, place: &Place) -> RirPlace {
@@ -5281,6 +6369,7 @@ impl<'a> PlanCx<'a> {
             air::PlaceRoot::Local(_)
             | air::PlaceRoot::LambdaCapture(_)
             | air::PlaceRoot::ScopedBorrow(_)
+            | air::PlaceRoot::DynBorrowParam(_)
             | air::PlaceRoot::CaptureCell(_) => {
                 let (_, local) = self.current_place_root(function, place);
                 RirPlaceRoot::Local(local)

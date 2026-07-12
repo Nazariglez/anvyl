@@ -1,26 +1,28 @@
 #![allow(dead_code)]
 
-use anvyx_runtime::{AnvString, AnvyxEnum, AnvyxInline, ExternRep, ExternTypeExpr};
+use anvyx_runtime::{
+    AnvyxEnum, AnvyxInline, ExternLayout, ExternMaterialization, ExternRep, ExternTypeExpr,
+};
 
 /// Two-dimensional point.
-#[derive(AnvyxInline)]
+#[derive(Clone, Copy, AnvyxInline)]
 #[anvyx(name = "Point")]
-struct Vec2 {
+pub struct Vec2 {
     /// Horizontal component.
     #[anvyx(field)]
-    x: f64,
+    pub x: f64,
     #[anvyx(field)]
-    y: f64,
+    pub y: f64,
     hidden: i64,
 }
 
-#[derive(AnvyxEnum)]
+#[derive(Clone, PartialEq, Eq, Hash, AnvyxEnum)]
 #[anvyx(name = "LoadError")]
-enum HostLoadError {
+pub enum HostLoadError {
     /// Missing asset path.
-    Missing(AnvString),
+    Missing(anvyx_runtime::AnvString),
     Decode {
-        message: AnvString,
+        message: anvyx_runtime::AnvString,
     },
 }
 
@@ -40,6 +42,18 @@ fn inline_descriptor_contains_exported_fields_docs_and_name() {
         Some("Two-dimensional point.")
     );
     assert_eq!(export.descriptor.rep, ExternRep::Inline);
+    assert_eq!(
+        export.descriptor.layout,
+        Some(ExternLayout {
+            size: size_of::<Vec2>() as u64,
+            align: align_of::<Vec2>() as u64,
+        })
+    );
+    assert_eq!(
+        export.descriptor.materialization,
+        Some(ExternMaterialization::Copy)
+    );
+    assert_eq!(export.descriptor.owns_heap_edges, Some(false));
     assert_eq!(export.descriptor.fields.len(), 2);
     assert_eq!(export.descriptor.fields[0].name, "x");
     assert_eq!(export.descriptor.fields[0].ty, ExternTypeExpr::Float);
@@ -59,6 +73,18 @@ fn enum_descriptor_contains_name_and_marker() {
 
     assert_eq!(export.descriptor.name, "LoadError");
     assert_eq!(export.descriptor.rep, ExternRep::Inline);
+    assert_eq!(
+        export.descriptor.layout,
+        Some(ExternLayout {
+            size: size_of::<HostLoadError>() as u64,
+            align: align_of::<HostLoadError>() as u64,
+        })
+    );
+    assert_eq!(
+        export.descriptor.materialization,
+        Some(ExternMaterialization::Clone)
+    );
+    assert_eq!(export.descriptor.owns_heap_edges, Some(false));
     assert!(export.descriptor.fields.is_empty());
     assert_eq!(export.descriptor.variants.len(), 2);
     assert_eq!(export.descriptor.variants[0].name, "Missing");

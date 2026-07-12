@@ -1,0 +1,55 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 17
+// 22
+// 30
+// 34
+// @match-end
+
+contract Counter {
+    fn add(ref self, amount: int);
+    fn value(self) -> int;
+}
+
+struct Actor {
+    points: int,
+
+    fn add(ref self, amount: int) { self.points += amount; }
+    fn value(self) -> int { self.points }
+}
+
+struct Holder {
+    actor: dyn Counter,
+}
+
+struct Large {
+    first: string,
+    second: string,
+    third: string,
+    fourth: string,
+    points: int,
+
+    fn add(ref self, amount: int) { self.points += amount; }
+    fn value(self) -> int { self.points }
+}
+
+fn main() {
+    let first = Holder { actor: Actor { points: 17 } };
+    var second = first;
+    second.actor.add(5);
+    println(first.actor.value());
+    println(second.actor.value());
+
+    let boxed: dyn Counter = Large {
+        first: "a",
+        second: "b",
+        third: "c",
+        fourth: "d",
+        points: 30,
+    };
+    var boxed_copy = boxed;
+    boxed_copy.add(4);
+    println(boxed.value());
+    println(boxed_copy.value());
+}

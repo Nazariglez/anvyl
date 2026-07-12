@@ -2,7 +2,15 @@
 // @expect: success
 // @match: 25
 
-import pkg:host.host { len2_of, fov_of, Vec2, Camera, Glyph };
+import pkg:host.host { len2_of, fov_of, Vec2, CloneValue, Camera, Glyph };
+
+contract HasLength {
+    fn len2(self) -> float;
+}
+
+contract Numbered {
+    fn number(self) -> int;
+}
 
 fn main() {
     let v = Vec2 { x: 3.0, y: 4.0 };
@@ -16,6 +24,10 @@ fn main() {
     assert(x_again == 3.0);
     assert(v.len2() == 25.0);
     assert(len2_of(v) == 25.0);
+    let dynamic: dyn HasLength = v;
+    assert(dynamic.len2() == 25.0);
+    let numbered: dyn Numbered = CloneValue { value: 7 };
+    assert(numbered.number() == 7);
 
     let adjusted = Vec2 { x: 3.0, y: 4.0, sum: 10.0 };
     let Vec2 { x: adjusted_x, sum: adjusted_sum } = adjusted;

@@ -1,9 +1,9 @@
 use anvyx_runtime::{AnvyxInline, function};
 
-#[derive(Clone, AnvyxInline)]
-struct Bad {
+#[derive(Clone, Copy, AnvyxInline)]
+pub struct Bad {
     #[anvyx(field)]
-    value: String,
+    pub value: String,
 }
 
 #[function]

@@ -57,6 +57,33 @@ impl Vec2 {
 }
 
 #[derive(Clone, Copy, AnvyxInline)]
+pub struct CloneValue {
+    value: i64,
+}
+
+#[methods]
+impl CloneValue {
+    #[anvyx(init)]
+    pub fn new(value: i64) -> Self {
+        Self { value }
+    }
+
+    #[anvyx(getter)]
+    pub fn value(&self) -> i64 {
+        self.value
+    }
+
+    #[anvyx(setter)]
+    pub fn set_value(&mut self, value: i64) {
+        self.value = value;
+    }
+
+    pub fn number(&self) -> i64 {
+        self.value
+    }
+}
+
+#[derive(Clone, Copy, AnvyxInline)]
 pub struct Camera {
     fov: f64,
 }
@@ -115,5 +142,5 @@ pub fn fov_of(camera: Camera) -> f64 {
 anvyx_runtime::builtin_module! {
     name: "host",
     source: "",
-    exports: [len2_of, fov_of, Vec2, Camera, Glyph],
+    exports: [len2_of, fov_of, Vec2, CloneValue, Camera, Glyph],
 }

@@ -1,6 +1,6 @@
 use anvyx_runtime::{AnvyxEnum, function};
 
-#[derive(Clone, AnvyxEnum)]
+#[derive(Clone, PartialEq, Eq, Hash, AnvyxEnum)]
 enum Bad {
     Value(String),
 }

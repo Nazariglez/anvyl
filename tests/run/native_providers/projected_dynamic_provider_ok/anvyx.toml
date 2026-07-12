@@ -1,0 +1,6 @@
+[project]
+name = "projected_dynamic_provider_game"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

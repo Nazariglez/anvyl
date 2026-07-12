@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: dynamic downcast execution is not lowered to the Rust backend yet
 // @match: 2
 
 contract Updatable {

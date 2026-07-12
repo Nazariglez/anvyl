@@ -1,26 +1,30 @@
+use anvyx_frontend::air;
+
 use super::{
     analysis,
     dataref_place::{DataRefPlaceDescriptor, DataRefPlaceDescriptors},
     native_call::{NativeArgAction, NativeCallPlan},
     place::RustPlaces,
-    rep_policy::{LambdaTraceAction, LambdaVariantLayout, RustRepPolicy, RustTracePlan},
+    rep_policy::{LambdaTraceAction, LambdaVariantLayout, RirRustRepPolicy, RustTracePlan},
     retained_callbacks::{RetainedCallbackEmitter, RetainedCallbackSigPlan},
     rir::{
         RirCallArg, RirCallTarget, RirCellDecl, RirCellLifetime, RirCellRef, RirCellStorage,
-        RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope, RirCollectionStorageKind,
-        RirCoreEnumKind, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirExternKind,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirIf,
-        RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
+        RirChild, RirCollectionAccess, RirCollectionFor, RirCollectionLoanScope,
+        RirCollectionStorageKind, RirDataRefId, RirDynCarrier, RirDynCarrierId, RirDynDispatchArm,
+        RirDynReceiver, RirDynStorage, RirDynVariantId, RirEnum, RirEnumId, RirEnumRepr,
+        RirExternKind, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
+        RirIf, RirIterCountCheck, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
         RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaId, RirLambdaSig,
         RirLambdaSigId, RirLambdaStorage, RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch,
         RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
         RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParamAbi, RirParamSemantic,
         RirPatternAlternative, RirPatternBinding, RirPatternBindingMode, RirPatternMatch,
         RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace, RirPlaceRoot, RirProgram,
-        RirProjection, RirRValue, RirRangeFor, RirRawEnumValue, RirScopedPlaceCellDecl,
-        RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram, native_arg_facts,
-        native_ty_is_resource_ref, stmt_child_blocks_any,
+        RirProjection, RirRValue, RirRangeFor, RirRawEnumValue, RirResolvedCallTarget,
+        RirScopedPlaceCellDecl, RirScopedPlaceCellRef, RirStmt, RirStructuredBlock, RirTerm,
+        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        native_arg_facts, native_dynamic_arg_facts, native_ty_is_resource_ref,
+        stmt_child_blocks_any,
     },
     runtime_owner::RuntimeOwnerEmit,
     syntax::{
@@ -69,6 +73,14 @@ pub fn emit(program: &VerifiedRirProgram<'_>) -> RustSource {
     cx.emit_program();
     RustSource::new(cx.w.finish())
 }
+
+struct ResolvedReceiver {
+    expr: String,
+    ty: RirTypeId,
+    semantic: RirParamSemantic,
+}
+
+type PreparedNativeArgs = (Vec<String>, Vec<String>, Vec<(String, String, bool)>);
 
 struct EmitCx<'a> {
     program: &'a RirProgram,
@@ -156,7 +168,7 @@ impl EmitCx<'_> {
     fn emit_ctx(&mut self) {
         let types = target::generated_types_symbol(&self.program.ctx);
         let globals = target::generated_globals_symbol(&self.program.ctx);
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let retained_sigs = &self.retained_callback_sigs;
         let mut heap_types = self
             .program
@@ -538,7 +550,7 @@ impl EmitCx<'_> {
                 w.line("runtime.with_entry(|anv_entry| {");
                 w.indented(|w| {
                     let rt = if self.program.globals.iter().any(|global| {
-                        RustRepPolicy::new(self.program).type_owns_heap_edges(global.ty)
+                        RirRustRepPolicy::new(self.program).type_owns_heap_edges(global.ty)
                     }) {
                         target::runtime_ctx_from_raw_with_trace_roots_and_safepoint(
                             "anv_entry.heap",
@@ -586,7 +598,7 @@ impl EmitCx<'_> {
 
     fn emit_dataref(&mut self, dataref: &super::rir::RirDataRef) {
         let storage = dataref.storage_symbol();
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let cx_dependent = policy.dataref_cx_dependent(dataref);
         let storage_lifetime = if cx_dependent { "<'cx>" } else { "" };
         let fields = dataref
@@ -642,7 +654,7 @@ impl EmitCx<'_> {
         w: &mut RustWriter,
         descriptor: &DataRefPlaceDescriptor,
     ) {
-        let policy = RustRepPolicy::new(program);
+        let policy = RirRustRepPolicy::new(program);
         let dataref = &program.datarefs[descriptor.dataref.index()];
         let storage = policy.dataref_storage_ty(dataref);
         let payload = policy.rust_ty(descriptor.ty);
@@ -657,7 +669,7 @@ impl EmitCx<'_> {
         w.blank();
         w.block(
             format_args!(
-                "impl<'cx> {} for {}<'cx>",
+                "unsafe impl<'cx> {} for {}<'cx>",
                 target::dataref_place_ops_ty(&payload),
                 descriptor.symbol
             ),
@@ -755,7 +767,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_lambda_env(&mut self, env: &RirLambdaEnvLayout) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let lifetime = if policy.lambda_env_cx_dependent(env) {
             "<'cx>"
         } else {
@@ -801,7 +813,7 @@ impl EmitCx<'_> {
             self.w.blank();
             return;
         }
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         self.emit_record_struct(
             strukt.symbol.as_str(),
             &strukt.fields,
@@ -812,7 +824,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_tuple(&mut self, tuple: &super::rir::RirTuple) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         self.emit_record_struct(
             tuple.symbol.as_str(),
             &tuple.fields,
@@ -839,7 +851,7 @@ impl EmitCx<'_> {
                 comma(derives.iter().map(|derive| (*derive).to_string()))
             ));
         }
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
         let fields = fields
             .iter()
@@ -855,7 +867,16 @@ impl EmitCx<'_> {
     }
 
     fn emit_enum(&mut self, enm: &RirEnum) {
-        let policy = RustRepPolicy::new(self.program);
+        if let Some(path) = &enm.native_path {
+            self.w.line(format_args!(
+                "type {} = {};",
+                enm.symbol.as_str(),
+                path.join("::")
+            ));
+            self.w.blank();
+            return;
+        }
+        let policy = RirRustRepPolicy::new(self.program);
         let cx_dependent = policy.enum_cx_dependent(enm);
         let needs_trace = self.trace_plan.needs_enum_trace(enm.id);
         let copy = enm.repr == RirEnumRepr::RawInt && !enm.variants.is_empty();
@@ -863,7 +884,7 @@ impl EmitCx<'_> {
         if needs_trace {
             self.w.line(target::trace_derive(&derives));
             self.w.line(target::trace_crate_attr(cx_dependent));
-        } else {
+        } else if !derives.is_empty() {
             self.w.line(format_args!(
                 "#[derive({})]",
                 comma(derives.iter().map(|derive| (*derive).to_string()))
@@ -871,6 +892,9 @@ impl EmitCx<'_> {
         }
         if copy {
             self.w.line("#[repr(i64)]");
+        }
+        if self.program.dyn_carrier_for_enum(enm.id).is_some() {
+            self.w.line(target::dynamic_carrier_repr_attr());
         }
         let lifetime = if cx_dependent { "<'cx>" } else { "" };
         let variants = enm
@@ -885,12 +909,18 @@ impl EmitCx<'_> {
                     format!("{}{raw},", variant.symbol.as_str())
                 }
                 RirVariantKind::Tuple => {
-                    let fields = comma(
-                        variant
-                            .fields
-                            .iter()
-                            .map(|field| policy.rust_storage_ty(field.ty)),
-                    );
+                    let dynamic = self
+                        .program
+                        .dyn_carrier_for_enum(enm.id)
+                        .and_then(|carrier| carrier.variants.get(variant.id.index()));
+                    let fields = comma(variant.fields.iter().map(|field| {
+                        let ty = policy.rust_storage_ty(field.ty);
+                        if dynamic.is_some_and(|variant| variant.storage == RirDynStorage::Boxed) {
+                            format!("Box<{ty}>")
+                        } else {
+                            ty
+                        }
+                    }));
                     format!("{}({fields}),", variant.symbol.as_str())
                 }
                 RirVariantKind::Struct => {
@@ -909,7 +939,168 @@ impl EmitCx<'_> {
                 }
             },
         );
+        if let Some(carrier) = self.program.dyn_carrier_for_enum(enm.id) {
+            let function = &self.program.functions[0];
+            let values = RustValues::new(self.program, function);
+            let arms = carrier.variants.iter().map(|variant| {
+                let rir_variant = &enm.variants[variant.id.index()];
+                let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+                let source = if variant.storage == RirDynStorage::Boxed {
+                    "payload.as_ref()"
+                } else {
+                    "payload"
+                };
+                let payload =
+                    values.dyn_payload_from_ref(variant.concrete_ty, variant.payload, source);
+                let payload = if variant.storage == RirDynStorage::Boxed {
+                    format!("Box::new({payload})")
+                } else {
+                    payload
+                };
+                format!("{path}(payload) => {path}({payload})")
+            });
+            self.w.block(
+                format_args!("impl{lifetime} Clone for {}{lifetime}", enm.symbol.as_str()),
+                |w| {
+                    w.block("fn clone(&self) -> Self", |w| {
+                        w.line(match_expr("self", arms));
+                    });
+                },
+            );
+            if self.dyn_borrow_carrier_used(carrier) {
+                self.emit_dyn_borrow_descriptor(carrier, enm);
+            }
+        }
         self.w.blank();
+    }
+
+    fn dyn_borrow_carrier_used(&self, carrier: &RirDynCarrier) -> bool {
+        self.program.functions.iter().any(|function| {
+            function
+                .params
+                .iter()
+                .any(|param| param.abi == RirParamAbi::DynBorrow && param.ty == carrier.storage_ty)
+        })
+    }
+
+    fn emit_dyn_borrow_descriptor(&mut self, carrier: &RirDynCarrier, enm: &RirEnum) {
+        let policy = RirRustRepPolicy::new(self.program);
+        let symbol = self.program.dyn_borrow_symbol(carrier.id);
+        let weakenings = self
+            .program
+            .dyn_weakenings
+            .iter()
+            .filter(|w| w.target == carrier.id)
+            .collect::<Vec<_>>();
+        let mut variants = carrier
+            .variants
+            .iter()
+            .map(|variant| {
+                let name = enm.variants[variant.id.index()].symbol.as_str();
+                let ty = policy.rust_ty(variant.concrete_ty);
+                format!("{name}({}<'place, 'cx, {ty}>),", target::mut_place_ty())
+            })
+            .collect::<Vec<_>>();
+        variants.push(format!(
+            "Owned({}<'place, 'cx, {}>),",
+            target::mut_place_ty(),
+            policy.rust_ty(carrier.storage_ty)
+        ));
+        for weakening in &weakenings {
+            let source = &self.program.dyn_carriers[weakening.source.index()];
+            variants.push(format!(
+                "OwnedFrom{}({}<'place, 'cx, {}>),",
+                source.id.index(),
+                target::mut_place_ty(),
+                policy.rust_ty(source.storage_ty)
+            ));
+        }
+        self.w.block(format!("enum {symbol}<'place, 'cx>"), |w| {
+            for variant in &variants {
+                w.line(variant);
+            }
+        });
+
+        let mut reborrow_arms = carrier
+            .variants
+            .iter()
+            .map(|variant| {
+                let name = enm.variants[variant.id.index()].symbol.as_str();
+                format!("Self::{name}(place) => {symbol}::{name}(place.reborrow())")
+            })
+            .collect::<Vec<_>>();
+        reborrow_arms.push(format!(
+            "Self::Owned(place) => {symbol}::Owned(place.reborrow())"
+        ));
+        for weakening in &weakenings {
+            let source = weakening.source.index();
+            reborrow_arms.push(format!(
+                "Self::OwnedFrom{source}(place) => {symbol}::OwnedFrom{source}(place.reborrow())"
+            ));
+        }
+
+        let methods = weakenings
+            .iter()
+            .filter(|weakening| {
+                self.dyn_borrow_carrier_used(&self.program.dyn_carriers[weakening.source.index()])
+            })
+            .map(|weakening| self.dyn_borrow_weaken_method(weakening, enm, &symbol))
+            .collect::<Vec<_>>();
+        self.w
+            .block(format!("impl<'place, 'cx> {symbol}<'place, 'cx>"), |w| {
+                w.block(
+                    format!("fn reborrow(&mut self) -> {symbol}<'_, 'cx>"),
+                    |w| w.line(match_expr("self", reborrow_arms)),
+                );
+                for (header, body) in &methods {
+                    w.block(header, |w| w.line(body));
+                }
+            });
+    }
+
+    fn dyn_borrow_weaken_method(
+        &self,
+        weakening: &super::rir::RirDynWeakening,
+        target_enum: &RirEnum,
+        target_symbol: &str,
+    ) -> (String, String) {
+        let source = &self.program.dyn_carriers[weakening.source.index()];
+        let source_symbol = self.program.dyn_borrow_symbol(source.id);
+        let RirType::Enum(source_enum) = self.program.types[source.storage_ty.index()] else {
+            unreachable!("verified dynamic carrier storage")
+        };
+        let source_enum = &self.program.enums[source_enum.index()];
+        let mut arms = weakening
+            .arms
+            .iter()
+            .map(|arm| {
+                let source_name = source_enum.variants[arm.source.index()].symbol.as_str();
+                let target_name = target_enum.variants[arm.target.index()].symbol.as_str();
+                format!(
+                    "{source_symbol}::{source_name}(place) => {target_symbol}::{target_name}(place.reborrow())"
+                )
+            })
+            .collect::<Vec<_>>();
+        arms.push(format!(
+            "{source_symbol}::Owned(place) => {target_symbol}::OwnedFrom{}(place.reborrow())",
+            source.id.index()
+        ));
+        for ancestor in self
+            .program
+            .dyn_weakenings
+            .iter()
+            .filter(|candidate| candidate.target == source.id)
+        {
+            let ancestor = ancestor.source.index();
+            arms.push(format!(
+                "{source_symbol}::OwnedFrom{ancestor}(place) => {target_symbol}::OwnedFrom{ancestor}(place.reborrow())"
+            ));
+        }
+        let header = format!(
+            "fn weaken_from_{}<'borrow>(source: &'borrow mut {source_symbol}<'_, 'cx>) -> {target_symbol}<'borrow, 'cx>",
+            source.id.index()
+        );
+        (header, match_expr("source", arms))
     }
 
     fn emit_stringify_helper(&mut self, helper: &super::rir::RirStringifyHelper) {
@@ -990,7 +1181,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_lambda_sig(&mut self, sig: &RirLambdaSig) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let layout = policy.lambda_sig_layout(sig.id);
         let symbol = policy.lambda_sig_symbol(sig.id);
         let retained_callbacks = self.has_retained_callbacks();
@@ -1195,7 +1386,7 @@ impl EmitCx<'_> {
         sig: RirLambdaSigId,
         variants: &[LambdaVariantLayout<'_>],
     ) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let symbol = policy.lambda_sig_symbol(sig);
         let lifetime = policy.lambda_sig_impl_generics(sig);
         let ty = format!("{symbol}{lifetime}");
@@ -1255,7 +1446,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_scoped_lambda_thunk(&mut self, sig: &RirLambdaSig, fallible: bool) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let symbol = policy.lambda_sig_symbol(sig.id);
         let lifetime = policy.lambda_sig_impl_generics(sig.id);
         let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig.id);
@@ -1371,7 +1562,7 @@ impl EmitCx<'_> {
     }
 
     fn lambda_sig_ret_ty(&self, sig: &RirLambdaSig, fallible: bool) -> String {
-        let ret = RustRepPolicy::new(self.program).callable_ret_ty(sig.ret);
+        let ret = RirRustRepPolicy::new(self.program).callable_ret_ty(sig.ret);
         if !fallible {
             return ret;
         }
@@ -1384,7 +1575,7 @@ impl EmitCx<'_> {
 
     fn emit_function(&mut self, function: &RirFunction) {
         let ctx_use = analysis::function_context_use(self.program, function);
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let retained_callbacks = self.has_retained_callbacks();
         let mut params = vec![
             format!(
@@ -1422,12 +1613,13 @@ impl EmitCx<'_> {
         }
         params.extend(function.params.iter().map(|param| {
             let local = &function.locals[param.local.index()];
-            let mutability =
-                if param.abi == RirParamAbi::MutPlace || self.local_needs_mut_binding(local.ty) {
-                    "mut "
-                } else {
-                    ""
-                };
+            let mutability = if matches!(param.abi, RirParamAbi::MutPlace | RirParamAbi::DynBorrow)
+                || self.local_needs_mut_binding(local.ty)
+            {
+                "mut "
+            } else {
+                ""
+            };
             format!(
                 "{mutability}{}: {}",
                 local.symbol.as_str(),
@@ -1457,6 +1649,7 @@ impl EmitCx<'_> {
                         | RirStmt::CollectionLoanScope(_)
                         | RirStmt::CollectionSlotScope(_)
                         | RirStmt::PatternMatch(_)
+                        | RirStmt::DynMatch(_)
                         | RirStmt::OptionMatch(_)
                         | RirStmt::MapEntryMatch(_)
                 )
@@ -1478,7 +1671,7 @@ impl EmitCx<'_> {
     }
 
     fn function_ret_ty(&self, function: &RirFunction) -> String {
-        let ret = RustRepPolicy::new(self.program).callable_ret_ty(function.ret.ty);
+        let ret = RirRustRepPolicy::new(self.program).callable_ret_ty(function.ret.ty);
         if !self.fallible_functions[function.id.index()] {
             return ret;
         }
@@ -1506,7 +1699,7 @@ impl EmitCx<'_> {
     }
 
     fn emit_local_declarations(&mut self, function: &RirFunction) {
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         for cell in
             self.program.cells.iter().filter(|cell| {
                 cell.owner == function.id && cell.lifetime == RirCellLifetime::Function
@@ -1721,6 +1914,9 @@ impl EmitCx<'_> {
             }
             RirStmt::PatternMatch(match_) => {
                 self.emit_pattern_match(function, index, match_, predeclared);
+            }
+            RirStmt::DynMatch(match_) => {
+                self.emit_dyn_match(function, index, match_, predeclared);
             }
             RirStmt::OptionMatch(match_) => {
                 self.emit_option_match(function, index, match_, predeclared);
@@ -2444,6 +2640,439 @@ impl EmitCx<'_> {
         self.w.line(format_args!("drop({guard});"));
     }
 
+    fn emit_dyn_match(
+        &mut self,
+        function: &RirFunction,
+        index: usize,
+        match_: &super::rir::RirDynMatch,
+        predeclared: bool,
+    ) {
+        let match_source = match &match_.source {
+            super::rir::RirDynMatchSource::MutPlace(source) => source,
+            super::rir::RirDynMatchSource::Borrowed(borrow) => {
+                self.emit_borrowed_dyn_match(function, match_, borrow, predeclared);
+                return;
+            }
+            super::rir::RirDynMatchSource::Owned { .. } => {
+                self.emit_owned_dyn_match(function, match_, predeclared);
+                return;
+            }
+        };
+        let (prelude, source) =
+            self.prepared_escaping_payload_place_arg(function, index, match_source);
+        for line in prelude {
+            self.w.line(line);
+        }
+        let source_local = format!("__anv_dyn_match_source_{index}");
+        self.w.line(format!("let mut {source_local} = {source};"));
+        let source = format!("{source_local}.reborrow()");
+        let carrier = &self.program.dyn_carriers[match_.carrier.index()];
+        let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+            unreachable!("verified dynamic match carrier")
+        };
+        let enm = &self.program.enums[id.index()];
+        for (arm_index, arm) in match_.arms.iter().enumerate() {
+            let patterns = arm.variants.iter().map(|variant| {
+                let variant = &enm.variants[variant.index()];
+                format!(
+                    "{}(..)",
+                    variant_path(enm.symbol.as_str(), variant.symbol.as_str())
+                )
+            });
+            let patterns = patterns.collect::<Vec<_>>();
+            let test_body = if patterns.is_empty() {
+                "Ok(false)".to_string()
+            } else {
+                format!("Ok(matches!(value, {}))", patterns.join(" | "))
+            };
+            let test = target::mut_place_access(&source, target::runtime_param_name(), &test_body);
+            let branch = if arm_index == 0 { "if" } else { "else if" };
+            self.w.line(format!("{branch} {test} {{"));
+            self.indented(|this| {
+                if let super::rir::RirDynMatchBinding::Alias(binding) = arm.binding {
+                    let ops = format!("__AnvDynPayloadOps_{index}_{arm_index}");
+                    let descriptor = RustValues::new(this.program, function)
+                        .dyn_payload_projection_descriptor(
+                            &ops,
+                            match_.carrier,
+                            &arm.variants,
+                            arm.target,
+                        );
+                    this.w.line(descriptor.struct_decl);
+                    this.w.line(descriptor.impl_decl);
+                    let binding = &function.locals[binding.index()];
+                    this.w.line(format!(
+                        "let {} = {};",
+                        binding.symbol.as_str(),
+                        target::scoped_mut_place_cell_new(
+                            &target::mut_place_projected(&source, &format!("&{}", descriptor.ctor)),
+                            &target::runtime_safepoint_state("rt"),
+                        )
+                    ));
+                }
+                this.emit_structured_block(function, &arm.block, predeclared);
+            });
+            self.w.line("}");
+        }
+        let emit_fallback = |this: &mut Self| {
+            if let Some(binding) = match_.fallback_binding {
+                let binding = &function.locals[binding.index()];
+                this.w.line(format!(
+                    "let {} = {};",
+                    binding.symbol.as_str(),
+                    target::scoped_mut_place_cell_new(
+                        &format!("{source_local}.reborrow()"),
+                        &target::runtime_safepoint_state("rt"),
+                    )
+                ));
+            }
+            this.emit_structured_block(function, &match_.fallback, predeclared);
+        };
+        if match_.arms.is_empty() {
+            emit_fallback(self);
+        } else {
+            self.w.line("else {");
+            self.indented(emit_fallback);
+            self.w.line("}");
+        }
+    }
+
+    fn emit_borrowed_dyn_match(
+        &mut self,
+        function: &RirFunction,
+        match_: &super::rir::RirDynMatch,
+        borrow: &super::rir::RirDynBorrow,
+        predeclared: bool,
+    ) {
+        let super::rir::RirDynBorrowSource::Borrowed { local, carrier } = borrow.source else {
+            unreachable!("dynamic match borrowed parameter root")
+        };
+        debug_assert_eq!(carrier, match_.carrier);
+        let carrier = &self.program.dyn_carriers[carrier.index()];
+        let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+            unreachable!("verified dynamic match carrier")
+        };
+        let enm = &self.program.enums[id.index()];
+        let symbol = self.program.dyn_borrow_symbol(carrier.id);
+        let local = function.locals[local.index()].symbol.as_str();
+        self.w.line(format!("match &mut {local} {{"));
+        for variant in &carrier.variants {
+            let name = enm.variants[variant.id.index()].symbol.as_str();
+            self.indented(|this| {
+                this.w.line(format!("{symbol}::{name}(place) => {{"));
+                this.indented(|this| {
+                    if let Some(arm) = match_
+                        .arms
+                        .iter()
+                        .find(|arm| arm.variants.contains(&variant.id))
+                    {
+                        match arm.binding {
+                            super::rir::RirDynMatchBinding::Alias(binding) => {
+                                let binding = &function.locals[binding.index()];
+                                this.w.line(format!(
+                                    "let {} = {};",
+                                    binding.symbol.as_str(),
+                                    target::scoped_mut_place_cell_new(
+                                        &target::mut_place_reborrow("place"),
+                                        &target::runtime_safepoint_state("rt"),
+                                    )
+                                ));
+                            }
+                            super::rir::RirDynMatchBinding::Owned(binding) => {
+                                let binding = &function.locals[binding.index()];
+                                let payload = RustValues::new(this.program, function)
+                                    .dyn_payload_from_ref(
+                                        variant.concrete_ty,
+                                        variant.payload,
+                                        "value",
+                                    );
+                                let value = target::mut_place_access(
+                                    &target::mut_place_reborrow("place"),
+                                    target::runtime_param_name(),
+                                    &format!("Ok({payload})"),
+                                );
+                                this.w
+                                    .line(format!("{} = {value};", binding.symbol.as_str()));
+                            }
+                            super::rir::RirDynMatchBinding::Discard => {}
+                        }
+                        this.emit_structured_block(function, &arm.block, predeclared);
+                    } else {
+                        this.emit_borrowed_dyn_fallback(
+                            function,
+                            match_,
+                            &format!("{symbol}::{name}(place.reborrow())"),
+                            predeclared,
+                        );
+                    }
+                });
+                this.w.line("}");
+            });
+        }
+        self.emit_borrowed_owned_match_arm(
+            function,
+            match_,
+            carrier,
+            &format!("{symbol}::Owned"),
+            predeclared,
+        );
+        for weakening in self
+            .program
+            .dyn_weakenings
+            .iter()
+            .filter(|w| w.target == carrier.id)
+        {
+            let source = &self.program.dyn_carriers[weakening.source.index()];
+            self.emit_borrowed_owned_match_arm(
+                function,
+                match_,
+                source,
+                &format!("{symbol}::OwnedFrom{}", source.id.index()),
+                predeclared,
+            );
+        }
+        self.w.line("}");
+    }
+
+    fn emit_borrowed_owned_match_arm(
+        &mut self,
+        function: &RirFunction,
+        match_: &super::rir::RirDynMatch,
+        source: &RirDynCarrier,
+        pattern: &str,
+        predeclared: bool,
+    ) {
+        self.indented(|this| {
+            this.w.line(format!("{pattern}(place) => {{"));
+            this.indented(|this| {
+                let source_local = "__anv_borrowed_dyn_match_source";
+                this.w
+                    .line(format!("let mut {source_local} = place.reborrow();"));
+                let RirType::Enum(id) = this.program.types[source.storage_ty.index()] else {
+                    unreachable!("verified dynamic match source carrier")
+                };
+                let enm = &this.program.enums[id.index()];
+                let supported = match_
+                    .arms
+                    .iter()
+                    .filter_map(|arm| {
+                        let variants = source
+                            .variants
+                            .iter()
+                            .filter(|variant| variant.concrete_ty == arm.target)
+                            .map(|variant| variant.id)
+                            .collect::<Vec<_>>();
+                        (!variants.is_empty()).then_some((arm, variants))
+                    })
+                    .collect::<Vec<_>>();
+                for (index, (arm, variants)) in supported.iter().enumerate() {
+                    let patterns = variants
+                        .iter()
+                        .map(|variant| {
+                            let variant = &enm.variants[variant.index()];
+                            format!(
+                                "{}(..)",
+                                variant_path(enm.symbol.as_str(), variant.symbol.as_str())
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let test = target::mut_place_access(
+                        &format!("{source_local}.reborrow()"),
+                        target::runtime_param_name(),
+                        &format!("Ok(matches!(value, {}))", patterns.join(" | ")),
+                    );
+                    let branch = if index == 0 { "if" } else { "else if" };
+                    this.w.line(format!("{branch} {test} {{"));
+                    this.indented(|this| {
+                        if !matches!(arm.binding, super::rir::RirDynMatchBinding::Discard) {
+                            let ops = format!(
+                                "__AnvBorrowedDynPayloadOps_{}_{}",
+                                source.id.index(),
+                                index
+                            );
+                            let values = RustValues::new(this.program, function);
+                            let descriptor = values.dyn_payload_projection_descriptor(
+                                &ops, source.id, variants, arm.target,
+                            );
+                            this.w.line(descriptor.struct_decl);
+                            this.w.line(descriptor.impl_decl);
+                            let projected = target::mut_place_projected(
+                                &target::mut_place_reborrow(source_local),
+                                &format!("&{}", descriptor.ctor),
+                            );
+                            match arm.binding {
+                                super::rir::RirDynMatchBinding::Alias(binding) => {
+                                    let binding = &function.locals[binding.index()];
+                                    this.w.line(format!(
+                                        "let {} = {};",
+                                        binding.symbol.as_str(),
+                                        target::scoped_mut_place_cell_new(
+                                            &projected,
+                                            &target::runtime_safepoint_state("rt"),
+                                        )
+                                    ));
+                                }
+                                super::rir::RirDynMatchBinding::Owned(binding) => {
+                                    let variant = &source.variants[variants[0].index()];
+                                    debug_assert!(variants.iter().all(|id| {
+                                        source.variants[id.index()].payload == variant.payload
+                                    }));
+                                    let binding = &function.locals[binding.index()];
+                                    let payload = values.dyn_payload_from_ref(
+                                        arm.target,
+                                        variant.payload,
+                                        "value",
+                                    );
+                                    let value = target::mut_place_access(
+                                        &projected,
+                                        target::runtime_param_name(),
+                                        &format!("Ok({payload})"),
+                                    );
+                                    this.w
+                                        .line(format!("{} = {value};", binding.symbol.as_str()));
+                                }
+                                super::rir::RirDynMatchBinding::Discard => unreachable!(),
+                            }
+                        }
+                        this.emit_structured_block(function, &arm.block, predeclared);
+                    });
+                    this.w.line("}");
+                }
+                let emit_fallback = |this: &mut Self| {
+                    let target_symbol = this.program.dyn_borrow_symbol(match_.carrier);
+                    let constructor = if source.id == match_.carrier {
+                        format!("{target_symbol}::Owned({source_local}.reborrow())")
+                    } else {
+                        format!(
+                            "{target_symbol}::OwnedFrom{}({source_local}.reborrow())",
+                            source.id.index()
+                        )
+                    };
+                    this.emit_borrowed_dyn_fallback(function, match_, &constructor, predeclared);
+                };
+                if supported.is_empty() {
+                    emit_fallback(this);
+                } else {
+                    this.w.line("else {");
+                    this.indented(emit_fallback);
+                    this.w.line("}");
+                }
+            });
+            this.w.line("}");
+        });
+    }
+
+    fn emit_borrowed_dyn_fallback(
+        &mut self,
+        function: &RirFunction,
+        match_: &super::rir::RirDynMatch,
+        descriptor: &str,
+        predeclared: bool,
+    ) {
+        if let Some(binding) = match_.fallback_binding {
+            let binding = &function.locals[binding.index()];
+            self.w.line(format!(
+                "let mut {} = {descriptor};",
+                binding.symbol.as_str()
+            ));
+        }
+        self.emit_structured_block(function, &match_.fallback, predeclared);
+    }
+
+    fn emit_owned_dyn_match(
+        &mut self,
+        function: &RirFunction,
+        match_: &super::rir::RirDynMatch,
+        predeclared: bool,
+    ) {
+        let super::rir::RirDynMatchSource::Owned { value, air_use, .. } = &match_.source else {
+            unreachable!("checked by caller")
+        };
+        let carrier = &self.program.dyn_carriers[match_.carrier.index()];
+        let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+            unreachable!("verified dynamic match carrier")
+        };
+        let enm = &self.program.enums[id.index()];
+        let values = RustValues::new(self.program, function);
+        let source = values.operand(value);
+        let source = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+            source
+        } else {
+            format!("&{source}")
+        };
+        self.w.line(format!("match {source} {{"));
+        for variant in &carrier.variants {
+            let rir_variant = &enm.variants[variant.id.index()];
+            let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+            let arm = match_
+                .arms
+                .iter()
+                .find(|arm| arm.variants.contains(&variant.id));
+            self.indented(|this| {
+                this.w.line(format!("{path}(payload) => {{"));
+                this.indented(|this| {
+                    if let Some(arm) = arm {
+                        if let super::rir::RirDynMatchBinding::Owned(binding) = arm.binding {
+                            let binding = &function.locals[binding.index()];
+                            let payload = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                                if variant.storage == RirDynStorage::Boxed {
+                                    "*payload".to_string()
+                                } else {
+                                    "payload".to_string()
+                                }
+                            } else {
+                                let payload = if variant.storage == RirDynStorage::Boxed {
+                                    "payload.as_ref()"
+                                } else {
+                                    "payload"
+                                };
+                                values.dyn_payload_from_ref(
+                                    variant.concrete_ty,
+                                    variant.payload,
+                                    payload,
+                                )
+                            };
+                            this.w
+                                .line(format!("let {} = {payload};", binding.symbol.as_str()));
+                        }
+                        this.emit_structured_block(function, &arm.block, predeclared);
+                    } else {
+                        if let Some(binding) = match_.fallback_binding {
+                            let binding = &function.locals[binding.index()];
+                            let payload = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                                "payload".to_string()
+                            } else {
+                                let payload = if variant.storage == RirDynStorage::Boxed {
+                                    "payload.as_ref()"
+                                } else {
+                                    "payload"
+                                };
+                                let payload = values.dyn_payload_from_ref(
+                                    variant.concrete_ty,
+                                    variant.payload,
+                                    payload,
+                                );
+                                if variant.storage == RirDynStorage::Boxed {
+                                    format!("Box::new({payload})")
+                                } else {
+                                    payload
+                                }
+                            };
+                            this.w.line(format!(
+                                "let {} = {};",
+                                binding.symbol.as_str(),
+                                tuple_variant(&path, [payload])
+                            ));
+                        }
+                        this.emit_structured_block(function, &match_.fallback, predeclared);
+                    }
+                });
+                this.w.line("}");
+            });
+        }
+        self.w.line("}");
+    }
+
     fn emit_option_match(
         &mut self,
         function: &RirFunction,
@@ -2542,7 +3171,6 @@ impl EmitCx<'_> {
             self.indented(|this| {
                 this.emit_structured_block(function, &match_.none_block, predeclared);
             });
-            self.w.line("}");
             self.emit_mut_place_option_some(function, index, match_, predeclared, &mut_place.1);
         } else {
             self.w.line(format_args!("if {is_some} {{"));
@@ -2722,13 +3350,662 @@ impl EmitCx<'_> {
         }
     }
 
+    fn dyn_call(
+        &self,
+        function: &RirFunction,
+        carrier: RirDynCarrierId,
+        receiver: &RirDynReceiver,
+        exact_variant: Option<RirDynVariantId>,
+        args: &[RirCallArg],
+        arms: &[RirDynDispatchArm],
+    ) -> String {
+        if let RirDynReceiver::MutPlace(place) = receiver {
+            return self.dyn_mut_call(function, carrier, place, args, arms);
+        }
+        if let RirDynReceiver::Borrowed(borrow) = receiver {
+            return self.dyn_borrowed_call(function, carrier, borrow, args, arms);
+        }
+        let carrier = &self.program.dyn_carriers[carrier.index()];
+        let RirType::Enum(enum_id) = self.program.types[carrier.storage_ty.index()] else {
+            unreachable!("verified dynamic carrier storage")
+        };
+        let enm = &self.program.enums[enum_id.index()];
+        let values = RustValues::new(self.program, function);
+        let (receiver, consume) = match receiver {
+            RirDynReceiver::Owned { value, consume } => (values.operand(value), *consume),
+            RirDynReceiver::Borrowed(_) => unreachable!(),
+            RirDynReceiver::MutPlace(_) => {
+                unreachable!("readonly dynamic dispatch excludes mutable receivers")
+            }
+        };
+        let arms = arms
+            .iter()
+            .filter(|arm| exact_variant.is_none_or(|variant| arm.variant == variant))
+            .map(|arm| {
+                let variant = &carrier.variants[arm.variant.index()];
+                let rir_variant = &enm.variants[arm.variant.index()];
+                let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+                let payload = match (variant.storage, consume) {
+                    (RirDynStorage::Boxed, true) => "(*payload)".to_string(),
+                    (RirDynStorage::Boxed, false) => "payload.as_ref()".to_string(),
+                    (RirDynStorage::Inline, _) => "payload".to_string(),
+                };
+                let (target, receiver, receiver_ty) =
+                    self.dyn_projected_target(&arm.target, payload, variant.concrete_ty, !consume);
+                let receiver = match (arm.receiver, consume) {
+                    (RirParamAbi::Value, true) | (RirParamAbi::SharedBorrow, false) => receiver,
+                    (RirParamAbi::Value, false) => values.value_from_ref(receiver_ty, &receiver),
+                    (RirParamAbi::SharedBorrow, true) => format!("&{receiver}"),
+                    _ => unreachable!("verified readonly dynamic receiver ABI"),
+                };
+                let call_args = self.dyn_call_args(target, args);
+                let call = self.resolved_call_expr(
+                    function,
+                    target,
+                    &call_args,
+                    Some(ResolvedReceiver {
+                        expr: receiver,
+                        ty: receiver_ty,
+                        semantic: Self::param_abi_semantic(arm.receiver),
+                    }),
+                );
+                (path, call)
+            })
+            .collect::<Vec<_>>();
+        let subject = if consume {
+            receiver
+        } else {
+            format!("&{receiver}")
+        };
+        if exact_variant.is_some() {
+            let (path, call) = arms
+                .first()
+                .expect("verified exact dynamic variant has a dispatch arm");
+            return format!(
+                "{{ let {path}(payload) = {subject} else {{ unreachable!(\"verified exact dynamic witness\") }}; {call} }}"
+            );
+        }
+        match_expr(
+            &subject,
+            arms.into_iter()
+                .map(|(path, call)| format!("{path}(payload) => {call}")),
+        )
+    }
+
+    fn dyn_call_args(
+        &self,
+        target: &RirResolvedCallTarget,
+        args: &[RirCallArg],
+    ) -> Vec<RirCallArg> {
+        let semantics = match target.base() {
+            RirResolvedCallTarget::Function(id) => self.program.functions[id.index()]
+                .params
+                .iter()
+                .skip(1)
+                .map(|param| param.semantic)
+                .collect::<Vec<_>>(),
+            RirResolvedCallTarget::Extern(id) => self.program.externs[id.index()]
+                .params
+                .iter()
+                .skip(1)
+                .map(|param| param.semantic)
+                .collect::<Vec<_>>(),
+            RirResolvedCallTarget::Promoted { .. } => unreachable!(),
+        };
+        semantics
+            .into_iter()
+            .zip(args)
+            .map(|(semantic, arg)| {
+                arg.adapted_to(semantic, self.program)
+                    .expect("verified dynamic call argument adaptation")
+            })
+            .collect()
+    }
+
+    fn dyn_borrowed_call(
+        &self,
+        function: &RirFunction,
+        carrier_id: RirDynCarrierId,
+        borrow: &super::rir::RirDynBorrow,
+        args: &[RirCallArg],
+        arms: &[RirDynDispatchArm],
+    ) -> String {
+        debug_assert_eq!(borrow.target, carrier_id);
+        let (super::rir::RirDynBorrowSource::Borrowed { local, carrier }
+        | super::rir::RirDynBorrowSource::Reborrowed { local, carrier }) = borrow.source
+        else {
+            unreachable!("dynamic borrowed receiver must be a descriptor root")
+        };
+        debug_assert_eq!(carrier, carrier_id);
+        let readonly = arms
+            .first()
+            .expect("verified dynamic dispatch arm")
+            .receiver
+            .is_readonly_receiver();
+        debug_assert!(
+            arms.iter()
+                .all(|arm| arm.receiver.is_readonly_receiver() == readonly)
+        );
+        self.dyn_borrowed_dispatch(function, carrier_id, local, args, arms, readonly)
+    }
+
+    fn dyn_borrowed_dispatch(
+        &self,
+        function: &RirFunction,
+        carrier_id: RirDynCarrierId,
+        local: RirLocalId,
+        args: &[RirCallArg],
+        arms: &[RirDynDispatchArm],
+        readonly: bool,
+    ) -> String {
+        let carrier = &self.program.dyn_carriers[carrier_id.index()];
+        let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+            unreachable!("verified dynamic carrier storage")
+        };
+        let enm = &self.program.enums[id.index()];
+        let symbol = self.program.dyn_borrow_symbol(carrier_id);
+        let mut dispatch = arms
+            .iter()
+            .map(|arm| {
+                let variant = &carrier.variants[arm.variant.index()];
+                let name = enm.variants[arm.variant.index()].symbol.as_str();
+                let receiver = target::mut_place_reborrow("place");
+                let call = if readonly {
+                    self.dyn_readonly_concrete_call(function, variant, arm, args, &receiver)
+                } else {
+                    self.dyn_concrete_descriptor_call(function, variant, arm, args, &receiver)
+                };
+                format!("{symbol}::{name}(place) => {call}")
+            })
+            .collect::<Vec<_>>();
+        dispatch.push(format!(
+            "{symbol}::Owned(place) => {}",
+            self.dyn_borrowed_carrier_call(function, carrier_id, arms, args, "place", readonly)
+        ));
+        for weakening in self
+            .program
+            .dyn_weakenings
+            .iter()
+            .filter(|weakening| weakening.target == carrier_id)
+        {
+            let source_arms = weakening
+                .arms
+                .iter()
+                .map(|map| {
+                    let mut arm = arms
+                        .iter()
+                        .find(|arm| arm.variant == map.target)
+                        .expect("verified weakened dispatch arm")
+                        .clone();
+                    arm.variant = map.source;
+                    arm
+                })
+                .collect::<Vec<_>>();
+            dispatch.push(format!(
+                "{symbol}::OwnedFrom{}(place) => {}",
+                weakening.source.index(),
+                self.dyn_borrowed_carrier_call(
+                    function,
+                    weakening.source,
+                    &source_arms,
+                    args,
+                    "place",
+                    readonly,
+                )
+            ));
+        }
+        let local = function.locals[local.index()].symbol.as_str();
+        match_expr(&format!("&mut {local}"), dispatch)
+    }
+
+    fn dyn_borrowed_carrier_call(
+        &self,
+        function: &RirFunction,
+        carrier: RirDynCarrierId,
+        arms: &[RirDynDispatchArm],
+        args: &[RirCallArg],
+        place: &str,
+        readonly: bool,
+    ) -> String {
+        let carrier_decl = &self.program.dyn_carriers[carrier.index()];
+        let values = RustValues::new(self.program, function);
+        self.dyn_carrier_descriptor_dispatch(carrier, arms, place, |arm| {
+            if !readonly {
+                return self.dyn_mut_descriptor_call(function, carrier, arm, args);
+            }
+            let variant = &carrier_decl.variants[arm.variant.index()];
+            let payload = values.dyn_payload_projection_descriptor(
+                "__AnvDynPayloadOps",
+                carrier,
+                &[arm.variant],
+                variant.concrete_ty,
+            );
+            let root = target::mut_place_reborrow("__anv_carrier_place");
+            let receiver = target::mut_place_projected(&root, "&__anv_payload_ops");
+            let call = self.dyn_readonly_concrete_call(function, variant, arm, args, &receiver);
+            block_expr(
+                [
+                    payload.struct_decl,
+                    payload.impl_decl,
+                    format!("let __anv_payload_ops = {};", payload.ctor),
+                ],
+                Some(call),
+            )
+        })
+    }
+
+    fn dyn_carrier_descriptor_dispatch(
+        &self,
+        carrier: RirDynCarrierId,
+        arms: &[RirDynDispatchArm],
+        place: &str,
+        mut render: impl FnMut(&RirDynDispatchArm) -> String,
+    ) -> String {
+        let carrier_decl = &self.program.dyn_carriers[carrier.index()];
+        let RirType::Enum(id) = self.program.types[carrier_decl.storage_ty.index()] else {
+            unreachable!("verified dynamic carrier storage")
+        };
+        let enm = &self.program.enums[id.index()];
+        let tag = match_expr(
+            "value",
+            arms.iter().enumerate().map(|(index, arm)| {
+                let variant = &enm.variants[arm.variant.index()];
+                let path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
+                format!("{path}(..) => {index}")
+            }),
+        );
+        let probe = target::mut_place_reborrow("__anv_carrier_place");
+        let stmts = [
+            format!("let mut __anv_carrier_root = {place};"),
+            format!(
+                "let mut __anv_carrier_place = {};",
+                target::mut_place_reborrow("__anv_carrier_root")
+            ),
+            format!(
+                "let __anv_variant = {};",
+                target::mut_place_access_ctx(
+                    &probe,
+                    target::runtime_param_name(),
+                    &format!("{{ let _ = rt; Ok({tag}) }}"),
+                )
+            ),
+        ];
+        let dispatch = arms
+            .iter()
+            .enumerate()
+            .map(|(index, arm)| format!("{index} => {}", render(arm)))
+            .chain(std::iter::once(
+                "_ => unreachable!(\"verified dynamic dispatch tag\")".to_string(),
+            ));
+        block_expr(stmts, Some(match_expr("__anv_variant", dispatch)))
+    }
+
+    fn dyn_concrete_receiver<'a>(
+        &self,
+        function: &RirFunction,
+        target: &'a RirResolvedCallTarget,
+        concrete_ty: RirTypeId,
+        receiver: &str,
+    ) -> (&'a RirResolvedCallTarget, RirTypeId, Vec<String>) {
+        let (target, fields, receiver_ty) = self.dyn_mut_projected_target(target, concrete_ty);
+        let mut stmts = vec![format!("let mut __anv_receiver = {receiver};")];
+        if fields.is_empty() {
+            return (target, receiver_ty, stmts);
+        }
+        let projections = fields
+            .into_iter()
+            .map(RirProjection::Field)
+            .collect::<Vec<_>>();
+        let descriptor = RustValues::new(self.program, function)
+            .mut_place_projection_descriptor_for(
+                "__AnvPromotedReceiverOps",
+                concrete_ty,
+                "__anv_receiver",
+                receiver_ty,
+                &projections,
+            );
+        stmts.extend([descriptor.struct_decl, descriptor.impl_decl]);
+        stmts.push(format!("let __anv_promoted_ops = {};", descriptor.ctor));
+        let root = target::mut_place_reborrow("__anv_receiver");
+        stmts.push(format!(
+            "let mut __anv_receiver = {};",
+            target::mut_place_projected(&root, "&__anv_promoted_ops")
+        ));
+        (target, receiver_ty, stmts)
+    }
+
+    fn dyn_readonly_concrete_call(
+        &self,
+        function: &RirFunction,
+        variant: &super::rir::RirDynVariant,
+        arm: &RirDynDispatchArm,
+        args: &[RirCallArg],
+        receiver: &str,
+    ) -> String {
+        let (target, receiver_ty, mut stmts) =
+            self.dyn_concrete_receiver(function, &arm.target, variant.concrete_ty, receiver);
+        let values = RustValues::new(self.program, function);
+        let materialized = values.value_from_ref(receiver_ty, "value");
+        let place = target::mut_place_reborrow("__anv_receiver");
+        stmts.push(format!(
+            "let __anv_receiver_value = {};",
+            target::mut_place_access_ctx(
+                &place,
+                target::runtime_param_name(),
+                &format!("{{ Ok({materialized}) }}"),
+            )
+        ));
+        let args = self.dyn_call_args(target, args);
+        let receiver = match arm.receiver {
+            RirParamAbi::Value => "__anv_receiver_value".to_string(),
+            RirParamAbi::SharedBorrow => "&__anv_receiver_value".to_string(),
+            _ => unreachable!("verified readonly dynamic receiver ABI"),
+        };
+        let call = self.resolved_call_expr(
+            function,
+            target,
+            &args,
+            Some(ResolvedReceiver {
+                expr: receiver,
+                ty: receiver_ty,
+                semantic: Self::param_abi_semantic(arm.receiver),
+            }),
+        );
+        block_expr(stmts, Some(call))
+    }
+
+    fn dyn_concrete_descriptor_call(
+        &self,
+        function: &RirFunction,
+        variant: &super::rir::RirDynVariant,
+        arm: &RirDynDispatchArm,
+        args: &[RirCallArg],
+        receiver: &str,
+    ) -> String {
+        let (target, receiver_ty, mut stmts) =
+            self.dyn_concrete_receiver(function, &arm.target, variant.concrete_ty, receiver);
+        let args = self.dyn_call_args(target, args);
+        let call = match arm.receiver {
+            RirParamAbi::MutPlace => self.resolved_call_expr(
+                function,
+                target,
+                &args,
+                Some(ResolvedReceiver {
+                    expr: "__anv_receiver".to_string(),
+                    ty: receiver_ty,
+                    semantic: RirParamSemantic::MutPlace,
+                }),
+            ),
+            RirParamAbi::MutBorrow => {
+                debug_assert!(matches!(target, RirResolvedCallTarget::Extern(_)));
+                debug_assert!(native_ty_is_resource_ref(self.program, receiver_ty));
+                let snapshot =
+                    RustValues::new(self.program, function).value_from_ref(receiver_ty, "value");
+                let place = target::mut_place_reborrow("__anv_receiver");
+                stmts.push(format!(
+                    "let mut __anv_native_receiver = {};",
+                    target::mut_place_access_ctx(
+                        &place,
+                        target::runtime_param_name(),
+                        &format!("{{ Ok({snapshot}) }}"),
+                    )
+                ));
+                self.resolved_call_expr(
+                    function,
+                    target,
+                    &args,
+                    Some(ResolvedReceiver {
+                        expr: "&mut __anv_native_receiver".to_string(),
+                        ty: receiver_ty,
+                        semantic: RirParamSemantic::MutBorrow,
+                    }),
+                )
+            }
+            _ => unreachable!("verified mutable dynamic receiver ABI"),
+        };
+        block_expr(stmts, Some(call))
+    }
+
+    fn dyn_mut_call(
+        &self,
+        function: &RirFunction,
+        carrier: RirDynCarrierId,
+        place: &RirMutPlaceArg,
+        args: &[RirCallArg],
+        arms: &[RirDynDispatchArm],
+    ) -> String {
+        let (prelude, place) = self.prepared_escaping_payload_place_arg(function, 0, place);
+        let call = self.dyn_carrier_descriptor_dispatch(carrier, arms, &place, |arm| {
+            self.dyn_mut_descriptor_call(function, carrier, arm, args)
+        });
+        block_expr(prelude, Some(call))
+    }
+
+    fn dyn_mut_descriptor_call(
+        &self,
+        function: &RirFunction,
+        carrier: RirDynCarrierId,
+        arm: &RirDynDispatchArm,
+        args: &[RirCallArg],
+    ) -> String {
+        let variant = &self.program.dyn_carriers[carrier.index()].variants[arm.variant.index()];
+        let payload = RustValues::new(self.program, function).dyn_payload_projection_descriptor(
+            "__AnvDynPayloadOps",
+            carrier,
+            &[arm.variant],
+            variant.concrete_ty,
+        );
+        let stmts = [
+            payload.struct_decl,
+            payload.impl_decl,
+            format!("let __anv_payload_ops = {};", payload.ctor),
+        ];
+        let root = target::mut_place_reborrow("__anv_carrier_place");
+        let receiver = target::mut_place_projected(&root, "&__anv_payload_ops");
+        let call = self.dyn_concrete_descriptor_call(function, variant, arm, args, &receiver);
+        block_expr(stmts, Some(call))
+    }
+
+    fn dyn_mut_projected_target<'a>(
+        &self,
+        target: &'a RirResolvedCallTarget,
+        mut ty: RirTypeId,
+    ) -> (
+        &'a RirResolvedCallTarget,
+        Vec<super::rir::RirFieldId>,
+        RirTypeId,
+    ) {
+        let mut target = target;
+        let mut fields = vec![];
+        while let RirResolvedCallTarget::Promoted {
+            fields: promoted,
+            target: next,
+        } = target
+        {
+            for field in promoted {
+                let RirType::Struct(id) = self.program.types[ty.index()] else {
+                    unreachable!("verified promoted mutable dynamic receiver")
+                };
+                let field_decl = &self.program.structs[id.index()].fields[field.index()];
+                fields.push(*field);
+                ty = field_decl.ty;
+            }
+            target = next;
+        }
+        (target, fields, ty)
+    }
+
+    fn dyn_projected_target<'a>(
+        &self,
+        target: &'a RirResolvedCallTarget,
+        mut receiver: String,
+        mut ty: RirTypeId,
+        borrowed: bool,
+    ) -> (&'a RirResolvedCallTarget, String, RirTypeId) {
+        let mut target = target;
+        while let RirResolvedCallTarget::Promoted {
+            fields,
+            target: next,
+        } = target
+        {
+            for field in fields {
+                let RirType::Struct(id) = self.program.types[ty.index()] else {
+                    unreachable!("verified promoted dynamic receiver")
+                };
+                let field = &self.program.structs[id.index()].fields[field.index()];
+                receiver = if borrowed {
+                    format!("&({receiver}).{}", field.symbol.as_str())
+                } else {
+                    format!("({receiver}).{}", field.symbol.as_str())
+                };
+                ty = field.ty;
+            }
+            target = next;
+        }
+        (target, receiver, ty)
+    }
+
     fn rvalue(&mut self, function: &RirFunction, value: &RirRValue) -> String {
         let values = RustValues::new(self.program, function);
         let places = RustPlaces::new(self.program, function);
         match value {
+            RirRValue::DynCopy { value, .. } => values.value_operand(value),
+            RirRValue::DynPack {
+                carrier,
+                variant,
+                value,
+                action,
+                ..
+            } => {
+                let carrier = &self.program.dyn_carriers[carrier.index()];
+                let RirType::Enum(enum_id) = self.program.types[carrier.storage_ty.index()] else {
+                    unreachable!("verified dynamic carrier storage")
+                };
+                let enm = &self.program.enums[enum_id.index()];
+                let rir_variant = &enm.variants[variant.index()];
+                let mut payload = values.dyn_payload(value, *action);
+                if carrier.variants[variant.index()].storage == RirDynStorage::Boxed {
+                    payload = format!("Box::new({payload})");
+                }
+                tuple_variant(
+                    &variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str()),
+                    [payload],
+                )
+            }
+            RirRValue::DynDowncast {
+                carrier,
+                air_use,
+                value,
+                variants,
+                ..
+            } => {
+                let carrier = &self.program.dyn_carriers[carrier.index()];
+                let RirType::Enum(id) = self.program.types[carrier.storage_ty.index()] else {
+                    unreachable!("verified dynamic carrier storage")
+                };
+                let enm = &self.program.enums[id.index()];
+                let arms = carrier.variants.iter().map(|variant| {
+                    let rir_variant = &enm.variants[variant.id.index()];
+                    let path = variant_path(enm.symbol.as_str(), rir_variant.symbol.as_str());
+                    if !variants.contains(&variant.id) {
+                        return format!("{path}(..) => None");
+                    }
+                    let payload = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                        if variant.storage == RirDynStorage::Boxed {
+                            "*payload".to_string()
+                        } else {
+                            "payload".to_string()
+                        }
+                    } else {
+                        let payload = if variant.storage == RirDynStorage::Boxed {
+                            "payload.as_ref()"
+                        } else {
+                            "payload"
+                        };
+                        values.dyn_payload_from_ref(variant.concrete_ty, variant.payload, payload)
+                    };
+                    format!("{path}(payload) => Some({payload})")
+                });
+                let source = values.operand(value);
+                let source = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                    source
+                } else {
+                    format!("&{source}")
+                };
+                match_expr(&source, arms)
+            }
+            RirRValue::DynCall {
+                carrier,
+                exact_variant,
+                receiver,
+                args,
+                arms,
+                ..
+            } => self.dyn_call(function, *carrier, receiver, *exact_variant, args, arms),
+            RirRValue::DynWeaken {
+                source,
+                target,
+                air_use,
+                value,
+                arms,
+                ..
+            } => {
+                let source = &self.program.dyn_carriers[source.index()];
+                let target = &self.program.dyn_carriers[target.index()];
+                let RirType::Enum(source_enum) = self.program.types[source.storage_ty.index()]
+                else {
+                    unreachable!("verified source dynamic storage")
+                };
+                let RirType::Enum(target_enum) = self.program.types[target.storage_ty.index()]
+                else {
+                    unreachable!("verified target dynamic storage")
+                };
+                let source_enum = &self.program.enums[source_enum.index()];
+                let target_enum = &self.program.enums[target_enum.index()];
+                let arms = arms.iter().map(|arm| {
+                    let source_plan = &source.variants[arm.source.index()];
+                    let source_variant = &source_enum.variants[arm.source.index()];
+                    let target_variant = &target_enum.variants[arm.target.index()];
+                    let source_path =
+                        variant_path(source_enum.symbol.as_str(), source_variant.symbol.as_str());
+                    let target_path =
+                        variant_path(target_enum.symbol.as_str(), target_variant.symbol.as_str());
+                    let payload = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                        "payload".to_string()
+                    } else {
+                        let payload = if source_plan.storage == RirDynStorage::Boxed {
+                            "payload.as_ref()"
+                        } else {
+                            "payload"
+                        };
+                        let payload = values.dyn_payload_from_ref(
+                            source_plan.concrete_ty,
+                            source_plan.payload,
+                            payload,
+                        );
+                        if source_plan.storage == RirDynStorage::Boxed {
+                            format!("Box::new({payload})")
+                        } else {
+                            payload
+                        }
+                    };
+                    format!(
+                        "{source_path}(payload) => {}",
+                        tuple_variant(&target_path, [payload])
+                    )
+                });
+                let source = values.operand(value);
+                let source = if *air_use == air::DynOwnedUse::ConsumeTemporary {
+                    source
+                } else {
+                    format!("&{source}")
+                };
+                match_expr(&source, arms)
+            }
             RirRValue::Use(operand) | RirRValue::FunctionValue { value: operand, .. } => {
                 values.value_operand(operand)
             }
+            RirRValue::MoveValue { value, .. } => values.operand(value),
             RirRValue::Struct { ty, fields } => self.struct_literal(function, *ty, fields),
             RirRValue::Tuple { ty, fields } => self.tuple_literal(function, *ty, fields),
             RirRValue::DataRefAlloc { ty, fields } => self.dataref_alloc(function, *ty, fields),
@@ -2792,16 +4069,18 @@ impl EmitCx<'_> {
                 format!("Some({})", values.value_operand(value))
             }
             RirRValue::Call { callee, args, .. } => match callee {
-                RirCallTarget::Function(id) => {
-                    let symbol = self.program.functions[id.index()].symbol.as_str();
-                    let call = self.call_expr(function, args, |args| format!("{symbol}({args})"));
-                    if self.fallible_functions[id.index()] {
-                        format!("{call}?")
-                    } else {
-                        call
-                    }
-                }
-                RirCallTarget::Extern(id) => self.extern_call(function, *id, args),
+                RirCallTarget::Function(id) => self.resolved_call_expr(
+                    function,
+                    &RirResolvedCallTarget::Function(*id),
+                    args,
+                    None,
+                ),
+                RirCallTarget::Extern(id) => self.resolved_call_expr(
+                    function,
+                    &RirResolvedCallTarget::Extern(*id),
+                    args,
+                    None,
+                ),
                 RirCallTarget::LambdaValue { callee, sig } => {
                     let receiver = values.value_operand(callee);
                     let call =
@@ -2930,7 +4209,7 @@ impl EmitCx<'_> {
                 lambda, captures, ..
             } => {
                 let lambda_decl = &self.program.lambdas[lambda.index()];
-                let sig = RustRepPolicy::new(self.program).lambda_sig_symbol(lambda_decl.sig);
+                let sig = RirRustRepPolicy::new(self.program).lambda_sig_symbol(lambda_decl.sig);
                 let variant = lambda_variant(*lambda);
                 match lambda_decl.storage {
                     RirLambdaStorage::ZeroEnv => format!("{sig}::{variant}"),
@@ -3106,7 +4385,7 @@ impl EmitCx<'_> {
             RirType::Array { .. } => "__anv_sequence[index] = __anv_sequence_value".to_string(),
             RirType::Slice(_) => format!(
                 "{}?",
-                target::slice_with_elem_owned_mut_short(
+                target::slice_with_elem_mut_leaf(
                     "__anv_sequence",
                     target::runtime_param_name(),
                     "index",
@@ -3181,7 +4460,7 @@ impl EmitCx<'_> {
             prelude,
             Some(format!(
                 "{}?",
-                target::list_with_elem_owned_mut_short(
+                target::list_with_elem_mut_leaf(
                     "__anv_list",
                     target::runtime_param_name(),
                     "index",
@@ -3329,7 +4608,7 @@ impl EmitCx<'_> {
             ],
             Some(format!(
                 "{}?; Ok(())",
-                target::list_with_elem_owned_mut_short(
+                target::list_with_elem_mut_leaf(
                     "value",
                     target::runtime_param_name(),
                     "index",
@@ -3374,7 +4653,7 @@ impl EmitCx<'_> {
             ],
             Some(format!(
                 "{}?; Ok(())",
-                target::slice_with_elem_owned_mut_short(
+                target::slice_with_elem_mut_leaf(
                     "value",
                     target::runtime_param_name(),
                     "index",
@@ -3446,10 +4725,15 @@ impl EmitCx<'_> {
         };
         let key = RustValues::new(self.program, function).operand(key);
         self.map_read(function, map, |map| {
+            let value = RustValues::new(self.program, function).value_from_ref(value_ty, "value");
             format!(
-                "{map}.get({}, &{key})?.map(|value| {})",
-                target::runtime_param_name(),
-                RustValues::new(self.program, function).value_from_place(value_ty, "value")
+                "{}?",
+                target::map_with_value_shared_short(
+                    map,
+                    target::runtime_param_name(),
+                    &format!("&{key}"),
+                    &format!("Ok(value.map(|value| {value}))"),
+                )
             )
         })
     }
@@ -3729,20 +5013,58 @@ impl EmitCx<'_> {
                 block_expr(prelude, Some(format!("{body}?")))
             }
             RirCollectionAccess::MutPlace(root) => {
-                let (mut prelude, place) = self.prepared_mut_place_arg(function, 0, root);
+                let requires_detached_leaf = !root.projections.is_empty()
+                    || matches!(
+                        root.access,
+                        RirMutPlaceAccess::DataRef { .. }
+                            | RirMutPlaceAccess::Handle(RirMutPlaceHandle::HeapCell { .. })
+                    );
+                if !requires_detached_leaf {
+                    let (mut prelude, place) = self.prepared_mut_place_arg(function, 0, root);
+                    prelude.extend(
+                        bindings
+                            .into_iter()
+                            .map(|(name, value)| format!("let {name} = {value};")),
+                    );
+                    return block_expr(
+                        prelude,
+                        Some(target::mut_place_mutate_ctx(
+                            &place,
+                            target::runtime_param_name(),
+                            body,
+                        )),
+                    );
+                }
+                let values = RustValues::new(self.program, function);
+                let (mut prelude, place) =
+                    self.prepared_escaping_payload_place_arg(function, 0, root);
+                prelude.push(format!("let mut __anv_collection_place = {place};"));
+                let place = target::mut_place_reborrow("__anv_collection_place");
                 prelude.extend(
                     bindings
                         .into_iter()
                         .map(|(name, value)| format!("let {name} = {value};")),
                 );
-                block_expr(
-                    prelude,
-                    Some(target::mut_place_mutate_ctx(
+                let snapshot = values.value_from_ref(root.ty, "value");
+                prelude.push(format!(
+                    "let mut __anv_collection = {};",
+                    target::mut_place_access(
                         &place,
                         target::runtime_param_name(),
-                        body,
-                    )),
-                )
+                        &format!("Ok({snapshot})"),
+                    )
+                ));
+                prelude.push("let value = &mut __anv_collection;".to_string());
+                prelude.push(format!("let __anv_mutation = {body}?;"));
+                prelude.push(format!(
+                    "{};",
+                    target::mut_place_replace_collection(
+                        &place,
+                        target::runtime_param_name(),
+                        "__anv_collection",
+                    )
+                ));
+                block_expr(prelude, Some("__anv_mutation".to_string()))
             }
         }
     }
@@ -3860,7 +5182,7 @@ impl EmitCx<'_> {
 
     fn cell_get_copy(&self, function: &RirFunction, cell: RirCellRef) -> String {
         let decl = self.cell_decl(cell);
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let access = if !policy.copyable(decl.payload_ty) && policy.shareable_value(decl.payload_ty)
         {
             let values = RustValues::new(self.program, function);
@@ -3878,6 +5200,59 @@ impl EmitCx<'_> {
                     "cell",
                     &format!("cell.{access}"),
                 ) + "?"
+            }
+        }
+    }
+
+    fn param_abi_semantic(abi: RirParamAbi) -> RirParamSemantic {
+        match abi {
+            RirParamAbi::Value => RirParamSemantic::Value,
+            RirParamAbi::SharedBorrow => RirParamSemantic::SharedBorrow,
+            RirParamAbi::MutBorrow => RirParamSemantic::MutBorrow,
+            RirParamAbi::MutPlace => RirParamSemantic::MutPlace,
+            RirParamAbi::DynBorrow => RirParamSemantic::DynBorrow,
+            RirParamAbi::ScopedLambda => RirParamSemantic::ScopedLambda,
+            RirParamAbi::EscapingLambda => RirParamSemantic::EscapingLambda,
+            RirParamAbi::AnvCallback => RirParamSemantic::AnvCallback,
+            RirParamAbi::StackCell => RirParamSemantic::StackCell,
+            RirParamAbi::HeapCell => RirParamSemantic::HeapCell,
+            RirParamAbi::ScopedPlaceCell => RirParamSemantic::ScopedPlaceCell,
+        }
+    }
+
+    fn resolved_call_expr(
+        &self,
+        function: &RirFunction,
+        target: &RirResolvedCallTarget,
+        args: &[RirCallArg],
+        receiver: Option<ResolvedReceiver>,
+    ) -> String {
+        match target {
+            RirResolvedCallTarget::Function(id) => {
+                let symbol = self.program.functions[id.index()].symbol.as_str();
+                let call = match receiver {
+                    Some(receiver) => {
+                        let mut rendered = if self.has_retained_callbacks() {
+                            target::retained_generated_call_args([])
+                        } else {
+                            target::generated_call_args([])
+                        };
+                        rendered.push(receiver.expr);
+                        self.prepared_call_expr(function, args, rendered, |args| {
+                            format!("{symbol}({args})")
+                        })
+                    }
+                    None => self.call_expr(function, args, |args| format!("{symbol}({args})")),
+                };
+                if self.fallible_functions[id.index()] {
+                    format!("{call}?")
+                } else {
+                    call
+                }
+            }
+            RirResolvedCallTarget::Extern(id) => self.extern_call(function, *id, args, receiver),
+            RirResolvedCallTarget::Promoted { .. } => {
+                unreachable!("promoted paths must be projected before call emission")
             }
         }
     }
@@ -3924,13 +5299,59 @@ impl EmitCx<'_> {
         native_plan: &NativeCallPlan,
         abis: &[anvyx_runtime::RustParamAbi],
         tys: &[RirTypeId],
+        receiver: Option<ResolvedReceiver>,
         mut rendered: Vec<String>,
         render: impl FnOnce(String) -> String,
     ) -> String {
+        let mut resource_borrows = vec![];
+        let offset = if let Some(receiver) = receiver {
+            let abi = &abis[0];
+            let ty = tys[0];
+            debug_assert_eq!(receiver.ty, ty);
+            let facts = native_dynamic_arg_facts(self.program, ty, receiver.semantic);
+            let action = native_plan.arg_action(0, facts);
+            let mut expr = receiver.expr;
+            if let Some(mutable) = action.native_ref_borrow_mutability() {
+                let arg = "__anv_ref_arg_0".to_string();
+                resource_borrows.push((expr, arg.clone(), mutable));
+                expr = arg;
+            } else {
+                expr = self.native_arg_expr(abi, ty, expr);
+            }
+            rendered.push(expr);
+            1
+        } else {
+            0
+        };
+        let (prelude, rendered, mut args_borrows) =
+            self.prepared_native_args(function, args, native_plan, abis, tys, offset, rendered);
+        resource_borrows.append(&mut args_borrows);
+        let mut call = render(comma(rendered));
+        for (resource, arg, mutable) in resource_borrows.into_iter().rev() {
+            call = target::native_ref_borrow(&resource, &arg, mutable, &call);
+        }
+        if prelude.is_empty() {
+            call
+        } else {
+            block_expr(prelude, Some(call))
+        }
+    }
+
+    fn prepared_native_args(
+        &self,
+        function: &RirFunction,
+        args: &[RirCallArg],
+        native_plan: &NativeCallPlan,
+        abis: &[anvyx_runtime::RustParamAbi],
+        tys: &[RirTypeId],
+        offset: usize,
+        mut rendered: Vec<String>,
+    ) -> PreparedNativeArgs {
         let mut prelude = vec![];
         let mut resource_borrows = vec![];
         let values = RustValues::new(self.program, function);
-        for (index, arg) in args.iter().enumerate() {
+        for (arg_index, arg) in args.iter().enumerate() {
+            let index = arg_index + offset;
             let (stmts, mut expr) = self.prepared_call_arg(function, index, arg);
             let (Some(abi), Some(ty)) = (abis.get(index), tys.get(index)) else {
                 prelude.extend(stmts);
@@ -3969,15 +5390,7 @@ impl EmitCx<'_> {
             }
             rendered.push(expr);
         }
-        let mut call = render(comma(rendered));
-        for (resource, arg, mutable) in resource_borrows.into_iter().rev() {
-            call = target::native_ref_borrow(&resource, &arg, mutable, &call);
-        }
-        if prelude.is_empty() {
-            call
-        } else {
-            format!("{{ {} {call} }}", prelude.join(" "))
-        }
+        (prelude, rendered, resource_borrows)
     }
 
     fn native_array_map_expr(expr: &str, body: &str) -> String {
@@ -4054,123 +5467,8 @@ impl EmitCx<'_> {
                     &self.native_value_arg_expr(elem, elem_ty, "value".to_string()),
                 )
             }
-            anvyx_runtime::ExternTypeExpr::Named { .. } => self.native_named_arg_expr(ty, expr),
             _ => expr,
         }
-    }
-
-    fn native_named_arg_expr(&self, ty: RirTypeId, expr: String) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
-                self.native_enum_arg_expr(enum_id, &expr)
-            }
-            _ => expr,
-        }
-    }
-
-    fn native_enum_arg_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
-        let enm = &self.program.enums[enum_id.index()];
-        let native = enm
-            .native_path
-            .as_ref()
-            .expect("verified native enum type")
-            .join("::");
-        let arms = enm.variants.iter().map(|variant| {
-            let generated_path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
-            let native_path = variant_path(&native, variant.symbol.as_str());
-            match variant.kind {
-                RirVariantKind::Unit => format!("{generated_path} => {native_path}"),
-                RirVariantKind::Tuple => {
-                    let bindings = (0..variant.fields.len())
-                        .map(|index| format!("value{index}"))
-                        .collect::<Vec<_>>();
-                    let fields = variant
-                        .fields
-                        .iter()
-                        .zip(&bindings)
-                        .map(|(field, binding)| self.native_rir_arg_expr(field.ty, binding.clone()))
-                        .collect::<Vec<_>>();
-                    format!(
-                        "{} => {}",
-                        tuple_variant(&generated_path, bindings.iter().cloned()),
-                        tuple_variant(&native_path, fields)
-                    )
-                }
-                RirVariantKind::Struct => {
-                    let bindings = variant
-                        .fields
-                        .iter()
-                        .map(|field| field.symbol.as_str().to_string())
-                        .collect::<Vec<_>>();
-                    let fields = variant
-                        .fields
-                        .iter()
-                        .zip(&bindings)
-                        .map(|(field, binding)| {
-                            field_init(
-                                field.symbol.as_str(),
-                                self.native_rir_arg_expr(field.ty, binding.clone()),
-                            )
-                        });
-                    format!(
-                        "{} => {}",
-                        struct_variant(&generated_path, bindings.iter().cloned()),
-                        struct_variant(&native_path, fields)
-                    )
-                }
-            }
-        });
-        match_expr(expr, arms)
-    }
-
-    fn native_rir_arg_expr(&self, ty: RirTypeId, expr: String) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Option(inner) => target::rust_option_map(
-                &expr,
-                &self.native_rir_arg_expr(inner, "value".to_string()),
-            ),
-            RirType::Array { elem, .. } => Self::native_array_map_expr(
-                &expr,
-                &self.native_rir_arg_expr(elem, "value".to_string()),
-            ),
-            RirType::Tuple(tuple_id) => self.native_rir_tuple_arg_expr(tuple_id, &expr),
-            RirType::Enum(enum_id)
-                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
-            {
-                self.native_rir_result_arg_expr(enum_id, &expr)
-            }
-            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
-                self.native_enum_arg_expr(enum_id, &expr)
-            }
-            _ => expr,
-        }
-    }
-
-    fn native_rir_tuple_arg_expr(&self, tuple_id: RirTupleId, expr: &str) -> String {
-        let tuple = &self.program.tuples[tuple_id.index()];
-        target::rust_tuple(tuple.fields.iter().map(|field| {
-            self.native_rir_arg_expr(field.ty, format!("{expr}.{}", field.symbol.as_str()))
-        }))
-    }
-
-    fn native_rir_result_arg_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
-        let enm = &self.program.enums[enum_id.index()];
-        let [ok, err] = enm.variants.as_slice() else {
-            unreachable!("verified result enum variants")
-        };
-        target::rust_result_match(
-            expr,
-            &format!(
-                "{}(value) => {}",
-                variant_path(enm.symbol.as_str(), ok.symbol.as_str()),
-                target::rust_ok(&self.native_rir_arg_expr(ok.fields[0].ty, "value".to_string()))
-            ),
-            &format!(
-                "{}(value) => {}",
-                variant_path(enm.symbol.as_str(), err.symbol.as_str()),
-                target::rust_err(&self.native_rir_arg_expr(err.fields[0].ty, "value".to_string()))
-            ),
-        )
     }
 
     fn native_tuple_arg_expr(
@@ -4258,6 +5556,9 @@ impl EmitCx<'_> {
         arg: &RirCallArg,
     ) -> (Vec<String>, String) {
         let values = RustValues::new(self.program, function);
+        if let RirCallArg::DynBorrow(borrow) = arg {
+            return self.prepared_dyn_borrow_arg(function, index, borrow);
+        }
         if let RirCallArg::ScopedLambda { callee, sig } = arg {
             return self.prepared_scoped_lambda_call_arg(function, index, callee, *sig);
         }
@@ -4299,6 +5600,74 @@ impl EmitCx<'_> {
             return (vec![], values.call_arg(arg));
         };
         self.prepared_mut_place_arg(function, index, mut_place)
+    }
+
+    fn prepared_dyn_borrow_arg(
+        &self,
+        function: &RirFunction,
+        index: usize,
+        borrow: &super::rir::RirDynBorrow,
+    ) -> (Vec<String>, String) {
+        let symbol = self.program.dyn_borrow_symbol(borrow.target);
+        let weakening = borrow.air_weakening.map(|id| {
+            self.program
+                .dyn_weakenings
+                .iter()
+                .find(|weakening| weakening.air_id == id)
+                .expect("verified dynamic borrow weakening")
+        });
+        match &borrow.source {
+            super::rir::RirDynBorrowSource::Concrete {
+                place,
+                carrier,
+                air_witness,
+            } => {
+                let source = &self.program.dyn_carriers[carrier.index()];
+                let source_variant = source
+                    .variants
+                    .iter()
+                    .find(|variant| variant.air_witness == *air_witness)
+                    .expect("verified dynamic borrow witness");
+                let target_variant = weakening.map_or(source_variant.id, |weakening| {
+                    weakening
+                        .arms
+                        .iter()
+                        .find(|arm| arm.source == source_variant.id)
+                        .expect("verified dynamic borrow weakening arm")
+                        .target
+                });
+                let target = &self.program.dyn_carriers[borrow.target.index()];
+                let RirType::Enum(id) = self.program.types[target.storage_ty.index()] else {
+                    unreachable!("verified dynamic carrier storage")
+                };
+                let name = self.program.enums[id.index()].variants[target_variant.index()]
+                    .symbol
+                    .as_str();
+                let (stmts, place) = self.prepared_mut_place_arg(function, index, place);
+                (stmts, format!("{symbol}::{name}({place})"))
+            }
+            super::rir::RirDynBorrowSource::Owned { place, carrier } => {
+                let (stmts, place) = self.prepared_mut_place_arg(function, index, place);
+                let constructor = if *carrier == borrow.target {
+                    "Owned".to_string()
+                } else {
+                    format!("OwnedFrom{}", carrier.index())
+                };
+                (stmts, format!("{symbol}::{constructor}({place})"))
+            }
+            super::rir::RirDynBorrowSource::Borrowed { local, carrier }
+            | super::rir::RirDynBorrowSource::Reborrowed { local, carrier } => {
+                let local = function.locals[local.index()].symbol.as_str();
+                if *carrier == borrow.target {
+                    (vec![], format!("{local}.reborrow()"))
+                } else {
+                    (
+                        vec![],
+                        format!("{symbol}::weaken_from_{}(&mut {local})", carrier.index()),
+                    )
+                }
+            }
+        }
     }
 
     fn mut_place_get_copy(
@@ -4483,7 +5852,7 @@ impl EmitCx<'_> {
         sig: RirLambdaSigId,
     ) -> (Vec<String>, String) {
         let values = RustValues::new(self.program, function);
-        let policy = RustRepPolicy::new(self.program);
+        let policy = RirRustRepPolicy::new(self.program);
         let (args_ty, ret_ty) = policy.scoped_lambda_sig_args_ret(sig);
         let state = format!("__anv_scoped_lambda_state_{index}");
         let lambda = values.value_operand(callee);
@@ -4637,6 +6006,7 @@ impl EmitCx<'_> {
         let descriptor =
             if let RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) =
                 mut_place.access
+                && !RustPlaces::new(self.program, function).payload_ref_cell_local(local)
             {
                 let raw_root = function.locals[local.index()].symbol.as_str();
                 let projection = RustPlaces::new(self.program, function)
@@ -5021,135 +6391,8 @@ impl EmitCx<'_> {
                     &self.native_value_return_expr(elem_ty, elem, "value"),
                 )
             }
-            anvyx_runtime::ExternTypeExpr::Named { .. } => self.native_named_return_expr(ret, expr),
             _ => expr.to_string(),
         }
-    }
-
-    fn native_named_return_expr(&self, ret: RirTypeId, expr: &str) -> String {
-        match self.program.types[ret.index()] {
-            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
-                self.native_enum_return_expr(enum_id, expr)
-            }
-            _ => expr.to_string(),
-        }
-    }
-
-    fn native_enum_return_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
-        let enm = &self.program.enums[enum_id.index()];
-        let native = enm
-            .native_path
-            .as_ref()
-            .expect("verified native enum type")
-            .join("::");
-        let arms = enm.variants.iter().map(|variant| {
-            let generated_path = variant_path(enm.symbol.as_str(), variant.symbol.as_str());
-            let native_path = variant_path(&native, variant.symbol.as_str());
-            match variant.kind {
-                RirVariantKind::Unit => format!("{native_path} => {generated_path}"),
-                RirVariantKind::Tuple => {
-                    let bindings = (0..variant.fields.len())
-                        .map(|index| format!("value{index}"))
-                        .collect::<Vec<_>>();
-                    let fields = variant
-                        .fields
-                        .iter()
-                        .zip(&bindings)
-                        .map(|(field, binding)| self.native_rir_return_expr(field.ty, binding))
-                        .collect::<Vec<_>>();
-                    format!(
-                        "{} => {}",
-                        tuple_variant(&native_path, bindings.iter().cloned()),
-                        tuple_variant(&generated_path, fields)
-                    )
-                }
-                RirVariantKind::Struct => {
-                    let bindings = variant
-                        .fields
-                        .iter()
-                        .map(|field| field.symbol.as_str().to_string())
-                        .collect::<Vec<_>>();
-                    let fields = variant
-                        .fields
-                        .iter()
-                        .zip(&bindings)
-                        .map(|(field, binding)| {
-                            field_init(
-                                field.symbol.as_str(),
-                                self.native_rir_return_expr(field.ty, binding),
-                            )
-                        });
-                    format!(
-                        "{} => {}",
-                        struct_variant(&native_path, bindings.iter().cloned()),
-                        struct_variant(&generated_path, fields)
-                    )
-                }
-            }
-        });
-        match_expr(expr, arms)
-    }
-
-    fn native_rir_return_expr(&self, ty: RirTypeId, expr: &str) -> String {
-        match self.program.types[ty.index()] {
-            RirType::Option(inner) => {
-                target::rust_option_map(expr, &self.native_rir_return_expr(inner, "value"))
-            }
-            RirType::Array { elem, .. } => {
-                Self::native_array_map_expr(expr, &self.native_rir_return_expr(elem, "value"))
-            }
-            RirType::Tuple(tuple_id) => self.native_rir_tuple_return_expr(tuple_id, expr),
-            RirType::Enum(enum_id)
-                if self.program.enums[enum_id.index()].core == Some(RirCoreEnumKind::Result) =>
-            {
-                self.native_rir_result_return_expr(enum_id, expr)
-            }
-            RirType::Enum(enum_id) if self.program.enums[enum_id.index()].native_path.is_some() => {
-                self.native_enum_return_expr(enum_id, expr)
-            }
-            _ => expr.to_string(),
-        }
-    }
-
-    fn native_rir_tuple_return_expr(&self, tuple_id: RirTupleId, expr: &str) -> String {
-        let tuple = &self.program.tuples[tuple_id.index()];
-        if tuple.fields.is_empty() {
-            return target::rust_eval_then(
-                expr,
-                &struct_lit(tuple.symbol.as_str(), Vec::<String>::new()),
-            );
-        }
-        let tmp = "__anv_native_payload";
-        let fields = tuple.fields.iter().enumerate().map(|(index, field)| {
-            field_init(
-                field.symbol.as_str(),
-                self.native_rir_return_expr(field.ty, &target::rust_tuple_field(tmp, index)),
-            )
-        });
-        format!(
-            "{{ let {tmp} = {expr}; {} }}",
-            struct_lit(tuple.symbol.as_str(), fields)
-        )
-    }
-
-    fn native_rir_result_return_expr(&self, enum_id: RirEnumId, expr: &str) -> String {
-        let enm = &self.program.enums[enum_id.index()];
-        let [ok, err] = enm.variants.as_slice() else {
-            unreachable!("verified result enum variants")
-        };
-        target::rust_result_match(
-            expr,
-            &format!(
-                "Ok(value) => {}({})",
-                variant_path(enm.symbol.as_str(), ok.symbol.as_str()),
-                self.native_rir_return_expr(ok.fields[0].ty, "value")
-            ),
-            &format!(
-                "Err(value) => {}({})",
-                variant_path(enm.symbol.as_str(), err.symbol.as_str()),
-                self.native_rir_return_expr(err.fields[0].ty, "value")
-            ),
-        )
     }
 
     fn native_tuple_return_expr(
@@ -5237,6 +6480,7 @@ impl EmitCx<'_> {
         function: &RirFunction,
         id: super::rir::RirExternId,
         args: &[RirCallArg],
+        receiver: Option<ResolvedReceiver>,
     ) -> String {
         let ext = &self.program.externs[id.index()];
         let RirExternKind::Native(native) = &ext.kind;
@@ -5254,6 +6498,7 @@ impl EmitCx<'_> {
             &native_plan,
             native.abi.params.as_slice(),
             &param_tys,
+            receiver,
             rendered,
             |rendered| {
                 let call = format!("{symbol}({rendered})");
@@ -5474,7 +6719,7 @@ impl EmitCx<'_> {
     }
 
     fn ty(&self, ty: RirTypeId) -> String {
-        RustRepPolicy::new(self.program).rust_ty(ty)
+        RirRustRepPolicy::new(self.program).rust_ty(ty)
     }
 
     fn indented(&mut self, f: impl FnOnce(&mut Self)) {
@@ -5579,6 +6824,24 @@ fn stmt_directly_uses_local(program: &RirProgram, stmt: &RirStmt, local: RirLoca
         }
         RirStmt::CollectionLoanScope(RirCollectionLoanScope { root, .. }) => root.uses_local(local),
         RirStmt::PatternMatch(RirPatternMatch { subject, .. }) => place_uses_local(subject, local),
+        RirStmt::DynMatch(match_) => match &match_.source {
+            super::rir::RirDynMatchSource::Owned { value, .. } => {
+                operand_uses_local(program, value, local)
+            }
+            super::rir::RirDynMatchSource::MutPlace(place) => {
+                mut_place_arg_uses_local(program, place, local)
+            }
+            super::rir::RirDynMatchSource::Borrowed(borrow) => match &borrow.source {
+                super::rir::RirDynBorrowSource::Concrete { place, .. }
+                | super::rir::RirDynBorrowSource::Owned { place, .. } => {
+                    mut_place_arg_uses_local(program, place, local)
+                }
+                super::rir::RirDynBorrowSource::Borrowed { local: source, .. }
+                | super::rir::RirDynBorrowSource::Reborrowed { local: source, .. } => {
+                    *source == local
+                }
+            },
+        },
         RirStmt::OptionMatch(RirOptionMatch { subject, .. }) => {
             option_subject_uses_local(program, subject, local)
         }
@@ -5609,114 +6872,53 @@ fn term_uses_local(program: &RirProgram, term: &RirTerm, local: RirLocalId) -> b
 }
 
 fn rvalue_uses_local(program: &RirProgram, value: &RirRValue, local: RirLocalId) -> bool {
-    match value {
-        RirRValue::Use(operand)
-        | RirRValue::FunctionValue { value: operand, .. }
-        | RirRValue::Unary { value: operand, .. }
-        | RirRValue::Cast { value: operand, .. }
-        | RirRValue::OptionalSome { value: operand, .. }
-        | RirRValue::Stringify { value: operand, .. }
-        | RirRValue::Format { value: operand, .. }
-        | RirRValue::CheckedIterCount { count: operand, .. } => {
-            operand_uses_local(program, operand, local)
-        }
-        RirRValue::Struct { fields, .. }
-        | RirRValue::Tuple { fields, .. }
-        | RirRValue::Array { elems: fields, .. }
-        | RirRValue::List { elems: fields, .. }
-        | RirRValue::EnumVariant { fields, .. } => fields
-            .iter()
-            .any(|operand| operand_uses_local(program, operand, local)),
-        RirRValue::Map { entries, .. } => entries.iter().any(|(key, value)| {
-            operand_uses_local(program, key, local) || operand_uses_local(program, value, local)
-        }),
-        RirRValue::DataRefAlloc { fields, .. } => fields
-            .iter()
-            .any(|value| operand_uses_local(program, value, local)),
-        RirRValue::DataRefGet {
-            object,
-            projections,
-            ..
-        } => {
-            operand_uses_local(program, object, local) || projections_use_local(projections, local)
-        }
+    let mut uses = match value {
         RirRValue::CellGetCopy { cell, .. } => cell_uses_local(cell, local),
         RirRValue::ScopedPlaceCellGet { cell, .. } => scoped_cell_uses_local(program, cell, local),
-        RirRValue::MutPlaceGetCopy { place, .. } => mut_place_arg_uses_local(program, place, local),
-        RirRValue::Binary { lhs, rhs, .. } | RirRValue::SharedRefEq { lhs, rhs, .. } => {
-            operand_uses_local(program, lhs, local) || operand_uses_local(program, rhs, local)
-        }
-        RirRValue::Call { callee, args, .. } => {
-            call_target_uses_local(program, callee, local)
-                || args
-                    .iter()
-                    .any(|arg| call_arg_uses_local(program, arg, local))
-        }
-        RirRValue::StringConcat { parts } => parts
-            .iter()
-            .any(|part| operand_uses_local(program, part, local)),
-        RirRValue::Len { source } => place_uses_local(source, local),
-        RirRValue::CollectionLen { source }
-        | RirRValue::SequenceSlotAt {
-            collection: source, ..
-        } => source.uses_local(local),
-        RirRValue::SliceView {
-            source, start, end, ..
-        }
-        | RirRValue::RangeListCopy {
-            source, start, end, ..
-        } => place_uses_local(source, local) || *start == local || *end == local,
-        RirRValue::MapEntryAt {
-            map: source, index, ..
-        }
-        | RirRValue::MapKeyAt {
-            map: source, index, ..
-        }
-        | RirRValue::MapValueAt {
-            map: source, index, ..
-        } => source.uses_local(local) || *index == local,
-        RirRValue::ListPush { list, value } => {
-            list.uses_local(local) || operand_uses_local(program, value, local)
-        }
-        RirRValue::MapGet { map, key, .. } | RirRValue::MapRemove { map, key, .. } => {
-            map.uses_local(local) || operand_uses_local(program, key, local)
-        }
-        RirRValue::MapInsert {
-            map, key, value, ..
-        } => {
-            map.uses_local(local)
-                || operand_uses_local(program, key, local)
-                || operand_uses_local(program, value, local)
-        }
-        RirRValue::Lambda { captures, .. } => captures.iter().any(|capture| match capture {
-            RirLambdaCaptureArg::Readonly { value } => operand_uses_local(program, value, local),
-            RirLambdaCaptureArg::Scoped { place } => place_uses_local(place, local),
-            RirLambdaCaptureArg::StackCell { cell } | RirLambdaCaptureArg::HeapCell { cell } => {
-                cell_uses_local(cell, local)
-            }
-            RirLambdaCaptureArg::ScopedPlaceCell { cell } => {
-                scoped_cell_uses_local(program, cell, local)
-            }
-        }),
-    }
-}
-
-fn call_target_uses_local(program: &RirProgram, callee: &RirCallTarget, local: RirLocalId) -> bool {
-    match callee {
-        RirCallTarget::LambdaValue { callee, .. } => operand_uses_local(program, callee, local),
-        RirCallTarget::Function(_) | RirCallTarget::Extern(_) => false,
-    }
+        _ => false,
+    };
+    value.for_each_child(crate::rust::rir::RirValueUse::Read, &mut |child| {
+        uses |= match child {
+            RirChild::Operand { operand, .. } => operand_uses_local(program, operand, local),
+            RirChild::Place { place, .. } => place_uses_local(place, local),
+            RirChild::MutPlace { place, .. } => mut_place_arg_uses_local(program, place, local),
+            RirChild::Collection { collection, .. } => collection.uses_local(local),
+            RirChild::CallArg(arg) => call_arg_uses_local(program, arg, local),
+            RirChild::CaptureArg(capture) => match capture {
+                RirLambdaCaptureArg::Readonly { value } => {
+                    operand_uses_local(program, value, local)
+                }
+                RirLambdaCaptureArg::Scoped { place } => place_uses_local(place, local),
+                RirLambdaCaptureArg::StackCell { cell }
+                | RirLambdaCaptureArg::HeapCell { cell } => cell_uses_local(cell, local),
+                RirLambdaCaptureArg::ScopedPlaceCell { cell } => {
+                    scoped_cell_uses_local(program, cell, local)
+                }
+            },
+            RirChild::LocalRead(read) => read == local,
+            RirChild::Block(_) | RirChild::Tail(_) => false,
+        };
+    });
+    uses
 }
 
 fn call_arg_uses_local(program: &RirProgram, arg: &RirCallArg, local: RirLocalId) -> bool {
     match arg {
-        RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
-            operand_uses_local(program, operand, local)
-        }
+        RirCallArg::Value(operand)
+        | RirCallArg::MovedValue { value: operand, .. }
+        | RirCallArg::InitFieldProvided(operand) => operand_uses_local(program, operand, local),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_uses_local(place, local)
         }
         RirCallArg::MutPlace(place) => mut_place_arg_uses_local(program, place, local),
+        RirCallArg::DynBorrow(borrow) => match &borrow.source {
+            super::rir::RirDynBorrowSource::Concrete { place, .. }
+            | super::rir::RirDynBorrowSource::Owned { place, .. } => {
+                mut_place_arg_uses_local(program, place, local)
+            }
+            super::rir::RirDynBorrowSource::Borrowed { local: found, .. }
+            | super::rir::RirDynBorrowSource::Reborrowed { local: found, .. } => *found == local,
+        },
         RirCallArg::ScopedLambda { callee, .. }
         | RirCallArg::EscapingLambda { callee, .. }
         | RirCallArg::AnvCallback { callee, .. } => operand_uses_local(program, callee, local),
@@ -5852,6 +7054,7 @@ fn stmt_directly_uses_scoped_lambda_sig(stmt: &RirStmt, sig: RirLambdaSigId) -> 
         | RirStmt::CollectionLoanScope(_)
         | RirStmt::CollectionSlotScope(_)
         | RirStmt::PatternMatch(_)
+        | RirStmt::DynMatch(_)
         | RirStmt::OptionMatch(_)
         | RirStmt::MapEntryMatch(_) => false,
     }
@@ -5868,6 +7071,10 @@ fn rvalue_uses_scoped_lambda_sig(value: &RirRValue, sig: RirLambdaSigId) -> bool
 fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
     match arg {
         RirCallArg::Value(RirOperand::Place(place))
+        | RirCallArg::MovedValue {
+            value: RirOperand::Place(place),
+            ..
+        }
         | RirCallArg::InitFieldProvided(RirOperand::Place(place))
         | RirCallArg::ScopedLambda {
             callee: RirOperand::Place(place),
@@ -5894,7 +7101,22 @@ fn call_arg_root_local(arg: &RirCallArg) -> Option<RirLocalId> {
             }
             _ => None,
         },
+        RirCallArg::DynBorrow(borrow) => match &borrow.source {
+            super::rir::RirDynBorrowSource::Concrete { place, .. }
+            | super::rir::RirDynBorrowSource::Owned { place, .. } => match &place.access {
+                RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local, .. }) => {
+                    place.projections.is_empty().then_some(*local)
+                }
+                _ => None,
+            },
+            super::rir::RirDynBorrowSource::Borrowed { local, .. }
+            | super::rir::RirDynBorrowSource::Reborrowed { local, .. } => Some(*local),
+        },
         RirCallArg::Value(RirOperand::Const(_))
+        | RirCallArg::MovedValue {
+            value: RirOperand::Const(_),
+            ..
+        }
         | RirCallArg::InitFieldProvided(RirOperand::Const(_))
         | RirCallArg::InitFieldOmitted
         | RirCallArg::ScopedLambda {
@@ -5967,6 +7189,7 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
             RirParamSemantic::Value | RirParamSemantic::SharedBorrow => format!("*c{index}"),
             RirParamSemantic::MutBorrow => format!("&mut **c{index}"),
             RirParamSemantic::MutPlace
+            | RirParamSemantic::DynBorrow
             | RirParamSemantic::ScopedLambda
             | RirParamSemantic::EscapingLambda
             | RirParamSemantic::AnvCallback

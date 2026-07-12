@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match: 14
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct Actor {
+    fn score(self) -> int {
+        14
+    }
+}
+
+enum Boxed {
+    Some(dyn Scored),
+    None,
+}
+
+fn main() {
+    let value = Boxed.Some(Actor {});
+    match value {
+        Boxed.Some(actor) => println(actor.score()),
+        Boxed.None => println(0),
+    }
+}

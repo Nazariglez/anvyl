@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 12
+// 12
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct Actor {
+    fn score(self) -> int {
+        12
+    }
+}
+
+fn main() {
+    let actor: (dyn Scored)? = Actor {};
+    if let value? = actor {
+        println(value.score());
+    }
+    if let value? = actor {
+        println(value.score());
+    }
+}

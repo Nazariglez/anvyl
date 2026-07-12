@@ -1,0 +1,40 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 4
+// @match-end
+
+contract Updatable {
+    fn update(ref self);
+    fn value(self) -> int;
+}
+
+struct Enemy {
+    hp: int,
+    fn update(ref self) { self.hp += 1; }
+    fn value(self) -> int { self.hp }
+}
+
+struct Bullet {
+    speed: int,
+    fn update(ref self) { self.speed += 1; }
+    fn value(self) -> int { self.speed }
+}
+
+fn update_enemy(ref actor: dyn Updatable) {
+    match ref actor as? {
+        Enemy(enemy) => enemy.hp += 1,
+        other => other.update(),
+    };
+}
+
+fn main() {
+    var enemy = Enemy { hp: 1 };
+    update_enemy(enemy);
+    println(enemy.hp);
+
+    var actor: dyn Updatable = Bullet { speed: 3 };
+    update_enemy(actor);
+    println(actor.value());
+}

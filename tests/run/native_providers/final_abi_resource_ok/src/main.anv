@@ -12,11 +12,55 @@
 // 11
 // 13
 // missing
+// 20
+// 22
+// 21
+// 32
+// 31
+// 42
 // @match-end
 
 import pkg:host.host { Counter, make_counter, make_owned_counter, maybe_owned_counter, result_owned_counter, counter_value, counter_result_value };
 
+contract DynamicCounter {
+    fn bump(ref self, delta: int);
+}
+
+contract DuplicableCounter {
+    fn duplicate(self, delta: int) -> Counter;
+}
+
+contract WrappedCounter {
+    fn duplicate(self, delta: int) -> Counter;
+    fn bump(ref self, delta: int);
+}
+
+struct LocalCounter {
+    value: int,
+
+    fn bump(ref self, delta: int) { self.value += delta; }
+}
+
+fn bump_one(ref counter: dyn DynamicCounter) {
+    counter.bump(1);
+}
+
+struct CounterBox {
+    embed counter: Counter,
+}
+
+struct OuterCounterBox {
+    embed inner: CounterBox,
+}
+
 fn main() {
+    var local = LocalCounter { value: 1 };
+    bump_one(local);
+    assert(local.value == 2);
+
+    var context_counter = make_counter(0);
+    bump_one(context_counter);
+
     var counter = make_counter(42);
     println(counter_value(counter));
     counter.bump(1);
@@ -38,4 +82,23 @@ fn main() {
     println(counter_value(maybe));
     println(counter_result_value(result_owned_counter(true, 13)));
     println(counter_result_value(result_owned_counter(false, 0)));
+
+    var dynamic: dyn DynamicCounter + DuplicableCounter = make_counter(20);
+    if let counter? = dynamic as? Counter { println(counter_value(counter)); }
+    println(counter_value(dynamic.duplicate(2)));
+    dynamic.bump(1);
+    if let counter? = dynamic as? Counter { println(counter_value(counter)); }
+
+    var wrapped: dyn WrappedCounter = CounterBox { counter: make_counter(30) };
+    println(counter_value(wrapped.duplicate(2)));
+    wrapped.bump(1);
+    if let box? = wrapped as? CounterBox { println(counter_value(box.counter)); }
+
+    var nested: dyn WrappedCounter = OuterCounterBox {
+        inner: CounterBox { counter: make_counter(40) },
+    };
+    nested.bump(2);
+    if let outer? = nested as? OuterCounterBox {
+        println(counter_value(outer.inner.counter));
+    }
 }

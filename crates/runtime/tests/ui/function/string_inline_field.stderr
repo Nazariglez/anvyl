@@ -1,5 +1,16 @@
 error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
- --> tests/ui/function/string_inline_field.rs:6:12
+ --> tests/ui/function/string_inline_field.rs:6:16
   |
-6 |     value: String,
-  |            ^^^^^^
+6 |     pub value: String,
+  |                ^^^^^^
+
+error[E0204]: the trait `std::marker::Copy` cannot be implemented for this type
+ --> tests/ui/function/string_inline_field.rs:4:12
+  |
+3 | #[derive(Clone, Copy, AnvyxInline)]
+  |                 ---- in this derive macro expansion
+4 | pub struct Bad {
+  |            ^^^
+5 |     #[anvyx(field)]
+6 |     pub value: String,
+  |     ----------------- this field does not implement `std::marker::Copy`

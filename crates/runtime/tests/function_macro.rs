@@ -25,9 +25,9 @@ fn renamed_type(value: i64) -> i64 {
 
 #[derive(Clone, Copy, AnvyxInline)]
 #[anvyx(name = "Point")]
-struct RustPoint {
+pub struct RustPoint {
     #[anvyx(field)]
-    x: f64,
+    pub x: f64,
 }
 
 #[function(params(point = "Point"))]
@@ -106,10 +106,10 @@ fn retain_callback(f: EscapingLambda<(i64,), ()>) {
     drop(f);
 }
 
-#[derive(Clone, AnvyxInline)]
-struct LoadError {
+#[derive(Clone, Copy, AnvyxInline)]
+pub struct LoadError {
     #[anvyx(field)]
-    code: i64,
+    pub code: i64,
 }
 
 #[function]
@@ -131,9 +131,9 @@ fn fallible_visible_result(ok: bool) -> RuntimeResult<Result<i64, LoadError>> {
 }
 
 #[derive(AnvyxRef)]
-struct Counter {
+pub struct Counter {
     #[anvyx(field)]
-    value: i64,
+    pub value: i64,
 }
 
 #[function(ctx)]

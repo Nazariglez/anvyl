@@ -94,6 +94,19 @@ impl NativeArgFacts {
         }
     }
 
+    pub(super) fn dynamic(semantic: RirParamSemantic, string: bool, native_ref: bool) -> Self {
+        let mode = match semantic {
+            RirParamSemantic::SharedBorrow => NativeArgMode::SharedBorrow,
+            RirParamSemantic::MutBorrow => NativeArgMode::MutBorrow,
+            _ => NativeArgMode::Direct,
+        };
+        Self {
+            mode,
+            string,
+            native_ref,
+        }
+    }
+
     pub(super) fn rir(arg: &RirCallArg, string: bool, native_ref: bool) -> Self {
         let mode = match arg {
             RirCallArg::SharedBorrow(_) => NativeArgMode::SharedBorrow,
@@ -124,15 +137,8 @@ pub(super) struct NativeCallPlan {
 
 impl NativeCallPlan {
     pub(super) fn for_abi(abi: &RustExternAbi, retained_callbacks: bool) -> Self {
-        Self::new(
-            abi.params.iter().map(classify_param).collect(),
-            retained_callbacks,
-        )
-    }
-
-    pub(super) fn new(params: Vec<NativeParamAbi>, retained_callbacks: bool) -> Self {
         Self {
-            params,
+            params: abi.params.iter().map(classify_param).collect(),
             provider_entry: ProviderEntryPlan::for_retained_callbacks(retained_callbacks),
         }
     }
@@ -293,10 +299,9 @@ fn reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
         RustParamAbi::Borrow(anvyx_runtime::ExternTypeExpr::String) => {
             NativeReentryPolicy::SnapshotStringBorrow
         }
-        RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::MutPlace(_) => {
+        RustParamAbi::Borrow(_) | RustParamAbi::MutBorrow(_) | RustParamAbi::Slice(_) => {
             NativeReentryPolicy::UnsupportedLiveBoundary
         }
-        RustParamAbi::Slice(_) => NativeReentryPolicy::UnsupportedLiveBoundary,
         RustParamAbi::InitField(inner) | RustParamAbi::Option(inner) => {
             nested_value_reentry_policy(inner)
         }
@@ -315,6 +320,7 @@ fn reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
         },
         RustParamAbi::Value(_)
         | RustParamAbi::OwnedNamed(_)
+        | RustParamAbi::MutPlace(_)
         | RustParamAbi::ScopedLambda(_)
         | RustParamAbi::EscapingLambda(_)
         | RustParamAbi::AnvCallback(_) => NativeReentryPolicy::Safe,
@@ -333,7 +339,10 @@ fn nested_value_reentry_policy(abi: &RustParamAbi) -> NativeReentryPolicy {
 
 #[cfg(test)]
 mod tests {
-    use anvyx_runtime::{ExternTypeExpr, RustParamAbi};
+    use anvyx_runtime::{
+        CallbackPolicy, ExternCallbackSignature, ExternTypeExpr, RustAbiSupport, RustParamAbi,
+        RustReturnAbi,
+    };
 
     use super::*;
 
@@ -399,11 +408,18 @@ mod tests {
                 NativeArgAction::NativeRefBorrow { mutable: true },
             ),
             (
+                "mutable place remains descriptor-safe across retained callback reentry",
+                RustParamAbi::MutPlace(named("Counter")),
+                true,
+                facts(NativeArgMode::Direct, false, false),
+                NativeArgAction::Direct,
+            ),
+            (
                 "scoped callback is direct across retained callback reentry",
-                RustParamAbi::ScopedLambda(anvyx_runtime::ExternCallbackSignature {
+                RustParamAbi::ScopedLambda(ExternCallbackSignature {
                     params: vec![],
                     ret: Box::new(ExternTypeExpr::Void),
-                    policy: anvyx_runtime::CallbackPolicy::default(),
+                    policy: CallbackPolicy::default(),
                 }),
                 true,
                 facts(NativeArgMode::Direct, false, false),
@@ -412,8 +428,19 @@ mod tests {
         ];
 
         for (name, abi, retained, arg_facts, expected) in cases {
-            let plan = NativeCallPlan::new(vec![classify_param(&abi)], retained);
+            let plan =
+                NativeCallPlan::for_abi(&extern_abi(vec![abi], RustWrapperCtx::None), retained);
             assert_eq!(plan.arg_action(0, arg_facts), expected, "{name}");
+        }
+    }
+
+    fn extern_abi(params: Vec<RustParamAbi>, ctx: RustWrapperCtx) -> RustExternAbi {
+        RustExternAbi {
+            params,
+            ret: RustReturnAbi::Void,
+            fallible: false,
+            support: RustAbiSupport::Direct,
+            ctx,
         }
     }
 }

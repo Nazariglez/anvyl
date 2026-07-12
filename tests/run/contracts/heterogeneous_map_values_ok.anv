@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 31
+// 32
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct First {
+    fn score(self) -> int { 31 }
+}
+
+struct Second {
+    fn score(self) -> int { 32 }
+}
+
+fn main() {
+    let actors: [string: dyn Scored] = ["a": First {}, "b": Second {}];
+    if let actor? = actors["a"] {
+        println(actor.score());
+    }
+    if let actor? = actors["b"] {
+        println(actor.score());
+    }
+}

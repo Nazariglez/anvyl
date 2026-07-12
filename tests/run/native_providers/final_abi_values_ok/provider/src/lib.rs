@@ -1,9 +1,55 @@
-use anvyx_runtime::{AnvString, AnvyxEnum, function};
+use anvyx_runtime::{function, methods, AnvString, AnvyxEnum};
 
-#[derive(Clone, AnvyxEnum)]
+#[derive(Clone, PartialEq, Eq, Hash, AnvyxEnum)]
 #[anvyx(name = "HostError")]
 pub enum HostError {
-    Bad(AnvString),
+    Bad(anvyx_runtime::AnvString),
+}
+
+#[methods]
+impl HostError {
+    pub fn label(&self) -> AnvString {
+        match self {
+            Self::Bad(label) => label.clone(),
+        }
+    }
+}
+
+#[function]
+pub fn make_host_error() -> HostError {
+    HostError::Bad(AnvString::from("dynamic enum"))
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, AnvyxEnum)]
+pub enum HostValue {
+    Pair((i64, i64)),
+    Outcome(std::result::Result<i64, anvyx_runtime::AnvString>),
+}
+
+#[methods]
+impl HostValue {
+    pub fn score(&self) -> i64 {
+        match self {
+            Self::Pair((left, right)) => left + right,
+            Self::Outcome(Ok(value)) => *value,
+            Self::Outcome(Err(_)) => 0,
+        }
+    }
+}
+
+#[function]
+pub fn make_host_pair() -> HostValue {
+    HostValue::Pair((3, 4))
+}
+
+#[function]
+pub fn make_host_outcome() -> HostValue {
+    HostValue::Outcome(Ok(9))
+}
+
+#[function]
+pub fn echo_host_value(value: HostValue) -> HostValue {
+    value
 }
 
 #[function]
@@ -43,7 +89,11 @@ pub fn first_char_array(values: [char; 3]) -> char {
 
 #[function]
 pub fn visible_result(ok: bool) -> Result<i64, AnvString> {
-    if ok { Ok(7) } else { Err(AnvString::from("bad")) }
+    if ok {
+        Ok(7)
+    } else {
+        Err(AnvString::from("bad"))
+    }
 }
 
 #[function]
@@ -89,6 +139,11 @@ anvyx_runtime::builtin_module! {
     source: "",
     exports: [
         HostError,
+        make_host_error,
+        HostValue,
+        make_host_pair,
+        make_host_outcome,
+        echo_host_value,
         maybe_add,
         swap_pair,
         counted_pair,

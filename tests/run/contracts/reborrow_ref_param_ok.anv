@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match: 5
+
+contract Counter {
+    fn bump(ref self);
+}
+
+struct Score {
+    points: int,
+
+    fn bump(ref self) { self.points += 1; }
+}
+
+fn bump(ref counter: dyn Counter) {
+    counter.bump();
+}
+
+fn forward(ref counter: dyn Counter) {
+    bump(counter);
+    bump(counter);
+}
+
+fn main() {
+    var score = Score { points: 3 };
+    forward(score);
+    println(score.points);
+}

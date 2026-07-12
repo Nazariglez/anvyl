@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match: 91
+
+contract Marker {
+    fn mark(self) -> int;
+}
+
+struct Node {
+    next: (dyn Marker)?,
+
+    fn mark(self) -> int { 91 }
+}
+
+fn main() {
+    let leaf: dyn Marker = Node { next: nil };
+    let root: dyn Marker = Node { next: leaf };
+    println(root.mark());
+}

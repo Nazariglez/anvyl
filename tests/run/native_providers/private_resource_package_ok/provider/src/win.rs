@@ -3,7 +3,7 @@ use anvyx_runtime::{function, methods, AnvyxRef};
 #[derive(AnvyxRef)]
 pub struct WWin {
     #[anvyx(field)]
-    value: i64,
+    pub value: i64,
     score: i64,
 }
 

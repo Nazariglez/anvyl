@@ -1,0 +1,53 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 4
+// 6
+// 8
+// @match-end
+
+contract Updatable {
+    fn update(ref self);
+}
+
+struct Enemy {
+    hp: int,
+
+    fn update(ref self) { self.hp += 1; }
+}
+
+struct Holder {
+    actor: dyn Updatable,
+}
+
+dataref HeapHolder {
+    actor: dyn Updatable,
+}
+
+lazy var global_actor: dyn Updatable = Enemy { hp: 7 };
+
+fn main() {
+    var holder = Holder { actor: Enemy { hp: 1 } };
+    if ref enemy = holder.actor as? Enemy {
+        enemy.update();
+    }
+    if let enemy? = holder.actor as? Enemy { println(enemy.hp); }
+
+    var actors: [dyn Updatable] = [Enemy { hp: 3 }];
+    if ref enemy = actors[0] as? Enemy {
+        enemy.update();
+    }
+    if let enemy? = actors[0] as? Enemy { println(enemy.hp); }
+
+    var heap = HeapHolder { actor: Enemy { hp: 5 } };
+    if ref enemy = heap.actor as? Enemy {
+        enemy.update();
+    }
+    if let enemy? = heap.actor as? Enemy { println(enemy.hp); }
+
+    if ref enemy = global_actor as? Enemy {
+        enemy.update();
+    }
+    if let enemy? = global_actor as? Enemy { println(enemy.hp); }
+}

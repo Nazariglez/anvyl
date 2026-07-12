@@ -1,0 +1,60 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 4
+// 6
+// index
+// 8
+// 10
+// @match-end
+
+contract Counter {
+    fn bump(ref self);
+    fn value(self) -> int;
+}
+
+struct Score {
+    points: int,
+
+    fn bump(ref self) { self.points += 1; }
+    fn value(self) -> int { self.points }
+}
+
+struct Holder {
+    score: Score,
+}
+
+dataref HeapHolder {
+    score: Score,
+}
+
+lazy var global_score = Score { points: 9 };
+
+fn bump(ref counter: dyn Counter) {
+    counter.bump();
+}
+
+fn first() -> int {
+    println("index");
+    0
+}
+
+fn main() {
+    var score = Score { points: 3 };
+    bump(score);
+    println(score.points);
+
+    var holder = Holder { score: Score { points: 5 } };
+    bump(holder.score);
+    println(holder.score.points);
+
+    var scores = [Score { points: 7 }];
+    bump(scores[first()]);
+    println(scores[0].points);
+
+    var heap = HeapHolder { score: Score { points: 9 } };
+    bump(heap.score);
+    println(heap.score.points);
+
+    bump(global_score);
+}

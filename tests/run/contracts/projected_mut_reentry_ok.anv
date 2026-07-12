@@ -1,0 +1,167 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 12
+// 12
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// 1
+// @match-end
+
+contract Counter {
+    fn bump(ref self);
+    fn reenter(ref self);
+    fn value(self) -> int;
+}
+
+struct Score {
+    points: int,
+
+    fn bump(ref self) { self.points += 1; }
+
+    fn reenter(ref self) {
+        self.points += 1;
+        add_reentrant();
+        self.points += 1;
+    }
+
+    fn value(self) -> int { self.points }
+}
+
+struct LargeScore {
+    points: int,
+    a: string,
+    b: string,
+    c: string,
+    d: string,
+
+    fn bump(ref self) { self.points += 1; }
+
+    fn reenter(ref self) {
+        self.points += 2;
+    }
+
+    fn value(self) -> int { self.points }
+}
+
+struct ListScore {
+    points: int,
+
+    fn bump(ref self) { self.points += 1; }
+
+    fn reenter(ref self) {
+        self.points += 1;
+        add_list_reentrant();
+        self.points += 1;
+    }
+
+    fn value(self) -> int { self.points }
+}
+
+struct Holder {
+    actor: dyn Counter,
+}
+
+struct Group {
+    actors: [Holder],
+}
+
+dataref HeapHolder {
+    actor: dyn Counter,
+}
+
+lazy var reentrant_heap = HeapHolder { actor: Score { points: 0 } };
+lazy var reentrant_groups = [Group {
+    actors: [Holder { actor: ListScore { points: 0 } }],
+}];
+lazy var global_actor: dyn Counter = Score { points: 0 };
+
+fn add_reentrant() {
+    for _ in 0..10 {
+        reentrant_heap.actor.bump();
+    }
+}
+
+fn add_list_reentrant() {
+    for _ in 0..10 {
+        reentrant_groups[0].actors[0].actor.bump();
+    }
+}
+
+fn bump_slice(ref actors: slice[dyn Counter]) {
+    actors[0].bump();
+}
+
+fn bump_scoped(ref holder: HeapHolder) {
+    let bump = || { holder.actor.bump(); };
+    bump();
+}
+
+fn main() {
+    reentrant_heap.actor.reenter();
+    println(reentrant_heap.actor.value());
+
+    reentrant_groups[0].actors.push(Holder { actor: Score { points: 0 } });
+    reentrant_groups[0].actors[0].actor.reenter();
+    println(reentrant_groups[0].actors[0].actor.value());
+
+    var direct: dyn Counter = Score { points: 0 };
+    direct.bump();
+    println(direct.value());
+
+    var holder = Holder { actor: Score { points: 0 } };
+    holder.actor.bump();
+    println(holder.actor.value());
+
+    var pair: ((dyn Counter), int) = (Score { points: 0 }, 0);
+    pair.0.bump();
+    println(pair.0.value());
+
+    var list: [dyn Counter] = [Score { points: 0 }];
+    list[0].bump();
+    println(list[0].value());
+
+    var array: [dyn Counter; 1] = [Score { points: 0 }];
+    array[0].bump();
+    println(array[0].value());
+
+    var boxed: [dyn Counter] = [LargeScore {
+        points: 0,
+        a: "a",
+        b: "b",
+        c: "c",
+        d: "d",
+    }];
+    boxed[0].bump();
+    println(boxed[0].value());
+
+    var sliced: [dyn Counter] = [Score { points: 0 }];
+    bump_slice(sliced);
+    println(sliced[0].value());
+
+    var actors: [string: dyn Counter] = ["a": Score { points: 0 }];
+    if ref actor? = actors["a"] {
+        actor.bump();
+        println(actor.value());
+    }
+
+    global_actor.bump();
+    println(global_actor.value());
+
+    var captured: dyn Counter = Score { points: 0 };
+    let bump_captured = || { captured.bump(); };
+    bump_captured();
+    println(captured.value());
+
+    var scoped = HeapHolder { actor: Score { points: 0 } };
+    bump_scoped(scoped);
+    println(scoped.actor.value());
+}

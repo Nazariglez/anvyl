@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 111
+// 111
+// @match-end
+
+contract Marker {
+    fn mark(self) -> int;
+}
+
+dataref Node {
+    value: int,
+    next: (dyn Marker)?,
+
+    fn mark(self) -> int { self.value }
+}
+
+fn main() {
+    var node = Node { value: 111, next: nil };
+    let carrier: dyn Marker = node;
+    node.next = carrier;
+    println(carrier.mark());
+    if let next? = node.next {
+        println(next.mark());
+    }
+}

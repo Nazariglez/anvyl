@@ -17,10 +17,19 @@
 // bad
 // enum
 // 21
+// dynamic enum
+// 7
+// 9
+// 7
 // @match-end
 
 import pkg:host.host {
     HostError,
+    make_host_error,
+    HostValue,
+    make_host_pair,
+    make_host_outcome,
+    echo_host_value,
     maybe_add,
     swap_pair,
     counted_pair,
@@ -35,6 +44,14 @@ import pkg:host.host {
     unit_result,
     describe_unit_result,
 };
+
+contract Labeled {
+    fn label(self) -> string;
+}
+
+contract Scored {
+    fn score(self) -> int;
+}
 
 fn main() {
     println(maybe_add(41, 5) ?? 0);
@@ -57,4 +74,13 @@ fn main() {
     println(describe_result(visible_result(false)));
     println(describe_enum_result(visible_enum_result(false)));
     println(describe_unit_result(unit_result()));
+
+    let labeled: dyn Labeled = make_host_error();
+    println(labeled.label());
+
+    let pair = echo_host_value(make_host_pair());
+    println(pair.score());
+    println(echo_host_value(make_host_outcome()).score());
+    let scored: dyn Scored = pair;
+    println(scored.score());
 }

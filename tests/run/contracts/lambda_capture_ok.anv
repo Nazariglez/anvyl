@@ -1,0 +1,42 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 81
+// 81
+// 82
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+struct First {
+    fn score(self) -> int { 81 }
+}
+
+struct Second {
+    fn score(self) -> int { 82 }
+}
+
+fn readonly() -> fn() -> int {
+    let actor: dyn Scored = First {};
+    || actor.score()
+}
+
+fn mutable() -> fn() -> int {
+    var actor: dyn Scored = First {};
+    || {
+        let score = actor.score();
+        actor = Second {};
+        score
+    }
+}
+
+fn main() {
+    let read = readonly();
+    println(read());
+
+    let update = mutable();
+    println(update());
+    println(update());
+}

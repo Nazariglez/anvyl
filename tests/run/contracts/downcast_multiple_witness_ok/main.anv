@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+import left { make_left };
+import right { make_right };
+import shared { Actor };
+
+fn main() {
+    if let actor? = make_left() as? Actor {
+        println(actor.score);
+    }
+    if let actor? = make_right() as? Actor {
+        println(actor.score);
+    }
+}

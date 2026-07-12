@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: error
+// @contains: dynamic provider failure
+
+import pkg:host.host { Counter, make_counter };
+
+contract FailingCounter {
+    fn fail(self) -> int;
+}
+
+struct LocalCounter {
+    fn fail(self) -> int { 7 }
+}
+
+struct WrappedCounter {
+    embed counter: Counter,
+}
+
+fn invoke(counter: dyn FailingCounter) -> int {
+    counter.fail()
+}
+
+fn main() {
+    assert(invoke(LocalCounter {}) == 7);
+    invoke(WrappedCounter { counter: make_counter() });
+}

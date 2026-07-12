@@ -1,0 +1,17 @@
+// @helper
+
+import shared { A, Actor, B };
+
+extend Actor {
+    fn a(self) {
+        println("left");
+    }
+
+    fn b(self) {}
+}
+
+pub fn run() {
+    let both: dyn A + B = Actor {};
+    let only: dyn A = both;
+    only.a();
+}

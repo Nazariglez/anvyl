@@ -1,0 +1,5 @@
+error: mutable methods with runtime context require #[anvyx(place, ctx)]
+ --> tests/ui/methods/mut_ctx_requires_place.rs:8:9
+  |
+8 |     pub fn bump<'cx>(&mut self, ctx: &mut anvyx_runtime::Ctx<'cx, '_>) {
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

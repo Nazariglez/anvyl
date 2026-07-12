@@ -1,0 +1,31 @@
+// @mode: run
+// @expect: success
+// @match: original
+
+contract A {
+    fn a(self);
+}
+
+contract B {
+    fn b(self);
+}
+
+contract C {
+    fn c(self);
+}
+
+struct All {
+    fn a(self) {
+        println("original");
+    }
+
+    fn b(self) {}
+    fn c(self) {}
+}
+
+fn main() {
+    let all: dyn A + B + C = All {};
+    let pair: dyn A + B = all;
+    let one: dyn A = pair;
+    one.a();
+}

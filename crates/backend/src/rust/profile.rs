@@ -5,8 +5,8 @@ use anvyx_frontend::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, GlobalId, Local, LocalId,
         LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
-        PlaceRoot, Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, VariantDecl,
-        VariantShape, VerifiedProgram,
+        PlaceRoot, Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, ValueUse,
+        VariantDecl, VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
@@ -18,8 +18,7 @@ use super::{
         PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
     },
     rep_policy::{
-        AirRustRepPolicy, LambdaStorageFamily, LambdaStorageGap, RustMaterialIntent,
-        RustMaterialSource, RustMaterialization,
+        LambdaStorageFamily, LambdaStorageGap, RustRecipePosition, RustRepresentationPlan,
     },
     rir,
 };
@@ -234,11 +233,15 @@ impl ProfileCx<'_> {
     }
 
     fn enum_decl_supported(&self, enm: EnumId) -> bool {
-        self.program
-            .enum_decl(enm)
-            .variants
-            .iter()
-            .all(|variant| variant_field_tys(variant).all(|ty| self.stored_payload_supported(ty)))
+        self.program.enum_decl(enm).variants.iter().all(|variant| {
+            variant_field_tys(variant).all(|ty| {
+                self.stored_payload_supported(ty)
+                    || self
+                        .policy()
+                        .storage_supported(ty, LambdaStorageFamily::EnumPayload)
+                        .is_ok()
+            })
+        })
     }
 
     fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {
@@ -503,6 +506,30 @@ impl ProfileCx<'_> {
                         self.check_air_block(function, &arm.block);
                     }
                 }
+                air::AirStmt::DynMatch(match_) => {
+                    match &match_.source {
+                        air::AirDynMatchSource::Owned { value, .. } => {
+                            self.check_operand(site, value);
+                        }
+                        air::AirDynMatchSource::Mutable(place) => {
+                            if !matches!(place.root, PlaceRoot::DynBorrowParam(_)) {
+                                match self.access().plan(
+                                    function,
+                                    PlaceAccessIntent::MutPlaceArg,
+                                    place,
+                                ) {
+                                    Ok(_) => self.check_type_ref(site, place.ty),
+                                    Err(gap) => self.push(site, profile_gap_kind(gap)),
+                                }
+                            }
+                        }
+                        air::AirDynMatchSource::Borrowed(_) => {}
+                    }
+                    for arm in &match_.arms {
+                        self.check_air_block(function, &arm.block);
+                    }
+                    self.check_air_block(function, &match_.fallback.block);
+                }
                 air::AirStmt::OptionalMatch(match_) => {
                     self.check_place(site, &match_.discr);
                     if match_.payload_ref
@@ -516,6 +543,7 @@ impl ProfileCx<'_> {
                         && !match_.payload_ref
                         && let TypeData::Optional(inner) =
                             self.program.type_arena.data(match_.discr.ty)
+                        && !matches!(self.program.type_arena.data(*inner), TypeData::Dyn(_))
                         && !self.policy().value_from_ref_supported(*inner)
                     {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
@@ -671,10 +699,51 @@ impl ProfileCx<'_> {
 
     fn check_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         match value {
+            RValue::DynPack { value, .. } | RValue::DynWeaken { value, .. } => {
+                self.check_operand(site, value);
+            }
+            RValue::DynCall {
+                receiver,
+                surface,
+                slot,
+                args,
+            } => {
+                match receiver {
+                    air::DynReceiver::Owned(value) => self.check_operand(site, value),
+                    air::DynReceiver::Borrowed(_) => {}
+                    air::DynReceiver::MutableOwned(place) => {
+                        let Some(function) = Self::current_function_id(site) else {
+                            self.push(site, ProfileErrorKind::UnsupportedMutablePlace);
+                            return;
+                        };
+                        match self
+                            .access()
+                            .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                        {
+                            Ok(_) => self.check_type_ref(site, place.ty),
+                            Err(gap) => self.push(site, profile_gap_kind(gap)),
+                        }
+                    }
+                }
+                let required = &self.program.contract_surfaces[surface.index()].slots[slot.index()];
+                for (arg, param) in args.iter().zip(&required.params) {
+                    self.check_call_arg(
+                        site,
+                        arg,
+                        Some(rir::source_param_semantic(
+                            self.program,
+                            param.ty,
+                            param.mode,
+                        )),
+                    );
+                }
+            }
             RValue::FunctionRef { .. } => {}
             RValue::Use(operand) | RValue::FunctionValue { value: operand, .. } => {
                 self.check_operand(site, operand);
-                if self.non_shareable_value_operand(operand) {
+                if self.non_shareable_value_operand(operand)
+                    && !self.unbound_movable_temp_operand(site, operand)
+                {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -703,14 +772,16 @@ impl ProfileCx<'_> {
                     }
                 }
             }
-            RValue::Cast { value, target } => {
+            RValue::DynDowncast { value, target, .. } | RValue::Cast { value, target } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *target);
             }
             RValue::OptionalSome { value, ty } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *ty);
-                if self.non_shareable_value_operand(value) {
+                if self.non_shareable_value_operand(value)
+                    && !self.unbound_movable_temp_operand(site, value)
+                {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -1029,7 +1100,9 @@ impl ProfileCx<'_> {
             if self.operand_ty(operand) != expected {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
             }
-            if self.non_shareable_value_operand(operand) {
+            if self.non_shareable_value_operand(operand)
+                && !self.unbound_movable_temp_operand(site, operand)
+            {
                 self.push(site, ProfileErrorKind::NonCopyValueRequired);
             }
         }
@@ -1124,7 +1197,7 @@ impl ProfileCx<'_> {
                 .signature
                 .params
                 .iter()
-                .map(|param| rir::source_param_semantic(param.mode))
+                .map(|param| rir::source_param_semantic(self.program, param.ty, param.mode))
                 .collect(),
             Callee::Extern(_) => vec![],
             Callee::Lambda(operand) => match self.program.type_arena.data(self.operand_ty(operand))
@@ -1132,7 +1205,7 @@ impl ProfileCx<'_> {
                 TypeData::Function(sig) => sig
                     .params
                     .iter()
-                    .map(|param| rir::source_param_semantic(param.mode))
+                    .map(|param| rir::source_param_semantic(self.program, param.ty, param.mode))
                     .collect(),
                 _ => vec![],
             },
@@ -1145,7 +1218,9 @@ impl ProfileCx<'_> {
         };
         native::resolve_extern(self.native_providers, self.program.extern_decl(*id))
             .ok()
-            .map(|native| native_call::NativeCallPlan::new(native.params, self.retained_callbacks))
+            .map(|native| {
+                native_call::NativeCallPlan::for_abi(&native.binding.abi, self.retained_callbacks)
+            })
     }
 
     fn call_arg_native_facts(&self, arg: &CallArg) -> native_call::NativeArgFacts {
@@ -1154,6 +1229,7 @@ impl ProfileCx<'_> {
             CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
                 Some(self.operand_ty(operand))
             }
+            CallArg::DynBorrow(borrow) => Some(borrow.ty),
             CallArg::SharedStringConst(_) | CallArg::InitFieldOmitted => None,
         };
         native_call::NativeArgFacts::air(
@@ -1178,9 +1254,28 @@ impl ProfileCx<'_> {
         expected: Option<rir::RirParamSemantic>,
     ) {
         match arg {
+            CallArg::DynBorrow(borrow) => match &borrow.source {
+                air::DynBorrowSource::Concrete { place, .. }
+                | air::DynBorrowSource::Owned(place) => {
+                    let Some(function) = Self::current_function_id(site) else {
+                        self.push(site, ProfileErrorKind::UnsupportedMutablePlace);
+                        return;
+                    };
+                    match self
+                        .access()
+                        .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                    {
+                        Ok(_) => self.check_type_ref(site, place.ty),
+                        Err(gap) => self.push(site, profile_gap_kind(gap)),
+                    }
+                }
+                air::DynBorrowSource::Borrowed(_) => {}
+            },
             CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
                 self.check_operand(site, operand);
-                if self.non_shareable_value_operand(operand) {
+                if self.non_shareable_value_operand(operand)
+                    && !self.unbound_movable_temp_operand(site, operand)
+                {
                     self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
@@ -1256,6 +1351,7 @@ impl ProfileCx<'_> {
                     }
                     rir::RirParamSemantic::Value
                     | rir::RirParamSemantic::SharedBorrow
+                    | rir::RirParamSemantic::DynBorrow
                     | rir::RirParamSemantic::ScopedLambda
                     | rir::RirParamSemantic::EscapingLambda
                     | rir::RirParamSemantic::AnvCallback
@@ -1282,13 +1378,42 @@ impl ProfileCx<'_> {
         }
     }
 
+    fn unbound_movable_temp_operand(&self, site: ProfileSite, operand: &Operand) -> bool {
+        let (Some(function), Operand::Place(place)) = (Self::current_function_id(site), operand)
+        else {
+            return false;
+        };
+        let Some(local) = place.root.local() else {
+            return false;
+        };
+        let local = &self.program.functions[function.index()].locals[local.index()];
+        place.projection.is_empty()
+            && (local.kind == LocalKind::Temp
+                || (matches!(
+                    self.program.type_arena.data(place.ty),
+                    TypeData::Function(_)
+                ) && local.binding.is_none()))
+    }
+
     fn non_shareable_value_operand(&self, operand: &Operand) -> bool {
         let Operand::Place(place) = operand else {
             return false;
         };
-        !matches!(self.program.type_arena.data(place.ty), TypeData::Slice(_))
+        let ty = self.program.type_arena.data(place.ty);
+        let reconstructable = matches!(
+            ty,
+            TypeData::Aggregate(_)
+                | TypeData::Tuple(_)
+                | TypeData::Enum(_)
+                | TypeData::Array { .. }
+        ) && self
+            .policy()
+            .storage_supported(place.ty, LambdaStorageFamily::UnknownOrigin)
+            .is_ok();
+        !matches!(ty, TypeData::Slice(_) | TypeData::Dyn(_))
             && self.non_copy_type(place.ty)
             && !self.policy().value_place_shareable(place.ty)
+            && !reconstructable
     }
 
     fn non_copy_type(&self, ty: TypeId) -> bool {
@@ -1302,7 +1427,8 @@ impl ProfileCx<'_> {
     }
 
     fn supports_param_mode(&self, ty: TypeId, mode: ParamMode) -> bool {
-        self.policy().supports_param_mode(ty, mode)
+        matches!(self.program.type_arena.data(ty), TypeData::Dyn(_))
+            || self.policy().supports_param_mode(ty, mode)
     }
 
     fn check_operand(&mut self, site: ProfileSite, operand: &Operand) {
@@ -1659,6 +1785,7 @@ impl ProfileCx<'_> {
                 }
                 true
             }
+            TypeData::Dyn(_) => true,
             TypeData::Function(sig) => {
                 for param in &sig.params {
                     self.check_type_ref(site, param.ty);
@@ -1732,18 +1859,17 @@ impl ProfileCx<'_> {
     }
 
     fn stored_payload_supported(&self, ty: TypeId) -> bool {
-        !matches!(
-            self.policy().materialization_for(
+        self.policy()
+            .recipe_for(
                 ty,
-                RustMaterialSource::StoredPayload,
-                RustMaterialIntent::Store,
-            ),
-            RustMaterialization::Gap
-        )
+                ValueUse::Store,
+                RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+            )
+            .is_ok()
     }
 
-    fn policy(&self) -> AirRustRepPolicy<'_> {
-        AirRustRepPolicy::new(self.program, &self.classes)
+    fn policy(&self) -> RustRepresentationPlan<'_> {
+        RustRepresentationPlan::new(self.program, &self.classes)
     }
 
     fn access(&self) -> PlaceAccessCx<'_> {

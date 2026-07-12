@@ -5,10 +5,11 @@ pub use anvyx_externs::{
     ExternBindingOp, ExternBindingTarget, ExternCallbackParam, ExternCallbackSignature,
     ExternEffects, ExternEnumVariantDescriptor, ExternEnumVariantFieldDescriptor,
     ExternFieldDescriptor, ExternFunctionDescriptor, ExternFunctionKey, ExternInitDescriptor,
-    ExternMemberKey, ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor,
-    ExternOperator, ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature,
-    ExternStaticDescriptor, ExternTypeDescriptor, ExternTypeExpr, ExternTypeKey, ModulePath,
-    ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp, effective_callback_escape,
+    ExternLayout, ExternMaterialization, ExternMemberKey, ExternMemberSelector,
+    ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
+    ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
+    ExternTypeExpr, ExternTypeKey, ModulePath, ParamFlow, ProviderDescriptor, ProviderId,
+    ReceiverMode, UnaryOp, effective_callback_escape,
 };
 use serde::{Deserialize, Serialize};
 
@@ -993,11 +994,25 @@ fn validate_native_module(
             )
         })?;
     for ty in &support.types {
-        if ty.key.module != support.module
-            || !module.types.iter().any(|decl| decl.name == ty.key.name)
-        {
+        let Some(decl) = module.types.iter().find(|decl| decl.name == ty.key.name) else {
             return Err(format!(
                 "native provider `{}` has support for unknown type `{}::{}`",
+                descriptor.provider.name,
+                ty.key.module.segments.join("::"),
+                ty.key.name
+            ));
+        };
+        if ty.key.module != support.module {
+            return Err(format!(
+                "native provider `{}` has support for unknown type `{}::{}`",
+                descriptor.provider.name,
+                ty.key.module.segments.join("::"),
+                ty.key.name
+            ));
+        }
+        if decl.owns_heap_edges != Some(ty.owns_heap_edges) {
+            return Err(format!(
+                "native provider `{}` has inconsistent heap-edge metadata for type `{}::{}`",
                 descriptor.provider.name,
                 ty.key.module.segments.join("::"),
                 ty.key.name
@@ -1240,6 +1255,14 @@ fn validate_native_abi(
                 descriptor,
                 key,
                 &format!("parameter {index} ABI mismatch"),
+            ));
+        }
+        if matches!(param_abi, RustParamAbi::MutPlace(ty) if payload_has_resource(descriptor, key, ty))
+        {
+            return Err(native_abi_error(
+                descriptor,
+                key,
+                "mutable-place ABI is unsupported for shared resources",
             ));
         }
     }
@@ -1801,7 +1824,7 @@ fn native_abi_error(
     )
 }
 
-pub trait AnvyxInlineExport {}
+pub trait AnvyxInlineExport: Copy {}
 
 /// # Safety
 /// Manual impls must set `OWNS_ANVYX_HEAP_EDGES` to true when the type owns any
@@ -1811,7 +1834,7 @@ pub unsafe trait AnvyxRefExport {
     const OWNS_ANVYX_HEAP_EDGES: bool = false;
 }
 
-pub trait AnvyxEnumExport {}
+pub trait AnvyxEnumExport: Clone + PartialEq + Eq + std::hash::Hash {}
 
 #[cfg(test)]
 mod tests {
@@ -1852,11 +1875,13 @@ mod tests {
     #[test]
     fn rejects_tracked_owned_resource_return() {
         let resource = shared_resource();
+        let mut resource_type = shared_resource_type(vec![]);
+        resource_type.owns_heap_edges = Some(true);
         let descriptor = ProviderDescriptor {
             provider: provider(),
             modules: vec![ExternModuleDescriptor {
                 path: module(),
-                types: vec![shared_resource_type(vec![])],
+                types: vec![resource_type],
                 functions: vec![ExternFunctionDescriptor {
                     name: "make".to_string(),
                     doc: None,
@@ -1903,12 +1928,14 @@ mod tests {
             name: "Thing".to_string(),
             args: vec![],
         };
+        let mut resource_type = shared_resource_type(vec![]);
+        resource_type.owns_heap_edges = Some(true);
         let descriptor = ProviderDescriptor {
             provider: provider(),
             modules: vec![
                 ExternModuleDescriptor {
                     path: resource_module.clone(),
-                    types: vec![shared_resource_type(vec![])],
+                    types: vec![resource_type],
                     functions: vec![],
                 },
                 ExternModuleDescriptor {
@@ -1991,6 +2018,9 @@ mod tests {
                     name: "Thing".to_string(),
                     doc: None,
                     rep: ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: None,
                     fields: vec![],
                     variants: vec![],
                     init: None,
@@ -2041,6 +2071,9 @@ mod tests {
                     name: "Thing".to_string(),
                     doc: None,
                     rep: ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: None,
                     fields: vec![],
                     variants: vec![],
                     init: None,
@@ -2081,6 +2114,25 @@ mod tests {
             ),
             void_binding("use_owned", RustParamAbi::OwnedNamed(resource)),
             "shared resource parameters must use top-level, Option, or Result AnvRef",
+        );
+    }
+
+    #[test]
+    fn rejects_shared_resource_mutable_place() {
+        let resource = shared_resource();
+        assert_abi_error(
+            shared_resource_descriptor(
+                "edit",
+                vec![ExternParam {
+                    name: Some("value".to_string()),
+                    ty: resource.clone(),
+                    flow: ParamFlow::MutBorrow,
+                    escape: CallbackEscape::NonEscaping,
+                }],
+                ExternTypeExpr::Void,
+            ),
+            void_binding("edit", RustParamAbi::MutPlace(resource)),
+            "mutable-place ABI is unsupported for shared resources",
         );
     }
 
@@ -2481,6 +2533,9 @@ mod tests {
                     name: "Host".to_string(),
                     doc: None,
                     rep: ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: None,
                     fields: vec![],
                     variants: vec![],
                     init: None,
@@ -3135,6 +3190,9 @@ mod tests {
                     name: "Thing".to_string(),
                     doc: None,
                     rep: ExternRep::Shared,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: None,
                     fields: vec![ExternFieldDescriptor {
                         name: "n".to_string(),
                         ty: ExternTypeExpr::Int,
@@ -3226,6 +3284,9 @@ mod tests {
             name: "Thing".to_string(),
             doc: None,
             rep: ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: Some(false),
             fields: vec![],
             variants: vec![],
             init: None,

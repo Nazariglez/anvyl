@@ -1,0 +1,10 @@
+error: scoped callback wrapper parameters cannot be combined with method receivers
+  --> tests/ui/methods/place_rejects_callback.rs:11:9
+   |
+11 |       pub fn apply<'cx>(
+   |  _________^
+12 | |         ctx: &mut anvyx_runtime::Ctx<'cx, '_>,
+13 | |         place: anvyx_runtime::MutPlace<'_, 'cx, Self>,
+14 | |         callback: anvyx_runtime::ScopedLambda<'_, '_, (), ()>,
+15 | |     ) -> anvyx_runtime::RuntimeResult<()> {
+   | |_________________________________________^
