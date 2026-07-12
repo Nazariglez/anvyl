@@ -1709,7 +1709,7 @@ fn lifetime_only_args(args: &PathArguments) -> bool {
             .all(|arg| matches!(arg, GenericArgument::Lifetime(lifetime) if lifetime.ident == "cx"))
 }
 
-fn mut_place_type_arg(path: &TypePath) -> syn::Result<Option<&Type>> {
+pub(crate) fn mut_place_type_arg(path: &TypePath) -> syn::Result<Option<&Type>> {
     if !path_is(path, &["MutPlace"]) && !path_is(path, &["anvyx_runtime", "MutPlace"]) {
         return Ok(None);
     }

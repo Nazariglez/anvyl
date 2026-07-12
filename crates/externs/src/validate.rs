@@ -69,6 +69,14 @@ pub enum ExternDescriptorError {
         ty: ExternTypeKey,
         variant: String,
     },
+    InvalidRepresentationMetadata {
+        ty: ExternTypeKey,
+    },
+    InvalidLayout {
+        ty: ExternTypeKey,
+        size: u64,
+        align: u64,
+    },
     VoidType {
         context: TypeContext,
     },
@@ -226,6 +234,31 @@ fn check_type(
         module: module.path.clone(),
         name: ty.name.clone(),
     };
+
+    if mode == ValidationMode::Provider {
+        let metadata_valid = match ty.rep {
+            ExternRep::Inline => {
+                ty.layout.is_some() && ty.materialization.is_some() && ty.owns_heap_edges.is_some()
+            }
+            ExternRep::Shared => {
+                ty.layout.is_none() && ty.materialization.is_none() && ty.owns_heap_edges.is_some()
+            }
+        };
+        if !metadata_valid {
+            errors.push(ExternDescriptorError::InvalidRepresentationMetadata { ty: key.clone() });
+        }
+        if let Some(layout) = ty.layout
+            && (layout.align == 0
+                || !layout.align.is_power_of_two()
+                || layout.size % layout.align != 0)
+        {
+            errors.push(ExternDescriptorError::InvalidLayout {
+                ty: key.clone(),
+                size: layout.size,
+                align: layout.align,
+            });
+        }
+    }
 
     let mut fields = HashSet::new();
     for field in &ty.fields {
@@ -659,6 +692,9 @@ mod tests {
                     name: "Vec2".to_string(),
                     doc: None,
                     rep: ExternRep::Inline,
+                    layout: Some(ExternLayout { size: 8, align: 8 }),
+                    materialization: Some(ExternMaterialization::Copy),
+                    owns_heap_edges: Some(false),
                     fields: vec![ExternFieldDescriptor {
                         name: "x".to_string(),
                         ty: ExternTypeExpr::Float,
@@ -1150,6 +1186,44 @@ mod tests {
         assert!(errors.contains(&ExternDescriptorError::VoidType {
             context: TypeContext::Nested,
         }));
+    }
+
+    #[test]
+    fn rejects_incomplete_and_shared_representation_metadata() {
+        let mut provider = valid_provider();
+        provider.modules[0].types[0].materialization = None;
+        let key = ty(module(&["math"]), "Vec2");
+
+        let errors = validate(&provider).unwrap_err();
+        assert!(
+            errors.contains(&ExternDescriptorError::InvalidRepresentationMetadata {
+                ty: key.clone(),
+            })
+        );
+
+        let ty = &mut provider.modules[0].types[0];
+        ty.rep = ExternRep::Shared;
+        ty.layout = Some(ExternLayout { size: 8, align: 8 });
+        ty.materialization = None;
+        ty.owns_heap_edges = Some(false);
+        let errors = validate(&provider).unwrap_err();
+        assert!(errors.contains(&ExternDescriptorError::InvalidRepresentationMetadata { ty: key }));
+    }
+
+    #[test]
+    fn rejects_invalid_inline_layout() {
+        let key = ty(module(&["math"]), "Vec2");
+        for (size, align) in [(8, 0), (8, 3), (9, 8)] {
+            let mut provider = valid_provider();
+            provider.modules[0].types[0].layout = Some(ExternLayout { size, align });
+
+            let errors = validate(&provider).unwrap_err();
+            assert!(errors.contains(&ExternDescriptorError::InvalidLayout {
+                ty: key.clone(),
+                size,
+                align,
+            }));
+        }
     }
 
     #[test]

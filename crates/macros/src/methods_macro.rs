@@ -12,7 +12,7 @@ use syn::{
 use crate::boundary::{
     BoundaryConversion, BoundaryParam, BoundaryReturn, BoundaryType, OwnerReturn, ReturnAbi,
     classify_init_param, classify_param, classify_provider_return_for_owner, classify_return,
-    conversion_tokens, flow_tokens, has_callback_wrapper, merge_conversions,
+    conversion_tokens, flow_tokens, has_callback_wrapper, merge_conversions, mut_place_type_arg,
     named_type_expr_tokens, param_abi_for_override, param_abi_tokens, param_escape_tokens,
     return_abi_for_override, return_abi_tokens, signature_conversion, type_expr_tokens,
     type_with_override, validate_callable_signature, validate_callback_wrapper_precheck,
@@ -94,6 +94,14 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                     &export_name,
                 )?);
             }
+            Role::PlaceMethod => descriptor_methods.push(method_descriptor(
+                method,
+                Receiver::Mutable,
+                &export,
+                &params,
+                &owner,
+                &export_name,
+            )?),
             Role::Static => descriptor_statics.push(static_descriptor(
                 method,
                 &export,
@@ -166,6 +174,9 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
                     name: #export_name.to_string(),
                     doc: None,
                     rep: anvyx_runtime::ExternRep::Inline,
+                    layout: None,
+                    materialization: None,
+                    owns_heap_edges: None,
                     fields: vec![#(#descriptor_fields),*],
                     variants: vec![],
                     init: #init,
@@ -234,6 +245,7 @@ struct MethodExport {
 #[derive(Clone)]
 enum Role {
     Method(Receiver),
+    PlaceMethod,
     Static,
     Init,
     Getter,
@@ -259,7 +271,7 @@ impl MethodExport {
         validate_role(owner, method, &role, receiver, &attrs)?;
         let name = method.sig.ident.to_string();
         let selector = match &role {
-            Role::Method(_) => {
+            Role::Method(_) | Role::PlaceMethod => {
                 quote! { anvyx_runtime::ExternMemberSelector::Method(#name.to_string()) }
             }
             Role::Static => {
@@ -311,6 +323,11 @@ fn validate_role(
             &method.sig.ident,
             "methods require &self or &mut self",
         )),
+        Role::Method(Receiver::Mutable) if attrs.ctx => Err(syn::Error::new_spanned(
+            &method.sig,
+            "mutable methods with runtime context require #[anvyx(place, ctx)]",
+        )),
+        Role::PlaceMethod => validate_place_method(method, attrs),
         Role::Init => {
             if attrs.ret.is_some() {
                 return Err(syn::Error::new_spanned(
@@ -369,6 +386,57 @@ fn validate_role(
     }
 }
 
+fn validate_place_method(method: &ImplItemFn, attrs: &MethodAttrs) -> syn::Result<()> {
+    if receiver(&method.sig.inputs)?.is_some() {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[anvyx(place)] must be an associated function",
+        ));
+    }
+    if !attrs.ctx {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[anvyx(place)] requires #[anvyx(ctx)]",
+        ));
+    }
+    let params = visible_typed_params(method, true)?;
+    let Some(receiver) = params.first() else {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "#[anvyx(place)] requires `receiver: MutPlace<'_, 'cx, Self>`",
+        ));
+    };
+    let Type::Path(path) = receiver.ty.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &receiver.ty,
+            "place receiver must have type MutPlace<'_, 'cx, Self>",
+        ));
+    };
+    let Some(payload) = mut_place_type_arg(path)? else {
+        return Err(syn::Error::new_spanned(
+            &receiver.ty,
+            "place receiver must have type MutPlace<'_, 'cx, Self>",
+        ));
+    };
+    let Type::Path(payload) = payload else {
+        return Err(syn::Error::new_spanned(
+            payload,
+            "place receiver payload must be Self",
+        ));
+    };
+    let valid = payload.qself.is_none()
+        && payload.path.segments.len() == 1
+        && payload.path.segments[0].ident == "Self"
+        && matches!(payload.path.segments[0].arguments, PathArguments::None);
+    if !valid {
+        return Err(syn::Error::new_spanned(
+            payload,
+            "place receiver payload must be Self",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct MethodAttrs {
     role: Option<Role>,
@@ -382,7 +450,9 @@ impl MethodAttrs {
         let mut parsed = Self::default();
         for attr in attrs.iter().filter(|attr| attr.path().is_ident("anvyx")) {
             attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("init") {
+                if meta.path.is_ident("place") {
+                    parsed.set_role(meta.error("duplicate #[anvyx(...)] role"), Role::PlaceMethod)
+                } else if meta.path.is_ident("init") {
                     parsed.set_role(meta.error("duplicate #[anvyx(...)] role"), Role::Init)
                 } else if meta.path.is_ident("getter") {
                     parsed.set_role(meta.error("duplicate #[anvyx(...)] role"), Role::Getter)
@@ -435,7 +505,7 @@ impl MethodAttrs {
                     Ok(())
                 } else {
                     Err(meta.error(
-                        "expected init, getter, setter, ctx, op(...), ret = ..., or params(...)",
+                        "expected place, init, getter, setter, ctx, op(...), ret = ..., or params(...)",
                     ))
                 }
             })?;
@@ -612,6 +682,17 @@ fn visible_typed_params(method: &ImplItemFn, skip_ctx: bool) -> syn::Result<Vec<
             FnArg::Typed(_) | FnArg::Receiver(_) => None,
         })
         .collect()
+}
+
+fn method_value_params<'a>(
+    method: &'a ImplItemFn,
+    export: &MethodExport,
+) -> syn::Result<Vec<&'a syn::PatType>> {
+    let mut params = visible_typed_params(method, export.ctx)?;
+    if matches!(export.role, Role::PlaceMethod) {
+        params.remove(0);
+    }
+    Ok(params)
 }
 
 fn method_descriptor(
@@ -1119,7 +1200,7 @@ fn native_wrapper(
     let ctx = quote! { ctx };
     let inputs = wrapper_inputs(owner, method, export, &ctx, runtime_arg);
     let output = wrapper_output(owner, method);
-    let args = visible_typed_params(method, export.ctx)
+    let args = method_value_params(method, export)
         .expect("validated method signature")
         .into_iter()
         .map(|param| &param.pat)
@@ -1133,6 +1214,7 @@ fn native_wrapper(
         Role::Method(_) | Role::Getter | Role::Setter | Role::Operator(_) => {
             quote! { receiver.#ident(#call_args) }
         }
+        Role::PlaceMethod => quote! { super::#owner::#ident(ctx, receiver, #(#args),*) },
         Role::Static | Role::Init => quote! { super::#owner::#ident(#call_args) },
     };
     Ok(quote! {
@@ -1172,7 +1254,7 @@ fn wrapper_inputs(
     ctx: &TokenStream,
     runtime_arg: bool,
 ) -> TokenStream {
-    let params = visible_typed_params(method, export.ctx)
+    let params = method_value_params(method, export)
         .expect("validated method signature")
         .into_iter()
         .map(|param| {
@@ -1194,6 +1276,12 @@ fn wrapper_inputs(
             } else {
                 quote! { #receiver, #(#params),* }
             }
+        }
+        Role::PlaceMethod => {
+            let receiver = quote! {
+                receiver: anvyx_runtime::MutPlace<'_, 'cx, super::#owner>
+            };
+            quote! { #ctx: &mut anvyx_runtime::Ctx<'cx, '_>, #receiver, #(#params),* }
         }
         Role::Static | Role::Init => {
             if runtime_arg {
@@ -1278,17 +1366,17 @@ fn method_params(method: &ImplItemFn, export: &MethodExport) -> syn::Result<Vec<
             classify_param(param, export.ctx)
         }
     };
-    let params = visible_typed_params(method, export.ctx)?
+    let params = method_value_params(method, export)?
         .into_iter()
         .map(classify)
         .collect::<syn::Result<Vec<_>>>()?;
     if export.ctx {
-        let receiver = role_receiver(method, &export.role);
+        let rust_receiver = receiver(&method.sig.inputs)?;
         if let Some(FnArg::Typed(ctx)) = method
             .sig
             .inputs
             .iter()
-            .nth(usize::from(receiver.is_some()))
+            .nth(usize::from(rust_receiver.is_some()))
         {
             validate_mut_place_ctx(&method.sig, ctx, &params, "#[anvyx(ctx)]")?;
         }
@@ -1338,12 +1426,19 @@ fn member_binding(
     } else {
         params_with_overrides(method, Some(export), params)?
     };
-    let mut abis = match role_receiver(method, &export.role) {
-        Some(Receiver::Shared) => vec![quote! { anvyx_runtime::RustParamAbi::Borrow(#owner_ty) }],
-        Some(Receiver::Mutable) => {
-            vec![quote! { anvyx_runtime::RustParamAbi::MutBorrow(#owner_ty) }]
+    let mut abis = match export.role {
+        Role::PlaceMethod => {
+            vec![quote! { anvyx_runtime::RustParamAbi::MutPlace(#owner_ty) }]
         }
-        None => vec![],
+        _ => match role_receiver(method, &export.role) {
+            Some(Receiver::Shared) => {
+                vec![quote! { anvyx_runtime::RustParamAbi::Borrow(#owner_ty) }]
+            }
+            Some(Receiver::Mutable) => {
+                vec![quote! { anvyx_runtime::RustParamAbi::MutBorrow(#owner_ty) }]
+            }
+            None => vec![],
+        },
     };
     if self_operator {
         abis.push(quote! { anvyx_runtime::RustParamAbi::OwnedNamed(#owner_ty) });
@@ -1429,6 +1524,7 @@ fn member_binding(
 fn role_receiver(method: &ImplItemFn, role: &Role) -> Option<Receiver> {
     match role {
         Role::Method(receiver) => Some(*receiver),
+        Role::PlaceMethod => Some(Receiver::Mutable),
         Role::Getter | Role::Setter | Role::Operator(_) => {
             receiver(&method.sig.inputs).ok().flatten()
         }

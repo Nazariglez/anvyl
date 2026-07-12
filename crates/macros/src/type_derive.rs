@@ -58,7 +58,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     if let Some(message) = generic_error {
         return Err(syn::Error::new_spanned(item.generics, message));
     }
-    let mut owns_heap_edges = false;
+    let owns_heap_edges;
     let (fields, variants) = match (&item.data, kind) {
         (Data::Struct(strukt), TypeDeriveKind::Inline | TypeDeriveKind::Ref) => {
             let Fields::Named(fields) = &strukt.fields else {
@@ -67,9 +67,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                     format!("{} requires a named-field struct", kind.macro_name()),
                 ));
             };
-            if matches!(kind, TypeDeriveKind::Ref) {
-                owns_heap_edges = validate_ref_fields(fields)?;
-            }
+            owns_heap_edges = validate_ref_fields(fields)?;
             (
                 fields
                     .named
@@ -79,13 +77,20 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                 vec![],
             )
         }
-        (Data::Enum(enm), TypeDeriveKind::Enum) => (
-            vec![],
-            enm.variants
+        (Data::Enum(enm), TypeDeriveKind::Enum) => {
+            owns_heap_edges = enm
+                .variants
                 .iter()
-                .map(variant_descriptor)
-                .collect::<syn::Result<Vec<_>>>()?,
-        ),
+                .flat_map(|variant| &variant.fields)
+                .any(|field| classify_ref_field_type(&field.ty).owns_heap_edges);
+            (
+                vec![],
+                enm.variants
+                    .iter()
+                    .map(variant_descriptor)
+                    .collect::<syn::Result<Vec<_>>>()?,
+            )
+        }
         (_, TypeDeriveKind::Enum) => {
             return Err(syn::Error::new_spanned(
                 item.ident,
@@ -103,6 +108,12 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     let ident = &item.ident;
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     let export_name = type_name(&item.attrs)?.unwrap_or_else(|| ident.to_string());
+    if !matches!(item.vis, syn::Visibility::Public(_)) {
+        return Err(syn::Error::new_spanned(
+            ident,
+            format!("{} requires a public exported type", kind.macro_name()),
+        ));
+    }
     let companion = crate::naming::fn_companion_ident(ident);
     let native_mod = crate::naming::native_export_module_ident(ident);
     let doc = crate::util::extract_doc(&item.attrs)
@@ -114,6 +125,29 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     };
     let marker_trait = kind.marker_trait();
     let rep = kind.rep();
+    let trace_assert = (owns_heap_edges && !matches!(kind, TypeDeriveKind::Ref)).then(|| {
+        quote! {
+            fn __anvyx_assert_trace<T: for<'trace> anvyx_runtime::Trace<'trace>>() {}
+            __anvyx_assert_trace::<#ident #ty_generics>();
+        }
+    });
+    let (layout, materialization, heap_edges) = match kind {
+        TypeDeriveKind::Inline => (
+            quote! { Some(anvyx_runtime::ExternLayout { size: ::core::mem::size_of::<#ident #ty_generics>() as u64, align: ::core::mem::align_of::<#ident #ty_generics>() as u64 }) },
+            quote! { Some(anvyx_runtime::ExternMaterialization::Copy) },
+            quote! { Some(#owns_heap_edges) },
+        ),
+        TypeDeriveKind::Enum => (
+            quote! { Some(anvyx_runtime::ExternLayout { size: ::core::mem::size_of::<#ident #ty_generics>() as u64, align: ::core::mem::align_of::<#ident #ty_generics>() as u64 }) },
+            quote! { Some(anvyx_runtime::ExternMaterialization::Clone) },
+            quote! { Some(#owns_heap_edges) },
+        ),
+        TypeDeriveKind::Ref => (
+            quote! { None },
+            quote! { None },
+            quote! { Some(#owns_heap_edges) },
+        ),
+    };
     let marker_impl = if matches!(kind, TypeDeriveKind::Ref) {
         quote! {
             unsafe impl #impl_generics #marker_trait for #ident #ty_generics #where_clause {
@@ -131,6 +165,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
         pub fn #companion #impl_generics() -> anvyx_runtime::TypeExport #where_clause {
             fn __anvyx_assert_type<T: #marker_trait>() {}
             __anvyx_assert_type::<#ident #ty_generics>();
+            #trace_assert
             anvyx_runtime::merge_type_members(anvyx_runtime::TypeExport {
                 rust_type_path: #rust_type_path,
                 owns_heap_edges: #owns_heap_edges,
@@ -138,6 +173,9 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                     name: #export_name.to_string(),
                     doc: #doc,
                     rep: #rep,
+                    layout: #layout,
+                    materialization: #materialization,
+                    owns_heap_edges: #heap_edges,
                     fields: vec![#(#fields),*],
                     variants: vec![#(#variants),*],
                     init: None,
@@ -223,22 +261,17 @@ fn classify_ref_field_path(path: &syn::TypePath) -> RefFieldType {
             ..RefFieldType::default()
         };
     };
-    if segment.ident == "PhantomData" {
+    if path_is(path, &["std", "marker", "PhantomData"])
+        || path_is(path, &["core", "marker", "PhantomData"])
+    {
         return RefFieldType::default();
     }
     let mut class = classify_path_arguments(&segment.arguments);
     let name = segment.ident.to_string();
-    let is_heap_edge = matches!(
-        name.as_str(),
-        "AnvCallback" | "AnvList" | "AnvMap" | "AnvRef" | "ErasedHandle" | "Handle"
-    );
     if name == "EscapingLambda" {
         class.contains_escaping_lambda = true;
     }
-    if name == "EscapingLambda"
-        || is_heap_edge
-        || !path_segment_known_no_heap_edges(&name, &segment.arguments, class)
-    {
+    if class.contains_escaping_lambda || !path_known_edge_free(path, class) {
         class.owns_heap_edges = true;
     }
     class
@@ -267,25 +300,50 @@ fn classify_path_arguments(args: &PathArguments) -> RefFieldType {
     class
 }
 
-fn path_segment_known_no_heap_edges(name: &str, args: &PathArguments, class: RefFieldType) -> bool {
-    match (name, args) {
-        (
-            "bool" | "char" | "String" | "AnvString" | "u8" | "u16" | "u32" | "u64" | "u128"
-            | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "f32" | "f64",
-            PathArguments::None,
-        ) => true,
-        ("Option" | "Box", PathArguments::AngleBracketed(args)) => {
-            args.args
-                .iter()
-                .all(|arg| matches!(arg, GenericArgument::Type(_)))
-                && !class.contains_escaping_lambda
-                && !class.owns_heap_edges
-        }
-        ("Result", PathArguments::AngleBracketed(_)) => {
-            !class.contains_escaping_lambda && !class.owns_heap_edges
-        }
-        _ => false,
-    }
+fn path_known_edge_free(path: &syn::TypePath, class: RefFieldType) -> bool {
+    path_is(path, &["std", "string", "String"])
+        || path_is(path, &["alloc", "string", "String"])
+        || path_is(path, &["anvyx_runtime", "AnvString"])
+        || ((path_is(path, &["std", "option", "Option"])
+            || path_is(path, &["core", "option", "Option"])
+            || path_is(path, &["std", "boxed", "Box"])
+            || path_is(path, &["alloc", "boxed", "Box"])
+            || path_is(path, &["std", "result", "Result"])
+            || path_is(path, &["core", "result", "Result"]))
+            && !class.contains_escaping_lambda
+            && !class.owns_heap_edges)
+        || path.qself.is_none()
+            && path.path.segments.len() == 1
+            && matches!(
+                path.path.segments[0].ident.to_string().as_str(),
+                "bool"
+                    | "char"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "f32"
+                    | "f64"
+            )
+}
+
+fn path_is(path: &syn::TypePath, segments: &[&str]) -> bool {
+    path.qself.is_none()
+        && path.path.segments.len() == segments.len()
+        && path
+            .path
+            .segments
+            .iter()
+            .zip(segments)
+            .all(|(actual, expected)| actual.ident == *expected)
 }
 
 fn variant_descriptor(variant: &syn::Variant) -> syn::Result<TokenStream> {
@@ -339,6 +397,12 @@ fn field_descriptor(field: &syn::Field) -> Option<syn::Result<TokenStream>> {
 }
 
 fn field_descriptor_inner(field: &syn::Field) -> syn::Result<TokenStream> {
+    if !matches!(field.vis, syn::Visibility::Public(_)) {
+        return Err(syn::Error::new_spanned(
+            field,
+            "#[anvyx(field)] requires a public field",
+        ));
+    }
     let name = field
         .ident
         .as_ref()

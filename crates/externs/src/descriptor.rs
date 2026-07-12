@@ -24,6 +24,12 @@ pub struct ExternTypeDescriptor {
     pub name: String,
     pub doc: Option<String>,
     pub rep: ExternRep,
+    #[serde(default)]
+    pub layout: Option<ExternLayout>,
+    #[serde(default)]
+    pub materialization: Option<ExternMaterialization>,
+    #[serde(default)]
+    pub owns_heap_edges: Option<bool>,
     pub fields: Vec<ExternFieldDescriptor>,
     #[serde(default)]
     pub variants: Vec<ExternEnumVariantDescriptor>,
@@ -31,6 +37,18 @@ pub struct ExternTypeDescriptor {
     pub methods: Vec<ExternMethodDescriptor>,
     pub statics: Vec<ExternStaticDescriptor>,
     pub operators: Vec<ExternOperatorDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ExternLayout {
+    pub size: u64,
+    pub align: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ExternMaterialization {
+    Copy,
+    Clone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
