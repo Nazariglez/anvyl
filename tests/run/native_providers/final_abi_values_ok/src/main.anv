@@ -21,6 +21,10 @@
 // 7
 // 9
 // 7
+// NaN
+// inf
+// -inf
+// -0.0
 // @match-end
 
 import pkg:host.host {
@@ -35,6 +39,12 @@ import pkg:host.host {
     counted_pair,
     first_array,
     echo_char,
+    host_inf,
+    host_neg_inf,
+    host_payload_nan,
+    host_neg_zero,
+    host_accepts_nonfinite,
+    host_preserves_float_bits,
     maybe_char,
     first_char_array,
     visible_result,
@@ -83,4 +93,18 @@ fn main() {
     println(echo_host_value(make_host_outcome()).score());
     let scored: dyn Scored = pair;
     println(scored.score());
+
+    let nan = host_payload_nan();
+    let inf = host_inf();
+    let neg_inf = host_neg_inf();
+    let neg_zero = host_neg_zero();
+    assert(nan.is_nan());
+    assert(inf.is_infinite());
+    assert(neg_inf.is_infinite());
+    assert(host_accepts_nonfinite(nan, inf, neg_inf));
+    assert(host_preserves_float_bits(nan, neg_zero));
+    println(nan);
+    println(inf);
+    println(neg_inf);
+    println(neg_zero);
 }

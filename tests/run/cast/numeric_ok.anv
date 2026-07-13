@@ -1,9 +1,12 @@
 // @mode: run
 // @expect: success
-// @match: 45
 
 fn main() {
-    let a = 42 as float;
-    let b = 3.14 as int;
-    println((a as int) + b);
+    assert(3.75 as int == 3);
+    assert(-3.75 as int == -3);
+    assert(42 as float == 42.0);
+    assert(9007199254740993 as float == 9007199254740992.0);
+    assert((-9223372036854775807 - 1) as float == -9223372036854775808.0);
+    assert(-9223372036854775808.0 as int == (-9223372036854775807 - 1));
+    assert(9223372036854774784.0 as int == 9223372036854774784);
 }

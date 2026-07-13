@@ -28,13 +28,14 @@ pub use anvyx_heap::{
 pub use anvyx_macros::{
     AnvyxEnum, AnvyxInline, AnvyxRef, builtin_module, function, methods, module, provider_package,
 };
+pub use anvyx_semantics::{display_float, int_to_float};
 #[doc(hidden)]
 pub use callback_registry::{
     CallbackCloseResult, CallbackInvocationGuard, CallbackSlot, CallbackSlotState,
 };
 pub use check::{
     AnvOrdinalIter, checked_index, checked_index_result, checked_iter_skip, checked_iter_step_by,
-    checked_iter_take, checked_range,
+    checked_iter_take, checked_range, float_to_int,
 };
 pub use collection::{CollectionLoanState, ShapeLoanGuard, ValueLoanGuard};
 pub use collection_storage::{ListStorage, MapStorage};
@@ -70,4 +71,4 @@ pub use resource::{AnvRef, AnvRefType};
 pub use runtime_owner::{RuntimeOwnerEntry, RuntimeOwnerHandle, RuntimeOwnerShutdownGuard};
 pub use safepoint::{SafepointGuard, SafepointGuardKind, SafepointState};
 pub use scoped_lambda::ScopedLambda;
-pub use value::{AnvList, AnvMap, AnvSlice, AnvString, display_float};
+pub use value::{AnvList, AnvMap, AnvSlice, AnvString};

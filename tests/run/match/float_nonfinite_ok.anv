@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+
+fn classify(value: float) -> string {
+    match value {
+        0.0 => "zero",
+        1.5 => "finite",
+        _ => "other",
+    }
+}
+
+fn main() {
+    assert(classify(-0.0) == "zero");
+    assert(classify(0.0 / 0.0) == "other");
+    assert(classify(1.5) == "finite");
+}

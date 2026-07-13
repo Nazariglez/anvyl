@@ -1,0 +1,46 @@
+// @mode: run
+// @expect: success
+
+const INF: float = 1.0 / 0.0;
+const NEG_INF: float = -1.0 / 0.0;
+const NAN: float = 0.0 / 0.0;
+const REM: float = 5.0 % 3.0;
+const NEG_REM: float = -5.0 % 3.0;
+const NEG_ZERO_REM: float = -4.0 % 2.0;
+const NAN_LT: bool = NAN < 1.0;
+const NAN_LE: bool = NAN <= 1.0;
+const NAN_GT: bool = NAN > 1.0;
+const NAN_GE: bool = NAN >= 1.0;
+const NAN_NE: bool = NAN != NAN;
+const ZERO_EQ: bool = 0.0 == -0.0;
+const LOSSY_FLOAT: float = 9007199254740993 as float;
+const NEG_CAST: int = -3.75 as int;
+const MIN_CAST: int = -9223372036854775808.0 as int;
+const HIGH_CAST: int = 9223372036854774784.0 as int;
+const INF_TEXT: string = f"{INF}";
+const NAN_TEXT: string = f"{NAN}";
+
+fn main() {
+    assert(INF == 1.0 / 0.0);
+    assert(NEG_INF == -1.0 / 0.0);
+    assert(NAN != NAN);
+    assert(REM == 2.0);
+    assert(REM == 5.0 % 3.0);
+    assert(NEG_REM == -2.0);
+    assert(NEG_REM == -5.0 % 3.0);
+    assert(1.0 / NEG_ZERO_REM == NEG_INF);
+    assert(!NAN_LT);
+    assert(!NAN_LE);
+    assert(!NAN_GT);
+    assert(!NAN_GE);
+    assert(NAN_NE == ((0.0 / 0.0) != (0.0 / 0.0)));
+    assert(ZERO_EQ == (0.0 == -0.0));
+    assert(LOSSY_FLOAT == (9007199254740993 as float));
+    assert(LOSSY_FLOAT == 9007199254740992.0);
+    assert(1.0 / -0.0 == NEG_INF);
+    assert(NEG_CAST == (-3.75 as int));
+    assert(MIN_CAST == (-9223372036854775808.0 as int));
+    assert(HIGH_CAST == (9223372036854774784.0 as int));
+    assert(INF_TEXT == "inf");
+    assert(NAN_TEXT == "NaN");
+}

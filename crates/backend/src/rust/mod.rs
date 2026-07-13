@@ -6593,7 +6593,7 @@ fn const_suffix(value: &ConstValue) -> String {
     match value {
         ConstValue::Int(value) if *value < 0 => format!("n_neg_{}", value.unsigned_abs()),
         ConstValue::Int(value) => format!("n{value}"),
-        ConstValue::Float(value) => sanitize(&format!("f{value}")),
+        ConstValue::Float(value) => format!("f{:016x}", value.to_bits()),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::String(value) => sanitize(value).to_ascii_lowercase(),
         ConstValue::Char(value) => sanitize(&format!("c{}", *value as u32)),

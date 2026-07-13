@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: error
+// @contains: cannot convert non-finite float to int
+
+fn main() {
+    println((0.0 / 0.0) as int);
+}

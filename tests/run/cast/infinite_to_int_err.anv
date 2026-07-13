@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: error
+// @contains: cannot convert non-finite float to int
+fn cast_inf(value: float) -> int {
+    value as int
+}
+
+fn main() {
+    println(cast_inf(1.0 / 0.0));
+}

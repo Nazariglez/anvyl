@@ -78,6 +78,37 @@ pub fn echo_char(value: char) -> char {
 }
 
 #[function]
+pub fn host_inf() -> f64 {
+    f64::INFINITY
+}
+
+#[function]
+pub fn host_neg_inf() -> f64 {
+    f64::NEG_INFINITY
+}
+
+#[function]
+pub fn host_payload_nan() -> f64 {
+    f64::from_bits(0x7ff8_0000_0000_0042)
+}
+
+#[function]
+pub fn host_neg_zero() -> f64 {
+    -0.0
+}
+
+#[function]
+pub fn host_accepts_nonfinite(nan: f64, inf: f64, neg_inf: f64) -> bool {
+    nan.is_nan() && inf == f64::INFINITY && neg_inf == f64::NEG_INFINITY
+}
+
+#[function]
+pub fn host_preserves_float_bits(payload_nan: f64, neg_zero: f64) -> bool {
+    payload_nan.to_bits() == 0x7ff8_0000_0000_0042
+        && neg_zero.to_bits() == (-0.0_f64).to_bits()
+}
+
+#[function]
 pub fn maybe_char(value: Option<char>) -> Option<char> {
     value
 }
@@ -149,6 +180,12 @@ anvyx_runtime::builtin_module! {
         counted_pair,
         first_array,
         echo_char,
+        host_inf,
+        host_neg_inf,
+        host_payload_nan,
+        host_neg_zero,
+        host_accepts_nonfinite,
+        host_preserves_float_bits,
         maybe_char,
         first_char_array,
         visible_result,

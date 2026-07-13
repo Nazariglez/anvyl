@@ -77,14 +77,6 @@ impl fmt::Display for AnvString {
     }
 }
 
-pub fn display_float(value: f64) -> String {
-    let mut text = value.to_string();
-    if value.is_finite() && !text.contains(['.', 'e', 'E']) {
-        text.push_str(".0");
-    }
-    text
-}
-
 // SAFETY: `AnvString` owns only `EcoString` text and cannot contain heap handles.
 unsafe impl<'cx> Trace<'cx> for AnvString {
     #[inline]
@@ -1053,7 +1045,7 @@ unsafe impl<'cx, T> Trace<'cx> for AnvSlice<'cx, T> {
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
-    use super::{AnvList, AnvMap, AnvSlice, AnvString, display_float};
+    use super::{AnvList, AnvMap, AnvSlice, AnvString};
     use crate::{
         Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, RuntimeError, Trace, TraceDriver,
         Visitor,
@@ -1065,14 +1057,6 @@ mod tests {
 
     fn map_ty<'cx, K: 'cx, V: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, MapStorage<'cx, K, V>> {
         heap.register_untracked::<MapStorage<'_, K, V>>()
-    }
-
-    #[test]
-    fn display_float_preserves_non_whole_and_non_finite_values() {
-        assert_eq!(display_float(1.25), "1.25");
-        assert_eq!(display_float(f64::NAN), "NaN");
-        assert_eq!(display_float(f64::INFINITY), "inf");
-        assert_eq!(display_float(f64::NEG_INFINITY), "-inf");
     }
 
     #[test]

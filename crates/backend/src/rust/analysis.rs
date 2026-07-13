@@ -160,6 +160,18 @@ fn rvalue_calls_fallible(
     rvalue_uses_mut_place_param(function, value)
         || rvalue_uses_fallible_place(program, function, value)
         || match value {
+            RirRValue::Cast { value, target } => {
+                let Some(source) = operand_ty(program, value) else {
+                    return true;
+                };
+                matches!(
+                    (
+                        &program.types[source.index()],
+                        &program.types[target.index()]
+                    ),
+                    (RirType::Float, RirType::Int)
+                )
+            }
             RirRValue::ListPush { .. }
             | RirRValue::RangeListCopy { .. }
             | RirRValue::MapGet { .. }

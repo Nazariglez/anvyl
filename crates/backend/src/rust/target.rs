@@ -645,6 +645,18 @@ pub(super) fn anv_string_format(fmt: &str, arg: &str) -> String {
     anv_string_from(&format!("format!({fmt}, {arg})"))
 }
 
+pub(super) fn int_to_float(value: &str) -> String {
+    rt_path(&format!("int_to_float({value})"))
+}
+
+pub(super) fn float_to_int(value: &str) -> String {
+    rt_path(&format!("float_to_int({value})"))
+}
+
+pub(super) fn float_const(value: f64) -> String {
+    format!("f64::from_bits(0x{:016x}u64)", value.to_bits())
+}
+
 pub(super) fn display_float(value: &str) -> String {
     rt_path(&format!("display_float({value})"))
 }

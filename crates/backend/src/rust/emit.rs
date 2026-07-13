@@ -6082,17 +6082,17 @@ impl EmitCx<'_> {
         }
     }
 
-    fn cast(&self, function: &RirFunction, value: &RirOperand, target: RirTypeId) -> String {
-        if self.program.types[target.index()] == RirType::Int
+    fn cast(&self, function: &RirFunction, value: &RirOperand, target_ty: RirTypeId) -> String {
+        if self.program.types[target_ty.index()] == RirType::Int
             && let Some((enm, value)) = self.raw_enum_place(function, value, RirEnumRepr::RawInt)
         {
             return if enm.variants.is_empty() {
                 Self::raw_enum_cast_match(&value, String::new())
             } else {
-                format!("{value} as {}", self.ty(target))
+                format!("{value} as {}", self.ty(target_ty))
             };
         }
-        if self.program.types[target.index()] == RirType::String
+        if self.program.types[target_ty.index()] == RirType::String
             && let Some((enm, value)) = self.raw_enum_place(function, value, RirEnumRepr::RawString)
         {
             let arms = enm
@@ -6112,11 +6112,18 @@ impl EmitCx<'_> {
                 .join(", ");
             return Self::raw_enum_cast_match(&value, arms);
         }
-        format!(
-            "{} as {}",
-            RustValues::new(self.program, function).operand(value),
-            self.ty(target)
-        )
+
+        let values = RustValues::new(self.program, function);
+        let value_ty = values.operand_ty(value);
+        let value = values.operand(value);
+        match (
+            &self.program.types[value_ty.index()],
+            &self.program.types[target_ty.index()],
+        ) {
+            (RirType::Int, RirType::Float) => target::int_to_float(&value),
+            (RirType::Float, RirType::Int) => format!("{}?", target::float_to_int(&value)),
+            _ => format!("{value} as {}", self.ty(target_ty)),
+        }
     }
 
     fn raw_enum_cast_match(value: &str, arms: String) -> String {

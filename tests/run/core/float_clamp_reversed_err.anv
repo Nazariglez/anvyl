@@ -1,0 +1,7 @@
+// @mode: run
+// @expect: error
+// @contains: clamp lower bound exceeds upper bound
+
+fn main() {
+    println(1.0.clamp(2.0, 1.0));
+}

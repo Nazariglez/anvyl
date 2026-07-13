@@ -1,6 +1,17 @@
 use std::ops::Range;
 
+use anvyx_semantics::FloatToIntError;
+
 use crate::{RuntimeError, RuntimeResult};
+
+pub fn float_to_int(float: f64) -> RuntimeResult<i64> {
+    anvyx_semantics::float_to_int(float).map_err(|error| {
+        RuntimeError::new(match error {
+            FloatToIntError::NonFinite => "cannot convert non-finite float to int",
+            FloatToIntError::OutOfRange => "float is out of range for int",
+        })
+    })
+}
 
 pub fn checked_index(index: i64, len: usize) -> usize {
     assert!(index >= 0, "negative index");

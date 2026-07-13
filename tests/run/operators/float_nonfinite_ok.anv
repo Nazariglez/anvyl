@@ -1,0 +1,44 @@
+// @mode: run
+// @expect: success
+
+fn main() {
+    let nan = 0.0 / 0.0;
+    let inf = 1.0 / 0.0;
+    let neg_inf = -1.0 / 0.0;
+
+    assert(1.0 / 0.0 == inf);
+    assert(1.0 / -0.0 == neg_inf);
+    assert(-1.0 / 0.0 == neg_inf);
+    assert(-1.0 / -0.0 == inf);
+    assert((0.0 / 0.0) != (0.0 / 0.0));
+
+    assert(5.0 % inf == 5.0);
+    assert(5.0 % neg_inf == 5.0);
+    assert(-5.0 % inf == -5.0);
+    assert((inf % 2.0) != (inf % 2.0));
+    assert((neg_inf % 2.0) != (neg_inf % 2.0));
+    assert((5.0 % 0.0) != (5.0 % 0.0));
+    assert((5.0 % -0.0) != (5.0 % -0.0));
+    assert((nan % 2.0) != (nan % 2.0));
+    assert((2.0 % nan) != (2.0 % nan));
+    assert(1.0 / (-4.0 % 2.0) == neg_inf);
+
+    assert(nan != nan);
+    assert(!(nan == nan));
+    assert(!(nan < 1.0));
+    assert(!(nan <= 1.0));
+    assert(!(nan > 1.0));
+    assert(!(nan >= 1.0));
+    assert(0.0 == -0.0);
+
+    let left_grouped = (1.0e16 + -1.0e16) + 1.0;
+    let right_grouped = 1.0e16 + (-1.0e16 + 1.0);
+    assert(left_grouped == 1.0);
+    assert(right_grouped == 0.0);
+
+    assert(2e3 == 2000.0);
+    assert(5.0e-324 > 0.0);
+    assert(1.0e-400 == 0.0);
+    assert(1.0 / -1.0e-400 == neg_inf);
+    assert(1_2.3_4 == 12.34);
+}

@@ -11709,11 +11709,11 @@ fn emit_renders_format_with_central_specs_and_borrowed_strings() {
 
     assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:04}\", 7))"));
     assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:*>5}\", v1.as_str()))"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:.2}\", 1.25))"));
+    assert!(source.contains("format!(\"{:.2}\","));
     assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:X}\", 255))"));
     assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:b}\", 5))"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:e}\", 1.0))"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:E}\", 1.0))"));
+    assert!(source.contains("format!(\"{:e}\","));
+    assert!(source.contains("format!(\"{:E}\","));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
 }

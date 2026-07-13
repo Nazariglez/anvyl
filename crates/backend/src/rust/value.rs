@@ -1192,14 +1192,7 @@ impl<'a> RustValues<'a> {
     pub(super) fn const_value(konst: &RirConst) -> String {
         match &konst.value {
             RirConstValue::Int(value) => value.to_string(),
-            RirConstValue::Float(value) => {
-                let text = value.to_string();
-                if text.contains('.') {
-                    text
-                } else {
-                    format!("{text}.0")
-                }
-            }
+            RirConstValue::Float(value) => target::float_const(*value),
             RirConstValue::Bool(value) => value.to_string(),
             RirConstValue::String(value) => target::anv_string_from(&rust_string(value)),
             RirConstValue::Char(value) => rust_char(*value),

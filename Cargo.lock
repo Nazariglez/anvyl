@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "anvyx-core",
  "anvyx-externs",
+ "anvyx-semantics",
  "ariadne",
  "chumsky",
  "internment",
@@ -201,12 +202,17 @@ dependencies = [
  "anvyx-externs",
  "anvyx-heap",
  "anvyx-macros",
+ "anvyx-semantics",
  "ecow",
  "indexmap",
  "inventory",
  "serde",
  "trybuild",
 ]
+
+[[package]]
+name = "anvyx-semantics"
+version = "0.1.0"
 
 [[package]]
 name = "anvyx-stdlib"

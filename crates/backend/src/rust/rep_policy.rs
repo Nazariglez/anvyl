@@ -1928,7 +1928,7 @@ impl<'a> StructuralKeyCx<'a> {
     fn const_value(value: &air::ConstValue) -> String {
         match value {
             air::ConstValue::Int(value) => format!("int:{value}"),
-            air::ConstValue::Float(value) => format!("float:{}", value.to_bits()),
+            air::ConstValue::Float(value) => format!("float:{:016x}", value.to_bits()),
             air::ConstValue::Bool(value) => format!("bool:{value}"),
             air::ConstValue::String(value) => format!("string:{value:?}"),
             air::ConstValue::Char(value) => format!("char:{}", *value as u32),
