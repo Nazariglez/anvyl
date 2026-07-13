@@ -72,7 +72,7 @@ impl Display for Token {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LitToken {
     Number(i64),
-    Float(Intern<String>),
+    Float(Intern<String>, f64),
     String(Intern<String>),
     Char(char),
 }
@@ -81,7 +81,7 @@ impl Display for LitToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LitToken::Number(n) => write!(f, "{n}"),
-            LitToken::Float(s) | LitToken::String(s) => write!(f, "{s}"),
+            LitToken::Float(s, _) | LitToken::String(s) => write!(f, "{s}"),
             LitToken::Char(c) => write!(f, "{c:?}"),
         }
     }
@@ -617,21 +617,28 @@ fn strip_underscores(s: &str) -> String {
     s.chars().filter(|c| *c != '_').collect()
 }
 
-fn try_consume_exponent<'src>(
+fn consume_decimal_digits<'src>(
     input: &mut InputRef<'src, '_, &'src str, Extra<'src>>,
     buf: &mut String,
 ) {
+    while matches!(input.peek(), Some('0'..='9' | '_')) {
+        buf.push(input.next().unwrap());
+    }
+}
+
+fn try_consume_exponent<'src>(
+    input: &mut InputRef<'src, '_, &'src str, Extra<'src>>,
+    buf: &mut String,
+) -> bool {
     if !matches!(input.peek(), Some('e' | 'E')) {
-        return;
+        return false;
     }
 
     let checkpoint = input.save();
-    let e = input.next().unwrap();
-    let mut exp_buf = String::new();
-    exp_buf.push(e);
-
+    let buf_len = buf.len();
+    buf.push(input.next().unwrap());
     if matches!(input.peek(), Some('+' | '-')) {
-        exp_buf.push(input.next().unwrap());
+        buf.push(input.next().unwrap());
     }
 
     let mut has_digit = false;
@@ -639,21 +646,19 @@ fn try_consume_exponent<'src>(
         match input.peek() {
             Some(c) if c.is_ascii_digit() => {
                 has_digit = true;
-                exp_buf.push(input.next().unwrap());
+                buf.push(input.next().unwrap());
             }
-            Some('_') => {
-                exp_buf.push(input.next().unwrap());
-            }
+            Some('_') => buf.push(input.next().unwrap()),
             _ => break,
         }
     }
 
-    if !has_digit {
-        input.rewind(checkpoint);
-        return;
+    if has_digit {
+        return true;
     }
-
-    buf.push_str(&exp_buf);
+    input.rewind(checkpoint);
+    buf.truncate(buf_len);
+    false
 }
 
 fn char_literal<'src>() -> impl Parser<'src, &'src str, Token, Extra<'src>> {
@@ -816,35 +821,25 @@ fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
         }
 
         buf.push(first);
-        while let Some(c) = input.peek() {
-            if !matches!(c, '0'..='9' | '_') {
-                break;
-            }
-            buf.push(c);
-            input.skip();
-        }
+        consume_decimal_digits(input, &mut buf);
 
+        let mut has_fraction = false;
         let dot_checkpoint = input.save();
-        let Some('.') = input.peek() else {
-            return decimal_int(&buf, input.span_since(&start));
-        };
-        input.skip();
-        if !matches!(input.peek(), Some(c) if c.is_ascii_digit()) {
-            input.rewind(dot_checkpoint);
-            return decimal_int(&buf, input.span_since(&start));
-        }
-        buf.push('.');
-        buf.push(input.next().unwrap());
-        while let Some(c) = input.peek() {
-            if !matches!(c, '0'..='9' | '_') {
-                break;
-            }
-            buf.push(c);
+        if matches!(input.peek(), Some('.')) {
             input.skip();
+            if matches!(input.peek(), Some(c) if c.is_ascii_digit()) {
+                has_fraction = true;
+                buf.push('.');
+                consume_decimal_digits(input, &mut buf);
+            } else {
+                input.rewind(dot_checkpoint);
+            }
         }
 
-        try_consume_exponent(input, &mut buf);
-
+        let has_exponent = try_consume_exponent(input, &mut buf);
+        if !has_fraction && !has_exponent {
+            return decimal_int(&buf, input.span_since(&start));
+        }
         if !validate_numeric_underscores(&buf) {
             return Err(Rich::custom(
                 input.span_since(&start),
@@ -852,7 +847,17 @@ fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
             ));
         }
 
-        Ok(LitToken::Float(Intern::new(strip_underscores(&buf))))
+        let text = strip_underscores(&buf);
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| Rich::custom(input.span_since(&start), "invalid float literal"))?;
+        Ok(LitToken::Float(Intern::new(text), value))
+    })
+    .validate(|token, extra, emitter| {
+        if matches!(token, LitToken::Float(_, value) if !value.is_finite()) {
+            emitter.emit(Rich::custom(extra.span(), "float literal overflow"));
+        }
+        token
     })
 }
 
@@ -1084,7 +1089,7 @@ mod tests {
             assert!(
                 matches!(
                     tokens[0],
-                    Token::Literal(LitToken::Number(_) | LitToken::Float(_))
+                    Token::Literal(LitToken::Number(_) | LitToken::Float(_, _))
                 ),
                 "missing leading number token for {source:?}: {tokens:?}"
             );
@@ -1092,6 +1097,14 @@ mod tests {
                 tokens.iter().any(|token| matches!(token, Token::Ident(_))),
                 "invalid exponent was consumed for {source:?}: {tokens:?}"
             );
+        }
+    }
+
+    #[test]
+    fn float_overflow_span_covers_literal() {
+        for source in ["1.0e309", "1e309"] {
+            let errors = tokenize_test(source).unwrap_err();
+            assert_eq!(errors[0].span(), &SimpleSpan::new((), 0..source.len()));
         }
     }
 

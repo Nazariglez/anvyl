@@ -1,3 +1,4 @@
+import runtime { assert };
 import ext:core_float {
     float_sin,
     float_cos,
@@ -16,15 +17,25 @@ import ext:core_float {
     float_exp,
     float_ln,
     float_abs,
-    float_min,
-    float_max,
-    float_clamp,
     float_lerp,
     float_to_radians,
     float_to_degrees,
 };
 
 pub extend float {
+    fn nan() -> float { 0.0 / 0.0 }
+    fn inf() -> float { 1.0 / 0.0 }
+
+    fn is_nan(self) -> bool { self != self }
+    fn is_infinite(self) -> bool {
+        if self == float.inf() { return true; }
+        self == -float.inf()
+    }
+    fn is_finite(self) -> bool {
+        if self.is_nan() { return false; }
+        self.is_infinite() == false
+    }
+
     /// Sine (radians).
     fn sin(self) -> float { float_sin(self) }
     /// Cosine (radians).
@@ -63,11 +74,37 @@ pub extend float {
     /// Absolute value.
     fn abs(self) -> float { float_abs(self) }
     /// Returns the smaller of self and other.
-    fn min(self, other: float) -> float { float_min(self, other) }
+    fn min(self, other: float) -> float {
+        if self.is_nan() { return self; }
+        if other.is_nan() { return other; }
+        if self < other { return self; }
+        if other < self { return other; }
+        if self == 0.0 {
+            if 1.0 / other < 0.0 { return other; }
+        }
+        self
+    }
     /// Returns the larger of self and other.
-    fn max(self, other: float) -> float { float_max(self, other) }
+    fn max(self, other: float) -> float {
+        if self.is_nan() { return self; }
+        if other.is_nan() { return other; }
+        if self > other { return self; }
+        if other > self { return other; }
+        if self == 0.0 {
+            if 1.0 / other > 0.0 { return other; }
+        }
+        self
+    }
     /// Clamps self between lo and hi.
-    fn clamp(self, lo: float, hi: float) -> float { float_clamp(self, lo, hi) }
+    fn clamp(self, lo: float, hi: float) -> float {
+        if self.is_nan() { return self; }
+        if lo.is_nan() { return lo; }
+        if hi.is_nan() { return hi; }
+        assert(lo <= hi, "clamp lower bound exceeds upper bound");
+        if self < lo { return lo; }
+        if self > hi { return hi; }
+        self
+    }
 
     /// Linearly interpolates between self and target by t.
     fn lerp(self, target: float, t: float) -> float { float_lerp(self, target, t) }

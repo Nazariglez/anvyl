@@ -30,12 +30,7 @@ use crate::{
 pub(crate) enum PatternCover {
     CatchAll,
     Bool(bool),
-    Int(i64),
-    Float(u64),
-    String(String),
-    Char(char),
     EnumVariant { key: NominalKey, variant: Ident },
-    Tuple(Vec<PatternCover>),
     Or(Vec<PatternCover>),
     Unsupported,
 }
@@ -930,7 +925,6 @@ impl<'tc> PatternChecker<'tc> {
         let mut had_error = false;
         let mut refutability = Refutability::Irrefutable;
         let mut bindings = BindingAlternatives::single_empty();
-        let mut covers = vec![];
         let mut checked_fields = vec![];
         for (index, (elem, elem_ty)) in elems.iter().zip(elem_tys).enumerate() {
             let elem_input = input.tuple_field(index, elem_ty);
@@ -938,12 +932,11 @@ impl<'tc> PatternChecker<'tc> {
             had_error |= result.outcome.had_error;
             refutability = combine_refutability(refutability, result.outcome.refutability);
             bindings = bindings.product(&result.bindings, self.tc);
-            covers.push(result.outcome.cover);
             checked_fields.push(result.checked);
         }
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::Tuple(covers),
+                cover: PatternCover::Unsupported,
                 had_error,
                 refutability,
             },
@@ -969,11 +962,7 @@ impl<'tc> PatternChecker<'tc> {
         }
         let cover = match lit {
             Lit::Bool(value) => PatternCover::Bool(*value),
-            Lit::Int(value) => PatternCover::Int(*value),
-            Lit::Float(value) => PatternCover::Float(value.to_bits()),
-            Lit::String(value) => PatternCover::String(value.clone()),
-            Lit::Char(value) => PatternCover::Char(*value),
-            Lit::Nil => PatternCover::Unsupported,
+            _ => PatternCover::Unsupported,
         };
         PatternOutcome::refutable(cover)
     }
@@ -1718,9 +1707,10 @@ fn check_roots_detailed(
         );
     };
     let span = first.pattern.span;
+    let single_root = roots.len() == 1;
+    let mut cover = PatternCover::Unsupported;
     let mut had_error = false;
     let mut refutability = Refutability::Irrefutable;
-    let mut covers = vec![];
     let mut bindings = BindingAlternatives::single_empty();
     let mut checked_patterns = vec![];
     let mut function_flow_roots = vec![];
@@ -1753,7 +1743,9 @@ fn check_roots_detailed(
         }
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
-        covers.push(result.outcome.cover);
+        if single_root {
+            cover = result.outcome.cover;
+        }
         checked_patterns.push(result.checked);
         bindings = bindings.product(&result.bindings, checker.tc);
     }
@@ -1771,11 +1763,6 @@ fn check_roots_detailed(
         );
     }
 
-    let cover = if covers.len() == 1 {
-        covers.pop().expect("non-empty root covers")
-    } else {
-        PatternCover::Tuple(covers)
-    };
     let checked = if checked_patterns.len() == 1 {
         checked_patterns.pop().expect("non-empty checked patterns")
     } else {

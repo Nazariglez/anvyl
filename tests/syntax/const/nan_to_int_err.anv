@@ -1,0 +1,5 @@
+// @mode: check
+// @expect: error
+// @contains: cannot convert non-finite float to int
+
+const BAD: int = (0.0 / 0.0) as int;

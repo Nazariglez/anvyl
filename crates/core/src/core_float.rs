@@ -104,24 +104,6 @@ pub fn float_abs(x: f64) -> f64 {
 
 #[inline]
 #[function]
-pub fn float_min(a: f64, b: f64) -> f64 {
-    a.min(b)
-}
-
-#[inline]
-#[function]
-pub fn float_max(a: f64, b: f64) -> f64 {
-    a.max(b)
-}
-
-#[inline]
-#[function]
-pub fn float_clamp(x: f64, lo: f64, hi: f64) -> f64 {
-    x.clamp(lo, hi)
-}
-
-#[inline]
-#[function]
 pub fn float_lerp(x: f64, target: f64, t: f64) -> f64 {
     x + (target - x) * t
 }
@@ -144,7 +126,7 @@ anvyx_runtime::builtin_module! {
     exports: [
         float_sin, float_cos, float_tan, float_asin, float_acos, float_atan, float_atan2,
         float_floor, float_ceil, float_round, float_trunc, float_sqrt, float_cbrt, float_pow,
-        float_exp, float_ln, float_abs, float_min, float_max, float_clamp, float_lerp,
+        float_exp, float_ln, float_abs, float_lerp,
         float_to_radians, float_to_degrees
     ],
 }

@@ -69,8 +69,7 @@ fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
 fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
     select! {
         Token::Literal(LitToken::Number(n)) => ast::ConstArg::Value(ast::ConstValue::Int(n)),
-        Token::Literal(LitToken::Float(s)) => {
-            let value = s.as_ref().parse::<f64>().unwrap_or(0.0);
+        Token::Literal(LitToken::Float(_, value)) => {
             ast::ConstArg::Value(ast::ConstValue::Float(value))
         },
         Token::Literal(LitToken::String(s)) => {

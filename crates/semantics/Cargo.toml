@@ -1,0 +1,7 @@
+[package]
+name = "anvyx-semantics"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

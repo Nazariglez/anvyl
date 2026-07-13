@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: cannot be used as map key
+
+fn main() {
+    let values: [(int, float): string] = [:];
+}

@@ -1,6 +1,7 @@
 use anvyx_externs::{
     AbiPosition, AbiTypeError, CallbackEscape, ExternDescriptorError, ExternTypeKey,
 };
+use anvyx_semantics::FloatToIntError;
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::{
@@ -1038,6 +1039,10 @@ pub(super) fn diagnose_type_error(
         TypeError::InvalidConstCast { from, to, .. } => {
             format!("cannot cast constant from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }
+        TypeError::ConstFloatToInt { error, .. } => match error {
+            FloatToIntError::NonFinite => "cannot convert non-finite float to int".to_string(),
+            FloatToIntError::OutOfRange => "float is out of range for int".to_string(),
+        },
         TypeError::InvalidCast { from, to, .. } => {
             format!("Invalid cast: cannot cast from '{}' to '{}'", render_surface_type(from, type_ctx), render_surface_type(to, type_ctx))
         }

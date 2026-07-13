@@ -1,3 +1,5 @@
+use anvyx_semantics::{display_float, float_to_int, int_to_float};
+
 use super::{
     CallableTemplateEnv, CheckedType, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
     ModuleScope, TypeChecker, TypeError, ValueDecl, VarInfo, body::with_callable_body_env,
@@ -679,8 +681,14 @@ impl TypeChecker {
         let to = self.resolve_type_for_tc_at(&node.node.target, node.span);
         match (value, &to) {
             (value, _) if from == to => Ok(value),
-            (ConstValue::Int(value), Type::Float) => Ok(ConstValue::Float(value as f64)),
-            (ConstValue::Float(value), Type::Int) => Ok(ConstValue::Int(value as i64)),
+            (ConstValue::Int(int), Type::Float) => Ok(ConstValue::Float(int_to_float(int))),
+            (ConstValue::Float(float), Type::Int) => match float_to_int(float) {
+                Ok(int) => Ok(ConstValue::Int(int)),
+                Err(error) => const_error(TypeError::ConstFloatToInt {
+                    error,
+                    span: self.error_span(node.span),
+                }),
+            },
             _ => const_error(TypeError::InvalidConstCast {
                 from,
                 to,
@@ -741,7 +749,8 @@ fn const_string(value: &ConstValue) -> String {
     match value {
         ConstValue::String(value) => value.clone(),
         ConstValue::Char(value) => value.to_string(),
-        ConstValue::Int(_) | ConstValue::Float(_) | ConstValue::Bool(_) => format!("{value}"),
+        ConstValue::Float(value) => display_float(*value),
+        ConstValue::Int(_) | ConstValue::Bool(_) => format!("{value}"),
     }
 }
 
@@ -872,10 +881,10 @@ fn eval_float_binary(
         BinaryOp::Add => Ok(ConstValue::Float(a + b)),
         BinaryOp::Sub => Ok(ConstValue::Float(a - b)),
         BinaryOp::Mul => Ok(ConstValue::Float(a * b)),
-        BinaryOp::Div if b == 0.0 => const_error(TypeError::ConstDivisionByZero { span }),
         BinaryOp::Div => Ok(ConstValue::Float(a / b)),
-        BinaryOp::Eq => Ok(ConstValue::Bool(a.to_bits() == b.to_bits())),
-        BinaryOp::NotEq => Ok(ConstValue::Bool(a.to_bits() != b.to_bits())),
+        BinaryOp::Rem => Ok(ConstValue::Float(a % b)),
+        BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
+        BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
         BinaryOp::LessThan => Ok(ConstValue::Bool(a < b)),
         BinaryOp::GreaterThan => Ok(ConstValue::Bool(a > b)),
         BinaryOp::LessThanEq => Ok(ConstValue::Bool(a <= b)),

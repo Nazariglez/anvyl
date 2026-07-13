@@ -146,10 +146,7 @@ pub(super) fn literal<'src>() -> BoxedParser<'src, ast::Lit> {
     select! {
         Token::Literal(lit) => match lit {
             LitToken::Number(n) => ast::Lit::Int(n),
-            LitToken::Float(s) => {
-                let value = s.as_ref().parse::<f64>().unwrap_or(0.0);
-                ast::Lit::Float(value)
-            }
+            LitToken::Float(_, value) => ast::Lit::Float(value),
             LitToken::String(s) => ast::Lit::String(s.to_string()),
             LitToken::Char(c) => ast::Lit::Char(c),
         },

@@ -1,0 +1,5 @@
+// @mode: check
+// @expect: error
+// @contains: float is out of range for int
+
+const BAD: int = 9223372036854775808.0 as int;

@@ -1004,7 +1004,7 @@ fn postfix_expr<'src>(
         Token::Dot => (),
     }
     .ignore_then(select! {
-        Token::Literal(LitToken::Float(s)) => s,
+        Token::Literal(LitToken::Float(s, _)) => s,
     })
     .try_map(|s, span| {
         let parts = s.as_ref().split('.').collect::<Vec<_>>();

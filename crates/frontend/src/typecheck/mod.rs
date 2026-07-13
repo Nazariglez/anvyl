@@ -3,6 +3,8 @@ use std::{
     rc::Rc,
 };
 
+use anvyx_semantics::FloatToIntError;
+
 pub(crate) use self::{
     annotation::DeprecatedUseKind,
     const_term::ConstTerm,
@@ -784,6 +786,10 @@ pub(crate) enum TypeError {
         to: Type,
         span: Option<SourceSpan>,
     },
+    ConstFloatToInt {
+        error: FloatToIntError,
+        span: Option<SourceSpan>,
+    },
     InvalidCast {
         from: Type,
         to: Type,
@@ -999,6 +1005,7 @@ impl TypeError {
             | TypeError::RawEnumExpectedIntValue { span, .. }
             | TypeError::RawEnumExpectedStringValue { span, .. }
             | TypeError::InvalidConstCast { span, .. }
+            | TypeError::ConstFloatToInt { span, .. }
             | TypeError::InvalidCast { span, .. }
             | TypeError::AmbiguousCast { span, .. }
             | TypeError::RawEnumWrongRawCast { span, .. }

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: float literal overflow
+
+fn main() {
+    let overflow = 1e309;
+}
