@@ -1257,88 +1257,6 @@ fn plan_lowers_list_index_collection_access_to_mut_place() {
 }
 
 #[test]
-fn indexed_map_assignment_preserves_unsupported_lambda_capture_gap() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let map = program.alloc_type(TypeData::Map {
-        key: int,
-        value: int,
-        order: air::MapOrder::Insertion,
-    });
-    let void = program.alloc_type(TypeData::Void);
-    let sig = air::SignatureType::new(vec![], air::ReturnMode::Value(void));
-    let module = program.alloc_module(root_module());
-    let owner = FunctionId::from_index(1);
-    let source = air::LocalId::from_index(0);
-    let body = program.alloc_function(Function {
-        name: Ident::new("lambda"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], void),
-        locals: vec![],
-        body: structured_body(vec![], air::AirTail::Return(None)),
-    });
-    let lambda = program.alloc_lambda(LambdaDecl {
-        source: ExprId(0),
-        module,
-        owner,
-        body,
-        signature: sig,
-        escape: LambdaEscape::NonEscaping,
-        captures: vec![air::LambdaCaptureDecl::ScopedLocal {
-            binding: BindingId::from_index(0),
-            source: CaptureLocalSource {
-                owner,
-                local: source,
-            },
-            ty: map,
-            mutability: Mutability::Mutable,
-        }],
-    });
-    program.function_mut(body).kind = FunctionKind::Lambda(lambda);
-    let owner_fn = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], void),
-        locals: vec![bound_source_local(BindingId::from_index(0), map)],
-        body: structured_body(vec![], air::AirTail::Return(None)),
-    });
-    assert_eq!(owner_fn, owner);
-    program
-        .module_mut(module)
-        .functions
-        .extend([body, owner_fn]);
-
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let mut cx = PlanCx::new(&verified, RustPlanConfig::default());
-    cx.plan_types(&mut RirProgram::default())
-        .expect("type plan failed");
-    let mut locals = vec![];
-    let map = root_place(
-        PlaceRoot::LambdaCapture(air::LambdaCaptureSlotId::from_index(0)),
-        map,
-    );
-
-    let Err(RustPlanError::TargetGaps(gaps)) = cx.plan_collection_access(
-        body,
-        &map,
-        CollectionAccessOp::IndexedMapAssign,
-        &mut locals,
-    ) else {
-        panic!("expected indexed map assignment gap");
-    };
-    assert!(
-        gaps.iter()
-            .any(|gap| gap.kind == RustTargetGapKind::UnsupportedLambdaCapture)
-    );
-}
-
-#[test]
 fn profile_accepts_dataref_list_payload() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
@@ -1358,6 +1276,7 @@ fn profile_accepts_dataref_list_payload() {
         stringify_override: None,
     });
     program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::DataRef(aggregate));
 
     check(program);
 }
@@ -1382,6 +1301,7 @@ fn profile_accepts_dataref_tuple_payload() {
         stringify_override: None,
     });
     program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::DataRef(aggregate));
 
     check(program);
 }
@@ -1456,6 +1376,7 @@ fn profile_rejects_dataref_tuple_payload_with_unsupported_element() {
         stringify_override: None,
     });
     program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::DataRef(aggregate));
 
     expect_reject(program, ProfileErrorKind::UnsupportedModuleItem);
 }
@@ -4741,6 +4662,42 @@ fn source_job_compiles_and_runs_struct_construction_and_field_read() {
 
     assert_eq!(output.status, SourceJobStatus::Success);
     assert_eq!(output.stdout, "7\n");
+}
+
+#[test]
+fn plan_uses_common_dataref_representation_per_concrete_air_type() {
+    let air = owner_specialized_datarefs_program();
+    let verified = air::verify(&air).expect("AIR verify failed");
+    let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
+    let rir = plan.program();
+
+    assert_eq!(rir.datarefs.len(), 2);
+    assert_eq!(rir.datarefs[0].display, rir.datarefs[1].display);
+    assert_ne!(rir.datarefs[0].symbol, rir.datarefs[1].symbol);
+    assert_ne!(rir.datarefs[0].air_id, rir.datarefs[1].air_id);
+    assert!(rir.datarefs.iter().all(|dataref| dataref.cycle_capable));
+    assert_eq!(rir.datarefs[0].fields[0].ty, rir.datarefs[1].fields[0].ty);
+
+    let source = emit::emit(&plan.verified()).into_string();
+    assert_eq!(source.matches("heap.register_tracked::<").count(), 2);
+    for dataref in &rir.datarefs {
+        let storage = format!("{}Storage", dataref.symbol.as_str());
+        assert_eq!(source.matches(&format!("struct {storage} ")).count(), 1);
+        assert_eq!(
+            source
+                .matches(&format!("heap.register_tracked::<{storage}>()"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches(&format!(
+                    "unsafe impl<'cx> anvyx_runtime::Trace<'cx> for {storage}"
+                ))
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]
@@ -16351,6 +16308,31 @@ fn valid_global_rir(edit: impl FnOnce(&mut RirProgram)) -> RirProgram {
         ..RirProgram::default()
     };
     edit(&mut program);
+    program
+}
+
+fn owner_specialized_datarefs_program() -> Program {
+    let mut program = Program::default();
+    let int = program.alloc_type(TypeData::Int);
+    let string = program.alloc_type(TypeData::String);
+    let module = program.alloc_module(root_module());
+    for arg in [int, string] {
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Local"),
+            module,
+            kind: air::AggregateKind::DataRef,
+            type_args: vec![arg],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("marker"),
+                ty: int,
+            }],
+            cycle_capable: true,
+            stringify_override: None,
+        });
+        program.module_mut(module).aggregates.push(aggregate);
+        program.alloc_type(TypeData::DataRef(aggregate));
+    }
     program
 }
 

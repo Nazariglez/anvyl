@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// inner
+// 7
+// @match-end
+
+fn main() {
+    struct Item { value: int }
+    let outer = Item { value: 7 };
+    println(outer.value);
+    {
+        struct Item { text: string }
+        let inner = Item { text: "inner" };
+        println(inner.text);
+    };
+    println(outer.value);
+}

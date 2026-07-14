@@ -1,0 +1,6 @@
+// @helper
+
+pub fn run() -> int {
+    struct Item { fn get(self) -> int { 2 } }
+    Item {}.get()
+}

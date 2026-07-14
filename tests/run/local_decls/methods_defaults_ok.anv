@@ -1,0 +1,30 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// kept
+// 12
+// @match-end
+
+fn main() {
+    fn step() -> int { 3 }
+
+    struct Health {
+        hp: int = 10,
+        fn damage(ref self, amount: int = step()) { self.hp -= amount; }
+        fn keep<T>(self, value: T) -> T { value }
+    }
+    dataref Counter {
+        value: int,
+        fn bump(ref self, amount: int = step()) { self.value += amount; }
+    }
+
+    var health = Health {};
+    health.damage();
+    println(health.hp);
+    println(health.keep("kept"));
+
+    var counter = Counter { value: 9 };
+    counter.bump();
+    println(counter.value);
+}

@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+import a;
+import b;
+
+fn main() {
+    println(a.run());
+    println(b.run());
+}

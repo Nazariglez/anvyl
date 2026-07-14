@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 30
+
+fn outer<U>(unused: U) -> int {
+    enum Tree<T> { Leaf([T]) }
+    let leaf = Tree.Leaf<int>([]);
+    var values: [int] = match leaf { Tree.Leaf(items) => items };
+    values.push(30);
+    values[0]
+}
+
+fn main() {
+    println(outer(false));
+}

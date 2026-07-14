@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 9
+// move 2,4
+// @match-end
+
+fn main() {
+    enum Event { Score(int), Move { x: int, y: int } }
+    let score = Event.Score(9);
+    println(match score {
+        Event.Score(value) => value,
+        Event.Move { x, y } => x + y,
+    });
+    let movement = Event.Move { x: 2, y: 4 };
+    println(match movement {
+        Event.Score(value) => f"score {value}",
+        Event.Move { x, y } => f"move {x},{y}",
+    });
+}

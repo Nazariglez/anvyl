@@ -1,0 +1,30 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 15
+// 15
+// Wrap
+// 5
+// @match-end
+
+fn main() {
+    const FIRST = 4;
+    enum Code: int { First = FIRST, Next }
+
+    struct Core {
+        value: int = 10,
+        fn add(self, amount: int = 5) -> int { self.value + amount }
+    }
+    struct Wrap {
+        embed core: Core = Core {},
+        fn make() -> Self { Wrap {} }
+        fn total(self, amount: int = 5) -> int { self.add(amount) }
+        fn to_string(self) -> string { "Wrap" }
+    }
+
+    let wrapped = Wrap.make();
+    println(wrapped.total());
+    println(wrapped.add());
+    println(f"{wrapped}");
+    println(Code.Next as int);
+}

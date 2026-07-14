@@ -1176,7 +1176,7 @@ fn compiler_rejects_recursive_function_payload_cycles_without_overflow() {
     let aggregate = program.alloc_aggregate(AggregateDecl {
         name: Ident::new("Node"),
         module,
-        kind: AggregateKind::Struct,
+        kind: AggregateKind::DataRef,
         type_args: vec![],
         const_args: vec![],
         fields: vec![FieldDecl {
@@ -1188,7 +1188,6 @@ fn compiler_rejects_recursive_function_payload_cycles_without_overflow() {
     });
     debug_assert_eq!(aggregate, node);
     program.module_mut(module).aggregates.push(node);
-    let node_ty = program.alloc_type(TypeData::Aggregate(node));
     let func = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
@@ -1196,7 +1195,7 @@ fn compiler_rejects_recursive_function_payload_cycles_without_overflow() {
         owner: None,
         specialization: None,
         signature: Signature::new(vec![], void),
-        locals: vec![local(node_ty, Mutability::Immutable, LocalKind::User)],
+        locals: vec![local(node_ref, Mutability::Immutable, LocalKind::User)],
         body: structured_body(vec![], air::AirTail::Return(None)),
     });
     program.module_mut(module).functions.push(func);
@@ -1887,7 +1886,7 @@ impl StorageFamilyCase {
                 let id = program.alloc_aggregate(AggregateDecl {
                     name: Ident::new("PayloadRef"),
                     module,
-                    kind: AggregateKind::Struct,
+                    kind: AggregateKind::DataRef,
                     type_args: vec![],
                     const_args: vec![],
                     fields: vec![FieldDecl {

@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// text
+// @match-end
+
+fn make<T>(value: T) -> _ {
+    struct Local { value: T }
+    Local { value: value }
+}
+
+fn main() {
+    let number = make(7);
+    let text = make("text");
+    println(number.value);
+    println(text.value);
+}

@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// local
+// @match-end
+
+fn main() {
+    struct Point {
+        x: int,
+        fn label(self) -> string { "local" }
+    }
+    let point = Point { x: 7 };
+    let read = || point.x;
+    let label = || point.label();
+    println(read());
+    println(label());
+}

@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match: 9
+
+fn main() {
+    dataref Node { value: int, next: Node? }
+    var first = Node { value: 1, next: nil };
+    var second = Node { value: 2, next: nil };
+    first.next = second;
+    second.next = first;
+
+    var alias = first;
+    alias.value = 9;
+    assert(alias == first);
+    assert(first.value == 9);
+    match first.next {
+        next? => match next.next {
+            again? => println(again.value),
+            nil => println(0),
+        },
+        nil => println(0),
+    };
+}

@@ -1,0 +1,61 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 9
+// true
+// false
+// 5
+// 13
+// 3
+// 12
+// ok
+// @match-end
+
+fn after_return() -> int {
+    return later();
+    fn later() -> int { 9 }
+}
+
+fn parity(n: int) -> bool {
+    fn even(n: int) -> bool {
+        if n == 0 { true } else { odd(n - 1) }
+    }
+    fn odd(n: int) -> bool {
+        if n == 0 { false } else { even(n - 1) }
+    }
+    even(n)
+}
+
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+
+fn function_value() -> int {
+    fn inc(x: int) -> int { x + 1 }
+    let f = inc;
+    apply(f, 4)
+}
+
+fn local_generic() -> int {
+    fn id<T>(item: T) -> T { item }
+    id(13)
+}
+
+fn local_default() -> int {
+    fn value(x: int = 3) -> int { x }
+    value()
+}
+
+fn outer<T>(value: T) -> T {
+    fn id(item: T) -> T { item }
+    id(value)
+}
+
+fn main() {
+    println(after_return());
+    println(parity(6));
+    println(parity(5));
+    println(function_value());
+    println(local_generic());
+    println(local_default());
+    println(outer(12));
+    println(outer("ok"));
+}

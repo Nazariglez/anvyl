@@ -429,6 +429,11 @@ struct PlannedOperands {
     operands: Vec<RirOperand>,
 }
 
+struct PlannedLambdaCaptureArgs {
+    stmts: Vec<RirStmt>,
+    captures: Vec<RirLambdaCaptureArg>,
+}
+
 struct PlannedCollectionLoanRoot {
     root: RirCollectionAccess,
     root_kind: RirCollectionRootKind,
@@ -2212,20 +2217,20 @@ impl<'a> PlanCx<'a> {
             air::LambdaCaptureDecl::NoRuntime { .. } => Ok(None),
             air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
                 let function_ty = matches!(self.air.type_data(*ty), TypeData::Function(_));
-                if !function_ty && !self.rust_shareable_air_type(*ty) {
+                let ty = self.type_map[ty];
+                if !function_ty && !policy.shareable_value(ty) {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(owner),
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
                 }
-                let by_value = escape == air::LambdaEscape::Escaping
-                    || (!function_ty && self.rust_copyable_air_type(*ty));
+                let by_value =
+                    escape == air::LambdaEscape::Escaping || (!function_ty && policy.copyable(ty));
                 let semantic = if by_value {
                     RirParamSemantic::Value
                 } else {
                     RirParamSemantic::SharedBorrow
                 };
-                let ty = self.type_map[ty];
                 Ok(Some(RirLambdaCapture {
                     ty,
                     semantic,
@@ -4117,11 +4122,15 @@ impl<'a> PlanCx<'a> {
                 ty,
             } => {
                 let captures = self.plan_lambda_capture_args(function, captures, locals)?;
-                PlannedRValue::from_value(RirRValue::Lambda {
-                    lambda: self.lambda_map[lambda],
-                    captures,
-                    ty: self.type_map[ty],
-                })
+                PlannedRValue {
+                    stmts: captures.stmts,
+                    value: RirRValue::Lambda {
+                        lambda: self.lambda_map[lambda],
+                        captures: captures.captures,
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
             }
             RValue::MapEntryAt { map, index, ty } => {
                 let map = self.plan_collection_access(
@@ -4243,19 +4252,15 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         captures: &[air::LambdaCaptureArg],
         locals: &mut Vec<RirLocal>,
-    ) -> Result<Vec<RirLambdaCaptureArg>, RustPlanError> {
+    ) -> Result<PlannedLambdaCaptureArgs, RustPlanError> {
+        let mut stmts = vec![];
         let mut planned = vec![];
         for capture in captures {
             match capture {
                 air::LambdaCaptureArg::NoRuntime => {}
                 air::LambdaCaptureArg::ReadonlyLocal { value } => {
                     let value = self.plan_operand_read(function, value, locals);
-                    if !value.stmts.is_empty() {
-                        return Err(Self::gap(
-                            RustTargetGapSite::Function(function),
-                            RustTargetGapKind::UnsupportedLambdaCapture,
-                        ));
-                    }
+                    stmts.extend(value.stmts);
                     planned.push(RirLambdaCaptureArg::Readonly {
                         value: value.operand,
                     });
@@ -4290,7 +4295,10 @@ impl<'a> PlanCx<'a> {
                 }
             }
         }
-        Ok(planned)
+        Ok(PlannedLambdaCaptureArgs {
+            stmts,
+            captures: planned,
+        })
     }
 
     fn air_place_value_readable(&self, ty: TypeId) -> bool {
@@ -5077,8 +5085,22 @@ impl<'a> PlanCx<'a> {
                     .collect(),
                 ty: self.type_map[&plan.ty],
             }),
-            PlaceAccessRoot::LambdaCapture(_) => {
-                return Err(Self::gap(site, RustTargetGapKind::UnsupportedLambdaCapture));
+            PlaceAccessRoot::LambdaCapture(slot) => {
+                let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
+                    unreachable!("AIR verifier rejects capture roots outside lambdas")
+                };
+                let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
+                RirCollectionAccess::Direct(RirPlace {
+                    root: RirPlaceRoot::Local(RirLocalId::from_index(
+                        self.air.function(function).locals.len() + runtime,
+                    )),
+                    projections: plan
+                        .projection
+                        .iter()
+                        .map(|projection| self.rir_place_projection(projection))
+                        .collect(),
+                    ty: self.type_map[&plan.ty],
+                })
             }
             PlaceAccessRoot::Local {
                 source_mut_param: true,

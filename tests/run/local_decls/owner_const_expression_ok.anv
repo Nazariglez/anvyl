@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 2
+// 3
+// @match-end
+
+fn size<N: int, M: int>(seed: [int; N], values: [int; M]) -> int {
+    const LEN = N + 1;
+    struct Local { values: [int; LEN] }
+    let local = Local { values };
+    local.values[0]
+}
+
+fn main() {
+    println(size<1, 2>([1], [2, 0]));
+    println(size<2, 3>([1, 2], [3, 0, 0]));
+}

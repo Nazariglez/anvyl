@@ -1,0 +1,46 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// distinct
+// exact
+// 11
+// 22
+// @match-end
+
+contract Tagged {
+    fn tag(self) -> int;
+}
+
+fn make_left() -> dyn Tagged {
+    struct Item {
+        value: int,
+        fn tag(self) -> int { self.value }
+    }
+    Item { value: 11 }
+}
+
+fn check(left: dyn Tagged) {
+    struct Item {
+        value: int,
+        fn tag(self) -> int { self.value }
+    }
+    let right: dyn Tagged = Item { value: 22 };
+    let packed: [dyn Tagged] = [left, right];
+
+    if let item? = packed[0] as? Item {
+        println("wrong");
+    } else {
+        println("distinct");
+    }
+    if let item? = packed[1] as? Item {
+        println("exact");
+    } else {
+        println("missing");
+    }
+    println(packed[0].tag());
+    println(packed[1].tag());
+}
+
+fn main() {
+    check(make_left());
+}

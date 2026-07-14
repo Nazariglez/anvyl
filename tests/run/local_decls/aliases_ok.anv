@@ -1,0 +1,32 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 42
+// 7
+// 3
+// @match-end
+
+fn local_alias() -> int {
+    type Number = int;
+    let value: Number = 42;
+    value
+}
+
+fn forward_after_return() -> int {
+    let value: Later = 7;
+    return value;
+    type Later = int;
+}
+
+fn alias_const_environment() -> int {
+    const SIZE = 2;
+    type Buffer = [int; SIZE];
+    let value: Buffer = [1, 2];
+    value[0] + value[1]
+}
+
+fn main() {
+    println(local_alias());
+    println(forward_after_return());
+    println(alias_const_environment());
+}

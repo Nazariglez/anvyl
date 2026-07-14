@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 5
+// 6
+// 8
+// 12
+// @match-end
+
+fn specialize<T, N: int>(owner: T) -> int {
+    struct Fixed<U, M: int> {
+        owner: T,
+        items: [U; M],
+        fn size(self, extra: int = N) -> int { M + extra }
+    }
+    let fixed = Fixed<int, 2> { owner: owner, items: [1, 2] };
+    fixed.size()
+}
+
+fn nested_function() -> int {
+    fn helper() -> int {
+        struct Leaf { value: int }
+        let leaf = Leaf { value: 8 };
+        leaf.value
+    }
+    helper()
+}
+
+struct Host {
+    fn run(self) -> int {
+        enum Local { Value(int) }
+        match Local.Value(12) {
+            Local.Value(value) => value,
+        }
+    }
+}
+
+fn main() {
+    println(specialize<int, 3>(1));
+    println(specialize<string, 4>("owner"));
+    println(nested_function());
+    println(Host {}.run());
+}

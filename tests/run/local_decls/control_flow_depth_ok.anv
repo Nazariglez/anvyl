@@ -1,0 +1,28 @@
+// @mode: run
+// @expect: success
+// @match: 6
+
+fn main() {
+    var total = 0;
+    while total < 1 {
+        struct WhileItem { value: int }
+        let item = WhileItem { value: 1 };
+        total += item.value;
+    }
+    for value in [2] {
+        enum ForItem { Value(int) }
+        let item = ForItem.Value(value);
+        total += match item {
+            ForItem.Value(found) => found,
+        };
+    }
+    let tail = match total {
+        3 => {
+            dataref MatchItem { value: int }
+            let item = MatchItem { value: 3 };
+            item.value
+        },
+        _ => 0,
+    };
+    println(total + tail);
+}

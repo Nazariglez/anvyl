@@ -1,0 +1,33 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 7
+// struct
+// @match-end
+
+contract Scored {
+    fn score(self) -> int;
+}
+
+extend<S> struct S {
+    fn category(self) -> string { "struct" }
+}
+
+fn make<T>(marker: T, value: int) -> _ {
+    struct Score {
+        value: int,
+        fn score(self) -> int { self.value }
+    }
+    struct Escaped { @as embed score: Score }
+    Escaped { score: Score { value } }
+}
+
+fn main() {
+    let escaped = make(false, 7);
+    let actors: [dyn Scored] = [escaped];
+    println(actors[0].score());
+    let read = || actors[0].score();
+    println(read());
+    println(escaped.category());
+}

@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 5
+// some 8
+// @match-end
+
+fn main() {
+    struct Point { x: int, y: int }
+    dataref Cell { point: Point }
+    enum Choice { None, Some(Point) }
+
+    let point = Point { x: 3, y: 5 };
+    let cell = Cell { point: point };
+    println(cell.point.x);
+    println(cell.point.y);
+    let choice = Choice.Some(cell.point);
+    println(match choice {
+        Choice.None => "none",
+        Choice.Some(found) => f"some {found.x + found.y}",
+    });
+}

@@ -2922,13 +2922,16 @@ impl<'a> RirRustRepPolicy<'a> {
         self.contains_dynamic(ty, &mut BTreeSet::new())
     }
 
-    pub fn record_derives(self, fields: &[RirField]) -> Vec<&'static str> {
+    pub fn record_derives(self, fields: &[RirField], copyable: bool) -> Vec<&'static str> {
         let mut derives = vec!["Clone"];
         let contains_dynamic = fields
             .iter()
             .any(|field| self.type_contains_dynamic(field.ty));
         if !contains_dynamic && self.record_key_supported(fields, &mut BTreeSet::new()) {
             derives.extend(["PartialEq", "Eq", "Hash"]);
+        }
+        if copyable {
+            derives.push("Copy");
         }
         derives
     }
@@ -5134,10 +5137,14 @@ mod tests {
         assert!(!policy.map_key_supported(ty(4)));
         assert!(!policy.map_key_supported(ty(7)));
         assert_eq!(
-            policy.record_derives(&key_fields),
+            policy.record_derives(&key_fields, false),
             vec!["Clone", "PartialEq", "Eq", "Hash"]
         );
-        assert_eq!(policy.record_derives(&float_fields), vec!["Clone"]);
+        assert_eq!(
+            policy.record_derives(&key_fields, true),
+            vec!["Clone", "PartialEq", "Eq", "Hash", "Copy"]
+        );
+        assert_eq!(policy.record_derives(&float_fields, false), vec!["Clone"]);
         assert_eq!(
             policy.enum_derives(&program.enums[0]),
             vec!["Clone", "PartialEq", "Eq", "Hash"]

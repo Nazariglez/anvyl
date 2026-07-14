@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+fn make() -> int {
+    let item = Later { value: 3 };
+    return item.value;
+    const UNUSED = 1;
+    struct Later { value: int }
+}
+
+fn main() {
+    println(make());
+}

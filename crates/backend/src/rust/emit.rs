@@ -819,7 +819,7 @@ impl EmitCx<'_> {
             &strukt.fields,
             self.trace_plan.needs_struct_trace(strukt.id),
             policy.struct_cx_dependent(strukt),
-            &policy.record_derives(&strukt.fields),
+            &policy.record_derives(&strukt.fields, strukt.copyable),
         );
     }
 
@@ -830,7 +830,7 @@ impl EmitCx<'_> {
             &tuple.fields,
             self.trace_plan.needs_tuple_trace(tuple.id),
             policy.tuple_cx_dependent(tuple),
-            &policy.record_derives(&tuple.fields),
+            &policy.record_derives(&tuple.fields, tuple.copyable),
         );
     }
 

@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// text
+// blanket
+// value
+// @match-end
+
+extend<S> struct S {
+    fn label() -> string { "blanket" }
+}
+
+fn static_owner<T>(value: T) -> T {
+    struct Local {
+        fn get(value: T) -> T { value }
+    }
+    Local.get(value)
+}
+
+fn static_blanket<T>(value: T) -> string {
+    struct Local { marker: T }
+    Local.label()
+}
+
+fn struct_variant<T>(value: T) -> T {
+    enum Local { Item { value: T } }
+    let item = Local.Item { value };
+    match item {
+        Local.Item { value } => value,
+    }
+}
+
+fn main() {
+    println(static_owner(7));
+    println(static_owner("text"));
+    println(static_blanket(11));
+    println(struct_variant("value"));
+}

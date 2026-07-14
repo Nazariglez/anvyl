@@ -1,0 +1,40 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 10
+// 20
+// 30
+// @match-end
+
+fn sibling(flag: bool) -> int {
+    if flag {
+        struct Item { value: int }
+        let item = Item { value: 10 };
+        return item.value;
+    }
+    let nested = {
+        struct Item { value: int }
+        if true {
+            let deeper = {
+                struct Item { value: int }
+                let item = Item { value: 20 };
+                item.value
+            };
+            return deeper;
+        }
+        0
+    };
+    nested
+}
+
+fn local_recursion() -> int {
+    enum Tree<T> { Leaf(T), Branch(Node<T>) }
+    dataref Node<T> { tree: Tree<T> }
+    30
+}
+
+fn main() {
+    println(sibling(true));
+    println(sibling(false));
+    println(local_recursion());
+}

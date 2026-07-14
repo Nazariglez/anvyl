@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 7
+// @match-end
+
+fn code<T>(marker: T) -> int {
+    enum Code: int { Value = 7 }
+    Code.Value as int
+}
+
+fn main() {
+    println(code(1));
+    println(code("owner"));
+}
