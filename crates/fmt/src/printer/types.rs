@@ -191,6 +191,33 @@ impl Printer<'_> {
                     self.write_fmt(id);
                 }
             }
+            ast::ArrayLen::Expr(expr) => self.format_const_expr(expr),
+        }
+    }
+
+    fn format_const_expr(&mut self, expr: &ast::ConstExpr) {
+        match expr {
+            ast::ConstExpr::Value(value) => self.write_fmt(value),
+            ast::ConstExpr::Param(id) => {
+                if let Some(name) = self.const_param_names.get(id) {
+                    self.buf.push_str(name);
+                } else {
+                    self.write_fmt(id);
+                }
+            }
+            ast::ConstExpr::Unary(op, expr) => {
+                self.write_fmt(op);
+                self.format_const_expr(expr);
+            }
+            ast::ConstExpr::Binary(op, left, right) => {
+                self.write("(");
+                self.format_const_expr(left);
+                self.write(" ");
+                self.write_fmt(op);
+                self.write(" ");
+                self.format_const_expr(right);
+                self.write(")");
+            }
         }
     }
 

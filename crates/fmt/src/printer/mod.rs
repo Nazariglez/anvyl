@@ -277,6 +277,20 @@ impl<'a> Printer<'a> {
             .collect();
     }
 
+    fn with_type_param_names(
+        &mut self,
+        type_params: &[ast::TypeParam],
+        const_params: &[ast::ConstParam],
+        f: impl FnOnce(&mut Self),
+    ) {
+        let saved_type_vars = std::mem::take(&mut self.type_var_names);
+        let saved_const_params = std::mem::take(&mut self.const_param_names);
+        self.populate_type_param_names(type_params, const_params);
+        f(self);
+        self.type_var_names = saved_type_vars;
+        self.const_param_names = saved_const_params;
+    }
+
     fn extend_type_param_names(
         &mut self,
         type_params: &[ast::TypeParam],

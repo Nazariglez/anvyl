@@ -97,19 +97,20 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_func(&mut self, func: &ast::Func) {
-        self.populate_type_param_names(&func.type_params, &func.const_params);
-        self.format_annotations(&func.annotations);
-        self.format_doc_comment(func.doc.as_ref());
-        self.write_indent();
-        self.format_visibility(func.visibility);
-        self.write("fn ");
-        self.write_fmt(func.name);
-        self.format_type_params(&func.type_params, &func.const_params);
-        self.format_param_list(&func.params);
-        self.format_return_type(&func.ret);
-        self.write(" ");
-        self.format_block(&func.body);
-        self.writeln();
+        self.with_type_param_names(&func.type_params, &func.const_params, |this| {
+            this.format_annotations(&func.annotations);
+            this.format_doc_comment(func.doc.as_ref());
+            this.write_indent();
+            this.format_visibility(func.visibility);
+            this.write("fn ");
+            this.write_fmt(func.name);
+            this.format_type_params(&func.type_params, &func.const_params);
+            this.format_param_list(&func.params);
+            this.format_return_type(&func.ret);
+            this.write(" ");
+            this.format_block(&func.body);
+            this.writeln();
+        });
     }
 
     pub(super) fn format_extern_func(&mut self, ef: &ast::ExternFunc) {
@@ -508,31 +509,32 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_aggregate(&mut self, decl: &ast::StructDecl) {
-        self.populate_type_param_names(&decl.type_params, &decl.const_params);
-        self.format_annotations(&decl.annotations);
-        self.format_doc_comment(decl.doc.as_ref());
-        self.write_indent();
-        self.format_visibility(decl.visibility);
-        self.write(decl.kind.keyword());
-        self.write(" ");
-        self.write_fmt(decl.name);
-        self.format_type_params(&decl.type_params, &decl.const_params);
-        self.write(" {");
-        self.writeln();
-        self.indent();
-        for field in &decl.fields {
-            self.format_struct_field(field);
-        }
-        if !decl.fields.is_empty() && !decl.methods.is_empty() {
-            self.writeln();
-        }
-        for method in &decl.methods {
-            self.format_method(method);
-        }
-        self.dedent();
-        self.write_indent();
-        self.write("}");
-        self.writeln();
+        self.with_type_param_names(&decl.type_params, &decl.const_params, |this| {
+            this.format_annotations(&decl.annotations);
+            this.format_doc_comment(decl.doc.as_ref());
+            this.write_indent();
+            this.format_visibility(decl.visibility);
+            this.write(decl.kind.keyword());
+            this.write(" ");
+            this.write_fmt(decl.name);
+            this.format_type_params(&decl.type_params, &decl.const_params);
+            this.write(" {");
+            this.writeln();
+            this.indent();
+            for field in &decl.fields {
+                this.format_struct_field(field);
+            }
+            if !decl.fields.is_empty() && !decl.methods.is_empty() {
+                this.writeln();
+            }
+            for method in &decl.methods {
+                this.format_method(method);
+            }
+            this.dedent();
+            this.write_indent();
+            this.write("}");
+            this.writeln();
+        });
     }
 
     fn format_enum_variant(&mut self, variant: &ast::EnumVariant) {
@@ -574,28 +576,29 @@ impl Printer<'_> {
     }
 
     pub(super) fn format_enum(&mut self, decl: &ast::EnumDecl) {
-        self.populate_type_param_names(&decl.type_params, &decl.const_params);
-        self.format_annotations(&decl.annotations);
-        self.format_doc_comment(decl.doc.as_ref());
-        self.write_indent();
-        self.format_visibility(decl.visibility);
-        self.write("enum ");
-        self.write_fmt(decl.name);
-        self.format_type_params(&decl.type_params, &decl.const_params);
-        if let Some(raw_backing) = &decl.raw_backing {
-            self.write(": ");
-            self.format_type(&raw_backing.node);
-        }
-        self.write(" {");
-        self.writeln();
-        self.indent();
-        for variant in &decl.variants {
-            self.format_enum_variant(variant);
-        }
-        self.dedent();
-        self.write_indent();
-        self.write("}");
-        self.writeln();
+        self.with_type_param_names(&decl.type_params, &decl.const_params, |this| {
+            this.format_annotations(&decl.annotations);
+            this.format_doc_comment(decl.doc.as_ref());
+            this.write_indent();
+            this.format_visibility(decl.visibility);
+            this.write("enum ");
+            this.write_fmt(decl.name);
+            this.format_type_params(&decl.type_params, &decl.const_params);
+            if let Some(raw_backing) = &decl.raw_backing {
+                this.write(": ");
+                this.format_type(&raw_backing.node);
+            }
+            this.write(" {");
+            this.writeln();
+            this.indent();
+            for variant in &decl.variants {
+                this.format_enum_variant(variant);
+            }
+            this.dedent();
+            this.write_indent();
+            this.write("}");
+            this.writeln();
+        });
     }
 
     fn format_extend_method(&mut self, method: &ast::ExtendMethod) {

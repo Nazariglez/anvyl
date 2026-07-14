@@ -108,6 +108,19 @@ mod tests {
     }
 
     #[test]
+    fn mixed_nested_declarations_restore_generic_names() {
+        let source = "fn outer<T>(value:T)->T{type Saved=T;struct Local<U>{outer:T,item:U}enum State<V>{Some(V),None}fn inner<U>(value:U)->U{value}inner<T>(value)}struct Box<V>{value:V,fn get(self)->V{self.value}}enum Choice<W>{Some(W),None}";
+        let expected = "fn outer<T>(value: T) -> T {\n    type Saved = T;\n    struct Local<U> {\n        outer: T,\n        item: U,\n    }\n    enum State<V> {\n        Some(V),\n        None,\n    }\n    fn inner<U>(value: U) -> U { value }\n    inner<T>(value)\n}\n\nstruct Box<V> {\n    value: V,\n\n    fn get(self) -> V { self.value }\n}\n\nenum Choice<W> {\n    Some(W),\n    None,\n}\n";
+
+        let formatted = format_source(source).expect("format failed");
+        assert_eq!(formatted, expected);
+        assert_eq!(
+            format_source(&formatted).expect("reformat failed"),
+            formatted
+        );
+    }
+
+    #[test]
     fn preserves_comment_after_non_ascii() {
         assert_fmt(
             "fn main() { let café = 1; // comment\ncafé; }",
