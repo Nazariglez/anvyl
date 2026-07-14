@@ -331,7 +331,7 @@ pub(super) fn resolve_field(
         };
     };
     let owner_ty = nominal.surface_ty();
-    let ResolvedNominal::Aggregate(agg) = nominal else {
+    let ResolvedNominal::Aggregate { key, schema: agg } = nominal else {
         if let ResolvedNominal::Extern { id, .. } = nominal {
             return match resolve_extern_field(id, name, receiver_access, tc) {
                 Some(field) => FieldResolution::Extern(field),
@@ -340,7 +340,6 @@ pub(super) fn resolve_field(
         }
         return FieldResolution::Missing { ty: owner_ty };
     };
-    let key = &agg.key;
     let Some(field) = agg.fields.get(name) else {
         let has_static = agg.methods.contains_key(&MethodKey::static_(name));
         if let Some(promoted) = resolve_promoted_field(receiver, name, receiver_access, tc) {
@@ -357,7 +356,7 @@ pub(super) fn resolve_field(
     };
 
     FieldResolution::Direct(FieldAccess {
-        ty: super::substitute_aggregate_member(receiver, &agg.generics, &field.ty),
+        ty: super::substitute_aggregate_member(receiver, &agg.all_generics(), &field.ty),
         policy: field.policy.clone(),
         origin: key.module.clone(),
     })
@@ -437,10 +436,11 @@ pub(super) fn resolve_method(
     if let Some(nominal) = tc.resolve_nominal(receiver) {
         aggregate_ty = Some(nominal.surface_ty());
         match nominal {
-            ResolvedNominal::Aggregate(agg) => {
+            ResolvedNominal::Aggregate { key, schema: agg } => {
                 if let Some(method) = agg.methods.get(&MethodKey::instance(name)) {
                     return MethodResolution::Direct(Box::new(MethodAccess {
                         callee: tc.decls.callable_for_aggregate_method(
+                            &key,
                             agg,
                             name,
                             method,
@@ -448,7 +448,7 @@ pub(super) fn resolve_method(
                         ),
                         mode: method.mode,
                         policy: method.policy.clone(),
-                        origin: agg.key.module.clone(),
+                        origin: key.module.clone(),
                     }));
                 }
                 static_method_on_value |= agg.methods.contains_key(&MethodKey::static_(name));
@@ -541,6 +541,7 @@ fn resolve_promoted_method(
         exposure: alias.exposure,
         target: PromotedMethodTarget::Aggregate(Box::new(MethodAccess {
             callee: tc.decls.callable_for_aggregate_method(
+                &key,
                 origin,
                 origin_method,
                 method,

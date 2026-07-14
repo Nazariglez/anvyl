@@ -1,7 +1,7 @@
 use std::collections::hash_map::{Iter, Values};
 
 use crate::{
-    ast::{ContractRef, ExprId, Ident, NominalKind, Type},
+    ast::{ContractRef, ExprId, Ident, Type},
     diagnostic::DiagnosticTag,
     externs::{self, RawExterns, catalog::ExternCatalog},
     lint::{LintEvent, LintId},
@@ -13,12 +13,12 @@ use crate::{
         DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact,
         ExpectedProjectionMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
         MemberPathMap, SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
-        decls::DeclarationIndex,
+        decls::{DeclarationIndex, ModuleScope, nominal_type},
     },
 };
 
 pub(crate) struct TypecheckTestResult {
-    program: SemanticProgram,
+    pub(super) program: SemanticProgram,
     source_types: typecheck::infer::SourceExprTypes,
     public_facts: typecheck::TypecheckFacts,
     flat_facts: SemanticBodyFacts,
@@ -104,11 +104,7 @@ impl TypecheckTestResult {
     ) -> typecheck::contract_surface::ContractSurfaceId {
         self.program
             .contract_surfaces
-            .id_for_ref(
-                &self.program.declarations,
-                &typecheck::ModuleScope::Root,
-                contract,
-            )
+            .id_for_ref(&self.program.declarations, &ModuleScope::Root, contract)
             .unwrap_or_else(|| panic!("contract surface should resolve: {contract:?}"))
     }
 
@@ -183,13 +179,17 @@ impl TypecheckTestResult {
     }
 }
 
-pub(crate) fn nominal_struct(name: &str) -> Type {
-    Type::nominal(NominalKind::Struct, Ident::new(name), vec![], vec![], None)
+pub(crate) fn nominal_struct(result: &TypecheckTestResult, name: &str) -> Type {
+    let key = result
+        .decls()
+        .local_nominal_type(&ModuleScope::Root, Ident::new(name))
+        .expect("missing nominal declaration");
+    nominal_type(&key)
 }
 
 pub(crate) fn generic_body(name: &str, type_args: Vec<Type>) -> BodyInstanceKey {
     BodyInstanceKey::Callable(CallableInstanceKey {
-        target: CallableId::function(typecheck::ModuleScope::Root, Ident::new(name)),
+        target: CallableId::function(ModuleScope::Root, Ident::new(name)),
         args: typecheck::GenericArgs {
             type_args,
             const_args: vec![],
@@ -213,7 +213,7 @@ pub(crate) fn single_expected_projection(
 pub(crate) fn assert_expected_projection(
     result: &TypecheckTestResult,
     path: &[&str],
-    target_ty: Type,
+    target_ty: &Type,
 ) -> ExprId {
     let (expr_id, fact) = single_expected_projection(result);
     let path = path
@@ -221,7 +221,7 @@ pub(crate) fn assert_expected_projection(
         .map(|name| Ident::new(*name))
         .collect::<Vec<_>>();
     assert_eq!(fact.path, path);
-    assert_eq!(fact.target_ty, target_ty);
+    assert_eq!(&fact.target_ty, target_ty);
     expr_id
 }
 
@@ -402,9 +402,9 @@ pub(crate) fn ty_of(source: &str) -> Type {
     last_expr_type(&result).unwrap_or(Type::Void)
 }
 
-pub(crate) fn assert_ty(source: &str, expected: Type) {
+pub(crate) fn assert_ty(source: &str, expected: &Type) {
     let ty = ty_of(source);
-    assert_eq!(ty, expected, "source: {source}");
+    assert_eq!(&ty, expected, "source: {source}");
 }
 
 pub(crate) fn assert_calls(source: &str, count: usize) {

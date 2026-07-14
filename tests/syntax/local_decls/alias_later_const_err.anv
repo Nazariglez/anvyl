@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: unknown constant 'SIZE'
+
+fn main() {
+    type Buffer = [int; SIZE];
+    const SIZE = 2;
+    let value: Buffer = [1, 2];
+}

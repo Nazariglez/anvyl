@@ -1,21 +1,73 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Mutex, OnceLock},
+};
 
 use anvyx_externs::ProviderDescriptor;
 
 use crate::{
-    ast::{Ident, ImportItemKind, ImportKind, ModuleOrigin, NominalKind, Program, Stmt, Type},
+    ast::{
+        ConstArg, Ident, ImportItemKind, ImportKind, ModuleOrigin, NominalKind, Program, Stmt, Type,
+    },
     externs,
     externs::{ExternInputs, PackageExternInputs},
     lexer, parser,
     resolve::{
         self, ModuleId, ModulePath, PackageId, ResolveResult, ResolvedImportTarget, ResolvedModule,
     },
+    semantic_id::{NominalId, SourceDeclId},
     source::{SourceId, SourceKind, SourceTable},
-    typecheck::{self, ModuleScope, NominalKey, TypecheckConfig},
+    span::Span,
+    typecheck::{self, ModuleScope, NominalKey, NominalPlacement, TypecheckConfig},
 };
 
 pub(crate) fn test_source_id() -> SourceId {
-    SourceTable::default().add(SourceKind::Virtual, "test", None, "")
+    static SOURCES: OnceLock<Mutex<SourceTable>> = OnceLock::new();
+    SOURCES
+        .get_or_init(|| Mutex::new(SourceTable::default()))
+        .lock()
+        .expect("test source table lock poisoned")
+        .add(SourceKind::Virtual, "test", None, "")
+}
+
+pub(crate) fn nominal_test_source_id() -> SourceId {
+    static SOURCE: OnceLock<SourceId> = OnceLock::new();
+    *SOURCE.get_or_init(test_source_id)
+}
+
+pub(crate) fn test_nominal_key(
+    source: SourceId,
+    site: usize,
+    module: ModuleScope,
+    kind: NominalKind,
+    name: Ident,
+) -> NominalKey {
+    NominalKey {
+        id: NominalId::Source(SourceDeclId::new(source, Span::new(site, site + 1))),
+        module,
+        kind,
+        name,
+        placement: NominalPlacement::Module,
+    }
+}
+
+pub(crate) fn test_nominal_type(
+    source: SourceId,
+    site: usize,
+    kind: NominalKind,
+    name: Ident,
+    type_args: Vec<Type>,
+    const_args: Vec<ConstArg>,
+    origin: Option<ModuleOrigin>,
+) -> Type {
+    Type::Nominal(crate::ast::NominalType {
+        id: NominalId::Source(SourceDeclId::new(source, Span::new(site, site + 1))),
+        kind,
+        name,
+        type_args,
+        const_args,
+        origin,
+    })
 }
 
 pub(crate) fn ident(name: &str) -> Ident {
@@ -42,11 +94,13 @@ pub(crate) fn module_path_segments(path: &[&str]) -> ModulePath {
 }
 
 pub(crate) fn core_option_key() -> NominalKey {
-    NominalKey {
-        module: ModuleScope::Package(ModuleId::named(PackageId::core(), module_path("option"))),
-        kind: NominalKind::Enum,
-        name: ident(Type::OPTION_ENUM_NAME),
-    }
+    test_nominal_key(
+        nominal_test_source_id(),
+        0,
+        ModuleScope::Package(ModuleId::named(PackageId::core(), module_path("option"))),
+        NominalKind::Enum,
+        ident(Type::OPTION_ENUM_NAME),
+    )
 }
 
 pub(crate) fn core_option_origin() -> ModuleOrigin {
@@ -57,13 +111,7 @@ pub(crate) fn core_option_origin() -> ModuleOrigin {
 }
 
 pub(crate) fn core_option_type(inner: Type) -> Type {
-    Type::nominal_with_origin(
-        NominalKind::Enum,
-        ident(Type::OPTION_ENUM_NAME),
-        vec![inner],
-        vec![],
-        Some(core_option_origin()),
-    )
+    typecheck::nominal_type_with_args(&core_option_key(), &[inner], &[])
 }
 
 fn assert_core_provider_names_match_source_imports(

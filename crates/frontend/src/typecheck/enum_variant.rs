@@ -4,9 +4,9 @@ use super::{
     annotation::{AccessPolicy, deprecated_lint},
     const_term::ConstTerm,
     decls::{
-        CallableDef, CallableId, CallableRef, CallableSig, NamedSchemas, NominalKey,
-        VariantPayload, VariantSchema, nominal_generic_args, nominal_type, nominal_type_with_args,
-        owner_template,
+        CallableDef, CallableId, CallableRef, CallableSig, ModuleMemberLookup, NamedSchemas,
+        NominalKey, TypeBinding, VariantPayload, VariantSchema, nominal_generic_args, nominal_type,
+        nominal_type_with_args, owner_template,
     },
     generic_bind::GenericSolveSession,
     infer::GenericSolverSeeds,
@@ -20,6 +20,8 @@ use crate::{
 pub(super) struct ResolvedEnumVariant {
     pub(super) key: NominalKey,
     pub(super) variant: Ident,
+    pub(super) owner_generics: GenericParams,
+    pub(super) declaration_generics: GenericParams,
     pub(super) generics: GenericParams,
     pub(super) schema: VariantSchema,
 }
@@ -30,13 +32,35 @@ impl ResolvedEnumVariant {
     }
 
     pub(super) fn owner_args_from_type(&self, ty: &Type, tc: &TypeChecker) -> Option<GenericArgs> {
+        let (owner, declaration) = self.split_args_from_type(ty, tc)?;
+        let mut args = owner;
+        args.type_args.extend(declaration.type_args);
+        args.const_args.extend(declaration.const_args);
+        Some(args)
+    }
+
+    pub(super) fn split_args_from_type(
+        &self,
+        ty: &Type,
+        tc: &TypeChecker,
+    ) -> Option<(GenericArgs, GenericArgs)> {
         if tc.decls.key_for_type(ty).as_ref() != Some(&self.key) {
             return None;
         }
-        let args = nominal_generic_args(ty)?;
-        let has_type_args = args.type_args.len() == self.generics.type_params.len();
-        let has_const_args = args.const_args.len() == self.generics.const_params.len();
-        (has_type_args && has_const_args).then_some(args)
+        tc.decls
+            .split_nominal_args(&self.key, &nominal_generic_args(ty)?)
+    }
+
+    pub(super) fn inherited_owner_args(&self, tc: &TypeChecker) -> GenericArgs {
+        let owner = tc.visible_generic_owner();
+        let type_len = self.owner_generics.type_params.len();
+        let const_len = self.owner_generics.const_params.len();
+        debug_assert!(owner.args.type_args.len() >= type_len);
+        debug_assert!(owner.args.const_args.len() >= const_len);
+        GenericArgs {
+            type_args: owner.args.type_args[..type_len].to_vec(),
+            const_args: owner.args.const_args[..const_len].to_vec(),
+        }
     }
 
     fn owner_ty_from_args(&self, args: &GenericArgs) -> Option<Type> {
@@ -108,8 +132,8 @@ pub(super) fn tuple_callable_ref(
         def: CallableDef {
             id: CallableId::enum_variant(resolved.key.clone(), resolved.variant),
             sig: CallableSig {
-                owner_generics: resolved.generics.clone(),
-                generics: GenericParams::default(),
+                owner_generics: resolved.owner_generics.clone(),
+                generics: resolved.declaration_generics.clone(),
                 params,
                 default_sites: vec![],
                 required_params: payload_types.len(),
@@ -136,13 +160,30 @@ pub(super) fn expect_struct<'a>(
 pub(super) fn solve_unit_owner_ty(
     tc: &mut TypeChecker,
     resolved: &ResolvedEnumVariant,
-    explicit_args: Option<&GenericArgs>,
+    owner_args: &GenericArgs,
+    declaration_args: Option<&GenericArgs>,
     expected: Option<&Type>,
     span: Span,
 ) -> Option<Type> {
-    let seeds = explicit_args.map_or_else(GenericSolverSeeds::default, |args| {
-        GenericSolverSeeds::from_args(&resolved.generics, args)
+    let mut seeds = declaration_args.map_or_else(GenericSolverSeeds::default, |args| {
+        GenericSolverSeeds::from_args(&resolved.declaration_generics, args)
     });
+    for (param, ty) in resolved
+        .owner_generics
+        .type_params
+        .iter()
+        .zip(&owner_args.type_args)
+    {
+        seeds.type_args.insert(param.id, ty.clone());
+    }
+    for (param, term) in resolved
+        .owner_generics
+        .const_params
+        .iter()
+        .zip(&owner_args.const_args)
+    {
+        seeds.const_args.insert(param.id, term.clone());
+    }
     let session = GenericSolveSession::new(tc, &resolved.generics, &seeds, span);
 
     if let Some(expected) =
@@ -181,7 +222,9 @@ pub(super) fn resolve_use(
     let ResolvedNominal::Enum { schema, .. } = nominal else {
         return None;
     };
-    let generics = schema.generics.clone();
+    let owner_generics = schema.owner_generics.clone();
+    let declaration_generics = schema.generics.clone();
+    let generics = schema.all_generics();
     let warning = resolved_use_lint(
         key.name,
         variant,
@@ -195,6 +238,8 @@ pub(super) fn resolve_use(
     Some(ResolvedEnumVariant {
         key: key.clone(),
         variant,
+        owner_generics,
+        declaration_generics,
         generics,
         schema: variant_schema,
     })
@@ -278,7 +323,12 @@ fn resolve_explicit_pattern(
         return None;
     }
 
-    if let Some(key) = expected_key.filter(|key| key.name == name) {
+    if let Some(key) = expected_key
+        && matches!(
+            tc.decls.module_type(&key.module, name),
+            ModuleMemberLookup::Found(TypeBinding::Nominal(id)) if id == key.id
+        )
+    {
         return Some(key.clone());
     }
 

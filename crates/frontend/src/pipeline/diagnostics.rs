@@ -21,12 +21,13 @@ use crate::{
     },
     lexer::{Delimiter, Op, Token},
     resolve::{ModuleId, PackageId, PackageModulePath, ResolveError},
+    semantic_id::{NominalId, SourceDeclId},
     source::SourceId,
     span::SourceSpan,
     typecheck::{
         ArityError, BindingNamespace, BindingOrigin, CaptureStorageOrigin, CompileWarning,
         ConstDiagnostic, DeclError, DynContainerConversionKind, ModuleScope, RawEnumValue,
-        TryCarrierKind, TypeDiagnosticContext, TypeError, VariantShape, nominal_key_for_type,
+        TryCarrierKind, TypeDiagnosticContext, TypeError, VariantShape, nominal_id_for_type,
     },
 };
 
@@ -1322,7 +1323,16 @@ fn render_type_mismatch_parts(
     let expected_surface = render_surface_type(expected, type_ctx);
     let found_surface = render_surface_type(found, type_ctx);
     if expected != found && expected_surface == found_surface {
-        return (render_detailed_type(expected), render_detailed_type(found));
+        let expected_detail = render_detailed_type(expected);
+        let found_detail = render_detailed_type(found);
+        let (expected_sites, found_sites) = differing_nominal_sites(expected, found);
+        if !expected_sites.is_empty() || !found_sites.is_empty() {
+            return (
+                render_type_with_sites(expected_detail, expected_sites, type_ctx),
+                render_type_with_sites(found_detail, found_sites, type_ctx),
+            );
+        }
+        return (expected_detail, found_detail);
     }
     (expected_surface, found_surface)
 }
@@ -1365,19 +1375,16 @@ fn surface_type(ty: &Type, type_ctx: &TypeDiagnosticContext) -> Type {
                 .collect(),
         },
         Type::Tuple(elems) => Type::Tuple(surface_types(elems, type_ctx)),
-        Type::Nominal(nominal) => Type::nominal_with_origin(
-            nominal.kind,
-            nominal.name,
+        Type::Nominal(nominal) => nominal.with_args(
             surface_types(&nominal.type_args, type_ctx),
             nominal.const_args.clone(),
-            nominal.origin.clone(),
         ),
         Type::List { elem } => Type::List {
             elem: Box::new(surface_type(elem, type_ctx)),
         },
         Type::Array { elem, len } => Type::Array {
             elem: Box::new(surface_type(elem, type_ctx)),
-            len: *len,
+            len: len.clone(),
         },
         Type::Map { key, value } => Type::Map {
             key: Box::new(surface_type(key, type_ctx)),
@@ -1451,13 +1458,208 @@ fn semantic_option_inner<'a>(ty: &'a Type, type_ctx: &TypeDiagnosticContext) -> 
     let Type::Nominal(nominal) = ty else {
         return None;
     };
-    if &nominal_key_for_type(ty)? != type_ctx.core_option()? {
+    if nominal_id_for_type(ty)? != &type_ctx.core_option()?.id {
         return None;
     }
     let [inner] = nominal.type_args.as_slice() else {
         return None;
     };
     nominal.const_args.is_empty().then_some(inner)
+}
+
+fn differing_nominal_sites(
+    expected: &Type,
+    found: &Type,
+) -> (Vec<SourceDeclId>, Vec<SourceDeclId>) {
+    let mut expected_sites = vec![];
+    let mut found_sites = vec![];
+    collect_differing_nominal_sites(expected, found, &mut expected_sites, &mut found_sites);
+    expected_sites.sort_by_key(source_decl_sort_key);
+    expected_sites.dedup();
+    found_sites.sort_by_key(source_decl_sort_key);
+    found_sites.dedup();
+    (expected_sites, found_sites)
+}
+
+fn collect_differing_nominal_sites(
+    expected: &Type,
+    found: &Type,
+    expected_sites: &mut Vec<SourceDeclId>,
+    found_sites: &mut Vec<SourceDeclId>,
+) {
+    match (expected, found) {
+        (Type::Nominal(expected), Type::Nominal(found)) => {
+            if expected.id != found.id {
+                if let NominalId::Source(site) = &expected.id {
+                    expected_sites.push(*site);
+                }
+                if let NominalId::Source(site) = &found.id {
+                    found_sites.push(*site);
+                }
+            }
+            collect_type_pairs(
+                &expected.type_args,
+                &found.type_args,
+                expected_sites,
+                found_sites,
+            );
+        }
+        (
+            Type::Func {
+                params: expected_params,
+                ret: expected_ret,
+            },
+            Type::Func {
+                params: found_params,
+                ret: found_ret,
+            },
+        ) => {
+            for (expected, found) in expected_params.iter().zip(found_params) {
+                collect_differing_nominal_sites(
+                    &expected.ty,
+                    &found.ty,
+                    expected_sites,
+                    found_sites,
+                );
+            }
+            collect_differing_nominal_sites(
+                &expected_ret.ty(),
+                &found_ret.ty(),
+                expected_sites,
+                found_sites,
+            );
+        }
+        (Type::Dyn(expected), Type::Dyn(found)) => {
+            collect_contract_nominal_sites(expected, found, expected_sites, found_sites);
+        }
+        (
+            Type::UnresolvedNominal {
+                generic_args: expected,
+                ..
+            },
+            Type::UnresolvedNominal {
+                generic_args: found,
+                ..
+            },
+        ) => {
+            for (expected, found) in expected.iter().zip(found) {
+                if let (ast::GenericArg::Type(expected), ast::GenericArg::Type(found)) =
+                    (expected, found)
+                {
+                    collect_differing_nominal_sites(expected, found, expected_sites, found_sites);
+                }
+            }
+        }
+        (Type::Tuple(expected), Type::Tuple(found)) => {
+            collect_type_pairs(expected, found, expected_sites, found_sites);
+        }
+        (Type::List { elem: expected }, Type::List { elem: found })
+        | (Type::Array { elem: expected, .. }, Type::Array { elem: found, .. })
+        | (Type::Slice { elem: expected }, Type::Slice { elem: found })
+        | (Type::Optional { inner: expected }, Type::Optional { inner: found }) => {
+            collect_differing_nominal_sites(expected, found, expected_sites, found_sites);
+        }
+        (
+            Type::Map {
+                key: expected_key,
+                value: expected_value,
+            },
+            Type::Map {
+                key: found_key,
+                value: found_value,
+            },
+        ) => {
+            collect_differing_nominal_sites(expected_key, found_key, expected_sites, found_sites);
+            collect_differing_nominal_sites(
+                expected_value,
+                found_value,
+                expected_sites,
+                found_sites,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_contract_nominal_sites(
+    expected: &ast::ContractRef,
+    found: &ast::ContractRef,
+    expected_sites: &mut Vec<SourceDeclId>,
+    found_sites: &mut Vec<SourceDeclId>,
+) {
+    match (expected, found) {
+        (ast::ContractRef::Anonymous(expected), ast::ContractRef::Anonymous(found)) => {
+            for (expected, found) in expected.requirements.iter().zip(&found.requirements) {
+                for (expected, found) in expected.params.iter().zip(&found.params) {
+                    collect_differing_nominal_sites(
+                        &expected.ty,
+                        &found.ty,
+                        expected_sites,
+                        found_sites,
+                    );
+                }
+                collect_differing_nominal_sites(
+                    &expected.ret.ty(),
+                    &found.ret.ty(),
+                    expected_sites,
+                    found_sites,
+                );
+            }
+        }
+        (ast::ContractRef::Intersection(expected), ast::ContractRef::Intersection(found)) => {
+            for (expected, found) in expected.iter().zip(found) {
+                collect_contract_nominal_sites(expected, found, expected_sites, found_sites);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_type_pairs(
+    expected: &[Type],
+    found: &[Type],
+    expected_sites: &mut Vec<SourceDeclId>,
+    found_sites: &mut Vec<SourceDeclId>,
+) {
+    for (expected, found) in expected.iter().zip(found) {
+        collect_differing_nominal_sites(expected, found, expected_sites, found_sites);
+    }
+}
+
+fn source_decl_sort_key(site: &SourceDeclId) -> (usize, usize, usize) {
+    let span = site.span();
+    (site.source().index(), span.start, span.end)
+}
+
+fn render_type_with_sites(
+    mut rendered: String,
+    sites: Vec<SourceDeclId>,
+    type_ctx: &TypeDiagnosticContext,
+) -> String {
+    let locations = sites
+        .into_iter()
+        .filter_map(|site| render_source_decl_location(site, type_ctx))
+        .collect::<Vec<_>>();
+    if !locations.is_empty() {
+        rendered.push_str(" (declared at ");
+        rendered.push_str(&locations.join(", "));
+        rendered.push(')');
+    }
+    rendered
+}
+
+fn render_source_decl_location(
+    site: SourceDeclId,
+    type_ctx: &TypeDiagnosticContext,
+) -> Option<String> {
+    let source = type_ctx.sources()?.get(site.source())?;
+    let position = source.line_index().byte_to_line_col(site.span().start)?;
+    Some(format!(
+        "{}:{}:{}",
+        source.label(),
+        position.line + 1,
+        position.column + 1
+    ))
 }
 
 fn render_detailed_type(ty: &Type) -> String {
@@ -1878,6 +2080,12 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
         DeclError::RawEnumGenericParams { owner, .. } => {
             format!("raw enum '{}' cannot be generic", owner.name)
         }
+        DeclError::RawEnumOwnerDependency { owner, .. } => {
+            format!(
+                "raw enum '{}' cannot depend on enclosing generic parameters",
+                owner.name
+            )
+        }
         DeclError::RawEnumValueWithoutBacking { owner, variant, .. } => {
             format!(
                 "variant '{}.{variant}' cannot have a raw value without enum backing",
@@ -2272,7 +2480,8 @@ mod tests {
         resolve::SourceFileId,
         span::SourceSpan,
         test_support::{
-            core_option_key, core_option_type, ident, module_path_segments, test_source_id,
+            core_option_key, core_option_type, ident, module_path_segments, nominal_test_source_id,
+            test_nominal_type, test_source_id,
         },
     };
 
@@ -2357,7 +2566,9 @@ mod tests {
     }
 
     fn local_option(inner: Type) -> Type {
-        Type::nominal(
+        test_nominal_type(
+            nominal_test_source_id(),
+            30,
             ast::NominalKind::Enum,
             ident("Option"),
             vec![inner],
@@ -2367,7 +2578,9 @@ mod tests {
     }
 
     fn module_option(module: &[&str], inner: Type) -> Type {
-        Type::nominal_with_origin(
+        test_nominal_type(
+            nominal_test_source_id(),
+            31,
             ast::NominalKind::Enum,
             ident("Option"),
             vec![inner],

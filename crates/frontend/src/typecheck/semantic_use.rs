@@ -8,7 +8,7 @@ use super::{
     contract_surface::{
         ContractSlotId, ContractSurfaceId, ContractSurfaceSchemas, ContractWeakening,
     },
-    decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_key_for_type},
+    decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_id_for_type},
     infer::{SemanticLocalId, TypeHandle},
     type_ops::type_has_unfinished_facts,
 };
@@ -456,6 +456,7 @@ pub(crate) struct SemanticModuleFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticFunctionInstanceFact {
+    pub(crate) site: crate::source_ast::SourceCallableSite,
     pub(crate) id: CallableId,
     pub(crate) args: GenericArgs,
     pub(crate) body: BodyInstanceKey,
@@ -486,6 +487,7 @@ impl SemanticDeclarations {
 
         let mut functions = std::collections::HashSet::new();
         for fact in &self.functions {
+            debug_assert_eq!(fact.site.owner().source(), fact.span.source());
             match &fact.body {
                 BodyInstanceKey::Callable(key) => {
                     debug_assert_eq!(key.target, fact.id);
@@ -628,6 +630,7 @@ pub(crate) struct DefaultArgFact {
     pub(crate) callee: CallableInstanceKey,
     pub(crate) param_index: usize,
     pub(crate) default: DefaultExprSite,
+    pub(crate) facts_body: BodyInstanceKey,
     pub(crate) ty: Type,
 }
 
@@ -639,6 +642,7 @@ pub(crate) struct DefaultFieldFact {
     pub(crate) field: Ident,
     pub(crate) slot: usize,
     pub(crate) default: DefaultExprSite,
+    pub(crate) facts_body: BodyInstanceKey,
     pub(crate) ty: Type,
 }
 
@@ -761,10 +765,7 @@ impl SemanticBodyFacts {
             debug_assert!(self.expr_types.contains_key(expr_id));
             for fact in facts {
                 debug_assert_eq!(*expr_id, fact.aggregate);
-                debug_assert_eq!(
-                    nominal_key_for_type(&fact.owner),
-                    Some(fact.owner_key.clone())
-                );
+                debug_assert_eq!(nominal_id_for_type(&fact.owner), Some(&fact.owner_key.id));
                 debug_assert!(!type_has_unfinished_facts(&fact.owner));
                 debug_assert!(!type_has_unfinished_facts(&fact.ty));
             }

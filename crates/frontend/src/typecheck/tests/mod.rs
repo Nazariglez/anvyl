@@ -5,6 +5,7 @@ mod externs;
 mod globals;
 mod imports;
 mod lambdas;
+mod local_nominal_headers;
 mod members;
 mod semantic_facts;
 mod support;

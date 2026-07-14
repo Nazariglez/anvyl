@@ -1118,7 +1118,10 @@ impl<'tc> PatternChecker<'tc> {
         };
         self.tc.mark_import_used(import);
         match binding {
-            TypeBinding::Nominal(key) => {
+            TypeBinding::Nominal(id) => {
+                let Some(key) = self.tc.decls.nominal(&id).cloned() else {
+                    return StructPatternTarget::Missing;
+                };
                 let ty = nominal_type(&key);
                 StructPatternTarget::Found(key, ty)
             }
@@ -1206,15 +1209,9 @@ impl<'tc> PatternChecker<'tc> {
         schema: &NamedSchemas<FieldSchema>,
         input: &PatternInput,
     ) -> PatternCheckResult {
-        let owner_key = self
-            .tc
-            .decls
-            .key_for_type(owner_ty)
-            .unwrap_or_else(|| NominalKey {
-                module: self.tc.current_module.clone(),
-                kind: NominalKind::Struct,
-                name: Ident::new("<unknown>"),
-            });
+        let Some(owner_key) = self.tc.decls.key_for_type(owner_ty) else {
+            return PatternCheckResult::empty(PatternOutcome::error());
+        };
         let owner = field_check::FieldOwner::Nominal(owner_ty.clone());
         let shape = self.check_field_shape(
             fields,
@@ -1950,9 +1947,9 @@ fn refined_binding_type(annot: &Type, value: &Type, tc: &TypeChecker) -> Type {
         ) => Type::Array {
             elem: Box::new(refined_binding_type(elem, value_elem, tc)),
             len: if matches!(len, ArrayLen::Infer) {
-                *value_len
+                value_len.clone()
             } else {
-                *len
+                len.clone()
             },
         },
         (Type::List { elem }, Type::List { elem: value_elem }) => Type::List {

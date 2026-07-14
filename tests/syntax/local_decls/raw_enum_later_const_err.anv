@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: unknown constant 'FIRST'
+
+fn main() {
+    enum Code: int { First = FIRST }
+    const FIRST = 4;
+}

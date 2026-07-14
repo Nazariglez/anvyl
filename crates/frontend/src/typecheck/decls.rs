@@ -29,6 +29,7 @@ use crate::{
         ExternProvenance, RawExternModule, RawExterns, catalog::ExternCatalog, raw_module_scope,
     },
     resolve::{ModuleId, ModulePath, PackageId, PackageModulePath, ResolveResult, SourceFileId},
+    semantic_id::{ExternalNominalId, NominalId, SourceDeclId},
     source::SourceId,
     span::{SourceSpan, Span, Spanned},
     typecheck::{CanonicalTypeKey, Exposure, PromotedSurface, annotation::AccessPolicy},
@@ -136,11 +137,63 @@ impl ModuleScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum NominalPlacement {
+    Module,
+    Lexical,
+    External,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct NominalKey {
+    pub(crate) id: NominalId,
     pub(crate) module: ModuleScope,
     pub(crate) kind: NominalKind,
     pub(crate) name: Ident,
+    pub(crate) placement: NominalPlacement,
+}
+
+impl NominalKey {
+    fn source(
+        source: SourceId,
+        span: Span,
+        module: ModuleScope,
+        kind: NominalKind,
+        name: Ident,
+        placement: NominalPlacement,
+    ) -> Self {
+        Self {
+            id: NominalId::Source(SourceDeclId::new(source, span)),
+            module,
+            kind,
+            name,
+            placement,
+        }
+    }
+
+    fn external(module: ModuleScope, name: Ident) -> Self {
+        Self {
+            id: NominalId::External(ExternalNominalId::new(module_id_for_scope(&module), name)),
+            module,
+            kind: NominalKind::Extern,
+            name,
+            placement: NominalPlacement::External,
+        }
+    }
+}
+
+impl PartialEq for NominalKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for NominalKey {}
+
+impl std::hash::Hash for NominalKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -189,46 +242,16 @@ impl ContractRequirementKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TypeBinding {
-    Nominal(NominalKey),
+    Nominal(NominalId),
     Alias(TypeAliasKey),
     Contract(ContractKey),
 }
 
 impl TypeBinding {
-    pub(crate) fn module(&self) -> &ModuleScope {
+    pub(crate) fn nominal(&self) -> Option<&NominalId> {
         match self {
-            Self::Nominal(key) => &key.module,
-            Self::Alias(key) => &key.module,
-            Self::Contract(key) => &key.module,
-        }
-    }
-
-    pub(crate) fn as_nominal(&self) -> Option<&NominalKey> {
-        match self {
-            Self::Nominal(key) => Some(key),
+            Self::Nominal(id) => Some(id),
             Self::Alias(_) | Self::Contract(_) => None,
-        }
-    }
-
-    pub(crate) fn into_nominal(self) -> Option<NominalKey> {
-        match self {
-            Self::Nominal(key) => Some(key),
-            Self::Alias(_) | Self::Contract(_) => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct LocalCallableId {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-}
-
-impl LocalCallableId {
-    pub(crate) fn new(span: Span) -> Self {
-        Self {
-            start: span.start,
-            end: span.end,
         }
     }
 }
@@ -260,10 +283,10 @@ impl CallableId {
         }
     }
 
-    pub(crate) fn local_function(module: ModuleScope, name: Ident, span: Span) -> Self {
+    pub(crate) fn local_function(module: ModuleScope, name: Ident, id: SourceDeclId) -> Self {
         Self {
             module,
-            parent: Some(CallableParent::Local(LocalCallableId::new(span))),
+            parent: Some(CallableParent::Local(id)),
             kind: CallableKind::Function,
             name,
         }
@@ -272,7 +295,7 @@ impl CallableId {
     pub(crate) fn aggregate_method(owner: NominalKey, name: Ident, surface: MethodSurface) -> Self {
         Self {
             module: owner.module.clone(),
-            parent: Some(CallableParent::Nominal(owner)),
+            parent: Some(CallableParent::Nominal(owner.id)),
             kind: match surface {
                 MethodSurface::Static => CallableKind::StaticMethod,
                 MethodSurface::Instance => CallableKind::InstanceMethod,
@@ -293,7 +316,7 @@ impl CallableId {
     pub(crate) fn enum_variant(enum_key: NominalKey, variant: Ident) -> Self {
         Self {
             module: enum_key.module.clone(),
-            parent: Some(CallableParent::Nominal(enum_key)),
+            parent: Some(CallableParent::Nominal(enum_key.id)),
             kind: CallableKind::EnumVariant,
             name: variant,
         }
@@ -302,9 +325,9 @@ impl CallableId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum CallableParent {
-    Nominal(NominalKey),
+    Nominal(NominalId),
     Extend(ExtendId),
-    Local(LocalCallableId),
+    Local(SourceDeclId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -509,6 +532,10 @@ pub(crate) enum DeclError {
         span: Option<SourceSpan>,
     },
     RawEnumGenericParams {
+        owner: NominalKey,
+        span: Option<SourceSpan>,
+    },
+    RawEnumOwnerDependency {
         owner: NominalKey,
         span: Option<SourceSpan>,
     },
@@ -732,6 +759,7 @@ impl DeclError {
             | DeclError::DuplicateEnumVariant { span, .. }
             | DeclError::RawEnumInvalidBacking { span, .. }
             | DeclError::RawEnumGenericParams { span, .. }
+            | DeclError::RawEnumOwnerDependency { span, .. }
             | DeclError::RawEnumValueWithoutBacking { span, .. }
             | DeclError::RawEnumPayloadVariant { span, .. }
             | DeclError::RawEnumMissingStringValue { span, .. }
@@ -806,15 +834,17 @@ fn core_module_scope(segment: &str) -> ModuleScope {
 #[derive(Clone, Default)]
 pub(crate) struct DeclarationIndex {
     modules: HashMap<ModuleScope, ModuleDecls>,
-    aggregates: HashMap<NominalKey, AggregateSchema>,
-    enums: HashMap<NominalKey, EnumSchema>,
-    pending_raw_enums: HashMap<NominalKey, PendingRawEnum>,
+    nominals: HashMap<NominalId, NominalKey>,
+    aggregates: HashMap<NominalId, AggregateSchema>,
+    enums: HashMap<NominalId, EnumSchema>,
+    pending_raw_enums: HashMap<NominalId, PendingRawEnum>,
+    processed_nominals: HashSet<NominalId>,
     extends: Vec<ExtendSchema>,
     type_aliases: HashMap<TypeAliasKey, TypeAliasSchema>,
     contracts: HashMap<ContractKey, ContractSchema>,
-    extern_type_policies: HashMap<NominalKey, AccessPolicy>,
+    extern_type_policies: HashMap<NominalId, AccessPolicy>,
     value_spans: HashMap<(ModuleScope, Ident), Span>,
-    type_spans: HashMap<NominalKey, Span>,
+    type_spans: HashMap<NominalId, Span>,
     errors: Vec<DeclError>,
     import_records: Vec<ImportRecord>,
     used_imports: HashSet<ImportId>,
@@ -968,10 +998,12 @@ impl NamespaceMember<'_> {
         }
     }
 
-    fn module(&self) -> ModuleScope {
+    fn module(&self, nominals: &HashMap<NominalId, NominalKey>) -> ModuleScope {
         match self {
             Self::Value(value) => value.module.clone(),
-            Self::Type(binding) => binding.module().clone(),
+            Self::Type(TypeBinding::Nominal(id)) => nominals[id].module.clone(),
+            Self::Type(TypeBinding::Alias(key)) => key.module.clone(),
+            Self::Type(TypeBinding::Contract(key)) => key.module.clone(),
             Self::Module(module) => (*module).clone(),
         }
     }
@@ -1349,10 +1381,10 @@ impl ImportScope {
         self.binding_origins.get(&(namespace, name)).cloned()
     }
 
-    fn activate_imported_origins(&mut self) {
+    fn activate_imported_origins(&mut self, nominals: &HashMap<NominalId, NominalKey>) {
         let mut origins = vec![];
         self.namespace.for_each_member(|name, member| {
-            origins.push((member.module(), (member.namespace(), name)));
+            origins.push((member.module(nominals), (member.namespace(), name)));
         });
         for (module, key) in origins {
             self.activate_imported_origin(module, &key);
@@ -1459,6 +1491,7 @@ pub(crate) struct GlobalSig {
     pub(crate) key: GlobalKey,
     pub(crate) ty: Type,
     pub(crate) mutability: Mutability,
+    pub(crate) exported: bool,
     pub(crate) policy: AccessPolicy,
     pub(crate) span: SourceSpan,
     pub(crate) initializer_span: SourceSpan,
@@ -1572,8 +1605,9 @@ impl<T> NamedSchemas<T> {
 
 #[derive(Clone)]
 pub(crate) struct AggregateSchema {
-    pub(crate) key: NominalKey,
+    pub(crate) owner_generics: GenericParams,
     pub(crate) generics: GenericParams,
+    pub(crate) generic_context: GenericTypeContext,
     pub(crate) fields: NamedSchemas<FieldSchema>,
     pub(crate) methods: HashMap<MethodKey, MethodSchema>,
     pub(crate) promoted: PromotedSurface,
@@ -1687,6 +1721,10 @@ pub(crate) struct MethodSchema {
 }
 
 impl AggregateSchema {
+    pub(crate) fn all_generics(&self) -> GenericParams {
+        combine_nominal_generics(&self.owner_generics, &self.generics)
+    }
+
     pub(crate) fn stringify_override(&self) -> Option<&MethodSchema> {
         self.methods
             .get(&MethodKey::instance(Ident::new("to_string")))
@@ -1723,10 +1761,25 @@ pub(super) struct VerifiedRawEnumMetadata {
 
 #[derive(Clone)]
 pub(crate) struct EnumSchema {
+    pub(crate) owner_generics: GenericParams,
     pub(crate) generics: GenericParams,
+    pub(crate) generic_context: GenericTypeContext,
     pub(crate) repr: EnumRepr,
     pub(crate) variants: NamedSchemas<VariantSchema>,
     pub(crate) policy: AccessPolicy,
+}
+
+impl EnumSchema {
+    pub(crate) fn all_generics(&self) -> GenericParams {
+        combine_nominal_generics(&self.owner_generics, &self.generics)
+    }
+}
+
+fn combine_nominal_generics(owner: &GenericParams, declaration: &GenericParams) -> GenericParams {
+    let mut params = owner.clone();
+    params.type_params.extend(declaration.type_params.clone());
+    params.const_params.extend(declaration.const_params.clone());
+    params
 }
 
 #[derive(Clone)]
@@ -1960,6 +2013,63 @@ impl DeclarationIndex {
         index
     }
 
+    fn register_source_nominal(
+        &mut self,
+        source: SourceId,
+        span: Span,
+        module: ModuleScope,
+        kind: NominalKind,
+        name: Ident,
+    ) -> NominalKey {
+        self.register_nominal(NominalKey::source(
+            source,
+            span,
+            module,
+            kind,
+            name,
+            NominalPlacement::Module,
+        ))
+    }
+
+    pub(crate) fn register_lexical_nominal(
+        &mut self,
+        source: SourceId,
+        span: Span,
+        module: ModuleScope,
+        kind: NominalKind,
+        name: Ident,
+    ) -> NominalKey {
+        self.register_nominal(NominalKey::source(
+            source,
+            span,
+            module,
+            kind,
+            name,
+            NominalPlacement::Lexical,
+        ))
+    }
+
+    fn register_external_nominal(&mut self, module: ModuleScope, name: Ident) -> NominalKey {
+        self.register_nominal(NominalKey::external(module, name))
+    }
+
+    fn register_nominal(&mut self, key: NominalKey) -> NominalKey {
+        match self.nominals.entry(key.id.clone()) {
+            Entry::Occupied(entry) => {
+                let existing = entry.get();
+                debug_assert_eq!(existing.module, key.module);
+                debug_assert_eq!(existing.kind, key.kind);
+                debug_assert_eq!(existing.name, key.name);
+                debug_assert_eq!(existing.placement, key.placement);
+                existing.clone()
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(key.clone());
+                key
+            }
+        }
+    }
+
     pub(crate) fn import_records(&self) -> &[ImportRecord] {
         &self.import_records
     }
@@ -2016,6 +2126,10 @@ impl DeclarationIndex {
         !self.errors.is_empty()
     }
 
+    pub(super) fn take_errors_from(&mut self, start: usize) -> Vec<DeclError> {
+        self.errors.drain(start..).collect()
+    }
+
     pub(crate) fn sync_extern_headers(&mut self, catalog: &ExternCatalog) {
         for function in catalog.functions() {
             let decls = self
@@ -2038,36 +2152,45 @@ impl DeclarationIndex {
         self.sync_value_projections();
     }
 
-    pub(crate) fn fold_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
+    pub(crate) fn fold_nominal_type_uses<F>(
+        &mut self,
+        ids: &HashSet<NominalId>,
+        mut f: F,
+    ) -> Vec<GenericContextError>
     where
         F: FnMut(DeclTypeSite, Type) -> Type,
     {
         let mut errors = vec![];
 
-        for (key, schema) in &mut self.aggregates {
-            let Some(span) = self.type_spans.get(key).copied() else {
+        for (id, schema) in &mut self.aggregates {
+            if !ids.contains(id) {
+                continue;
+            }
+            let Some(span) = self.type_spans.get(id).copied() else {
                 continue;
             };
-            let owner_generics = generic_context(
-                &key.module,
-                &schema.generics.type_params,
-                &schema.generics.const_params,
-                span,
-                &mut errors,
-            );
-            map_generic_bounds(
-                &key.module,
-                span,
-                &owner_generics,
-                &mut schema.generics,
-                &mut f,
-            );
-            let owner_type_params = schema.generics.type_params.clone();
+            let key = self
+                .nominals
+                .get(id)
+                .expect("aggregate missing nominal metadata");
+            let generics = match key.placement {
+                NominalPlacement::Module => generic_context(
+                    &key.module,
+                    &schema.generics.type_params,
+                    &schema.generics.const_params,
+                    span,
+                    &mut errors,
+                ),
+                NominalPlacement::Lexical => schema.generic_context.clone(),
+                NominalPlacement::External => unreachable!("external aggregate schema"),
+            };
+            map_generic_bounds(&key.module, span, &generics, &mut schema.generics, &mut f);
+            let owner_type_params = schema.all_generics().type_params;
             for field in schema.fields.values_mut() {
                 let site = type_site(
                     &key.module,
                     span,
-                    &owner_generics,
+                    &generics,
                     &owner_type_params,
                     DeclTypeUseKind::Field,
                 );
@@ -2076,7 +2199,7 @@ impl DeclarationIndex {
             for method in schema.methods.values_mut() {
                 let generics = extend_generic_context(
                     &key.module,
-                    &owner_generics,
+                    &generics,
                     &method.generics.type_params,
                     &method.generics.const_params,
                     span,
@@ -2106,19 +2229,30 @@ impl DeclarationIndex {
             }
         }
 
-        for (key, schema) in &mut self.enums {
-            let Some(span) = self.type_spans.get(key).copied() else {
+        for (id, schema) in &mut self.enums {
+            if !ids.contains(id) {
+                continue;
+            }
+            let Some(span) = self.type_spans.get(id).copied() else {
                 continue;
             };
-            let generics = generic_context(
-                &key.module,
-                &schema.generics.type_params,
-                &schema.generics.const_params,
-                span,
-                &mut errors,
-            );
+            let key = self
+                .nominals
+                .get(id)
+                .expect("enum missing nominal metadata");
+            let generics = match key.placement {
+                NominalPlacement::Module => generic_context(
+                    &key.module,
+                    &schema.generics.type_params,
+                    &schema.generics.const_params,
+                    span,
+                    &mut errors,
+                ),
+                NominalPlacement::Lexical => schema.generic_context.clone(),
+                NominalPlacement::External => unreachable!("external enum schema"),
+            };
             map_generic_bounds(&key.module, span, &generics, &mut schema.generics, &mut f);
-            let type_params = schema.generics.type_params.clone();
+            let type_params = schema.all_generics().type_params;
             for variant in schema.variants.values_mut() {
                 match &mut variant.payload {
                     VariantPayload::Unit => {}
@@ -2149,6 +2283,25 @@ impl DeclarationIndex {
                 }
             }
         }
+
+        errors
+    }
+
+    pub(crate) fn fold_canonical_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
+    where
+        F: FnMut(DeclTypeSite, Type) -> Type,
+    {
+        let ids = self.nominals.keys().cloned().collect();
+        let mut errors = self.fold_nominal_type_uses(&ids, &mut f);
+        errors.extend(self.fold_non_nominal_type_uses(&mut f));
+        errors
+    }
+
+    pub(crate) fn fold_non_nominal_type_uses<F>(&mut self, mut f: F) -> Vec<GenericContextError>
+    where
+        F: FnMut(DeclTypeSite, Type) -> Type,
+    {
+        let mut errors = vec![];
 
         for (key, schema) in &mut self.contracts {
             for req in &mut schema.direct_requirements {
@@ -2332,7 +2485,11 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn embedded_fields(&self) -> impl Iterator<Item = EmbeddedFieldRef<'_>> {
-        self.aggregates.iter().flat_map(|(owner, schema)| {
+        self.aggregates.iter().flat_map(|(id, schema)| {
+            let owner = self
+                .nominals
+                .get(id)
+                .expect("aggregate missing nominal metadata");
             schema.fields.iter().filter_map(move |(name, field)| {
                 let embed = field.embed.as_ref()?;
                 Some(EmbeddedFieldRef {
@@ -2345,14 +2502,23 @@ impl DeclarationIndex {
         })
     }
 
-    pub(crate) fn build_projection_edges(&mut self) -> Vec<DeclError> {
+    pub(crate) fn build_projection_edges(
+        &mut self,
+        target_ids: &HashSet<NominalId>,
+    ) -> Vec<DeclError> {
         let mut errors = vec![];
-        let mut keys = self.aggregates.keys().cloned().collect::<Vec<_>>();
-        keys.sort_by_key(nominal_key_sort_key);
-        for key in keys {
+        let mut ids = self
+            .aggregates
+            .keys()
+            .filter(|id| target_ids.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| nominal_key_sort_key(&self.nominals[id]));
+        for id in ids {
+            let key = self.nominals[&id].clone();
             let mut projections = vec![];
             let mut seen = HashSet::new();
-            for field in self.embedded_fields().filter(|field| field.owner == &key) {
+            for field in self.embedded_fields().filter(|field| field.owner.id == id) {
                 if !field.embed.as_projection {
                     continue;
                 }
@@ -2371,7 +2537,7 @@ impl DeclarationIndex {
                     field_path: vec![field.name],
                 });
             }
-            if let Some(schema) = self.aggregates.get_mut(&key) {
+            if let Some(schema) = self.aggregates.get_mut(&id) {
                 schema.projection_edges = projections;
             }
         }
@@ -2379,7 +2545,7 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn type_span(&self, key: &NominalKey) -> Option<Span> {
-        self.type_spans.get(key).copied()
+        self.type_spans.get(&key.id).copied()
     }
 
     fn sync_value_projections(&mut self) {
@@ -2513,6 +2679,222 @@ impl DeclarationIndex {
         schemas
     }
 
+    fn build_aggregate_schema(
+        &mut self,
+        source: SourceId,
+        module: ModuleScope,
+        node: &ast::AggregateDeclNode,
+    ) -> (NominalKey, AggregateSchema) {
+        let agg = &node.node;
+        let key =
+            self.register_source_nominal(source, node.span, module, agg.kind.into(), agg.name);
+        let schema = self.build_aggregate_schema_for_key(
+            source,
+            &key,
+            node,
+            GenericParams::default(),
+            GenericTypeContext::default(),
+        );
+        (key, schema)
+    }
+
+    pub(super) fn build_aggregate_schema_for_key(
+        &mut self,
+        source: SourceId,
+        key: &NominalKey,
+        node: &ast::AggregateDeclNode,
+        owner_generics: GenericParams,
+        generic_context: GenericTypeContext,
+    ) -> AggregateSchema {
+        let agg = &node.node;
+        let target = match agg.kind {
+            AggregateKind::Struct => annotation::AnnotationTarget::Struct,
+            AggregateKind::DataRef => annotation::AnnotationTarget::DataRef,
+        };
+        let policy =
+            annotation::normalize_annotations(source, &agg.annotations, target, &mut self.errors);
+        let fields = self.collect_field_schemas(source, &agg.fields, true, true, |name, span| {
+            DeclError::DuplicateAggregateField {
+                owner: key.clone(),
+                name,
+                span: Some(span),
+            }
+        });
+        validate_embed_field_schemas(&fields, &mut self.errors);
+        let mut methods = HashMap::new();
+        for method in &agg.methods {
+            let policy = annotation::normalize_annotations(
+                source,
+                &method.annotations,
+                annotation::AnnotationTarget::InlineMethod,
+                &mut self.errors,
+            );
+            if method.sig.name == Ident::new("to_string") {
+                if policy.has_internal() {
+                    self.errors.push(DeclError::InternalOnToString {
+                        span: Some(SourceSpan::from_byte_span(source, node.span)),
+                    });
+                }
+                self.validate_to_string_method(
+                    &method.sig,
+                    SourceSpan::from_byte_span(source, node.span),
+                );
+            }
+            let mode = MethodMode::from_receiver(method.sig.receiver);
+            let method_key = MethodKey::new(method.sig.name, mode.surface());
+            let schema = method_schema(source, &method.sig, mode, policy);
+            match methods.entry(method_key) {
+                Entry::Occupied(entry) => {
+                    self.errors.push(DeclError::DuplicateAggregateMethod {
+                        owner: key.clone(),
+                        name: method.sig.name,
+                        surface: entry.key().surface,
+                        span: Some(SourceSpan::from_byte_span(source, node.span)),
+                    });
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(schema);
+                }
+            }
+        }
+        AggregateSchema {
+            owner_generics,
+            generics: generic_params(&agg.type_params, &agg.const_params),
+            generic_context,
+            fields,
+            methods,
+            promoted: PromotedSurface::default(),
+            dependent_embeds: vec![],
+            projection_edges: vec![],
+            policy,
+        }
+    }
+
+    fn build_enum_schema(
+        &mut self,
+        source: SourceId,
+        module: ModuleScope,
+        node: &ast::EnumDeclNode,
+    ) -> (NominalKey, EnumSchema, Option<PendingRawEnum>) {
+        let enm = &node.node;
+        let key =
+            self.register_source_nominal(source, node.span, module, NominalKind::Enum, enm.name);
+        let (schema, pending) = self.build_enum_schema_for_key(
+            source,
+            &key,
+            node,
+            GenericParams::default(),
+            GenericTypeContext::default(),
+        );
+        (key, schema, pending)
+    }
+
+    pub(super) fn build_enum_schema_for_key(
+        &mut self,
+        source: SourceId,
+        key: &NominalKey,
+        node: &ast::EnumDeclNode,
+        owner_generics: GenericParams,
+        generic_context: GenericTypeContext,
+    ) -> (EnumSchema, Option<PendingRawEnum>) {
+        let enm = &node.node;
+        let policy = annotation::normalize_annotations(
+            source,
+            &enm.annotations,
+            annotation::AnnotationTarget::Enum,
+            &mut self.errors,
+        );
+        let mut variants = NamedSchemas::default();
+        for variant in &enm.variants {
+            let variant_policy = annotation::normalize_annotations(
+                source,
+                &variant.annotations,
+                annotation::AnnotationTarget::Variant,
+                &mut self.errors,
+            );
+            let payload =
+                match &variant.kind {
+                    VariantKind::Unit => VariantPayload::Unit,
+                    VariantKind::Tuple(types) => VariantPayload::Tuple(types.clone()),
+                    VariantKind::Struct(fields) => VariantPayload::Struct(
+                        self.collect_field_schemas(source, fields, false, false, |name, span| {
+                            DeclError::DuplicateVariantField {
+                                owner: key.clone(),
+                                variant: variant.name,
+                                name,
+                                span: Some(span),
+                            }
+                        }),
+                    ),
+                };
+            let schema = VariantSchema {
+                policy: variant_policy,
+                payload,
+                raw_value: None,
+            };
+            if variants.insert(variant.name, schema).is_err() {
+                self.errors.push(DeclError::DuplicateEnumVariant {
+                    owner: key.clone(),
+                    name: variant.name,
+                    span: Some(SourceSpan::from_byte_span(source, variant.span)),
+                });
+            }
+        }
+        let pending = (enm.raw_backing.is_some()
+            || enm
+                .variants
+                .iter()
+                .any(|variant| variant.raw_value.is_some()))
+        .then(|| PendingRawEnum {
+            source,
+            backing: enm.raw_backing.clone(),
+            variants: enm
+                .variants
+                .iter()
+                .map(|variant| PendingRawVariant {
+                    name: variant.name,
+                    span: variant.span,
+                    value: variant.raw_value.clone(),
+                })
+                .collect(),
+        });
+        (
+            EnumSchema {
+                owner_generics,
+                generics: generic_params(&enm.type_params, &enm.const_params),
+                generic_context,
+                repr: EnumRepr::Adt,
+                variants,
+                policy,
+            },
+            pending,
+        )
+    }
+
+    pub(super) fn install_aggregate_schema(
+        &mut self,
+        key: &NominalKey,
+        span: Span,
+        schema: AggregateSchema,
+    ) {
+        self.type_spans.insert(key.id.clone(), span);
+        self.aggregates.insert(key.id.clone(), schema);
+    }
+
+    pub(super) fn install_enum_schema(
+        &mut self,
+        key: &NominalKey,
+        span: Span,
+        schema: EnumSchema,
+        pending: Option<PendingRawEnum>,
+    ) {
+        self.type_spans.insert(key.id.clone(), span);
+        if let Some(pending) = pending {
+            self.pending_raw_enums.insert(key.id.clone(), pending);
+        }
+        self.enums.insert(key.id.clone(), schema);
+    }
+
     fn collect_module(
         &mut self,
         program: &Program,
@@ -2559,187 +2941,31 @@ impl DeclarationIndex {
                     );
                 }
                 Stmt::Aggregate(agg_node) => {
-                    let agg = &agg_node.node;
-                    let key = NominalKey {
-                        module: scope.clone(),
-                        kind: agg.kind.into(),
-                        name: agg.name,
-                    };
-                    let target = match agg.kind {
-                        AggregateKind::Struct => annotation::AnnotationTarget::Struct,
-                        AggregateKind::DataRef => annotation::AnnotationTarget::DataRef,
-                    };
-                    let policy = annotation::normalize_annotations(
-                        source,
-                        &agg.annotations,
-                        target,
-                        &mut self.errors,
-                    );
-                    let fields = self.collect_field_schemas(
-                        source,
-                        &agg.fields,
-                        true,
-                        true,
-                        |name, span| DeclError::DuplicateAggregateField {
-                            owner: key.clone(),
-                            name,
-                            span: Some(span),
-                        },
-                    );
-                    validate_embed_field_schemas(&fields, &mut self.errors);
-                    let mut methods = HashMap::new();
-                    for method in &agg.methods {
-                        let policy = annotation::normalize_annotations(
-                            source,
-                            &method.annotations,
-                            annotation::AnnotationTarget::InlineMethod,
-                            &mut self.errors,
-                        );
-                        if method.sig.name == Ident::new("to_string") {
-                            if policy.has_internal() {
-                                self.errors.push(DeclError::InternalOnToString {
-                                    span: Some(SourceSpan::from_byte_span(source, agg_node.span)),
-                                });
-                            }
-                            self.validate_to_string_method(
-                                &method.sig,
-                                SourceSpan::from_byte_span(source, agg_node.span),
-                            );
-                        }
-                        let mode = MethodMode::from_receiver(method.sig.receiver);
-                        let method_key = MethodKey::new(method.sig.name, mode.surface());
-                        let schema = method_schema(source, &method.sig, mode, policy);
-                        match methods.entry(method_key) {
-                            Entry::Occupied(entry) => {
-                                self.errors.push(DeclError::DuplicateAggregateMethod {
-                                    owner: key.clone(),
-                                    name: method.sig.name,
-                                    surface: entry.key().surface,
-                                    span: Some(SourceSpan::from_byte_span(source, agg_node.span)),
-                                });
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(schema);
-                            }
-                        }
-                    }
+                    let (key, schema) =
+                        self.build_aggregate_schema(source, scope.clone(), agg_node);
                     if self.insert_local_type(
                         &mut decls,
                         &scope,
-                        agg.name,
-                        TypeBinding::Nominal(key.clone()),
+                        agg_node.node.name,
+                        TypeBinding::Nominal(key.id.clone()),
                         exported,
                         Some(SourceSpan::from_byte_span(source, agg_node.span)),
                     ) {
-                        self.type_spans.insert(key.clone(), agg_node.span);
-                        self.aggregates.insert(
-                            key.clone(),
-                            AggregateSchema {
-                                key,
-                                generics: generic_params(&agg.type_params, &agg.const_params),
-                                fields,
-                                methods,
-                                promoted: PromotedSurface::default(),
-                                dependent_embeds: vec![],
-                                projection_edges: vec![],
-                                policy,
-                            },
-                        );
+                        self.install_aggregate_schema(&key, agg_node.span, schema);
                     }
                 }
                 Stmt::Enum(enum_node) => {
-                    let enm = &enum_node.node;
-                    let key = NominalKey {
-                        module: scope.clone(),
-                        kind: NominalKind::Enum,
-                        name: enm.name,
-                    };
-                    let policy = annotation::normalize_annotations(
-                        source,
-                        &enm.annotations,
-                        annotation::AnnotationTarget::Enum,
-                        &mut self.errors,
-                    );
-                    let mut variants = NamedSchemas::default();
-                    for variant in &enm.variants {
-                        let variant_policy = annotation::normalize_annotations(
-                            source,
-                            &variant.annotations,
-                            annotation::AnnotationTarget::Variant,
-                            &mut self.errors,
-                        );
-                        let payload = match &variant.kind {
-                            VariantKind::Unit => VariantPayload::Unit,
-                            VariantKind::Tuple(types) => VariantPayload::Tuple(types.clone()),
-                            VariantKind::Struct(fields) => {
-                                VariantPayload::Struct(self.collect_field_schemas(
-                                    source,
-                                    fields,
-                                    false,
-                                    false,
-                                    |name, span| DeclError::DuplicateVariantField {
-                                        owner: key.clone(),
-                                        variant: variant.name,
-                                        name,
-                                        span: Some(span),
-                                    },
-                                ))
-                            }
-                        };
-                        let schema = VariantSchema {
-                            policy: variant_policy,
-                            payload,
-                            raw_value: None,
-                        };
-                        if variants.insert(variant.name, schema).is_err() {
-                            self.errors.push(DeclError::DuplicateEnumVariant {
-                                owner: key.clone(),
-                                name: variant.name,
-                                span: Some(SourceSpan::from_byte_span(source, variant.span)),
-                            });
-                        }
-                    }
+                    let (key, schema, pending) =
+                        self.build_enum_schema(source, scope.clone(), enum_node);
                     if self.insert_local_type(
                         &mut decls,
                         &scope,
-                        enm.name,
-                        TypeBinding::Nominal(key.clone()),
+                        enum_node.node.name,
+                        TypeBinding::Nominal(key.id.clone()),
                         exported,
                         Some(SourceSpan::from_byte_span(source, enum_node.span)),
                     ) {
-                        self.type_spans.insert(key.clone(), enum_node.span);
-                        if enm.raw_backing.is_some()
-                            || enm
-                                .variants
-                                .iter()
-                                .any(|variant| variant.raw_value.is_some())
-                        {
-                            self.pending_raw_enums.insert(
-                                key.clone(),
-                                PendingRawEnum {
-                                    source,
-                                    backing: enm.raw_backing.clone(),
-                                    variants: enm
-                                        .variants
-                                        .iter()
-                                        .map(|variant| PendingRawVariant {
-                                            name: variant.name,
-                                            span: variant.span,
-                                            value: variant.raw_value.clone(),
-                                        })
-                                        .collect(),
-                                },
-                            );
-                        }
-                        self.enums.insert(
-                            key.clone(),
-                            EnumSchema {
-                                generics: generic_params(&enm.type_params, &enm.const_params),
-                                repr: EnumRepr::Adt,
-                                variants,
-                                policy,
-                            },
-                        );
+                        self.install_enum_schema(&key, enum_node.span, schema, pending);
                     }
                 }
                 Stmt::Const(const_node) => {
@@ -2788,6 +3014,7 @@ impl DeclarationIndex {
                             key,
                             ty: global.ty.clone().unwrap_or(Type::Infer),
                             mutability: global.mutability,
+                            exported: matches!(global.visibility, Visibility::Public),
                             policy,
                             span,
                             initializer_span,
@@ -3020,28 +3247,24 @@ impl DeclarationIndex {
 
         for ty in &module.types {
             let name = Ident::new(&ty.name);
-            let key = NominalKey {
-                module: scope.clone(),
-                kind: NominalKind::Extern,
-                name,
-            };
+            let key = self.register_external_nominal(scope.clone(), name);
             let span = ty.site.span;
             if self.insert_local_type(
                 &mut decls,
                 &scope,
                 name,
-                TypeBinding::Nominal(key.clone()),
+                TypeBinding::Nominal(key.id.clone()),
                 ty.exported,
                 span,
             ) {
                 if let Some(span) = span {
-                    self.type_spans.insert(key.clone(), span.byte());
+                    self.type_spans.insert(key.id.clone(), span.byte());
                 }
                 let policy = source_policies
                     .and_then(|policies| policies.types.get(&(scope.clone(), name)))
                     .cloned()
                     .unwrap_or_default();
-                self.extern_type_policies.insert(key, policy);
+                self.extern_type_policies.insert(key.id, policy);
             }
         }
 
@@ -3250,7 +3473,7 @@ impl DeclarationIndex {
             );
             let (mut imports, errors) = builder.finish_import_scope();
             self.errors.extend(errors);
-            imports.activate_imported_origins();
+            imports.activate_imported_origins(&self.nominals);
             self.expand_active_modules(&mut imports);
             if let Some(decls) = self.modules.get_mut(&module.scope) {
                 decls.imports = imports;
@@ -3356,12 +3579,46 @@ impl DeclarationIndex {
         self.modules.get(module)?.locals.ty(name).cloned()
     }
 
+    pub(crate) fn nominal(&self, id: &NominalId) -> Option<&NominalKey> {
+        self.nominals.get(id)
+    }
+
+    pub(crate) fn nominal_ids(&self) -> HashSet<NominalId> {
+        self.aggregates
+            .keys()
+            .chain(self.enums.keys())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn unprocessed_nominals(
+        &self,
+        ids: impl IntoIterator<Item = NominalId>,
+    ) -> HashSet<NominalId> {
+        ids.into_iter()
+            .filter(|id| !self.processed_nominals.contains(id))
+            .collect()
+    }
+
+    pub(crate) fn mark_nominals_processed(&mut self, ids: &HashSet<NominalId>) {
+        self.processed_nominals.extend(ids.iter().cloned());
+    }
+
+    pub(crate) fn nominal_processed(&self, id: &NominalId) -> bool {
+        self.processed_nominals.contains(id)
+    }
+
+    pub(crate) fn source_nominal(&self, source: SourceId, span: Span) -> Option<&NominalKey> {
+        self.nominal(&NominalId::Source(SourceDeclId::new(source, span)))
+    }
+
     pub(crate) fn local_nominal_type(
         &self,
         module: &ModuleScope,
         name: Ident,
     ) -> Option<NominalKey> {
-        self.local_type_binding(module, name)?.into_nominal()
+        let binding = self.local_type_binding(module, name)?;
+        self.nominal(binding.nominal()?).cloned()
     }
 
     pub(crate) fn exported_value(
@@ -3385,7 +3642,8 @@ impl DeclarationIndex {
         module: &ModuleScope,
         name: Ident,
     ) -> Option<NominalKey> {
-        self.exported_type_binding(module, name)?.into_nominal()
+        let binding = self.exported_type_binding(module, name)?;
+        self.nominal(binding.nominal()?).cloned()
     }
 
     pub(crate) fn exported_module(&self, module: &ModuleScope, name: Ident) -> Option<ModuleScope> {
@@ -3630,7 +3888,7 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn aggregate(&self, key: &NominalKey) -> Option<&AggregateSchema> {
-        let aggregate = self.aggregates.get(key)?;
+        let aggregate = self.aggregates.get(&key.id)?;
         debug_assert!(aggregate.promoted.invariants_hold());
         debug_assert!(
             aggregate
@@ -3651,7 +3909,12 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn aggregate_mut(&mut self, key: &NominalKey) -> Option<&mut AggregateSchema> {
-        self.aggregates.get_mut(key)
+        self.aggregates.get_mut(&key.id)
+    }
+
+    pub(crate) fn aggregate_for_type(&self, ty: &Type) -> Option<&AggregateSchema> {
+        let key = self.key_for_type(ty)?;
+        self.aggregate(&key)
     }
 
     pub(super) fn projection_paths_from(&self, source: &Type) -> Vec<ProjectionPath> {
@@ -3677,9 +3940,9 @@ impl DeclarationIndex {
             return;
         }
 
+        let generics = aggregate.all_generics();
         for edge in &aggregate.projection_edges {
-            let target_ty =
-                substitute_aggregate_member(source, &aggregate.generics, &edge.target_ty);
+            let target_ty = substitute_aggregate_member(source, &generics, &edge.target_ty);
             let start = prefix.len();
             prefix.extend(edge.field_path.iter().copied());
             paths.push(ProjectionPath {
@@ -3701,6 +3964,7 @@ impl DeclarationIndex {
             return vec![];
         };
         let target = CanonicalTypeKey(target.clone());
+        let generics = aggregate.all_generics();
         aggregate
             .fields
             .iter()
@@ -3709,20 +3973,32 @@ impl DeclarationIndex {
                 if embed.as_projection {
                     return None;
                 }
-                let field_ty = substitute_aggregate_member(source, &aggregate.generics, &field.ty);
+                let field_ty = substitute_aggregate_member(source, &generics, &field.ty);
                 (CanonicalTypeKey(field_ty) == target).then(|| vec![name])
             })
             .collect()
     }
 
     pub(crate) fn aggregates(&self) -> impl Iterator<Item = (&NominalKey, &AggregateSchema)> {
-        self.aggregates.iter()
+        self.aggregates.iter().map(|(id, schema)| {
+            (
+                self.nominals
+                    .get(id)
+                    .expect("aggregate missing nominal metadata"),
+                schema,
+            )
+        })
     }
 
     pub(crate) fn enum_schema(&self, key: &NominalKey) -> Option<&EnumSchema> {
-        let schema = self.enums.get(key)?;
+        let schema = self.enums.get(&key.id)?;
         debug_assert!(self.enum_schema_invariants_hold(key, schema));
         Some(schema)
+    }
+
+    pub(crate) fn enum_schema_for_type(&self, ty: &Type) -> Option<&EnumSchema> {
+        let key = self.key_for_type(ty)?;
+        self.enum_schema(&key)
     }
 
     fn enum_schema_invariants_hold(&self, key: &NominalKey, schema: &EnumSchema) -> bool {
@@ -3776,15 +4052,15 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn aggregate_fields(&self, key: &NominalKey) -> Option<&NamedSchemas<FieldSchema>> {
-        self.aggregates.get(key).map(|schema| &schema.fields)
+        self.aggregates.get(&key.id).map(|schema| &schema.fields)
     }
 
     pub(crate) fn enum_variants(&self, key: &NominalKey) -> Option<&NamedSchemas<VariantSchema>> {
-        self.enums.get(key).map(|schema| &schema.variants)
+        self.enums.get(&key.id).map(|schema| &schema.variants)
     }
 
     pub(crate) fn enum_repr_for_key(&self, key: &NominalKey) -> Option<EnumRepr> {
-        Some(self.enums.get(key)?.repr)
+        Some(self.enums.get(&key.id)?.repr)
     }
 
     pub(crate) fn enum_repr_for_type(&self, ty: &Type) -> Option<EnumRepr> {
@@ -3804,7 +4080,7 @@ impl DeclarationIndex {
             return None;
         }
         self.enums
-            .get(key)?
+            .get(&key.id)?
             .variants
             .get(variant)?
             .raw_value
@@ -3820,7 +4096,7 @@ impl DeclarationIndex {
             return None;
         }
         self.enums
-            .get(key)?
+            .get(&key.id)?
             .variants
             .iter()
             .find_map(|(name, variant)| (variant.raw_value.as_ref() == Some(value)).then_some(name))
@@ -3835,7 +4111,7 @@ impl DeclarationIndex {
         }
         Some(
             self.enums
-                .get(key)?
+                .get(&key.id)?
                 .variants
                 .iter()
                 .filter_map(|(name, variant)| Some((name, variant.raw_value.as_ref()?))),
@@ -3847,7 +4123,7 @@ impl DeclarationIndex {
         key: &NominalKey,
         variant: Ident,
     ) -> Option<&NamedSchemas<FieldSchema>> {
-        let variant = self.enums.get(key)?.variants.get(variant)?;
+        let variant = self.enums.get(&key.id)?.variants.get(variant)?;
         match &variant.payload {
             VariantPayload::Struct(fields) => Some(fields),
             VariantPayload::Unit | VariantPayload::Tuple(_) => None,
@@ -3872,17 +4148,38 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn enums(&self) -> impl Iterator<Item = (&NominalKey, &EnumSchema)> {
-        self.enums.iter()
+        self.enums.iter().map(|(id, schema)| {
+            (
+                self.nominals
+                    .get(id)
+                    .expect("enum missing nominal metadata"),
+                schema,
+            )
+        })
     }
 
-    pub(super) fn take_pending_raw_enums(&mut self) -> Vec<(NominalKey, PendingRawEnum)> {
-        let mut pending = self.pending_raw_enums.drain().collect::<Vec<_>>();
+    pub(super) fn take_pending_raw_enums(
+        &mut self,
+        ids: &HashSet<NominalId>,
+    ) -> Vec<(NominalKey, PendingRawEnum)> {
+        let mut pending = ids
+            .iter()
+            .filter_map(|id| {
+                let pending = self.pending_raw_enums.remove(id)?;
+                let key = self
+                    .nominals
+                    .get(id)
+                    .expect("raw enum missing nominal metadata")
+                    .clone();
+                Some((key, pending))
+            })
+            .collect::<Vec<_>>();
         pending.sort_by_key(|(key, _)| nominal_key_sort_key(key));
         pending
     }
 
     pub(super) fn sanitize_raw_enum(&mut self, key: &NominalKey) {
-        let Some(schema) = self.enums.get_mut(key) else {
+        let Some(schema) = self.enums.get_mut(&key.id) else {
             return;
         };
         schema.repr = EnumRepr::Adt;
@@ -3896,7 +4193,7 @@ impl DeclarationIndex {
         key: &NominalKey,
         metadata: VerifiedRawEnumMetadata,
     ) -> bool {
-        let Some(schema) = self.enums.get_mut(key) else {
+        let Some(schema) = self.enums.get_mut(&key.id) else {
             return false;
         };
         debug_assert_ne!(metadata.repr, EnumRepr::Adt);
@@ -3914,7 +4211,7 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn extern_type_policy(&self, key: &NominalKey) -> Option<&AccessPolicy> {
-        self.extern_type_policies.get(key)
+        self.extern_type_policies.get(&key.id)
     }
 
     pub(crate) fn type_alias(&self, key: &TypeAliasKey) -> Option<&TypeAliasSchema> {
@@ -3948,16 +4245,59 @@ impl DeclarationIndex {
                 .get(&key.module)?
                 .locals
                 .ty(key.name)?
-                .as_nominal()
-                .filter(|found| *found == key)
+                .nominal()
+                .filter(|found| *found == &key.id)
                 .map(|_| GenericParams::default()),
         }
     }
 
+    pub(crate) fn nominal_owner_generics(&self, key: &NominalKey) -> GenericParams {
+        match key.kind {
+            NominalKind::Struct | NominalKind::DataRef => self
+                .aggregate(key)
+                .map(|schema| schema.owner_generics.clone())
+                .unwrap_or_default(),
+            NominalKind::Enum => self
+                .enum_schema(key)
+                .map(|schema| schema.owner_generics.clone())
+                .unwrap_or_default(),
+            NominalKind::Extern => GenericParams::default(),
+        }
+    }
+
+    pub(crate) fn split_nominal_args(
+        &self,
+        key: &NominalKey,
+        args: &GenericArgs,
+    ) -> Option<(GenericArgs, GenericArgs)> {
+        let owner = self.nominal_owner_generics(key);
+        let declaration = self.nominal_generics(key)?;
+        let owner_types = owner.type_params.len();
+        let owner_consts = owner.const_params.len();
+        let declaration_types = declaration.type_params.len();
+        let declaration_consts = declaration.const_params.len();
+        if args.type_args.len() != owner_types + declaration_types
+            || args.const_args.len() != owner_consts + declaration_consts
+        {
+            return None;
+        }
+        Some((
+            GenericArgs {
+                type_args: args.type_args[..owner_types].to_vec(),
+                const_args: args.const_args[..owner_consts].to_vec(),
+            },
+            GenericArgs {
+                type_args: args.type_args[owner_types..].to_vec(),
+                const_args: args.const_args[owner_consts..].to_vec(),
+            },
+        ))
+    }
+
     pub(crate) fn key_for_type(&self, ty: &Type) -> Option<NominalKey> {
-        let key = nominal_key_for_type(ty)?;
-        self.local_nominal_type(&key.module, key.name)
-            .filter(|found| found.kind == key.kind)
+        let Type::Nominal(nominal) = ty else {
+            return None;
+        };
+        self.nominals.get(&nominal.id).cloned()
     }
 
     pub(crate) fn core_result_key(&self) -> Option<NominalKey> {
@@ -3978,7 +4318,7 @@ impl DeclarationIndex {
         let Type::Nominal(nominal) = ty else {
             return None;
         };
-        if nominal_key_for_type(ty)? != *key || !nominal.const_args.is_empty() {
+        if nominal.id != key.id || !nominal.const_args.is_empty() {
             return None;
         }
         let [inner] = nominal.type_args.as_slice() else {
@@ -4001,7 +4341,7 @@ impl DeclarationIndex {
         let Type::Nominal(nominal) = ty else {
             return None;
         };
-        if nominal_key_for_type(ty)? != key || !nominal.const_args.is_empty() {
+        if nominal.id != key.id || !nominal.const_args.is_empty() {
             return None;
         }
         let [ok, err] = nominal.type_args.as_slice() else {
@@ -4107,8 +4447,9 @@ impl DeclarationIndex {
         seen: &mut HashSet<Type>,
     ) -> Option<MapKeyError> {
         let agg = self.aggregate(key)?;
+        let generics = agg.all_generics();
         agg.fields.iter().find_map(|(name, field)| {
-            self.member_map_key_error(ty, &agg.generics, &field.ty, Some(name), seen)
+            self.member_map_key_error(ty, &generics, &field.ty, Some(name), seen)
         })
     }
 
@@ -4119,16 +4460,17 @@ impl DeclarationIndex {
         seen: &mut HashSet<Type>,
     ) -> Option<MapKeyError> {
         let schema = self.enum_schema(key)?;
+        let generics = schema.all_generics();
         schema
             .variants
             .values()
             .find_map(|variant| match &variant.payload {
                 VariantPayload::Unit => None,
                 VariantPayload::Tuple(fields) => fields.iter().find_map(|field_ty| {
-                    self.member_map_key_error(ty, &schema.generics, field_ty, None, seen)
+                    self.member_map_key_error(ty, &generics, field_ty, None, seen)
                 }),
                 VariantPayload::Struct(fields) => fields.iter().find_map(|(name, field)| {
-                    self.member_map_key_error(ty, &schema.generics, &field.ty, Some(name), seen)
+                    self.member_map_key_error(ty, &generics, &field.ty, Some(name), seen)
                 }),
             })
     }
@@ -4171,7 +4513,7 @@ impl DeclarationIndex {
         let field = agg.fields.get(name)?;
         Some(substitute_aggregate_member(
             receiver,
-            &agg.generics,
+            &agg.all_generics(),
             &field.ty,
         ))
     }
@@ -4366,6 +4708,7 @@ impl DeclarationIndex {
 
     pub(crate) fn callable_for_aggregate_method(
         &self,
+        owner: &NominalKey,
         aggregate: &AggregateSchema,
         name: Ident,
         method: &MethodSchema,
@@ -4374,6 +4717,7 @@ impl DeclarationIndex {
         debug_assert_eq!(method.mode.surface(), MethodSurface::Instance);
         let owner_ty = receiver_ty.clone();
         self.callable_for_aggregate_member(
+            owner,
             aggregate,
             name,
             method,
@@ -4384,25 +4728,28 @@ impl DeclarationIndex {
 
     pub(crate) fn callable_for_aggregate_static_method(
         &self,
+        owner: &NominalKey,
         aggregate: &AggregateSchema,
         name: Ident,
         method: &MethodSchema,
         owner_ty: Option<&Type>,
     ) -> CallableRef {
         debug_assert_eq!(method.mode.surface(), MethodSurface::Static);
-        self.callable_for_aggregate_member(aggregate, name, method, owner_ty, None)
+        self.callable_for_aggregate_member(owner, aggregate, name, method, owner_ty, None)
     }
 
     fn callable_for_aggregate_member(
         &self,
+        owner: &NominalKey,
         aggregate: &AggregateSchema,
         name: Ident,
         method: &MethodSchema,
         owner_ty: Option<&Type>,
         receiver_ty: Option<Type>,
     ) -> CallableRef {
-        debug_assert!(self.aggregates.contains_key(&aggregate.key));
-        let subst = owner_ty.and_then(|ty| aggregate_substitutions(ty, &aggregate.generics));
+        debug_assert!(self.aggregates.contains_key(&owner.id));
+        let owner_generics = aggregate.all_generics();
+        let subst = owner_ty.and_then(|ty| aggregate_substitutions(ty, &owner_generics));
         let params = subst.as_ref().map_or_else(
             || method.params.clone(),
             |(type_subst, const_subst)| {
@@ -4418,13 +4765,9 @@ impl DeclarationIndex {
 
         CallableRef {
             def: CallableDef {
-                id: CallableId::aggregate_method(
-                    aggregate.key.clone(),
-                    name,
-                    method.mode.surface(),
-                ),
+                id: CallableId::aggregate_method(owner.clone(), name, method.mode.surface()),
                 sig: CallableSig {
-                    owner_generics: aggregate.generics.clone(),
+                    owner_generics,
                     generics: method.generics.clone(),
                     params,
                     default_sites: method.default_sites.clone(),
@@ -4797,18 +5140,11 @@ pub(crate) fn stmt_visibility(stmt: &StmtNode) -> Visibility {
     }
 }
 
-pub(crate) fn nominal_key_for_type(ty: &Type) -> Option<NominalKey> {
+pub(crate) fn nominal_id_for_type(ty: &Type) -> Option<&NominalId> {
     let Type::Nominal(nominal) = ty else {
         return None;
     };
-    Some(NominalKey {
-        module: nominal
-            .origin
-            .as_ref()
-            .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin),
-        kind: nominal.kind,
-        name: nominal.name,
-    })
+    Some(&nominal.id)
 }
 
 pub(crate) fn nominal_type(key: &NominalKey) -> Type {
@@ -4820,13 +5156,14 @@ pub(crate) fn nominal_type_with_args(
     type_args: &[Type],
     const_args: &[ConstArg],
 ) -> Type {
-    Type::nominal_with_origin(
-        key.kind,
-        key.name,
-        type_args.to_vec(),
-        const_args.to_vec(),
-        key.module.nominal_origin(),
-    )
+    Type::Nominal(ast::NominalType {
+        id: key.id.clone(),
+        kind: key.kind,
+        name: key.name,
+        type_args: type_args.to_vec(),
+        const_args: const_args.to_vec(),
+        origin: key.module.nominal_origin(),
+    })
 }
 
 #[cfg(test)]
@@ -4872,16 +5209,9 @@ mod tests {
             super::super::TypecheckConfig::default(),
         )
         .expect("typecheck failed");
-        tc.finish().expect("typecheck failed");
+        let source_index = crate::source_ast::SourceAstIndex::new(&root, &resolved);
+        tc.finish(&source_index).expect("typecheck failed");
         tc.decls.clone()
-    }
-
-    fn root_key(kind: NominalKind, name: &str) -> NominalKey {
-        NominalKey {
-            module: ModuleScope::Root,
-            kind,
-            name: ident(name),
-        }
     }
 
     #[test]
@@ -4916,7 +5246,9 @@ mod tests {
     #[test]
     fn aggregate_fields_keep_decl_order() {
         let index = checked_index("struct Weird { z: int, a: int, m: int }", &[]);
-        let key = root_key(NominalKind::Struct, "Weird");
+        let key = index
+            .local_nominal_type(&ModuleScope::Root, ident("Weird"))
+            .expect("aggregate key");
         let fields = index.aggregate_fields(&key).expect("aggregate fields");
         assert_eq!(
             fields.names().collect::<Vec<_>>(),
@@ -4930,7 +5262,9 @@ mod tests {
     #[test]
     fn enum_variants_and_struct_fields_keep_decl_order() {
         let index = checked_index("enum Weird { Z, A { b: int, a: string }, M }", &[]);
-        let key = root_key(NominalKind::Enum, "Weird");
+        let key = index
+            .local_nominal_type(&ModuleScope::Root, ident("Weird"))
+            .expect("enum key");
         let variants = index.enum_variants(&key).expect("enum variants");
         assert_eq!(
             variants.names().collect::<Vec<_>>(),
@@ -4972,9 +5306,12 @@ mod tests {
             super::super::TypecheckConfig::default(),
         )
         .expect("typecheck failed");
-        tc.finish().expect("typecheck failed");
+        let source_index = crate::source_ast::SourceAstIndex::new(&root, &resolved);
+        tc.finish(&source_index).expect("typecheck failed");
         let index = tc.decls.clone();
-        let key = root_key(NominalKind::Struct, "Defaults");
+        let key = index
+            .local_nominal_type(&ModuleScope::Root, ident("Defaults"))
+            .expect("aggregate key");
         let fields = index.aggregate_fields(&key).expect("aggregate fields");
         let default = fields
             .iter()
@@ -4982,6 +5319,72 @@ mod tests {
             .and_then(|(_, field)| field.default.as_ref())
             .expect("default");
         assert_eq!(default.expr_id, expected);
+    }
+
+    #[test]
+    fn promoted_surface_subset_reuses_processed_dependency() {
+        let mut index = checked_index(
+            "struct Base { hp: int } struct Holder { embed base: Base }",
+            &[],
+        );
+        let holder = index
+            .local_nominal_type(&ModuleScope::Root, ident("Holder"))
+            .expect("missing Holder");
+        let ids = HashSet::from([holder.id.clone()]);
+
+        let errors = index.build_promoted_surfaces(&ids, &ExternCatalog::default());
+
+        assert!(errors.is_empty());
+        assert!(
+            index
+                .aggregate(&holder)
+                .expect("missing Holder schema")
+                .promoted
+                .fields
+                .contains_key(&ident("hp"))
+        );
+    }
+
+    #[test]
+    fn nominal_processing_tracks_subsets_idempotently() {
+        let mut index = index("struct A {} enum B { Unit }", &[]);
+        let a = index
+            .local_nominal_type(&ModuleScope::Root, ident("A"))
+            .expect("missing A")
+            .id
+            .clone();
+        let b = index
+            .local_nominal_type(&ModuleScope::Root, ident("B"))
+            .expect("missing B")
+            .id
+            .clone();
+        let all = HashSet::from([a.clone(), b.clone()]);
+
+        index.mark_nominals_processed(&HashSet::from([a.clone()]));
+        assert!(index.nominal_processed(&a));
+        assert!(!index.nominal_processed(&b));
+        assert_eq!(
+            index.unprocessed_nominals(all.clone()),
+            HashSet::from([b.clone()])
+        );
+        index.mark_nominals_processed(&all);
+        assert!(index.nominal_processed(&b));
+        assert!(index.unprocessed_nominals(all).is_empty());
+
+        let index = checked_index("fn main() { struct Local {} let item = Local {}; }", &[]);
+        let local = index
+            .aggregates()
+            .find(|(key, _)| key.name == ident("Local"))
+            .expect("missing local nominal")
+            .0
+            .id
+            .clone();
+        assert!(index.nominal_processed(&local));
+        assert!(
+            index
+                .unprocessed_nominals(HashSet::from([local]))
+                .is_empty()
+        );
     }
 
     fn provider_index(root: &str, provider: ProviderDescriptor) -> DeclarationIndex {
@@ -5066,64 +5469,6 @@ mod tests {
     }
 
     #[test]
-    fn type_args_origin() {
-        let name = ident("Box");
-        let scope = ModuleScope::Named(ModulePath::new(vec!["tools".into()]).unwrap());
-        let ty = Type::UnresolvedNominal {
-            qualifier: None,
-            name,
-            generic_args: vec![GenericArg::Type(Type::Int)],
-        };
-        let index = index("", &[("tools", "pub struct Box<T> { value: T }")]);
-        let result = finalize_type(&index, &scope, &ty).unwrap();
-
-        assert_eq!(
-            result,
-            Type::nominal(
-                NominalKind::Struct,
-                name,
-                vec![Type::Int],
-                vec![],
-                Some(std::rc::Rc::new(["tools".into()])),
-            )
-        );
-    }
-
-    #[test]
-    fn nested_type_args() {
-        let wrapper = ident("Wrapper");
-        let inner = ident("Inner");
-        let scope = ModuleScope::Root;
-        let ty = Type::UnresolvedNominal {
-            qualifier: None,
-            name: wrapper,
-            generic_args: vec![GenericArg::Type(Type::UnresolvedName(inner))],
-        };
-        let index = index(
-            "struct Wrapper<T> { value: T } struct Inner { value: int }",
-            &[],
-        );
-        let result = finalize_type(&index, &scope, &ty).unwrap();
-
-        assert_eq!(
-            result,
-            Type::nominal(
-                NominalKind::Struct,
-                wrapper,
-                vec![Type::nominal(
-                    NominalKind::Struct,
-                    inner,
-                    vec![],
-                    vec![],
-                    None
-                )],
-                vec![],
-                None,
-            )
-        );
-    }
-
-    #[test]
     fn unresolved_qualifier() {
         let ty = Type::UnresolvedNominal {
             qualifier: Some(ident("gamekit")),
@@ -5167,9 +5512,10 @@ mod tests {
 
         let lookup =
             index.resolve_type_member(&ModuleScope::Root, Some(ident("shapes")), ident("Point"));
-        let ModuleMemberLookup::Found(TypeBinding::Nominal(key)) = lookup.result else {
+        let ModuleMemberLookup::Found(TypeBinding::Nominal(id)) = lookup.result else {
             panic!("missing qualified type");
         };
+        let key = index.nominal(&id).expect("missing nominal metadata");
 
         assert_eq!(key.module, scope("shapes"));
         assert_eq!(key.name, ident("Point"));
@@ -5184,58 +5530,6 @@ mod tests {
             index.resolve_type_member(&ModuleScope::Root, Some(ident("shapes")), ident("Point"));
 
         assert!(matches!(lookup.result, ModuleMemberLookup::Missing));
-    }
-
-    #[test]
-    fn key_for_type_uses_nominal_origin() {
-        let index = index(
-            "",
-            &[
-                ("alpha", "pub struct Point { x: int }"),
-                ("beta", "pub struct Point { y: int }"),
-            ],
-        );
-        let ty = Type::nominal(
-            NominalKind::Struct,
-            ident("Point"),
-            vec![],
-            vec![],
-            Some(std::rc::Rc::new(["alpha".into()])),
-        );
-
-        let key = index.key_for_type(&ty).expect("missing key");
-
-        assert_eq!(key.module, scope("alpha"));
-        assert_eq!(key.name, ident("Point"));
-        assert_eq!(key.kind, NominalKind::Struct);
-    }
-
-    #[test]
-    fn root_originless_nominal_key() {
-        let index = index("struct Point { x: int }", &[]);
-        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
-
-        let key = index.key_for_type(&ty).expect("missing key");
-
-        assert_eq!(key.module, ModuleScope::Root);
-        assert_eq!(key.name, ident("Point"));
-        assert_eq!(key.kind, NominalKind::Struct);
-    }
-
-    #[test]
-    fn imported_originless_no_guess() {
-        let index = index("", &[("alpha", "pub struct Point { x: int }")]);
-        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
-
-        assert!(index.key_for_type(&ty).is_none());
-    }
-
-    #[test]
-    fn key_for_type_rejects_kind_mismatch() {
-        let index = index("enum Point { A }", &[]);
-        let ty = Type::nominal(NominalKind::Struct, ident("Point"), vec![], vec![], None);
-
-        assert!(index.key_for_type(&ty).is_none());
     }
 
     #[test]
@@ -5412,10 +5706,11 @@ mod tests {
             }),
         );
         let host = provider_scope("host");
-        let ty = index
+        let id = index
             .imported_type_binding(&ModuleScope::Root, ident("Handle"))
-            .and_then(TypeBinding::into_nominal)
+            .and_then(|binding| binding.nominal().cloned())
             .expect("missing provider type import");
+        let ty = index.nominal(&id).expect("missing provider type metadata");
         let value = index
             .imported_value(&ModuleScope::Root, ident("load"))
             .expect("missing provider function import");
@@ -5541,13 +5836,7 @@ mod tests {
             .local_nominal_type(&ModuleScope::Root, ident("Box"))
             .unwrap();
         let aggregate = index.aggregate(&key).unwrap();
-        let receiver = Type::nominal(
-            NominalKind::Struct,
-            ident("Box"),
-            vec![Type::Int],
-            vec![],
-            None,
-        );
+        let receiver = nominal_type_with_args(&key, &[Type::Int], &[]);
         let static_method = aggregate
             .methods
             .get(&MethodKey::static_(ident("make")))
@@ -5558,12 +5847,14 @@ mod tests {
             .unwrap();
 
         let static_ref = index.callable_for_aggregate_static_method(
+            &key,
             aggregate,
             ident("make"),
             static_method,
             None,
         );
         let instance_ref = index.callable_for_aggregate_method(
+            &key,
             aggregate,
             ident("get"),
             instance_method,

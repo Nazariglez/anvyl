@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+fn value() -> int {
+    return make();
+
+    fn make() -> int { Node { choice: Choice.Done }.choice as int }
+    dataref Node { choice: Choice }
+    enum Choice: int { Done = 7 }
+}

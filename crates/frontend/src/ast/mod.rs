@@ -165,12 +165,21 @@ impl Display for ConstArg {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstExpr {
+    Value(ConstValue),
+    Param(ConstParamId),
+    Unary(UnaryOp, Box<ConstExpr>),
+    Binary(BinaryOp, Box<ConstExpr>, Box<ConstExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
     Fixed(usize),
     Infer,
     Named(Ident),
     Param(ConstParamId),
+    Expr(ConstExpr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -237,6 +246,17 @@ impl Display for FuncParam {
     }
 }
 
+impl Display for ConstExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => write!(f, "{value}"),
+            Self::Param(id) => write!(f, "{id}"),
+            Self::Unary(op, expr) => write!(f, "{op}{expr}"),
+            Self::Binary(op, left, right) => write!(f, "({left} {op} {right})"),
+        }
+    }
+}
+
 impl Display for ArrayLen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -244,6 +264,7 @@ impl Display for ArrayLen {
             ArrayLen::Infer => write!(f, "_"),
             ArrayLen::Named(ident) => write!(f, "{ident}"),
             ArrayLen::Param(id) => write!(f, "{id}"),
+            ArrayLen::Expr(expr) => write!(f, "{expr}"),
         }
     }
 }
@@ -301,13 +322,45 @@ impl ExtendTargetConstraint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct NominalType {
+    pub(crate) id: crate::semantic_id::NominalId,
     pub kind: NominalKind,
     pub name: Ident,
     pub type_args: Vec<Type>,
     pub const_args: Vec<ConstArg>,
     pub origin: Option<ModuleOrigin>,
+}
+
+impl NominalType {
+    pub(crate) fn with_args(&self, type_args: Vec<Type>, const_args: Vec<ConstArg>) -> Type {
+        Type::Nominal(Self {
+            id: self.id.clone(),
+            kind: self.kind,
+            name: self.name,
+            type_args,
+            const_args,
+            origin: self.origin.clone(),
+        })
+    }
+}
+
+impl PartialEq for NominalType {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.type_args == other.type_args
+            && self.const_args == other.const_args
+    }
+}
+
+impl Eq for NominalType {}
+
+impl std::hash::Hash for NominalType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.type_args.hash(state);
+        self.const_args.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -526,42 +579,6 @@ impl Type {
     #[inline]
     pub fn boxed(&self) -> Box<Self> {
         Box::new(self.clone())
-    }
-
-    pub fn nominal(
-        kind: NominalKind,
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModulePath>,
-    ) -> Type {
-        Self::nominal_with_origin(
-            kind,
-            name,
-            type_args,
-            const_args,
-            origin.map(ModuleOrigin::Module),
-        )
-    }
-
-    pub fn nominal_with_origin(
-        kind: NominalKind,
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModuleOrigin>,
-    ) -> Type {
-        if kind == NominalKind::Extern {
-            debug_assert!(type_args.is_empty());
-            debug_assert!(const_args.is_empty());
-        }
-        Type::Nominal(NominalType {
-            kind,
-            name,
-            type_args,
-            const_args,
-            origin,
-        })
     }
 
     pub fn as_nominal(&self) -> Option<&NominalType> {
@@ -1206,6 +1223,7 @@ pub struct MethodSig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Method {
+    pub span: Span,
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
     pub visibility: Visibility,
@@ -2046,7 +2064,17 @@ impl AggregateKind {
         const_args: Vec<ConstArg>,
         origin: Option<ModulePath>,
     ) -> Type {
-        Type::nominal(self.into(), name, type_args, const_args, origin)
+        debug_assert!(origin.is_none());
+        let generic_args = type_args
+            .into_iter()
+            .map(GenericArg::Type)
+            .chain(const_args.into_iter().map(GenericArg::Const))
+            .collect();
+        Type::UnresolvedNominal {
+            qualifier: None,
+            name,
+            generic_args,
+        }
     }
 }
 
@@ -2172,15 +2200,14 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        AggregateKind, ConstArg, ConstValue, Ident, ModuleOrigin, ModulePath, NominalKind,
-        NominalType, Type,
+        AggregateKind, ConstArg, ConstValue, Ident, ModuleOrigin, ModulePath, NominalKind, Type,
     };
 
     fn origin(name: &str) -> ModulePath {
         Rc::from(vec![name.to_string()].into_boxed_slice())
     }
 
-    fn nominal(kind: NominalKind, origin: Option<ModulePath>) -> Type {
+    fn nominal(site: usize, kind: NominalKind, origin: Option<ModulePath>) -> Type {
         let type_args = (kind != NominalKind::Extern)
             .then_some(Type::Int)
             .into_iter()
@@ -2189,60 +2216,72 @@ mod tests {
             .then_some(ConstArg::Value(ConstValue::Int(1)))
             .into_iter()
             .collect();
-        Type::nominal(kind, Ident::new("Foo"), type_args, const_args, origin)
+        crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            site,
+            kind,
+            Ident::new("Foo"),
+            type_args,
+            const_args,
+            origin.map(ModuleOrigin::Module),
+        )
     }
 
     #[test]
-    fn nominal_identity_distinguishes_kind_origin_args() {
-        let struct_a = nominal(NominalKind::Struct, Some(origin("a")));
-        let struct_b = nominal(NominalKind::Struct, Some(origin("b")));
-        let enum_a = nominal(NominalKind::Enum, Some(origin("a")));
-        let type_arg = Type::nominal(
+    fn nominal_identity_uses_id_and_args() {
+        let struct_a = nominal(1, NominalKind::Struct, Some(origin("a")));
+        let struct_b = nominal(2, NominalKind::Struct, Some(origin("b")));
+        let enum_a = nominal(1, NominalKind::Enum, Some(origin("a")));
+        let type_arg = crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            1,
             NominalKind::Struct,
             Ident::new("Foo"),
             vec![Type::Bool],
             vec![ConstArg::Value(ConstValue::Int(1))],
-            Some(origin("a")),
+            Some(ModuleOrigin::Module(origin("a"))),
         );
-        let const_arg = Type::nominal(
+        let const_arg = crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            1,
             NominalKind::Struct,
             Ident::new("Foo"),
             vec![Type::Int],
             vec![ConstArg::Value(ConstValue::Int(2))],
-            Some(origin("a")),
+            Some(ModuleOrigin::Module(origin("a"))),
         );
 
         assert_ne!(struct_a, struct_b);
-        assert_ne!(struct_a, enum_a);
+        assert_eq!(struct_a, enum_a);
         assert_ne!(struct_a, type_arg);
         assert_ne!(struct_a, const_arg);
     }
 
     #[test]
     fn as_nominal_preserves_identity() {
-        let ty = nominal(NominalKind::Struct, Some(origin("a")));
-        assert_eq!(
-            ty.as_nominal(),
-            Some(&NominalType {
-                kind: NominalKind::Struct,
-                name: Ident::new("Foo"),
-                type_args: vec![Type::Int],
-                const_args: vec![ConstArg::Value(ConstValue::Int(1))],
-                origin: Some(ModuleOrigin::Module(origin("a"))),
-            })
-        );
+        let ty = nominal(1, NominalKind::Struct, Some(origin("a")));
+        let nominal = ty.as_nominal().expect("expected nominal");
+        assert_eq!(nominal.kind, NominalKind::Struct);
+        assert_eq!(nominal.name, Ident::new("Foo"));
+        assert_eq!(nominal.type_args, [Type::Int]);
+        assert_eq!(nominal.const_args, [ConstArg::Value(ConstValue::Int(1))]);
+        assert_eq!(nominal.origin, Some(ModuleOrigin::Module(origin("a"))));
         assert!(Type::Int.as_nominal().is_none());
     }
 
     #[test]
     fn as_aggregate_filters_nominal_kinds() {
-        let ty = nominal(NominalKind::Struct, None);
+        let ty = nominal(1, NominalKind::Struct, None);
         let aggregate = ty.as_aggregate().expect("expected aggregate");
         assert_eq!(aggregate.kind, AggregateKind::Struct);
         assert_eq!(aggregate.type_args, [Type::Int]);
         assert_eq!(aggregate.const_args, [ConstArg::Value(ConstValue::Int(1))]);
 
-        assert!(nominal(NominalKind::Enum, None).as_aggregate().is_none());
-        assert!(nominal(NominalKind::Extern, None).as_aggregate().is_none());
+        assert!(nominal(2, NominalKind::Enum, None).as_aggregate().is_none());
+        assert!(
+            nominal(3, NominalKind::Extern, None)
+                .as_aggregate()
+                .is_none()
+        );
     }
 }

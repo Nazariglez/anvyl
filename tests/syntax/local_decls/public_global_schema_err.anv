@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: public runtime global type cannot contain a block-local declaration
+
+pub lazy let leaked = {
+    struct Hidden { value: int }
+    Hidden { value: 1 }
+};

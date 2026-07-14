@@ -12,6 +12,7 @@ use crate::{
     externs::catalog::ExternCatalog,
     lint::{LintEvent, LintId},
     resolve::PackageId,
+    source::SourceTable,
 };
 
 #[derive(Clone)]
@@ -26,6 +27,7 @@ pub(crate) struct SemanticProgram {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TypeDiagnosticContext {
     core_option: Option<NominalKey>,
+    sources: Option<SourceTable>,
 }
 
 impl TypeDiagnosticContext {
@@ -33,13 +35,26 @@ impl TypeDiagnosticContext {
         self.core_option.as_ref()
     }
 
+    pub(crate) fn sources(&self) -> Option<&SourceTable> {
+        self.sources.as_ref()
+    }
+
+    pub(crate) fn with_sources(mut self, sources: SourceTable) -> Self {
+        self.sources = Some(sources);
+        self
+    }
+
     pub(crate) fn from_core_option(core_option: Option<NominalKey>) -> Self {
-        Self { core_option }
+        Self {
+            core_option,
+            sources: None,
+        }
     }
 
     pub(crate) fn from_decls(decls: &DeclarationIndex) -> Self {
         Self {
             core_option: decls.core_option_key(),
+            sources: None,
         }
     }
 }

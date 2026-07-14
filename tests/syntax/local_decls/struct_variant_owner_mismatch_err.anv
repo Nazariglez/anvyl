@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+fn outer<T>(value: T) {
+    enum Local { Item { value: T } }
+    let item = Local.Item { value: 1 };
+}
+
+fn main() {
+    outer("text");
+}

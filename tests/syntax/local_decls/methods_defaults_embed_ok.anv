@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    struct Health {
+        hp: int = 10,
+        fn damage(self, amount: int = 3) -> int { self.hp - amount }
+    }
+    struct Enemy {
+        embed health: Health,
+        fn make() -> Self { Enemy { health: Health {} } }
+    }
+
+    let enemy = Enemy.make();
+    let remaining: int = enemy.damage();
+}

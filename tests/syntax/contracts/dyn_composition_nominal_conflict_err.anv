@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: conflicting contract requirement
+
+contract A {
+    fn draw(self);
+}
+
+contract B {
+    fn draw(self, layer: int);
+}
+
+struct Holder {
+    actor: dyn A + B,
+}

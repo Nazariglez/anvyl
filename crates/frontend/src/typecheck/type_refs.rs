@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::{
     ArityError, DeclError, DeprecatedUseKind, TypeChecker, TypeError,
     annotation::deprecated_lint,
+    body::CallableTemplateEnv,
     const_term::ConstTerm,
     contracts,
     decls::{
@@ -19,6 +20,7 @@ use crate::{
         AnonymousContractRequirement, ArrayLen, ConstArg, ConstParam, ConstParamId, ContractRef,
         GenericArg, Ident, ModuleOrigin, Type, TypeParam, TypeVarId, TypeVisitor,
     },
+    semantic_id::{NominalId, SourceDeclId},
     span::{SourceSpan, Span},
 };
 
@@ -195,6 +197,9 @@ pub(crate) enum TypeRefError {
         name: Ident,
         import: Option<Box<ImportId>>,
     },
+    NotContract {
+        name: Ident,
+    },
     DuplicateContractRequirement {
         name: Ident,
     },
@@ -236,6 +241,7 @@ impl TypeRefError {
             | Self::ExpectedIntConst { .. }
             | Self::AliasCycle { .. }
             | Self::ContractAsType { .. }
+            | Self::NotContract { .. }
             | Self::DuplicateContractRequirement { .. }
             | Self::ConflictingContractRequirement { .. }
             | Self::MissingCoreOption => None,
@@ -281,6 +287,10 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
             },
             span,
         },
+        TypeRefError::NotContract { name } => TypeError::CompileError {
+            message: format!("type '{name}' is not a contract"),
+            span,
+        },
         TypeRefError::DuplicateContractRequirement { name } => TypeError::CompileError {
             message: format!("duplicate contract requirement '{name}'"),
             span,
@@ -296,47 +306,73 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
     }
 }
 
-pub(crate) type LocalTypeAliasKey = Span;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LexicalTypeBinding {
+    Alias(SourceDeclId),
+    Nominal(NominalId),
+}
 
 #[derive(Clone)]
 pub(crate) struct LocalTypeAlias {
-    pub(crate) key: LocalTypeAliasKey,
+    pub(crate) key: SourceDeclId,
     pub(crate) def: TypeAliasDef,
     pub(crate) visible_depth: usize,
+    pub(super) env: Option<CallableTemplateEnv>,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct LocalTypeScopes {
-    scopes: Vec<HashMap<Ident, LocalTypeAlias>>,
+pub(crate) struct LexicalTypeScopes {
+    scopes: Vec<HashMap<Ident, LexicalTypeBinding>>,
+    aliases: HashMap<SourceDeclId, LocalTypeAlias>,
 }
 
-impl LocalTypeScopes {
+impl LexicalTypeScopes {
     pub(crate) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
     pub(crate) fn pop_scope(&mut self) {
-        self.scopes.pop();
+        let Some(scope) = self.scopes.pop() else {
+            return;
+        };
+        for binding in scope.into_values() {
+            if let LexicalTypeBinding::Alias(id) = binding {
+                self.aliases.remove(&id);
+            }
+        }
     }
 
     pub(crate) fn depth(&self) -> usize {
         self.scopes.len()
     }
 
-    pub(crate) fn insert(&mut self, alias: LocalTypeAlias) -> bool {
+    pub(crate) fn insert_alias(&mut self, alias: LocalTypeAlias) -> bool {
+        let name = alias.def.name;
+        if !self.insert_binding(name, LexicalTypeBinding::Alias(alias.key)) {
+            return false;
+        }
+        self.aliases.insert(alias.key, alias);
+        true
+    }
+
+    pub(crate) fn insert_nominal(&mut self, name: Ident, id: NominalId) -> bool {
+        self.insert_binding(name, LexicalTypeBinding::Nominal(id))
+    }
+
+    fn insert_binding(&mut self, name: Ident, binding: LexicalTypeBinding) -> bool {
         let Some(scope) = self.scopes.last_mut() else {
             return false;
         };
-        match scope.entry(alias.def.name) {
+        match scope.entry(name) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(alias);
+                entry.insert(binding);
                 true
             }
         }
     }
 
-    pub(crate) fn visible(&self, name: Ident, depth: Option<usize>) -> Option<&LocalTypeAlias> {
+    pub(crate) fn visible(&self, name: Ident, depth: Option<usize>) -> Option<&LexicalTypeBinding> {
         let depth = depth.unwrap_or(self.scopes.len()).min(self.scopes.len());
         self.scopes[..depth]
             .iter()
@@ -344,11 +380,12 @@ impl LocalTypeScopes {
             .find_map(|scope| scope.get(&name))
     }
 
-    pub(crate) fn by_key(&self, key: LocalTypeAliasKey) -> Option<&LocalTypeAlias> {
-        self.scopes
-            .iter()
-            .flat_map(|scope| scope.values())
-            .find(|alias| alias.key == key)
+    pub(crate) fn alias(&self, id: &SourceDeclId) -> Option<&LocalTypeAlias> {
+        self.aliases.get(id)
+    }
+
+    pub(crate) fn alias_mut(&mut self, id: &SourceDeclId) -> Option<&mut LocalTypeAlias> {
+        self.aliases.get_mut(id)
     }
 }
 
@@ -407,6 +444,33 @@ impl TypeChecker {
             Some(span),
         );
         self.finish_source_type_ref(result, span)
+    }
+
+    pub(super) fn finalize_lexical_decl_type(
+        &mut self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        ty: &Type,
+        span: Span,
+    ) -> Type {
+        let result = self
+            .type_ref_resolver()
+            .finalize_at(module, generics, ty, Some(span));
+        match result {
+            Ok(finalized) => {
+                self.used_imports.extend(finalized.used_imports);
+                self.push_type_ref_warnings(finalized.warnings);
+                let ty = self.reject_source_dyn_contracts(finalized.ty, span);
+                let ty = self.normalize_type_consts(&ty, span);
+                self.reject_user_any_type(&ty, span);
+                ty
+            }
+            Err(error) => {
+                self.mark_import_used(error.import().cloned());
+                self.push_error_once(type_ref_error(error, self.error_span(span)));
+                Type::Infer
+            }
+        }
     }
 
     pub(super) fn resolve_callable_param_type(
@@ -544,7 +608,10 @@ impl TypeChecker {
                     return;
                 };
                 let args = nominal_generic_args(ty).expect("nominal type");
-                self.validate_nominal_args(decls, &key, &generics, &args, span);
+                let Some((_, declaration_args)) = decls.split_nominal_args(&key, &args) else {
+                    return;
+                };
+                self.validate_nominal_args(decls, &key, &generics, &declaration_args, &args, span);
             }
             Type::Func { params, ret } => {
                 for param in params {
@@ -756,7 +823,7 @@ fn type_contains_raw_dyn_infer_func(ty: &Type) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AliasExpansionKey {
     Module(TypeAliasKey),
-    Local(LocalTypeAliasKey),
+    Local(SourceDeclId),
 }
 
 struct AliasRef<'a> {
@@ -767,7 +834,7 @@ struct AliasRef<'a> {
 
 pub(crate) struct TypeRefResolver<'a> {
     decls: &'a DeclarationIndex,
-    local_types: Option<&'a LocalTypeScopes>,
+    local_types: Option<&'a LexicalTypeScopes>,
 }
 
 #[derive(Default)]
@@ -849,7 +916,7 @@ impl<'a> TypeRefResolver<'a> {
 
     pub(crate) fn with_local_types(
         decls: &'a DeclarationIndex,
-        local_types: &'a LocalTypeScopes,
+        local_types: &'a LexicalTypeScopes,
     ) -> Self {
         Self {
             decls,
@@ -926,22 +993,7 @@ impl<'a> TypeRefResolver<'a> {
                     .iter()
                     .map(|arg| finalize_const_arg(generics, arg))
                     .collect::<Result<Vec<_>, _>>()?;
-                if nominal.origin.is_none()
-                    && let Some(key) = self
-                        .decls
-                        .visible_type_binding_with_import(module, nominal.name)
-                        .and_then(|(binding, _)| binding.into_nominal())
-                        .filter(|key| key.kind == nominal.kind)
-                {
-                    return Ok(nominal_type_with_args(&key, &type_args, &const_args));
-                }
-                Ok(Type::nominal_with_origin(
-                    nominal.kind,
-                    nominal.name,
-                    type_args,
-                    const_args,
-                    nominal.origin.clone(),
-                ))
+                Ok(nominal.with_args(type_args, const_args))
             }
             Type::List { elem } => Ok(Type::List {
                 elem: Box::new(self.finalize_inner(module, generics, elem, state)?),
@@ -951,7 +1003,7 @@ impl<'a> TypeRefResolver<'a> {
             }),
             Type::Array { elem, len } => Ok(Type::Array {
                 elem: Box::new(self.finalize_inner(module, generics, elem, state)?),
-                len: finalize_array_len(generics, *len)?,
+                len: finalize_array_len(generics, len.clone())?,
             }),
             Type::Map { key, value } => Ok(Type::Map {
                 key: Box::new(self.finalize_inner(module, generics, key, state)?),
@@ -993,9 +1045,8 @@ impl<'a> TypeRefResolver<'a> {
                 import: None,
             });
         }
-        if let Some(alias) = self.local_alias(name, state.local_depth) {
-            let alias_ref = Self::local_alias_ref(alias);
-            return self.expand_alias_ref(module, generics, &alias_ref, &[], state, name);
+        if let Some(binding) = self.lexical_binding(name, state.local_depth) {
+            return self.finalize_semantic_binding(module, generics, binding, &[], state, name);
         }
         let (binding, import) = self.resolve_type_binding(module, None, name)?;
         state.mark_import_used(import);
@@ -1024,10 +1075,16 @@ impl<'a> TypeRefResolver<'a> {
             }
         }
         if qualifier.is_none()
-            && let Some(alias) = self.local_alias(name, state.local_depth)
+            && let Some(binding) = self.lexical_binding(name, state.local_depth)
         {
-            let alias_ref = Self::local_alias_ref(alias);
-            return self.expand_alias_ref(module, generics, &alias_ref, generic_args, state, name);
+            return self.finalize_semantic_binding(
+                module,
+                generics,
+                binding,
+                generic_args,
+                state,
+                name,
+            );
         }
         let (binding, import) = self.resolve_type_binding(module, qualifier, name)?;
         state.mark_import_used(import);
@@ -1056,8 +1113,36 @@ impl<'a> TypeRefResolver<'a> {
         }
     }
 
-    fn local_alias(&self, name: Ident, depth: Option<usize>) -> Option<&LocalTypeAlias> {
-        self.local_types?.visible(name, depth)
+    fn lexical_binding(&self, name: Ident, depth: Option<usize>) -> Option<LexicalTypeBinding> {
+        self.local_types?.visible(name, depth).cloned()
+    }
+
+    fn finalize_semantic_binding(
+        &self,
+        module: &ModuleScope,
+        generics: &GenericTypeContext,
+        binding: LexicalTypeBinding,
+        args: &[GenericArg],
+        state: &mut FinalizeState,
+        use_name: Ident,
+    ) -> Result<Type, TypeRefError> {
+        match binding {
+            LexicalTypeBinding::Alias(id) => {
+                let alias = self
+                    .local_types
+                    .and_then(|types| types.alias(&id))
+                    .expect("lexical alias binding missing definition");
+                let alias_ref = Self::local_alias_ref(alias);
+                self.expand_alias_ref(module, generics, &alias_ref, args, state, use_name)
+            }
+            LexicalTypeBinding::Nominal(id) => {
+                let key = self
+                    .decls
+                    .nominal(&id)
+                    .expect("lexical nominal binding missing registry metadata");
+                self.finalize_nominal(module, generics, key, args, state)
+            }
+        }
     }
 
     fn local_alias_ref(alias: &LocalTypeAlias) -> AliasRef<'_> {
@@ -1143,7 +1228,14 @@ impl<'a> TypeRefResolver<'a> {
         use_name: Ident,
     ) -> Result<Type, TypeRefError> {
         match binding {
-            TypeBinding::Nominal(key) => self.finalize_nominal(module, generics, &key, args, state),
+            TypeBinding::Nominal(id) => self.finalize_semantic_binding(
+                module,
+                generics,
+                LexicalTypeBinding::Nominal(id),
+                args,
+                state,
+                use_name,
+            ),
             TypeBinding::Alias(key) => {
                 let alias_ref = self.module_alias_ref(&key)?;
                 self.expand_alias_ref(module, generics, &alias_ref, args, state, use_name)
@@ -1232,6 +1324,12 @@ impl<'a> TypeRefResolver<'a> {
                 name,
                 origin,
             } => {
+                if qualifier.is_none()
+                    && origin.is_none()
+                    && self.lexical_binding(*name, state.local_depth).is_some()
+                {
+                    return Err(TypeRefError::NotContract { name: *name });
+                }
                 let (key, import) = self.resolve_contract_name_with_import(
                     module,
                     *qualifier,
@@ -1364,9 +1462,23 @@ impl<'a> TypeRefResolver<'a> {
     ) -> Result<Type, TypeRefError> {
         let params = self.decls.nominal_generics(key).unwrap_or_default();
         let args = self.finalize_decl_generic_args_inner(module, generics, &params, args, state)?;
-        let const_args = ConstTerm::to_args_no_infer(&args.const_args)
-            .expect("type reference finalization does not create const inference terms");
-        Ok(nominal_type_with_args(key, &args.type_args, &const_args))
+        let owner = self.decls.nominal_owner_generics(key);
+        let mut type_args = owner
+            .type_params
+            .iter()
+            .map(|param| Type::Var(param.id))
+            .collect::<Vec<_>>();
+        type_args.extend(args.type_args);
+        let mut const_args = owner
+            .const_params
+            .iter()
+            .map(|param| ConstArg::Param(param.id))
+            .collect::<Vec<_>>();
+        const_args.extend(
+            ConstTerm::to_args_no_infer(&args.const_args)
+                .expect("type reference finalization does not create const inference terms"),
+        );
+        Ok(nominal_type_with_args(key, &type_args, &const_args))
     }
 
     fn finalize_decl_generic_args_inner(
@@ -1568,6 +1680,6 @@ fn finalize_array_len(
         ArrayLen::Named(name) => {
             Ok(finalize_const_name(generics, name)?.map_or(ArrayLen::Named(name), ArrayLen::Param))
         }
-        ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) => Ok(len),
+        ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Param(_) | ArrayLen::Expr(_) => Ok(len),
     }
 }

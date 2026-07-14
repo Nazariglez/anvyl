@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown method 'mark' for type 'Token'
+
+struct Token {}
+extend Token { fn mark() -> int { 1 } }
+
+fn main() {
+    struct Token {}
+    Token.mark();
+}

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: extend declarations are only allowed at module scope
+
+fn main() {
+    extend int { fn doubled(self) -> int { self * 2 } }
+}

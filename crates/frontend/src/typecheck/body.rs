@@ -4,16 +4,19 @@ use super::{
     BodyInstanceKey, CallableInstanceKey, CastFromInstanceKey, CheckedType, LocalBindingKind,
     LocalCallableInfo, LocalConstInfo, LocalDefKind, LocalSymbol, ReturnCandidate, ReturnFrame,
     ReturnMode, ScopeState, TypeChecker, TypeError, VarInfo, annotation, check_expr_checked,
-    check_expr_checked_with_hint, checked_void, const_eval, control_flow,
+    check_expr_checked_with_hint, checked_void, const_eval,
+    const_term::ConstTerm,
+    control_flow,
     decl_validate::{
         check_method_generic_shadows, has_generics, has_mutable_param, is_generic,
-        method_sig_is_generic, validate_return_spec, validate_type_alias_def,
+        method_sig_is_generic, validate_method_signature, validate_return_spec,
+        validate_type_alias_def,
     },
     decls::{
         AggregateSchema, CallableDef, CallableId, CallableKind, CallableRef, CallableSig,
         CastFromConversion, DeclError, ExtendId, MethodKey, MethodMode, ModuleScope, NominalKey,
-        ParamDefaultSite, TypeAliasDef, generic_params, nominal_type, required_param_count,
-        stmt_visibility,
+        NominalPlacement, ParamDefaultSite, TypeAliasDef, generic_params, nominal_type,
+        required_param_count, stmt_visibility,
     },
     defaults,
     dyn_infer::DynInference,
@@ -29,11 +32,12 @@ use super::{
 };
 use crate::{
     ast::{
-        AggregateDeclNode, BlockNode, CastFromNode, ConstValue, EnumPatternPayload, ExprKind,
-        ExprNode, ExtendDeclNode, Func, FuncNode, FuncParam, Ident, MethodReceiver, Mutability,
-        Param, Pattern, PatternNode, Program, ReturnAccess, ReturnSpec, Stmt, StmtNode, StructDecl,
-        Type, TypeAliasDeclNode, Visibility,
+        AggregateDeclNode, BlockNode, CastFromNode, ConstValue, EnumDeclNode, EnumPatternPayload,
+        ExprKind, ExprNode, ExtendDeclNode, Func, FuncNode, FuncParam, Ident, MethodReceiver,
+        Mutability, NominalKind, Param, Pattern, PatternNode, Program, ReturnAccess, ReturnSpec,
+        Stmt, StmtNode, StructDecl, Type, TypeAliasDeclNode, Visibility,
     },
+    semantic_id::{NominalId, SourceDeclId},
     span::Span,
 };
 
@@ -42,6 +46,8 @@ pub(super) enum CallableTemplateEnv {
     SourceModule,
     Local(ScopeState),
 }
+
+pub(super) type LocalNominalTemplate = (CallableTemplateEnv, GenericOwnerFrame);
 
 struct SourceFuncSig {
     owner_generics: GenericParams,
@@ -155,10 +161,12 @@ pub(super) fn collect_callable_templates(
             }
             Stmt::Aggregate(agg_node) => {
                 let agg = &agg_node.node;
-                let owner = NominalKey {
-                    module: module.clone(),
-                    kind: agg.kind.into(),
-                    name: agg.name,
+                let Some(owner) = tc
+                    .decls
+                    .source_nominal(tc.source_id(), agg_node.span)
+                    .cloned()
+                else {
+                    continue;
                 };
                 let owner_is_generic = has_generics(&agg.type_params, &agg.const_params);
                 let has_generic_method = agg
@@ -349,7 +357,7 @@ fn register_callable_dyn_infer_params(program: &Program, tc: &mut TypeChecker) {
                     .set_func_type(&module, func_node.node.name, &sig.surface_ty);
             }
             Stmt::Aggregate(agg_node) => {
-                register_aggregate_method_dyn_infer_params(agg_node, &module, exported, tc);
+                register_aggregate_method_dyn_infer_params(agg_node, exported, tc);
             }
             Stmt::Extend(extend_node) => {
                 let id = ExtendId {
@@ -366,15 +374,16 @@ fn register_callable_dyn_infer_params(program: &Program, tc: &mut TypeChecker) {
 
 fn register_aggregate_method_dyn_infer_params(
     agg_node: &AggregateDeclNode,
-    module: &ModuleScope,
     exported: bool,
     tc: &mut TypeChecker,
 ) {
     let agg = &agg_node.node;
-    let key = NominalKey {
-        module: module.clone(),
-        kind: agg.kind.into(),
-        name: agg.name,
+    let Some(key) = tc
+        .decls
+        .source_nominal(tc.source_id(), agg_node.span)
+        .cloned()
+    else {
+        return;
     };
     let owner_generics = tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
     for method in &agg.methods {
@@ -520,47 +529,166 @@ fn source_func_sig(func: &Func, span: Span, tc: &mut TypeChecker) -> SourceFuncS
     }
 }
 
-fn register_local_type_aliases(stmts: &[StmtNode], tc: &mut TypeChecker) {
+fn register_local_type_headers(stmts: &[StmtNode], tc: &mut TypeChecker) {
     for stmt in stmts {
-        let Stmt::TypeAlias(alias_node) = &stmt.node else {
-            continue;
-        };
-        let alias = &alias_node.node;
-        let owner = tc.generic_contexts.last().cloned().unwrap_or_default();
-        let generic_context = tc.extended_generic_context(
-            &owner,
-            &alias.type_params,
-            &alias.const_params,
-            alias_node.span,
-        );
-        let mut errors = vec![];
-        let policy = annotation::normalize_annotations(
-            tc.source_id(),
-            &alias.annotations,
-            annotation::AnnotationTarget::TypeAlias,
-            &mut errors,
-        );
-        tc.errors.extend(errors.into_iter().map(TypeError::Decl));
-        let local = LocalTypeAlias {
-            key: alias_node.span,
-            def: TypeAliasDef {
-                module: tc.current_module.clone(),
-                name: alias.name,
-                generics: generic_params(&alias.type_params, &alias.const_params),
-                generic_context,
-                aliased: alias.aliased.clone(),
-                policy,
-                span: tc.source_span(alias_node.span),
-            },
-            visible_depth: tc.local_type_scopes.depth(),
-        };
-        if !tc.local_type_scopes.insert(local) {
-            tc.push_error(TypeError::Decl(DeclError::DuplicateType {
-                module: tc.current_module.clone(),
-                name: alias.name,
-                span: tc.error_span(alias_node.span),
-            }));
+        match &stmt.node {
+            Stmt::TypeAlias(alias_node) => register_local_alias_header(alias_node, tc),
+            Stmt::Aggregate(aggregate) => register_local_nominal_header(
+                aggregate.node.name,
+                aggregate.node.kind.into(),
+                aggregate.span,
+                tc,
+            ),
+            Stmt::Enum(enm) => {
+                register_local_nominal_header(enm.node.name, NominalKind::Enum, enm.span, tc)
+            }
+            _ => {}
         }
+    }
+}
+
+fn register_local_alias_header(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
+    let alias = &alias_node.node;
+    let owner = tc.generic_contexts.last().cloned().unwrap_or_default();
+    let generic_context = tc.extended_generic_context(
+        &owner,
+        &alias.type_params,
+        &alias.const_params,
+        alias_node.span,
+    );
+    let mut errors = vec![];
+    let policy = annotation::normalize_annotations(
+        tc.source_id(),
+        &alias.annotations,
+        annotation::AnnotationTarget::TypeAlias,
+        &mut errors,
+    );
+    tc.errors.extend(errors.into_iter().map(TypeError::Decl));
+    let local = LocalTypeAlias {
+        key: SourceDeclId::new(tc.source_id(), alias_node.span),
+        def: TypeAliasDef {
+            module: tc.current_module.clone(),
+            name: alias.name,
+            generics: generic_params(&alias.type_params, &alias.const_params),
+            generic_context,
+            aliased: alias.aliased.clone(),
+            policy,
+            span: tc.source_span(alias_node.span),
+        },
+        visible_depth: tc.local_type_scopes.depth(),
+        env: None,
+    };
+    if local_type_name_conflicts(alias.name, tc) || !tc.local_type_scopes.insert_alias(local) {
+        push_duplicate_local_type(alias.name, alias_node.span, tc);
+    }
+}
+
+fn register_local_nominal_header(name: Ident, kind: NominalKind, span: Span, tc: &mut TypeChecker) {
+    let id = NominalId::Source(SourceDeclId::new(tc.source_id(), span));
+    if local_type_name_conflicts(name, tc) || !tc.local_type_scopes.insert_nominal(name, id.clone())
+    {
+        push_duplicate_local_type(name, span, tc);
+        return;
+    }
+    tc.decls
+        .register_lexical_nominal(tc.source_id(), span, tc.current_module.clone(), kind, name);
+}
+
+fn local_type_name_conflicts(name: Ident, tc: &TypeChecker) -> bool {
+    name == Ident::new(Type::OPTION_ENUM_NAME) && tc.decls.core_option_key().is_some()
+}
+
+fn push_duplicate_local_type(name: Ident, span: Span, tc: &mut TypeChecker) {
+    tc.push_error(TypeError::Decl(DeclError::DuplicateType {
+        module: tc.current_module.clone(),
+        name,
+        span: tc.error_span(span),
+    }));
+}
+
+fn stage_local_nominal_schemas(stmts: &[StmtNode], tc: &mut TypeChecker) {
+    for stmt in stmts {
+        match &stmt.node {
+            Stmt::Aggregate(node) => stage_local_aggregate_schema(node, tc),
+            Stmt::Enum(node) => stage_local_enum_schema(node, tc),
+            _ => {}
+        }
+    }
+}
+
+fn stage_local_aggregate_schema(node: &AggregateDeclNode, tc: &mut TypeChecker) {
+    let Some(key) = tc.decls.source_nominal(tc.source_id(), node.span).cloned() else {
+        return;
+    };
+    if tc.decls.aggregate(&key).is_some() {
+        return;
+    }
+    let owner = tc.visible_generic_owner();
+    let context = tc.extended_generic_context(
+        &owner.generics,
+        &node.node.type_params,
+        &node.node.const_params,
+        node.span,
+    );
+    let error_start = tc.decls.errors().len();
+    let schema =
+        tc.decls
+            .build_aggregate_schema_for_key(tc.source_id(), &key, node, owner.params, context);
+    tc.decls.install_aggregate_schema(&key, node.span, schema);
+    push_local_schema_errors(error_start, tc);
+}
+
+fn stage_local_enum_schema(node: &EnumDeclNode, tc: &mut TypeChecker) {
+    let Some(key) = tc.decls.source_nominal(tc.source_id(), node.span).cloned() else {
+        return;
+    };
+    if tc.decls.enum_schema(&key).is_some() {
+        return;
+    }
+    let owner = tc.visible_generic_owner();
+    let context = tc.extended_generic_context(
+        &owner.generics,
+        &node.node.type_params,
+        &node.node.const_params,
+        node.span,
+    );
+    let error_start = tc.decls.errors().len();
+    let (schema, pending) =
+        tc.decls
+            .build_enum_schema_for_key(tc.source_id(), &key, node, owner.params, context);
+    tc.decls
+        .install_enum_schema(&key, node.span, schema, pending);
+    push_local_schema_errors(error_start, tc);
+}
+
+fn push_local_schema_errors(start: usize, tc: &mut TypeChecker) {
+    let errors = tc.decls.take_errors_from(start);
+    tc.errors.extend(errors.into_iter().map(TypeError::Decl));
+}
+
+fn capture_local_alias_env(
+    node: &TypeAliasDeclNode,
+    env: CallableTemplateEnv,
+    tc: &mut TypeChecker,
+) {
+    let id = SourceDeclId::new(tc.source_id(), node.span);
+    let Some(alias) = tc.local_type_scopes.alias(&id).cloned() else {
+        return;
+    };
+    let module = tc.current_module.clone();
+    let aliased = with_callable_body_env(&module, &env, tc, |tc| {
+        let saved_type_substs = std::mem::take(&mut tc.type_substs);
+        let saved_const_substs = std::mem::take(&mut tc.const_substs);
+        tc.push_generic_context(alias.def.generic_context.clone());
+        let aliased = tc.resolve_type_for_tc_at(&alias.def.aliased, node.span);
+        tc.pop_generic_context();
+        tc.type_substs = saved_type_substs;
+        tc.const_substs = saved_const_substs;
+        aliased
+    });
+    if let Some(alias) = tc.local_type_scopes.alias_mut(&id) {
+        alias.def.aliased = aliased;
+        alias.env = Some(env);
     }
 }
 
@@ -570,40 +698,79 @@ pub(super) fn register_block_declarations(
 ) -> Vec<Option<LocalConstInfo>> {
     let mut declarations = vec![None; stmts.len()];
     let mut funcs = vec![];
-    register_local_type_aliases(stmts, tc);
+    register_local_type_headers(stmts, tc);
+    stage_local_nominal_schemas(stmts, tc);
     let mut sig_env = tc.scopes.clone();
     add_callable_decl_placeholders(stmts, &mut sig_env, tc);
+    let mut declaration_envs = vec![None; stmts.len()];
     for (index, stmt) in stmts.iter().enumerate() {
         match &stmt.node {
-            Stmt::Func(func_node) => {
-                let func = &func_node.node;
-                let module = tc.current_module.clone();
-                let env = CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone()));
-                let sig = with_callable_body_env(&module, &env, tc, |tc| {
-                    source_func_sig(func, func_node.span, tc)
-                });
-                let id = CallableId::local_function(
-                    tc.current_module.clone(),
-                    func.name,
-                    func_node.span,
-                );
-                funcs.push(LocalFuncDecl {
-                    id,
-                    sig,
-                    func: func_node,
-                });
-            }
             Stmt::Const(const_node) => {
-                let info = tc.declare_local_const(
-                    const_node,
-                    CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone())),
-                );
+                let env = CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone()));
+                let info = tc.declare_local_const(const_node, env.clone());
                 add_env_symbol(const_node.node.name, info.symbol(), &mut sig_env);
                 declarations[index] = Some(info);
+                declaration_envs[index] = Some(env);
+            }
+            Stmt::TypeAlias(alias) => {
+                let env = CallableTemplateEnv::Local(tc.scope_state_from(sig_env.clone()));
+                capture_local_alias_env(alias, env.clone(), tc);
+                declaration_envs[index] = Some(env);
+            }
+            Stmt::Func(_) | Stmt::Aggregate(_) | Stmt::Enum(_) => {
+                declaration_envs[index] = Some(CallableTemplateEnv::Local(
+                    tc.scope_state_from(sig_env.clone()),
+                ));
             }
             _ => add_stmt_capture_blockers(&stmt.node, &mut sig_env, tc),
         }
     }
+
+    for declaration_env in declaration_envs.iter_mut().flatten() {
+        let CallableTemplateEnv::Local(state) = declaration_env else {
+            unreachable!("block declaration environment is lexical");
+        };
+        state.local_type_scopes = tc.local_type_scopes.clone();
+    }
+
+    let mut nominal_envs = HashMap::new();
+    for (stmt, declaration_env) in stmts.iter().zip(declaration_envs) {
+        let Some(declaration_env) = declaration_env else {
+            continue;
+        };
+        let nominal_span = match &stmt.node {
+            Stmt::Aggregate(node) => Some(node.span),
+            Stmt::Enum(node) => Some(node.span),
+            _ => None,
+        };
+        if let Some(span) = nominal_span {
+            let Some(key) = tc.decls.source_nominal(tc.source_id(), span).cloned() else {
+                continue;
+            };
+            nominal_envs.insert(key.id, (declaration_env, tc.visible_generic_owner()));
+            continue;
+        }
+        let Stmt::Func(func_node) = &stmt.node else {
+            continue;
+        };
+        let func = &func_node.node;
+        let module = tc.current_module.clone();
+        let sig = with_callable_body_env(&module, &declaration_env, tc, |tc| {
+            source_func_sig(func, func_node.span, tc)
+        });
+        let id = CallableId::local_function(
+            tc.current_module.clone(),
+            func.name,
+            SourceDeclId::new(tc.source_id(), func_node.span),
+        );
+        funcs.push(LocalFuncDecl {
+            id,
+            sig,
+            func: func_node,
+        });
+    }
+
+    tc.finalize_nominals(nominal_envs.keys().cloned().collect(), &nominal_envs);
 
     for decl in &funcs {
         let func = &decl.func.node;
@@ -635,6 +802,18 @@ pub(super) fn register_block_declarations(
                 check_local_func_defaults(&decl, env.clone(), tc);
                 store_local_callable_template(decl, env.clone(), tc);
             }
+            Stmt::Aggregate(node) => {
+                let Some(key) = tc.decls.source_nominal(tc.source_id(), node.span).cloned() else {
+                    continue;
+                };
+                let Some(schema) = tc.decls.aggregate(&key).cloned() else {
+                    continue;
+                };
+                let owner = tc.visible_generic_owner();
+                let env = CallableTemplateEnv::Local(tc.scope_state_from(env.clone()));
+                check_local_aggregate_decl(node, &key, &schema, &env, &owner.args, tc);
+            }
+            Stmt::Enum(_) => {}
             Stmt::Const(const_node) => {
                 let Some(info) = local_const else {
                     continue;
@@ -684,7 +863,11 @@ fn add_callable_decl_placeholders(
             continue;
         };
         let func = &func_node.node;
-        let id = CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+        let id = CallableId::local_function(
+            tc.current_module.clone(),
+            func.name,
+            SourceDeclId::new(tc.source_id(), func_node.span),
+        );
         let callee = CallableRef {
             def: CallableDef {
                 id,
@@ -829,14 +1012,23 @@ fn add_pattern_capture_blockers(
 
 fn check_aggregate_decl(agg_node: &AggregateDeclNode, tc: &mut TypeChecker) {
     let agg = &agg_node.node;
-    let key = NominalKey {
-        module: tc.current_module.clone(),
-        kind: agg.kind.into(),
-        name: agg.name,
+    let Some(key) = tc
+        .decls
+        .source_nominal(tc.source_id(), agg_node.span)
+        .cloned()
+    else {
+        debug_assert!(tc.errors.iter().any(|error| matches!(
+            error,
+            TypeError::Decl(DeclError::DuplicateType { name, .. }) if *name == agg.name
+        )));
+        return;
     };
     let Some(schema) = tc.decls.aggregate(&key).cloned() else {
         return;
     };
+    if matches!(key.placement, NominalPlacement::Lexical) {
+        return;
+    }
 
     if agg.fields.iter().any(|field| field.default.is_some()) {
         let generics = tc.generic_context(&agg.type_params, &agg.const_params, agg_node.span);
@@ -844,7 +1036,7 @@ fn check_aggregate_decl(agg_node: &AggregateDeclNode, tc: &mut TypeChecker) {
             &agg.fields,
             &schema.fields,
             GenericOwnerFrame {
-                params: schema.generics.clone(),
+                params: schema.all_generics(),
                 args: GenericArgs::default(),
                 generics,
             },
@@ -853,6 +1045,119 @@ fn check_aggregate_decl(agg_node: &AggregateDeclNode, tc: &mut TypeChecker) {
     }
     check_method_generic_shadows(agg, agg_node.span, tc);
     check_aggregate_method_bodies(agg, agg_node.span, &key, &schema, tc);
+}
+
+fn check_local_aggregate_decl(
+    node: &AggregateDeclNode,
+    key: &NominalKey,
+    schema: &AggregateSchema,
+    env: &CallableTemplateEnv,
+    owner_args: &GenericArgs,
+    tc: &mut TypeChecker,
+) {
+    let module = key.module.clone();
+    with_callable_body_env(&module, env, tc, |tc| {
+        let args = local_nominal_template_args(schema, owner_args);
+        if node.node.fields.iter().any(|field| field.default.is_some()) {
+            defaults::check_aggregate_field_defaults(
+                &node.node.fields,
+                &schema.fields,
+                GenericOwnerFrame {
+                    params: schema.all_generics(),
+                    args: args.clone(),
+                    generics: schema.generic_context.clone(),
+                },
+                tc,
+            );
+        }
+        check_method_generic_shadows(&node.node, node.span, tc);
+        check_local_method_defaults_and_templates(node, key, schema, &args, owner_args, env, tc);
+        if schema.all_generics().is_empty() {
+            check_aggregate_method_bodies(&node.node, node.span, key, schema, tc);
+        }
+    });
+}
+
+fn local_nominal_template_args(schema: &AggregateSchema, owner: &GenericArgs) -> GenericArgs {
+    let mut args = owner.clone();
+    args.type_args.extend(
+        schema
+            .generics
+            .type_params
+            .iter()
+            .map(|param| Type::Var(param.id)),
+    );
+    args.const_args.extend(
+        schema
+            .generics
+            .const_params
+            .iter()
+            .map(|param| ConstTerm::Param(param.id)),
+    );
+    args
+}
+
+fn check_local_method_defaults_and_templates(
+    node: &AggregateDeclNode,
+    key: &NominalKey,
+    schema: &AggregateSchema,
+    owner_args: &GenericArgs,
+    template_owner_args: &GenericArgs,
+    env: &CallableTemplateEnv,
+    tc: &mut TypeChecker,
+) {
+    let owner_generics = schema.all_generics();
+    for method in &node.node.methods {
+        validate_method_signature(!owner_generics.is_empty(), &method.sig, method.span, tc);
+        let mode = MethodMode::from_receiver(method.sig.receiver);
+        let Some(method_schema) = schema
+            .methods
+            .get(&MethodKey::new(method.sig.name, mode.surface()))
+        else {
+            continue;
+        };
+        let generics = tc.extended_generic_context(
+            &schema.generic_context,
+            &method.sig.type_params,
+            &method.sig.const_params,
+            node.span,
+        );
+        defaults::check_param_defaults_in_decl_scope(
+            &method.sig.params,
+            &method_schema.params,
+            mode.receiver().is_some(),
+            GenericOwnerFrame {
+                params: defaults::combine_params(
+                    owner_generics.clone(),
+                    method_schema.generics.clone(),
+                ),
+                args: owner_args.clone(),
+                generics: generics.clone(),
+            },
+            tc,
+        );
+        let needs_template = !owner_generics.is_empty()
+            || !method_schema.generics.is_empty()
+            || method_schema.ret.is_infer();
+        if !needs_template {
+            continue;
+        }
+        let id = CallableId::aggregate_method(key.clone(), method.sig.name, mode.surface());
+        tc.store_local_callable_template(
+            id,
+            template_owner_args.clone(),
+            CallableTemplate {
+                span: node.span,
+                mode,
+                generics,
+                env: env.clone(),
+                params: method.sig.params.clone(),
+                ret: method.sig.ret.clone(),
+                ret_span: node.span,
+                body: method.body.clone(),
+            },
+        );
+    }
 }
 
 pub(super) fn check_module_bodies(module: &ModuleScope, program: &Program, tc: &mut TypeChecker) {
@@ -869,8 +1174,11 @@ fn check_stmt(stmt: &StmtNode, local_const: Option<LocalConstInfo>, tc: &mut Typ
     match &stmt.node {
         Stmt::Func(func_node) => {
             let func = &func_node.node;
-            let id =
-                CallableId::local_function(tc.current_module.clone(), func.name, func_node.span);
+            let id = CallableId::local_function(
+                tc.current_module.clone(),
+                func.name,
+                SourceDeclId::new(tc.source_id(), func_node.span),
+            );
             let local = tc.local_callable(&id);
             if is_generic(func) && local.is_none() {
                 return;
@@ -959,7 +1267,11 @@ fn callable_body_key(target: CallableId, args: GenericArgs) -> BodyInstanceKey {
 fn check_func(func_node: &FuncNode, tc: &mut TypeChecker) {
     let func = &func_node.node;
     let id = if tc.scopes.len() > 1 {
-        CallableId::local_function(tc.current_module.clone(), func.name, func_node.span)
+        CallableId::local_function(
+            tc.current_module.clone(),
+            func.name,
+            SourceDeclId::new(tc.source_id(), func_node.span),
+        )
     } else {
         CallableId::function(tc.current_module.clone(), func.name)
     };
@@ -1074,7 +1386,7 @@ fn check_aggregate_method_bodies(
     schema: &AggregateSchema,
     tc: &mut TypeChecker,
 ) {
-    if !schema.generics.is_empty() {
+    if !schema.all_generics().is_empty() {
         return;
     }
 
@@ -1133,12 +1445,21 @@ pub(super) fn check_block_checked_with_hint(
 }
 
 fn check_type_alias(alias_node: &TypeAliasDeclNode, tc: &mut TypeChecker) {
-    let Some(local) = tc.local_type_scopes.by_key(alias_node.span).cloned() else {
+    let id = SourceDeclId::new(tc.source_id(), alias_node.span);
+    let Some(local) = tc.local_type_scopes.alias(&id).cloned() else {
         return;
     };
-    tc.push_generic_context(local.def.generic_context.clone());
-    let aliased = tc.resolve_type_for_tc_at(&local.def.aliased, alias_node.span);
-    tc.pop_generic_context();
+    let env = local
+        .env
+        .clone()
+        .expect("local type alias missing declaration environment");
+    let module = local.def.module.clone();
+    let aliased = with_callable_body_env(&module, &env, tc, |tc| {
+        tc.push_generic_context(local.def.generic_context.clone());
+        let aliased = tc.resolve_type_for_tc_at(&local.def.aliased, alias_node.span);
+        tc.pop_generic_context();
+        aliased
+    });
     validate_type_alias_def(&local.def, &aliased, &mut tc.errors);
 }
 
@@ -1432,10 +1753,13 @@ pub(super) fn callable_template_returns_iter_plan_syntax(
     callee: &CallableRef,
     tc: &mut TypeChecker,
 ) -> bool {
-    let Some((env, expr)) = tc.callable_template(&callee.def.id).and_then(|template| {
-        callable_template_terminal_expr(&template.body)
-            .map(|expr| (template.env.clone(), expr.clone()))
-    }) else {
+    let Some((env, expr)) = tc
+        .callable_template_for(&callee.def.id, &callee.owner_args)
+        .and_then(|template| {
+            callable_template_terminal_expr(&template.body)
+                .map(|expr| (template.env.clone(), expr.clone()))
+        })
+    else {
         return false;
     };
     with_callable_body_env(&callee.def.id.module, &env, tc, |tc| {
@@ -1617,7 +1941,7 @@ pub(super) fn check_specialized_callable_body(
         return None;
     }
 
-    let template = tc.callable_template(&callee.def.id).cloned()?;
+    let template = tc.callable_template_for(&callee.def.id, args).cloned()?;
     let inferred = template.ret.is_infer();
     let key = specialization_key(callee.def.id.clone(), args);
     match tc.specialization(&key).cloned() {

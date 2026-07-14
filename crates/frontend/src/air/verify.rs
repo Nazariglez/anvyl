@@ -160,6 +160,23 @@ pub enum BadType {
         first: TypeId,
         duplicate: TypeId,
     },
+    MissingAggregate(AggregateId),
+    DuplicateAggregate {
+        aggregate: AggregateId,
+        first: TypeId,
+        duplicate: TypeId,
+    },
+    AggregateKindMismatch {
+        aggregate: AggregateId,
+        declared: AggregateKind,
+        represented: AggregateKind,
+    },
+    MissingEnum(EnumId),
+    DuplicateEnum {
+        enm: EnumId,
+        first: TypeId,
+        duplicate: TypeId,
+    },
     Recursive(TypeId),
 }
 
@@ -175,7 +192,6 @@ pub enum BadEnum {
     AdtHasRawType,
     RawMissingRawType,
     RawTypeMismatch(TypeId),
-    RawGeneric,
     AdtVariantHasRawValue(VariantId),
     RawVariantMissingValue(VariantId),
     RawVariantPayload(VariantId),
@@ -1328,6 +1344,7 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
         let ty = TypeId::from_index(id);
         cx.verify_type_ref(VerifySite::Type(ty), ty);
     }
+    verify_nominal_type_identity(cx);
 
     for (id, _) in cx.program.modules.iter().enumerate() {
         verify_module(cx, ModuleId::from_index(id));
@@ -1366,6 +1383,76 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     }
     for (id, _) in cx.program.functions.iter().enumerate() {
         verify_function(cx, FunctionId::from_index(id));
+    }
+}
+
+fn verify_nominal_type_identity(cx: &mut VerifyCx<'_>) {
+    let mut aggregates = std::collections::HashMap::new();
+    let mut enums = std::collections::HashMap::new();
+    for (index, ty) in cx.program.type_arena.iter().enumerate() {
+        let current = TypeId::from_index(index);
+        match ty {
+            TypeData::Aggregate(aggregate) | TypeData::DataRef(aggregate) => {
+                let represented = match ty {
+                    TypeData::Aggregate(_) => AggregateKind::Struct,
+                    TypeData::DataRef(_) => AggregateKind::DataRef,
+                    _ => unreachable!(),
+                };
+                if let Some(decl) = cx.program.aggregates.get(aggregate.index())
+                    && decl.kind != represented
+                {
+                    cx.push(
+                        VerifySite::Type(current),
+                        VerifyErrorKind::BadType(BadType::AggregateKindMismatch {
+                            aggregate: *aggregate,
+                            declared: decl.kind,
+                            represented,
+                        }),
+                    );
+                }
+                if let Some(first) = aggregates.insert(*aggregate, current) {
+                    cx.push(
+                        VerifySite::Type(current),
+                        VerifyErrorKind::BadType(BadType::DuplicateAggregate {
+                            aggregate: *aggregate,
+                            first,
+                            duplicate: current,
+                        }),
+                    );
+                }
+            }
+            TypeData::Enum(enm) => {
+                if let Some(first) = enums.insert(*enm, current) {
+                    cx.push(
+                        VerifySite::Type(current),
+                        VerifyErrorKind::BadType(BadType::DuplicateEnum {
+                            enm: *enm,
+                            first,
+                            duplicate: current,
+                        }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    for index in 0..cx.program.aggregates.len() {
+        let aggregate = AggregateId::from_index(index);
+        if !aggregates.contains_key(&aggregate) {
+            cx.push(
+                VerifySite::Program,
+                VerifyErrorKind::BadType(BadType::MissingAggregate(aggregate)),
+            );
+        }
+    }
+    for index in 0..cx.program.enums.len() {
+        let enm = EnumId::from_index(index);
+        if !enums.contains_key(&enm) {
+            cx.push(
+                VerifySite::Program,
+                VerifyErrorKind::BadType(BadType::MissingEnum(enm)),
+            );
+        }
     }
 }
 
@@ -3098,9 +3185,6 @@ fn verify_enum(cx: &mut VerifyCx<'_>, id: EnumId) {
         ),
         EnumRepr::Adt => {}
         EnumRepr::RawInt | EnumRepr::RawString => {
-            if !enm.type_args.is_empty() || !enm.const_args.is_empty() {
-                cx.push(site.clone(), VerifyErrorKind::BadEnum(BadEnum::RawGeneric));
-            }
             let Some(raw_type) = enm.raw_type else {
                 cx.push(
                     site.clone(),

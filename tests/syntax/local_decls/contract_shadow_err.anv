@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: type 'Tagged' is not a contract
+
+contract Tagged {
+    fn tag(self) -> int;
+}
+
+fn main() {
+    struct Tagged { value: int }
+    let tagged: dyn Tagged = Tagged { value: 1 };
+}

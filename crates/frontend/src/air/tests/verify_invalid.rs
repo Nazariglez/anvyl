@@ -13,7 +13,7 @@ use crate::{
         ContractSurfaceDecl, ContractSurfaceId, ContractWeakeningDecl, ContractWitnessDecl,
         ContractWitnessKey, ContractWitnessSlotDecl, ContractWitnessTarget, ExternBindingDecl,
         ExternStaticDecl, ExternTypeId, FunctionSpecialization, FunctionValueCapability,
-        GlobalInitEffect,
+        GlobalInitEffect, Module,
     },
     ast::Ident,
 };
@@ -4211,6 +4211,115 @@ fn duplicate_primitive_type_is_invalid() {
     let duplicate = builder.alloc_type(TypeData::Int);
     let errors = verify(&builder.finish()).unwrap_err();
     assert!(errors.iter().any(|e| matches!(e.kind, EK::BadType(BadType::DuplicatePrimitive { kind: PrimitiveKind::Int, first: a, duplicate: b }) if a == first && b == duplicate)));
+}
+
+#[test]
+fn missing_nominal_type_identity_is_invalid() {
+    let mut program = Program::default();
+    let module = program.alloc_module(Module::default());
+    let aggregate = program.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Missing"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+
+    let errors = verify(&program).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.kind == EK::BadType(BadType::MissingAggregate(aggregate)) })
+    );
+}
+
+#[test]
+fn duplicate_nominal_type_identity_is_invalid() {
+    let mut program = Program::default();
+    let module = program.alloc_module(Module::default());
+    let aggregate = program.alloc_aggregate(AggregateDecl {
+        name: Ident::new("Duplicate"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    let first = program.alloc_type(TypeData::Aggregate(aggregate));
+    let duplicate = program.alloc_type(TypeData::Aggregate(aggregate));
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadType(BadType::DuplicateAggregate {
+            aggregate: found,
+            first: a,
+            duplicate: b,
+        }) if found == aggregate && a == first && b == duplicate
+    )));
+}
+
+#[test]
+fn struct_represented_as_dataref_is_invalid() {
+    let mut program = Program::default();
+    let module = program.alloc_module(Module::default());
+    let aggregate = program.alloc_aggregate(AggregateDecl {
+        name: Ident::new("WrongStruct"),
+        module,
+        kind: AggregateKind::Struct,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: false,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::DataRef(aggregate));
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadType(BadType::AggregateKindMismatch {
+            aggregate: found,
+            declared: AggregateKind::Struct,
+            represented: AggregateKind::DataRef,
+        }) if found == aggregate
+    )));
+}
+
+#[test]
+fn dataref_represented_as_struct_is_invalid() {
+    let mut program = Program::default();
+    let module = program.alloc_module(Module::default());
+    let aggregate = program.alloc_aggregate(AggregateDecl {
+        name: Ident::new("WrongDataRef"),
+        module,
+        kind: AggregateKind::DataRef,
+        type_args: vec![],
+        const_args: vec![],
+        fields: vec![],
+        cycle_capable: true,
+        stringify_override: None,
+    });
+    program.module_mut(module).aggregates.push(aggregate);
+    program.alloc_type(TypeData::Aggregate(aggregate));
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadType(BadType::AggregateKindMismatch {
+            aggregate: found,
+            declared: AggregateKind::DataRef,
+            represented: AggregateKind::Struct,
+        }) if found == aggregate
+    )));
 }
 
 #[test]

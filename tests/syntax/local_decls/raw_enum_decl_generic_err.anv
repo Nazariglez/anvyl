@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: raw enum 'Code' cannot be generic
+
+fn main() {
+    enum Code<T>: int { Value = 7 }
+}

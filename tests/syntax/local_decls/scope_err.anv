@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown type 'Hidden'
+
+fn define() {
+    struct Hidden { value: int }
+}
+
+fn use_hidden(value: Hidden) {}

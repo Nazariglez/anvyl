@@ -27,10 +27,7 @@ use self::{
         check_stmts, collect_callable_templates, register_declarations,
     },
     closure::{ClosureClassifier, ClosureScopeState, FunctionFlowMode},
-    decl_validate::{
-        check_finite_size_cycles, check_infer_return_decls, generic_param_type_error,
-        method_sig_is_generic,
-    },
+    decl_validate::{check_infer_return_decls, generic_param_type_error, method_sig_is_generic},
     defaults::{check_decl_param_defaults, check_decl_param_order},
     dyn_infer::DynInference,
     infer::{Solver, SolverFinalizeError, SolverRelationError, SourceExprTypes, TypeHandle},
@@ -43,7 +40,7 @@ use self::{
     place::{AliasAltGroupId, PlaceAccess, PlaceIdentity, PlaceRoot, PlaceUseFacts, check_place},
     postfix::{PostfixStep, check_map_key, check_postfix_chain, collect_postfix_chain},
     type_ops::{contains_borrowed_slice_view, type_contains_dyn_value},
-    type_refs::LocalTypeScopes,
+    type_refs::{LexicalTypeBinding, LexicalTypeScopes},
 };
 use crate::{
     ast::*,
@@ -57,7 +54,9 @@ use crate::{
     },
     lint::LintEvent,
     resolve::ResolveResult,
+    semantic_id::SourceDeclId,
     source::SourceId,
+    source_ast::{SourceAstIndex, SourceCallableSite, SourceDecl},
     span::{SourceSpan, Span},
 };
 
@@ -164,7 +163,10 @@ pub(crate) struct CompileWarning {
 }
 
 pub(crate) enum ResolvedNominal<'a> {
-    Aggregate(&'a AggregateSchema),
+    Aggregate {
+        key: NominalKey,
+        schema: &'a AggregateSchema,
+    },
     Enum {
         key: NominalKey,
         schema: &'a EnumSchema,
@@ -178,7 +180,7 @@ pub(crate) enum ResolvedNominal<'a> {
 impl<'a> ResolvedNominal<'a> {
     pub(crate) fn key(&self) -> &NominalKey {
         match self {
-            Self::Aggregate(schema) => &schema.key,
+            Self::Aggregate { key, .. } => key,
             Self::Enum { key, .. } => key,
             Self::Extern { ty, .. } => &ty.nominal,
         }
@@ -191,7 +193,7 @@ impl<'a> ResolvedNominal<'a> {
     pub(crate) fn variants(&self) -> Option<&'a NamedSchemas<VariantSchema>> {
         match self {
             Self::Enum { schema, .. } => Some(&schema.variants),
-            Self::Aggregate(_) | Self::Extern { .. } => None,
+            Self::Aggregate { .. } | Self::Extern { .. } => None,
         }
     }
 }
@@ -1269,7 +1271,6 @@ struct LocalValue {
 struct SourceModuleFactsInput {
     scope: ModuleScope,
     source: SourceId,
-    program: Rc<Program>,
 }
 
 struct SemanticMethodLikeInput<'a> {
@@ -1278,6 +1279,7 @@ struct SemanticMethodLikeInput<'a> {
     source_params: &'a [Param],
     body_span: Span,
     span: Span,
+    site: SourceCallableSite,
     callable: &'a CallableRef,
     args: GenericArgs,
     param_types: Vec<FuncParam>,
@@ -1375,7 +1377,7 @@ struct ReturnFrame {
 #[derive(Clone)]
 struct ScopeState {
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
-    local_type_scopes: LocalTypeScopes,
+    local_type_scopes: LexicalTypeScopes,
     closure: ClosureScopeState,
     active_collection_loans: Vec<collection_loan::ActiveCollectionLoan>,
 }
@@ -1405,7 +1407,7 @@ struct TypeChecker {
     externs: ExternCatalog,
     promoted_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
     scopes: Vec<HashMap<Ident, LocalSymbol>>,
-    local_type_scopes: LocalTypeScopes,
+    local_type_scopes: LexicalTypeScopes,
     named_function_frames: Vec<NamedFunctionFrame>,
     returns: Vec<ReturnFrame>,
     loop_depth: usize,
@@ -1430,9 +1432,11 @@ struct TypeChecker {
     local_def_bodies: HashMap<SemanticLocalId, BodyInstanceKey>,
     local_callables: HashMap<CallableId, LocalCallableInfo>,
     callable_templates: HashMap<CallableId, CallableTemplate>,
+    local_callable_templates: HashMap<(CallableId, GenericArgs), CallableTemplate>,
     specializations: HashMap<CallableInstanceKey, SpecializationState>,
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
     local_consts: Vec<const_eval::LocalConstEntry>,
+    default_fact_bodies: HashMap<DefaultExprSite, Vec<BodyInstanceKey>>,
     next_alias_alt_group: u32,
     next_binding_id: u32,
 }
@@ -1455,7 +1459,7 @@ impl TypeChecker {
             externs,
             promoted_surfaces: HashMap::new(),
             scopes: vec![],
-            local_type_scopes: LocalTypeScopes::default(),
+            local_type_scopes: LexicalTypeScopes::default(),
             named_function_frames: vec![],
             returns: vec![],
             loop_depth: 0,
@@ -1480,9 +1484,11 @@ impl TypeChecker {
             local_def_bodies: HashMap::new(),
             local_callables: HashMap::new(),
             callable_templates: HashMap::new(),
+            local_callable_templates: HashMap::new(),
             specializations: HashMap::new(),
             consts: HashMap::new(),
             local_consts: vec![],
+            default_fact_bodies: HashMap::new(),
             next_alias_alt_group: 0,
             next_binding_id: 0,
         }
@@ -1593,13 +1599,15 @@ impl TypeChecker {
                 key.target.parent.is_none() && matches!(key.target.kind, CallableKind::Function)
                     || matches!(
                         (&key.target.parent, key.target.kind),
-                        (
-                            Some(CallableParent::Nominal(_)),
-                            CallableKind::InstanceMethod | CallableKind::StaticMethod,
-                        ) | (
-                            Some(CallableParent::Extend(_)),
-                            CallableKind::ExtendMethod(_),
-                        )
+                        (Some(CallableParent::Local(_)), CallableKind::Function)
+                            | (
+                                Some(CallableParent::Nominal(_)),
+                                CallableKind::InstanceMethod | CallableKind::StaticMethod,
+                            )
+                            | (
+                                Some(CallableParent::Extend(_)),
+                                CallableKind::ExtendMethod(_),
+                            )
                     )
             }
             BodyInstanceKey::Module(_) => false,
@@ -2370,6 +2378,75 @@ impl TypeChecker {
         self.semantic_facts.record_function_value_call(site, fact);
     }
 
+    pub(super) fn register_default_facts_body(&mut self, expr: &ExprNode) {
+        let site = DefaultExprSite {
+            expr: expr.node.id,
+            source: self.source_id(),
+        };
+        let body = self.current_body();
+        let bodies = self.default_fact_bodies.entry(site).or_default();
+        if !bodies.contains(&body) {
+            bodies.push(body);
+        }
+    }
+
+    fn default_facts_body(
+        &self,
+        site: DefaultExprSite,
+        callee: &CallableInstanceKey,
+    ) -> BodyInstanceKey {
+        let local = match &callee.target.parent {
+            Some(CallableParent::Local(_)) => true,
+            Some(CallableParent::Nominal(id)) => self
+                .decls
+                .nominal(id)
+                .is_some_and(|key| matches!(key.placement, NominalPlacement::Lexical)),
+            Some(CallableParent::Extend(_)) | None => false,
+        };
+        if !local {
+            return BodyInstanceKey::Module(callee.target.module.clone());
+        }
+        self.default_facts_body_for_args(site, &callee.args)
+            .expect("local callable default missing declaration body")
+    }
+
+    fn default_facts_body_for_args(
+        &self,
+        site: DefaultExprSite,
+        target: &GenericArgs,
+    ) -> Option<BodyInstanceKey> {
+        self.default_fact_bodies.get(&site).and_then(|bodies| {
+            bodies
+                .iter()
+                .filter(|body| {
+                    let args = match body {
+                        BodyInstanceKey::Callable(owner) => Some(&owner.args),
+                        BodyInstanceKey::Lambda(lambda) => Some(&lambda.specialization),
+                        BodyInstanceKey::Module(_)
+                        | BodyInstanceKey::Global(_)
+                        | BodyInstanceKey::CastFrom(_) => None,
+                    };
+                    args.is_none_or(|args| {
+                        target.type_args.starts_with(&args.type_args)
+                            && target.const_args.starts_with(&args.const_args)
+                    })
+                })
+                .max_by_key(|body| match body {
+                    BodyInstanceKey::Callable(owner) => {
+                        owner.args.type_args.len() + owner.args.const_args.len()
+                    }
+                    BodyInstanceKey::Lambda(lambda) => {
+                        lambda.specialization.type_args.len()
+                            + lambda.specialization.const_args.len()
+                    }
+                    BodyInstanceKey::Module(_)
+                    | BodyInstanceKey::Global(_)
+                    | BodyInstanceKey::CastFrom(_) => 0,
+                })
+                .cloned()
+        })
+    }
+
     pub(super) fn record_default_args(
         &mut self,
         call: ExprId,
@@ -2390,16 +2467,19 @@ impl TypeChecker {
             let Some(site) = default_sites.get(index).copied().flatten() else {
                 continue;
             };
+            let default = DefaultExprSite {
+                expr: site.expr_id,
+                source: site.source,
+            };
+            let facts_body = self.default_facts_body(default, &callee);
             self.semantic_facts.record_default_arg(
                 body.clone(),
                 DefaultArgFact {
                     call,
                     callee: callee.clone(),
                     param_index: index,
-                    default: DefaultExprSite {
-                        expr: site.expr_id,
-                        source: site.source,
-                    },
+                    default,
+                    facts_body,
                     ty: param.ty.clone(),
                 },
             );
@@ -2416,6 +2496,21 @@ impl TypeChecker {
         default: &FieldDefault,
         ty: Type,
     ) {
+        let default = DefaultExprSite {
+            expr: default.expr_id,
+            source: default.span.source(),
+        };
+        let facts_body = match owner_key.placement {
+            NominalPlacement::Module | NominalPlacement::External => {
+                BodyInstanceKey::Module(owner_key.module.clone())
+            }
+            NominalPlacement::Lexical => {
+                let args = nominal_generic_args(&owner)
+                    .expect("local field default owner must be nominal");
+                self.default_facts_body_for_args(default, &args)
+                    .expect("local field default missing declaration body")
+            }
+        };
         self.semantic_facts.record_default_field(
             self.current_body(),
             DefaultFieldFact {
@@ -2424,10 +2519,8 @@ impl TypeChecker {
                 owner_key,
                 field,
                 slot,
-                default: DefaultExprSite {
-                    expr: default.expr_id,
-                    source: default.span.source(),
-                },
+                default,
+                facts_body,
                 ty,
             },
         );
@@ -2462,6 +2555,9 @@ impl TypeChecker {
     }
 
     fn record_contract_witness(&mut self, key: ContractWitnessKey, span: Span) -> WitnessId {
+        for slot in &key.slots {
+            self.ensure_witness_callable_specialization(&key.concrete_ty, &slot.target, span);
+        }
         let origins = key
             .slots
             .iter()
@@ -2480,6 +2576,58 @@ impl TypeChecker {
         }
         self.semantic_facts
             .record_contract_witness(key, self.source_span(span))
+    }
+
+    fn ensure_witness_callable_specialization(
+        &mut self,
+        receiver_ty: &Type,
+        target: &WitnessSlotTarget,
+        span: Span,
+    ) {
+        let WitnessSlotTarget::Direct {
+            callable,
+            owner_args,
+            receiver_mode,
+        } = target
+        else {
+            if let WitnessSlotTarget::Promoted {
+                origin_owner,
+                target,
+                ..
+            } = target
+            {
+                self.ensure_witness_callable_specialization(origin_owner, target, span);
+            }
+            return;
+        };
+        if owner_args.is_empty() {
+            return;
+        }
+        let Some(CallableParent::Nominal(owner_id)) = &callable.parent else {
+            return;
+        };
+        let Some(owner) = self.decls.nominal(owner_id).cloned() else {
+            return;
+        };
+        let Some(schema) = self.decls.aggregate(&owner).cloned() else {
+            return;
+        };
+        let Some(method) = schema
+            .methods
+            .get(&MethodKey::new(callable.name, receiver_mode.surface()))
+            .cloned()
+        else {
+            return;
+        };
+        let callee = self.decls.callable_for_aggregate_method(
+            &owner,
+            &schema,
+            callable.name,
+            &method,
+            receiver_ty.clone(),
+        );
+        debug_assert_eq!(callee.def.id, *callable);
+        self.ensure_aggregate_method_specialization(&callee, &method, owner_args, span);
     }
 
     fn record_dyn_conversion_at(
@@ -2621,7 +2769,7 @@ impl TypeChecker {
     fn extern_type_id(&self, ty: &Type) -> Option<ExternTypeId> {
         match self.resolve_nominal(ty)? {
             ResolvedNominal::Extern { id, .. } => Some(id),
-            ResolvedNominal::Aggregate(_) | ResolvedNominal::Enum { .. } => None,
+            ResolvedNominal::Aggregate { .. } | ResolvedNominal::Enum { .. } => None,
         }
     }
 
@@ -2639,9 +2787,10 @@ impl TypeChecker {
             });
         }
         match key.kind {
-            NominalKind::Struct | NominalKind::DataRef => {
-                self.decls.aggregate(&key).map(ResolvedNominal::Aggregate)
-            }
+            NominalKind::Struct | NominalKind::DataRef => self
+                .decls
+                .aggregate(&key)
+                .map(|schema| ResolvedNominal::Aggregate { key, schema }),
             NominalKind::Enum => self
                 .decls
                 .enum_schema(&key)
@@ -2927,16 +3076,43 @@ impl TypeChecker {
         if let Some(ty) = self.substituted_type_param(name) {
             return Some(ty);
         }
-        if self.local_type_scopes.visible(name, None).is_some() {
-            let ty = self.resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
-            return (!matches!(ty, Type::Infer)).then_some(ty);
+        if let Some(binding) = self.local_type_scopes.visible(name, None).cloned() {
+            return match binding {
+                LexicalTypeBinding::Nominal(id) => {
+                    let key = self.decls.nominal(&id)?.clone();
+                    let (type_len, const_len) = match key.kind {
+                        NominalKind::Struct | NominalKind::DataRef => {
+                            let generics = &self.decls.aggregate(&key)?.owner_generics;
+                            (generics.type_params.len(), generics.const_params.len())
+                        }
+                        NominalKind::Enum => {
+                            let generics = &self.decls.enum_schema(&key)?.owner_generics;
+                            (generics.type_params.len(), generics.const_params.len())
+                        }
+                        NominalKind::Extern => (0, 0),
+                    };
+                    let owner = self.visible_generic_owner();
+                    let const_args =
+                        ConstTerm::to_args_no_infer(owner.args.const_args.get(..const_len)?)?;
+                    Some(nominal_type_with_args(
+                        &key,
+                        owner.args.type_args.get(..type_len)?,
+                        &const_args,
+                    ))
+                }
+                LexicalTypeBinding::Alias(_) => {
+                    let ty = self.resolve_type_for_tc_at(&Type::UnresolvedName(name), span);
+                    (!matches!(ty, Type::Infer)).then_some(ty)
+                }
+            };
         }
         let (binding, import) = self
             .decls
             .visible_type_binding_with_import(&self.current_module, name)?;
         self.mark_import_used(import);
         match binding {
-            TypeBinding::Nominal(key) => {
+            TypeBinding::Nominal(id) => {
+                let key = self.decls.nominal(&id)?.clone();
                 self.warn_extern_type_deprecated(&key, span);
                 Some(nominal_type(&key))
             }
@@ -2985,122 +3161,166 @@ impl TypeChecker {
             .collect()
     }
 
-    fn build_semantic_declarations(&self) -> SemanticDeclarations {
+    fn build_semantic_declarations(&self, source_index: &SourceAstIndex) -> SemanticDeclarations {
         let mut facts = SemanticDeclarations::default();
         for module in &self.source_modules {
             facts.modules.push(SemanticModuleFact {
                 module: module.scope.clone(),
                 source: module.source,
             });
+        }
 
-            for stmt in &module.program.stmts {
-                match &stmt.node {
-                    Stmt::Func(func_node) => {
-                        let func = &func_node.node;
-                        let id = CallableId::function(module.scope.clone(), func.name);
-                        let value = self
-                            .decls
-                            .local_value(&module.scope, func.name)
-                            .expect("source function missing declaration");
-                        let callable = self
-                            .decls
-                            .callable_for_value(&value)
-                            .expect("source function declaration is not callable");
-                        assert_eq!(callable.def.id, id);
-                        assert!(callable.def.sig.owner_generics.is_empty());
-                        assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
-                        assert_eq!(func.params.len(), callable.def.sig.params.len());
-                        let instances = self.callable_fact_instances(
-                            &id,
-                            !callable.def.sig.generics.is_empty(),
-                            &callable.def.sig.params,
-                            &callable.def.sig.ret,
-                        );
-                        for (args, params, return_ty) in instances {
-                            facts.functions.push(Self::semantic_function_fact(
-                                module, func_node, &callable, args, params, return_ty,
-                            ));
-                        }
-                    }
-                    Stmt::Extend(extend_node) => {
-                        self.push_extend_method_facts(module, extend_node, &mut facts);
-                    }
-                    Stmt::Aggregate(agg_node) => {
-                        let agg = &agg_node.node;
-                        let owner = NominalKey {
-                            module: module.scope.clone(),
-                            kind: agg.kind.into(),
-                            name: agg.name,
-                        };
-                        let Some(schema) = self.decls.aggregate(&owner) else {
-                            continue;
-                        };
-                        for method in &agg.methods {
-                            let mode = MethodMode::from_receiver(method.sig.receiver);
-                            let Some(method_schema) = schema
-                                .methods
-                                .get(&MethodKey::new(method.sig.name, mode.surface()))
-                            else {
-                                continue;
-                            };
-                            let id = CallableId::aggregate_method(
-                                owner.clone(),
-                                method.sig.name,
-                                mode.surface(),
-                            );
-                            let instances = self.callable_fact_instances(
-                                &id,
-                                !schema.generics.is_empty() || method_sig_is_generic(&method.sig),
-                                &method_schema.params,
-                                &method_schema.ret,
-                            );
-                            for (args, params, return_ty) in instances {
-                                let owner_const_args = ConstTerm::to_args_no_infer(
-                                    &args.const_args[..schema.generics.const_params.len()],
-                                )
-                                .expect("generic method instance has unresolved owner const args");
-                                let self_ty = nominal_type_with_args(
-                                    &owner,
-                                    &args.type_args[..schema.generics.type_params.len()],
-                                    &owner_const_args,
-                                );
-                                let callable = match mode {
-                                    MethodMode::Instance { .. } => {
-                                        self.decls.callable_for_aggregate_method(
-                                            schema,
-                                            method.sig.name,
-                                            method_schema,
-                                            self_ty.clone(),
-                                        )
-                                    }
-                                    MethodMode::Static => {
-                                        self.decls.callable_for_aggregate_static_method(
-                                            schema,
-                                            method.sig.name,
-                                            method_schema,
-                                            Some(&self_ty),
-                                        )
-                                    }
-                                };
-                                debug_assert_eq!(callable.def.id, id);
-                                facts.functions.push(Self::semantic_method_fact(
-                                    module,
-                                    method,
-                                    agg_node.span,
-                                    &callable,
-                                    args,
-                                    params,
-                                    return_ty,
-                                ));
-                            }
-                        }
-                    }
-                    _ => {}
+        for (site, module_index, decl) in source_index.declarations() {
+            let module = &self.source_modules[module_index];
+            match decl {
+                SourceDecl::Function(func_node) => {
+                    self.push_source_function_facts(
+                        &site,
+                        source_index.is_module_declaration(&site),
+                        module,
+                        func_node,
+                        &mut facts,
+                    );
+                }
+                SourceDecl::Aggregate(agg_node) => {
+                    self.push_aggregate_method_facts(module, agg_node, &mut facts);
+                }
+                SourceDecl::Extend(extend_node) => {
+                    self.push_extend_method_facts(module, extend_node, &mut facts);
+                }
+                SourceDecl::Enum(enm) => {
+                    debug_assert_eq!(enm.span, site.span());
                 }
             }
         }
+        debug_assert!(
+            facts
+                .functions
+                .iter()
+                .all(|fact| source_index.callable(&fact.site).is_some())
+        );
         facts.validate();
         facts
+    }
+
+    fn push_source_function_facts(
+        &self,
+        site: &SourceDeclId,
+        module_declaration: bool,
+        module: &SourceModuleFactsInput,
+        func_node: &FuncNode,
+        facts: &mut SemanticDeclarations,
+    ) {
+        let func = &func_node.node;
+        let callable = if module_declaration {
+            let id = CallableId::function(module.scope.clone(), func.name);
+            let Some(value) = self.decls.local_value(&module.scope, func.name) else {
+                return;
+            };
+            let Some(callable) = self.decls.callable_for_value(&value) else {
+                return;
+            };
+            debug_assert_eq!(callable.def.id, id);
+            callable
+        } else {
+            let id = CallableId::local_function(module.scope.clone(), func.name, site.clone());
+            let Some(local) = self.local_callables.get(&id) else {
+                return;
+            };
+            local.callee.clone()
+        };
+        debug_assert!(callable.def.sig.required_params <= callable.def.sig.params.len());
+        debug_assert_eq!(func.params.len(), callable.def.sig.params.len());
+        let id = &callable.def.id;
+        let instances = self.callable_fact_instances(
+            id,
+            !callable.def.sig.owner_generics.is_empty() || !callable.def.sig.generics.is_empty(),
+            &callable.def.sig.params,
+            &callable.def.sig.ret,
+        );
+        for (args, params, return_ty) in instances {
+            facts.functions.push(Self::semantic_function_fact(
+                module, func_node, &callable, args, params, return_ty,
+            ));
+        }
+    }
+
+    fn push_aggregate_method_facts(
+        &self,
+        module: &SourceModuleFactsInput,
+        agg_node: &AggregateDeclNode,
+        facts: &mut SemanticDeclarations,
+    ) {
+        let agg = &agg_node.node;
+        let Some(owner) = self
+            .decls
+            .source_nominal(module.source, agg_node.span)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(schema) = self.decls.aggregate(&owner) else {
+            return;
+        };
+        let owner_site = SourceDeclId::new(module.source, agg_node.span);
+        let owner_generics = schema.all_generics();
+        for method in &agg.methods {
+            let mode = MethodMode::from_receiver(method.sig.receiver);
+            let Some(method_schema) = schema
+                .methods
+                .get(&MethodKey::new(method.sig.name, mode.surface()))
+            else {
+                continue;
+            };
+            let id = CallableId::aggregate_method(owner.clone(), method.sig.name, mode.surface());
+            let instances = self.callable_fact_instances(
+                &id,
+                !owner_generics.is_empty() || method_sig_is_generic(&method.sig),
+                &method_schema.params,
+                &method_schema.ret,
+            );
+            for (args, params, return_ty) in instances {
+                let owner_const_args = ConstTerm::to_args_no_infer(
+                    &args.const_args[..owner_generics.const_params.len()],
+                )
+                .expect("generic method instance has unresolved owner const args");
+                let self_ty = nominal_type_with_args(
+                    &owner,
+                    &args.type_args[..owner_generics.type_params.len()],
+                    &owner_const_args,
+                );
+                let callable = match mode {
+                    MethodMode::Instance { .. } => self.decls.callable_for_aggregate_method(
+                        &owner,
+                        schema,
+                        method.sig.name,
+                        method_schema,
+                        self_ty.clone(),
+                    ),
+                    MethodMode::Static => self.decls.callable_for_aggregate_static_method(
+                        &owner,
+                        schema,
+                        method.sig.name,
+                        method_schema,
+                        Some(&self_ty),
+                    ),
+                };
+                debug_assert_eq!(callable.def.id, id);
+                facts.functions.push(Self::semantic_method_fact(
+                    module,
+                    method,
+                    method.span,
+                    SourceCallableSite::AggregateMethod {
+                        owner: owner_site,
+                        method: SourceDeclId::new(module.source, method.span),
+                    },
+                    &callable,
+                    args,
+                    params,
+                    return_ty,
+                ));
+            }
+        }
     }
 
     fn callable_fact_instances(
@@ -3196,6 +3416,10 @@ impl TypeChecker {
                     module,
                     method,
                     method_node.span,
+                    SourceCallableSite::ExtendMethod {
+                        owner: SourceDeclId::new(module.source, extend_node.span),
+                        method: SourceDeclId::new(module.source, method_node.span),
+                    },
                     &callable,
                     args,
                     params,
@@ -3232,6 +3456,7 @@ impl TypeChecker {
             args,
             func.name,
             func_node.span,
+            SourceCallableSite::Function(SourceDeclId::new(module.source, func_node.span)),
             func.body.span,
             params,
             ret,
@@ -3242,6 +3467,7 @@ impl TypeChecker {
         module: &SourceModuleFactsInput,
         method: &Method,
         span: Span,
+        site: SourceCallableSite,
         callable: &CallableRef,
         args: GenericArgs,
         param_types: Vec<FuncParam>,
@@ -3255,6 +3481,7 @@ impl TypeChecker {
                 source_params: &method.sig.params,
                 body_span: method.body.span,
                 span,
+                site,
                 callable,
                 args,
                 param_types,
@@ -3267,6 +3494,7 @@ impl TypeChecker {
         module: &SourceModuleFactsInput,
         method: &ExtendMethod,
         span: Span,
+        site: SourceCallableSite,
         callable: &CallableRef,
         args: GenericArgs,
         param_types: Vec<FuncParam>,
@@ -3280,6 +3508,7 @@ impl TypeChecker {
                 source_params: &method.sig.params,
                 body_span: method.body.span,
                 span,
+                site,
                 callable,
                 args,
                 param_types,
@@ -3321,6 +3550,7 @@ impl TypeChecker {
             input.args,
             input.name,
             input.span,
+            input.site,
             input.body_span,
             params,
             input.ret,
@@ -3333,6 +3563,7 @@ impl TypeChecker {
         args: GenericArgs,
         name: Ident,
         span: Span,
+        site: SourceCallableSite,
         body_span: Span,
         params: Vec<SemanticParamSigFact>,
         ret: ReturnSpec,
@@ -3342,6 +3573,7 @@ impl TypeChecker {
             args: args.clone(),
         });
         SemanticFunctionInstanceFact {
+            site,
             id: callable.def.id.clone(),
             args,
             body,
@@ -3355,7 +3587,7 @@ impl TypeChecker {
         }
     }
 
-    fn finish(&mut self) -> Option<SemanticCheckOutput> {
+    fn finish(&mut self, source_index: &SourceAstIndex) -> Option<SemanticCheckOutput> {
         self.solve_constraints();
         self.solve_dyn_inference();
         let escape_events = self.closure.take_escape_events();
@@ -3409,7 +3641,7 @@ impl TypeChecker {
         facts.import_records = self.decls.import_records().to_vec();
         facts.used_imports.clone_from(self.decls.used_imports());
         facts.used_imports.extend(self.used_imports.clone());
-        let declaration_facts = self.build_semantic_declarations();
+        let declaration_facts = self.build_semantic_declarations(source_index);
         let contract_surfaces = ContractSurfaceSchemas::build(
             &self.decls,
             &self.dyn_infer,
@@ -3440,8 +3672,11 @@ impl TypeChecker {
         })
     }
 
-    fn into_semantic_result(mut self) -> Result<SemanticCheckOutput, TypecheckFailure> {
-        let semantic = self.finish();
+    fn into_semantic_result(
+        mut self,
+        source_index: &SourceAstIndex,
+    ) -> Result<SemanticCheckOutput, TypecheckFailure> {
+        let semantic = self.finish(source_index);
         let errors = std::mem::take(&mut self.errors);
         let warnings = std::mem::take(&mut self.warnings);
         let lint_events = std::mem::take(&mut self.lint_events);
@@ -3590,8 +3825,9 @@ impl TypeChecker {
             }
 
             let mut added = false;
+            let generics = aggregate.all_generics();
             for field in aggregate.fields.values() {
-                let field_ty = substitute_aggregate_member(ty, &aggregate.generics, &field.ty);
+                let field_ty = substitute_aggregate_member(ty, &generics, &field.ty);
                 added |= self.ensure_type_stringify_override_specializations(&field_ty, seen);
             }
             return added;
@@ -3601,9 +3837,10 @@ impl TypeChecker {
             return false;
         };
         let mut added = false;
+        let generics = schema.all_generics();
         for variant in schema.variants.values() {
             variant.payload.for_each_type(|payload_ty| {
-                let payload_ty = substitute_aggregate_member(ty, &schema.generics, payload_ty);
+                let payload_ty = substitute_aggregate_member(ty, &generics, payload_ty);
                 added |= self.ensure_type_stringify_override_specializations(&payload_ty, seen);
             });
         }
@@ -3622,12 +3859,33 @@ impl TypeChecker {
         if args.is_empty() {
             return false;
         }
+        let Some(owner) = self.decls.key_for_type(ty) else {
+            return false;
+        };
         let callable = self.decls.callable_for_aggregate_method(
+            &owner,
             aggregate,
             Ident::new("to_string"),
             method,
             ty.clone(),
         );
+        let owner_generics = aggregate.all_generics();
+        debug_assert_eq!(args.type_args.len(), owner_generics.type_params.len());
+        debug_assert_eq!(args.const_args.len(), owner_generics.const_params.len());
+        let span = self.decls.type_span(&owner).unwrap_or_default();
+        self.ensure_aggregate_method_specialization(&callable, method, &args, span)
+    }
+
+    fn ensure_aggregate_method_specialization(
+        &mut self,
+        callable: &CallableRef,
+        method: &MethodSchema,
+        args: &GenericArgs,
+        span: Span,
+    ) -> bool {
+        if args.is_empty() {
+            return false;
+        }
         let key = CallableInstanceKey {
             target: callable.def.id.clone(),
             args: args.clone(),
@@ -3636,21 +3894,32 @@ impl TypeChecker {
             return false;
         }
         debug_assert!(method.generics.is_empty());
-        debug_assert_eq!(args.type_args.len(), aggregate.generics.type_params.len());
-        debug_assert_eq!(args.const_args.len(), aggregate.generics.const_params.len());
-        let generics = combined_callable_params(&callable);
-        let (type_subst, const_subst) = generics.substitutions(&args);
+        let generics = combined_callable_params(callable);
+        let (type_subst, const_subst) = generics.substitutions(args);
+        let concrete_params = method
+            .params
+            .iter()
+            .map(|param| {
+                param.map_ty(|ty| self.substitute_checked(ty, &type_subst, &const_subst, span))
+            })
+            .collect::<Vec<_>>();
+        let ret = method.ret.with_ty(self.substitute_checked(
+            &method.ret.ty(),
+            &type_subst,
+            &const_subst,
+            span,
+        ));
         let const_bindings = callable_const_bindings(
             &callable.def.sig.owner_generics,
-            &args,
+            args,
             &callable.def.sig.generics,
             &GenericArgs::default(),
         );
         check_specialized_callable_body(
-            &callable,
-            &[],
-            &method.ret,
-            &args,
+            callable,
+            &concrete_params,
+            &ret,
+            args,
             type_subst,
             const_subst,
             &const_bindings,
@@ -3728,32 +3997,36 @@ impl TypeChecker {
         decls: &DeclarationIndex,
         key: &NominalKey,
         generics: &GenericParams,
-        args: &GenericArgs,
+        declaration_args: &GenericArgs,
+        all_args: &GenericArgs,
         span: Span,
     ) {
         let error_count = self.errors.len();
-        for term in &args.const_args {
+        for term in &all_args.const_args {
             self.require_usize_const(term.clone(), span, false);
         }
         if self.errors.len() != error_count {
             return;
         }
-        if !self.check_generic_bounds(generics, args, span) {
+        if !self.check_generic_bounds(generics, declaration_args, span) {
             return;
         }
-        let (type_subst, const_subst) = generics.substitutions(args);
+        if matches!(key.placement, NominalPlacement::Lexical) && !decls.nominal_processed(&key.id) {
+            return;
+        }
         match key.kind {
             NominalKind::Struct | NominalKind::DataRef => {
                 if let Some(schema) = decls.aggregate(key).cloned() {
+                    let (type_subst, const_subst) = schema.all_generics().substitutions(all_args);
                     for field in schema.fields.values() {
                         self.substitute_checked(&field.ty, &type_subst, &const_subst, span);
                     }
                 }
             }
             NominalKind::Enum => {
-                if let Some(variants) = decls.enum_schema(key).map(|schema| schema.variants.clone())
-                {
-                    for variant in variants.values() {
+                if let Some(schema) = decls.enum_schema(key).cloned() {
+                    let (type_subst, const_subst) = schema.all_generics().substitutions(all_args);
+                    for variant in schema.variants.values() {
                         match &variant.payload {
                             VariantPayload::Unit => {}
                             VariantPayload::Tuple(params) => {
@@ -3867,13 +4140,25 @@ pub(crate) fn check_with_modules(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn check_semantic_with_modules(
     program: &Program,
     resolved: &ResolveResult,
     externs: RawExterns,
     config: TypecheckConfig,
 ) -> Result<SemanticCheckOutput, TypecheckFailure> {
-    typechecker_for_modules(program, resolved, externs, config)?.into_semantic_result()
+    let source_index = SourceAstIndex::new(program, resolved);
+    check_semantic_with_source_index(program, resolved, &source_index, externs, config)
+}
+
+pub(crate) fn check_semantic_with_source_index(
+    program: &Program,
+    resolved: &ResolveResult,
+    source_index: &SourceAstIndex,
+    externs: RawExterns,
+    config: TypecheckConfig,
+) -> Result<SemanticCheckOutput, TypecheckFailure> {
+    typechecker_for_modules(program, resolved, externs, config)?.into_semantic_result(source_index)
 }
 
 fn typechecker_for_modules(
@@ -3913,7 +4198,6 @@ fn typechecker_for_modules(
         tc.source_modules.push(SourceModuleFactsInput {
             scope: scope.clone(),
             source,
-            program: Rc::clone(&program),
         });
         tc.module_programs
             .insert(scope.clone(), Rc::clone(&program));
@@ -3929,7 +4213,6 @@ fn typechecker_for_modules(
     tc.with_current_module(&root_scope, |tc| tc.eval_module_consts(&root_scope));
     tc.finalize_declarations();
     tc.seed_global_types();
-    check_finite_size_cycles(&mut tc);
     tc.with_current_module(&root_scope, |tc| {
         check_decl_param_order(program, tc);
         check_infer_return_decls(program, tc);
@@ -4776,10 +5059,11 @@ fn try_operand_field_carrier_ty(expr: &ExprNode, tc: &TypeChecker) -> Option<Typ
     let Type::Nominal(mut nominal) = carrier_ty else {
         return None;
     };
-    if nominal.type_args.len() != schema.generics.type_params.len() {
-        nominal.type_args = vec![Type::Infer; schema.generics.type_params.len()];
+    let generics = schema.all_generics();
+    if nominal.type_args.len() != generics.type_params.len() {
+        nominal.type_args = vec![Type::Infer; generics.type_params.len()];
     }
-    if nominal.const_args.len() != schema.generics.const_params.len() {
+    if nominal.const_args.len() != generics.const_params.len() {
         return None;
     }
 
@@ -5597,7 +5881,7 @@ impl CallTargetClosureFacts {
         match arg {
             ConstTerm::Name(_) => self.consts.contains_unresolved = true,
             ConstTerm::ArrayInfer | ConstTerm::Infer(_) => self.consts.contains_infer = true,
-            ConstTerm::Value(_) | ConstTerm::Param(_) => {}
+            ConstTerm::Value(_) | ConstTerm::Param(_) | ConstTerm::Expr(_) => {}
         }
     }
 

@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    CastConversionSchema, DeclError, DeclTypeUseKind, DeclarationIndex, DynInference, EnumRepr,
-    ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
-    MethodKey, MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue, TypeAliasDef,
-    TypeChecker, TypeError, VariantPayload, VerifiedRawEnumMetadata,
+    CastConversionSchema, DeclError, DeclTypeSite, DeclTypeUseKind, DeclarationIndex, DynInference,
+    EnumRepr, ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind,
+    GenericParams, MethodKey, MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue,
+    TypeAliasDef, TypeChecker, TypeError, VariantPayload, VerifiedRawEnumMetadata,
+    body::{CallableTemplateEnv, LocalNominalTemplate, with_callable_body_env},
     const_eval::const_type,
     contracts,
     extend_target::{ExtendTargetPattern, same_target_pattern, validate_constrained_target},
@@ -18,38 +19,62 @@ use crate::{
         NominalKind, Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
         TypeVisitor,
     },
+    semantic_id::NominalId,
     source::SourceId,
     span::{SourceSpan, Span},
 };
-
-pub(super) fn check_finite_size_cycles(tc: &mut TypeChecker) {
+pub(super) fn check_finite_size_cycles(ids: &HashSet<NominalId>, tc: &mut TypeChecker) {
     let graph = finite_size_graph(&tc.decls);
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     let mut reported = HashSet::new();
-    let mut keys = graph.keys().cloned().collect::<Vec<_>>();
-    keys.sort_by_key(super::decls::nominal_key_sort_key);
-    for key in keys {
-        check_finite_size_key(&key, &graph, &mut visiting, &mut visited, &mut reported, tc);
+    let mut roots = graph
+        .keys()
+        .filter(|id| ids.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|id| {
+        super::decls::nominal_key_sort_key(
+            tc.decls
+                .nominal(id)
+                .expect("finite-size node missing nominal metadata"),
+        )
+    });
+    for id in roots {
+        check_finite_size_id(
+            &id,
+            ids,
+            &graph,
+            &mut visiting,
+            &mut visited,
+            &mut reported,
+            tc,
+        );
     }
 }
 
-fn check_finite_size_key(
-    key: &NominalKey,
-    graph: &HashMap<NominalKey, Vec<NominalKey>>,
-    visiting: &mut HashSet<NominalKey>,
-    visited: &mut HashSet<NominalKey>,
-    reported: &mut HashSet<NominalKey>,
+fn check_finite_size_id(
+    id: &NominalId,
+    targets: &HashSet<NominalId>,
+    graph: &HashMap<NominalId, Vec<NominalId>>,
+    visiting: &mut HashSet<NominalId>,
+    visited: &mut HashSet<NominalId>,
+    reported: &mut HashSet<NominalId>,
     tc: &mut TypeChecker,
 ) {
-    if visited.contains(key) {
+    if visited.contains(id) {
         return;
     }
-    if !visiting.insert(key.clone()) {
-        if reported.insert(key.clone()) {
+    if !visiting.insert(id.clone()) {
+        if targets.contains(id) && reported.insert(id.clone()) {
+            let key = tc
+                .decls
+                .nominal(id)
+                .expect("finite-size node missing nominal metadata")
+                .clone();
             let span = tc
                 .decls
-                .type_span(key)
+                .type_span(&key)
                 .and_then(|span| tc.module_error_span(&key.module, span));
             tc.push_error(TypeError::InfiniteSize {
                 name: key.name,
@@ -58,24 +83,24 @@ fn check_finite_size_key(
         }
         return;
     }
-    if let Some(edges) = graph.get(key) {
+    if let Some(edges) = graph.get(id) {
         for edge in edges {
-            check_finite_size_key(edge, graph, visiting, visited, reported, tc);
+            check_finite_size_id(edge, targets, graph, visiting, visited, reported, tc);
         }
     }
-    visiting.remove(key);
-    visited.insert(key.clone());
+    visiting.remove(id);
+    visited.insert(id.clone());
 }
 
-fn finite_size_graph(decls: &DeclarationIndex) -> HashMap<NominalKey, Vec<NominalKey>> {
+fn finite_size_graph(decls: &DeclarationIndex) -> HashMap<NominalId, Vec<NominalId>> {
     let mut graph = HashMap::new();
     for (key, schema) in decls.aggregates() {
         let mut edges = vec![];
         for field in schema.fields.values() {
             finite_size_edges(&field.ty, decls, &mut edges);
         }
-        sort_finite_size_edges(&mut edges);
-        graph.insert(key.clone(), edges);
+        sort_finite_size_edges(&mut edges, decls);
+        graph.insert(key.id.clone(), edges);
     }
     for (key, schema) in decls.enums() {
         let mut edges = vec![];
@@ -94,26 +119,33 @@ fn finite_size_graph(decls: &DeclarationIndex) -> HashMap<NominalKey, Vec<Nomina
                 }
             }
         }
-        sort_finite_size_edges(&mut edges);
-        graph.insert(key.clone(), edges);
+        sort_finite_size_edges(&mut edges, decls);
+        graph.insert(key.id.clone(), edges);
     }
     graph
 }
 
-fn sort_finite_size_edges(edges: &mut Vec<NominalKey>) {
-    edges.sort_by_key(super::decls::nominal_key_sort_key);
+fn sort_finite_size_edges(edges: &mut Vec<NominalId>, decls: &DeclarationIndex) {
+    edges.sort_by_key(|id| {
+        super::decls::nominal_key_sort_key(
+            decls
+                .nominal(id)
+                .expect("finite-size edge missing nominal metadata"),
+        )
+    });
     edges.dedup();
 }
 
-fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<NominalKey>) {
+fn finite_size_edges(ty: &Type, decls: &DeclarationIndex, edges: &mut Vec<NominalId>) {
     match ty {
         Type::Nominal(nominal) => {
-            if let Some(key) = decls.key_for_type(ty)
-                && matches!(key.kind, NominalKind::Struct | NominalKind::Enum)
-            {
-                edges.push(key);
+            let Some(key) = decls.key_for_type(ty) else {
+                return;
+            };
+            if matches!(key.kind, NominalKind::Struct | NominalKind::Enum) {
+                edges.push(key.id);
             }
-            if !matches!(nominal.kind, NominalKind::DataRef | NominalKind::Extern) {
+            if !matches!(key.kind, NominalKind::DataRef | NominalKind::Extern) {
                 for arg in &nominal.type_args {
                     finite_size_edges(arg, decls, edges);
                 }
@@ -625,6 +657,22 @@ pub(super) fn method_sig_is_generic(sig: &MethodSig) -> bool {
     has_generics(&sig.type_params, &sig.const_params)
 }
 
+pub(super) fn validate_method_signature(
+    owner_generic: bool,
+    sig: &MethodSig,
+    span: Span,
+    tc: &mut TypeChecker,
+) {
+    super::defaults::check_param_order(&sig.params, span, tc);
+    validate_return_spec(
+        &sig.ret,
+        owner_generic || method_sig_is_generic(sig),
+        method_has_mutable_input(sig),
+        span,
+        tc,
+    );
+}
+
 pub(super) fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) {
     for stmt in &program.stmts {
         match &stmt.node {
@@ -650,26 +698,14 @@ pub(super) fn check_infer_return_decls(program: &Program, tc: &mut TypeChecker) 
                 let agg = &agg_node.node;
                 let owner_is_generic = has_generics(&agg.type_params, &agg.const_params);
                 for method in &agg.methods {
-                    validate_return_spec(
-                        &method.sig.ret,
-                        owner_is_generic || method_sig_is_generic(&method.sig),
-                        method_has_mutable_input(&method.sig),
-                        agg_node.span,
-                        tc,
-                    );
+                    validate_method_signature(owner_is_generic, &method.sig, method.span, tc);
                 }
             }
             Stmt::Extend(extend_node) => {
                 let extend = &extend_node.node;
                 let owner_is_generic = has_generics(&extend.type_params, &extend.const_params);
                 for method in &extend.methods {
-                    validate_return_spec(
-                        &method.node.sig.ret,
-                        owner_is_generic || method_sig_is_generic(&method.node.sig),
-                        method_has_mutable_input(&method.node.sig),
-                        method.span,
-                        tc,
-                    );
+                    validate_method_signature(owner_is_generic, &method.node.sig, method.span, tc);
                 }
                 for cast in &extend.cast_froms {
                     if let Some(ret) = &cast.node.ret {
@@ -834,12 +870,48 @@ fn raw_span(pending: &PendingRawEnum, span: Span) -> SourceSpan {
     SourceSpan::from_byte_span(pending.source, span)
 }
 
+struct OwnerTypeDependency {
+    ids: HashSet<TypeVarId>,
+    names: HashSet<Ident>,
+    depends: bool,
+}
+
+impl OwnerTypeDependency {
+    fn check(ty: &Type, owner: &GenericParams) -> bool {
+        let mut visitor = Self {
+            ids: owner.type_params.iter().map(|param| param.id).collect(),
+            names: owner.type_params.iter().map(|param| param.name).collect(),
+            depends: false,
+        };
+        visitor.visit_type(ty);
+        visitor.depends
+    }
+}
+
+impl TypeVisitor for OwnerTypeDependency {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        self.depends |= match ty {
+            Type::Var(id) => self.ids.contains(id),
+            Type::UnresolvedName(name) => self.names.contains(name),
+            Type::UnresolvedNominal {
+                qualifier: None,
+                name,
+                generic_args,
+            } if generic_args.is_empty() => self.names.contains(name),
+            _ => false,
+        };
+        self.depends
+    }
+}
+
 impl TypeChecker {
     pub(super) fn finalize_declarations(&mut self) {
         let saved_module = self.current_module.clone();
+        let ids = self.decls.nominal_ids();
+
         let mut decls = std::mem::take(&mut self.decls);
         let lookup = decls.clone();
-        let generic_errors = decls.fold_canonical_type_uses(|site, ty| {
+        let generic_errors = decls.fold_non_nominal_type_uses(|site, ty| {
             if matches!(
                 site.kind,
                 DeclTypeUseKind::ExternFunctionParam | DeclTypeUseKind::ExternFunctionReturn
@@ -853,38 +925,171 @@ impl TypeChecker {
             self.reject_user_any_type(&ty, span);
             ty
         });
-        for error in generic_errors {
-            let source = self.module_sources.get(&error.module).copied();
-            self.push_error(generic_param_decl_type_error(error, source));
-        }
+        self.push_generic_context_errors(generic_errors);
         validate_type_alias_decls(&decls, &mut self.errors);
-        self.decls = decls;
-        self.validate_raw_enum_declarations();
-        decls = std::mem::take(&mut self.decls);
         contracts::finalize_contracts(&mut decls, &mut self.errors, &mut self.lint_events);
+        self.decls = decls;
+
+        let envs = ids
+            .iter()
+            .cloned()
+            .map(|id| {
+                (
+                    id,
+                    (
+                        CallableTemplateEnv::SourceModule,
+                        GenericOwnerFrame::default(),
+                    ),
+                )
+            })
+            .collect();
+        self.finalize_nominals(ids, &envs);
+
+        decls = std::mem::take(&mut self.decls);
         validate_dyn_infer_decls(&mut decls, &self.module_sources, &mut self.errors);
         validate_extend_decls(&decls, &mut self.errors);
-        for error in decls.build_projection_edges() {
-            self.push_error(TypeError::Decl(error));
-        }
-        for error in decls.build_promoted_surfaces(&self.externs) {
-            self.push_error(TypeError::Decl(error));
-        }
-        self.validate_final_decl_type_uses(&mut decls);
+        self.validate_final_non_nominal_type_uses(&mut decls);
         self.current_module = saved_module;
         self.decls = decls;
     }
 
-    fn validate_raw_enum_declarations(&mut self) {
-        let pending = self.decls.take_pending_raw_enums();
-        for (key, pending) in pending {
-            self.validate_raw_enum_declaration(&key, &pending);
+    pub(super) fn finalize_nominals(
+        &mut self,
+        ids: HashSet<NominalId>,
+        envs: &HashMap<NominalId, LocalNominalTemplate>,
+    ) {
+        let ids = self.decls.unprocessed_nominals(ids);
+        if ids.is_empty() {
+            return;
+        }
+
+        let saved_module = self.current_module.clone();
+        let mut ordered = ids.iter().cloned().collect::<Vec<_>>();
+        ordered.sort_by_key(|id| {
+            crate::typecheck::decls::nominal_key_sort_key(
+                self.decls
+                    .nominal(id)
+                    .expect("nominal finalization target missing metadata"),
+            )
+        });
+        for id in ordered {
+            let (env, _) = envs
+                .get(&id)
+                .cloned()
+                .expect("nominal finalization target missing declaration environment");
+            let module = self
+                .decls
+                .nominal(&id)
+                .expect("nominal finalization target missing metadata")
+                .module
+                .clone();
+            with_callable_body_env(&module, &env, self, |tc| {
+                let saved_type_substs = std::mem::take(&mut tc.type_substs);
+                let saved_const_substs = std::mem::take(&mut tc.const_substs);
+                let mut decls = std::mem::take(&mut tc.decls);
+                tc.decls = decls.clone();
+                let target = HashSet::from([id]);
+                let generic_errors = decls.fold_nominal_type_uses(&target, |site, ty| {
+                    tc.finalize_lexical_decl_type(&site.module, &site.generics, &ty, site.span)
+                });
+                tc.decls = decls;
+                tc.type_substs = saved_type_substs;
+                tc.const_substs = saved_const_substs;
+                tc.push_generic_context_errors(generic_errors);
+            });
+        }
+
+        self.validate_raw_enum_declarations(&ids, envs);
+
+        let mut decls = std::mem::take(&mut self.decls);
+        for error in decls.build_projection_edges(&ids) {
+            self.push_error(TypeError::Decl(error));
+        }
+        for error in decls.build_promoted_surfaces(&ids, &self.externs) {
+            self.push_error(TypeError::Decl(error));
+        }
+        self.validate_final_nominal_type_uses(&ids, &mut decls);
+        self.decls = decls;
+        check_finite_size_cycles(&ids, self);
+        self.decls.mark_nominals_processed(&ids);
+        self.current_module = saved_module;
+    }
+
+    pub(super) fn push_generic_context_errors(&mut self, errors: Vec<GenericContextError>) {
+        for error in errors {
+            let source = self.module_sources.get(&error.module).copied();
+            self.push_error(generic_param_decl_type_error(error, source));
         }
     }
 
-    fn validate_raw_enum_declaration(&mut self, key: &NominalKey, pending: &PendingRawEnum) {
+    fn validate_raw_enum_declarations(
+        &mut self,
+        ids: &HashSet<NominalId>,
+        envs: &HashMap<NominalId, LocalNominalTemplate>,
+    ) {
+        let pending = self.decls.take_pending_raw_enums(ids);
+        for (key, pending) in pending {
+            let (env, owner) = envs
+                .get(&key.id)
+                .cloned()
+                .expect("raw enum missing declaration environment");
+            let module = key.module.clone();
+            with_callable_body_env(&module, &env, self, |tc| {
+                tc.validate_raw_enum_declaration(&key, &pending, &owner);
+            });
+        }
+    }
+
+    fn validate_raw_enum_declaration(
+        &mut self,
+        key: &NominalKey,
+        pending: &PendingRawEnum,
+        owner: &GenericOwnerFrame,
+    ) {
         let saved_module = self.current_module.clone();
         self.current_module = key.module.clone();
+        let schema = self.decls.enum_schema(key).cloned();
+        let owner_const_names = owner
+            .params
+            .const_params
+            .iter()
+            .map(|param| param.name)
+            .collect::<HashSet<_>>();
+        let depends_on_owner = pending
+            .backing
+            .as_ref()
+            .is_some_and(|backing| OwnerTypeDependency::check(&backing.node, &owner.params))
+            || pending.variants.iter().any(|variant| {
+                variant.value.as_ref().is_some_and(|value| {
+                    self.expr_depends_on_const_params(value, &owner_const_names)
+                })
+            });
+        let span = self
+            .decls
+            .type_span(key)
+            .map(|span| raw_span(pending, span));
+        let invalid_generics = schema
+            .as_ref()
+            .is_some_and(|schema| !schema.generics.is_empty());
+        let error = if invalid_generics {
+            Some(DeclError::RawEnumGenericParams {
+                owner: key.clone(),
+                span,
+            })
+        } else if depends_on_owner {
+            Some(DeclError::RawEnumOwnerDependency {
+                owner: key.clone(),
+                span,
+            })
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.push_error(TypeError::Decl(error));
+            self.decls.sanitize_raw_enum(key);
+            self.current_module = saved_module;
+            return;
+        }
         let valid = match &pending.backing {
             Some(backing) => match raw_backing_repr(&backing.node) {
                 Some(repr) => self.resolve_raw_enum_values(key, pending, repr),
@@ -925,17 +1130,6 @@ impl TypeChecker {
             return false;
         };
         let mut valid = true;
-        if !schema.generics.is_empty() {
-            let span = self
-                .decls
-                .type_span(key)
-                .map(|span| raw_span(pending, span));
-            self.push_error(TypeError::Decl(DeclError::RawEnumGenericParams {
-                owner: key.clone(),
-                span,
-            }));
-            valid = false;
-        }
         for raw_variant in &pending.variants {
             let Some(variant) = schema.variants.get(raw_variant.name) else {
                 continue;
@@ -1066,21 +1260,43 @@ impl TypeChecker {
         values
     }
 
-    fn validate_final_decl_type_uses(&mut self, decls: &mut DeclarationIndex) {
+    fn validate_final_nominal_type_uses(
+        &mut self,
+        ids: &HashSet<NominalId>,
+        decls: &mut DeclarationIndex,
+    ) {
         let validation = decls.clone();
         self.decls = validation.clone();
-        let _ = decls.fold_canonical_type_uses(|site, ty| {
-            self.current_module = site.module;
-            self.push_generic_owner_frame(GenericOwnerFrame {
-                params: GenericParams {
-                    type_params: site.type_params,
-                    const_params: vec![],
-                },
-                ..GenericOwnerFrame::default()
-            });
-            self.validate_nominal_uses_in(&validation, &ty, site.span);
-            self.pop_generic_owner_frame();
+        let _ = decls.fold_nominal_type_uses(ids, |site, ty| {
+            self.validate_final_type_use(&validation, site, &ty);
             ty
         });
+    }
+
+    fn validate_final_non_nominal_type_uses(&mut self, decls: &mut DeclarationIndex) {
+        let validation = decls.clone();
+        self.decls = validation.clone();
+        let _ = decls.fold_non_nominal_type_uses(|site, ty| {
+            self.validate_final_type_use(&validation, site, &ty);
+            ty
+        });
+    }
+
+    fn validate_final_type_use(
+        &mut self,
+        validation: &DeclarationIndex,
+        site: DeclTypeSite,
+        ty: &Type,
+    ) {
+        self.current_module = site.module;
+        self.push_generic_owner_frame(GenericOwnerFrame {
+            params: GenericParams {
+                type_params: site.type_params,
+                const_params: vec![],
+            },
+            ..GenericOwnerFrame::default()
+        });
+        self.validate_nominal_uses_in(validation, ty, site.span);
+        self.pop_generic_owner_frame();
     }
 }

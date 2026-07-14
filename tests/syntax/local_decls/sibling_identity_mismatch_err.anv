@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: declared at tests/syntax/local_decls/sibling_identity_mismatch_err.anv:12:9
+// @contains: declared at tests/syntax/local_decls/sibling_identity_mismatch_err.anv:9:5
+// @contains: expected
+// @contains: found
+
+fn main() {
+    struct Item { value: int }
+    let outer = Item { value: 1 };
+    {
+        struct Item { value: int }
+        let inner: Item = outer;
+    };
+}

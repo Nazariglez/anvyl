@@ -133,8 +133,8 @@ fn dependent_projected_ref_arg_records_specialized_expected_projection() {
         ",
     )
     .unwrap();
-    let entity_ty = nominal_struct("Entity");
-    let expr_id = assert_expected_projection(&result, &["value"], entity_ty.clone());
+    let entity_ty = nominal_struct(&result, "Entity");
+    let expr_id = assert_expected_projection(&result, &["value"], &entity_ty);
     assert_expr_type(&result, expr_id, &entity_ty);
 
     let body = result.expect_body(&generic_body("move_box", vec![entity_ty.clone()]));
@@ -238,7 +238,11 @@ fn projected_generic_return_records_call_target() {
         ",
     )
     .unwrap();
-    assert_expected_projection(&result, &["actor", "entity"], nominal_struct("Entity"));
+    assert_expected_projection(
+        &result,
+        &["actor", "entity"],
+        &nominal_struct(&result, "Entity"),
+    );
     let target = result
         .calls()
         .values()
@@ -249,7 +253,7 @@ fn projected_generic_return_records_call_target() {
         &CallTarget::new(
             CallableId::function(ModuleScope::Root, Ident::new("id")),
             GenericArgs {
-                type_args: vec![nominal_struct("Enemy")],
+                type_args: vec![nominal_struct(&result, "Enemy")],
                 const_args: vec![],
             }
         )
@@ -286,7 +290,7 @@ fn negative_const_arg_err() {
 fn generic_method_const_return() {
     assert_ty(
         "struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 4]) -> int { Arrays.len<int, 4>(xs) }",
-        Type::Int,
+        &Type::Int,
     );
 }
 
@@ -294,7 +298,7 @@ fn generic_method_const_return() {
 fn generic_method_named_const_arg() {
     assert_ty(
         "const CAP = 3; struct Arrays { fn len<T, N: int>(xs: [T; N]) -> int { N } } fn main(xs: [int; 3]) -> int { Arrays.len<int, CAP>(xs) }",
-        Type::Int,
+        &Type::Int,
     );
 }
 

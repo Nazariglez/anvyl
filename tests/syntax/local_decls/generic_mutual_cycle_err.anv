@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: infinite size
+
+fn define<T>() {
+    struct First<U> { second: Second<U> }
+    struct Second<U> { first: First<U> }
+}
+
+fn main() { define<int>(); }

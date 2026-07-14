@@ -430,9 +430,10 @@ fn type_expr(
                 type_expr(source, elem, span, SourceTypePosition::Nested)?,
                 *len as u64,
             )),
-            ast::ArrayLen::Infer | ast::ArrayLen::Named(_) | ast::ArrayLen::Param(_) => {
-                Err(unsupported_type(source, ty, span))
-            }
+            ast::ArrayLen::Infer
+            | ast::ArrayLen::Named(_)
+            | ast::ArrayLen::Param(_)
+            | ast::ArrayLen::Expr(_) => Err(unsupported_type(source, ty, span)),
         },
         Type::Slice { elem } => {
             if !position.allows_slice() {

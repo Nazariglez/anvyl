@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: success
+// @warn-contains: deprecated
+
+fn main() {
+    @deprecated("use Current")
+    struct Legacy { value: int }
+
+    let legacy = Legacy { value: 1 };
+    let value: int = legacy.value;
+}

@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: type 'Item' is already defined
+
+fn main() {
+    type Item = int;
+    struct Item { value: int }
+}

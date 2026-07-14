@@ -210,12 +210,12 @@ pub fn resolve_with_ignored(
 pub fn resolve_package(
     root_package: PackageId,
     source: &str,
-    packages: HashMap<PackageId, PackageInput>,
+    packages: &HashMap<PackageId, PackageInput>,
     loader: &mut InMemoryLoader,
 ) -> Result<ResolveResult, ResolveFailure<Infallible>> {
     resolve::resolve_package_modules(
         loaded_module(ModuleId::root(root_package), source),
-        &packages,
+        packages,
         vec![],
         loader,
         &HashSet::new(),

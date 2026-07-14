@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: named functions cannot capture local value 'runtime'
+
+fn main() {
+    let runtime = 1;
+    struct Bad {
+        fn read(self) -> int { runtime }
+    }
+}

@@ -13,6 +13,7 @@ use super::{
 use crate::{
     ast::{self, ConstArg, Ident, NominalKind, Type},
     externs::catalog::ExternCatalog,
+    semantic_id::NominalId,
     span::SourceSpan,
 };
 
@@ -201,11 +202,16 @@ fn render_path(path: &[Ident]) -> String {
 }
 
 impl DeclarationIndex {
-    pub(crate) fn build_promoted_surfaces(&mut self, externs: &ExternCatalog) -> Vec<DeclError> {
-        build_dependent_embed_templates(self);
-        let mut builder = SurfaceBuilder::new(self, externs);
+    pub(crate) fn build_promoted_surfaces(
+        &mut self,
+        ids: &HashSet<NominalId>,
+        externs: &ExternCatalog,
+    ) -> Vec<DeclError> {
+        build_dependent_embed_templates(self, ids);
+        let mut builder = SurfaceBuilder::new(self, externs, Some(ids));
         let mut keys = self
             .aggregates()
+            .filter(|(key, _)| ids.contains(&key.id))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         keys.sort_by_key(nominal_key_sort_key);
@@ -215,7 +221,14 @@ impl DeclarationIndex {
         let SurfaceBuilder {
             surfaces, errors, ..
         } = builder;
-        for (key, surface) in surfaces {
+        for (id, surface) in surfaces {
+            if !ids.contains(&id) {
+                continue;
+            }
+            let key = self
+                .nominal(&id)
+                .expect("promoted surface missing nominal metadata")
+                .clone();
             if let Some(aggregate) = self.aggregate_mut(&key) {
                 aggregate.promoted = surface;
             }
@@ -233,15 +246,16 @@ impl DeclarationIndex {
         if aggregate.dependent_embeds.is_empty() {
             return Some((aggregate.promoted.clone(), vec![]));
         }
-        let mut builder = SurfaceBuilder::new(self, externs);
+        let mut builder = SurfaceBuilder::new(self, externs, None);
         let surface = builder.build_type(receiver, None);
         Some((surface, builder.errors))
     }
 }
 
-fn build_dependent_embed_templates(decls: &mut DeclarationIndex) {
+fn build_dependent_embed_templates(decls: &mut DeclarationIndex, ids: &HashSet<NominalId>) {
     let mut keys = decls
         .aggregates()
+        .filter(|(key, _)| ids.contains(&key.id))
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     keys.sort_by_key(nominal_key_sort_key);
@@ -329,19 +343,25 @@ impl SurfaceMemberKind {
 struct SurfaceBuilder<'a> {
     decls: &'a DeclarationIndex,
     externs: &'a ExternCatalog,
-    states: HashMap<NominalKey, SurfaceState>,
-    surfaces: HashMap<NominalKey, PromotedSurface>,
+    targets: Option<&'a HashSet<NominalId>>,
+    states: HashMap<NominalId, SurfaceState>,
+    surfaces: HashMap<NominalId, PromotedSurface>,
     type_states: HashMap<CanonicalTypeKey, SurfaceState>,
     type_surfaces: HashMap<CanonicalTypeKey, PromotedSurface>,
-    reported_cycles: HashSet<NominalKey>,
+    reported_cycles: HashSet<NominalId>,
     errors: Vec<DeclError>,
 }
 
 impl<'a> SurfaceBuilder<'a> {
-    fn new(decls: &'a DeclarationIndex, externs: &'a ExternCatalog) -> Self {
+    fn new(
+        decls: &'a DeclarationIndex,
+        externs: &'a ExternCatalog,
+        targets: Option<&'a HashSet<NominalId>>,
+    ) -> Self {
         Self {
             decls,
             externs,
+            targets,
             states: HashMap::new(),
             surfaces: HashMap::new(),
             type_states: HashMap::new(),
@@ -352,12 +372,12 @@ impl<'a> SurfaceBuilder<'a> {
     }
 
     fn build(&mut self, key: &NominalKey, cycle_span: Option<SourceSpan>) -> PromotedSurface {
-        match self.states.get(key).copied() {
+        match self.states.get(&key.id).copied() {
             Some(SurfaceState::Done) => {
-                return self.surfaces.get(key).cloned().unwrap_or_default();
+                return self.surfaces.get(&key.id).cloned().unwrap_or_default();
             }
             Some(SurfaceState::Visiting) => {
-                if self.reported_cycles.insert(key.clone()) {
+                if self.reported_cycles.insert(key.id.clone()) {
                     self.errors.push(DeclError::EmbedSurfaceCycle {
                         owner: key.clone(),
                         target: key.clone(),
@@ -369,11 +389,11 @@ impl<'a> SurfaceBuilder<'a> {
             None => {}
         }
 
-        self.states.insert(key.clone(), SurfaceState::Visiting);
+        self.states.insert(key.id.clone(), SurfaceState::Visiting);
         let mut surface = PromotedSurface::default();
         let Some(schema) = self.decls.aggregate(key) else {
-            self.states.insert(key.clone(), SurfaceState::Done);
-            self.surfaces.insert(key.clone(), surface.clone());
+            self.states.insert(key.id.clone(), SurfaceState::Done);
+            self.surfaces.insert(key.id.clone(), surface.clone());
             return surface;
         };
 
@@ -381,8 +401,8 @@ impl<'a> SurfaceBuilder<'a> {
             self.add_embed_members(&mut surface, name, field);
         }
         self.merge_surface(key, schema, &mut surface);
-        self.states.insert(key.clone(), SurfaceState::Done);
-        self.surfaces.insert(key.clone(), surface.clone());
+        self.states.insert(key.id.clone(), SurfaceState::Done);
+        self.surfaces.insert(key.id.clone(), surface.clone());
         surface
     }
 
@@ -398,7 +418,7 @@ impl<'a> SurfaceBuilder<'a> {
             }
             Some(SurfaceState::Visiting) => {
                 if let Some(key) = self.decls.key_for_type(ty)
-                    && self.reported_cycles.insert(key.clone())
+                    && self.reported_cycles.insert(key.id.clone())
                 {
                     self.errors.push(DeclError::EmbedSurfaceCycle {
                         owner: key.clone(),
@@ -417,6 +437,17 @@ impl<'a> SurfaceBuilder<'a> {
         let Some(schema) = self.decls.aggregate(&key) else {
             return PromotedSurface::default();
         };
+        if self
+            .targets
+            .is_some_and(|targets| !targets.contains(&key.id))
+        {
+            debug_assert!(
+                self.decls.nominal_processed(&key.id),
+                "promoted-surface dependency must be processed or included in the finalization set"
+            );
+            let mut dependency = Self::new(self.decls, self.externs, None);
+            return dependency.build_type(ty, cycle_span);
+        }
 
         self.type_states
             .insert(cache_key.clone(), SurfaceState::Visiting);
@@ -441,8 +472,8 @@ impl<'a> SurfaceBuilder<'a> {
         let Some(embed_name) = template.field_path.first().copied() else {
             return;
         };
-        let target_ty =
-            substitute_aggregate_member(owner_ty, &schema.generics, &template.target_ty);
+        let generics = schema.all_generics();
+        let target_ty = substitute_aggregate_member(owner_ty, &generics, &template.target_ty);
         if !concrete_surface_type(&target_ty) {
             return;
         }

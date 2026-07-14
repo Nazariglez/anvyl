@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: type 'Option' is already defined
+
+fn main() {
+    struct Option { value: int }
+}

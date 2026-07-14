@@ -49,7 +49,7 @@ fn bare_import_is_local_even_when_dependency_alias_matches() {
     let result = resolve_package(
         game.clone(),
         "import math;",
-        packages([
+        &packages([
             (game.clone(), package_input(&[("math", math.clone())])),
             (math.clone(), package_root(&math, "", &[])),
         ]),
@@ -69,7 +69,7 @@ fn pkg_import_uses_direct_alias() {
     let result = resolve_package(
         game.clone(),
         "import pkg:math;",
-        packages([
+        &packages([
             (game, package_input(&[("math", math.clone())])),
             (math.clone(), package_root(&math, "", &[])),
         ]),
@@ -87,7 +87,7 @@ fn unknown_dependency_alias_is_rejected() {
     let errors = resolve_errors(resolve_package(
         game.clone(),
         "import pkg:math;",
-        packages([(game.clone(), PackageInput::default())]),
+        &packages([(game.clone(), PackageInput::default())]),
         &mut loader,
     ));
 
@@ -109,7 +109,7 @@ fn same_module_path_in_different_packages_does_not_collide() {
     let result = resolve_package(
         game.clone(),
         "import pkg:audio.math; import pkg:render.math;",
-        packages([
+        &packages([
             (
                 game,
                 package_input(&[("audio", audio.clone()), ("render", render.clone())]),
@@ -138,7 +138,7 @@ fn duplicate_local_imports_load_once_per_package() {
     let result = resolve_package(
         game.clone(),
         "import util; import util; import pkg:math.util; import pkg:math.util;",
-        packages([
+        &packages([
             (game.clone(), package_input(&[("math", math.clone())])),
             (math.clone(), package_root(&math, "pub import util;", &[])),
         ]),
@@ -192,7 +192,7 @@ fn pkg_needs_context() {
     let errors = resolve_errors(resolve_package(
         game.clone(),
         "import pkg:math;",
-        packages([(game.clone(), PackageInput::default())]),
+        &packages([(game.clone(), PackageInput::default())]),
         &mut loader,
     ));
 
@@ -238,7 +238,7 @@ fn local_import_chain_stays_package_local() {
     let result = resolve_package(
         game.clone(),
         "import a;",
-        packages([
+        &packages([
             (game.clone(), package_input(&[("b", math.clone())])),
             (math.clone(), package_root(&math, "", &[])),
         ]),
@@ -258,7 +258,7 @@ fn missing_local_module_reports_current_package() {
     let errors = resolve_errors(resolve_package(
         game.clone(),
         "import missing;",
-        packages([(game.clone(), PackageInput::default())]),
+        &packages([(game.clone(), PackageInput::default())]),
         &mut loader,
     ));
 
@@ -303,7 +303,7 @@ fn native_only_dependency_root_import_fails() {
     let errors = resolve_errors(resolve_package(
         game.clone(),
         "import pkg:host;",
-        packages([
+        &packages([
             (game, package_input(&[("host", host.clone())])),
             (host.clone(), native_package_input(&[])),
         ]),
@@ -325,7 +325,7 @@ fn unknown_native_only_dependency_provider_module_fails() {
     let errors = resolve_errors(resolve_package(
         game.clone(),
         "import pkg:host.audio;",
-        packages([
+        &packages([
             (game, package_input(&[("host", host.clone())])),
             (host.clone(), native_package_input(&[])),
         ]),
@@ -348,7 +348,7 @@ fn root_imports_resolve() {
     let result = resolve_package(
         game.clone(),
         "import pkg:math;",
-        packages([
+        &packages([
             (game, package_input(&[("math", math.clone())])),
             (math.clone(), package_root(&math, "import helpers;", &[])),
         ]),
@@ -369,7 +369,7 @@ fn root_aliases_source_entry() {
     let result = resolve_package(
         game.clone(),
         "import pkg:math;",
-        packages([
+        &packages([
             (game, package_input(&[("math", math.clone())])),
             (
                 math.clone(),

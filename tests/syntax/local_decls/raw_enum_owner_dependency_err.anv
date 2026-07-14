@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: raw enum 'Code' cannot depend on enclosing generic parameters
+
+fn code<N: int>() {
+    enum Code: int { Value = N }
+}
+
+fn main() {
+    code<7>();
+}

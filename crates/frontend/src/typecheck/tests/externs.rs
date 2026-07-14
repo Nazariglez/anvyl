@@ -677,7 +677,7 @@ mod projection {
 
         let (_, fact) = single_expected_projection(&result);
         assert_eq!(fact.path, vec![Ident::new("entity")]);
-        assert_eq!(fact.target_ty, nominal_struct("Entity"));
+        assert_eq!(fact.target_ty, nominal_struct(&result, "Entity"));
 
         let id = result
             .externs()
@@ -1807,8 +1807,8 @@ mod provider_imports {
             result
                 .decls()
                 .imported_type_binding(&ModuleScope::Root, Ident::new("Handle"))
-                .and_then(typecheck::TypeBinding::into_nominal),
-            Some(ty.nominal.clone())
+                .and_then(|binding| binding.nominal().cloned()),
+            Some(ty.nominal.id.clone())
         );
         let id = result
             .externs()

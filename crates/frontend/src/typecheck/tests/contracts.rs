@@ -366,8 +366,8 @@ fn cached_generic_specialization_restores_dyn_conversion_facts() {
         .flat_map(|body| body.dyn_conversions.values())
         .map(|conversion| &witnesses[&conversion.witness].key.concrete_ty)
         .collect::<Vec<_>>();
-    assert!(concrete.contains(&&nominal_struct("Enemy")));
-    assert!(concrete.contains(&&nominal_struct("Label")));
+    assert!(concrete.contains(&&nominal_struct(&result, "Enemy")));
+    assert!(concrete.contains(&&nominal_struct(&result, "Label")));
     assert_eq!(concrete.len(), 2);
 }
 
@@ -415,7 +415,7 @@ fn cached_generic_specialization_restores_dyn_downcast_facts() {
     )
     .expect("typecheck failed");
 
-    let enemy = nominal_struct("Enemy");
+    let enemy = nominal_struct(&result, "Enemy");
     assert_eq!(result.dyn_downcasts().len(), 1);
     assert!(
         result.dyn_downcasts().values().all(|fact| {
@@ -439,7 +439,10 @@ fn inferred_dyn_pending_facts_keep_specialized_body() {
     )
     .expect("typecheck failed");
 
-    for ty in [nominal_struct("Enemy"), nominal_struct("Label")] {
+    for ty in [
+        nominal_struct(&result, "Enemy"),
+        nominal_struct(&result, "Label"),
+    ] {
         let key = generic_body("wrap", vec![ty]);
         let body = result.expect_body(&key);
         assert_eq!(body.dyn_conversions.len(), 1);
@@ -671,7 +674,7 @@ fn witness_structural_keys_dedupe_spans() {
 }
 
 #[test]
-fn witness_structural_keys_ignore_declaration_order() {
+fn witness_structural_keys_preserve_nominal_identity() {
     let forward = check(
         "contract A { fn a(self); }
         struct Item { fn a(self) {} }
@@ -685,7 +688,7 @@ fn witness_structural_keys_ignore_declaration_order() {
     )
     .expect("typecheck failed");
 
-    assert_eq!(
+    assert_ne!(
         forward
             .witness_structural_keys()
             .values()

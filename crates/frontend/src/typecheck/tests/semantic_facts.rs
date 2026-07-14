@@ -2,14 +2,105 @@ use super::support::{check, check_named, generic_body};
 use crate::{
     ast::{ArrayLen, ConstValue, EscapeMode, Ident, Type},
     typecheck::{
-        BodyInstanceKey, FunctionValueKind, FunctionValueOrigin, GenericArgs, LambdaBodyKey,
-        LocalDefKind, LocalUseMode, semantic_use::ConstValueMap,
+        BodyInstanceKey, CallableParent, FunctionValueKind, FunctionValueOrigin, GenericArgs,
+        LambdaBodyKey, LocalDefKind, LocalUseMode, semantic_use::ConstValueMap,
     },
 };
 
-fn assert_single_const(values: &ConstValueMap, value: ConstValue) {
+#[test]
+fn indexes_local_function_declaration_facts_by_source_site() {
+    let result = check(
+        "fn local() -> int { 0 } fn main() { fn local(x: int) -> int { x } let y = local(1); }",
+    )
+    .expect("typecheck failed");
+    let fact = result
+        .program
+        .declaration_facts
+        .functions
+        .iter()
+        .find(|fact| matches!(fact.id.parent, Some(CallableParent::Local(_))))
+        .expect("missing local function fact");
+
+    assert_eq!(fact.name, Ident::new("local"));
+    assert_eq!(fact.site.owner().source(), fact.span.source());
+    assert_eq!(
+        result
+            .program
+            .declaration_facts
+            .functions
+            .iter()
+            .filter(|fact| fact.name == Ident::new("local"))
+            .count(),
+        2
+    );
+    assert_eq!(fact.params.len(), 1);
+}
+
+#[test]
+fn method_facts_reference_direct_source_index_entries() {
+    let result =
+        check("struct A { fn get(self) -> int { 1 } } fn main() {}").expect("typecheck failed");
+    let fact = result
+        .program
+        .declaration_facts
+        .functions
+        .iter()
+        .find(|fact| fact.name == Ident::new("get"))
+        .expect("missing method fact");
+
+    let crate::source_ast::SourceCallableSite::AggregateMethod { method, .. } = fact.site else {
+        panic!("expected aggregate method site")
+    };
+    assert_eq!(method.span(), fact.span.byte());
+}
+
+#[test]
+fn local_function_facts_include_owner_generic_instances() {
+    let result = check(
+        "fn outer<T>(x: T) { fn inner(y: T) -> T { y } let z = inner(x); } fn main() { outer<int>(1); }",
+    )
+    .expect("typecheck failed");
+    let fact = result
+        .program
+        .declaration_facts
+        .functions
+        .iter()
+        .find(|fact| fact.name == Ident::new("inner"))
+        .expect("missing inner function instance");
+
+    assert_eq!(fact.args.type_args, vec![Type::Int]);
+    assert_eq!(fact.params[0].ty, Type::Int);
+    assert_eq!(fact.ret.ty(), Type::Int);
+}
+
+#[test]
+fn local_default_facts_keep_declaration_body_owner() {
+    let result = check(
+        "fn main() { fn local(x: int = 1) -> int { x } fn call() { let y = local(); } call(); }",
+    )
+    .expect("typecheck failed");
+    let main = result.function_body("main");
+    let default = result
+        .program
+        .facts
+        .bodies
+        .values()
+        .flat_map(|body| body.default_args.values().flatten())
+        .next()
+        .expect("missing local default fact");
+
+    assert_eq!(default.facts_body, main);
+    assert!(
+        result
+            .expect_body(&main)
+            .expr_types
+            .contains_key(&default.default.expr)
+    );
+}
+
+fn assert_single_const(values: &ConstValueMap, expected: &ConstValue) {
     assert_eq!(values.len(), 1);
-    assert_eq!(values.values().next(), Some(&value));
+    assert_eq!(values.values().next(), Some(expected));
 }
 
 fn assert_main_mut_borrows(source: &str, name: &str) {
@@ -200,7 +291,7 @@ fn explicit_default_param_records_no_default_arg() {
 fn top_level_const_value_records_one_fact() {
     let result =
         check("const BASE: int = 10; fn main() { let value = BASE; }").expect("typecheck failed");
-    assert_single_const(result.const_values(), ConstValue::Int(10));
+    assert_single_const(result.const_values(), &ConstValue::Int(10));
 }
 
 #[test]
@@ -210,7 +301,7 @@ fn imported_const_value_records_fact() {
         &[("helper", "pub const BASE: int = 10;")],
     )
     .expect("typecheck failed");
-    assert_single_const(result.const_values(), ConstValue::Int(10));
+    assert_single_const(result.const_values(), &ConstValue::Int(10));
 }
 
 #[test]
@@ -220,7 +311,7 @@ fn module_qualified_const_value_records_fact() {
         &[("helper", "pub const BASE: int = 10;")],
     )
     .expect("typecheck failed");
-    assert_single_const(result.const_values(), ConstValue::Int(10));
+    assert_single_const(result.const_values(), &ConstValue::Int(10));
 }
 
 #[test]
@@ -239,7 +330,7 @@ fn local_const_value_records_fact_without_local_use() {
     let result =
         check("fn main() { const BASE: int = 10; let value = BASE; }").expect("typecheck failed");
     let body = result.expect_body(&result.function_body("main"));
-    assert_single_const(&body.const_values, ConstValue::Int(10));
+    assert_single_const(&body.const_values, &ConstValue::Int(10));
     assert!(body.locals.uses.is_empty());
 }
 
@@ -257,7 +348,7 @@ fn lambda_local_const_value_records_fact_without_capture() {
         expr: lambda,
         specialization: GenericArgs::default(),
     }));
-    assert_single_const(&body.const_values, ConstValue::Int(10));
+    assert_single_const(&body.const_values, &ConstValue::Int(10));
     assert!(body.locals.uses.is_empty());
     assert!(result.lambda_captures().is_empty());
 }

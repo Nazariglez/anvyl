@@ -13,6 +13,8 @@ pub mod span;
 
 pub(crate) mod collection_effect;
 pub(crate) mod conditional;
+pub(crate) mod semantic_id;
+pub(crate) mod source_ast;
 pub(crate) mod typecheck;
 
 #[cfg(test)]

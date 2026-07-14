@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anvyx_semantics::{display_float, float_to_int, int_to_float};
 
 use super::{
@@ -7,9 +9,9 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstValue, ExprId, ExprKind,
-        ExprNode, FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type, TypeFolder,
-        UnaryOp,
+        ArrayLen, BinaryOp, CastNode, ConstArg, ConstDeclNode, ConstExpr, ConstValue, ExprId,
+        ExprKind, ExprNode, FieldAccessNode, Ident, Lit, Program, Stmt, StringPart, Type,
+        TypeFolder, UnaryOp,
     },
     span::{SourceSpan, Span},
 };
@@ -110,6 +112,17 @@ pub(super) fn const_type(value: &ConstValue) -> Type {
     value.ty()
 }
 
+fn const_expr_has_param(expr: &ConstExpr) -> bool {
+    match expr {
+        ConstExpr::Param(_) => true,
+        ConstExpr::Unary(_, expr) => const_expr_has_param(expr),
+        ConstExpr::Binary(_, left, right) => {
+            const_expr_has_param(left) || const_expr_has_param(right)
+        }
+        ConstExpr::Value(_) => false,
+    }
+}
+
 pub(super) fn const_usize(value: &ConstValue, span: Option<SourceSpan>) -> ConstEvalResult<usize> {
     match value {
         ConstValue::Int(value) => usize::try_from(*value).map_err(|_| {
@@ -178,6 +191,13 @@ impl TypeChecker {
                 Some(term) => self.eval_const_term(term, span, warn_deprecated),
                 None => Some(ConstTerm::Param(id)),
             },
+            ConstTerm::Expr(expr) => {
+                self.normalize_symbolic_const_expr(expr, span)
+                    .map(|expr| match expr {
+                        ConstExpr::Value(value) => ConstTerm::Value(value),
+                        expr => ConstTerm::Expr(expr),
+                    })
+            }
             ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
         }
     }
@@ -203,6 +223,16 @@ impl TypeChecker {
                 });
                 None
             }
+            ConstTerm::Expr(expr) => match self.normalize_symbolic_const_expr(expr, span)? {
+                ConstExpr::Value(value) => match const_usize(&value, self.error_span(span)) {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        self.push_error(err);
+                        None
+                    }
+                },
+                _ => None,
+            },
             ConstTerm::Param(_) | ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
         }
     }
@@ -221,11 +251,78 @@ impl TypeChecker {
             ConstTerm::Value(_) | ConstTerm::Name(_) => self
                 .require_usize_const(term, span, true)
                 .map(ArrayLen::Fixed),
+            ConstTerm::Expr(expr) => match self.normalize_symbolic_const_expr(expr, span)? {
+                ConstExpr::Value(value) => const_usize(&value, self.error_span(span))
+                    .map(ArrayLen::Fixed)
+                    .map_err(|error| self.push_error(error))
+                    .ok(),
+                expr => Some(ArrayLen::Expr(expr)),
+            },
             ConstTerm::Infer(_) => None,
         }
     }
 
+    fn normalize_symbolic_const_expr(&mut self, expr: ConstExpr, span: Span) -> Option<ConstExpr> {
+        match expr {
+            ConstExpr::Value(_) => Some(expr),
+            ConstExpr::Param(id) => {
+                let term = self
+                    .const_substs
+                    .last()
+                    .and_then(|subst| subst.get(&id).cloned());
+                match term {
+                    Some(ConstTerm::Value(value)) => Some(ConstExpr::Value(value)),
+                    Some(ConstTerm::Param(id)) => Some(ConstExpr::Param(id)),
+                    Some(ConstTerm::Expr(expr)) => self.normalize_symbolic_const_expr(expr, span),
+                    Some(ConstTerm::Name(name)) => self
+                        .eval_const_term(ConstTerm::Name(name), span, true)
+                        .and_then(|term| match term {
+                            ConstTerm::Value(value) => Some(ConstExpr::Value(value)),
+                            _ => None,
+                        }),
+                    Some(ConstTerm::ArrayInfer | ConstTerm::Infer(_)) => None,
+                    None => Some(ConstExpr::Param(id)),
+                }
+            }
+            ConstExpr::Unary(op, expr) => {
+                let expr = self.normalize_symbolic_const_expr(*expr, span)?;
+                if let ConstExpr::Value(value) = expr {
+                    match eval_unary(op, value, self.error_span(span)) {
+                        Ok(value) => Some(ConstExpr::Value(value)),
+                        Err(error) => {
+                            self.push_error(error);
+                            None
+                        }
+                    }
+                } else {
+                    Some(ConstExpr::Unary(op, Box::new(expr)))
+                }
+            }
+            ConstExpr::Binary(op, left, right) => {
+                let left = self.normalize_symbolic_const_expr(*left, span)?;
+                let right = self.normalize_symbolic_const_expr(*right, span)?;
+                match (left, right) {
+                    (ConstExpr::Value(left), ConstExpr::Value(right)) => {
+                        match eval_binary(op, left, right, self.error_span(span)) {
+                            Ok(value) => Some(ConstExpr::Value(value)),
+                            Err(error) => {
+                                self.push_error(error);
+                                None
+                            }
+                        }
+                    }
+                    (left, right) => Some(ConstExpr::Binary(op, Box::new(left), Box::new(right))),
+                }
+            }
+        }
+    }
+
     pub(super) fn normalize_const_arg(&mut self, arg: &ConstArg, span: Span) -> ConstArg {
+        if let ConstArg::Name(name) = arg
+            && let Some(param) = self.local_const_param(*name)
+        {
+            return ConstArg::Param(param);
+        }
         let Some(term) = self.eval_const_term(ConstTerm::from_arg(arg), span, true) else {
             return arg.clone();
         };
@@ -233,8 +330,85 @@ impl TypeChecker {
     }
 
     pub(super) fn normalize_array_len(&mut self, len: ArrayLen, span: Span) -> ArrayLen {
+        if let ArrayLen::Named(name) = &len
+            && let Some(expr) = self.symbolic_local_const(*name)
+        {
+            return match expr {
+                ConstExpr::Param(id) => ArrayLen::Param(id),
+                expr => ArrayLen::Expr(expr),
+            };
+        }
         self.array_len_from_term(ConstTerm::from_array_len(len), span)
             .unwrap_or(ArrayLen::Infer)
+    }
+
+    fn symbolic_local_const(&self, name: Ident) -> Option<ConstExpr> {
+        let id = self.local_const_id_in_env(name, None)?;
+        let mut visiting = HashSet::new();
+        let expr = self.symbolic_local_const_id(id, &mut visiting)?;
+        const_expr_has_param(&expr).then_some(expr)
+    }
+
+    fn symbolic_local_const_id(
+        &self,
+        id: LocalConstId,
+        visiting: &mut HashSet<LocalConstId>,
+    ) -> Option<ConstExpr> {
+        if !visiting.insert(id) {
+            return None;
+        }
+        let entry = self.local_consts.get(id.0 as usize)?;
+        let expr = self.symbolic_const_expr(&entry.value, Some(&entry.env), visiting);
+        visiting.remove(&id);
+        expr
+    }
+
+    fn symbolic_const_expr(
+        &self,
+        expr: &ExprNode,
+        env: Option<&CallableTemplateEnv>,
+        visiting: &mut HashSet<LocalConstId>,
+    ) -> Option<ConstExpr> {
+        match &expr.node.kind {
+            ExprKind::Lit(lit) => lit.const_value().map(ConstExpr::Value),
+            ExprKind::Ident(name) => {
+                if let Some(id) = self
+                    .generic_contexts
+                    .iter()
+                    .rev()
+                    .find_map(|context| context.const_param(*name))
+                {
+                    return Some(ConstExpr::Param(id));
+                }
+                let id = self.local_const_id_in_env(*name, env)?;
+                self.symbolic_local_const_id(id, visiting)
+            }
+            ExprKind::Unary(node) => Some(ConstExpr::Unary(
+                node.node.op,
+                Box::new(self.symbolic_const_expr(&node.node.expr, env, visiting)?),
+            )),
+            ExprKind::Binary(node) => Some(ConstExpr::Binary(
+                node.node.op,
+                Box::new(self.symbolic_const_expr(&node.node.left, env, visiting)?),
+                Box::new(self.symbolic_const_expr(&node.node.right, env, visiting)?),
+            )),
+            _ => None,
+        }
+    }
+
+    fn local_const_param(&self, name: Ident) -> Option<crate::ast::ConstParamId> {
+        let (LocalSymbol::Value(symbol), _) = self.lookup_local_symbol(name)? else {
+            return None;
+        };
+        let id = symbol.local_const?;
+        let entry = self.local_consts.get(id.0 as usize)?;
+        let ExprKind::Ident(param) = entry.value.node.kind else {
+            return None;
+        };
+        self.generic_contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.const_param(param))
     }
 
     pub(super) fn collect_const_decls(&mut self, module: &ModuleScope, program: &Program) {
@@ -296,6 +470,102 @@ impl TypeChecker {
                 self.push_error(err);
             }
         }
+    }
+
+    pub(super) fn expr_depends_on_const_params(
+        &self,
+        expr: &ExprNode,
+        params: &HashSet<Ident>,
+    ) -> bool {
+        self.expr_depends_on_const_params_inner(expr, params, None, &mut HashSet::new())
+    }
+
+    fn expr_depends_on_const_params_inner(
+        &self,
+        expr: &ExprNode,
+        params: &HashSet<Ident>,
+        env: Option<&CallableTemplateEnv>,
+        visiting: &mut HashSet<LocalConstId>,
+    ) -> bool {
+        match &expr.node.kind {
+            ExprKind::Ident(name) => {
+                if params.contains(name) {
+                    return true;
+                }
+                let Some(id) = self.local_const_id_in_env(*name, env) else {
+                    return false;
+                };
+                if !visiting.insert(id) {
+                    return false;
+                }
+                let depends = self.local_consts.get(id.0 as usize).is_some_and(|entry| {
+                    self.expr_depends_on_const_params_inner(
+                        &entry.value,
+                        params,
+                        Some(&entry.env),
+                        visiting,
+                    )
+                });
+                visiting.remove(&id);
+                depends
+            }
+            ExprKind::Unary(node) => {
+                self.expr_depends_on_const_params_inner(&node.node.expr, params, env, visiting)
+            }
+            ExprKind::Binary(node) => {
+                self.expr_depends_on_const_params_inner(&node.node.left, params, env, visiting)
+                    || self.expr_depends_on_const_params_inner(
+                        &node.node.right,
+                        params,
+                        env,
+                        visiting,
+                    )
+            }
+            ExprKind::Cast(node) | ExprKind::FailableCast(node) => {
+                self.expr_depends_on_const_params_inner(&node.node.expr, params, env, visiting)
+            }
+            ExprKind::Ternary(node) => {
+                self.expr_depends_on_const_params_inner(&node.node.cond, params, env, visiting)
+                    || self.expr_depends_on_const_params_inner(
+                        &node.node.then_expr,
+                        params,
+                        env,
+                        visiting,
+                    )
+                    || self.expr_depends_on_const_params_inner(
+                        &node.node.else_expr,
+                        params,
+                        env,
+                        visiting,
+                    )
+            }
+            ExprKind::StringInterp(parts) => parts.iter().any(|part| match part {
+                StringPart::Expr(expr, _) => {
+                    self.expr_depends_on_const_params_inner(expr, params, env, visiting)
+                }
+                StringPart::Text(_) => false,
+            }),
+            ExprKind::Lit(_) | ExprKind::Field(_) => false,
+            _ => false,
+        }
+    }
+
+    fn local_const_id_in_env(
+        &self,
+        name: Ident,
+        env: Option<&CallableTemplateEnv>,
+    ) -> Option<LocalConstId> {
+        let symbol = match env {
+            Some(CallableTemplateEnv::Local(state)) => {
+                state.scopes.iter().rev().find_map(|scope| scope.get(&name))
+            }
+            Some(CallableTemplateEnv::SourceModule) => None,
+            None => self.lookup_local_symbol(name).map(|(symbol, _)| symbol),
+        };
+        let LocalSymbol::Value(symbol) = symbol? else {
+            return None;
+        };
+        symbol.local_const
     }
 
     pub(super) fn eval_const_expr(
@@ -769,7 +1039,7 @@ fn bool_operand(
     }
 }
 
-fn eval_unary(
+pub(super) fn eval_unary(
     op: UnaryOp,
     value: ConstValue,
     span: Option<SourceSpan>,
@@ -790,7 +1060,7 @@ fn eval_unary(
     }
 }
 
-fn eval_binary(
+pub(super) fn eval_binary(
     op: BinaryOp,
     left: ConstValue,
     right: ConstValue,

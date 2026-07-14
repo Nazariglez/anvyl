@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: required parameter 'second' cannot follow a default parameter
+
+fn main() {
+    struct Bad {
+        fn order(self, first: int = 1, second: int) {}
+    }
+}

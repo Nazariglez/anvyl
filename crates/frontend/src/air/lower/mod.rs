@@ -37,7 +37,8 @@ use crate::{
     },
     collection_effect,
     externs::catalog::{ExternCatalog, ExternLoweringInfo},
-    resolve::{PackageModulePath, ResolveResult},
+    resolve::PackageModulePath,
+    semantic_id::NominalId,
     source::SourceId,
     span::SourceSpan,
     typecheck::{
@@ -49,16 +50,16 @@ use crate::{
         ContractParamSchema, ContractReturnSchema, ContractSurfaceId as SemanticContractSurfaceId,
         ContractSurfaceSchemas, ContractTypeSchema, CoreRangeKind, DeclarationIndex,
         DefaultArgFact, DefaultExprSite, DynCallFact, DynDowncastSource, EnumRepr as TcEnumRepr,
-        ExtendId, ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind,
-        FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
-        GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, IterRuntimeCheckKind,
-        LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
-        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
-        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
-        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
-        TypecheckFacts, UserCastSite, VariantPayload, WitnessId as SemanticWitnessId,
-        WitnessSlotTarget, generic_args_are_concrete, nominal_generic_args, nominal_key_for_type,
-        substitute_aggregate_member, type_has_unfinished_facts,
+        ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin,
+        GenericArgs, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect,
+        GlobalKey, GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
+        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
+        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
+        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
+        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
+        UserCastSite, VariantPayload, WitnessId as SemanticWitnessId, WitnessSlotTarget,
+        generic_args_are_concrete, nominal_generic_args, nominal_id_for_type,
+        nominal_type_with_args, substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
 
@@ -242,9 +243,19 @@ impl<'a> SemanticCallableFacts<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TypeCacheKey {
+    Source(Type),
+    Nominal {
+        id: NominalId,
+        type_args: Vec<TypeId>,
+        const_args: Vec<ast::ConstArg>,
+    },
+}
+
 #[derive(Debug, Default)]
 struct TypeLowerer {
-    cache: HashMap<Type, TypeId>,
+    cache: HashMap<TypeCacheKey, TypeId>,
 }
 
 struct TypeLowerEnv<'a, 'b> {
@@ -299,7 +310,7 @@ impl TypeLowerer {
         ty: &Type,
         mut env: TypeLowerEnv<'_, '_>,
     ) -> Result<TypeId, LowerError> {
-        if let Some(id) = self.cache.get(ty).copied() {
+        if let Some(id) = self.cache.get(&TypeCacheKey::Source(ty.clone())).copied() {
             return Ok(id);
         }
 
@@ -313,7 +324,7 @@ impl TypeLowerer {
             Type::Optional { inner } => {
                 let inner = self.lower_with_env(program, inner, env)?;
                 let id = optional_ty(program, inner);
-                self.cache.insert(ty.clone(), id);
+                self.cache.insert(TypeCacheKey::Source(ty.clone()), id);
                 return Ok(id);
             }
             Type::Tuple(elems) => TypeData::Tuple(
@@ -383,7 +394,7 @@ impl TypeLowerer {
         };
 
         let id = intern_structural_type(program, data);
-        self.cache.insert(ty.clone(), id);
+        self.cache.insert(TypeCacheKey::Source(ty.clone()), id);
         Ok(id)
     }
 
@@ -417,7 +428,7 @@ impl TypeLowerer {
                 });
             };
             let id = optional_ty(program, *inner);
-            self.cache.insert(ty.clone(), id);
+            self.cache.insert(TypeCacheKey::Source(ty.clone()), id);
             return Ok(id);
         }
         if decls.enum_schema(&key).is_some() {
@@ -436,7 +447,9 @@ impl TypeLowerer {
         decls: &DeclarationIndex,
         key: &NominalKey,
     ) -> Result<TypeId, LowerError> {
-        let schema = decls.aggregate(key).expect("aggregate schema exists");
+        let schema = decls
+            .aggregate_for_type(ty)
+            .expect("aggregate schema exists");
         let module = ensure_module(program, env.modules, &key.module);
         let kind = if key.kind == ast::NominalKind::DataRef {
             AggregateKind::DataRef
@@ -444,31 +457,13 @@ impl TypeLowerer {
             AggregateKind::Struct
         };
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
-        let const_args = nominal_const_args(ty);
-        if let Some(id) = program
-            .aggregates
-            .iter()
-            .enumerate()
-            .find(|(_, decl)| {
-                decl.module == module
-                    && decl.name == key.name
-                    && decl.kind == kind
-                    && decl.type_args == type_args
-                    && decl.const_args == const_args
-            })
-            .and_then(|(index, _)| {
-                let agg = super::AggregateId::from_index(index);
-                program
-                    .type_arena
-                    .iter()
-                    .position(|data| match kind {
-                        AggregateKind::Struct => data == &TypeData::Aggregate(agg),
-                        AggregateKind::DataRef => data == &TypeData::DataRef(agg),
-                    })
-                    .map(TypeId::from_index)
-            })
-        {
-            self.cache.insert(ty.clone(), id);
+        let (const_key, const_args) = nominal_const_args(ty);
+        let cache_key = TypeCacheKey::Nominal {
+            id: key.id.clone(),
+            type_args: type_args.clone(),
+            const_args: const_key,
+        };
+        if let Some(id) = self.cache.get(&cache_key).copied() {
             return Ok(id);
         }
         let agg = program.alloc_aggregate(AggregateDecl {
@@ -486,12 +481,13 @@ impl TypeLowerer {
             AggregateKind::Struct => TypeData::Aggregate(agg),
             AggregateKind::DataRef => TypeData::DataRef(agg),
         });
-        self.cache.insert(ty.clone(), id);
+        self.cache.insert(cache_key, id);
+        let generics = schema.all_generics();
         let fields = schema
             .fields
             .iter()
             .map(|(name, field)| {
-                let field_ty = substitute_aggregate_member(ty, &schema.generics, &field.ty);
+                let field_ty = substitute_aggregate_member(ty, &generics, &field.ty);
                 Ok(FieldDecl {
                     name,
                     ty: self.lower_with_env(program, &field_ty, env.reborrow())?,
@@ -510,30 +506,16 @@ impl TypeLowerer {
         decls: &DeclarationIndex,
         key: &NominalKey,
     ) -> Result<TypeId, LowerError> {
-        let schema = decls.enum_schema(key).expect("enum schema exists");
+        let schema = decls.enum_schema_for_type(ty).expect("enum schema exists");
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
-        let const_args = nominal_const_args(ty);
-        if let Some(id) = program
-            .enums
-            .iter()
-            .enumerate()
-            .find(|(_, decl)| {
-                decl.module == module
-                    && decl.name == key.name
-                    && decl.type_args == type_args
-                    && decl.const_args == const_args
-            })
-            .and_then(|(index, _)| {
-                let enum_id = super::EnumId::from_index(index);
-                program
-                    .type_arena
-                    .iter()
-                    .position(|data| data == &TypeData::Enum(enum_id))
-                    .map(TypeId::from_index)
-            })
-        {
-            self.cache.insert(ty.clone(), id);
+        let (const_key, const_args) = nominal_const_args(ty);
+        let cache_key = TypeCacheKey::Nominal {
+            id: key.id.clone(),
+            type_args: type_args.clone(),
+            const_args: const_key,
+        };
+        if let Some(id) = self.cache.get(&cache_key).copied() {
             return Ok(id);
         }
         let raw_type = decls
@@ -552,7 +534,8 @@ impl TypeLowerer {
         });
         program.module_mut(module).enums.push(enum_id);
         let id = program.alloc_type(TypeData::Enum(enum_id));
-        self.cache.insert(ty.clone(), id);
+        self.cache.insert(cache_key, id);
+        let generics = schema.all_generics();
         let variants = schema
             .variants
             .iter()
@@ -563,7 +546,7 @@ impl TypeLowerer {
                         items
                             .iter()
                             .map(|item| {
-                                let item = substitute_aggregate_member(ty, &schema.generics, item);
+                                let item = substitute_aggregate_member(ty, &generics, item);
                                 self.lower_with_env(program, &item, env.reborrow())
                             })
                             .collect::<Result<Vec<_>, _>>()?,
@@ -573,7 +556,7 @@ impl TypeLowerer {
                             .iter()
                             .map(|(field_name, field)| {
                                 let field_ty =
-                                    substitute_aggregate_member(ty, &schema.generics, &field.ty);
+                                    substitute_aggregate_member(ty, &generics, &field.ty);
                                 Ok(FieldDecl {
                                     name: field_name,
                                     ty: self.lower_with_env(program, &field_ty, env.reborrow())?,
@@ -609,7 +592,15 @@ impl TypeLowerer {
         let source = externs.ty(source_id);
         let module = ensure_module(program, env.modules, &key.module);
         let type_args = self.nominal_type_args(program, ty, env.reborrow())?;
-        let const_args = nominal_const_args(ty);
+        let (const_key, const_args) = nominal_const_args(ty);
+        let cache_key = TypeCacheKey::Nominal {
+            id: key.id.clone(),
+            type_args: type_args.clone(),
+            const_args: const_key,
+        };
+        if let Some(id) = self.cache.get(&cache_key).copied() {
+            return Ok(id);
+        }
         let binding = externs
             .type_lowering_info(source_id)
             .map(|info| ExternTypeBindingDecl {
@@ -641,7 +632,7 @@ impl TypeLowerer {
         });
         program.module_mut(module).extern_types.push(extern_id);
         let id = program.alloc_type(TypeData::Extern(extern_id));
-        self.cache.insert(ty.clone(), id);
+        self.cache.insert(cache_key, id);
 
         let fields = source
             .fields
@@ -996,10 +987,13 @@ fn lower_extern_op(op: anvyx_externs::ExternOperator) -> ExternOp {
     }
 }
 
-fn nominal_const_args(ty: &Type) -> Vec<String> {
-    ty.as_nominal()
-        .map(|nominal| nominal.const_args.iter().map(ToString::to_string).collect())
-        .unwrap_or_default()
+fn nominal_const_args(ty: &Type) -> (Vec<ast::ConstArg>, Vec<String>) {
+    let args = ty
+        .as_nominal()
+        .map(|nominal| nominal.const_args.clone())
+        .unwrap_or_default();
+    let display = args.iter().map(ToString::to_string).collect();
+    (args, display)
 }
 
 fn ensure_module(
@@ -1064,7 +1058,6 @@ struct LowerCx<'facts> {
     decls: Option<DeclarationIndex>,
     externs: Option<ExternCatalog>,
     contract_surfaces: Option<ContractSurfaceSchemas>,
-    contract_type_cache: HashMap<ContractTypeSchema, TypeId>,
     typecheck_facts: Option<&'facts TypecheckFacts>,
 }
 
@@ -1150,17 +1143,13 @@ impl LowerCx<'_> {
         &mut self,
         schema: &ContractTypeSchema,
     ) -> Result<TypeId, LowerError> {
-        if let Some(id) = self.contract_type_cache.get(schema) {
-            return Ok(*id);
-        }
         let surfaces = self
             .contract_surfaces
             .as_ref()
             .expect("contract surfaces are available");
-        let ty = contract_schema_source_type(schema, surfaces);
-        let id = self.lower_ty(&ty)?;
-        self.contract_type_cache.insert(schema.clone(), id);
-        Ok(id)
+        let decls = self.decls.as_ref().expect("declarations are available");
+        let ty = contract_schema_source_type(schema, surfaces, decls);
+        self.lower_ty(&ty)
     }
 
     fn lower_contract_declarations(
@@ -1894,23 +1883,11 @@ impl LowerCx<'_> {
         &mut self,
         key: &NominalKey,
     ) -> Result<crate::air::ExternTypeId, LowerError> {
-        let ty = Type::nominal_with_origin(
-            ast::NominalKind::Extern,
-            key.name,
-            vec![],
-            vec![],
-            key.module.nominal_origin(),
-        );
+        let ty = crate::typecheck::nominal_type(key);
         let ty = self.lower_ty(&ty)?;
         let TypeData::Extern(owner) = self.program.type_data(ty) else {
             return Err(LowerError::UnsupportedType {
-                ty: Box::new(Type::nominal_with_origin(
-                    ast::NominalKind::Extern,
-                    key.name,
-                    vec![],
-                    vec![],
-                    key.module.nominal_origin(),
-                )),
+                ty: Box::new(crate::typecheck::nominal_type(key)),
             });
         };
         Ok(*owner)
@@ -1930,13 +1907,13 @@ impl LowerCx<'_> {
 
     fn lower_function_shells(
         &mut self,
-        modules: &SourceModules<'_>,
+        modules: &[ModuleScope],
         functions: &ReachableItems<'_>,
     ) -> Result<(), LowerError> {
         for source in &functions.items {
             match &source.source {
                 ReachableSource::Callable { callable, fact } => {
-                    let module_scope = &modules.items[callable.module()].scope;
+                    let module_scope = &modules[callable.module()];
                     let return_mode = if fact.ret.is_iter() {
                         ReturnMode::Value(self.lower_ty(&Type::Void)?)
                     } else {
@@ -2025,7 +2002,7 @@ impl LowerCx<'_> {
                     );
                 }
                 ReachableSource::Global { global, sig } => {
-                    let module_scope = &modules.items[global.module].scope;
+                    let module_scope = &modules[global.module];
                     let ty = self.lower_ty(&sig.ty)?;
                     let mutability = lower_global_mutability(sig.mutability);
                     self.alloc_global_in_module(
@@ -2058,7 +2035,7 @@ impl LowerCx<'_> {
                     );
                 }
                 ReachableSource::CastFrom { cast, signature } => {
-                    let module_scope = &modules.items[cast.module].scope;
+                    let module_scope = &modules[cast.module];
                     let return_type = self.lower_ty(&signature.ret)?;
                     let (params, locals, local_map) = self.lower_params(
                         source,
@@ -2235,6 +2212,7 @@ impl LowerCx<'_> {
                 ConstTerm::Value(value) => Ok(lower_const_specialization_value(value)),
                 ConstTerm::Name(_)
                 | ConstTerm::Param(_)
+                | ConstTerm::Expr(_)
                 | ConstTerm::ArrayInfer
                 | ConstTerm::Infer(_) => Err(LowerError::UnsupportedCallableInstance {
                     id: Box::new(key.target.clone()),
@@ -2349,7 +2327,6 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
     index: &'facts SourceProgramIndex<'facts>,
     body_facts: &'facts HashMap<BodyInstanceKey, SemanticBodyFacts>,
     callable_facts: &'facts SemanticCallableFacts<'facts>,
-    default_facts: &'facts DefaultExprFactsIndex<'facts>,
     function_id: FunctionId,
     source: SourceId,
     function: Function,
@@ -2429,7 +2406,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             index: functions.index,
             body_facts: functions.body_facts,
             callable_facts: functions.callable_facts,
-            default_facts: &functions.default_facts,
             function_id,
             source,
             function,
@@ -3187,6 +3163,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_stmt(&mut self, stmt: &StmtNode) -> Result<(), LowerError> {
+        if matches!(
+            stmt.node,
+            Stmt::Const(_)
+                | Stmt::TypeAlias(_)
+                | Stmt::Aggregate(_)
+                | Stmt::Enum(_)
+                | Stmt::Func(_)
+        ) {
+            return Ok(());
+        }
         if self.terminated {
             return Err(LowerError::UnsupportedStmt {
                 kind: "statement after terminator",
@@ -3209,7 +3195,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             Stmt::For(for_) => self.lower_for(&for_.node),
             Stmt::Break => self.lower_loop_tail(stmt, AirTail::Break),
             Stmt::Continue => self.lower_loop_tail(stmt, AirTail::Continue),
-            Stmt::Const(_) => Ok(()),
             _ => Err(LowerError::UnsupportedStmt {
                 kind: stmt_kind(&stmt.node),
                 span: Some(self.source_span(stmt.span)),
@@ -4818,7 +4803,19 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
-    fn lower_projected_place(&mut self, expr: &ExprNode, root: Place) -> Result<Place, LowerError> {
+    fn lower_projected_place(
+        &mut self,
+        expr: &ExprNode,
+        mut root: Place,
+    ) -> Result<Place, LowerError> {
+        if let Some(fact) = self.facts.member_paths.get(&expr.node.id).cloned()
+            && fact.kind == MemberPathKind::MethodReceiver
+        {
+            for field in fact.path {
+                root = self.project_field(expr, root, field)?;
+            }
+            return Ok(root);
+        }
         self.lower_projected_place_from(expr, None, root)
     }
 
@@ -7034,7 +7031,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             };
             if values.contains_key(&default.field)
                 || !default_keys.insert((default.slot, default.field))
-                || nominal_key_for_type(&default.owner) != Some(default.owner_key.clone())
+                || nominal_id_for_type(&default.owner) != Some(&default.owner_key.id)
                 || self.cx.lower_ty(&default.owner)? != ty_id
                 || self.cx.lower_ty(&default.ty)? != *field_ty
             {
@@ -7067,21 +7064,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         default: &crate::typecheck::DefaultFieldFact,
         ty: TypeId,
     ) -> Result<Operand, LowerError> {
-        let Some(default_expr) = self
-            .index
-            .get_default_expr(&SourceDefaultKey::AggregateField {
-                owner: default.owner_key.clone(),
-                field: default.field,
-                slot: default.slot,
-                source: default.default.source,
-                expr: default.default.expr,
-            })
-        else {
+        let Some(default_expr) = self.index.get_default_expr(default.default) else {
             return Err(unsupported_expr(expr));
         };
         let default_expr = (*default_expr).clone();
-        let body = BodyInstanceKey::Module(default.owner_key.module.clone());
-        self.with_default_facts(default.default, &body, |this| {
+        self.with_default_facts(default.default, &default.facts_body, |this| {
             this.lower_expected_value(&default_expr, ty, expr)
         })
     }
@@ -8763,6 +8750,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         call: &ast::CallNode,
     ) -> Result<RValue, LowerError> {
+        let receiver = self.project_promoted_method_receiver(receiver, &call.node.func)?;
         let target = self
             .facts
             .calls
@@ -8809,6 +8797,28 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             callee: Callee::Function(callee),
             args,
         })
+    }
+
+    fn project_promoted_method_receiver(
+        &mut self,
+        receiver: Operand,
+        func: &ExprNode,
+    ) -> Result<Operand, LowerError> {
+        let Some(fact) = self.facts.member_paths.get(&func.node.id).cloned() else {
+            return Ok(receiver);
+        };
+        if fact.kind != MemberPathKind::MethodReceiver {
+            return Ok(receiver);
+        }
+        let origin_ty = self.cx.lower_ty(&fact.origin_owner)?;
+        if self.operand_ty(&receiver) == origin_ty {
+            return Ok(receiver);
+        }
+        let mut place = self.place_from_operand(receiver, func)?;
+        for field in fact.path {
+            place = self.project_field(func, place, field)?;
+        }
+        Ok(Operand::Place(place))
     }
 
     fn lower_dyn_borrow_arg(&mut self, expr: &ExprNode, ty: TypeId) -> Result<CallArg, LowerError> {
@@ -9163,6 +9173,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let Some(variant) = self.enum_variant_id(enum_id, target.id.name) else {
                 return Err(unsupported_expr(expr));
             };
+            let Some(key) = self.cx.decls.as_ref().and_then(|decls| decls.nominal(key)) else {
+                return Err(unsupported_expr(expr));
+            };
             if self.cx.program.enum_decl(enum_id).name != key.name {
                 return Err(unsupported_expr(expr));
             }
@@ -9187,6 +9200,23 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 fields,
                 ty: ty_id,
             });
+        }
+        if target.id.kind.has_receiver_param()
+            && self
+                .facts
+                .member_paths
+                .get(&call.node.func.node.id)
+                .is_some_and(|fact| fact.kind == MemberPathKind::MethodReceiver)
+        {
+            let ExprKind::Field(_) = &call.node.func.node.kind else {
+                return Err(unsupported_expr(&call.node.func));
+            };
+            let receiver = self.lower_place_arg(&call.node.func, false)?;
+            return self.lower_method_call_rvalue_with_receiver(
+                Operand::Place(receiver),
+                expr,
+                call,
+            );
         }
         if target.form != CallForm::Normal {
             return Err(LowerError::UnsupportedCallForm {
@@ -10031,19 +10061,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if matches!(param.mode, ParamMode::MutBorrow) {
             return Err(error());
         }
-        let Some(expr) = self
-            .index
-            .get_default_expr(&SourceDefaultKey::CallableParam {
-                target: fact.callee.target.clone(),
-                source: fact.default.source,
-                expr: fact.default.expr,
-            })
-        else {
+        let Some(expr) = self.index.get_default_expr(fact.default) else {
             return Err(error());
         };
         let expr = (*expr).clone();
-        let default_body = BodyInstanceKey::Module(fact.callee.target.module.clone());
-        self.with_default_facts(fact.default, &default_body, |this| {
+        self.with_default_facts(fact.default, &fact.facts_body, |this| {
             let value = this.lower_expected_value(&expr, param.ty, &expr)?;
             this.lower_operand_call_arg(value, param, &expr)
         })
@@ -10059,7 +10081,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         body: &BodyInstanceKey,
         lower: impl FnOnce(&mut Self) -> Result<R, LowerError>,
     ) -> Result<R, LowerError> {
-        let facts = self.default_facts.get(site, body)?;
+        let facts = self
+            .body_facts
+            .get(body)
+            .ok_or(LowerError::MissingDefaultExprFacts { site })?;
         let old_facts = std::mem::replace(&mut self.facts, facts);
         let result = lower(self);
         self.facts = old_facts;
@@ -10804,6 +10829,7 @@ fn enum_core_kind(decls: &DeclarationIndex, key: &NominalKey) -> Option<CoreEnum
 fn contract_schema_source_type(
     schema: &ContractTypeSchema,
     surfaces: &ContractSurfaceSchemas,
+    decls: &DeclarationIndex,
 ) -> Type {
     match schema {
         ContractTypeSchema::Any => Type::Any,
@@ -10818,7 +10844,7 @@ fn contract_schema_source_type(
                 .iter()
                 .map(|param| {
                     ast::FuncParam::new(
-                        contract_schema_source_type(&param.ty, surfaces),
+                        contract_schema_source_type(&param.ty, surfaces, decls),
                         param.mutable,
                         param.cast_accept,
                         param.escape,
@@ -10827,10 +10853,10 @@ fn contract_schema_source_type(
                 .collect(),
             ret: Box::new(match ret.as_ref() {
                 ContractReturnSchema::Value(ty) => {
-                    ast::ReturnSpec::value(contract_schema_source_type(ty, surfaces))
+                    ast::ReturnSpec::value(contract_schema_source_type(ty, surfaces, decls))
                 }
                 ContractReturnSchema::Place(ty) => {
-                    ast::ReturnSpec::place(contract_schema_source_type(ty, surfaces))
+                    ast::ReturnSpec::place(contract_schema_source_type(ty, surfaces, decls))
                 }
                 ContractReturnSchema::Iter => ast::ReturnSpec::iter(),
             }),
@@ -10843,41 +10869,39 @@ fn contract_schema_source_type(
         ContractTypeSchema::Tuple(items) => Type::Tuple(
             items
                 .iter()
-                .map(|item| contract_schema_source_type(item, surfaces))
+                .map(|item| contract_schema_source_type(item, surfaces, decls))
                 .collect(),
         ),
         ContractTypeSchema::Nominal {
-            kind,
-            name,
+            id,
             type_args,
             const_args,
-            origin,
-        } => Type::nominal_with_origin(
-            *kind,
-            *name,
-            type_args
+        } => {
+            let key = decls
+                .nominal(id)
+                .expect("contract nominal missing registry metadata");
+            let type_args = type_args
                 .iter()
-                .map(|arg| contract_schema_source_type(arg, surfaces))
-                .collect(),
-            const_args.clone(),
-            origin.clone(),
-        ),
+                .map(|arg| contract_schema_source_type(arg, surfaces, decls))
+                .collect::<Vec<_>>();
+            nominal_type_with_args(key, &type_args, const_args)
+        }
         ContractTypeSchema::List(elem) => Type::List {
-            elem: Box::new(contract_schema_source_type(elem, surfaces)),
+            elem: Box::new(contract_schema_source_type(elem, surfaces, decls)),
         },
         ContractTypeSchema::Array { elem, len } => Type::Array {
-            elem: Box::new(contract_schema_source_type(elem, surfaces)),
-            len: *len,
+            elem: Box::new(contract_schema_source_type(elem, surfaces, decls)),
+            len: len.clone(),
         },
         ContractTypeSchema::Map { key, value } => Type::Map {
-            key: Box::new(contract_schema_source_type(key, surfaces)),
-            value: Box::new(contract_schema_source_type(value, surfaces)),
+            key: Box::new(contract_schema_source_type(key, surfaces, decls)),
+            value: Box::new(contract_schema_source_type(value, surfaces, decls)),
         },
         ContractTypeSchema::Slice(elem) => Type::Slice {
-            elem: Box::new(contract_schema_source_type(elem, surfaces)),
+            elem: Box::new(contract_schema_source_type(elem, surfaces, decls)),
         },
         ContractTypeSchema::Optional(inner) => Type::Optional {
-            inner: Box::new(contract_schema_source_type(inner, surfaces)),
+            inner: Box::new(contract_schema_source_type(inner, surfaces, decls)),
         },
     }
 }
@@ -11004,15 +11028,26 @@ fn checked_extern_param(
     Ok(ExternParamDecl { ty, mode, escape })
 }
 
+#[cfg(test)]
 pub(crate) fn lower_with_modules(
     root: &ast::Program,
-    resolved: &ResolveResult,
+    resolved: &crate::resolve::ResolveResult,
+    semantic: &SemanticProgram,
+    typecheck_facts: &TypecheckFacts,
+    config: AirLowerConfig,
+) -> Result<Program, LowerError> {
+    let source_index = crate::source_ast::SourceAstIndex::new(root, resolved);
+    lower_with_source_index(source_index, semantic, typecheck_facts, config)
+}
+
+pub(crate) fn lower_with_source_index(
+    source_index: crate::source_ast::SourceAstIndex,
     semantic: &SemanticProgram,
     typecheck_facts: &TypecheckFacts,
     config: AirLowerConfig,
 ) -> Result<Program, LowerError> {
     validate_lambda_fact_carrier(typecheck_facts);
-    let index = SourceProgramIndex::new(root, resolved);
+    let index = SourceProgramIndex::new(&source_index, semantic);
     let callable_facts = SemanticCallableFacts::new(semantic);
     let AirLowerConfig { roots } = config;
     let entry = roots.entry.clone();
@@ -11027,7 +11062,7 @@ pub(crate) fn lower_with_modules(
         ..LowerCx::default()
     };
     cx.lower_contract_surfaces()?;
-    cx.lower_function_shells(&index.modules, &functions)?;
+    cx.lower_function_shells(&source_index.modules, &functions)?;
     ownership::finalize(&mut cx.program)
         .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
     cx.attach_stringify_overrides(&functions);
@@ -11186,55 +11221,9 @@ fn reject_any_types(program: &Program) -> Result<(), LowerError> {
 }
 
 #[derive(Debug)]
-struct SourceModules<'a> {
-    items: Vec<SourceModule<'a>>,
-}
-
-#[derive(Debug)]
-struct SourceModule<'a> {
-    scope: ModuleScope,
-    source: SourceId,
-    program: &'a ast::Program,
-}
-
-impl<'a> SourceModules<'a> {
-    fn new(root: &'a ast::Program, resolved: &'a ResolveResult) -> Self {
-        let items = DeclarationIndex::source_modules(root, resolved)
-            .into_iter()
-            .map(|module| SourceModule {
-                scope: module.scope,
-                source: module.source,
-                program: module.program,
-            })
-            .collect();
-        Self { items }
-    }
-}
-
-#[derive(Debug)]
 struct SourceProgramIndex<'a> {
-    modules: SourceModules<'a>,
+    source: &'a crate::source_ast::SourceAstIndex,
     callables: HashMap<CallableId, SourceCallable<'a>>,
-    globals: HashMap<GlobalKey, SourceGlobal<'a>>,
-    cast_froms: HashMap<(ExtendId, usize), SourceCastFrom<'a>>,
-    lambdas: HashMap<ExprId, &'a ast::LambdaNode>,
-    default_exprs: HashMap<SourceDefaultKey, &'a ExprNode>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum SourceDefaultKey {
-    CallableParam {
-        target: CallableId,
-        source: SourceId,
-        expr: ExprId,
-    },
-    AggregateField {
-        owner: NominalKey,
-        field: Ident,
-        slot: usize,
-        source: SourceId,
-        expr: ExprId,
-    },
 }
 
 fn source_const_matches_type(value: &ast::ConstValue, ty: &Type) -> bool {
@@ -11263,327 +11252,51 @@ fn lower_const_specialization_value(value: &ast::ConstValue) -> ConstValue {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SourceGlobal<'a> {
+struct SourceCallable<'a> {
     module: usize,
     source: SourceId,
-    node: &'a ast::GlobalDeclNode,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SourceCastFrom<'a> {
-    module: usize,
-    source: SourceId,
-    node: &'a ast::CastFromNode,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SourceCallable<'a> {
-    Function {
-        module: usize,
-        func: &'a ast::FuncNode,
-        source: SourceId,
-    },
-    AggregateMethod {
-        module: usize,
-        owner: Ident,
-        method: &'a ast::Method,
-        mode: MethodMode,
-        source: SourceId,
-    },
-    ExtendMethod {
-        module: usize,
-        method: &'a ast::ExtendMethod,
-        mode: MethodMode,
-        source: SourceId,
-    },
-}
-
-fn collect_block_lambdas<'a>(
-    block: &'a BlockNode,
-    lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>,
-) {
-    walk_block_exprs(block, &mut |expr| collect_lambda(expr, lambdas));
-}
-
-fn collect_expr_lambdas<'a>(
-    expr: &'a ExprNode,
-    lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>,
-) {
-    walk_exprs(expr, &mut |expr| collect_lambda(expr, lambdas));
-}
-
-fn collect_lambda<'a>(expr: &'a ExprNode, lambdas: &mut HashMap<ExprId, &'a ast::LambdaNode>) {
-    if let ExprKind::Lambda(lambda) = &expr.node.kind {
-        lambdas.insert(expr.node.id, lambda);
-    }
-}
-
-fn walk_block_exprs<'a>(block: &'a BlockNode, visit: &mut impl FnMut(&'a ExprNode)) {
-    for stmt in &block.node.stmts {
-        walk_stmt_exprs(stmt, visit);
-    }
-    if let Some(tail) = &block.node.tail {
-        walk_exprs(tail, visit);
-    }
-}
-
-fn walk_stmt_exprs<'a>(stmt: &'a StmtNode, visit: &mut impl FnMut(&'a ExprNode)) {
-    match &stmt.node {
-        Stmt::Expr(expr) => walk_exprs(expr, visit),
-        Stmt::Binding(binding) => walk_exprs(&binding.node.value, visit),
-        Stmt::LetElse(let_else) => {
-            walk_exprs(&let_else.node.value, visit);
-            match &let_else.node.fallback.node {
-                ast::LetElseFallback::Block(block) => walk_block_exprs(block, visit),
-                ast::LetElseFallback::Return(ret) => {
-                    if let Some(value) = &ret.node.value {
-                        walk_exprs(value, visit);
-                    }
-                }
-                ast::LetElseFallback::Break | ast::LetElseFallback::Continue => {}
-            }
-        }
-        Stmt::Return(ret) => {
-            if let Some(value) = &ret.node.value {
-                walk_exprs(value, visit);
-            }
-        }
-        Stmt::While(while_) => {
-            walk_exprs(&while_.node.cond, visit);
-            walk_block_exprs(&while_.node.body, visit);
-        }
-        Stmt::WhileLet(while_) => {
-            walk_exprs(&while_.node.value, visit);
-            walk_block_exprs(&while_.node.body, visit);
-        }
-        Stmt::For(for_) => {
-            walk_exprs(&for_.node.iterable, visit);
-            walk_block_exprs(&for_.node.body, visit);
-        }
-        Stmt::Defer(defer) => match &defer.node.body {
-            ast::DeferBody::Expr(expr) => walk_exprs(expr, visit),
-            ast::DeferBody::Block(block) => walk_block_exprs(block, visit),
-        },
-        Stmt::Global(global) => walk_exprs(&global.node.value, visit),
-        Stmt::Import(_)
-        | Stmt::Func(_)
-        | Stmt::ExternFunc(_)
-        | Stmt::ExternType(_)
-        | Stmt::Aggregate(_)
-        | Stmt::Enum(_)
-        | Stmt::Extend(_)
-        | Stmt::Const(_)
-        | Stmt::TypeAlias(_)
-        | Stmt::Contract(_)
-        | Stmt::Break
-        | Stmt::Continue => {}
-    }
-}
-
-fn walk_exprs<'a>(expr: &'a ExprNode, visit: &mut impl FnMut(&'a ExprNode)) {
-    visit(expr);
-    match &expr.node.kind {
-        ExprKind::Block(block) => walk_block_exprs(block, visit),
-        ExprKind::Call(call) => {
-            walk_exprs(&call.node.func, visit);
-            for arg in &call.node.args {
-                walk_exprs(arg, visit);
-            }
-        }
-        ExprKind::IterSource(iter) => walk_exprs(&iter.node.source, visit),
-        ExprKind::Binary(binary) => {
-            walk_exprs(&binary.node.left, visit);
-            walk_exprs(&binary.node.right, visit);
-        }
-        ExprKind::Unary(unary) => walk_exprs(&unary.node.expr, visit),
-        ExprKind::Assign(assign) => {
-            walk_exprs(&assign.node.target, visit);
-            walk_exprs(&assign.node.value, visit);
-        }
-        ExprKind::If(if_) => {
-            walk_exprs(&if_.node.cond, visit);
-            walk_block_exprs(&if_.node.then_block, visit);
-            if let Some(block) = &if_.node.else_block {
-                walk_block_exprs(block, visit);
-            }
-        }
-        ExprKind::Ternary(ternary) => {
-            walk_exprs(&ternary.node.cond, visit);
-            walk_exprs(&ternary.node.then_expr, visit);
-            walk_exprs(&ternary.node.else_expr, visit);
-        }
-        ExprKind::IfLet(if_) => {
-            walk_exprs(&if_.node.value, visit);
-            walk_block_exprs(&if_.node.then_block, visit);
-            if let Some(block) = &if_.node.else_block {
-                walk_block_exprs(block, visit);
-            }
-        }
-        ExprKind::Tuple(items) => {
-            for item in items {
-                walk_exprs(item, visit);
-            }
-        }
-        ExprKind::TupleIndex(tuple) => walk_exprs(&tuple.node.target, visit),
-        ExprKind::Field(field) => walk_exprs(&field.node.target, visit),
-        ExprKind::StructLiteral(literal) => {
-            for (_, value) in &literal.node.fields {
-                walk_exprs(value, visit);
-            }
-        }
-        ExprKind::Range(range) => match &range.node {
-            ast::Range::Bounded { start, end, .. } => {
-                walk_exprs(start, visit);
-                walk_exprs(end, visit);
-            }
-            ast::Range::From { start } => walk_exprs(start, visit),
-            ast::Range::To { end, .. } => walk_exprs(end, visit),
-        },
-        ExprKind::ArrayLiteral(array) => {
-            for item in &array.node.elements {
-                walk_exprs(item, visit);
-            }
-        }
-        ExprKind::ArrayFill(fill) => {
-            walk_exprs(&fill.node.value, visit);
-            walk_exprs(&fill.node.len, visit);
-        }
-        ExprKind::MapLiteral(map) => {
-            for (key, value) in &map.node.entries {
-                walk_exprs(key, visit);
-                walk_exprs(value, visit);
-            }
-        }
-        ExprKind::Index(index) => {
-            walk_exprs(&index.node.target, visit);
-            walk_exprs(&index.node.index, visit);
-        }
-        ExprKind::Match(match_) => {
-            walk_exprs(&match_.node.scrutinee, visit);
-            for arm in &match_.node.arms {
-                walk_exprs(&arm.node.body, visit);
-            }
-        }
-        ExprKind::StringInterp(parts) => {
-            for part in parts {
-                if let ast::StringPart::Expr(expr, _) = part {
-                    walk_exprs(expr, visit);
-                }
-            }
-        }
-        ExprKind::Cast(cast) | ExprKind::FailableCast(cast) => {
-            walk_exprs(&cast.node.expr, visit);
-        }
-        ExprKind::Try(try_) => walk_exprs(&try_.node.expr, visit),
-        ExprKind::Lambda(lambda) => walk_exprs(&lambda.node.body, visit),
-        ExprKind::InferredEnum(inferred) => match &inferred.node.args {
-            ast::InferredEnumArgs::Unit => {}
-            ast::InferredEnumArgs::Tuple(args) => {
-                for arg in args {
-                    walk_exprs(arg, visit);
-                }
-            }
-            ast::InferredEnumArgs::Struct(fields) => {
-                for (_, value) in fields {
-                    walk_exprs(value, visit);
-                }
-            }
-        },
-        ExprKind::IntrinsicCall(call) => {
-            for arg in &call.node.args {
-                walk_exprs(arg, visit);
-            }
-        }
-        ExprKind::Ident(_) | ExprKind::TypeSubject(_) | ExprKind::Lit(_) => {}
-    }
+    node: crate::source_ast::SourceCallable<'a>,
 }
 
 impl<'a> SourceCallable<'a> {
     fn module(self) -> usize {
-        match self {
-            Self::Function { module, .. }
-            | Self::AggregateMethod { module, .. }
-            | Self::ExtendMethod { module, .. } => module,
-        }
+        self.module
     }
 
     fn source(self) -> SourceId {
-        match self {
-            Self::Function { source, .. }
-            | Self::AggregateMethod { source, .. }
-            | Self::ExtendMethod { source, .. } => source,
-        }
+        self.source
     }
 
     fn name(self) -> Ident {
-        match self {
-            Self::Function { func, .. } => func.node.name,
-            Self::AggregateMethod { method, .. } => method.sig.name,
-            Self::ExtendMethod { method, .. } => method.sig.name,
-        }
+        self.node.name()
     }
 
     fn body(self) -> &'a BlockNode {
-        match self {
-            Self::Function { func, .. } => &func.node.body,
-            Self::AggregateMethod { method, .. } => &method.body,
-            Self::ExtendMethod { method, .. } => &method.body,
-        }
+        self.node.body()
     }
 
     fn params(self) -> Vec<Ident> {
-        match self {
-            Self::Function { func, .. } => {
-                func.node.params.iter().map(|param| param.name).collect()
-            }
-            Self::AggregateMethod { method, .. } => {
-                method.sig.params.iter().map(|param| param.name).collect()
-            }
-            Self::ExtendMethod { method, .. } => {
-                method.sig.params.iter().map(|param| param.name).collect()
-            }
-        }
+        self.node.params()
     }
 
     fn has_generics(self) -> bool {
-        match self {
-            Self::Function { func, .. } => {
-                !func.node.type_params.is_empty() || !func.node.const_params.is_empty()
-            }
-            Self::AggregateMethod { method, .. } => {
-                !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty()
-            }
-            Self::ExtendMethod { method, .. } => {
-                !method.sig.type_params.is_empty() || !method.sig.const_params.is_empty()
-            }
-        }
+        self.node.has_generics()
     }
 
     fn is_instance_method(self) -> bool {
-        matches!(
-            self,
-            Self::AggregateMethod {
-                mode: MethodMode::Instance { .. },
-                ..
-            } | Self::ExtendMethod {
-                mode: MethodMode::Instance { .. },
-                ..
-            }
-        )
+        self.node.receiver().is_some()
     }
 
     fn function_kind(self) -> FunctionKind {
-        match self {
-            Self::Function { .. } => FunctionKind::Normal,
-            Self::AggregateMethod { .. } | Self::ExtendMethod { .. } => FunctionKind::Method,
+        if self.node.is_method() {
+            FunctionKind::Method
+        } else {
+            FunctionKind::Normal
         }
     }
 
     fn owner(self) -> Option<FunctionOwner> {
-        match self {
-            Self::Function { .. } | Self::ExtendMethod { .. } => None,
-            Self::AggregateMethod { owner, .. } => Some(FunctionOwner { name: owner }),
-        }
+        self.node.owner().map(|name| FunctionOwner { name })
     }
 }
 
@@ -11592,58 +11305,14 @@ struct ReachableItems<'a> {
     index: &'a SourceProgramIndex<'a>,
     body_facts: &'a HashMap<BodyInstanceKey, SemanticBodyFacts>,
     callable_facts: &'a SemanticCallableFacts<'a>,
-    default_facts: DefaultExprFactsIndex<'a>,
     items: Vec<ReachableItem<'a>>,
-}
-
-#[derive(Debug, Default)]
-struct DefaultExprFactsIndex<'a> {
-    exprs: HashMap<(DefaultExprSite, BodyInstanceKey), &'a SemanticBodyFacts>,
-}
-
-impl<'a> DefaultExprFactsIndex<'a> {
-    fn new(semantic: &'a SemanticProgram, index: &SourceProgramIndex<'_>) -> Self {
-        let default_sites = index
-            .default_exprs
-            .keys()
-            .map(SourceDefaultKey::site)
-            .collect::<HashSet<_>>();
-        let mut exprs = HashMap::new();
-        for (body, facts) in &semantic.facts.bodies {
-            for (expr, fact) in &facts.expr_types {
-                let Some(span) = fact.span else {
-                    continue;
-                };
-                let site = DefaultExprSite {
-                    source: span.source(),
-                    expr: *expr,
-                };
-                if default_sites.contains(&site) {
-                    let old = exprs.insert((site, body.clone()), facts);
-                    debug_assert!(old.is_none());
-                }
-            }
-        }
-        Self { exprs }
-    }
-
-    fn get(
-        &self,
-        site: DefaultExprSite,
-        body: &BodyInstanceKey,
-    ) -> Result<&'a SemanticBodyFacts, LowerError> {
-        self.exprs
-            .get(&(site, body.clone()))
-            .copied()
-            .ok_or(LowerError::MissingDefaultExprFacts { site })
-    }
 }
 
 #[derive(Debug)]
 struct ReachableFactSlice<'a> {
     body: BodyInstanceKey,
     facts: &'a SemanticBodyFacts,
-    exprs: Option<HashSet<ExprId>>,
+    exprs: Option<&'a HashSet<ExprId>>,
 }
 
 impl ReachableFactSlice<'_> {
@@ -11674,11 +11343,11 @@ enum ReachableSource<'a> {
         ty: &'a Type,
     },
     Global {
-        global: SourceGlobal<'a>,
+        global: &'a crate::source_ast::SourceGlobal,
         sig: GlobalSig,
     },
     CastFrom {
-        cast: SourceCastFrom<'a>,
+        cast: crate::source_ast::SourceCastFrom<'a>,
         signature: CastFromSignature,
     },
 }
@@ -12412,190 +12081,29 @@ fn can_omit_body_facts(fact: &SemanticFunctionInstanceFact, callable: SourceCall
         && body.node.tail.is_none()
 }
 
-impl SourceDefaultKey {
-    fn site(&self) -> DefaultExprSite {
-        match self {
-            Self::CallableParam { source, expr, .. }
-            | Self::AggregateField { source, expr, .. } => DefaultExprSite {
-                source: *source,
-                expr: *expr,
-            },
-        }
-    }
-}
-
 impl<'a> SourceProgramIndex<'a> {
-    fn get_default_expr(&self, key: &SourceDefaultKey) -> Option<&'a ExprNode> {
-        self.default_exprs.get(key).copied()
+    fn get_default_expr(&self, site: DefaultExprSite) -> Option<&'a ExprNode> {
+        self.source.default_expr(site)
     }
 
-    fn new(root: &'a ast::Program, resolved: &'a ResolveResult) -> Self {
-        let modules = SourceModules::new(root, resolved);
+    fn new(source: &'a crate::source_ast::SourceAstIndex, semantic: &SemanticProgram) -> Self {
         let mut callables = HashMap::new();
-        let mut globals = HashMap::new();
-        let mut cast_froms = HashMap::new();
-        let mut lambdas = HashMap::new();
-        let mut default_exprs = HashMap::new();
-
-        for (module_index, module) in modules.items.iter().enumerate() {
-            let mut extend_index = 0;
-            for stmt in &module.program.stmts {
-                match &stmt.node {
-                    Stmt::Func(func_node) => {
-                        collect_block_lambdas(&func_node.node.body, &mut lambdas);
-                        let id = CallableId::function(module.scope.clone(), func_node.node.name);
-                        index_param_defaults(
-                            &mut default_exprs,
-                            &id,
-                            module.source,
-                            &func_node.node.params,
-                        );
-                        callables.insert(
-                            id,
-                            SourceCallable::Function {
-                                module: module_index,
-                                func: func_node,
-                                source: module.source,
-                            },
-                        );
-                    }
-                    Stmt::Aggregate(agg_node) => {
-                        let agg = &agg_node.node;
-                        let owner = NominalKey {
-                            module: module.scope.clone(),
-                            kind: agg.kind.into(),
-                            name: agg.name,
-                        };
-                        for (slot, field) in agg.fields.iter().enumerate() {
-                            if let Some(default) = &field.default {
-                                default_exprs.insert(
-                                    SourceDefaultKey::AggregateField {
-                                        owner: owner.clone(),
-                                        field: field.name,
-                                        slot,
-                                        source: module.source,
-                                        expr: default.node.id,
-                                    },
-                                    default,
-                                );
-                            }
-                        }
-                        for method in &agg.methods {
-                            collect_block_lambdas(&method.body, &mut lambdas);
-                            let mode = MethodMode::from_receiver(method.sig.receiver);
-                            let id = CallableId::aggregate_method(
-                                owner.clone(),
-                                method.sig.name,
-                                mode.surface(),
-                            );
-                            index_param_defaults(
-                                &mut default_exprs,
-                                &id,
-                                module.source,
-                                &method.sig.params,
-                            );
-                            callables.insert(
-                                id,
-                                SourceCallable::AggregateMethod {
-                                    module: module_index,
-                                    owner: agg.name,
-                                    method,
-                                    mode,
-                                    source: module.source,
-                                },
-                            );
-                        }
-                    }
-                    Stmt::Global(global) => {
-                        collect_expr_lambdas(&global.node.value, &mut lambdas);
-                        globals.insert(
-                            GlobalKey {
-                                module: module.scope.clone(),
-                                name: global.node.name,
-                            },
-                            SourceGlobal {
-                                module: module_index,
-                                source: module.source,
-                                node: global,
-                            },
-                        );
-                    }
-                    Stmt::Extend(extend_node) => {
-                        let extend_id = ExtendId {
-                            module: module.scope.clone(),
-                            index: extend_index,
-                        };
-                        extend_index += 1;
-                        for (cast_index, cast) in extend_node.node.cast_froms.iter().enumerate() {
-                            collect_block_lambdas(&cast.node.body, &mut lambdas);
-                            cast_froms.insert(
-                                (extend_id.clone(), cast_index),
-                                SourceCastFrom {
-                                    module: module_index,
-                                    source: module.source,
-                                    node: cast,
-                                },
-                            );
-                        }
-                        for method_node in &extend_node.node.methods {
-                            let method = &method_node.node;
-                            collect_block_lambdas(&method.body, &mut lambdas);
-                            let mode = MethodMode::from_receiver(method.sig.receiver);
-                            let id = CallableId::extend_method(
-                                extend_id.clone(),
-                                method.sig.name,
-                                mode.surface(),
-                            );
-                            index_param_defaults(
-                                &mut default_exprs,
-                                &id,
-                                module.source,
-                                &method.sig.params,
-                            );
-                            callables.insert(
-                                id,
-                                SourceCallable::ExtendMethod {
-                                    module: module_index,
-                                    method,
-                                    mode,
-                                    source: module.source,
-                                },
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        for fact in &semantic.declaration_facts.functions {
+            let declaration = fact.site.owner();
+            let Some(module) = source.declaration_module(&declaration) else {
+                continue;
+            };
+            let Some(entry) = source.callable(&fact.site) else {
+                continue;
+            };
+            let callable = SourceCallable {
+                module,
+                source: declaration.source(),
+                node: entry,
+            };
+            callables.entry(fact.id.clone()).or_insert(callable);
         }
-
-        Self {
-            modules,
-            callables,
-            globals,
-            cast_froms,
-            lambdas,
-            default_exprs,
-        }
-    }
-}
-
-fn index_param_defaults<'a>(
-    default_exprs: &mut HashMap<SourceDefaultKey, &'a ExprNode>,
-    target: &CallableId,
-    source: SourceId,
-    params: &'a [ast::Param],
-) {
-    for param in params {
-        if let Some(default) = &param.default {
-            default_exprs.insert(
-                SourceDefaultKey::CallableParam {
-                    target: target.clone(),
-                    source,
-                    expr: default.node.id,
-                },
-                default,
-            );
-        }
+        Self { source, callables }
     }
 }
 
@@ -12606,7 +12114,6 @@ impl<'a> ReachableItems<'a> {
         semantic_functions: &'a SemanticCallableFacts<'a>,
         roots: Vec<CallableInstanceKey>,
     ) -> Result<Self, LowerError> {
-        let default_facts = DefaultExprFactsIndex::new(semantic, index);
         let mut queued = HashSet::new();
         let mut worklist = vec![];
         for root in roots {
@@ -12630,7 +12137,6 @@ impl<'a> ReachableItems<'a> {
             enqueue_body_references(
                 index,
                 semantic_functions,
-                &default_facts,
                 semantic,
                 item.body_facts.as_facts(),
                 &item.body,
@@ -12645,7 +12151,6 @@ impl<'a> ReachableItems<'a> {
             index,
             body_facts: &semantic.facts.bodies,
             callable_facts: semantic_functions,
-            default_facts,
             items,
         })
     }
@@ -12672,18 +12177,20 @@ impl<'a> ReachableItems<'a> {
             if !visited.insert(default_use.clone()) {
                 continue;
             }
-            let site = default_use.key.site();
-            let expr = self
-                .index
-                .get_default_expr(&default_use.key)
+            let site = default_use.site;
+            self.index
+                .get_default_expr(site)
                 .ok_or(LowerError::MissingDefaultExprFacts { site })?;
-            let exprs = source_expr_ids(expr);
-            let facts = self.default_facts.get(site, &default_use.facts_body)?;
-            worklist.extend(default_uses(facts, Some(&exprs)));
+            let exprs = self.index.source.expression_ids(site);
+            let facts = self
+                .body_facts
+                .get(&default_use.facts_body)
+                .ok_or(LowerError::MissingDefaultExprFacts { site })?;
+            worklist.extend(default_uses(facts, exprs));
             slices.push(ReachableFactSlice {
                 body: default_use.facts_body,
                 facts,
-                exprs: Some(exprs),
+                exprs,
             });
         }
         Ok(slices)
@@ -12751,14 +12258,13 @@ fn reachable_global<'a>(
     semantic: &'a SemanticProgram,
     key: &GlobalKey,
 ) -> Result<ReachableItem<'a>, LowerError> {
-    let global =
-        index
-            .globals
-            .get(key)
-            .copied()
-            .ok_or_else(|| LowerError::MissingSourceGlobal {
-                key: Box::new(key.clone()),
-            })?;
+    let global = index
+        .source
+        .globals
+        .get(key)
+        .ok_or_else(|| LowerError::MissingSourceGlobal {
+            key: Box::new(key.clone()),
+        })?;
     let sig = semantic
         .declarations
         .global(key)
@@ -12787,9 +12293,8 @@ fn reachable_cast_from<'a>(
     key: &CastFromInstanceKey,
 ) -> Result<ReachableItem<'a>, LowerError> {
     let cast = index
-        .cast_froms
-        .get(&(key.extend.clone(), key.index))
-        .copied()
+        .source
+        .cast_from(&key.extend, key.index)
         .ok_or_else(|| LowerError::MissingSpecializedBodyFacts {
             body: Box::new(BodyInstanceKey::CastFrom(key.clone())),
         })?;
@@ -12831,9 +12336,8 @@ fn reachable_lambda<'a>(
                 body: Box::new(body.clone()),
             })?;
     let lambda = index
-        .lambdas
-        .get(&key.expr)
-        .copied()
+        .source
+        .lambda(source_id, key.expr)
         .ok_or(LowerError::UnsupportedExpr {
             expr_id: key.expr,
             kind: "Lambda",
@@ -12861,7 +12365,6 @@ fn reachable_lambda<'a>(
 fn enqueue_body_references(
     index: &SourceProgramIndex<'_>,
     semantic_functions: &SemanticCallableFacts<'_>,
-    default_facts: &DefaultExprFactsIndex<'_>,
     semantic: &SemanticProgram,
     body_facts: &SemanticBodyFacts,
     body: &BodyInstanceKey,
@@ -12885,19 +12388,17 @@ fn enqueue_body_references(
     let mut default_env = DefaultDependencyEnv {
         index,
         semantic_functions,
-        default_facts,
         semantic,
         queued,
         worklist,
         visited: HashSet::new(),
     };
-    enqueue_used_default_references(&mut default_env, body_facts, source_id)
+    enqueue_used_default_references(&mut default_env, body_facts)
 }
 
 struct DefaultDependencyEnv<'a, 'b> {
     index: &'a SourceProgramIndex<'a>,
     semantic_functions: &'a SemanticCallableFacts<'a>,
-    default_facts: &'a DefaultExprFactsIndex<'a>,
     semantic: &'a SemanticProgram,
     queued: &'b mut HashSet<ReachableKey>,
     worklist: &'b mut Vec<ReachableKey>,
@@ -12906,17 +12407,16 @@ struct DefaultDependencyEnv<'a, 'b> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DefaultUse {
-    key: SourceDefaultKey,
+    site: DefaultExprSite,
     facts_body: BodyInstanceKey,
 }
 
 fn enqueue_used_default_references(
     env: &mut DefaultDependencyEnv<'_, '_>,
     body_facts: &SemanticBodyFacts,
-    source_id: SourceId,
 ) -> Result<(), LowerError> {
     for default_use in default_uses(body_facts, None) {
-        enqueue_default_references(env, &default_use, source_id)?;
+        enqueue_default_references(env, &default_use)?;
     }
     Ok(())
 }
@@ -12932,12 +12432,8 @@ fn default_uses(
                 continue;
             }
             uses.push(DefaultUse {
-                key: SourceDefaultKey::CallableParam {
-                    target: default.callee.target.clone(),
-                    source: default.default.source,
-                    expr: default.default.expr,
-                },
-                facts_body: BodyInstanceKey::Module(default.callee.target.module.clone()),
+                site: default.default,
+                facts_body: default.facts_body.clone(),
             });
         }
     }
@@ -12947,18 +12443,12 @@ fn default_uses(
                 continue;
             }
             uses.push(DefaultUse {
-                key: SourceDefaultKey::AggregateField {
-                    owner: default.owner_key.clone(),
-                    field: default.field,
-                    slot: default.slot,
-                    source: default.default.source,
-                    expr: default.default.expr,
-                },
-                facts_body: BodyInstanceKey::Module(default.owner_key.module.clone()),
+                site: default.default,
+                facts_body: default.facts_body.clone(),
             });
         }
     }
-    uses.sort_by_key(|default_use| default_use.key.site().expr.0);
+    uses.sort_by_key(|default_use| default_use.site.expr.0);
     uses.dedup();
     uses
 }
@@ -12966,34 +12456,36 @@ fn default_uses(
 fn enqueue_default_references(
     env: &mut DefaultDependencyEnv<'_, '_>,
     default_use: &DefaultUse,
-    source_id: SourceId,
 ) -> Result<(), LowerError> {
     if !env.visited.insert(default_use.clone()) {
         return Ok(());
     }
-    let site = default_use.key.site();
-    let expr = env
-        .index
-        .get_default_expr(&default_use.key)
+    let site = default_use.site;
+    env.index
+        .get_default_expr(site)
         .ok_or(LowerError::MissingDefaultExprFacts { site })?;
-    let exprs = source_expr_ids(expr);
-    let facts = env.default_facts.get(site, &default_use.facts_body)?;
+    let exprs = env.index.source.expression_ids(site);
+    let facts = env
+        .semantic
+        .facts
+        .body(&default_use.facts_body)
+        .ok_or(LowerError::MissingDefaultExprFacts { site })?;
 
     enqueue_calls(
         env.index,
         env.semantic_functions,
         facts,
-        Some(&exprs),
+        exprs,
         env.queued,
         env.worklist,
     )?;
-    enqueue_global_accesses(facts, Some(&exprs), env.queued, env.worklist);
-    enqueue_user_cast_conversions(facts, Some(&exprs), env.queued, env.worklist);
+    enqueue_global_accesses(facts, exprs, env.queued, env.worklist);
+    enqueue_user_cast_conversions(facts, exprs, env.queued, env.worklist);
     enqueue_contract_witness_targets(
         env.index,
         env.semantic,
         facts,
-        Some(&exprs),
+        exprs,
         env.queued,
         env.worklist,
     )?;
@@ -13001,8 +12493,8 @@ fn enqueue_default_references(
         env.index,
         facts,
         &default_use.facts_body,
-        source_id,
-        Some(&exprs),
+        site.source,
+        exprs,
         env.queued,
         env.worklist,
     )?;
@@ -13010,12 +12502,12 @@ fn enqueue_default_references(
         env.index,
         env.semantic,
         facts,
-        Some(&exprs),
+        exprs,
         env.queued,
         env.worklist,
     );
-    for nested in default_uses(facts, Some(&exprs)) {
-        enqueue_default_references(env, &nested, source_id)?;
+    for nested in default_uses(facts, exprs) {
+        enqueue_default_references(env, &nested)?;
     }
     Ok(())
 }
@@ -13200,14 +12692,6 @@ fn queue_reachable(
     }
 }
 
-fn source_expr_ids(expr: &ExprNode) -> HashSet<ExprId> {
-    let mut ids = HashSet::new();
-    walk_exprs(expr, &mut |expr| {
-        ids.insert(expr.node.id);
-    });
-    ids
-}
-
 fn enqueue_function_values(
     index: &SourceProgramIndex<'_>,
     body_facts: &SemanticBodyFacts,
@@ -13363,8 +12847,9 @@ fn enqueue_nominal_stringify_override(
             }
             return;
         }
+        let generics = aggregate.all_generics();
         for field in aggregate.fields.values() {
-            let field_ty = substitute_aggregate_member(ty, &aggregate.generics, &field.ty);
+            let field_ty = substitute_aggregate_member(ty, &generics, &field.ty);
             enqueue_type_stringify_overrides(index, semantic, &field_ty, queued, worklist, visited);
         }
         return;
@@ -13373,9 +12858,10 @@ fn enqueue_nominal_stringify_override(
     let Some(schema) = semantic.declarations.enum_schema(&owner) else {
         return;
     };
+    let generics = schema.all_generics();
     for variant in schema.variants.values() {
         variant.payload.for_each_type(|payload_ty| {
-            let payload_ty = substitute_aggregate_member(ty, &schema.generics, payload_ty);
+            let payload_ty = substitute_aggregate_member(ty, &generics, payload_ty);
             enqueue_type_stringify_overrides(
                 index,
                 semantic,
@@ -13421,12 +12907,12 @@ mod tests {
         },
         ast, externs,
         externs::{ExternInputs, PackageExternInputs, RawExterns},
-        resolve::PackageId,
+        resolve::{PackageId, ResolveResult},
         test_support::{
             checked_with_full_core_shape, parse_program, resolved_modules_with_core_option,
             resolved_modules_with_core_option_external,
         },
-        typecheck::{self, TypecheckConfig},
+        typecheck::{self, TypecheckConfig, nominal_type, nominal_type_with_args},
     };
 
     #[test]
@@ -14551,18 +14037,346 @@ mod tests {
         assert_eq!(target.key.slots[0].target, source.key.slots[1].target);
     }
 
+    fn checked_with_same_named_local_nominals() -> (typecheck::SemanticCheckOutput, [Type; 4]) {
+        let (_, _, semantic) = checked(
+            "fn main() {
+                struct Item {}
+                enum Choice { Unit }
+                { struct Item {} enum Choice { Unit } };
+            }",
+        );
+        let decls = &semantic.program.declarations;
+        let mut aggregates = decls
+            .aggregates()
+            .filter(|(key, _)| key.name == Ident::new("Item"))
+            .map(|(key, _)| nominal_type(key))
+            .collect::<Vec<_>>();
+        let mut enums = decls
+            .enums()
+            .filter(|(key, _)| key.name == Ident::new("Choice"))
+            .map(|(key, _)| nominal_type(key))
+            .collect::<Vec<_>>();
+        aggregates.sort_by_key(|ty| format!("{ty:?}"));
+        enums.sort_by_key(|ty| format!("{ty:?}"));
+        assert_eq!(aggregates.len(), 2);
+        assert_eq!(enums.len(), 2);
+        (
+            semantic,
+            [
+                aggregates.remove(0),
+                aggregates.remove(0),
+                enums.remove(0),
+                enums.remove(0),
+            ],
+        )
+    }
+
+    #[test]
+    fn type_lowerer_cache_distinguishes_same_named_local_nominals() {
+        let (semantic, types) = checked_with_same_named_local_nominals();
+        let decls = &semantic.program.declarations;
+        let mut program = Program::default();
+        let mut modules = HashMap::new();
+        let mut lowerer = TypeLowerer::default();
+        let mut lower = |ty: &Type| {
+            lowerer
+                .lower_source(
+                    &mut program,
+                    &mut modules,
+                    decls,
+                    &semantic.program.externs,
+                    &semantic.program.contract_surfaces,
+                    &HashMap::new(),
+                    ty,
+                )
+                .expect("lower failed")
+        };
+
+        let outer_aggregate = lower(&types[0]);
+        let inner_aggregate = lower(&types[1]);
+        let outer_enum = lower(&types[2]);
+        let inner_enum = lower(&types[3]);
+
+        assert_ne!(outer_aggregate, inner_aggregate);
+        assert_ne!(outer_enum, inner_enum);
+        assert_eq!(program.aggregates.len(), 2);
+        assert_eq!(program.enums.len(), 2);
+        assert_eq!(program.aggregates[0].name, program.aggregates[1].name);
+        assert_eq!(program.enums[0].name, program.enums[1].name);
+        assert_eq!(program.modules.len(), 1);
+        assert_eq!(program.modules[0].aggregates.len(), 2);
+        assert_eq!(program.modules[0].enums.len(), 2);
+    }
+
+    #[test]
+    fn reachable_local_nominal_closure_uses_shared_air_paths() {
+        let (root, resolved, semantic) = checked(
+            "contract Named { fn name(self) -> string; }
+             fn consume(value: dyn Named) -> string { value.name() }
+             fn main() -> string {
+                 struct Local {
+                     value: int = field_value(),
+                     fn total(self, add: int = add_value()) -> int { self.value + add }
+                     fn apply(self) -> int { self.value }
+                     fn name(self) -> string { \"local\" }
+                     fn to_string(self) -> string { \"shown\" }
+                 }
+                 enum Choice { None, Some(Local) }
+                 dataref Cell { value: int = 2 }
+                 struct Unused {
+                     value: int,
+                     fn never(self) -> int { self.value }
+                 }
+                 fn field_value() -> int { 4 }
+                 fn add_value() -> int {
+                     let next = |x: int| x + 1;
+                     next(2)
+                 }
+                 Local {}.total();
+                 Local {}.apply();
+                 let shown = Local {};
+                 f\"{shown}\";
+                 Choice.Some(Local {});
+                 Cell {};
+                 consume(Local {})
+             }",
+        );
+
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["main"])
+            .expect("local nominal closure failed to lower");
+        let local = air
+            .aggregates
+            .iter()
+            .find(|decl| decl.name == Ident::new("Local"))
+            .expect("reachable local aggregate was not emitted");
+
+        assert!(
+            air.aggregates
+                .iter()
+                .any(|decl| decl.name == Ident::new("Cell"))
+        );
+        assert!(
+            air.enums
+                .iter()
+                .any(|decl| decl.name == Ident::new("Choice"))
+        );
+        assert!(
+            air.aggregates
+                .iter()
+                .all(|decl| decl.name != Ident::new("Unused"))
+        );
+        assert!(
+            air.functions
+                .iter()
+                .all(|function| function.name != Ident::new("never"))
+        );
+        for name in [
+            "field_value",
+            "add_value",
+            "total",
+            "apply",
+            "name",
+            "to_string",
+        ] {
+            assert!(
+                air.functions
+                    .iter()
+                    .any(|function| function.name == Ident::new(name)),
+                "missing reachable local method {name}"
+            );
+        }
+        assert!(local.stringify_override.is_some());
+        assert_eq!(air.lambdas.len(), 1);
+        assert!(!air.contract_witnesses.is_empty());
+    }
+
+    #[test]
+    fn reachable_local_nominals_preserve_owner_specializations() {
+        let (root, resolved, semantic) = checked(
+            "fn use<T>(value: T) -> T {
+                 struct Local {
+                     value: T,
+                     fn get(self) -> T { self.value }
+                 }
+                 Local { value: value }.get()
+             }
+             fn main() { use(1); use(\"text\"); }",
+        );
+
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["main"])
+            .expect("owner-specialized local nominal failed to lower");
+        let locals = air
+            .aggregates
+            .iter()
+            .filter(|decl| decl.name == Ident::new("Local"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(locals.len(), 2);
+        assert_ne!(locals[0].type_args, locals[1].type_args);
+        assert_eq!(
+            air.functions
+                .iter()
+                .filter(|function| function.name == Ident::new("get"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unused_owner_generic_keeps_reachable_instances_distinct() {
+        let (root, resolved, semantic) = checked(
+            "fn use<T>() -> int {
+                struct Marker { tag: int }
+                struct Unreachable { tag: int }
+                let marker = Marker { tag: 1 };
+                marker.tag
+            }
+            fn main() { use<int>(); use<string>(); }",
+        );
+
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["main"])
+            .expect("unused-owner local nominal failed to lower");
+        let markers = air
+            .aggregates
+            .iter()
+            .filter(|decl| decl.name == Ident::new("Marker"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(markers.len(), 2);
+        assert_ne!(markers[0].type_args, markers[1].type_args);
+        assert!(markers.iter().all(|decl| {
+            decl.fields.len() == 1 && matches!(air.type_data(decl.fields[0].ty), TypeData::Int)
+        }));
+        assert!(
+            air.aggregates
+                .iter()
+                .all(|decl| decl.name != Ident::new("Unreachable"))
+        );
+        assert_eq!(
+            air.modules
+                .iter()
+                .map(|module| module.aggregates.len())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn local_placement_adds_no_box_or_closure_environment() {
+        let (root, resolved, semantic) = checked(
+            "fn main() -> int {
+                struct Local {
+                    value: int,
+                    fn make(value: int) -> Self { Local { value } }
+                    fn get(self) -> int { self.value }
+                }
+                fn helper() -> int { 2 }
+                Local.make(5).get() + helper()
+            }",
+        );
+
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["main"])
+            .expect("local declarations should lower without runtime wrappers");
+        assert_eq!(air.aggregates.len(), 1);
+        assert_eq!(air.aggregates[0].kind, AggregateKind::Struct);
+        assert!(air.lambdas.is_empty());
+        assert!(air.capture_cells.is_empty());
+        assert!(
+            air.type_arena
+                .iter()
+                .all(|ty| !matches!(ty, TypeData::DataRef(_)))
+        );
+        for name in ["make", "get", "helper"] {
+            assert!(
+                air.functions
+                    .iter()
+                    .any(|function| function.name == Ident::new(name)),
+                "missing flat local callable {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn nominal_cache_uses_typed_const_identity() {
+        let (_, _, semantic) = checked_with_full_core_shape("struct Marker {}");
+        let id = semantic
+            .program
+            .declarations
+            .local_nominal_type(&ModuleScope::Root, Ident::new("Marker"))
+            .expect("missing Marker declaration")
+            .id
+            .clone();
+        let nan_a = ast::ConstArg::Value(ast::ConstValue::Float(f64::from_bits(
+            0x7ff8_0000_0000_0001,
+        )));
+        let nan_b = ast::ConstArg::Value(ast::ConstValue::Float(f64::from_bits(
+            0x7ff8_0000_0000_0002,
+        )));
+        assert_eq!(nan_a.to_string(), nan_b.to_string());
+        assert_ne!(
+            TypeCacheKey::Nominal {
+                id: id.clone(),
+                type_args: vec![],
+                const_args: vec![nan_a],
+            },
+            TypeCacheKey::Nominal {
+                id,
+                type_args: vec![],
+                const_args: vec![nan_b],
+            }
+        );
+    }
+
+    #[test]
+    fn type_lowerer_preserves_local_owner_and_declaration_args() {
+        let (_, _, semantic) = checked(
+            "fn outer<T>() { struct Box<U> { owner: T, item: U } }
+             fn main() { outer<int>(); }",
+        );
+        let decls = &semantic.program.declarations;
+        let key = decls
+            .aggregates()
+            .find(|(key, _)| key.name == Ident::new("Box"))
+            .map(|(key, _)| key)
+            .expect("missing local Box declaration");
+        let ty = nominal_type_with_args(key, &[Type::Int, Type::String], &[]);
+        let mut program = Program::default();
+        let mut modules = HashMap::new();
+        let id = TypeLowerer::default()
+            .lower_source(
+                &mut program,
+                &mut modules,
+                decls,
+                &semantic.program.externs,
+                &semantic.program.contract_surfaces,
+                &HashMap::new(),
+                &ty,
+            )
+            .expect("lower failed");
+
+        let TypeData::Aggregate(aggregate) = program.type_data(id) else {
+            panic!("expected aggregate type");
+        };
+        let decl = program.aggregate(*aggregate);
+        assert_eq!(decl.type_args.len(), 2);
+        assert_eq!(program.type_data(decl.type_args[0]), &TypeData::Int);
+        assert_eq!(program.type_data(decl.type_args[1]), &TypeData::String);
+        assert_eq!(program.type_data(decl.fields[0].ty), &TypeData::Int);
+        assert_eq!(program.type_data(decl.fields[1].ty), &TypeData::String);
+    }
+
     #[test]
     fn type_lowerer_lowers_nominal_aggregate_declarations() {
         let (_, _, semantic) = checked_with_full_core_shape("struct Point { x: int, y: string }");
         let mut program = Program::default();
         let mut modules = HashMap::new();
         let mut lowerer = TypeLowerer::default();
-        let point = Type::nominal(
-            ast::NominalKind::Struct,
-            Ident::new("Point"),
-            vec![],
-            vec![],
-            None,
+        let point = nominal_type(
+            &semantic
+                .program
+                .declarations
+                .local_nominal_type(&ModuleScope::Root, Ident::new("Point"))
+                .expect("missing Point declaration"),
         );
 
         let id = lowerer
@@ -14592,12 +14406,12 @@ mod tests {
         let mut program = Program::default();
         let mut modules = HashMap::new();
         let mut lowerer = TypeLowerer::default();
-        let node = Type::nominal(
-            ast::NominalKind::DataRef,
-            Ident::new("Node"),
-            vec![],
-            vec![],
-            None,
+        let node = nominal_type(
+            &semantic
+                .program
+                .declarations
+                .local_nominal_type(&ModuleScope::Root, Ident::new("Node"))
+                .expect("missing Node declaration"),
         );
 
         let id = lowerer
@@ -14619,18 +14433,61 @@ mod tests {
     }
 
     #[test]
+    fn type_lowerer_reserves_mutually_recursive_enum_and_dataref() {
+        let (_, _, semantic) = checked_with_full_core_shape(
+            "dataref Node { choice: Choice } enum Choice { Next(Node) }",
+        );
+        let mut program = Program::default();
+        let mut modules = HashMap::new();
+        let mut lowerer = TypeLowerer::default();
+        let choice = nominal_type(
+            &semantic
+                .program
+                .declarations
+                .local_nominal_type(&ModuleScope::Root, Ident::new("Choice"))
+                .expect("missing Choice declaration"),
+        );
+
+        let id = lowerer
+            .lower_source(
+                &mut program,
+                &mut modules,
+                &semantic.program.declarations,
+                &semantic.program.externs,
+                &semantic.program.contract_surfaces,
+                &HashMap::new(),
+                &choice,
+            )
+            .expect("lower failed");
+
+        assert!(matches!(program.type_data(id), TypeData::Enum(_)));
+        assert_eq!(program.enums.len(), 1);
+        assert_eq!(program.aggregates.len(), 1);
+        let VariantShape::Tuple(payload) = &program.enums[0].variants[0].shape else {
+            panic!("expected tuple enum payload");
+        };
+        let TypeData::DataRef(node) = program.type_data(payload[0]) else {
+            panic!("expected dataref enum payload");
+        };
+        assert!(matches!(
+            program.type_data(program.aggregate(*node).fields[0].ty),
+            TypeData::Enum(_)
+        ));
+    }
+
+    #[test]
     fn type_lowerer_lowers_nominal_enum_declarations() {
         let (_, _, semantic) =
             checked_with_full_core_shape("enum Choice { A, B(int), C { text: string } }");
         let mut program = Program::default();
         let mut modules = HashMap::new();
         let mut lowerer = TypeLowerer::default();
-        let choice = Type::nominal(
-            ast::NominalKind::Enum,
-            Ident::new("Choice"),
-            vec![],
-            vec![],
-            None,
+        let choice = nominal_type(
+            &semantic
+                .program
+                .declarations
+                .local_nominal_type(&ModuleScope::Root, Ident::new("Choice"))
+                .expect("missing Choice declaration"),
         );
 
         let id = lowerer
@@ -16010,15 +15867,12 @@ mod tests {
             &root,
             &[("gamekit", "fn g() {}"), ("util", "fn u() {}")],
         );
-        let modules = SourceModules::new(&root, &resolved);
-        assert_eq!(modules.items.len(), 5);
-        assert_eq!(
-            modules.items[0].scope,
-            ModuleScope::from_module_id(&resolved.root)
-        );
-        assert_eq!(modules.items[0].source, resolved.root_source);
-        assert!(modules.items.iter().all(|module| {
-            !module_path(&module.scope).is_empty() || matches!(module.scope, ModuleScope::Root)
+        let source_index = crate::source_ast::SourceAstIndex::new(&root, &resolved);
+        let modules = &source_index.modules;
+        assert_eq!(modules.len(), 5);
+        assert_eq!(modules[0], ModuleScope::from_module_id(&resolved.root));
+        assert!(modules.iter().all(|module| {
+            !module_path(module).is_empty() || matches!(module, ModuleScope::Root)
         }));
     }
 
@@ -16213,19 +16067,6 @@ mod tests {
         assert_eq!(id_returns.len(), 2);
         assert!(matches!(id_returns[0], Some(TypeData::Bool)));
         assert!(matches!(id_returns[1], Some(TypeData::Int)));
-    }
-
-    #[test]
-    fn local_function_call_is_unsupported_callable_instance() {
-        let source = "fn f() -> int { fn inner() -> int { 1 } inner() }";
-        let (root, resolved, semantic) = checked(source);
-        let err = lower_checked_roots(&root, &resolved, &semantic, &["f"])
-            .expect_err("expected unsupported local function");
-
-        assert!(matches!(
-            err,
-            LowerError::UnsupportedCallableInstance { .. }
-        ));
     }
 
     #[test]
@@ -16484,11 +16325,24 @@ mod tests {
             .expect("main body facts")
             .calls
             .insert(ExprId(u64::MAX), CallTarget::new(id.clone(), args.clone()));
+        let source_index = crate::source_ast::SourceAstIndex::new(&root, &resolved);
+        let site = source_index
+            .declarations()
+            .find_map(|(site, _, decl)| match decl {
+                crate::source_ast::SourceDecl::Function(func)
+                    if func.node.name == Ident::new("id") =>
+                {
+                    Some(site)
+                }
+                _ => None,
+            })
+            .expect("missing id declaration");
         semantic
             .program
             .declaration_facts
             .functions
             .push(SemanticFunctionInstanceFact {
+                site: crate::source_ast::SourceCallableSite::Function(site),
                 id: id.clone(),
                 args: args.clone(),
                 body: BodyInstanceKey::Callable(CallableInstanceKey { target: id, args }),
@@ -17217,11 +17071,26 @@ mod tests {
     }
 
     #[test]
-    fn promoted_method_call_is_unsupported() {
+    fn promoted_method_call_projects_receiver() {
         let source = "struct Health { fn damage(self) -> int { 1 } } struct Enemy { embed health: Health } fn f(enemy: Enemy) -> int { enemy.damage() }";
-        let err = lower_root(source, "f").expect_err("expected promoted method rejection");
-
-        assert!(matches!(err, LowerError::UnsupportedExpr { .. }));
+        let air = lower_root(source, "f").expect("promoted method should lower");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("f"))
+            .expect("missing f");
+        let AirStmt::Init {
+            value: RValue::Call { args, .. },
+            ..
+        } = &function.body.block.stmts[0]
+        else {
+            panic!("expected promoted method call")
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [CallArg::Value(Operand::Place(Place { projection, .. }))]
+                if projection == &[crate::air::Projection::Field(FieldId::from_index(0))]
+        ));
     }
 
     #[test]
@@ -17961,7 +17830,7 @@ fn f() -> int {
     }
 
     #[test]
-    fn unused_unsupported_top_level_declarations_are_ignored() {
+    fn unused_top_level_declarations_emit_nothing() {
         lower_empty("struct S { x: int }").expect("lower failed");
     }
 
@@ -18007,6 +17876,28 @@ fn main() {}
         assert!(air.aggregates.is_empty());
         assert!(air.enums.is_empty());
         assert!(air.extern_types.is_empty());
+    }
+
+    #[test]
+    fn cross_source_default_function_value_uses_declaration_source() {
+        let (root, resolved, semantic) = checked_with_modules(
+            "import util { invoke }; fn main() -> int { invoke() }",
+            &[(
+                "util",
+                "fn fallback() -> int { 7 }
+                 pub fn invoke(callback: fn() -> int = fallback) -> int { callback() }",
+            )],
+        );
+        let air = lower_checked_roots(&root, &resolved, &semantic, &["main"])
+            .expect("cross-source default function value failed to lower");
+
+        for name in ["invoke", "fallback"] {
+            assert!(
+                air.functions
+                    .iter()
+                    .any(|function| { function.name == Ident::new(name) })
+            );
+        }
     }
 
     #[test]
@@ -18962,7 +18853,8 @@ fn main() {}
         semantic: &typecheck::SemanticCheckOutput,
         roots: &[&str],
     ) -> Program {
-        let index = SourceProgramIndex::new(root, resolved);
+        let source_index = crate::source_ast::SourceAstIndex::new(root, resolved);
+        let index = SourceProgramIndex::new(&source_index, &semantic.program);
         let callable_facts = SemanticCallableFacts::new(&semantic.program);
         let root_keys = roots.iter().map(|name| root_function(name)).collect();
         let functions = ReachableItems::new(&index, &semantic.program, &callable_facts, root_keys)
@@ -18976,7 +18868,7 @@ fn main() {}
         };
         cx.lower_contract_surfaces()
             .expect("surface lowering failed");
-        cx.lower_function_shells(&index.modules, &functions)
+        cx.lower_function_shells(&source_index.modules, &functions)
             .expect("function shell lowering failed");
         cx.lower_extern_declarations(&functions, &semantic.program)
             .expect("extern lowering failed");
@@ -19322,15 +19214,16 @@ fn main() {}
     fn with_source_functions<R>(
         source: &str,
         names: &[&str],
-        f: impl FnOnce(&SourceModules<'_>, &ReachableItems<'_>, &SemanticProgram) -> R,
+        f: impl FnOnce(&[ModuleScope], &ReachableItems<'_>, &SemanticProgram) -> R,
     ) -> R {
         let (root, resolved, semantic) = checked(source);
-        let index = SourceProgramIndex::new(&root, &resolved);
+        let source_index = crate::source_ast::SourceAstIndex::new(&root, &resolved);
+        let index = SourceProgramIndex::new(&source_index, &semantic.program);
         let facts = SemanticCallableFacts::new(&semantic.program);
         let roots = names.iter().map(|name| root_function(name)).collect();
         let functions = ReachableItems::new(&index, &semantic.program, &facts, roots)
             .expect("source functions failed");
-        f(&index.modules, &functions, &semantic.program)
+        f(&source_index.modules, &functions, &semantic.program)
     }
 
     fn checked(source: &str) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {

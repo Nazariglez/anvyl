@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: cannot capture local value 'runtime'
+
+fn main() {
+    let runtime = 1;
+    struct Bad { value: int = runtime }
+    let bad = Bad {};
+}

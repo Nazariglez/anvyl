@@ -57,7 +57,8 @@ enum Subject {
     },
     EnumVariant {
         resolved: ResolvedEnumVariant,
-        explicit_args: Option<GenericArgs>,
+        owner_args: GenericArgs,
+        declaration_args: Option<GenericArgs>,
         surface_ty: Type,
     },
     ExternMethod {
@@ -356,7 +357,7 @@ pub(super) fn check_postfix_chain_place(
                 let field_expected = (is_last_step && !next_is_call)
                     .then(|| expected_for_chain(expected, optional_chain, tc))
                     .flatten();
-                let origin = field_function_origin(&subject);
+                let origin = field_function_origin(&subject, tc);
                 let subject = apply_field(
                     &subject,
                     node,
@@ -433,7 +434,8 @@ pub(super) fn check_postfix_chain_place(
     match &subject {
         Subject::EnumVariant {
             resolved,
-            explicit_args,
+            owner_args,
+            declaration_args,
             ..
         } => {
             let expected_ty = expected_for_chain(expected, optional_chain, tc)
@@ -443,7 +445,8 @@ pub(super) fn check_postfix_chain_place(
                 enum_variant::solve_unit_owner_ty(
                     tc,
                     resolved,
-                    explicit_args.as_ref(),
+                    owner_args,
+                    declaration_args.as_ref(),
                     expected_ty.as_ref(),
                     expr.span,
                 )
@@ -528,12 +531,17 @@ fn set_postfix_step_type(
     ty
 }
 
-fn field_function_origin(subject: &Subject) -> FunctionValueOrigin {
+fn field_function_origin(subject: &Subject, tc: &TypeChecker) -> FunctionValueOrigin {
     let Subject::Value(value) = subject else {
         return FunctionValueOrigin::UnknownProjection;
     };
-    if matches!(&value.checked.ty, Type::Nominal(nominal) if nominal.kind == crate::ast::NominalKind::DataRef)
-    {
+    let dataref = value
+        .checked
+        .ty
+        .as_nominal()
+        .and_then(|nominal| tc.decls.nominal(&nominal.id))
+        .is_some_and(|key| key.kind == crate::ast::NominalKind::DataRef);
+    if dataref {
         return FunctionValueOrigin::DataRefProjection;
     }
     if value.global.is_some() {
@@ -890,16 +898,21 @@ fn enum_variant_subject(
     tc: &TypeChecker,
 ) -> Subject {
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
-    let explicit_args = resolved.owner_args_from_type(subject_ty, tc);
+    let explicit_args = resolved.split_args_from_type(subject_ty, tc);
+    let (owner_args, declaration_args) = match explicit_args {
+        Some((owner, declaration)) => (owner, Some(declaration)),
+        None => (resolved.inherited_owner_args(tc), None),
+    };
     let surface_ty = expected_ty
         .as_ref()
         .filter(|ty| tc.decls.key_for_type(ty).as_ref() == Some(&resolved.key))
         .cloned()
-        .or_else(|| explicit_args.as_ref().map(|_| subject_ty.clone()))
+        .or_else(|| declaration_args.as_ref().map(|_| subject_ty.clone()))
         .unwrap_or_else(|| resolved.owner_ty());
     Subject::EnumVariant {
         resolved,
-        explicit_args,
+        owner_args,
+        declaration_args,
         surface_ty,
     }
 }
@@ -1309,7 +1322,12 @@ fn apply_module_field(
         ModuleMemberLookup::Missing => {}
     }
     match tc.decls.module_type(scope, name) {
-        ModuleMemberLookup::Found(TypeBinding::Nominal(key)) => {
+        ModuleMemberLookup::Found(TypeBinding::Nominal(id)) => {
+            let key = tc
+                .decls
+                .nominal(&id)
+                .expect("nominal binding missing registry metadata")
+                .clone();
             tc.warn_extern_type_deprecated(&key, span);
             return Subject::Type(nominal_type(&key));
         }
@@ -1398,8 +1416,13 @@ fn apply_type_field(
                     span,
                 );
                 return callable_subject(
-                    tc.decls
-                        .callable_for_aggregate_static_method(&agg, name, method, Some(target)),
+                    tc.decls.callable_for_aggregate_static_method(
+                        &key,
+                        &agg,
+                        name,
+                        method,
+                        Some(target),
+                    ),
                     None,
                 );
             }
@@ -1520,11 +1543,13 @@ fn apply_call(
         }
         Subject::EnumVariant {
             resolved,
-            explicit_args,
+            owner_args,
+            declaration_args,
             ..
         } => PlaceValue::not_place(check_enum_variant_call(
             resolved,
-            explicit_args.as_ref(),
+            owner_args,
+            declaration_args.as_ref(),
             call,
             call_id,
             expected,
@@ -2313,7 +2338,8 @@ fn substitute_params_checked(
 
 fn check_enum_variant_call(
     resolved: &ResolvedEnumVariant,
-    explicit_args: Option<&GenericArgs>,
+    owner_args: &GenericArgs,
+    declaration_args: Option<&GenericArgs>,
     call: &CallNode,
     call_id: ExprId,
     expected: Option<TypeHandle>,
@@ -2322,7 +2348,7 @@ fn check_enum_variant_call(
     let Some(params) = enum_variant::expect_tuple(tc, resolved, call.span) else {
         return check_unhinted_args(&call.node.args, tc);
     };
-    if explicit_args.is_some() && !call.node.generic_args.is_empty() {
+    if declaration_args.is_some() && !call.node.generic_args.is_empty() {
         tc.push_error(TypeError::GenericArity(super::ArityError::TypeArgs {
             expected: 0,
             found: call.node.generic_args.len(),
@@ -2340,10 +2366,10 @@ fn check_enum_variant_call(
         );
         return check_unhinted_args(&call.node.args, tc);
     }
-    let owner_args = explicit_args.cloned().unwrap_or_default();
-    let callee = enum_variant::tuple_callable_ref(resolved, params, owner_args);
-    let checked = check_callable_call_with_args(
+    let callee = enum_variant::tuple_callable_ref(resolved, params, owner_args.clone());
+    let checked = check_callable_call_with_prebound_args(
         &callee,
+        declaration_args,
         &call.node.args,
         &call.node.generic_args,
         call.span,
@@ -2496,6 +2522,32 @@ fn check_callable_call_with_args(
     expected: Option<TypeHandle>,
     tc: &mut TypeChecker,
 ) -> CheckedCall {
+    check_callable_call_with_prebound_args(
+        callee,
+        None,
+        args,
+        generic_args,
+        call_span,
+        call_id,
+        form,
+        receiver_arg,
+        expected,
+        tc,
+    )
+}
+
+fn check_callable_call_with_prebound_args(
+    callee: &CallableRef,
+    callable_args: Option<&GenericArgs>,
+    args: &[ExprNode],
+    generic_args: &[GenericArg],
+    call_span: Span,
+    call_id: ExprId,
+    form: CallForm,
+    receiver_arg: Option<MutableArg>,
+    expected: Option<TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedCall {
     let Some(mut seeds) =
         bind_prefix_generic_seeds(tc, syntactic_generics(callee), generic_args, call_span)
     else {
@@ -2506,6 +2558,9 @@ fn check_callable_call_with_args(
         &callee.def.sig.owner_generics,
         &callee.owner_args,
     );
+    if let Some(args) = callable_args {
+        seed_owner_args(&mut seeds, &callee.def.sig.generics, args);
+    }
 
     let all_generics =
         combined_generic_params(&callee.def.sig.owner_generics, &callee.def.sig.generics);
@@ -2808,14 +2863,7 @@ fn checked_extern_ret(ret: &ResolvedExternTy) -> CheckedType {
 }
 
 fn syntactic_generics(callee: &CallableRef) -> &GenericParams {
-    match callee.def.id.kind {
-        CallableKind::EnumVariant => &callee.def.sig.owner_generics,
-        CallableKind::Function
-        | CallableKind::ExternFunction
-        | CallableKind::StaticMethod
-        | CallableKind::InstanceMethod
-        | CallableKind::ExtendMethod(_) => &callee.def.sig.generics,
-    }
+    &callee.def.sig.generics
 }
 
 fn constrain_callable_owner(
@@ -2831,6 +2879,9 @@ fn constrain_callable_owner(
         return;
     };
     let Some(CallableParent::Nominal(owner)) = &callee.def.id.parent else {
+        return;
+    };
+    let Some(owner) = tc.decls.nominal(owner) else {
         return;
     };
 

@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: success
+
+fn keep(contract: int) -> int {
+    contract
+}
+
+fn main() {
+    let contract = 1;
+    contract;
+    let value = keep(contract);
+}

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use super::{
     TypeChecker, TypeError, check_expected_value_expr,
-    decls::{ExtendId, FieldSchema, MethodKey, MethodMode, NamedSchemas, NominalKey, ValueDecl},
+    decls::{ExtendId, FieldSchema, MethodKey, MethodMode, NamedSchemas, ValueDecl},
     generic::{GenericArgs, GenericOwnerFrame, GenericParams},
     type_refs::GenericTypeContext,
 };
@@ -16,19 +16,8 @@ use crate::{
 
 pub(super) fn check_decl_param_order(program: &Program, tc: &mut TypeChecker) {
     for stmt in &program.stmts {
-        match &stmt.node {
-            Stmt::Func(func) => check_param_order(&func.node.params, func.span, tc),
-            Stmt::Aggregate(agg) => {
-                for method in &agg.node.methods {
-                    check_param_order(&method.sig.params, agg.span, tc);
-                }
-            }
-            Stmt::Extend(extend) => {
-                for method in &extend.node.methods {
-                    check_param_order(&method.node.sig.params, method.span, tc);
-                }
-            }
-            _ => {}
+        if let Stmt::Func(func) = &stmt.node {
+            check_param_order(&func.node.params, func.span, tc);
         }
     }
 }
@@ -54,10 +43,12 @@ pub(super) fn check_decl_param_defaults(program: &Program, tc: &mut TypeChecker)
             Stmt::Func(func_node) => check_func_defaults(&func_node.node, func_node.span, tc),
             Stmt::Aggregate(agg_node) => {
                 let agg = &agg_node.node;
-                let key = NominalKey {
-                    module: tc.current_module.clone(),
-                    kind: agg.kind.into(),
-                    name: agg.name,
+                let Some(key) = tc
+                    .decls
+                    .source_nominal(tc.source_id(), agg_node.span)
+                    .cloned()
+                else {
+                    continue;
                 };
                 let Some(schema) = tc.decls.aggregate(&key).cloned() else {
                     continue;
@@ -76,7 +67,7 @@ pub(super) fn check_decl_param_defaults(program: &Program, tc: &mut TypeChecker)
                             method_schema.mode.receiver().is_some(),
                             method_schema.generics.clone(),
                             &owner_generics,
-                            schema.generics.clone(),
+                            schema.all_generics(),
                             agg_node.span,
                             tc,
                         );
@@ -198,6 +189,7 @@ pub(super) fn check_aggregate_field_defaults(
 ) {
     tc.push_generic_context(generics.generics.clone());
     tc.push_generic_owner_frame(generics);
+    tc.enter_named_function();
     let forbidden = fields
         .iter()
         .map(|field| field.name)
@@ -213,9 +205,11 @@ pub(super) fn check_aggregate_field_defaults(
             continue;
         }
         if validate_default(default, DefaultKind::Field, &forbidden, tc) {
+            tc.register_default_facts_body(default);
             check_default_type(default, TypeChecker::type_handle(&schema.ty), tc);
         }
     }
+    tc.exit_named_function();
     tc.pop_generic_owner_frame();
     tc.pop_generic_context();
 }
@@ -263,6 +257,7 @@ fn check_param_defaults(
             continue;
         }
         if validate_default(default, DefaultKind::Param { has_receiver }, &forbidden, tc) {
+            tc.register_default_facts_body(default);
             check_default_type(default, TypeChecker::type_handle(&param_ty.ty), tc);
         }
     }

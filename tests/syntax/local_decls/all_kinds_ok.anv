@@ -1,0 +1,16 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    struct Point { x: int }
+    dataref Cell { point: Point }
+    enum Choice { None, Some(Point) }
+
+    let point = Point { x: 3 };
+    let cell = Cell { point: point };
+    let choice = Choice.Some(cell.point);
+    let value: int = match choice {
+        Choice.None => 0,
+        Choice.Some(found) => found.x,
+    };
+}

@@ -31,9 +31,7 @@ pub(crate) trait TypeFolder {
                 generic_args,
             } => self.fold_unresolved_nominal(*qualifier, *name, generic_args),
             Type::Tuple(elems) => Type::Tuple(elems.iter().map(|ty| self.fold_type(ty)).collect()),
-            Type::Nominal(nominal) => Type::nominal_with_origin(
-                nominal.kind,
-                nominal.name,
+            Type::Nominal(nominal) => nominal.with_args(
                 nominal
                     .type_args
                     .iter()
@@ -44,14 +42,13 @@ pub(crate) trait TypeFolder {
                     .iter()
                     .map(|arg| self.fold_const_arg(arg))
                     .collect(),
-                nominal.origin.clone(),
             ),
             Type::List { elem } => Type::List {
                 elem: Box::new(self.fold_type(elem)),
             },
             Type::Array { elem, len } => Type::Array {
                 elem: Box::new(self.fold_type(elem)),
-                len: self.fold_array_len(*len),
+                len: self.fold_array_len(len.clone()),
             },
             Type::Map { key, value } => Type::Map {
                 key: Box::new(self.fold_type(key)),
@@ -189,7 +186,7 @@ pub(crate) trait TypeVisitor {
             }
             Type::List { elem } | Type::Slice { elem } => self.visit_type(elem),
             Type::Optional { inner } => self.visit_type(inner),
-            Type::Array { elem, len } => self.visit_type(elem) || self.visit_array_len(*len),
+            Type::Array { elem, len } => self.visit_type(elem) || self.visit_array_len(len.clone()),
             Type::Map { key, value } => self.visit_type(key) || self.visit_type(value),
             Type::UnresolvedNominal { generic_args, .. } => {
                 generic_args.iter().any(|arg| self.visit_generic_arg(arg))

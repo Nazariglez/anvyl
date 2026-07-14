@@ -9,7 +9,7 @@ use anvyx_externs::{
 };
 
 use crate::{
-    ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, NominalKind, ReturnSpec, Type},
+    ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, ReturnSpec, Type},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -19,6 +19,7 @@ use crate::{
         raw_module_scope,
     },
     resolve::{ModuleId, ModulePath, PackageId},
+    semantic_id::NominalId,
     span::SourceSpan,
     typecheck::{
         DeclarationIndex, GenericTypeContext, ModuleScope, NominalKey, TypeRefError,
@@ -183,7 +184,7 @@ pub(crate) struct ExternCatalog {
     functions: Vec<ExternFunction>,
     functions_by_key: HashMap<FunctionKey, ExternFunctionId>,
     types_by_key: HashMap<TypeKey, ExternTypeId>,
-    types_by_nominal: HashMap<NominalKey, ExternTypeId>,
+    types_by_nominal: HashMap<NominalId, ExternTypeId>,
 }
 
 enum ExternCatalogVisit<'a> {
@@ -457,7 +458,7 @@ impl ExternCatalog {
     }
 
     pub(crate) fn type_by_nominal(&self, key: &NominalKey) -> Option<ExternTypeId> {
-        self.types_by_nominal.get(key).copied()
+        self.types_by_nominal.get(&key.id).copied()
     }
 
     pub(crate) fn field_ref(&self, field_ref: ExternFieldRef) -> (&ExternType, &ExternField) {
@@ -1055,14 +1056,13 @@ impl<'a> CatalogBuilder<'a> {
                 module: scope.clone(),
                 name,
             };
-            let nominal = NominalKey {
-                module: scope.clone(),
-                kind: NominalKind::Extern,
-                name,
-            };
+            let nominal = self
+                .decls
+                .local_nominal_type(&scope, name)
+                .expect("catalog extern type missing nominal metadata");
             self.catalog.modules[module_id.0].types.push(id);
             self.catalog.types_by_key.insert(key.clone(), id);
-            self.catalog.types_by_nominal.insert(nominal.clone(), id);
+            self.catalog.types_by_nominal.insert(nominal.id.clone(), id);
             self.catalog.types.push(ExternType {
                 id,
                 key,
@@ -1792,6 +1792,7 @@ impl<'a> CatalogBuilder<'a> {
             }
             TypeRefError::AliasCycle { name }
             | TypeRefError::ContractAsType { name }
+            | TypeRefError::NotContract { name }
             | TypeRefError::DuplicateContractRequirement { name }
             | TypeRefError::ConflictingContractRequirement { name } => {
                 self.errors.push(ExternCatalogError::UnknownType {
@@ -2059,13 +2060,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        ast::{ModuleOrigin, NominalKind},
+        ast::NominalKind,
         externs::{RawExternScope, raw::RawExternGroup},
         resolve::PackageId,
+        semantic_id::ExternalNominalId,
         test_support::{
             ident, module_path_segments, parse_program, resolved_modules, root_id, test_source_id,
         },
-        typecheck::DeclarationIndex,
+        typecheck::{DeclarationIndex, nominal_type_with_args},
     };
 
     #[derive(Default)]
@@ -2121,7 +2123,7 @@ mod tests {
             assert!(
                 self.catalog
                     .types_by_nominal
-                    .insert(nominal.clone(), id)
+                    .insert(nominal.id.clone(), id)
                     .is_none()
             );
             let context =
@@ -2296,24 +2298,22 @@ mod tests {
     }
 
     fn nominal(module: ModuleScope, name: &str) -> NominalKey {
+        let module_id = match &module {
+            ModuleScope::Root => ModuleId::root(PackageId::synthetic_root()),
+            ModuleScope::Named(path) => ModuleId::named(PackageId::synthetic_root(), path.clone()),
+            ModuleScope::Package(module) => module.clone(),
+        };
         NominalKey {
+            id: NominalId::External(ExternalNominalId::new(module_id, ident(name))),
             module,
             kind: NominalKind::Extern,
             name: ident(name),
+            placement: crate::typecheck::NominalPlacement::External,
         }
     }
 
     fn provider_nominal(module: &str, name: &str) -> Type {
-        Type::nominal_with_origin(
-            NominalKind::Extern,
-            ident(name),
-            vec![],
-            vec![],
-            Some(ModuleOrigin::Provider {
-                package: PackageId::synthetic_root().to_string(),
-                path: vec![module.to_string()].into(),
-            }),
-        )
+        nominal_type(&nominal(provider_scope(module), name))
     }
 
     fn decls(root: &str, modules: &[(&str, &str)], raw: &RawExterns) -> DeclarationIndex {
@@ -2784,15 +2784,12 @@ mod tests {
                     .unwrap(),
             );
 
+            let key = decls
+                .local_nominal_type(&ModuleScope::Root, ident("Option"))
+                .expect("missing source Option");
             assert_eq!(
                 function.signature.ret.ty,
-                Type::nominal(
-                    NominalKind::Struct,
-                    ident("Option"),
-                    vec![Type::Int],
-                    vec![],
-                    None,
-                )
+                nominal_type_with_args(&key, &[Type::Int], &[])
             );
         }
 
@@ -2867,7 +2864,7 @@ mod tests {
             let owner = catalog
                 .type_by_key(&type_key(ModuleScope::Root, "Handle"))
                 .unwrap();
-            let self_ty = Type::nominal(NominalKind::Extern, ident("Handle"), vec![], vec![], None);
+            let self_ty = nominal_type(&catalog.ty(owner).nominal);
 
             assert_eq!(
                 catalog.field(owner, ident("next")).unwrap().1.ty.ty,

@@ -122,27 +122,12 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
 
     let documented_decl = annotations()
         .then(doc_comment_block())
-        .then(choice((
-            func_decl,
-            struct_decl,
-            dataref_decl,
-            enum_decl,
-            const_decl,
-            extern_decl,
-        )))
+        .then(choice((func_decl, const_decl, extern_decl)))
         .map(|((annots, doc), mut stmt_node)| {
             match &mut stmt_node.node {
                 ast::Stmt::Func(f) => {
                     f.node.doc = doc;
                     f.node.annotations = annots;
-                }
-                ast::Stmt::Aggregate(s) => {
-                    s.node.doc = doc;
-                    s.node.annotations = annots;
-                }
-                ast::Stmt::Enum(e) => {
-                    e.node.doc = doc;
-                    e.node.annotations = annots;
                 }
                 ast::Stmt::Const(c) => {
                     c.node.doc = doc;
@@ -161,10 +146,12 @@ fn parser<'src>() -> BoxedParser<'src, ast::Program> {
             stmt_node
         });
 
+    let nominal_decl = choice((struct_decl, dataref_decl, enum_decl));
     let undocumented_decl = choice((import_declaration(), extend_decl));
 
     choice((
         type_alias_decl,
+        nominal_decl,
         contract_decl,
         global_decl,
         documented_decl,

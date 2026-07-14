@@ -1,5 +1,5 @@
 use super::ConstDiagnostic;
-use crate::ast::{ArrayLen, ConstArg, ConstParamId, ConstValue, Ident};
+use crate::ast::{ArrayLen, ConstArg, ConstExpr, ConstParamId, ConstValue, Ident};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct ConstInferVarId(pub(crate) u32);
@@ -9,6 +9,7 @@ pub(crate) enum ConstTerm {
     Value(ConstValue),
     Name(Ident),
     Param(ConstParamId),
+    Expr(ConstExpr),
     ArrayInfer,
     Infer(ConstInferVarId),
 }
@@ -32,6 +33,7 @@ impl ConstTerm {
             ArrayLen::Infer => Self::ArrayInfer,
             ArrayLen::Named(name) => Self::Name(name),
             ArrayLen::Param(id) => Self::Param(id),
+            ArrayLen::Expr(expr) => Self::Expr(expr),
         }
     }
 
@@ -45,7 +47,7 @@ impl ConstTerm {
             Self::Value(value) => Some(ConstArg::Value(value.clone())),
             Self::Name(name) => Some(ConstArg::Name(*name)),
             Self::Param(id) => Some(ConstArg::Param(*id)),
-            Self::ArrayInfer | Self::Infer(_) => None,
+            Self::Expr(_) | Self::ArrayInfer | Self::Infer(_) => None,
         }
     }
 
@@ -61,6 +63,7 @@ impl ConstTerm {
             Self::Value(_) | Self::Infer(_) => None,
             Self::Name(name) => Some(ArrayLen::Named(*name)),
             Self::Param(id) => Some(ArrayLen::Param(*id)),
+            Self::Expr(expr) => Some(ArrayLen::Expr(expr.clone())),
             Self::ArrayInfer => Some(ArrayLen::Infer),
         }
     }
@@ -69,7 +72,9 @@ impl ConstTerm {
         match self {
             Self::Value(value) => ConstDiagnostic::Value(value.clone()),
             Self::Name(name) => ConstDiagnostic::Name(*name),
-            Self::Param(_) | Self::ArrayInfer | Self::Infer(_) => ConstDiagnostic::Unknown,
+            Self::Param(_) | Self::Expr(_) | Self::ArrayInfer | Self::Infer(_) => {
+                ConstDiagnostic::Unknown
+            }
         }
     }
 
@@ -113,7 +118,7 @@ mod tests {
         ];
         for len in lens {
             assert_eq!(
-                ConstTerm::from_array_len(len).to_array_len_no_infer(),
+                ConstTerm::from_array_len(len.clone()).to_array_len_no_infer(),
                 Some(len)
             );
         }

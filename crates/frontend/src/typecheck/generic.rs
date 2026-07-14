@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParam, ConstParamId, ConstValue, ContractRef, FuncParam,
-        GenericArg, Ident, Type, TypeFolder, TypeParam, TypeVarId,
+        ArrayLen, ConstArg, ConstExpr, ConstParam, ConstParamId, ConstValue, ContractRef,
+        FuncParam, GenericArg, Ident, Type, TypeFolder, TypeParam, TypeVarId,
     },
     span::Span,
 };
@@ -52,10 +52,16 @@ impl TypeFolder for CheckedSubstituter<'_, '_> {
                     .unwrap_or(ArrayLen::Infer),
                 None => ArrayLen::Param(id),
             },
+            ArrayLen::Expr(expr) => {
+                let len = substitute_array_len(ArrayLen::Expr(expr), self.consts);
+                self.tc
+                    .array_len_from_term(ConstTerm::from_array_len(len.clone()), self.span)
+                    .unwrap_or(len)
+            }
             other => self
                 .tc
-                .array_len_from_term(ConstTerm::from_array_len(other), self.span)
-                .unwrap_or(ArrayLen::Infer),
+                .array_len_from_term(ConstTerm::from_array_len(other.clone()), self.span)
+                .unwrap_or(other),
         }
     }
 }
@@ -162,6 +168,7 @@ fn const_param_bindings(params: &GenericParams, args: &GenericArgs) -> Vec<(Iden
             ConstTerm::Value(value) => Some((param.name, value.clone())),
             ConstTerm::Name(_)
             | ConstTerm::Param(_)
+            | ConstTerm::Expr(_)
             | ConstTerm::ArrayInfer
             | ConstTerm::Infer(_) => None,
         })
@@ -321,8 +328,36 @@ impl TypeChecker {
         self.callable_templates.insert(id, template);
     }
 
+    pub(super) fn store_local_callable_template(
+        &mut self,
+        id: CallableId,
+        owner_args: GenericArgs,
+        template: CallableTemplate,
+    ) {
+        self.callable_templates.insert(id.clone(), template.clone());
+        self.local_callable_templates
+            .insert((id, owner_args), template);
+    }
+
     pub(super) fn callable_template(&self, id: &CallableId) -> Option<&CallableTemplate> {
         self.callable_templates.get(id)
+    }
+
+    pub(super) fn callable_template_for(
+        &self,
+        id: &CallableId,
+        args: &GenericArgs,
+    ) -> Option<&CallableTemplate> {
+        self.local_callable_templates
+            .iter()
+            .filter(|((target, owner), _)| {
+                target == id
+                    && args.type_args.starts_with(&owner.type_args)
+                    && args.const_args.starts_with(&owner.const_args)
+            })
+            .max_by_key(|((_, owner), _)| owner.type_args.len() + owner.const_args.len())
+            .map(|(_, template)| template)
+            .or_else(|| self.callable_template(id))
     }
 
     pub(super) fn specialization(&self, key: &CallableInstanceKey) -> Option<&SpecializationState> {
@@ -396,7 +431,7 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
             None => cover.types.insert(*id, ty).is_none(),
         },
         (Type::Array { elem, len }, Type::Array { elem: se, len: sl }) => {
-            covers_type(elem, se, cover) && covers_len(*len, *sl, cover)
+            covers_type(elem, se, cover) && covers_len(len.clone(), sl.clone(), cover)
         }
         (
             Type::Func { params, ret },
@@ -421,9 +456,7 @@ fn covers_type<'a>(general: &Type, specific: &'a Type, cover: &mut Cover<'a>) ->
         }
         (Type::Tuple(a), Type::Tuple(b)) => covers_types(a, b, cover),
         (Type::Nominal(a), Type::Nominal(b)) => {
-            a.kind == b.kind
-                && a.name == b.name
-                && a.origin == b.origin
+            a.id == b.id
                 && covers_types(&a.type_args, &b.type_args, cover)
                 && covers_const_args(&a.const_args, &b.const_args, cover)
         }
@@ -557,13 +590,68 @@ impl TypeFolder for Substituter<'_> {
     }
 
     fn fold_array_len(&mut self, len: ArrayLen) -> ArrayLen {
-        match len {
-            ArrayLen::Param(id) => self
-                .consts
-                .get(&id)
-                .and_then(ConstTerm::to_array_len_no_infer)
-                .unwrap_or(ArrayLen::Param(id)),
-            other => other,
+        substitute_array_len(len, self.consts)
+    }
+}
+
+fn substitute_array_len(len: ArrayLen, consts: &ConstSubst) -> ArrayLen {
+    match len {
+        ArrayLen::Param(id) => consts
+            .get(&id)
+            .and_then(ConstTerm::to_array_len_no_infer)
+            .unwrap_or(ArrayLen::Param(id)),
+        ArrayLen::Expr(expr) => {
+            let expr = substitute_const_expr(expr, consts);
+            match expr {
+                ConstExpr::Value(ConstValue::Int(value)) => usize::try_from(value)
+                    .map(ArrayLen::Fixed)
+                    .unwrap_or(ArrayLen::Expr(ConstExpr::Value(ConstValue::Int(value)))),
+                expr => ArrayLen::Expr(expr),
+            }
+        }
+        other => other,
+    }
+}
+
+pub(super) fn substitute_const_expr(expr: ConstExpr, consts: &ConstSubst) -> ConstExpr {
+    match expr {
+        ConstExpr::Value(_) => expr,
+        ConstExpr::Param(id) => match consts.get(&id) {
+            Some(ConstTerm::Value(value)) => ConstExpr::Value(value.clone()),
+            Some(ConstTerm::Param(id)) => ConstExpr::Param(*id),
+            Some(ConstTerm::Expr(expr)) => substitute_const_expr(expr.clone(), consts),
+            _ => ConstExpr::Param(id),
+        },
+        ConstExpr::Unary(op, expr) => {
+            let expr = substitute_const_expr(*expr, consts);
+            if let ConstExpr::Value(value) = expr {
+                super::const_eval::eval_unary(op, value.clone(), None)
+                    .map(ConstExpr::Value)
+                    .unwrap_or(ConstExpr::Unary(op, Box::new(ConstExpr::Value(value))))
+            } else {
+                ConstExpr::Unary(op, Box::new(expr))
+            }
+        }
+        ConstExpr::Binary(op, left, right) => {
+            let left = substitute_const_expr(*left, consts);
+            let right = substitute_const_expr(*right, consts);
+            match (&left, &right) {
+                (ConstExpr::Value(left_value), ConstExpr::Value(right_value)) => {
+                    super::const_eval::eval_binary(
+                        op,
+                        left_value.clone(),
+                        right_value.clone(),
+                        None,
+                    )
+                    .map(ConstExpr::Value)
+                    .unwrap_or(ConstExpr::Binary(
+                        op,
+                        Box::new(left),
+                        Box::new(right),
+                    ))
+                }
+                _ => ConstExpr::Binary(op, Box::new(left), Box::new(right)),
+            }
         }
     }
 }
@@ -728,20 +816,41 @@ mod tests {
     }
 
     fn nominal(
+        site: usize,
         kind: NominalKind,
         name: &str,
         type_args: Vec<Type>,
         const_args: Vec<ConstArg>,
     ) -> Type {
-        Type::nominal(kind, Ident::new(name), type_args, const_args, None)
+        crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            site,
+            kind,
+            Ident::new(name),
+            type_args,
+            const_args,
+            None,
+        )
     }
 
-    fn struct_ty(name: &str, type_args: Vec<Type>) -> Type {
-        nominal(NominalKind::Struct, name, type_args, vec![])
+    fn struct_ty(site: usize, name: &str, type_args: Vec<Type>) -> Type {
+        nominal(site, NominalKind::Struct, name, type_args, vec![])
     }
 
-    fn struct_const(name: &str, type_args: Vec<Type>, const_args: Vec<ConstArg>) -> Type {
-        nominal(NominalKind::Struct, name, type_args, const_args)
+    fn struct_const(
+        site: usize,
+        name: &str,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+    ) -> Type {
+        nominal(site, NominalKind::Struct, name, type_args, const_args)
+    }
+
+    #[test]
+    fn nominal_coverage_requires_declaration_identity() {
+        let left = struct_ty(10, "Same", vec![Type::Var(tv(0))]);
+        let right = struct_ty(20, "Same", vec![Type::Int]);
+        assert!(!covers(&left, &right));
     }
 
     #[test]
@@ -777,11 +886,12 @@ mod tests {
     #[test]
     fn substitute_nominal_const_param_to_bool() {
         let cs = HashMap::from([(cp(0), ConstTerm::Value(ConstValue::Bool(true)))]);
-        let ty = struct_const("Flag", vec![], vec![ConstArg::Param(cp(0))]);
+        let ty = struct_const(40, "Flag", vec![], vec![ConstArg::Param(cp(0))]);
         let result = substitute(&ty, &HashMap::new(), &cs);
         assert_eq!(
             result,
             struct_const(
+                40,
                 "Flag",
                 vec![],
                 vec![ConstArg::Value(ConstValue::Bool(true))],
@@ -816,7 +926,7 @@ mod tests {
                 false,
                 EscapeMode::NonEscaping,
             )],
-            ret: Box::new(crate::ast::ReturnSpec::value(Type::Var(tv(1)))),
+            ret: Box::new(ReturnSpec::value(Type::Var(tv(1)))),
         };
         let result = substitute(&ty, &ts, &HashMap::new());
         assert_eq!(
@@ -828,7 +938,7 @@ mod tests {
                     false,
                     EscapeMode::NonEscaping
                 )],
-                ret: Box::new(crate::ast::ReturnSpec::value(Type::Bool)),
+                ret: Box::new(ReturnSpec::value(Type::Bool)),
             }
         );
     }
@@ -837,13 +947,18 @@ mod tests {
     fn substitute_nested_struct() {
         let ts = HashMap::from([(tv(0), Type::Int)]);
         let ty = struct_ty(
+            41,
             "Wrapper",
             vec![Type::Tuple(vec![Type::Var(tv(0)), Type::String])],
         );
         let result = substitute(&ty, &ts, &HashMap::new());
         assert_eq!(
             result,
-            struct_ty("Wrapper", vec![Type::Tuple(vec![Type::Int, Type::String])])
+            struct_ty(
+                41,
+                "Wrapper",
+                vec![Type::Tuple(vec![Type::Int, Type::String])]
+            )
         );
     }
 
@@ -938,11 +1053,13 @@ mod tests {
     #[test]
     fn spec_bool_const_arg_exact() {
         let a = struct_const(
+            40,
             "Flag",
             vec![],
             vec![ConstArg::Value(ConstValue::Bool(true))],
         );
         let b = struct_const(
+            40,
             "Flag",
             vec![],
             vec![ConstArg::Value(ConstValue::Bool(true))],
@@ -953,15 +1070,20 @@ mod tests {
     #[test]
     fn spec_repeated_const_across_nominal_and_array_requires_equal_terms() {
         let repeated = Type::Tuple(vec![
-            struct_const("Buf", vec![], vec![ConstArg::Param(cp(0))]),
+            struct_const(43, "Buf", vec![], vec![ConstArg::Param(cp(0))]),
             array_ty(Type::Int, ArrayLen::Param(cp(0))),
         ]);
         let same = Type::Tuple(vec![
-            struct_const("Buf", vec![], vec![carg(3)]),
+            struct_const(43, "Buf", vec![], vec![carg(3)]),
             array_ty(Type::Int, ArrayLen::Fixed(3)),
         ]);
         let different = Type::Tuple(vec![
-            struct_const("Buf", vec![], vec![ConstArg::Value(ConstValue::Bool(true))]),
+            struct_const(
+                43,
+                "Buf",
+                vec![],
+                vec![ConstArg::Value(ConstValue::Bool(true))],
+            ),
             array_ty(Type::Int, ArrayLen::Fixed(1)),
         ]);
         assert_eq!(
@@ -977,11 +1099,11 @@ mod tests {
     #[test]
     fn spec_negative_const_arg_not_array_len() {
         let repeated = Type::Tuple(vec![
-            struct_const("Buf", vec![], vec![ConstArg::Param(cp(0))]),
+            struct_const(43, "Buf", vec![], vec![ConstArg::Param(cp(0))]),
             array_ty(Type::Int, ArrayLen::Param(cp(0))),
         ]);
         let negative = Type::Tuple(vec![
-            struct_const("Buf", vec![], vec![carg(-1)]),
+            struct_const(43, "Buf", vec![], vec![carg(-1)]),
             array_ty(Type::Int, ArrayLen::Fixed(0)),
         ]);
         assert_eq!(
@@ -992,8 +1114,13 @@ mod tests {
 
     #[test]
     fn spec_ambig() {
-        let cap = struct_const("FixedBuf", vec![Type::Var(tv(0))], vec![carg(5)]);
-        let ints = struct_const("FixedBuf", vec![Type::Int], vec![ConstArg::Param(cp(0))]);
+        let cap = struct_const(44, "FixedBuf", vec![Type::Var(tv(0))], vec![carg(5)]);
+        let ints = struct_const(
+            44,
+            "FixedBuf",
+            vec![Type::Int],
+            vec![ConstArg::Param(cp(0))],
+        );
         assert_eq!(compare_specificity(&cap, &ints), Specificity::Incomparable);
     }
     #[test]

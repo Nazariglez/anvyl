@@ -233,7 +233,8 @@ impl TypeChecker {
                 return;
             };
             let policy = field.policy.clone();
-            let field_ty = substitute_aggregate_member(&owner, &aggregate.generics, &field.ty);
+            let generics = aggregate.all_generics();
+            let field_ty = substitute_aggregate_member(&owner, &generics, &field.ty);
             let origin = key.module;
             self.check_access_policy(
                 &policy,

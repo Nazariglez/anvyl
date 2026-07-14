@@ -5,24 +5,6 @@ use crate::{
     typecheck::{TypeError, type_closure_facts},
 };
 
-mod storage {
-    use crate::{
-        ast::{Ident, Program, Type},
-        test_support::empty_resolved,
-        typecheck::{DeclarationIndex, SemanticLocalId, TypeChecker, TypecheckConfig},
-    };
-
-    trait TypeCheckerTestExt {
-        fn set_local_type(&mut self, id: SemanticLocalId, ty: Type);
-    }
-
-    impl TypeCheckerTestExt for TypeChecker {
-        fn set_local_type(&mut self, id: SemanticLocalId, ty: Type) {
-            self.solver.set_local_type_from_type(id, &ty);
-        }
-    }
-}
-
 mod constraints {
     use super::*;
 
@@ -158,7 +140,9 @@ mod constraints {
 
     #[test]
     fn nominal_type_arg_infer_guard() {
-        let ty = Type::nominal(
+        let ty = crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            60,
             NominalKind::Struct,
             Ident::new("Box"),
             vec![Type::Infer],

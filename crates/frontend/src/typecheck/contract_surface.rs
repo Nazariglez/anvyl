@@ -9,8 +9,8 @@ use super::{
 };
 use crate::ast::{
     AnonymousContract, AnonymousContractParam, AnonymousContractRequirement, ArrayLen, ConstArg,
-    ConstValue, ContractRef, DynContractHoleId, EscapeMode, FuncParam, Ident, ModuleOrigin,
-    NominalKind, ReturnKind, ReturnSpec, Type, TypeFolder, TypeVisitor,
+    ConstExpr, ConstValue, ContractRef, DynContractHoleId, EscapeMode, FuncParam, Ident,
+    ReturnKind, ReturnSpec, Type, TypeFolder, TypeVisitor,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,11 +76,9 @@ pub(crate) enum ContractTypeSchema {
     Dyn(ContractSurfaceId),
     Tuple(Vec<ContractTypeSchema>),
     Nominal {
-        kind: NominalKind,
-        name: Ident,
+        id: crate::semantic_id::NominalId,
         type_args: Vec<ContractTypeSchema>,
         const_args: Vec<ConstArg>,
-        origin: Option<ModuleOrigin>,
     },
     List(Box<ContractTypeSchema>),
     Array {
@@ -649,22 +647,20 @@ impl<'a> SurfaceBuilder<'a> {
                     .collect(),
             ),
             Type::Nominal(nominal) => ContractTypeSchema::Nominal {
-                kind: nominal.kind,
-                name: nominal.name,
+                id: nominal.id.clone(),
                 type_args: nominal
                     .type_args
                     .iter()
                     .map(|ty| self.type_schema(ty, raw_ids))
                     .collect(),
                 const_args: nominal.const_args.clone(),
-                origin: nominal.origin.clone(),
             },
             Type::List { elem } => {
                 ContractTypeSchema::List(Box::new(self.type_schema(elem, raw_ids)))
             }
             Type::Array { elem, len } => ContractTypeSchema::Array {
                 elem: Box::new(self.type_schema(elem, raw_ids)),
-                len: *len,
+                len: len.clone(),
             },
             Type::Map { key, value } => ContractTypeSchema::Map {
                 key: Box::new(self.type_schema(key, raw_ids)),
@@ -905,13 +901,7 @@ fn encode_type(out: &mut Vec<u8>, ty: &Type) {
         }
         Type::Nominal(nominal) => {
             out.push(15);
-            out.push(match nominal.kind {
-                NominalKind::Struct => 0,
-                NominalKind::DataRef => 1,
-                NominalKind::Enum => 2,
-                NominalKind::Extern => 3,
-            });
-            push_str(out, nominal.name.as_str());
+            nominal.id.encode(out);
             push_len(out, nominal.type_args.len());
             for ty in &nominal.type_args {
                 encode_type(out, ty);
@@ -920,7 +910,6 @@ fn encode_type(out: &mut Vec<u8>, ty: &Type) {
             for arg in &nominal.const_args {
                 encode_const_arg(out, arg);
             }
-            encode_origin(out, nominal.origin.as_ref());
         }
         Type::List { elem } => {
             out.push(16);
@@ -929,7 +918,7 @@ fn encode_type(out: &mut Vec<u8>, ty: &Type) {
         Type::Array { elem, len } => {
             out.push(17);
             encode_type(out, elem);
-            encode_array_len(out, *len);
+            encode_array_len(out, len.clone());
         }
         Type::Map { key, value } => {
             out.push(18);
@@ -997,47 +986,34 @@ fn encode_array_len(out: &mut Vec<u8>, len: ArrayLen) {
             out.push(3);
             push_u64(out, u64::from(id.0));
         }
-    }
-}
-
-fn encode_origin(out: &mut Vec<u8>, origin: Option<&ModuleOrigin>) {
-    let Some(origin) = origin else {
-        out.push(0);
-        return;
-    };
-    match origin {
-        ModuleOrigin::Module(path) => {
-            out.push(1);
-            encode_path(out, path);
-        }
-        ModuleOrigin::SourceFile { package, path } => {
-            out.push(2);
-            encode_string_option(out, package.as_deref());
-            push_str(out, path);
-        }
-        ModuleOrigin::Package { package, path } => {
-            out.push(3);
-            push_str(out, package);
-            match path {
-                Some(path) => {
-                    out.push(1);
-                    encode_path(out, path);
-                }
-                None => out.push(0),
-            }
-        }
-        ModuleOrigin::Provider { package, path } => {
+        ArrayLen::Expr(expr) => {
             out.push(4);
-            push_str(out, package);
-            encode_path(out, path);
+            encode_const_expr(out, &expr);
         }
     }
 }
 
-fn encode_path(out: &mut Vec<u8>, path: &[String]) {
-    push_len(out, path.len());
-    for segment in path {
-        push_str(out, segment);
+fn encode_const_expr(out: &mut Vec<u8>, expr: &ConstExpr) {
+    match expr {
+        ConstExpr::Value(value) => {
+            out.push(0);
+            encode_const_arg(out, &ConstArg::Value(value.clone()));
+        }
+        ConstExpr::Param(id) => {
+            out.push(1);
+            push_u64(out, u64::from(id.0));
+        }
+        ConstExpr::Unary(op, expr) => {
+            out.push(2);
+            push_str(out, &op.to_string());
+            encode_const_expr(out, expr);
+        }
+        ConstExpr::Binary(op, left, right) => {
+            out.push(3);
+            push_str(out, &op.to_string());
+            encode_const_expr(out, left);
+            encode_const_expr(out, right);
+        }
     }
 }
 
@@ -1046,16 +1022,6 @@ fn encode_ident_option(out: &mut Vec<u8>, ident: Option<Ident>) {
         Some(ident) => {
             out.push(1);
             push_str(out, ident.as_str());
-        }
-        None => out.push(0),
-    }
-}
-
-fn encode_string_option(out: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            out.push(1);
-            push_str(out, value);
         }
         None => out.push(0),
     }

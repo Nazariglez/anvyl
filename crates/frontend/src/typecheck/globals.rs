@@ -1,12 +1,27 @@
 use super::{
-    CheckedType, GlobalAccessFact, GlobalAccessMode, GlobalKey, GlobalSig, Type, TypeChecker,
-    TypeError, ValueDecl, check_value_expr_checked_with_hint, push_type_closure_error,
-    register_declarations, type_closure_facts,
+    CheckedType, DeclarationIndex, GlobalAccessFact, GlobalAccessMode, GlobalKey, GlobalSig,
+    NominalPlacement, Type, TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint,
+    push_type_closure_error, register_declarations, type_closure_facts,
 };
 use crate::{
-    ast::{ExprId, GlobalDeclNode, Program, Stmt},
+    ast::{ExprId, GlobalDeclNode, Program, Stmt, TypeVisitor},
     typecheck::ModuleScope,
 };
+
+struct LexicalNominalVisitor<'a> {
+    decls: &'a DeclarationIndex,
+}
+
+impl TypeVisitor for LexicalNominalVisitor<'_> {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        let Type::Nominal(nominal) = ty else {
+            return false;
+        };
+        self.decls
+            .nominal(&nominal.id)
+            .is_some_and(|key| matches!(key.placement, NominalPlacement::Lexical))
+    }
+}
 
 pub(super) fn check_global_initializers(
     module: &ModuleScope,
@@ -102,6 +117,14 @@ impl TypeChecker {
                 if type_closure_facts(&ty).contains_any {
                     self.push_error_once(TypeError::AnyOutsideExternBoundary {
                         span: Some(sig.span),
+                    });
+                }
+                let contains_lexical_nominal =
+                    LexicalNominalVisitor { decls: &self.decls }.visit_type(&ty);
+                if sig.exported && contains_lexical_nominal {
+                    self.push_error_once(TypeError::CompileError {
+                        message: "public runtime global type cannot contain a block-local declaration; move the type declaration to module scope".to_string(),
+                        span: Some(sig.initializer_span),
                     });
                 }
                 let mut errors = vec![];

@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: visibility is not allowed on local aggregate declarations
+
+fn main() {
+    pub struct Hidden { value: int }
+}

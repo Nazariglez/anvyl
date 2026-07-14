@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+fn main() {
+    const FIRST = 4;
+    enum Code: int { First = FIRST, Next }
+    let raw: int = Code.Next as int;
+}

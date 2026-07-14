@@ -239,21 +239,20 @@ pub fn build_air_packages<L: PackageSourceLoader>(
             report,
         )));
     }
-    let air = air::lower::lower_with_modules(
-        &prepared.root.program,
-        &prepared.resolved,
+    let air = air::lower::lower_with_source_index(
+        prepared.source_index,
         &prepared.semantic.program,
         facts,
         air::lower::AirLowerConfig {
             roots: air::lower::AirRoots {
                 entry: roots.entry.as_deref().map(|name| {
-                    root_callable(&prepared.semantic.program, &prepared.root.module, name)
+                    root_callable(&prepared.semantic.program, &prepared.root_module, name)
                 }),
                 callables: roots
                     .callables
                     .iter()
                     .map(|name| {
-                        root_callable(&prepared.semantic.program, &prepared.root.module, name)
+                        root_callable(&prepared.semantic.program, &prepared.root_module, name)
                     })
                     .collect(),
             },
@@ -267,8 +266,8 @@ pub fn build_air_packages<L: PackageSourceLoader>(
 
 struct PreparedPipeline {
     sources: SourceTable,
-    root: LoadedModule,
-    resolved: resolve::ResolveResult,
+    root_module: ModuleId,
+    source_index: crate::source_ast::SourceAstIndex,
     semantic: typecheck::SemanticCheckOutput,
     lint: LintConfig,
 }
@@ -331,9 +330,11 @@ fn prepare_pipeline<L: PackageSourceLoader>(
     let raw_externs = externs::prepare_raw_externs(raw_externs, &root.program, &resolved)
         .map_err(|errors| PipelineStop::Diagnostic(extern_failure(&sources, errors)))?;
 
-    let semantic = typecheck::check_semantic_with_modules(
+    let source_index = crate::source_ast::SourceAstIndex::new(&root.program, &resolved);
+    let semantic = typecheck::check_semantic_with_source_index(
         &root.program,
         &resolved,
+        &source_index,
         raw_externs,
         typecheck::TypecheckConfig { context },
     )
@@ -344,8 +345,8 @@ fn prepare_pipeline<L: PackageSourceLoader>(
 
     Ok(PreparedPipeline {
         sources,
-        root,
-        resolved,
+        root_module: root.module,
+        source_index,
         semantic,
         lint,
     })
@@ -397,10 +398,14 @@ fn typecheck_failure_report(
     lint: &LintConfig,
     failure: typecheck::TypecheckFailure,
 ) -> DiagnosticReport {
+    let diagnostic_context = failure
+        .diagnostic_context
+        .clone()
+        .with_sources(sources.clone());
     let diagnostics = failure
         .errors
         .iter()
-        .map(|error| diagnose_type_error(error, &failure.diagnostic_context))
+        .map(|error| diagnose_type_error(error, &diagnostic_context))
         .chain(failure.warnings.iter().map(diagnose_compile_warning))
         .chain(apply_lints(lint, failure.lint_events));
     diagnostic_report(sources, diagnostics)

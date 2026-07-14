@@ -104,14 +104,10 @@ fn saturated_nominal(decls: &DeclarationIndex, ty: &Type) -> bool {
     let Some(key) = decls.key_for_type(ty) else {
         return false;
     };
-    let Some(generics) = decls.nominal_generics(&key) else {
+    let Some(args) = super::decls::nominal_generic_args(ty) else {
         return false;
     };
-    let Type::Nominal(nominal) = ty else {
-        return false;
-    };
-    nominal.type_args.len() == generics.type_params.len()
-        && nominal.const_args.len() == generics.const_params.len()
+    decls.split_nominal_args(&key, &args).is_some()
 }
 
 pub(crate) fn permits_receiver_conversion(pattern: &ExtendTargetPattern<'_>) -> bool {
@@ -244,9 +240,5 @@ fn static_nominal_family_match(target: &Type, subject: &Type) -> bool {
     let (Type::Nominal(target), Type::Nominal(subject)) = (target, subject) else {
         return false;
     };
-    target.kind == subject.kind
-        && target.name == subject.name
-        && target.origin == subject.origin
-        && subject.type_args.is_empty()
-        && subject.const_args.is_empty()
+    target.id == subject.id && subject.type_args.is_empty() && subject.const_args.is_empty()
 }

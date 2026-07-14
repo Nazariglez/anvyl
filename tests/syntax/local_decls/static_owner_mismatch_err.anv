@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+fn outer<T>(value: T) {
+    struct Local {
+        fn take(value: T) {}
+    }
+    Local.take(1);
+}
+
+fn main() {
+    outer("text");
+}

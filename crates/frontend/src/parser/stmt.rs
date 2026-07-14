@@ -3,14 +3,17 @@ use chumsky::prelude::*;
 use super::{
     AnvParser, BoxedParser,
     common::{block_stmt, identifier},
-    decl::{DeclPolicy, declaration_header, local_function, local_type_alias_statement},
+    decl::{
+        DeclPolicy, declaration_header, local_dataref_declaration, local_enum_declaration,
+        local_function, local_struct_declaration, local_type_alias_statement,
+    },
     expr::{cond_expression, expression, for_header_expression},
     pattern::{conditional_pattern, local_refutable_pattern, pattern},
     types::type_ident,
 };
 use crate::{
     ast,
-    lexer::{Keyword, Op, Token},
+    lexer::{Delimiter, Keyword, Op, Token},
     span::{SourceSpan, Span, Spanned},
 };
 
@@ -21,6 +24,35 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
         let bind = binding(stmt.clone());
         let const_s = const_stmt(stmt.clone());
         let type_alias = local_type_alias_statement();
+        let local_struct = local_struct_declaration(stmt.clone()).map(|node| {
+            let span = node.span;
+            Spanned::new(ast::Stmt::Aggregate(node), span)
+        });
+        let local_dataref = local_dataref_declaration(stmt.clone()).map(|node| {
+            let span = node.span;
+            Spanned::new(ast::Stmt::Aggregate(node), span)
+        });
+        let local_enum = local_enum_declaration(stmt.clone()).map(|node| {
+            let span = node.span;
+            Spanned::new(ast::Stmt::Enum(node), span)
+        });
+        let contract_header = declaration_header(DeclPolicy::MODULE_CONTRACT)
+            .ignored()
+            .then_ignore(select! { Token::Ident(id) if id.0.as_ref() == "contract" => () })
+            .then_ignore(identifier())
+            .boxed();
+        let local_contract = module_only_declaration(
+            contract_header.clone(),
+            "contracts are only allowed at module scope",
+        );
+        let extend_header = declaration_header(DeclPolicy::MODULE_AGGREGATE)
+            .ignored()
+            .then_ignore(select! { Token::Keyword(Keyword::Extend) => () })
+            .boxed();
+        let local_extend = module_only_declaration(
+            extend_header,
+            "extend declarations are only allowed at module scope",
+        );
         let ret = return_stmt(expr.clone());
         let while_let_s = while_let_stmt(stmt.clone(), expr.clone());
         let while_s = while_stmt(stmt.clone(), expr.clone());
@@ -59,6 +91,9 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             Token::Keyword(Keyword::If) => (),
             Token::Keyword(Keyword::Match) => (),
             Token::Keyword(Keyword::Struct) => (),
+            Token::Keyword(Keyword::DataRef) => (),
+            Token::Keyword(Keyword::Enum) => (),
+            Token::Keyword(Keyword::Extend) => (),
             Token::Keyword(Keyword::While) => (),
             Token::Keyword(Keyword::For) => (),
             Token::Keyword(Keyword::Break) => (),
@@ -70,6 +105,7 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             Token::At => (),
             Token::DocComment(_) => (),
         }
+        .or(contract_header)
         .rewind();
 
         let at_assign_start = select! { Token::Ident(_) => () }
@@ -126,6 +162,11 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
             }),
             const_s,
             type_alias,
+            local_struct,
+            local_dataref,
+            local_enum,
+            local_contract,
+            local_extend,
             ret,
             while_let_s,
             while_s,
@@ -140,6 +181,36 @@ pub(super) fn statement<'src>() -> BoxedParser<'src, ast::StmtNode> {
     .labelled("statement")
     .as_context()
     .boxed()
+}
+
+fn module_only_declaration<'src>(
+    target: impl AnvParser<'src, ()>,
+    message: &'static str,
+) -> BoxedParser<'src, ast::StmtNode> {
+    let body = recursive(|body| {
+        let close = select! { Token::Close(Delimiter::Brace) => () };
+        let token = any().and_is(close.clone().not()).ignored();
+        select! { Token::Open(Delimiter::Brace) => () }
+            .ignore_then(choice((body, token)).repeated())
+            .then_ignore(close.or_not())
+            .ignored()
+    });
+    let boundary = select! {
+        Token::Open(Delimiter::Brace) => (),
+        Token::Close(Delimiter::Brace) => (),
+        Token::Semicolon => (),
+    };
+    let header_tail = any().and_is(boundary.not()).ignored().repeated();
+
+    target
+        .then_ignore(header_tail)
+        .then_ignore(body.or_not())
+        .then_ignore(select! { Token::Semicolon => () }.or_not())
+        .validate(move |(), e, emitter| {
+            emitter.emit(Rich::custom(e.span(), message));
+            Spanned::new(ast::Stmt::Break, e.span().byte())
+        })
+        .boxed()
 }
 
 fn binding<'src>(stmt: impl AnvParser<'src, ast::StmtNode>) -> BoxedParser<'src, ast::BindingNode> {

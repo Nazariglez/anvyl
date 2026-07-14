@@ -1,14 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+};
 
 use super::{
-    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, ModuleScope, NominalKey, TypeSubst,
+    ConstDiagnostic, ConstSubst, GenericArgs, GenericParams, NominalKey, TypeSubst,
     const_term::{ConstInferVarId, ConstTerm},
 };
 use crate::{
     ast::{
-        ArrayLen, ConstArg, ConstParamId, ContractRef, EscapeMode, ExprId, FuncParam, GenericArg,
-        Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type, TypeFolder,
-        TypeVarId,
+        ArrayLen, ConstArg, ConstExpr, ConstParamId, ContractRef, EscapeMode, ExprId, FuncParam,
+        GenericArg, Ident, ModuleOrigin, NominalKind, NominalType, ReturnAccess, ReturnSpec, Type,
+        TypeFolder, TypeVarId,
     },
     span::SourceSpan,
 };
@@ -92,8 +95,9 @@ impl TyGenericArg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 struct TyNominal {
+    id: crate::semantic_id::NominalId,
     kind: NominalKind,
     name: Ident,
     type_args: Vec<Ty>,
@@ -101,24 +105,52 @@ struct TyNominal {
     origin: Option<ModuleOrigin>,
 }
 
-impl TyNominal {
-    fn key(&self) -> NominalKey {
-        NominalKey {
-            module: self
-                .origin
-                .as_ref()
-                .map_or(ModuleScope::Root, ModuleScope::from_nominal_origin),
-            kind: self.kind,
-            name: self.name,
-        }
+impl PartialEq for TyNominal {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.type_args == other.type_args
+            && self.const_args == other.const_args
     }
+}
 
+impl Eq for TyNominal {}
+
+impl Hash for TyNominal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.type_args.hash(state);
+        self.const_args.hash(state);
+    }
+}
+
+impl TyNominal {
     fn same_head(&self, other: &Self) -> bool {
-        self.kind == other.kind
-            && self.name == other.name
-            && self.origin == other.origin
+        self.id == other.id
             && self.type_args.len() == other.type_args.len()
             && self.const_args.len() == other.const_args.len()
+    }
+
+    fn from_nominal(nominal: &NominalType, type_args: Vec<Ty>, const_args: Vec<ConstTerm>) -> Ty {
+        Ty::Nominal(Self {
+            id: nominal.id.clone(),
+            kind: nominal.kind,
+            name: nominal.name,
+            type_args,
+            const_args,
+            origin: nominal.origin.clone(),
+        })
+    }
+
+    fn with_args(self, type_args: Vec<Ty>, const_args: Vec<ConstTerm>) -> Ty {
+        Ty::Nominal(Self {
+            type_args,
+            const_args,
+            ..self
+        })
+    }
+
+    fn with_cloned_args(&self, type_args: Vec<Ty>, const_args: Vec<ConstTerm>) -> Ty {
+        self.clone().with_args(type_args, const_args)
     }
 }
 
@@ -194,32 +226,17 @@ impl Ty {
         ))
     }
 
-    fn nominal(
-        kind: NominalKind,
-        name: Ident,
-        type_args: Vec<Self>,
-        const_args: Vec<ConstTerm>,
-        origin: Option<ModuleOrigin>,
-    ) -> Self {
-        Self::Nominal(TyNominal {
-            kind,
-            name,
-            type_args,
-            const_args,
-            origin,
-        })
-    }
-
     fn try_nominal_to_no_infer(nominal: &TyNominal) -> Option<Type> {
         let (type_args, const_args) =
             Self::try_nominal_args_to_no_infer(&nominal.type_args, &nominal.const_args)?;
-        Some(Type::nominal_with_origin(
-            nominal.kind,
-            nominal.name,
+        Some(Type::Nominal(NominalType {
+            id: nominal.id.clone(),
+            kind: nominal.kind,
+            name: nominal.name,
             type_args,
             const_args,
-            nominal.origin.clone(),
-        ))
+            origin: nominal.origin.clone(),
+        }))
     }
 
     fn from_recovery_type(ty: &Type) -> Self {
@@ -278,20 +295,14 @@ impl Ty {
                     .map(Self::from_recovery_type)
                     .collect();
                 let const_args = ConstTerm::from_args(&nominal.const_args);
-                Self::nominal(
-                    nominal.kind,
-                    nominal.name,
-                    type_args,
-                    const_args,
-                    nominal.origin.clone(),
-                )
+                TyNominal::from_nominal(nominal, type_args, const_args)
             }
             Type::List { elem } => Self::List {
                 elem: Box::new(Self::from_recovery_type(elem)),
             },
             Type::Array { elem, len } => Self::Array {
                 elem: Box::new(Self::from_recovery_type(elem)),
-                len: ConstTerm::from_array_len(*len),
+                len: ConstTerm::from_array_len(len.clone()),
             },
             Type::Map { key, value } => Self::Map {
                 key: Box::new(Self::from_recovery_type(key)),
@@ -633,7 +644,7 @@ pub(super) type SourceExprTypes = HashMap<ExprId, (Option<SourceSpan>, Type)>;
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct Solver {
-    core_option: Option<NominalKey>,
+    core_option: Option<crate::semantic_id::NominalId>,
     next_type_var: u32,
     next_const_var: u32,
     type_spans: HashMap<InferVarId, SourceSpan>,
@@ -649,6 +660,7 @@ pub(super) struct Solver {
 
 impl Solver {
     pub(super) fn new(core_option: Option<NominalKey>) -> Self {
+        let core_option = core_option.map(|key| key.id);
         Self {
             core_option,
             ..Self::default()
@@ -673,9 +685,7 @@ impl Solver {
     }
 
     fn is_core_option_nominal(&self, nominal: &TyNominal) -> bool {
-        self.core_option
-            .as_ref()
-            .is_some_and(|key| nominal.key() == *key)
+        self.core_option.as_ref() == Some(&nominal.id)
     }
 
     fn type_for_storage(&self, ty: &Ty) -> Type {
@@ -807,13 +817,7 @@ impl Solver {
             .map(|arg| self.resolve_ref(&arg.0))
             .collect();
         let const_args = ConstTerm::from_args(&nominal.const_args);
-        self.temp_handle(Ty::nominal(
-            nominal.kind,
-            nominal.name,
-            type_args,
-            const_args,
-            nominal.origin.clone(),
-        ))
+        self.temp_handle(TyNominal::from_nominal(nominal, type_args, const_args))
     }
 
     fn temp_handle(&mut self, ty: Ty) -> TypeHandle {
@@ -822,7 +826,7 @@ impl Solver {
 
     pub(super) fn array_handle(&mut self, elem: &TypeHandle, len: &ArrayLen) -> TypeHandle {
         let elem = self.resolve_ref(&elem.0);
-        let len = ConstTerm::from_array_len(*len);
+        let len = ConstTerm::from_array_len(len.clone());
         self.temp_handle(Ty::Array {
             elem: Box::new(elem),
             len,
@@ -1069,21 +1073,14 @@ impl Solver {
                     debug_assert!(nominal.type_args.is_empty());
                     debug_assert!(nominal.const_args.is_empty());
                 }
-                self.instantiate_nominal_template(
-                    nominal.kind,
-                    nominal.name,
-                    &nominal.type_args,
-                    &nominal.const_args,
-                    nominal.origin.as_ref(),
-                    vars,
-                )
+                self.instantiate_nominal_template(nominal, vars)
             }
             Type::List { elem } => Ty::List {
                 elem: Box::new(self.instantiate_type_template(elem, vars)),
             },
             Type::Array { elem, len } => Ty::Array {
                 elem: Box::new(self.instantiate_type_template(elem, vars)),
-                len: Self::instantiate_array_len_template(len, vars),
+                len: self.instantiate_array_len_template(len, vars),
             },
             Type::Map { key, value } => Ty::Map {
                 key: Box::new(self.instantiate_type_template(key, vars)),
@@ -1098,27 +1095,19 @@ impl Solver {
         }
     }
 
-    fn instantiate_nominal_template(
-        &self,
-        kind: NominalKind,
-        name: Ident,
-        type_args: &[Type],
-        const_args: &[ConstArg],
-        origin: Option<&ModuleOrigin>,
-        vars: &GenericSolverVars,
-    ) -> Ty {
-        Ty::nominal(
-            kind,
-            name,
-            type_args
+    fn instantiate_nominal_template(&self, nominal: &NominalType, vars: &GenericSolverVars) -> Ty {
+        TyNominal::from_nominal(
+            nominal,
+            nominal
+                .type_args
                 .iter()
                 .map(|ty| self.instantiate_type_template(ty, vars))
                 .collect(),
-            const_args
+            nominal
+                .const_args
                 .iter()
                 .map(|arg| Self::instantiate_const_arg_template(arg, vars))
                 .collect(),
-            origin.cloned(),
         )
     }
 
@@ -1194,15 +1183,30 @@ impl Solver {
         }
     }
 
-    fn instantiate_array_len_template(len: &ArrayLen, vars: &GenericSolverVars) -> ConstTerm {
+    fn instantiate_array_len_template(
+        &self,
+        len: &ArrayLen,
+        vars: &GenericSolverVars,
+    ) -> ConstTerm {
         match len {
             ArrayLen::Param(id) => vars
                 .consts
                 .get(id)
                 .cloned()
                 .unwrap_or(ConstTerm::Param(*id)),
+            ArrayLen::Expr(expr) => {
+                let consts = vars
+                    .consts
+                    .iter()
+                    .map(|(id, term)| (*id, self.resolve_const(term)))
+                    .collect();
+                match super::generic::substitute_const_expr(expr.clone(), &consts) {
+                    ConstExpr::Value(value) => ConstTerm::Value(value),
+                    expr => ConstTerm::Expr(expr),
+                }
+            }
             ArrayLen::Fixed(_) | ArrayLen::Infer | ArrayLen::Named(_) => {
-                ConstTerm::from_array_len(*len)
+                ConstTerm::from_array_len(len.clone())
             }
         }
     }
@@ -1210,7 +1214,9 @@ impl Solver {
     fn finalized_generic_const_arg(&self, arg: &ConstTerm) -> Option<ConstTerm> {
         let resolved = self.resolve_const(arg);
         match resolved {
-            ConstTerm::Value(_) | ConstTerm::Name(_) | ConstTerm::Param(_) => Some(resolved),
+            ConstTerm::Value(_) | ConstTerm::Name(_) | ConstTerm::Param(_) | ConstTerm::Expr(_) => {
+                Some(resolved)
+            }
             ConstTerm::ArrayInfer | ConstTerm::Infer(_) => None,
         }
     }
@@ -1789,16 +1795,11 @@ impl Solver {
         if !left.same_head(&right) {
             return Err(SolveError::type_mismatch(expected, found, span));
         }
+        let head = left.clone();
         let type_args =
             self.relate_ty_lists(span, left.type_args, right.type_args, TyRelation::Equal)?;
         let const_args = self.relate_const_arg_lists(span, left.const_args, right.const_args)?;
-        Ok(Ty::nominal(
-            left.kind,
-            left.name,
-            type_args,
-            const_args,
-            left.origin,
-        ))
+        Ok(head.with_args(type_args, const_args))
     }
 
     fn constrain_nominal_assignable(
@@ -1812,6 +1813,7 @@ impl Solver {
         if !from.same_head(&to) {
             return Err(SolveError::type_mismatch(expected, found, span));
         }
+        let head = to.clone();
         let outer_mismatch = self.is_core_option_nominal(&to);
         let type_args = Self::outer_mismatch(
             self.relate_ty_lists(span, to.type_args, from.type_args, TyRelation::Assignable),
@@ -1827,9 +1829,7 @@ impl Solver {
             &found,
             span,
         )?;
-        Ok(Ty::nominal(
-            to.kind, to.name, type_args, const_args, to.origin,
-        ))
+        Ok(head.with_args(type_args, const_args))
     }
 
     fn unify_generic_args_equal(
@@ -2046,13 +2046,7 @@ impl Solver {
     fn resolve_nominal(&self, nominal: &TyNominal) -> Ty {
         let (type_args, const_args) =
             self.resolve_nominal_args(&nominal.type_args, &nominal.const_args);
-        Ty::nominal(
-            nominal.kind,
-            nominal.name,
-            type_args,
-            const_args,
-            nominal.origin.clone(),
-        )
+        nominal.with_cloned_args(type_args, const_args)
     }
 
     fn resolve_ty(&self, ty: &Ty) -> Ty {
@@ -2127,6 +2121,7 @@ impl Solver {
             ConstTerm::Value(_)
             | ConstTerm::Name(_)
             | ConstTerm::Param(_)
+            | ConstTerm::Expr(_)
             | ConstTerm::ArrayInfer => term.clone(),
         }
     }
@@ -2281,13 +2276,14 @@ impl Solver {
     fn finalize_nominal(&self, nominal: TyNominal, cx: &mut FinalizeCx<'_>) -> Type {
         let type_args = self.finalize_tys(nominal.type_args, cx);
         match self.finalize_const_args(nominal.const_args, cx) {
-            Some(const_args) => Type::nominal_with_origin(
-                nominal.kind,
-                nominal.name,
+            Some(const_args) => Type::Nominal(NominalType {
+                id: nominal.id,
+                kind: nominal.kind,
+                name: nominal.name,
                 type_args,
                 const_args,
-                nominal.origin,
-            ),
+                origin: nominal.origin,
+            }),
             None => Type::Infer,
         }
     }
@@ -2447,6 +2443,46 @@ mod tests {
         ))
     }
 
+    fn type_nominal(
+        site: usize,
+        kind: NominalKind,
+        name: Ident,
+        type_args: Vec<Type>,
+        const_args: Vec<ConstArg>,
+        origin: Option<ModuleOrigin>,
+    ) -> Type {
+        crate::test_support::test_nominal_type(
+            crate::test_support::nominal_test_source_id(),
+            site,
+            kind,
+            name,
+            type_args,
+            const_args,
+            origin,
+        )
+    }
+
+    fn test_ty_nominal(
+        site: usize,
+        kind: NominalKind,
+        name: Ident,
+        type_args: Vec<Ty>,
+        const_args: Vec<ConstTerm>,
+        origin: Option<ModuleOrigin>,
+    ) -> Ty {
+        Ty::Nominal(TyNominal {
+            id: crate::semantic_id::NominalId::Source(crate::semantic_id::SourceDeclId::new(
+                crate::test_support::nominal_test_source_id(),
+                crate::span::Span::new(site, site + 1),
+            )),
+            kind,
+            name,
+            type_args,
+            const_args,
+            origin,
+        })
+    }
+
     fn source() -> SourceId {
         static SOURCE: OnceLock<SourceId> = OnceLock::new();
         *SOURCE.get_or_init(|| {
@@ -2456,7 +2492,7 @@ mod tests {
     }
 
     fn span(start: usize, end: usize) -> Option<SourceSpan> {
-        Some(SourceSpan::new(source(), start, end))
+        (start <= end).then(|| SourceSpan::new(source(), start, end))
     }
 
     fn type_var(id: u32) -> TypeVarId {
@@ -2479,7 +2515,7 @@ mod tests {
         Solver::new(Some(option_key()))
     }
 
-    fn ty_option(inner: Ty) -> Ty {
+    fn ty_option(inner: &Ty) -> Ty {
         Ty::from_recovery_type(&option(
             inner.try_to_type_no_infer().expect("concrete option arg"),
         ))
@@ -2489,9 +2525,9 @@ mod tests {
         TypeRef::concrete(ty)
     }
 
-    fn infer_id(ty: Ty) -> InferVarId {
+    fn infer_id(ty: &Ty) -> InferVarId {
         match ty {
-            Ty::Infer(id) => id,
+            Ty::Infer(id) => *id,
             _ => panic!("expected inference var"),
         }
     }
@@ -2527,17 +2563,42 @@ mod tests {
         }
     }
 
-    fn nominal(name: &str, args: Vec<Ty>) -> Ty {
-        ty_nominal(NominalKind::Struct, name, args)
+    fn nominal(site: usize, name: &str, args: Vec<Ty>) -> Ty {
+        ty_nominal(site, NominalKind::Struct, name, args)
     }
 
-    fn ty_nominal(kind: NominalKind, name: &str, args: Vec<Ty>) -> Ty {
-        Ty::nominal(kind, ident(name), args, vec![], Some(origin(&["pkg"])))
+    fn ty_nominal(site: usize, kind: NominalKind, name: &str, args: Vec<Ty>) -> Ty {
+        let name = ident(name);
+        let origin = origin(&["pkg"]);
+        test_ty_nominal(site, kind, name, args, vec![], Some(origin))
     }
 
     fn assert_roundtrip(ty: Type) {
         let infer = Ty::from_recovery_type(&ty);
         assert_eq!(infer.try_to_type_no_infer(), Some(ty));
+    }
+
+    #[test]
+    fn nominal_equality_ignores_display_metadata() {
+        let left = test_ty_nominal(
+            0,
+            NominalKind::Struct,
+            ident("Left"),
+            vec![Ty::Int],
+            vec![],
+            Some(origin(&["left"])),
+        );
+        let right = test_ty_nominal(
+            0,
+            NominalKind::Enum,
+            ident("Right"),
+            vec![Ty::Int],
+            vec![],
+            Some(origin(&["right"])),
+        );
+
+        assert_eq!(left, right);
+        assert_eq!(HashSet::from([left, right]).len(), 1);
     }
 
     #[test]
@@ -2614,21 +2675,24 @@ mod tests {
             ConstArg::Name(ident("CAP")),
             ConstArg::Param(const_param(9)),
         ];
-        assert_roundtrip(Type::nominal_with_origin(
+        assert_roundtrip(type_nominal(
+            70,
             NominalKind::Struct,
             ident("FixedBuf"),
             type_args.clone(),
             const_args.clone(),
             Some(origin(&["gamekit", "mem"])),
         ));
-        assert_roundtrip(Type::nominal_with_origin(
+        assert_roundtrip(type_nominal(
+            71,
             NominalKind::DataRef,
             ident("Handle"),
             type_args.clone(),
             const_args.clone(),
             Some(origin(&["gamekit", "mem"])),
         ));
-        assert_roundtrip(Type::nominal_with_origin(
+        assert_roundtrip(type_nominal(
+            72,
             NominalKind::Enum,
             ident("Option"),
             type_args,
@@ -2653,7 +2717,8 @@ mod tests {
 
     #[test]
     fn roundtrip_externs() {
-        assert_roundtrip(Type::nominal_with_origin(
+        assert_roundtrip(type_nominal(
+            73,
             NominalKind::Extern,
             ident("Texture"),
             vec![],
@@ -2665,7 +2730,8 @@ mod tests {
     #[test]
     fn nominals_enter_solver_as_nominal() {
         let origin = Some(origin(&["gamekit", "mem"]));
-        let ty = Type::nominal_with_origin(
+        let ty = type_nominal(
+            70,
             NominalKind::Struct,
             ident("FixedBuf"),
             vec![Type::Int],
@@ -2682,7 +2748,8 @@ mod tests {
         ));
         assert_eq!(
             solver_ty.try_to_type_no_infer(),
-            Some(Type::nominal_with_origin(
+            Some(type_nominal(
+                70,
                 NominalKind::Struct,
                 ident("FixedBuf"),
                 vec![Type::Int],
@@ -2695,7 +2762,8 @@ mod tests {
     #[test]
     fn externs_enter_solver_as_nominal() {
         let origin = Some(origin(&["gamekit", "gfx"]));
-        let ty = Type::nominal_with_origin(
+        let ty = type_nominal(
+            73,
             NominalKind::Extern,
             ident("Texture"),
             vec![],
@@ -2712,7 +2780,8 @@ mod tests {
         ));
         assert_eq!(
             solver_ty.try_to_type_no_infer(),
-            Some(Type::nominal_with_origin(
+            Some(type_nominal(
+                73,
                 NominalKind::Extern,
                 ident("Texture"),
                 vec![],
@@ -2776,7 +2845,8 @@ mod tests {
         solver
             .bind_type(var, &Ty::Int, span(30, 40))
             .expect("bind should succeed");
-        let nested = Ty::nominal(
+        let nested = test_ty_nominal(
+            0,
             NominalKind::Enum,
             ident(Type::OPTION_ENUM_NAME),
             vec![Ty::Infer(var)],
@@ -2901,7 +2971,8 @@ mod tests {
     fn unresolved_const_infer_finalizes_error() {
         let mut solver = Solver::default();
         let term = solver.fresh_const(span(3, 4));
-        let ty = Ty::nominal(
+        let ty = test_ty_nominal(
+            80,
             NominalKind::Struct,
             ident("Buf"),
             vec![],
@@ -2964,7 +3035,7 @@ mod tests {
     #[test]
     fn equal_occurs_check() {
         let mut solver = Solver::default();
-        let var = infer_id(solver.fresh_type(span(1, 2)));
+        let var = infer_id(&solver.fresh_type(span(1, 2)));
         assert_eq!(
             solver.unify_equal(
                 span(3, 4),
@@ -3009,13 +3080,13 @@ mod tests {
         let mut solver = Solver::default();
         solver.add_assignable(
             span(3, 4),
-            ty_ref(nominal("Meters", vec![])),
-            ty_ref(nominal("Seconds", vec![])),
+            ty_ref(nominal(90, "Meters", vec![])),
+            ty_ref(nominal(91, "Seconds", vec![])),
         );
         solver.add_assignable(
             span(3, 4),
-            ty_ref(nominal("Meters", vec![])),
-            ty_ref(nominal("Seconds", vec![])),
+            ty_ref(nominal(90, "Meters", vec![])),
+            ty_ref(nominal(91, "Seconds", vec![])),
         );
         let errors = solver.solve_all();
         assert_eq!(errors.len(), 1);
@@ -3041,7 +3112,7 @@ mod tests {
                 cast_accept: false,
                 escape: EscapeMode::NonEscaping,
             }],
-            ret: Box::new(TyReturnSpec::value(ty_option(Ty::Int))),
+            ret: Box::new(TyReturnSpec::value(ty_option(&Ty::Int))),
         };
         assert!(matches!(
             solver.constrain_assignable(span(1, 2), ty_ref(from), ty_ref(to)),
@@ -3052,7 +3123,8 @@ mod tests {
     #[test]
     fn non_core_option_is_not_optional() {
         let mut solver = option_solver();
-        let local_option = Ty::nominal(
+        let local_option = test_ty_nominal(
+            92,
             NominalKind::Enum,
             ident(Type::OPTION_ENUM_NAME),
             vec![Ty::Int],
@@ -3069,7 +3141,8 @@ mod tests {
     #[test]
     fn malformed_core_option_is_not_optional() {
         let mut solver = option_solver();
-        let extra_type_arg = Ty::nominal(
+        let extra_type_arg = test_ty_nominal(
+            0,
             NominalKind::Enum,
             ident(Type::OPTION_ENUM_NAME),
             vec![Ty::Int, Ty::String],
@@ -3081,7 +3154,8 @@ mod tests {
             Err(SolveError::TypeMismatch { .. })
         ));
 
-        let const_arg = Ty::nominal(
+        let const_arg = test_ty_nominal(
+            0,
             NominalKind::Enum,
             ident(Type::OPTION_ENUM_NAME),
             vec![Ty::Int],
@@ -3097,8 +3171,8 @@ mod tests {
     #[test]
     fn constraints_late_binding() {
         let mut solver = Solver::default();
-        let a = infer_id(solver.fresh_type(span(1, 2)));
-        let b = infer_id(solver.fresh_type(span(3, 4)));
+        let a = infer_id(&solver.fresh_type(span(1, 2)));
+        let b = infer_id(&solver.fresh_type(span(3, 4)));
         solver.add_equal(span(5, 6), ty_ref(Ty::Infer(a)), ty_ref(Ty::Infer(b)));
         solver.add_equal(span(7, 8), ty_ref(Ty::Infer(b)), ty_ref(Ty::String));
         assert!(solver.solve_all().is_empty());
@@ -3109,8 +3183,12 @@ mod tests {
     #[test]
     fn constraints_equal_first() {
         let mut solver = option_solver();
-        let a = infer_id(solver.fresh_type(span(1, 2)));
-        solver.add_assignable(span(3, 4), ty_ref(Ty::Infer(a)), ty_ref(ty_option(Ty::Int)));
+        let a = infer_id(&solver.fresh_type(span(1, 2)));
+        solver.add_assignable(
+            span(3, 4),
+            ty_ref(Ty::Infer(a)),
+            ty_ref(ty_option(&Ty::Int)),
+        );
         solver.add_equal(span(5, 6), ty_ref(Ty::Infer(a)), ty_ref(Ty::Int));
         assert!(solver.solve_all().is_empty());
         assert_eq!(solver.resolve_ty(&Ty::Infer(a)), Ty::Int);

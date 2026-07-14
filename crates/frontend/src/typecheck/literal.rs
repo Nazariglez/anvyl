@@ -308,16 +308,19 @@ struct NominalLiteralSolver<'a> {
 impl NominalLiteralSolver<'_> {
     fn new<'a>(
         generics: &'a GenericParams,
+        declaration_generics: &GenericParams,
+        owner_args: &GenericArgs,
         args: &[GenericArg],
         span: Span,
         tc: &mut TypeChecker,
     ) -> Option<NominalLiteralSolver<'a>> {
-        let seeds = if args.is_empty() {
-            GenericSolverSeeds::default()
-        } else {
-            let args = bind_exact_generic_args(tc, generics, args, span)?;
-            GenericSolverSeeds::from_args(generics, &args)
-        };
+        let mut seeds = GenericSolverSeeds::from_args(generics, owner_args);
+        if !args.is_empty() {
+            let args = bind_exact_generic_args(tc, declaration_generics, args, span)?;
+            let declaration = GenericSolverSeeds::from_args(declaration_generics, &args);
+            seeds.type_args.extend(declaration.type_args);
+            seeds.const_args.extend(declaration.const_args);
+        }
         Some(Self::from_seeds(generics, &seeds, span, tc))
     }
 
@@ -427,19 +430,30 @@ pub(super) fn check_struct_lit_hint(
     };
     tc.warn_deprecated(&agg.policy, kind, key.name, lit.span);
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
+    let generics = agg.all_generics();
+    let owner = tc.visible_generic_owner();
+    let owner_args = GenericArgs {
+        type_args: owner.args.type_args[..agg.owner_generics.type_params.len()].to_vec(),
+        const_args: owner.args.const_args[..agg.owner_generics.const_params.len()].to_vec(),
+    };
     let inf = match &target.seeds {
-        Some(seeds) => NominalLiteralSolver::from_seeds(&agg.generics, seeds, lit.span, tc),
+        Some(seeds) => NominalLiteralSolver::from_seeds(&generics, seeds, lit.span, tc),
         None => {
-            let Some(inf) =
-                NominalLiteralSolver::new(&agg.generics, &lit.node.generic_args, lit.span, tc)
-            else {
+            let Some(inf) = NominalLiteralSolver::new(
+                &generics,
+                &agg.generics,
+                &owner_args,
+                &lit.node.generic_args,
+                lit.span,
+                tc,
+            ) else {
                 check_unknown_nominal_fields(&lit.node.fields, tc);
                 return checked_from_type(expr, Type::Infer, tc);
             };
             inf
         }
     };
-    let expected_ok = inf.bind_expected(&key, &agg.generics, expected_ty.as_ref(), lit.span, tc);
+    let expected_ok = inf.bind_expected(&key, &generics, expected_ty.as_ref(), lit.span, tc);
     let field_check = check_nominal_fields(
         expr.node.id,
         &lit.node.fields,
@@ -452,14 +466,14 @@ pub(super) fn check_struct_lit_hint(
     if !expected_ok || field_check.failed {
         return checked_from_type(expr, Type::Infer, tc);
     }
-    let Some(ty) = inf.finalize(&key, &agg.generics, lit.span, tc) else {
+    let Some(ty) = inf.finalize(&key, &generics, lit.span, tc) else {
         return checked_from_type(expr, Type::Infer, tc);
     };
     record_default_fields(
         expr.node.id,
         &ty,
         &key,
-        &agg.generics,
+        &generics,
         field_check.default_fields,
         tc,
     );
@@ -501,7 +515,16 @@ fn check_enum_struct_variant_lit(
     }
 
     let expected_ty = expected.map(|handle| tc.handle_type(handle));
-    let inf = NominalLiteralSolver::without_args(&resolved.generics, lit.span, tc);
+    let owner_args = resolved.inherited_owner_args(tc);
+    let inf = NominalLiteralSolver::new(
+        &resolved.generics,
+        &resolved.declaration_generics,
+        &owner_args,
+        &[],
+        lit.span,
+        tc,
+    )
+    .expect("struct enum variants have no explicit generic arguments");
     let expected_ok =
         inf.bind_expected(&key, &resolved.generics, expected_ty.as_ref(), lit.span, tc);
     let field_check = check_variant_literal_fields(
@@ -812,19 +835,30 @@ fn resolve_struct_target(
     tc: &mut TypeChecker,
 ) -> Option<StructLiteralTarget> {
     if lit.node.qualifier.is_none()
-        && let Some(alias) = tc.local_type_scopes.visible(lit.node.name, None).cloned()
+        && let Some(binding) = tc.local_type_scopes.visible(lit.node.name, None).cloned()
     {
-        let expanded = if lit.node.generic_args.is_empty() {
-            tc.resolve_local_alias_target_for_tc_at(&alias, lit.span, lit.node.name)
-        } else {
-            let ty = Type::UnresolvedNominal {
-                qualifier: None,
-                name: lit.node.name,
-                generic_args: lit.node.generic_args.clone(),
-            };
-            tc.resolve_type_for_tc_at(&ty, lit.span)
-        };
-        return struct_literal_target_from_expanded(lit, &expanded, tc);
+        match binding {
+            super::type_refs::LexicalTypeBinding::Nominal(id) => {
+                return Some(StructLiteralTarget {
+                    key: tc.decls.nominal(&id)?.clone(),
+                    seeds: None,
+                });
+            }
+            super::type_refs::LexicalTypeBinding::Alias(id) => {
+                let alias = tc.local_type_scopes.alias(&id).cloned()?;
+                let expanded = if lit.node.generic_args.is_empty() {
+                    tc.resolve_local_alias_target_for_tc_at(&alias, lit.span, lit.node.name)
+                } else {
+                    let ty = Type::UnresolvedNominal {
+                        qualifier: None,
+                        name: lit.node.name,
+                        generic_args: lit.node.generic_args.clone(),
+                    };
+                    tc.resolve_type_for_tc_at(&ty, lit.span)
+                };
+                return struct_literal_target_from_expanded(lit, &expanded, tc);
+            }
+        }
     }
 
     let lookup =
@@ -851,7 +885,10 @@ fn resolve_struct_target(
         }
     };
     match binding {
-        TypeBinding::Nominal(key) => Some(StructLiteralTarget { key, seeds: None }),
+        TypeBinding::Nominal(id) => Some(StructLiteralTarget {
+            key: tc.decls.nominal(&id)?.clone(),
+            seeds: None,
+        }),
         TypeBinding::Alias(key) => {
             let expanded = if lit.node.generic_args.is_empty() {
                 tc.resolve_module_alias_target_for_tc_at(&key, lit.span, lit.node.name)
@@ -895,26 +932,33 @@ fn struct_literal_target_from_expanded(
         });
         return None;
     };
-    let seeds = tc
-        .decls
-        .nominal_generics(&key)
-        .map(|generics| literal_target_seeds(&generics, expanded));
+    let seeds = tc.decls.nominal_generics(&key).map(|generics| {
+        let args = nominal_generic_args(expanded)
+            .expect("alias-backed nominal literal target missing canonical arguments");
+        let (owner_args, declaration_args) = tc
+            .decls
+            .split_nominal_args(&key, &args)
+            .expect("alias-backed nominal literal target has non-canonical argument shape");
+        let owner_generics = tc.decls.nominal_owner_generics(&key);
+        let mut seeds = GenericSolverSeeds::from_args(&owner_generics, &owner_args);
+        let declaration = literal_target_seeds(&generics, &declaration_args);
+        seeds.type_args.extend(declaration.type_args);
+        seeds.const_args.extend(declaration.const_args);
+        seeds
+    });
     Some(StructLiteralTarget { key, seeds })
 }
 
-fn literal_target_seeds(generics: &GenericParams, expanded: &Type) -> GenericSolverSeeds {
-    let Some(args) = nominal_generic_args(expanded) else {
-        return GenericSolverSeeds::default();
-    };
+fn literal_target_seeds(generics: &GenericParams, args: &GenericArgs) -> GenericSolverSeeds {
     let mut seeds = GenericSolverSeeds::default();
-    for (param, ty) in generics.type_params.iter().zip(args.type_args) {
+    for (param, ty) in generics.type_params.iter().zip(&args.type_args) {
         if !type_depends_on_generics(&ty) {
-            seeds.type_args.insert(param.id, ty);
+            seeds.type_args.insert(param.id, ty.clone());
         }
     }
-    for (param, term) in generics.const_params.iter().zip(args.const_args) {
+    for (param, term) in generics.const_params.iter().zip(&args.const_args) {
         if !matches!(term, ConstTerm::Param(_)) {
-            seeds.const_args.insert(param.id, term);
+            seeds.const_args.insert(param.id, term.clone());
         }
     }
     seeds

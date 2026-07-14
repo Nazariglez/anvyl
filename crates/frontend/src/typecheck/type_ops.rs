@@ -133,7 +133,7 @@ impl TypeVisitor for TypeClosureFacts {
     fn visit_array_len(&mut self, len: ArrayLen) -> bool {
         match len {
             ArrayLen::Named(_) => self.contains_unresolved_const = true,
-            ArrayLen::Infer | ArrayLen::Fixed(_) | ArrayLen::Param(_) => {}
+            ArrayLen::Infer | ArrayLen::Fixed(_) | ArrayLen::Param(_) | ArrayLen::Expr(_) => {}
         }
         false
     }
@@ -187,8 +187,9 @@ fn nominal_contains_dyn_value(
     let contains = match key.kind {
         super::NominalKind::Struct | super::NominalKind::DataRef => {
             decls.aggregate(&key).is_some_and(|agg| {
+                let generics = agg.all_generics();
                 agg.fields.values().any(|field| {
-                    let field_ty = super::substitute_aggregate_member(ty, &agg.generics, &field.ty);
+                    let field_ty = super::substitute_aggregate_member(ty, &generics, &field.ty);
                     type_contains_dyn_value(&field_ty, decls, seen)
                 })
             })
@@ -201,7 +202,7 @@ fn nominal_contains_dyn_value(
                 type_args: nominal.type_args.clone(),
                 const_args: super::ConstTerm::from_args(&nominal.const_args),
             };
-            let (type_subst, const_subst) = schema.generics.substitutions(&args);
+            let (type_subst, const_subst) = schema.all_generics().substitutions(&args);
             schema
                 .variants
                 .values()
