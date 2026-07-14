@@ -1,0 +1,7 @@
+fn table() {
+    // fmt: skip
+    let rows = [
+        [ 1,  10 ], // ones
+        [ 2,  20 ], // twos
+    ]; // lookup
+}

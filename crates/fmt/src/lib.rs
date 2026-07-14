@@ -12,6 +12,7 @@ use chumsky::error::{Rich, RichPattern};
 pub enum FormatError {
     Lex(String),
     Parse(String),
+    Directive(String),
 }
 
 impl std::fmt::Display for FormatError {
@@ -19,6 +20,7 @@ impl std::fmt::Display for FormatError {
         match self {
             FormatError::Lex(msg) => write!(f, "Lex error: {msg}"),
             FormatError::Parse(msg) => write!(f, "Parse error: {msg}"),
+            FormatError::Directive(msg) => write!(f, "Formatter directive error: {msg}"),
         }
     }
 }
@@ -93,8 +95,10 @@ pub fn format_source(source: &str) -> Result<String, FormatError> {
         .map_err(|errors| FormatError::Parse(format_parse_errors(&errors)))?;
 
     let trivia = trivia::scan_trivia(source, &tokens.tokens);
-    let mut printer = printer::Printer::new(source, &trivia);
-    printer.format_program(&ast);
+    let mut printer = printer::Printer::new(source, &trivia, &tokens.tokens);
+    printer
+        .format_program(&ast)
+        .map_err(|error| FormatError::Directive(error.to_string()))?;
     Ok(printer.finish())
 }
 
@@ -105,6 +109,19 @@ mod tests {
     fn assert_fmt(source: &str, expected: &str) {
         let formatted = format_source(source).expect("format failed");
         assert_eq!(formatted, expected);
+    }
+
+    fn assert_idempotent(source: &str) -> String {
+        let formatted = format_source(source).expect("format failed");
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+        formatted
+    }
+
+    fn assert_directive_error(source: &str) {
+        assert!(matches!(
+            format_source(source),
+            Err(FormatError::Directive(_))
+        ));
     }
 
     #[test]
@@ -129,13 +146,130 @@ mod tests {
     }
 
     #[test]
+    fn skips_module_and_nested_block_statements() {
+        let source = "// fmt: skip\nconst MATRIX = [\n [ 1.0,  0.0 ], // first\n [ 0.0,  1.0 ],\n];\nfn main(){if true {\n// fmt: skip\n        let row = [ 1,  2,  3 ]; // aligned\nlet x=1;\n}\n}";
+        let expected = "// fmt: skip\nconst MATRIX = [\n [ 1.0,  0.0 ], // first\n [ 0.0,  1.0 ],\n];\n\nfn main() {\n    if true {\n        // fmt: skip\n        let row = [ 1,  2,  3 ]; // aligned\n        let x = 1;\n    }\n}\n";
+
+        assert_eq!(assert_idempotent(source), expected);
+    }
+
+    #[test]
+    fn skip_directive_preserves_surrounding_trivia_once() {
+        let source = "fn main() {\n// before\n// fmt: skip\n\n    // attached\n  let values = [ 1,  2 ]; // after\n// next\nlet x=1;\n}";
+        let formatted = assert_idempotent(source);
+
+        assert!(formatted.contains("    // before\n    // fmt: skip\n\n    // attached\n  let values = [ 1,  2 ]; // after\n    // next\n    let x = 1;"));
+        for comment in ["// before", "// attached", "// after", "// next"] {
+            assert_eq!(formatted.matches(comment).count(), 1, "{comment}");
+        }
+    }
+
+    #[test]
+    fn invalid_skip_directive_placement() {
+        for source in [
+            "// fmt: skip",
+            "fn main() {\n// fmt: skip\n}",
+            "// fmt: skip\n// fmt: skip\nconst X = 1;",
+            "fn main() {\n// fmt: skip\nlet x = 1; let y = 2;\n}",
+            "fn main() {\n// fmt: skip\nlet x = 1; }",
+            "fn main() {\n// fmt: skip\n1\n}",
+            "@deprecated\n// fmt: skip\nfn main() {}",
+            "// fmt: skip\nconst X = 1; @deprecated\nfn next() {}",
+            "// fmt: skip\nconst X = 1; /// Docs\nfn next() {}",
+            "fn main() {\nif true {\n// fmt: skip\n}\nlet x = 1;\n}",
+            "fn main() {\nuse([])\n// fmt: skip\n;\nlet x = 1;\n}",
+        ] {
+            assert_directive_error(source);
+        }
+    }
+
+    #[test]
+    fn skip_directive_does_not_hide_parse_errors() {
+        let error = format_source("// fmt: skip\nconst X = [;").unwrap_err();
+        assert!(matches!(error, FormatError::Parse(_)));
+    }
+
+    #[test]
+    fn similar_comments_format_normally() {
+        assert_fmt(
+            "fn main(){\nlet x=1; // fmt: skip\n// fmt: skip later\nlet y=2;\n}",
+            "fn main() {\n    let x = 1; // fmt: skip\n    // fmt: skip later\n    let y = 2;\n}\n",
+        );
+    }
+
+    #[test]
+    fn skipped_declaration_includes_metadata() {
+        for source in [
+            "// fmt: skip\n/// Kept docs.\nfn  main( ) {\n}",
+            "// fmt: skip\n@deprecated\nfn  main( ) {\n}",
+            "// fmt: skip\npub\nfn  main( ) {\n}",
+        ] {
+            let formatted = assert_idempotent(source);
+            assert!(formatted.contains(&source["// fmt: skip\n".len()..]));
+        }
+    }
+
+    #[test]
+    fn skipped_metadata_prefix_trivia_is_copied_once() {
+        let source = "// fmt: skip\n@deprecated\n// between\n\n/// Docs\npub\nfn  main( ) {\n}\n";
+        let formatted = assert_idempotent(source);
+        assert_eq!(formatted, source);
+        assert_eq!(formatted.matches("// between").count(), 1);
+    }
+
+    #[test]
+    fn preserves_trailing_whitespace_inside_skipped_line() {
+        let source = "fn main() {\n// fmt: skip\n  let x = [ 1 ];   \t\n}\n";
+        let formatted = assert_idempotent(source);
+        assert!(formatted.contains("  let x = [ 1 ];   \t\n"));
+    }
+
+    #[test]
+    fn metadata_trivia_without_directive_is_preserved() {
+        assert_fmt(
+            "@deprecated\n// between\npub\nfn main() {}\n",
+            "// between\n@deprecated\npub fn main() {}\n",
+        );
+    }
+
+    #[test]
+    fn outer_skip_still_validates_nested_directives() {
+        assert_directive_error("// fmt: skip\nfn main() {\n// fmt: skip\n}\n");
+
+        let source = "// fmt: skip\nfn main() {\n// fmt: skip\n  let x = [ 1 ];\n}\n";
+        assert_eq!(assert_idempotent(source), source);
+    }
+
+    #[test]
+    fn skipped_expression_statement_keeps_terminator_and_comment() {
+        let source = "fn main() {\n// fmt: skip\n  use( [ 1,  2 ] ); // kept\nlet x=1;\n}";
+        let formatted = assert_idempotent(source);
+        assert!(formatted.contains("  use( [ 1,  2 ] ); // kept\n    let x = 1;"));
+    }
+
+    #[test]
+    fn skipped_expression_keeps_split_terminator() {
+        let source = "fn main() {\r\n// fmt: skip\r\n  use([\"café\"] )\r\n;\r\n}\r\n";
+        let expected = "fn main() {\n    // fmt: skip\n  use([\"café\"] )\r\n;\r\n}\n";
+        assert_eq!(assert_idempotent(source), expected);
+    }
+
+    #[test]
+    fn speculative_render_restores_directive_state() {
+        let source = "fn main() {\nlet funcs = [|| {\n// fmt: skip\n  let values = [ 1,  2 ]; // kept\n}];\n}";
+        let formatted = assert_idempotent(source);
+        assert_eq!(formatted.matches("// fmt: skip").count(), 1);
+        assert_eq!(formatted.matches("// kept").count(), 1);
+    }
+
+    #[test]
     fn parse_error() {
         let source = "fn main() {";
         let result = format_source(source);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Parse(_) => {}
-            FormatError::Lex(other) => panic!("expected Parse error, got {other:?}"),
+            other => panic!("expected Parse error, got {other:?}"),
         }
     }
 

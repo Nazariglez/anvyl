@@ -1,0 +1,5 @@
+fn main() {
+    // fmt: skip
+    let values = [ 3,  2,  1 ];
+    let total = values.len();
+}

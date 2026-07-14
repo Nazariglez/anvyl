@@ -17,16 +17,19 @@ fn formatter_snapshots() {
     inputs.sort();
 
     for input in inputs {
-        let expected = input.with_file_name(
-            input
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replace(".input.anv", ".expected.anv"),
-        );
+        let name = input.file_name().unwrap().to_string_lossy();
+        let expected = input.with_file_name(name.replace(".input.anv", ".expected.anv"));
         let source = fs::read_to_string(&input).unwrap();
         let expected = fs::read_to_string(&expected).unwrap();
         let formatted = anvyx_fmt::format_source(&source).unwrap();
         assert_eq!(formatted, expected, "{}", input.display());
+        if name.starts_with("format_skip_") {
+            assert_eq!(
+                anvyx_fmt::format_source(&formatted).unwrap(),
+                formatted,
+                "{} is not idempotent",
+                input.display()
+            );
+        }
     }
 }

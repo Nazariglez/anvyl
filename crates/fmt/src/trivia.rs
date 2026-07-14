@@ -1,19 +1,22 @@
 use anvyx_frontend::{lexer::LexedToken, span::Span};
 
-pub struct TriviaItem {
-    pub kind: TriviaKind,
-    pub span: Span,
-    pub text: String,
+pub(super) struct TriviaItem {
+    pub(super) kind: TriviaKind,
+    pub(super) span: Span,
+    pub(super) text: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum TriviaKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TriviaKind {
     LineComment,
+    SkipDirective,
     BlankLine,
 }
 
+const SKIP_DIRECTIVE: &str = "// fmt: skip";
+
 // doc comments (`///`) are tokenized separately and won't appear in the gaps we scan here
-pub fn scan_trivia(source: &str, tokens: &[LexedToken]) -> Vec<TriviaItem> {
+pub(super) fn scan_trivia(source: &str, tokens: &[LexedToken]) -> Vec<TriviaItem> {
     let mut items = Vec::new();
 
     if tokens.is_empty() {
@@ -38,53 +41,55 @@ fn scan_gap(source: &str, start: usize, end: usize, items: &mut Vec<TriviaItem>)
         return;
     }
 
-    let gap = &source[start..end];
+    let mut line_start = start;
 
-    // no newline means no blank line possible, but may still have a trailing comment
-    if !gap.contains('\n') {
-        let trimmed = gap.trim();
-        if trimmed.starts_with("//") {
-            items.push(TriviaItem {
-                kind: TriviaKind::LineComment,
-                span: Span::new(start, end),
-                text: trimmed.to_string(),
-            });
-        }
-        return;
-    }
-
-    let line_count = gap.matches('\n').count() + 1;
-    let last_idx = line_count - 1;
-    let mut offset = 0;
-
-    for (i, line) in gap.split('\n').enumerate() {
-        let line_start = start + offset;
-        let line_end = if i == last_idx {
-            end
-        } else {
-            start + offset + line.len()
-        };
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            // skip first and last segments, those are just surrounding whitespace not blank lines
-            if i > 0 && i < last_idx {
+    for (i, line) in source[start..end].split('\n').enumerate() {
+        let line_end = line_start + line.len();
+        if line.trim().is_empty() {
+            if i > 0 && line_end < end {
                 items.push(TriviaItem {
                     kind: TriviaKind::BlankLine,
                     span: Span::new(line_start, line_end),
                     text: String::new(),
                 });
             }
-        } else if trimmed.starts_with("//") {
-            items.push(TriviaItem {
-                kind: TriviaKind::LineComment,
-                span: Span::new(line_start, line_end),
-                text: trimmed.to_string(),
-            });
+        } else {
+            let standalone = i > 0 || {
+                let physical_start = source[..start].rfind('\n').map_or(0, |pos| pos + 1);
+                source[physical_start..start].trim().is_empty()
+            };
+            push_comment(line_start, line, standalone, items);
         }
-
-        offset += line.len() + 1; // +1 for the '\n'
+        line_start = line_end + 1;
     }
+}
+
+fn push_comment(line_start: usize, line: &str, standalone: bool, items: &mut Vec<TriviaItem>) {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let comment = line.trim_start();
+    if !comment.starts_with("//") {
+        return;
+    }
+
+    let comment_start = line_start + line.len() - comment.len();
+    let is_directive = standalone && comment == SKIP_DIRECTIVE;
+
+    items.push(TriviaItem {
+        kind: if is_directive {
+            TriviaKind::SkipDirective
+        } else {
+            TriviaKind::LineComment
+        },
+        span: Span::new(
+            if is_directive {
+                comment_start
+            } else {
+                line_start
+            },
+            line_start + line.len(),
+        ),
+        text: comment.trim_end().to_string(),
+    });
 }
 
 #[cfg(test)]
@@ -166,5 +171,39 @@ mod tests {
         assert_eq!(trivia[0].text, "// line1");
         assert_eq!(trivia[1].kind, TriviaKind::LineComment);
         assert_eq!(trivia[1].text, "// line2");
+    }
+
+    #[test]
+    fn exact_standalone_skip_directive() {
+        for source in [
+            "// fmt: skip\nfn main() {}",
+            "    // fmt: skip\nfn main() {}",
+            "// fmt: skip\r\nfn main() {}",
+        ] {
+            let trivia = scan_trivia(source, &tokenize_test(source));
+            assert_eq!(trivia[0].kind, TriviaKind::SkipDirective);
+            assert_eq!(
+                &source[trivia[0].span.start..trivia[0].span.end],
+                "// fmt: skip"
+            );
+        }
+    }
+
+    #[test]
+    fn similar_comments_are_not_directives() {
+        for source in [
+            "const X = 1; // fmt: skip",
+            "// fmt: skip this\nfn main() {}",
+            "// fmt: skip   \nfn main() {}",
+            "// fmt: skip\t\nfn main() {}",
+            "const X = \"// fmt: skip\";",
+        ] {
+            let trivia = scan_trivia(source, &tokenize_test(source));
+            assert!(
+                !trivia
+                    .iter()
+                    .any(|item| item.kind == TriviaKind::SkipDirective)
+            );
+        }
     }
 }

@@ -1,0 +1,8 @@
+fn main(){
+// fmt: skip
+  let matrix = [
+      [ 1,  0 ],
+      [ 0,  1 ],
+  ];
+let x=1;
+}

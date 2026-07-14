@@ -1,6 +1,9 @@
 use std::{collections::HashMap, fmt::Write};
 
-use anvyx_frontend::ast;
+use anvyx_frontend::{
+    ast,
+    lexer::{LexedToken, Token},
+};
 
 use super::trivia::{TriviaItem, TriviaKind};
 
@@ -11,12 +14,28 @@ mod stmt;
 mod types;
 
 const MAX_WIDTH: usize = 100;
+const MISPLACED_DIRECTIVE: &str =
+    "skip directive must precede a statement in the same statement list";
 
 #[derive(Clone, Copy)]
 struct Snapshot {
     buf_len: usize,
     trivia_cursor: usize,
     indent: u32,
+    pending_directive: Option<usize>,
+    directive_error: Option<DirectiveError>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DirectiveError {
+    pos: usize,
+    message: &'static str,
+}
+
+impl std::fmt::Display for DirectiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "byte {}: {}", self.pos, self.message)
+    }
 }
 
 fn expr_has_block(expr: &ast::Expr) -> bool {
@@ -61,31 +80,37 @@ fn needs_blank_line_between(a: &ast::Stmt, b: &ast::Stmt) -> bool {
     !same_group
 }
 
-pub struct Printer<'a> {
+pub(super) struct Printer<'a> {
     source: &'a str,
     trivia: &'a [TriviaItem],
+    tokens: &'a [LexedToken],
     trivia_cursor: usize,
     buf: String,
     indent: u32,
     type_var_names: HashMap<ast::TypeVarId, String>,
     const_param_names: HashMap<ast::ConstParamId, String>,
+    pending_directive: Option<usize>,
+    directive_error: Option<DirectiveError>,
 }
 
 impl<'a> Printer<'a> {
-    pub fn new(source: &'a str, trivia: &'a [TriviaItem]) -> Self {
+    pub(super) fn new(source: &'a str, trivia: &'a [TriviaItem], tokens: &'a [LexedToken]) -> Self {
         let estimated_capacity = source.len() + source.len() / 4;
         Self {
             source,
             trivia,
+            tokens,
             trivia_cursor: 0,
             buf: String::with_capacity(estimated_capacity),
             indent: 0,
             type_var_names: HashMap::new(),
             const_param_names: HashMap::new(),
+            pending_directive: None,
+            directive_error: None,
         }
     }
 
-    pub fn finish(self) -> String {
+    pub(super) fn finish(self) -> String {
         let mut result = self.buf;
         if !result.ends_with('\n') {
             result.push('\n');
@@ -155,6 +180,8 @@ impl<'a> Printer<'a> {
             buf_len: self.buf.len(),
             trivia_cursor: self.trivia_cursor,
             indent: self.indent,
+            pending_directive: self.pending_directive,
+            directive_error: self.directive_error,
         }
     }
 
@@ -162,6 +189,8 @@ impl<'a> Printer<'a> {
         self.buf.truncate(snap.buf_len);
         self.trivia_cursor = snap.trivia_cursor;
         self.indent = snap.indent;
+        self.pending_directive = snap.pending_directive;
+        self.directive_error = snap.directive_error;
     }
 
     // speculatively render the given function and keep the result if it fits
@@ -330,6 +359,20 @@ impl<'a> Printer<'a> {
                     self.write(&item.text);
                     self.writeln();
                 }
+                TriviaKind::SkipDirective => {
+                    let directive_pos = item.span.start;
+                    self.write_indent();
+                    self.write(&item.text);
+                    self.writeln();
+                    if self.pending_directive.is_some() {
+                        self.record_directive_error(
+                            directive_pos,
+                            "duplicate skip directive before statement",
+                        );
+                    } else {
+                        self.pending_directive = Some(directive_pos);
+                    }
+                }
                 TriviaKind::BlankLine => {
                     if !self.buf.ends_with("\n\n") {
                         self.writeln();
@@ -341,32 +384,142 @@ impl<'a> Printer<'a> {
     }
 
     fn emit_trailing_trivia(&mut self, prev_end: usize, next_start: usize) {
+        // struct/enum/extend bodies don't consume their own trivia
+        self.discard_trivia_before(prev_end);
+
         while self.trivia_cursor < self.trivia.len() {
             let item = &self.trivia[self.trivia_cursor];
             if item.span.start >= next_start {
                 break;
             }
-            // struct/enum/extend bodies don't consume their own trivia so skip anything before prev_end
-            if item.span.start < prev_end {
-                self.trivia_cursor += 1;
-                continue;
-            }
-            let between = &self.source[prev_end..item.span.start];
-            let on_same_line = !between.contains('\n');
-            if on_same_line {
-                // remove the trailing newline that format_stmt wrote so
-                // the comment lands on the same line
-                if self.buf.ends_with('\n') {
-                    self.buf.pop();
-                }
-                self.write(" ");
-                self.write(&item.text);
-                self.writeln();
-                self.trivia_cursor += 1;
-            } else {
+            if self.source[prev_end..item.span.start].contains('\n') {
                 break;
             }
+
+            // remove the trailing newline that format_stmt wrote so
+            // the comment lands on the same line
+            if self.buf.ends_with('\n') {
+                self.buf.pop();
+            }
+            self.write(" ");
+            self.write(&item.text);
+            self.writeln();
+            self.trivia_cursor += 1;
         }
+    }
+
+    fn discard_trivia_before(&mut self, end: usize) {
+        while self.trivia_cursor < self.trivia.len()
+            && self.trivia[self.trivia_cursor].span.start < end
+        {
+            let item = &self.trivia[self.trivia_cursor];
+            let kind = item.kind;
+            let pos = item.span.start;
+            self.trivia_cursor += 1;
+            if kind == TriviaKind::SkipDirective {
+                self.record_directive_error(pos, MISPLACED_DIRECTIVE);
+            }
+        }
+    }
+
+    fn record_directive_error(&mut self, pos: usize, message: &'static str) {
+        if self.directive_error.is_none() {
+            self.directive_error = Some(DirectiveError { pos, message });
+        }
+    }
+
+    fn reject_pending_directive(&mut self) {
+        if let Some(pos) = self.pending_directive.take() {
+            self.record_directive_error(pos, MISPLACED_DIRECTIVE);
+        }
+    }
+
+    fn statement_source_start(&self, stmt: &ast::StmtNode, lower_bound: usize) -> usize {
+        let first = self
+            .tokens
+            .partition_point(|(_, span)| span.start() < lower_bound);
+        self.tokens[first..]
+            .iter()
+            .take_while(|(_, span)| span.start() <= stmt.span.start)
+            .find(|(token, _)| !matches!(token, Token::Semicolon))
+            .map_or(stmt.span.start, |(_, span)| span.start())
+    }
+
+    fn statement_source_end(&self, stmt: &ast::StmtNode) -> usize {
+        let next = self
+            .tokens
+            .partition_point(|(_, span)| span.start() < stmt.span.end);
+        self.tokens
+            .get(next)
+            .filter(|(token, _)| matches!(token, Token::Semicolon))
+            .map_or(stmt.span.end, |(_, span)| span.end())
+    }
+
+    fn reject_directives_before(&mut self, end: usize) {
+        let pos = self.trivia[self.trivia_cursor..]
+            .iter()
+            .take_while(|item| item.span.start < end)
+            .find(|item| item.kind == TriviaKind::SkipDirective)
+            .map(|item| item.span.start);
+        if let Some(pos) = pos {
+            self.record_directive_error(pos, MISPLACED_DIRECTIVE);
+        }
+    }
+
+    fn format_statement(&mut self, stmt: &ast::StmtNode, source_start: usize, next_start: usize) {
+        self.emit_trivia_before(source_start);
+
+        if let Some(directive_pos) = self.pending_directive.take()
+            && self.format_raw_statement(stmt, source_start, next_start, directive_pos)
+        {
+            return;
+        }
+
+        self.emit_trivia_before(stmt.span.start);
+        self.reject_pending_directive();
+        self.format_stmt(stmt);
+        self.emit_trailing_trivia(stmt.span.end, next_start);
+        self.reject_directives_before(self.statement_source_end(stmt));
+    }
+
+    fn format_raw_statement(
+        &mut self,
+        stmt: &ast::StmtNode,
+        source_start: usize,
+        next_start: usize,
+        directive_pos: usize,
+    ) -> bool {
+        let line_start = self.source[..source_start]
+            .rfind('\n')
+            .map_or(0, |pos| pos + 1);
+        let source_end = self.statement_source_end(stmt);
+        let line_end = self.source[source_end..]
+            .find('\n')
+            .map_or(self.source.len(), |offset| source_end + offset + 1);
+
+        if next_start < line_end {
+            self.record_directive_error(
+                directive_pos,
+                "skipped statement must own its final physical line",
+            );
+            return false;
+        }
+
+        self.validate_raw_statement(stmt, line_end);
+        self.trivia_cursor +=
+            self.trivia[self.trivia_cursor..].partition_point(|item| item.span.start < line_end);
+        self.write(&self.source[line_start..line_end]);
+        true
+    }
+
+    fn validate_raw_statement(&mut self, stmt: &ast::StmtNode, line_end: usize) {
+        let snap = self.snapshot();
+        self.format_stmt(stmt);
+        self.emit_trailing_trivia(stmt.span.end, line_end);
+        self.discard_trivia_before(line_end);
+        let error = self.directive_error;
+        self.restore(snap);
+        self.directive_error = self.directive_error.or(error);
     }
 
     fn format_lit(&mut self, lit: &ast::Lit) {
@@ -409,26 +562,23 @@ impl<'a> Printer<'a> {
         debug_assert!(block.span.end <= self.source.len());
         debug_assert_eq!(self.source.as_bytes().get(block.span.start), Some(&b'{'));
         debug_assert_eq!(self.source.as_bytes().get(block.span.end - 1), Some(&b'}'));
-        let close_brace_byte_start = block.span.end - 1;
-        let open_brace_byte_end = block.span.start + 1;
+        let close_start = block.span.end - 1;
+        let open_end = block.span.start + 1;
 
-        // skip trivia before `{` so outer scope items don't leak in (like blank lines in struct bodies)
-        while self.trivia_cursor < self.trivia.len()
-            && self.trivia[self.trivia_cursor].span.start < open_brace_byte_end
-        {
-            self.trivia_cursor += 1;
-        }
+        // Discard outer-scope trivia before `{` so it cannot leak into the block.
+        self.discard_trivia_before(open_end);
 
         let has_inner_trivia = self.trivia_cursor < self.trivia.len()
-            && self.trivia[self.trivia_cursor].span.start >= open_brace_byte_end
-            && self.trivia[self.trivia_cursor].span.start < close_brace_byte_start;
+            && self.trivia[self.trivia_cursor].span.start >= open_end
+            && self.trivia[self.trivia_cursor].span.start < close_start;
 
         if block.node.stmts.is_empty() && block.node.tail.is_none() {
             if has_inner_trivia {
                 self.write("{");
                 self.writeln();
                 self.indent();
-                self.emit_trivia_before(close_brace_byte_start);
+                self.emit_trivia_before(close_start);
+                self.reject_pending_directive();
                 self.dedent();
                 self.write_indent();
                 self.write("}");
@@ -458,46 +608,53 @@ impl<'a> Printer<'a> {
         self.writeln();
         self.indent();
 
-        let stmts_len = block.node.stmts.len();
-        for (i, stmt_node) in block.node.stmts.iter().enumerate() {
-            self.emit_trivia_before(stmt_node.span.start);
-            self.format_stmt(stmt_node);
-            let next_byte_start = if i + 1 < stmts_len {
-                block.node.stmts[i + 1].span.start
+        for (i, stmt) in block.node.stmts.iter().enumerate() {
+            let lower = if i == 0 {
+                open_end
+            } else {
+                block.node.stmts[i - 1].span.end
+            };
+            let start = self.statement_source_start(stmt, lower);
+            let next = if i + 1 < block.node.stmts.len() {
+                self.statement_source_start(&block.node.stmts[i + 1], stmt.span.end)
             } else if let Some(tail) = &block.node.tail {
                 tail.span.start
             } else {
-                close_brace_byte_start
+                close_start
             };
-            self.emit_trailing_trivia(stmt_node.span.end, next_byte_start);
+            self.format_statement(stmt, start, next);
         }
 
         if let Some(tail) = &block.node.tail {
             self.emit_trivia_before(tail.span.start);
+            self.reject_pending_directive();
             self.write_indent();
             self.format_expr(&tail.node);
             self.writeln();
-            self.emit_trailing_trivia(tail.span.end, close_brace_byte_start);
+            self.emit_trailing_trivia(tail.span.end, close_start);
         }
 
-        self.emit_trivia_before(close_brace_byte_start);
+        self.emit_trivia_before(close_start);
+        self.reject_pending_directive();
         self.dedent();
         self.write_indent();
         self.write("}");
     }
 
-    pub fn format_program(&mut self, program: &ast::Program) {
+    pub(super) fn format_program(&mut self, program: &ast::Program) -> Result<(), DirectiveError> {
         for (i, stmt) in program.stmts.iter().enumerate() {
-            self.emit_trivia_before(stmt.span.start);
-
-            self.format_stmt(stmt);
-
-            let next_byte_start = if i + 1 < program.stmts.len() {
-                program.stmts[i + 1].span.start
+            let lower = if i == 0 {
+                0
+            } else {
+                program.stmts[i - 1].span.end
+            };
+            let start = self.statement_source_start(stmt, lower);
+            let next = if i + 1 < program.stmts.len() {
+                self.statement_source_start(&program.stmts[i + 1], stmt.span.end)
             } else {
                 self.source.len()
             };
-            self.emit_trailing_trivia(stmt.span.end, next_byte_start);
+            self.format_statement(stmt, start, next);
 
             if i + 1 < program.stmts.len()
                 && needs_blank_line_between(&stmt.node, &program.stmts[i + 1].node)
@@ -508,5 +665,7 @@ impl<'a> Printer<'a> {
         }
 
         self.emit_trivia_before(self.source.len());
+        self.reject_pending_directive();
+        self.directive_error.map_or(Ok(()), Err)
     }
 }
