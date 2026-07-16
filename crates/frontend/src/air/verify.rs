@@ -7889,7 +7889,7 @@ fn verify_rvalue(
             verify_operand(cx, function_id, block_id, stmt_index, lhs);
             verify_operand(cx, function_id, block_id, stmt_index, rhs);
             cx.verify_type_ref(site.clone(), *ty);
-            if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce) {
+            if op.has_lazy_rhs() {
                 cx.push(
                     site,
                     VerifyErrorKind::BadRValue(BadRValue::UnsupportedBinaryOp(*op)),

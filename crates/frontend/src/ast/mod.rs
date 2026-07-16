@@ -893,6 +893,18 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
+    pub fn short_circuit_value(self) -> Option<bool> {
+        match self {
+            Self::And => Some(false),
+            Self::Or => Some(true),
+            _ => None,
+        }
+    }
+
+    pub fn has_lazy_rhs(self) -> bool {
+        self.short_circuit_value().is_some() || self == Self::Coalesce
+    }
+
     pub fn precedence(self) -> ExprPrecedence {
         match self {
             Self::Mul | Self::Div | Self::Rem => ExprPrecedence::Multiplicative,

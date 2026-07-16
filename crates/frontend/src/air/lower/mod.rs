@@ -6086,67 +6086,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     ty,
                 })
             }
-            ExprKind::Binary(binary) => {
-                let result_ty = self.lower_expr_ty(expr.node.id)?;
-                if binary.node.op == BinaryOp::Add && result_ty == Type::String {
-                    return self.lower_string_concat(expr);
-                }
-                if binary.node.op == BinaryOp::Coalesce {
-                    return self.lower_coalesce(expr, binary, &result_ty);
-                }
-                if matches!(binary.node.op, BinaryOp::And | BinaryOp::Or) {
-                    return Err(unsupported_expr(expr));
-                }
-                if let Some(value) = self.lower_nil_equality(expr, binary)? {
-                    return Ok(value);
-                }
-                if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
-                    && let Some(value) = self.lower_dataref_eq(expr, binary, &result_ty)?
-                {
-                    return Ok(value);
-                }
-                if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
-                    && let Some(value) = self.lower_unit_enum_eq(binary, &result_ty)?
-                {
-                    return Ok(value);
-                }
-                let lhs = self.lower_value(&binary.node.left)?;
-                let rhs = self.lower_value(&binary.node.right)?;
-                let lhs_air_ty = self.operand_ty(&lhs);
-                let rhs_air_ty = self.operand_ty(&rhs);
-                let ty = self.cx.lower_ty(&result_ty)?;
-                let same_flag = lhs_air_ty == rhs_air_ty
-                    && matches!(self.cx.program.type_data(lhs_air_ty), TypeData::Flag(_));
-                let flag_op = same_flag
-                    && match binary.node.op {
-                        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor => ty == lhs_air_ty,
-                        BinaryOp::Eq | BinaryOp::NotEq => {
-                            matches!(self.cx.program.type_data(ty), TypeData::Bool)
-                        }
-                        _ => false,
-                    };
-                if !flag_op {
-                    self.require_builtin_scalar(expr)?;
-                    let lhs_ty = self.operand_type(&lhs);
-                    let rhs_ty = self.operand_type(&rhs);
-                    let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
-                        lhs_ty.scalar_kind(),
-                        rhs_ty.scalar_kind(),
-                        result_ty.scalar_kind(),
-                    ) else {
-                        return Err(unsupported_expr(expr));
-                    };
-                    if binary.node.op.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
-                        return Err(unsupported_expr(expr));
-                    }
-                }
-                self.emit_temp(RValue::Binary {
-                    op: binary.node.op,
-                    lhs,
-                    rhs,
-                    ty,
-                })
-            }
+            ExprKind::Binary(binary) => self.lower_binary_value(expr, binary),
             ExprKind::Call(call) => self.lower_call_value(expr, call),
             ExprKind::IntrinsicCall(call) => self.lower_intrinsic_value(expr, call),
             ExprKind::StringInterp(parts) => self.lower_string_interp(parts),
@@ -6169,6 +6109,98 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             }
             _ => Err(unsupported_expr(expr)),
         }
+    }
+
+    fn lower_binary_value(
+        &mut self,
+        expr: &ExprNode,
+        binary: &ast::BinaryNode,
+    ) -> Result<Operand, LowerError> {
+        let result_ty = self.lower_expr_ty(expr.node.id)?;
+        if binary.node.op == BinaryOp::Add && result_ty == Type::String {
+            return self.lower_string_concat(expr);
+        }
+        if binary.node.op == BinaryOp::Coalesce {
+            return self.lower_coalesce(expr, binary, &result_ty);
+        }
+        if let Some(decisive) = binary.node.op.short_circuit_value() {
+            return self.lower_short_circuit_value(expr, binary, decisive, &result_ty);
+        }
+        if let Some(value) = self.lower_nil_equality(expr, binary)? {
+            return Ok(value);
+        }
+        if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
+            && let Some(value) = self.lower_dataref_eq(expr, binary, &result_ty)?
+        {
+            return Ok(value);
+        }
+        if matches!(binary.node.op, BinaryOp::Eq | BinaryOp::NotEq)
+            && let Some(value) = self.lower_unit_enum_eq(binary, &result_ty)?
+        {
+            return Ok(value);
+        }
+        let lhs = self.lower_value(&binary.node.left)?;
+        let rhs = self.lower_value(&binary.node.right)?;
+        let lhs_air_ty = self.operand_ty(&lhs);
+        let rhs_air_ty = self.operand_ty(&rhs);
+        let ty = self.cx.lower_ty(&result_ty)?;
+        let same_flag = lhs_air_ty == rhs_air_ty
+            && matches!(self.cx.program.type_data(lhs_air_ty), TypeData::Flag(_));
+        let flag_op = same_flag
+            && match binary.node.op {
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor => ty == lhs_air_ty,
+                BinaryOp::Eq | BinaryOp::NotEq => {
+                    matches!(self.cx.program.type_data(ty), TypeData::Bool)
+                }
+                _ => false,
+            };
+        if !flag_op {
+            self.require_builtin_scalar(expr)?;
+            let lhs_ty = self.operand_type(&lhs);
+            let rhs_ty = self.operand_type(&rhs);
+            let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
+                lhs_ty.scalar_kind(),
+                rhs_ty.scalar_kind(),
+                result_ty.scalar_kind(),
+            ) else {
+                return Err(unsupported_expr(expr));
+            };
+            if binary.node.op.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
+                return Err(unsupported_expr(expr));
+            }
+        }
+        self.emit_temp(RValue::Binary {
+            op: binary.node.op,
+            lhs,
+            rhs,
+            ty,
+        })
+    }
+
+    fn lower_short_circuit_value(
+        &mut self,
+        expr: &ExprNode,
+        binary: &ast::BinaryNode,
+        decisive: bool,
+        result_ty: &Type,
+    ) -> Result<Operand, LowerError> {
+        if result_ty != &Type::Bool {
+            return Err(unsupported_expr(expr));
+        }
+        let ty = self.cx.lower_ty(result_ty)?;
+        let result = self.temp(ty);
+        let cond = self.lower_if_cond(&binary.node.left)?;
+        let rhs = self.lower_nested_expr_branch_value(&binary.node.right, result)?;
+        let decisive_branch = self.with_nested_block(|this| {
+            let value = this.bool_const(ty, decisive);
+            this.emit_init(result, RValue::Use(value))
+        })?;
+        let (then_block, else_block) = if decisive {
+            (decisive_branch, rhs)
+        } else {
+            (rhs, decisive_branch)
+        };
+        self.finish_conditional_value(expr, cond, Some(result), then_block, else_block)
     }
 
     fn lower_safe_field_chain(&mut self, expr: &ExprNode) -> Result<Option<Operand>, LowerError> {
@@ -7569,6 +7601,17 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let cond = self.lower_if_cond(&if_expr.node.cond)?;
         let then_block = self.lower_nested_branch_value(&if_expr.node.then_block, expr, result)?;
         let else_block = self.lower_nested_branch_value(else_block, expr, result)?;
+        self.finish_conditional_value(expr, cond, result, then_block, else_block)
+    }
+
+    fn finish_conditional_value(
+        &mut self,
+        owner: &ExprNode,
+        cond: Operand,
+        result: Option<LocalId>,
+        then_block: AirBlock,
+        else_block: AirBlock,
+    ) -> Result<Operand, LowerError> {
         let then_falls = air_block_falls_through(&then_block);
         let else_falls = air_block_falls_through(&else_block);
         self.ensure_open()?;
@@ -7582,7 +7625,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.dummy_operand(self.function.signature.return_type());
         }
         let Some(result) = result else {
-            return Err(unsupported_expr(expr));
+            return Err(unsupported_expr(owner));
         };
         Ok(self.operand_place(result))
     }
@@ -18037,6 +18080,50 @@ fn f() -> int {
             branch.else_block.as_ref().unwrap().stmts[0],
             AirStmt::Init { .. }
         ));
+    }
+
+    #[test]
+    fn logical_binary_lowers_rhs_inside_selected_branch() {
+        let source = r"
+fn rhs(value: bool) -> bool { value }
+fn and_value(lhs: bool) -> bool { lhs && rhs(rhs(false)) }
+fn or_value(lhs: bool) -> bool { lhs || rhs(rhs(true)) }
+";
+        let air = lower_roots(source, &["and_value", "or_value"]).expect("lower failed");
+
+        for (name, rhs_in_then) in [("and_value", true), ("or_value", false)] {
+            let function = air
+                .functions
+                .iter()
+                .find(|function| function.name == Ident::new(name))
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let [AirStmt::If(branch)] = function.body.block.stmts.as_slice() else {
+                panic!("{name} did not lower to one outer branch")
+            };
+            let else_block = branch.else_block.as_ref().expect("missing else branch");
+            let (rhs, constant) = if rhs_in_then {
+                (&branch.then_block, else_block)
+            } else {
+                (else_block, &branch.then_block)
+            };
+            let [
+                AirStmt::Init {
+                    local: result,
+                    value: RValue::Use(Operand::Const(_)),
+                },
+            ] = constant.stmts.as_slice()
+            else {
+                panic!("{name} constant branch did not initialize one result")
+            };
+            assert!(matches!(
+                rhs.stmts.as_slice(),
+                [
+                    AirStmt::Init { value: RValue::Call { .. }, .. },
+                    AirStmt::Init { value: RValue::Call { .. }, .. },
+                    AirStmt::Init { local, .. },
+                ] if local == result
+            ));
+        }
     }
 
     #[test]

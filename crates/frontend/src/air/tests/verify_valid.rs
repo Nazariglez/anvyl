@@ -1745,36 +1745,6 @@ fn extern_call() {
 }
 
 #[test]
-fn if_bool() {
-    let mut builder = ProgramBuilder::default();
-    let bool_ty = builder.bool_ty();
-    let void_ty = builder.void_ty();
-    let module = test_module(&mut builder);
-
-    let mut fb = FunctionBuilder::new("branch", module, FunctionKind::Normal, void_ty);
-    let p_cond = fb.push_param("cond", bool_ty, ParamRole::Normal);
-    let block = fb.push_block(term_return_void());
-    fb.add_statement(
-        block,
-        AirStmt::If(AirIf {
-            cond: op_place(p_cond, bool_ty),
-            then_block: AirBlock {
-                stmts: vec![],
-                tail: term_return_void(),
-            },
-            else_block: Some(AirBlock {
-                stmts: vec![],
-                tail: term_return_void(),
-            }),
-        }),
-    );
-
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
-    expect_verified(&builder.finish());
-}
-
-#[test]
 fn unreachable_fn() {
     let mut builder = ProgramBuilder::default();
     let void_ty = builder.void_ty();

@@ -300,8 +300,19 @@ impl TypeChecker {
             }
             ConstExpr::Binary(op, left, right) => {
                 let left = self.normalize_symbolic_const_expr(*left, span)?;
+                if let ConstExpr::Value(ConstValue::Bool(value)) = &left
+                    && op.short_circuit_value() == Some(*value)
+                {
+                    return Some(left);
+                }
                 let right = self.normalize_symbolic_const_expr(*right, span)?;
                 match (left, right) {
+                    (
+                        ConstExpr::Value(ConstValue::Bool(_)),
+                        ConstExpr::Value(ConstValue::Bool(right)),
+                    ) if op.short_circuit_value().is_some() => {
+                        Some(ConstExpr::Value(ConstValue::Bool(right)))
+                    }
                     (ConstExpr::Value(left), ConstExpr::Value(right)) => {
                         match eval_binary(op, left, right, self.error_span(span)) {
                             Ok(value) => Some(ConstExpr::Value(value)),
@@ -648,45 +659,22 @@ impl TypeChecker {
                 let value = self.eval_const_expr(&node.node.expr, warn_deprecated)?;
                 eval_unary(node.node.op, value, self.error_span(node.span))
             }
-            ExprKind::Binary(node) => match node.node.op {
-                BinaryOp::And => {
-                    let left = bool_operand(
-                        node.node.op,
-                        self.eval_const_expr(&node.node.left, warn_deprecated)?,
-                        self.error_span(node.span),
-                    )?;
-                    if !left {
-                        return Ok(ConstValue::Bool(false));
-                    }
-                    eval_binary(
-                        node.node.op,
-                        ConstValue::Bool(left),
-                        self.eval_const_expr(&node.node.right, warn_deprecated)?,
-                        self.error_span(node.span),
-                    )
-                }
-                BinaryOp::Or => {
-                    let left = bool_operand(
-                        node.node.op,
-                        self.eval_const_expr(&node.node.left, warn_deprecated)?,
-                        self.error_span(node.span),
-                    )?;
-                    if left {
-                        return Ok(ConstValue::Bool(true));
-                    }
-                    eval_binary(
-                        node.node.op,
-                        ConstValue::Bool(left),
-                        self.eval_const_expr(&node.node.right, warn_deprecated)?,
-                        self.error_span(node.span),
-                    )
-                }
-                _ => {
+            ExprKind::Binary(node) => {
+                let op = node.node.op;
+                if let Some(decisive) = op.short_circuit_value() {
+                    let span = self.error_span(node.span);
                     let left = self.eval_const_expr(&node.node.left, warn_deprecated)?;
+                    let left = bool_operand(op, left, span)?;
+                    if left == decisive {
+                        return Ok(ConstValue::Bool(left));
+                    }
                     let right = self.eval_const_expr(&node.node.right, warn_deprecated)?;
-                    eval_binary(node.node.op, left, right, self.error_span(node.span))
+                    return bool_operand(op, right, span).map(ConstValue::Bool);
                 }
-            },
+                let left = self.eval_const_expr(&node.node.left, warn_deprecated)?;
+                let right = self.eval_const_expr(&node.node.right, warn_deprecated)?;
+                eval_binary(op, left, right, self.error_span(node.span))
+            }
             ExprKind::Cast(node) => self.eval_const_cast(node, warn_deprecated),
             ExprKind::Ternary(node) => {
                 let cond = self.eval_const_expr(&node.node.cond, warn_deprecated)?;
@@ -1307,8 +1295,6 @@ fn eval_bool_binary(
     span: Option<SourceSpan>,
 ) -> ConstEvalResult<ConstValue> {
     match op {
-        BinaryOp::And => Ok(ConstValue::Bool(a && b)),
-        BinaryOp::Or => Ok(ConstValue::Bool(a || b)),
         BinaryOp::Eq => Ok(ConstValue::Bool(a == b)),
         BinaryOp::NotEq => Ok(ConstValue::Bool(a != b)),
         _ => const_error(TypeError::InvalidOperand {

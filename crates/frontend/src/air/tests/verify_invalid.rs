@@ -4862,39 +4862,58 @@ fn place_claimed_type_and_index_type_are_verified() {
 }
 
 #[test]
-fn rvalue_binary_and_cast_invariants() {
+fn lazy_binary_rvalues_are_rejected() {
+    use crate::ast::BinaryOp;
+
     let mut builder = ProgramBuilder::default();
-    let int_ty = builder.alloc_type(TypeData::Int);
     let bool_ty = builder.alloc_type(TypeData::Bool);
     let module = test_module(&mut builder);
-    let mut fb = FunctionBuilder::new("bad_rvalues", module, FunctionKind::Normal, int_ty);
-    let i = fb.push_local(None, int_ty, Mutability::Immutable, LocalKind::User);
-    let b = fb.push_local(None, bool_ty, Mutability::Immutable, LocalKind::User);
-    let bb0 = fb.push_block(term_return(op_place(i, int_ty)));
+    let mut fb = FunctionBuilder::new("bad_lazy_binary", module, FunctionKind::Normal, bool_ty);
+    let value = fb.push_param("value", bool_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return(op_place(value, bool_ty)));
+    for op in [BinaryOp::And, BinaryOp::Or, BinaryOp::Coalesce] {
+        fb.add_statement(
+            block,
+            stmt_eval(RValue::Binary {
+                op,
+                lhs: op_place(value, bool_ty),
+                rhs: op_place(value, bool_ty),
+                ty: bool_ty,
+            }),
+        );
+    }
+    let function = builder.alloc_function(fb.finish());
+    builder.set_entry(function);
+
+    let errors = verify(&builder.finish()).unwrap_err();
+    for op in [BinaryOp::And, BinaryOp::Or, BinaryOp::Coalesce] {
+        assert!(errors.iter().any(|error| matches!(
+            error.kind,
+            EK::BadRValue(BadRValue::UnsupportedBinaryOp(found)) if found == op
+        )));
+    }
+}
+
+#[test]
+fn same_type_cast_is_rejected() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.alloc_type(TypeData::Int);
+    let module = test_module(&mut builder);
+    let mut fb = FunctionBuilder::new("bad_cast", module, FunctionKind::Normal, int_ty);
+    let value = fb.push_param("value", int_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return(op_place(value, int_ty)));
     fb.add_statement(
-        bb0,
-        stmt_eval(RValue::Binary {
-            op: crate::ast::BinaryOp::And,
-            lhs: op_place(b, bool_ty),
-            rhs: op_place(b, bool_ty),
-            ty: bool_ty,
-        }),
-    );
-    fb.add_statement(
-        bb0,
+        block,
         stmt_eval(RValue::Cast {
-            value: op_place(i, int_ty),
+            value: op_place(value, int_ty),
             target: int_ty,
         }),
     );
-    let fid = builder.alloc_function(fb.finish());
-    builder.set_entry(fid);
+    let function = builder.alloc_function(fb.finish());
+    builder.set_entry(function);
+
     let errors = verify(&builder.finish()).unwrap_err();
-    assert!(errors.iter().any(|e| matches!(
-        e.kind,
-        EK::BadRValue(BadRValue::UnsupportedBinaryOp(crate::ast::BinaryOp::And))
-    )));
-    assert!(errors.iter().any(|e| matches!(e.kind, EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target }) if value == int_ty && target == int_ty)));
+    assert!(errors.iter().any(|error| matches!(error.kind, EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target }) if value == int_ty && target == int_ty)));
 }
 
 #[test]

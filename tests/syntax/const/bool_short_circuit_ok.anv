@@ -1,9 +1,47 @@
 // @mode: check
 // @expect: success
 
-const X = false && (1 / 0 == 0);
-const N = X ? 1 : 2;
+const FALSE_AND = false && (1 / 0 == 0);
+const TRUE_OR = true || (1 / 0 == 0);
+const TRUE_AND = true && false;
+const FALSE_OR = false || true;
+const NESTED = !(FALSE_AND || (TRUE_AND && TRUE_OR));
+
+const FALSE_AND_LEN = FALSE_AND ? 1 : 2;
+const TRUE_OR_LEN = TRUE_OR ? 2 : 1;
+const TRUE_AND_LEN = TRUE_AND ? 1 : 2;
+const FALSE_OR_LEN = FALSE_OR ? 2 : 1;
+const NESTED_LEN = NESTED ? 2 : 1;
+
+fn and_len<N: int>() -> int {
+    const USE_ONE = N == 0 && (1 / (N - N) == 0);
+    const LEN = USE_ONE ? 1 : 2;
+    let xs: [int; LEN] = [1, 2];
+    LEN
+}
+
+fn or_len<N: int>() -> int {
+    const USE_TWO = N == 1 || (1 / (N - N) == 0);
+    const LEN = USE_TWO ? 2 : 1;
+    let xs: [int; LEN] = [1, 2];
+    LEN
+}
+
+fn selected_len<N: int>() -> int {
+    const AND_VALUE = N == 1 && true;
+    const OR_VALUE = N == 0 || false;
+    const LEN = AND_VALUE && !OR_VALUE ? 2 : 1;
+    let xs: [int; LEN] = [1, 2];
+    LEN
+}
 
 fn main() {
-    let xs: [int; N] = [1, 2];
+    let false_and: [int; FALSE_AND_LEN] = [1, 2];
+    let true_or: [int; TRUE_OR_LEN] = [1, 2];
+    let true_and: [int; TRUE_AND_LEN] = [1, 2];
+    let false_or: [int; FALSE_OR_LEN] = [1, 2];
+    let nested: [int; NESTED_LEN] = [1, 2];
+    let and_result = and_len<1>();
+    let or_result = or_len<1>();
+    let selected_result = selected_len<1>();
 }
