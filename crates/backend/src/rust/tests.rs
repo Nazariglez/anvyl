@@ -374,6 +374,53 @@ fn rir_flag_operations_reject_scalar_and_mismatched_shapes() {
 }
 
 #[test]
+fn lazy_binary_rvalues_are_rejected() {
+    let void_ty = RirTypeId::from_index(0);
+    let bool_ty = RirTypeId::from_index(1);
+    let value = RirLocalId::from_index(0);
+    let function_id = RirFunctionId::from_index(0);
+    let operand = || RirOperand::Place(rir_place(value, bool_ty));
+    let stmts = [BinaryOp::And, BinaryOp::Or, BinaryOp::Coalesce]
+        .into_iter()
+        .map(|op| {
+            RirStmt::Eval(RirRValue::Binary {
+                op,
+                lhs: operand(),
+                rhs: operand(),
+                ty: bool_ty,
+            })
+        })
+        .collect();
+    let function = rir_function(
+        function_id,
+        void_ty,
+        vec![rir_param(
+            value,
+            bool_ty,
+            RirParamSemantic::Value,
+            RirParamAbi::Value,
+        )],
+        vec![rir_local(value, bool_ty, false, "value")],
+        stmts,
+    );
+    let program = RirProgram {
+        types: vec![RirType::Void, RirType::Bool],
+        functions: vec![function],
+        entry: Some(function_id),
+        ..RirProgram::default()
+    };
+
+    let errors = rir::verify(&program).expect_err("lazy binary rvalues verified");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.kind == RirVerifyErrorKind::UnsupportedRValueType)
+            .count(),
+        3
+    );
+}
+
+#[test]
 fn profile_accepts_native_scoped_lambda_param() {
     let program = native_scoped_lambda_air();
     let verified = air::verify(&program).expect("AIR verify failed");

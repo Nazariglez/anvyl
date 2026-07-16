@@ -1,0 +1,106 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// and-skip-lhs
+// or-skip-lhs
+// and-select-lhs
+// and-select-rhs
+// or-select-lhs
+// or-select-rhs
+// mix-a
+// mix-b
+// chain-a
+// chain-b
+// chain-c
+// precedence
+// assign-lhs
+// assign-rhs
+// arg-lhs
+// arg-rhs
+// if-lhs
+// if-rhs
+// if-body
+// while-rhs
+// while-body
+// stmt-skip-lhs
+// stmt-select-lhs
+// stmt-select-rhs
+// return-rhs
+// tail-and-rhs
+// tail-or-rhs
+// tail-not
+// @match-end
+
+fn probe(label: string, value: bool) -> bool {
+    println(label);
+    value
+}
+
+fn expect(value: bool, expected: bool) {
+    assert(value == expected);
+}
+
+fn explicit_return(lhs: bool, rhs: bool) -> bool {
+    return lhs && probe("return-rhs", rhs);
+}
+
+fn tail_and(lhs: bool) -> bool { lhs && probe("tail-and-rhs", true) }
+fn tail_or(lhs: bool) -> bool { lhs || probe("tail-or-rhs", true) }
+fn tail_not(value: bool) -> bool { !probe("tail-not", value) }
+fn neither(a: bool, b: bool) -> bool { !(a || b) }
+
+fn skip_oob(lhs: bool) -> bool {
+    let xs: [bool] = [true, false];
+    lhs && xs[2]
+}
+
+fn main() {
+    let and_skip = probe("and-skip-lhs", false) && probe("and-skip-rhs", true);
+    assert(!and_skip);
+
+    let or_skip = probe("or-skip-lhs", true) || probe("or-skip-rhs", false);
+    assert(or_skip);
+
+    let and_selected = probe("and-select-lhs", true) && probe("and-select-rhs", false);
+    assert(!and_selected);
+
+    let or_selected = probe("or-select-lhs", false) || probe("or-select-rhs", false);
+    assert(!or_selected);
+
+    let mixed = (probe("mix-a", true) && probe("mix-b", true)) || probe("mix-c", false);
+    assert(mixed);
+
+    let chained = probe("chain-a", false) || probe("chain-b", true) && probe("chain-c", false);
+    assert(!chained);
+
+    let precedence = false && true || true;
+    assert(precedence);
+    println("precedence");
+
+    var assigned = false;
+    assigned = probe("assign-lhs", false) || probe("assign-rhs", true);
+    assert(assigned);
+
+    expect(probe("arg-lhs", true) && probe("arg-rhs", true), true);
+
+    if probe("if-lhs", true) && probe("if-rhs", true) {
+        println("if-body");
+    }
+
+    var count = 0;
+    while count < 1 && probe("while-rhs", true) {
+        println("while-body");
+        count += 1;
+    }
+    assert(count == 1);
+
+    probe("stmt-skip-lhs", false) && probe("stmt-skip-rhs", true);
+    probe("stmt-select-lhs", true) && probe("stmt-select-rhs", true);
+
+    assert(!explicit_return(true, false));
+    assert(tail_and(true));
+    assert(tail_or(false));
+    assert(tail_not(false));
+    assert(neither(false, false));
+    assert(!skip_oob(false));
+}

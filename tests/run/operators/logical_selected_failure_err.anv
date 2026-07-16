@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: error
+// @stderr-contains: list index 2 out of bounds for len 2
+
+fn select_oob(lhs: bool) -> bool {
+    let xs: [bool] = [true, false];
+    lhs && xs[2]
+}
+
+fn main() {
+    println(select_oob(true));
+}

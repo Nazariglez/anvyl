@@ -9300,7 +9300,7 @@ impl VerifyCx<'_> {
                 let lhs_ty = self.operand_ty(site, function, lhs);
                 let rhs_ty = self.operand_ty(site, function, rhs);
                 self.check_type_id(site, *ty);
-                if !self.binary_ok(*op, lhs_ty, rhs_ty, *ty) {
+                if op.has_lazy_rhs() || !self.binary_ok(*op, lhs_ty, rhs_ty, *ty) {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
                 }
                 Some(*ty)

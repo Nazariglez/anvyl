@@ -113,14 +113,14 @@ pub(super) fn binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::GreaterThan => ">",
         BinaryOp::LessThanEq => "<=",
         BinaryOp::GreaterThanEq => ">=",
-        BinaryOp::And => "&&",
-        BinaryOp::Or => "||",
         BinaryOp::Xor => "^",
         BinaryOp::BitAnd => "&",
         BinaryOp::BitOr => "|",
         BinaryOp::Shl => "<<",
         BinaryOp::Shr => ">>",
-        BinaryOp::Coalesce => panic!("verified RIR excludes coalesce"),
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce => {
+            panic!("verified RIR excludes lazy binary operators")
+        }
     }
 }
 
