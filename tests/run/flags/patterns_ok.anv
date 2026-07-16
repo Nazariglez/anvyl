@@ -1,0 +1,49 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// both
+// single
+// exact
+// nested
+// value
+// loop
+// @match-end
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+struct Holder { access: Access }
+
+fn classify(value: Access) -> string {
+    match value {
+        Access.Read => "read",
+        .Both => "both",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(classify(Access.Both));
+    match Access.Write {
+        .Read | .Write => println("single"),
+        _ => println("other"),
+    }
+    if let .Both = Access.Both {
+        println("exact");
+    }
+    let holder = Holder { access: Access.Both };
+    match (holder, 0) {
+        (Holder { access: .Both }, _) => println("nested"),
+        _ => println("other"),
+    }
+    let label = if let .Read = Access.Read { "value" } else { "other" };
+    println(label);
+    var value = Access.Both;
+    while let .Both = value {
+        println("loop");
+        value = Access.Read;
+    }
+}

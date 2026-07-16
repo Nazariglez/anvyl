@@ -1,0 +1,86 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// Choice.One
+// Event.Pair(2, ok)
+// Event.Move { x: 3, y: 4 }
+// Event.Float(1.5)
+// State.Run
+// Anim.Idle
+// 1
+// 1
+// |  State.Run|
+// | Access.Read|
+// Access.None
+// Emptyless.empty()
+// Access.Read
+// Access.Both
+// Access.Read | Access.Execute
+// Access.Read | Access.Write | Access.Execute
+// Access.Write | Access.Execute
+// Access.Both
+// Holder(event: Choice.Two, access: Access.Read | Access.Execute)
+// PayloadHolder(event: Event.Pair(5, nested))
+// Access.Read | Access.Execute
+// Access.Read | Access.Execute
+// Access.Read | Access.Execute
+// @match-end
+
+enum Choice { One, Two }
+
+enum Event {
+    Pair(int, string),
+    Move { x: int, y: int },
+    Float(float),
+}
+
+enum State: int { Idle, Run }
+enum Anim: string { Idle = "idle" }
+
+enum Access: flag {
+    None = 0,
+    Read,
+    Write,
+    Execute,
+    Both = Read | Write,
+}
+
+enum Emptyless: flag { Read }
+
+struct Holder {
+    event: Choice,
+    access: Access,
+}
+
+struct PayloadHolder { event: Event }
+
+fn main() {
+    println(#stringify(Choice.One));
+    println(#stringify(Event.Pair(2, "ok")));
+    println(#stringify(Event.Move { x: 3, y: 4 }));
+    println(#stringify(Event.Float(1.5)));
+    println(#stringify(State.Run));
+    println(#stringify(Anim.Idle));
+    println(f"{State.Run as int:X}");
+    println(f"{Access.Read as int:X}");
+    println(f"|{State.Run:>11}|");
+    println(f"|{Access.Read:>12}|");
+    println(#stringify(Access.None));
+    println(#stringify(Emptyless.empty()));
+    println(#stringify(Access.Read));
+    println(#stringify(Access.Both));
+
+    let unnamed = Access.Read | Access.Execute;
+    println(#stringify(unnamed));
+    println(#stringify(Access.all()));
+    println(#stringify(~Access.Read));
+    println(f"{Access.Both}");
+    println(#stringify(Holder { event: Choice.Two, access: unnamed }));
+    println(#stringify(PayloadHolder { event: Event.Pair(5, "nested") }));
+
+    var i = 0;
+    while i < 3 {
+        println(#stringify(unnamed));
+        i += 1;
+    }
+}

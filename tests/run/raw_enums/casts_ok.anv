@@ -1,12 +1,39 @@
 // @mode: run
 // @expect: success
-// @match: 10
+// @match-begin
+// 10
+// 10
+// 10
+// idle
+// idle
+// idle
+// state:10
+// @match-end
 
 enum State: int {
     Idle,
     Dead = 10,
 }
 
+enum Animation: string {
+    Idle = "idle",
+}
+
+extend string {
+    cast from(state: State) { f"state:{state as int}" }
+}
+
 fn main() {
-    println(State.Dead as int);
+    let state = State.Dead;
+    println(state as int);
+    println(state as int);
+    let raw_state: int = state;
+    println(raw_state);
+
+    let animation = Animation.Idle;
+    println(animation as string);
+    println(animation as string);
+    let raw_animation: string = animation;
+    println(raw_animation);
+    println(state as string);
 }

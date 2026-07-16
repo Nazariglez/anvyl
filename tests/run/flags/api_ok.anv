@@ -1,0 +1,53 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// true
+// true
+// true
+// false
+// true
+// true
+// true
+// true
+// true
+// true
+// @match-end
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+fn local_api() -> bool {
+    enum Local: flag { A, B }
+    var value = Local.empty();
+    value.insert(Local.A);
+    value.toggle(Local.B);
+    value.remove(Local.A);
+    if value != Local.B { return false; }
+    Local.all().contains(value)
+}
+
+fn main() {
+    let empty = Access.empty();
+    let all = Access.all();
+    println(empty.is_empty());
+    println(all == Access.Both);
+    println(all.contains(Access.Read));
+    println(empty.contains(Access.empty()));
+    println(empty.intersects(Access.Read));
+    println((Access.all() | 8) == 11);
+
+    var value = Access.empty();
+    value.insert(Access.Read);
+    println(value == Access.Read);
+    value.insert(Access.Write);
+    println(value == Access.Both);
+    value.remove(Access.Read);
+    println(value == Access.Write);
+    value.toggle(Access.Read);
+    println(value == Access.Both);
+    println(local_api());
+}

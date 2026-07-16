@@ -1,0 +1,50 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// int-ok
+// string-ok
+// 2
+// idle
+// @match-end
+
+enum State: int {
+    Idle,
+    Running = 2,
+}
+
+enum Animation: string {
+    Idle = "idle",
+    Run = "run",
+}
+
+enum Never: int {}
+
+fn main() {
+    let raw = 2;
+    if let state = raw as? State {
+        if state == State.Running {
+            println("int-ok");
+        }
+    }
+    if let state = 99 as? State {
+        println("bad-int");
+    }
+    let never: Never? = 0 as? Never;
+    if let state = 0 as? Never {
+        println("bad-empty");
+    }
+
+    let name = "idle";
+    if var animation = name as? Animation {
+        if animation == Animation.Idle {
+            println("string-ok");
+        }
+        animation = Animation.Run;
+    }
+    if let animation = "missing" as? Animation {
+        println("bad-string");
+    }
+
+    println(raw);
+    println(name);
+}

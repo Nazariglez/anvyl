@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: raw projection produces a value, not a mutable place
+
+import pkg:host.host { clear_bits };
+
+enum Access: flag { Read }
+
+fn main() {
+    var access = Access.Read;
+    clear_bits(access);
+}

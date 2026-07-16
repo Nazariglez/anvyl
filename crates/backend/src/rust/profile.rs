@@ -407,42 +407,8 @@ impl ProfileCx<'_> {
         })
     }
 
-    fn pattern_alternative_supported(alternative: &air::AirPatternAlternative) -> bool {
-        alternative.tests.iter().all(|test| match test {
-            air::AirPatternTest::Literal { path, .. }
-            | air::AirPatternTest::Nil { path }
-            | air::AirPatternTest::OptionalSome { path } => Self::pattern_path_supported(path),
-            air::AirPatternTest::EnumVariant { path, .. } => path.steps.is_empty(),
-        }) && alternative
-            .bindings
-            .iter()
-            .all(|binding| match binding.mode {
-                air::AirPatternBindingMode::Owned => Self::pattern_path_supported(&binding.path),
-                air::AirPatternBindingMode::Alias => {
-                    Self::pattern_alias_path_supported(&binding.path)
-                }
-            })
-    }
-
-    fn pattern_alias_path_supported(path: &air::AirPatternPath) -> bool {
-        matches!(
-            path.steps.as_slice(),
-            [air::AirPatternPathStep::EnumTupleField { .. }
-                | air::AirPatternPathStep::EnumStructField { .. }]
-        )
-    }
-
-    fn pattern_path_supported(path: &air::AirPatternPath) -> bool {
-        path.steps
-            .iter()
-            .enumerate()
-            .all(|(index, step)| match step {
-                air::AirPatternPathStep::Field(_)
-                | air::AirPatternPathStep::TupleField(_)
-                | air::AirPatternPathStep::OptionalSome => true,
-                air::AirPatternPathStep::EnumTupleField { .. }
-                | air::AirPatternPathStep::EnumStructField { .. } => index == 0,
-            })
+    fn pattern_alternative_supported(_alternative: &air::AirPatternAlternative) -> bool {
+        true
     }
 
     fn check_air_block(&mut self, function: FunctionId, body: &air::AirBlock) {
@@ -739,6 +705,7 @@ impl ProfileCx<'_> {
                 }
             }
             RValue::FunctionRef { .. } => {}
+            RValue::FlagStatic { ty, .. } => self.check_type_ref(site, *ty),
             RValue::Use(operand) | RValue::FunctionValue { value: operand, .. } => {
                 self.check_operand(site, operand);
                 if self.non_shareable_value_operand(operand)
@@ -772,9 +739,16 @@ impl ProfileCx<'_> {
                     }
                 }
             }
-            RValue::DynDowncast { value, target, .. } | RValue::Cast { value, target } => {
+            RValue::DynDowncast { value, target, .. }
+            | RValue::Cast { value, target }
+            | RValue::RawProject { value, target } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *target);
+            }
+            RValue::RawTryConstruct { value, target, ty } => {
+                self.check_operand(site, value);
+                self.check_type_ref(site, *target);
+                self.check_type_ref(site, *ty);
             }
             RValue::OptionalSome { value, ty } => {
                 self.check_operand(site, value);
@@ -1722,6 +1696,7 @@ impl ProfileCx<'_> {
             TypeData::Enum(enm) => {
                 self.reject_function_container(site, ty) || self.enum_decl_supported(*enm)
             }
+            TypeData::Flag(_) | TypeData::Dyn(_) => true,
             TypeData::Extern(ext) => {
                 self.reject_function_container(site, ty) || self.extern_type_supported(*ext)
             }
@@ -1785,7 +1760,6 @@ impl ProfileCx<'_> {
                 }
                 true
             }
-            TypeData::Dyn(_) => true,
             TypeData::Function(sig) => {
                 for param in &sig.params {
                     self.check_type_ref(site, param.ty);
@@ -1941,13 +1915,17 @@ fn scalar_type_is_slice1(ty: &TypeData) -> bool {
 
 fn const_is_slice1(program: &Program, id: ConstId) -> bool {
     let konst = program.const_arena.get(id);
+    let ty = program.type_arena.data(konst.ty);
     matches!(
-        (program.type_arena.data(konst.ty), &konst.value),
+        (ty, &konst.value),
         (TypeData::Int, ConstValue::Int(_))
             | (TypeData::Float, ConstValue::Float(_))
             | (TypeData::Bool, ConstValue::Bool(_))
             | (TypeData::String, ConstValue::String(_))
             | (TypeData::Char, ConstValue::Char(_))
             | (TypeData::Optional(_), ConstValue::Nil)
+    ) || matches!(
+        (ty, &konst.value),
+        (TypeData::Flag(flag), ConstValue::Flag { flag: value_flag, .. }) if flag == value_flag
     )
 }

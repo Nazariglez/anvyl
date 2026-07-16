@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::{
     native_call::NativeArgAction,
     place::{mut_place_dynamic_facts, place_dynamic_facts},
@@ -6,10 +8,178 @@ use super::{
         RirCollectionLoanScope, RirCollectionRootKind, RirDynReceiver, RirExternKind, RirFunction,
         RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
         RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirRangeFor,
-        RirResolvedCallTarget, RirStmt, RirStringifyReqKind, RirStruct, RirStructuredBlock,
-        RirType, RirTypeId, native_arg_facts, native_return_adopts_resource, stmt_child_blocks_any,
+        RirRawEnumValue, RirResolvedCallTarget, RirStmt, RirStringLiteralId, RirStringifyHelper,
+        RirStringifyHelperKind, RirStringifyReq, RirStringifyReqKind, RirStructuredBlock, RirType,
+        RirTypeId, native_arg_facts, native_return_adopts_resource, stmt_child_blocks_any,
     },
 };
+
+pub(super) fn owned_string_literals(program: &RirProgram) -> HashSet<RirStringLiteralId> {
+    let mut owned = HashSet::new();
+    for helper in &program.stringify_helpers {
+        match &helper.kind {
+            RirStringifyHelperKind::Struct(_) => {}
+            RirStringifyHelperKind::Enum { variants, .. } => {
+                for variant in variants {
+                    owned.insert(variant.label);
+                    owned.extend(&variant.field_labels);
+                }
+            }
+            RirStringifyHelperKind::Flag { empty, members, .. } => {
+                owned.insert(*empty);
+                owned.extend(members);
+            }
+        }
+    }
+    for function in &program.functions {
+        collect_block_string_literals(program, &function.body, &mut owned);
+    }
+    owned
+}
+
+fn collect_block_string_literals(
+    program: &RirProgram,
+    block: &RirStructuredBlock,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    for stmt in &block.stmts {
+        match stmt {
+            RirStmt::Init { value, .. }
+            | RirStmt::GlobalSetRoot { value, .. }
+            | RirStmt::GlobalUpdateRoot { value, .. }
+            | RirStmt::MutPlaceSet { value, .. }
+            | RirStmt::Assign { value, .. }
+            | RirStmt::CellInit { value, .. }
+            | RirStmt::CellSet { value, .. }
+            | RirStmt::ScopedPlaceCellSet { value, .. }
+            | RirStmt::Eval(value) => collect_rvalue_string_literals(program, value, owned),
+            RirStmt::DataRefSet { object, value, .. } => {
+                collect_operand_string_literal(program, object, owned);
+                collect_operand_string_literal(program, value, owned);
+            }
+            RirStmt::SequenceSlotSet { value, .. } | RirStmt::MapValueSet { value, .. } => {
+                collect_operand_string_literal(program, value, owned);
+            }
+            RirStmt::MapEntryMatch(match_) => {
+                collect_operand_string_literal(program, &match_.key, owned);
+            }
+            RirStmt::GlobalEnsure { .. }
+            | RirStmt::ScopedPlaceCellInit { .. }
+            | RirStmt::If(_)
+            | RirStmt::Loop(_)
+            | RirStmt::RangeFor(_)
+            | RirStmt::CollectionFor(_)
+            | RirStmt::CollectionLoanScope(_)
+            | RirStmt::CollectionSlotScope(_)
+            | RirStmt::PatternMatch(_)
+            | RirStmt::DynMatch(_)
+            | RirStmt::OptionMatch(_) => {}
+        }
+        stmt.for_each_child(&mut |child| {
+            if let RirChild::Block(child) = child {
+                collect_block_string_literals(program, child, owned);
+            }
+        });
+    }
+    if let super::rir::RirTerm::Return(Some(value)) = &block.term {
+        collect_operand_string_literal(program, value, owned);
+    }
+}
+
+fn collect_rvalue_string_literals(
+    program: &RirProgram,
+    value: &RirRValue,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    match value {
+        RirRValue::StringConcat { .. } | RirRValue::RawTryConstruct { .. } => return,
+        RirRValue::Format { source_ty, .. }
+            if matches!(program.types.get(source_ty.index()), Some(RirType::String)) =>
+        {
+            return;
+        }
+        RirRValue::RawProject { value, target }
+            if raw_string_projection_uses_statics(program, value, *target) =>
+        {
+            let Some(source) = operand_ty(program, value) else {
+                return;
+            };
+            let Some(RirType::Enum(id)) = program.types.get(source.index()) else {
+                return;
+            };
+            let Some(enm) = program.enums.get(id.index()) else {
+                return;
+            };
+            for variant in &enm.variants {
+                if let Some(RirRawEnumValue::String(id)) = variant.raw_value {
+                    owned.insert(id);
+                }
+            }
+        }
+        _ => {}
+    }
+    value.for_each_child(super::rir::RirValueUse::Read, &mut |child| match child {
+        RirChild::Operand { operand, .. } => {
+            collect_operand_string_literal(program, operand, owned);
+        }
+        RirChild::CallArg(arg) => collect_call_arg_string_literals(program, arg, owned),
+        RirChild::CaptureArg(super::rir::RirLambdaCaptureArg::Readonly { value }) => {
+            collect_operand_string_literal(program, value, owned);
+        }
+        RirChild::Place { .. }
+        | RirChild::MutPlace { .. }
+        | RirChild::Collection { .. }
+        | RirChild::CaptureArg(_)
+        | RirChild::LocalRead(_)
+        | RirChild::Block(_)
+        | RirChild::Tail(_) => {}
+    });
+}
+
+fn collect_call_arg_string_literals(
+    program: &RirProgram,
+    arg: &RirCallArg,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    match arg {
+        RirCallArg::Value(value)
+        | RirCallArg::MovedValue { value, .. }
+        | RirCallArg::InitFieldProvided(value)
+        | RirCallArg::ScopedLambda { callee: value, .. }
+        | RirCallArg::EscapingLambda { callee: value, .. }
+        | RirCallArg::AnvCallback { callee: value, .. } => {
+            collect_operand_string_literal(program, value, owned);
+        }
+        RirCallArg::InitFieldOmitted
+        | RirCallArg::SharedBorrow(_)
+        | RirCallArg::SharedStringConst(_)
+        | RirCallArg::MutBorrow(_)
+        | RirCallArg::MutPlace(_)
+        | RirCallArg::DynBorrow(_) => {}
+    }
+}
+
+fn collect_operand_string_literal(
+    program: &RirProgram,
+    operand: &RirOperand,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    if let RirOperand::Const(id) = operand {
+        collect_const_string_literal(program, *id, owned);
+    }
+}
+
+fn collect_const_string_literal(
+    program: &RirProgram,
+    id: super::rir::RirConstId,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    if let Some(super::rir::RirConstValue::String(id)) =
+        program.consts.get(id.index()).map(|konst| &konst.value)
+    {
+        owned.insert(*id);
+    }
+}
 
 pub(super) fn fallible_functions(program: &RirProgram) -> Vec<bool> {
     let mut fallible = vec![false; program.functions.len()];
@@ -401,20 +571,42 @@ fn loan_scope_is_fallible(program: &RirProgram, scope: &RirCollectionLoanScope) 
 }
 
 fn stringify_calls_fallible(program: &RirProgram, fallible: &[bool], ty: RirTypeId) -> bool {
-    program
-        .stringify_reqs
-        .iter()
-        .find(|req| req.ty == ty)
-        .is_some_and(|req| match req.kind {
-            RirStringifyReqKind::Override { function, .. } => fallible[function.index()],
-            RirStringifyReqKind::Structural(_) => false,
-        })
+    let Some(req) = program.stringify_req(ty) else {
+        return false;
+    };
+    match req.kind {
+        RirStringifyReqKind::Override { function, .. } => fallible[function.index()],
+        RirStringifyReqKind::Helper(helper) => stringify_helper_fallible(
+            program,
+            fallible,
+            &program.stringify_helpers[helper.index()],
+        ),
+    }
+}
+
+pub(super) fn stringify_helper_fallible(
+    program: &RirProgram,
+    fallible: &[bool],
+    helper: &RirStringifyHelper,
+) -> bool {
+    match &helper.kind {
+        RirStringifyHelperKind::Struct(strukt) => program.structs[strukt.index()]
+            .fields
+            .iter()
+            .any(|field| stringify_calls_fallible(program, fallible, field.ty)),
+        RirStringifyHelperKind::Enum { enm, .. } => program.enums[enm.index()]
+            .variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .any(|field| stringify_calls_fallible(program, fallible, field.ty)),
+        RirStringifyHelperKind::Flag { .. } => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ContextUse {
     pub rt: bool,
-    pub types: bool,
+    pub statics: bool,
     pub globals: bool,
 }
 
@@ -422,7 +614,7 @@ impl ContextUse {
     fn union(self, other: Self) -> Self {
         Self {
             rt: self.rt || other.rt,
-            types: self.types || other.types,
+            statics: self.statics || other.statics,
             globals: self.globals || other.globals,
         }
     }
@@ -434,10 +626,17 @@ impl ContextUse {
         }
     }
 
-    fn rt_types() -> Self {
+    fn statics() -> Self {
+        Self {
+            statics: true,
+            ..Self::default()
+        }
+    }
+
+    fn rt_statics() -> Self {
         Self {
             rt: true,
-            types: true,
+            statics: true,
             ..Self::default()
         }
     }
@@ -452,7 +651,7 @@ impl ContextUse {
     fn generated_call() -> Self {
         Self {
             rt: true,
-            types: true,
+            statics: true,
             globals: true,
         }
     }
@@ -462,15 +661,36 @@ pub(super) fn function_context_use(program: &RirProgram, function: &RirFunction)
     block_context_use(program, function, &function.body)
 }
 
-pub(super) fn stringify_helper_context_use(program: &RirProgram, strukt: &RirStruct) -> ContextUse {
-    if strukt
-        .fields
-        .iter()
-        .any(|field| matches!(program.types[field.ty.index()], RirType::Struct(_)))
-    {
-        ContextUse::rt_types()
-    } else {
-        ContextUse::default()
+pub(super) fn stringify_helper_context_use(
+    program: &RirProgram,
+    helper: &RirStringifyHelper,
+) -> ContextUse {
+    match &helper.kind {
+        RirStringifyHelperKind::Struct(strukt) => program.structs[strukt.index()]
+            .fields
+            .iter()
+            .filter_map(|field| program.stringify_req(field.ty))
+            .fold(ContextUse::default(), |use_, req| {
+                use_.union(stringify_req_context_use(program, req))
+            }),
+        RirStringifyHelperKind::Enum { enm, .. } => program.enums[enm.index()]
+            .variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .filter_map(|field| program.stringify_req(field.ty))
+            .fold(ContextUse::statics(), |use_, req| {
+                use_.union(stringify_req_context_use(program, req))
+            }),
+        RirStringifyHelperKind::Flag { .. } => ContextUse::statics(),
+    }
+}
+
+fn stringify_req_context_use(program: &RirProgram, req: &RirStringifyReq) -> ContextUse {
+    match req.kind {
+        RirStringifyReqKind::Helper(helper) => {
+            stringify_helper_context_use(program, &program.stringify_helpers[helper.index()])
+        }
+        RirStringifyReqKind::Override { .. } => ContextUse::generated_call(),
     }
 }
 
@@ -508,7 +728,7 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
         RirStmt::ScopedPlaceCellSet { value, .. } => {
             ContextUse::rt().union(rvalue_context_use(program, function, value))
         }
-        RirStmt::DataRefSet { object, value, .. } => ContextUse::rt_types()
+        RirStmt::DataRefSet { object, value, .. } => ContextUse::rt_statics()
             .union(operand_context_use(program, function, object))
             .union(operand_context_use(program, function, value)),
         RirStmt::SequenceSlotSet {
@@ -651,11 +871,19 @@ fn rvalue_context_use(
             });
             uses
         }
+        RirRValue::RawProject { value, target }
+            if raw_string_projection_uses_statics(program, value, *target) =>
+        {
+            uses.union(ContextUse {
+                statics: true,
+                ..ContextUse::default()
+            })
+        }
         RirRValue::DataRefAlloc { .. }
         | RirRValue::DataRefGet { .. }
         | RirRValue::List { .. }
         | RirRValue::Map { .. }
-        | RirRValue::RangeListCopy { .. } => uses.union(ContextUse::rt_types()),
+        | RirRValue::RangeListCopy { .. } => uses.union(ContextUse::rt_statics()),
         RirRValue::ListPush { .. }
         | RirRValue::MapGet { .. }
         | RirRValue::MapInsert { .. }
@@ -669,7 +897,10 @@ fn rvalue_context_use(
             .union(mut_place_context_use(program, function, place)),
         RirRValue::CellGetCopy { cell, .. } => uses.union(cell_context_use(program, *cell)),
         RirRValue::Stringify { source_ty, .. }
-            if matches!(program.types[source_ty.index()], RirType::Struct(_)) =>
+            if matches!(
+                program.types[source_ty.index()],
+                RirType::Struct(_) | RirType::Enum(_) | RirType::Flag(_)
+            ) =>
         {
             uses.union(stringify_context_use(program, *source_ty))
         }
@@ -678,7 +909,7 @@ fn rvalue_context_use(
                 matches!(lambda.storage, RirLambdaStorage::HeapEnv { .. })
             }) =>
         {
-            uses.union(ContextUse::rt_types())
+            uses.union(ContextUse::rt_statics())
         }
         _ => uses,
     }
@@ -732,6 +963,22 @@ fn rvalue_operand_context_use(
     function: &RirFunction,
     value: &RirRValue,
 ) -> ContextUse {
+    match value {
+        RirRValue::StringConcat { parts } => {
+            return parts.iter().fold(ContextUse::default(), |uses, part| {
+                uses.union(borrowed_string_operand_context_use(program, function, part))
+            });
+        }
+        RirRValue::Format {
+            value, source_ty, ..
+        } if matches!(program.types.get(source_ty.index()), Some(RirType::String)) => {
+            return borrowed_string_operand_context_use(program, function, value);
+        }
+        RirRValue::RawTryConstruct { value, .. } => {
+            return borrowed_string_operand_context_use(program, function, value);
+        }
+        _ => {}
+    }
     let mut uses = ContextUse::default();
     value.for_each_child(super::rir::RirValueUse::Read, &mut |child| {
         let child = match child {
@@ -833,13 +1080,10 @@ fn native_ref_borrow_conversion_fallible(
 }
 
 fn stringify_context_use(program: &RirProgram, ty: RirTypeId) -> ContextUse {
-    let Some(req) = program.stringify_reqs.iter().find(|req| req.ty == ty) else {
+    let Some(req) = program.stringify_req(ty) else {
         return ContextUse::generated_call();
     };
-    match req.kind {
-        RirStringifyReqKind::Structural(_) => ContextUse::rt_types(),
-        RirStringifyReqKind::Override { .. } => ContextUse::generated_call(),
-    }
+    stringify_req_context_use(program, req)
 }
 
 fn call_arg_context_use(
@@ -879,7 +1123,7 @@ fn mut_place_context_use(
 ) -> ContextUse {
     let root = mut_place_root_context_use(&arg.access);
     let Some(facts) = mut_place_dynamic_facts(program, arg) else {
-        return root.union(ContextUse::rt_types());
+        return root.union(ContextUse::rt_statics());
     };
     if facts.fallible_projection {
         root.union(ContextUse::rt())
@@ -891,7 +1135,7 @@ fn mut_place_context_use(
 fn mut_place_root_context_use(access: &RirMutPlaceAccess) -> ContextUse {
     match access {
         RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }) => ContextUse::generated_call(),
-        RirMutPlaceAccess::DataRef { .. } => ContextUse::rt_types(),
+        RirMutPlaceAccess::DataRef { .. } => ContextUse::rt_statics(),
         RirMutPlaceAccess::Handle(
             RirMutPlaceHandle::Local { .. }
             | RirMutPlaceHandle::Param { .. }
@@ -933,7 +1177,7 @@ fn operands_context_use<'a>(
         })
 }
 
-fn operand_context_use(
+fn borrowed_string_operand_context_use(
     program: &RirProgram,
     function: &RirFunction,
     operand: &RirOperand,
@@ -941,6 +1185,45 @@ fn operand_context_use(
     match operand {
         RirOperand::Place(place) => place_context_use(program, function, place),
         RirOperand::Const(_) => ContextUse::default(),
+    }
+}
+
+fn raw_string_projection_uses_statics(
+    program: &RirProgram,
+    operand: &RirOperand,
+    target: RirTypeId,
+) -> bool {
+    if !matches!(program.types.get(target.index()), Some(RirType::String)) {
+        return false;
+    }
+    let Some(source) = operand_ty(program, operand) else {
+        return false;
+    };
+    let Some(RirType::Enum(id)) = program.types.get(source.index()) else {
+        return false;
+    };
+    program.enums.get(id.index()).is_some_and(|enm| {
+        enm.repr == super::rir::RirEnumRepr::RawString && !enm.variants.is_empty()
+    })
+}
+
+fn operand_context_use(
+    program: &RirProgram,
+    function: &RirFunction,
+    operand: &RirOperand,
+) -> ContextUse {
+    match operand {
+        RirOperand::Place(place) => place_context_use(program, function, place),
+        RirOperand::Const(id) => {
+            let needs_statics = match &program.consts[id.index()].value {
+                super::rir::RirConstValue::String(id) => program.string_literal(*id).needs_owned,
+                _ => false,
+            };
+            ContextUse {
+                statics: needs_statics,
+                ..ContextUse::default()
+            }
+        }
     }
 }
 
@@ -960,7 +1243,7 @@ fn place_context_use(program: &RirProgram, function: &RirFunction, place: &RirPl
 
 fn cell_context_use(program: &RirProgram, cell: RirCellRef) -> ContextUse {
     if cell_uses_ctx(program, cell) {
-        ContextUse::rt_types()
+        ContextUse::rt_statics()
     } else {
         ContextUse::rt()
     }

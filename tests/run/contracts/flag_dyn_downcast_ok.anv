@@ -1,0 +1,46 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// exact
+// none
+// @match-end
+
+contract Bits {
+    fn bits(self) -> int;
+}
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+enum Other: flag {
+    Read,
+}
+
+extend Access {
+    fn bits(self) -> int { self as int }
+}
+
+extend Other {
+    fn bits(self) -> int { self as int }
+}
+
+fn erase(value: Access) -> dyn Bits { value }
+
+fn main() {
+    let value = erase(Access.Both);
+    println(value.bits());
+
+    if let access? = value as? Access {
+        println(if access == Access.Both { "exact" } else { "bad" });
+    }
+
+    if let other? = value as? Other {
+        println(other as int);
+    } else {
+        println("none");
+    }
+}

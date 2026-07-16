@@ -1,0 +1,11 @@
+// @mode: run
+// @expect: success
+// @match: true
+
+fn echo(text: string) -> string { text }
+
+fn main() {
+    let text = "this source-known string is intentionally longer than the inline representation";
+    let echoed = echo("this source-known string is intentionally longer than the inline representation");
+    println(text == echoed);
+}

@@ -1,0 +1,6 @@
+[project]
+name = "flag_int_boundary_error"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "../flag_int_boundary_ok/provider" }

@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: Outer(inner: inner)
+
+struct Inner {
+    x: int,
+
+    fn to_string(self) -> string { "inner" }
+}
+
+struct Outer { inner: Inner }
+
+fn main() {
+    println(#stringify(Outer { inner: Inner { x: 7 } }));
+}

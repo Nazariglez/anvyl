@@ -7,16 +7,17 @@ use anvyx_frontend::{
         ContractSurfaceDecl, ContractWitnessDecl, ContractWitnessKey, ContractWitnessSlotDecl,
         ContractWitnessTarget, EnumDecl, ExternBindingDecl, ExternDecl, ExternFieldDecl,
         ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeBindingDecl,
-        ExternTypeDecl, FieldDecl, Function, FunctionId, FunctionKind, FunctionSpecialization,
-        LambdaDecl, LambdaEscape, Local, LocalKind, Mutability, Operand, Param, ParamEscape,
-        ParamMode, ParamRole, Place, PlaceRoot, Program, Projection, RValue, RawEnumValue,
-        Signature, TypeData, TypePassClasses, VariantDecl, VariantId, VariantShape,
+        ExternTypeDecl, FieldDecl, FlagDecl, FlagMemberDecl, FlagMemberId, Function, FunctionId,
+        FunctionKind, FunctionSpecialization, LambdaDecl, LambdaEscape, Local, LocalKind,
+        Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program,
+        Projection, RValue, RawEnumValue, Signature, TypeData, TypePassClasses, VariantDecl,
+        VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
 
 use super::{
-    CollectionAccessOp, PlanCx, RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
+    RustPlanConfig, RustPlanError, RustTargetGapKind, cargo_job,
     dataref_place::DataRefPlaceDescriptors,
     emit,
     place_access::{PlaceAccessCx, PlaceAccessIntent},
@@ -29,21 +30,22 @@ use super::{
         RirCollectionRootKind, RirCollectionStorage, RirCollectionStorageId,
         RirCollectionStorageKind, RirConst, RirConstId, RirConstValue, RirCoreEnumKind, RirDataRef,
         RirDataRefId, RirEnum, RirEnumId, RirExtern, RirExternId, RirExternKind, RirExternParam,
-        RirField, RirFieldId, RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal,
-        RirGlobalId, RirIf, RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind,
-        RirLambdaEnvField, RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout,
-        RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
-        RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId, RirLoop, RirLoopId,
-        RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle,
-        RirOperand, RirOptionMatch, RirOptionSubject, RirParam, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirPatternAlternative, RirPatternArm, RirPatternBinding,
-        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
-        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirReturn,
-        RirScopedPlaceCellDecl, RirScopedPlaceCellId, RirScopedPlaceCellRef, RirScopedPlaceSource,
-        RirStmt, RirStringifyHelper, RirStringifyHelperId, RirStringifyReq, RirStringifyReqId,
-        RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock, RirSymbol, RirTerm,
-        RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
-        RirVerifyErrorKind, RirVerifySite,
+        RirField, RirFieldId, RirFlag, RirFlagId, RirFlagMember, RirFlagMemberId, RirFlagStaticOp,
+        RirFormatKind, RirFormatSpec, RirFunction, RirFunctionId, RirGlobal, RirGlobalId, RirIf,
+        RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
+        RirParamAbi, RirParamEscape, RirParamSemantic, RirPatternAlternative, RirPatternArm,
+        RirPatternBinding, RirPatternBindingMode, RirPatternMatch, RirPatternPath,
+        RirPatternPathStep, RirPatternTest, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
+        RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
+        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringLiteralId,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyHelperKind, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, RirVerifyErrorKind, RirVerifySite,
     },
     runtime_owner::RuntimeOwnerEmit,
     source_job::{self, SourceJobStatus},
@@ -53,6 +55,323 @@ use crate::test_support::{
     global_with_init, immutable_local as local, mutable_local as mut_local, param, place,
     root_module, structured_body,
 };
+
+#[test]
+fn plans_flag_declarations_as_distinct_rir_storage() {
+    let mut program = Program::default();
+    let module = program.alloc_module(root_module());
+    let flag = program.alloc_flag(FlagDecl {
+        name: Ident::new("Access"),
+        module,
+        known_bits: 7,
+        members: vec![
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(0),
+                name: Ident::new("Read"),
+                value: 1,
+                atomic: true,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(1),
+                name: Ident::new("Write"),
+                value: 2,
+                atomic: true,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(2),
+                name: Ident::new("KNOWN_BITS"),
+                value: 4,
+                atomic: true,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(3),
+                name: Ident::new("All"),
+                value: 7,
+                atomic: false,
+            },
+        ],
+    });
+    program.module_mut(module).flags.push(flag);
+    let ty = program.type_arena.alloc(TypeData::Flag(flag));
+    program.const_arena.alloc(ConstData {
+        ty,
+        value: ConstValue::Flag { flag, bits: 7 },
+    });
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    assert_eq!(
+        plan.program().types[ty.index()],
+        RirType::Flag(RirFlagId(0))
+    );
+    let flag = &plan.program().flags[0];
+    assert_eq!(flag.air_id, air::FlagId(0));
+    assert_eq!(flag.known_bits, 7);
+    assert_eq!(flag.members[2].symbol.as_str(), "KNOWN_BITS_1");
+    assert_eq!(flag.members[3].id, RirFlagMemberId(3));
+    assert_eq!(flag.members[3].display.as_str(), "All");
+    assert_eq!(flag.members[3].value, 7);
+    assert!(!flag.members[3].atomic);
+    let mut forged = plan.program().clone();
+    forged.flags[0].known_bits = 3;
+    assert!(
+        rir::verify_with_air(&forged, &program)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
+    );
+    let mut forged = plan.program().clone();
+    forged.flags[0].members[0].value = 2;
+    assert!(
+        rir::verify_with_air(&forged, &program)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
+    );
+    assert_eq!(
+        plan.program().consts[0].value,
+        RirConstValue::Flag {
+            flag: RirFlagId(0),
+            bits: 7,
+        }
+    );
+    let source = emit::emit(&plan.verified()).into_string();
+    assert!(source.contains("#[repr(transparent)]"));
+    assert!(source.contains("struct anvT0_Access(i64);"));
+    assert!(source.contains("const KNOWN_BITS: i64 = 7;"));
+    assert!(source.contains("const KNOWN_BITS_1: anvT0_Access = anvT0_Access(4);"));
+    assert!(source.contains("const ALL: anvT0_Access = anvT0_Access(7);"));
+}
+
+#[test]
+fn rir_flag_metadata_requires_valid_storage_domain() {
+    let mut program = RirProgram::default();
+    program.types.push(RirType::Int);
+    program.types.push(RirType::Flag(RirFlagId::from_index(0)));
+    program.types.push(RirType::Flag(RirFlagId::from_index(99)));
+    program.flags.push(RirFlag {
+        id: RirFlagId::from_index(0),
+        air_id: air::FlagId::from_index(0),
+        symbol: RirSymbol::new("Access"),
+        display: RirSymbol::new("Access"),
+        known_bits: 3,
+        members: vec![
+            RirFlagMember {
+                id: RirFlagMemberId::from_index(7),
+                symbol: RirSymbol::new("Read"),
+                display: RirSymbol::new("Read"),
+                value: 1,
+                atomic: true,
+            },
+            RirFlagMember {
+                id: RirFlagMemberId::from_index(1),
+                symbol: RirSymbol::new("Negative"),
+                display: RirSymbol::new("Negative"),
+                value: -1,
+                atomic: false,
+            },
+            RirFlagMember {
+                id: RirFlagMemberId::from_index(2),
+                symbol: RirSymbol::new("Duplicate"),
+                display: RirSymbol::new("Duplicate"),
+                value: 1,
+                atomic: true,
+            },
+            RirFlagMember {
+                id: RirFlagMemberId::from_index(3),
+                symbol: RirSymbol::new("All"),
+                display: RirSymbol::new("All"),
+                value: 5,
+                atomic: true,
+            },
+        ],
+    });
+    program.consts.push(RirConst {
+        id: RirConstId::from_index(0),
+        ty: RirTypeId::from_index(1),
+        value: RirConstValue::Flag {
+            flag: RirFlagId::from_index(0),
+            bits: 8,
+        },
+    });
+
+    let errors = rir::verify(&program).expect_err("malformed flag metadata verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagUnknownBits)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagAtomicMismatch)
+    );
+    assert!(errors.iter().any(|error| {
+        error.site == RirVerifySite::Type(RirTypeId::from_index(1))
+            && error.kind == RirVerifyErrorKind::FlagInvalidKnownBits
+    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagInvalidValue)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagDuplicateValue)
+    );
+    assert!(
+        errors
+            .iter()
+            .filter(|error| error.kind == RirVerifyErrorKind::BadId)
+            .count()
+            >= 2
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::ConstTypeMismatch)
+    );
+}
+
+#[test]
+fn rir_flag_operations_reject_scalar_and_mismatched_shapes() {
+    let void = RirTypeId::from_index(0);
+    let bool_ty = RirTypeId::from_index(1);
+    let flag_ty = RirTypeId::from_index(2);
+    let flag = RirFlagId::from_index(0);
+    let value = RirLocalId::from_index(0);
+    let boolean = RirLocalId::from_index(1);
+    let mut program = RirProgram {
+        types: vec![RirType::Void, RirType::Bool, RirType::Flag(flag)],
+        flags: vec![RirFlag {
+            id: flag,
+            air_id: air::FlagId::from_index(0),
+            symbol: RirSymbol::new("Access"),
+            display: RirSymbol::new("Access"),
+            known_bits: 1,
+            members: vec![RirFlagMember {
+                id: RirFlagMemberId::from_index(0),
+                symbol: RirSymbol::new("READ"),
+                display: RirSymbol::new("Read"),
+                value: 1,
+                atomic: true,
+            }],
+        }],
+        entry: Some(RirFunctionId::from_index(0)),
+        ..RirProgram::default()
+    };
+    let operand = || RirOperand::Place(RirPlace::local(value, vec![], flag_ty));
+    program.functions.push(RirFunction {
+        id: RirFunctionId::from_index(0),
+        air_id: None,
+        symbol: RirSymbol::new("bad_flag_ops"),
+        params: vec![RirParam {
+            local: value,
+            ty: flag_ty,
+            semantic: RirParamSemantic::Value,
+            abi: RirParamAbi::Value,
+            escape: RirParamEscape::NonEscaping,
+        }],
+        ret: RirReturn { ty: void },
+        locals: vec![
+            RirLocal {
+                id: value,
+                ty: flag_ty,
+                mutable: false,
+                symbol: RirSymbol::new("value"),
+                initialized: true,
+                payload_ref: false,
+            },
+            RirLocal {
+                id: boolean,
+                ty: bool_ty,
+                mutable: false,
+                symbol: RirSymbol::new("boolean"),
+                initialized: true,
+                payload_ref: false,
+            },
+        ],
+        body: RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Eval(RirRValue::Binary {
+                    op: BinaryOp::Add,
+                    lhs: operand(),
+                    rhs: operand(),
+                    ty: flag_ty,
+                }),
+                RirStmt::Eval(RirRValue::Binary {
+                    op: BinaryOp::BitOr,
+                    lhs: operand(),
+                    rhs: operand(),
+                    ty: bool_ty,
+                }),
+                RirStmt::Eval(RirRValue::Unary {
+                    op: anvyx_frontend::ast::UnaryOp::Neg,
+                    value: operand(),
+                    ty: flag_ty,
+                }),
+                RirStmt::Eval(RirRValue::FlagStatic {
+                    op: RirFlagStaticOp::Empty,
+                    ty: bool_ty,
+                }),
+                RirStmt::PatternMatch(RirPatternMatch {
+                    subject: RirPlace::local(value, vec![], flag_ty),
+                    arms: vec![RirPatternArm {
+                        alternatives: vec![RirPatternAlternative {
+                            tests: vec![RirPatternTest::FlagValue {
+                                path: RirPatternPath::default(),
+                                flag,
+                                bits: 2,
+                            }],
+                            bindings: vec![],
+                        }],
+                        block: RirStructuredBlock::default(),
+                    }],
+                }),
+                RirStmt::PatternMatch(RirPatternMatch {
+                    subject: RirPlace::local(boolean, vec![], bool_ty),
+                    arms: vec![RirPatternArm {
+                        alternatives: vec![RirPatternAlternative {
+                            tests: vec![RirPatternTest::FlagValue {
+                                path: RirPatternPath::default(),
+                                flag,
+                                bits: 1,
+                            }],
+                            bindings: vec![],
+                        }],
+                        block: RirStructuredBlock::default(),
+                    }],
+                }),
+            ],
+            term: RirTerm::Return(None),
+        },
+    });
+
+    let errors = rir::verify(&program).expect_err("malformed flag operations verified");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error.kind == RirVerifyErrorKind::UnsupportedRValueType)
+            .count(),
+        3
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidFlagStatic)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagPatternUnknownBits)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::FlagPatternTypeMismatch)
+    );
+}
 
 #[test]
 fn profile_accepts_native_scoped_lambda_param() {
@@ -155,6 +474,20 @@ fn profile_accepts_retained_callback_native_string_borrow_reentry_arg() {
 
     RustBackendProfile::check_with_native_support(&verified, &[support])
         .expect("profile rejected snapshottable retained callback string borrow");
+}
+
+fn push_string_literal(
+    program: &mut RirProgram,
+    text: &str,
+    needs_owned: bool,
+) -> RirStringLiteralId {
+    let id = RirStringLiteralId::from_index(program.string_literals.len());
+    program.string_literals.push(rir::RirStringLiteral {
+        id,
+        text: text.to_string(),
+        needs_owned,
+    });
+    id
 }
 
 fn retained_callback_string_borrow_rir() -> RirProgram {
@@ -1998,7 +2331,7 @@ fn emit_direct_rir_global_read_uses_named_context_params() {
     let source = emit::emit(&verified).into_string();
 
     assert!(source.contains(
-        "fn main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"
+        "fn main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>)"
     ));
 }
 
@@ -2051,7 +2384,7 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
     let text = source.as_str();
 
     assert!(text.contains(
-        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, types, globals))?; *(&*__global) }; host::sink(rt, __anv_arg_0)"
+        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, statics, globals))?; *(&*__global) }; host::sink(rt, __anv_arg_0)"
     ), "{text}");
 
     let source = emit::RustSource::new(format!(
@@ -3331,9 +3664,7 @@ fn emit_non_scalar_global_read_and_root_set_materializes_owned_values() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains("g0_title: anvyx_runtime::GlobalSlot<anvyx_runtime::AnvString>"));
-    assert!(source.contains(
-        "globals.g0_title.set_without_init(anvyx_runtime::AnvString::from(\"ready\"))?;"
-    ));
+    assert!(source.contains("globals.g0_title.set_without_init(statics.string0.share())?;"));
     assert!(source.contains("globals.g0_title.read(||"));
     assert!(source.contains("(*(&*__global)).share()"));
     assert!(!source.contains("static "));
@@ -3927,7 +4258,7 @@ fn source_job_compiles_hand_built_air_capture_cell_lambdas() {
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig1<'env>"));
     assert!(text.contains("c0: &'env anvyx_runtime::StackLambdaCell<i64>"));
-    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains(".set(1)?;"));
     assert!(text.contains(".get_copy()?"));
     assert!(text.contains("c0: &__cell0"));
@@ -4172,22 +4503,7 @@ fn source_job_compiles_struct_stringify_helper() {
             source_ty: point,
         };
     }
-    let source = plan_source(program);
-
-    assert!(!source.as_str().contains("use std::fmt::Write;"));
-    assert!(source.as_str().contains("fn anvstringify_t3_point"));
-    assert!(
-        source.as_str().contains(
-            "std::fmt::Write::write_fmt(&mut out, format_args!(\"{}\", value.x)).unwrap();"
-        )
-    );
-    assert!(!source.as_str().contains("format!(\"{}\", value.x)"));
-    assert!(!source.as_str().contains("write!(out,"));
-    assert!(!source.as_str().contains("{:?}"));
-    assert!(!source.as_str().contains(".clone()"));
-    assert!(!source.as_str().contains(".to_owned()"));
-
-    let output = run_source(source);
+    let output = run_source(plan_source(program));
 
     assert_eq!(output.status, SourceJobStatus::Success);
     assert_eq!(output.stdout, "Point(x: 7)\n");
@@ -4237,13 +4553,7 @@ fn stringify_override_value_receiver_uses_copy_reconstruction() {
         };
     }
 
-    let source = plan_source(program);
-    let text = source.as_str();
-
-    assert!(text.contains("anv_f1_Point_to_string(rt, types, globals, anvT3_Point { x: v0.x })"));
-    assert!(!text.contains(".clone()"));
-
-    let output = run_source(source);
+    let output = run_source(plan_source(program));
 
     assert_eq!(output.status, SourceJobStatus::Success);
     assert_eq!(output.stdout, "ok\n");
@@ -4306,19 +4616,7 @@ fn stringify_override_propagates_fallible_receiver_function() {
         };
     }
 
-    let source = plan_source(program);
-    let text = source.as_str();
-
-    assert!(
-        text.contains("Point_to_string<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>, v0: &anvT3_Point)")
-    );
-    assert!(text.contains("-> Result<anvyx_runtime::AnvString, anvyx_runtime::RuntimeError>"));
-    assert!(text.contains("host::fallible(rt, 41)?;"));
-    assert!(text.contains("Point_to_string(rt, types, globals, &v0)?"));
-    assert!(text.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
-    assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
-
-    let output = run_source(with_fallible_host(source));
+    let output = run_source(with_fallible_host(plan_source(program)));
 
     assert_eq!(output.status, SourceJobStatus::Success);
     assert_eq!(output.stdout, "ok\n");
@@ -4568,9 +4866,9 @@ fn source_job_compiles_methods_as_free_functions() {
     let text = source.as_str();
 
     assert!(text.contains(
-        "fn anv_f0_Point_value<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>, v0: anvT3_Point) -> i64"
+        "fn anv_f0_Point_value<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>, v0: anvT3_Point) -> i64"
     ));
-    assert!(text.contains("anv_f0_Point_value(rt, types, globals, anvT3_Point { x: v0.x })"));
+    assert!(text.contains("anv_f0_Point_value(rt, statics, globals, anvT3_Point { x: v0.x })"));
     assert!(!text.contains("impl anvT"));
     assert!(!text.contains("trait "));
     assert!(!text.contains(".clone()"));
@@ -6841,7 +7139,7 @@ fn emit_heap_cell_init_hoists_ctx_using_value_before_alloc() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
-    assert!(text.contains("let value = seed(rt, types, globals);"));
+    assert!(text.contains("let value = seed(rt, statics, globals);"));
     assert!(
         text.contains("let safepoint = rt.__anvyx_safepoint_state(); rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new_with_safepoint(value, safepoint))")
     );
@@ -6874,12 +7172,12 @@ fn emit_heap_cell_alloc_env_and_access_use_handles() {
             .contains("let __cell0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>> =")
     );
     assert!(source.contains(
-        "= { let value = 1; let heap_type = types.lambda_cell0; let safepoint = rt.__anvyx_safepoint_state(); rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new_with_safepoint(value, safepoint)) };"
+        "= { let value = 1; let heap_type = statics.lambda_cell0; let safepoint = rt.__anvyx_safepoint_state(); rt.heap().alloc(heap_type, anvyx_runtime::LambdaCell::<i64>::new_with_safepoint(value, safepoint)) };"
     ));
     assert!(source.contains("c0: anvyx_runtime::Handle<'cx, anvyx_runtime::LambdaCell<i64>>,"));
     assert!(source.contains("c0: __cell0.clone()"));
     assert!(source.contains("let c0 = rt.heap().with(env, |env| env.c0.clone());"));
-    assert!(source.contains("target(rt, types, globals, c0)"));
+    assert!(source.contains("target(rt, statics, globals, c0)"));
     assert!(source.contains("rt.heap().with(&cell, |cell| cell.get_copy())?"));
     assert!(!source.contains("StackLambdaCell"));
     assert!(!source.contains("RefCell"));
@@ -7242,9 +7540,9 @@ fn emit_stack_cell_lambda_values_are_copyable_shared_refs() {
     let text = source.as_str();
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig0<'env>"));
     assert!(text.contains("L0 { c0: &'env anvyx_runtime::StackLambdaCell<i64> }"));
-    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains("c0: &__cell0"));
-    assert!(text.contains("target(rt, types, globals, *c0)"));
+    assert!(text.contains("target(rt, statics, globals, *c0)"));
     assert!(!text.contains("&'env mut"));
     assert!(!text.contains("fn call<'cx, 'rt>(&mut self"));
     assert!(!text.contains("&mut source"));
@@ -9180,7 +9478,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
     assert!(text.contains("enum LambdaSig0"));
-    assert!(text.contains("fn call<'cx, 'rt>(self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>)"));
+    assert!(text.contains("fn call<'cx, 'rt>(self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>)"));
     assert!(text.contains("LambdaSig0::L0"));
     assert!(!text.contains("Box<dyn"));
     assert!(!text.contains("LambdaEnv"));
@@ -9870,7 +10168,7 @@ fn plan_lowers_escaping_readonly_capture_to_heap_env() {
         .find("let c0 = rt.heap().with(env, |env|")
         .expect("missing env field materialization");
     let call = source[materialize..]
-        .find("(rt, types, globals, c0)")
+        .find("(rt, statics, globals, c0)")
         .expect("missing materialized body call");
     assert!(call > 0);
     for forbidden in [
@@ -11243,7 +11541,7 @@ fn emit_passes_capture_heap_cell_ref_arg_as_heap_cell_mut_place() {
 fn emit_reentrant_heap_cell_ref_arg_call_is_not_wrapped_in_cell_borrow() {
     let source = plan_source(heap_capture_cell_reentrant_source_ref_arg_program()).into_string();
 
-    assert!(source.contains("apply(rt, types, globals, anvyx_runtime::MutPlace::heap_cell("));
+    assert!(source.contains("apply(rt, statics, globals, anvyx_runtime::MutPlace::heap_cell("));
     assert!(!source.contains("rt.heap().with(&v0, |cell| apply"));
     assert!(!source.contains("cell.mutate(|value| apply"));
     assert!(!source.contains("rt.heap().with(&v0, |cell| cell.get_copy())?"));
@@ -11651,10 +11949,10 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
     assert!(source.contains("fn anv_f1_Second_value"));
     assert!(source.contains("fn anv_f2_First_value"));
     assert!(source.contains("fn anv_f3_value"));
-    assert!(source.contains("anv_f0_First_value(rt, types, globals,"));
-    assert!(source.contains("anv_f1_Second_value(rt, types, globals,"));
-    assert!(source.contains("anv_f2_First_value(rt, types, globals)"));
-    assert!(source.contains("anv_f3_value(rt, types, globals)"));
+    assert!(source.contains("anv_f0_First_value(rt, statics, globals,"));
+    assert!(source.contains("anv_f1_Second_value(rt, statics, globals,"));
+    assert!(source.contains("anv_f2_First_value(rt, statics, globals)"));
+    assert!(source.contains("anv_f3_value(rt, statics, globals)"));
     assert!(!source.contains("impl anvT"));
     assert!(!source.contains("trait "));
 }
@@ -11664,15 +11962,79 @@ fn emit_renders_format_with_central_specs_and_borrowed_strings() {
     let program = format_program();
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:04}\", 7))"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:*>5}\", v1.as_str()))"));
-    assert!(source.contains("format!(\"{:.2}\","));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:X}\", 255))"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(format!(\"{:b}\", 5))"));
-    assert!(source.contains("format!(\"{:e}\","));
-    assert!(source.contains("format!(\"{:E}\","));
+    assert!(source.contains("anvyx_runtime::AnvString::default()"));
+    assert!(source.contains("std::fmt::Write::write_fmt(&mut out, format_args!(\"{:04}\", 7))"));
+    assert!(source.contains("format_args!(\"{:*>5}\", v1.as_str())"));
+    assert!(source.contains("format_args!(\"{:.2}\","));
+    assert!(source.contains("format_args!(\"{:X}\", 255)"));
+    assert!(source.contains("format_args!(\"{:b}\", 5)"));
+    assert!(source.contains("format_args!(\"{:e}\","));
+    assert!(source.contains("format_args!(\"{:E}\","));
+    assert!(!source.contains("AnvString::from(format!"));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
+}
+
+#[test]
+fn rir_dedupes_string_literals_and_tracks_owned_use() {
+    let program = string_concat_program();
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
+    let literals = &plan.program().string_literals;
+
+    assert_eq!(
+        literals
+            .iter()
+            .map(|literal| (literal.text.as_str(), literal.needs_owned))
+            .collect::<Vec<_>>(),
+        [("a", false), ("b", false), ("c", true)]
+    );
+
+    let mut forged = plan.program().clone();
+    forged.string_literals[2].needs_owned = false;
+    let errors = rir::verify(&forged).expect_err("invalid literal ownership verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.kind == RirVerifyErrorKind::StringLiteralOwnershipMismatch })
+    );
+}
+
+#[test]
+fn rir_string_ownership_analysis_rejects_malformed_ids_without_panicking() {
+    let mut format = empty_rir_function(RirType::Void);
+    format.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::Format {
+            value: RirOperand::Const(RirConstId::from_index(0)),
+            source_ty: RirTypeId::from_index(99),
+            spec: RirFormatSpec::default(),
+        }));
+    let errors = rir::verify(&format).expect_err("malformed format verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::BadId)
+    );
+
+    let mut cast = empty_rir_function(RirType::Void);
+    cast.types.push(RirType::Enum(RirEnumId::from_index(99)));
+    cast.types.push(RirType::String);
+    cast.consts[0].ty = RirTypeId::from_index(1);
+    cast.functions[0]
+        .body
+        .stmts
+        .push(RirStmt::Eval(RirRValue::RawProject {
+            value: RirOperand::Const(RirConstId::from_index(0)),
+            target: RirTypeId::from_index(2),
+        }));
+    let errors = rir::verify(&cast).expect_err("malformed raw cast verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::BadId)
+    );
 }
 
 #[test]
@@ -11680,11 +12042,26 @@ fn emit_renders_string_concat_as_anv_string_without_clone_or_to_owned() {
     let program = string_concat_program();
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("let mut out = String::new();"));
+    assert!(source.contains("let mut out = anvyx_runtime::AnvString::default();"));
     assert!(source.contains("out.push_str(\"a\");"));
+    assert!(source.contains("out.push_str(\"c\");"));
     assert!(source.contains("out.push_str(v0.as_str());"));
-    assert!(source.contains("v0 = { let mut out = String::new(); out.push_str(v0.as_str());"));
-    assert!(source.contains("anvyx_runtime::AnvString::from(out)"));
+    assert!(source.contains(
+        "v0 = { let mut out = anvyx_runtime::AnvString::default(); out.push_str(v0.as_str());"
+    ));
+    assert_eq!(
+        source.matches("string2: anvyx_runtime::AnvString,").count(),
+        1
+    );
+    assert_eq!(
+        source
+            .matches("string2: anvyx_runtime::AnvString::from(\"c\"),")
+            .count(),
+        1
+    );
+    assert_eq!(source.matches("statics.string2.share()").count(), 2);
+    assert!(!source.contains("String::new()"));
+    assert!(!source.contains("AnvString::from(out)"));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
 }
@@ -11694,11 +12071,10 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
     let program = scalar_print_program();
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("struct AnvTypes<'cx>"));
-    assert!(source.contains("fn register(_heap: &mut anvyx_runtime::Heap<'cx>) -> Self"));
+    assert!(source.contains("struct AnvStatics<'cx>"));
+    assert!(source.contains("fn new(_heap: &mut anvyx_runtime::Heap<'cx>) -> Self"));
     assert!(source.contains("struct AnvGlobals<'cx>"));
-    assert!(source.contains("struct AnvGlobals<'cx>"));
-    assert!(source.contains("let types = AnvTypes::register(&mut heap);"));
+    assert!(source.contains("let statics = AnvStatics::new(&mut heap);"));
     assert!(source.contains("let mut runtime = AnvRuntime::new(heap);"));
     assert!(
         source.contains(
@@ -11706,7 +12082,7 @@ fn emit_renders_context_first_free_functions_without_clone_or_traits() {
         )
     );
     assert!(source.contains("let globals = AnvGlobals::new(&safepoint);"));
-    assert!(source.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>)"));
+    assert!(source.contains("fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>)"));
     assert!(source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, v0.as_str())"));
     assert!(!source.contains("type AnvCtx"));
     assert_eq!(
@@ -11766,30 +12142,13 @@ fn emit_uses_underscored_context_only_for_leaf_bodies() {
 
     let source = plan_source(program).into_string();
 
-    assert!(source.contains("fn anv_f0_leaf<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> i64"));
-    assert!(source.contains("fn anv_f1_caller<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>) -> i64"));
-    assert!(source.contains("anv_f0_leaf(rt, types, globals)"));
+    assert!(source.contains("fn anv_f0_leaf<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>) -> i64"));
+    assert!(source.contains("fn anv_f1_caller<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>) -> i64"));
+    assert!(source.contains("anv_f0_leaf(rt, statics, globals)"));
 }
 
 #[test]
-fn emit_uses_underscored_context_for_primitive_struct_stringify_helper() {
-    let mut program = struct_field_read_program();
-    let point = program.functions[0].locals[0].ty;
-    if let air::AirStmt::Init { value, .. } = &mut program.functions[0].body.block.stmts[1] {
-        *value = RValue::Stringify {
-            value: Operand::Place(place(air::LocalId::from_index(0), point)),
-            source_ty: point,
-        };
-    }
-    let source = plan_source(program).into_string();
-
-    assert!(source.contains(
-        "fn anvstringify_t3_point<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, value: &anvT3_Point)"
-    ));
-}
-
-#[test]
-fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
+fn rir_rejects_mismatched_stringify_helper_kinds() {
     let int = RirTypeId::from_index(0);
     let inner = RirTypeId::from_index(1);
     let outer = RirTypeId::from_index(2);
@@ -11836,37 +12195,59 @@ fn emit_keeps_context_name_for_nested_struct_stringify_helper() {
                 id: RirStringifyHelperId::from_index(0),
                 ty: inner,
                 symbol: RirSymbol::new("stringify_inner"),
+                kind: RirStringifyHelperKind::Struct(RirStructId::from_index(0)),
             },
             RirStringifyHelper {
                 id: RirStringifyHelperId::from_index(1),
                 ty: outer,
                 symbol: RirSymbol::new("stringify_outer"),
+                kind: RirStringifyHelperKind::Struct(RirStructId::from_index(1)),
             },
         ],
         stringify_reqs: vec![
             RirStringifyReq {
                 id: RirStringifyReqId::from_index(0),
                 ty: inner,
-                kind: RirStringifyReqKind::Structural(RirStringifyHelperId::from_index(0)),
+                kind: RirStringifyReqKind::Helper(RirStringifyHelperId::from_index(0)),
             },
             RirStringifyReq {
                 id: RirStringifyReqId::from_index(1),
                 ty: outer,
-                kind: RirStringifyReqKind::Structural(RirStringifyHelperId::from_index(1)),
+                kind: RirStringifyReqKind::Helper(RirStringifyHelperId::from_index(1)),
             },
         ],
         ..RirProgram::default()
     };
-    let verified = rir::verify(&program).expect("RIR verify failed");
-    let source = emit::emit(&verified).into_string();
+    let mut malformed = program.clone();
+    malformed.stringify_helpers[0].kind =
+        RirStringifyHelperKind::Struct(RirStructId::from_index(1));
+    assert_rir_error(malformed, RirVerifyErrorKind::UnsupportedRValueType);
+    let mut malformed = program.clone();
+    malformed.stringify_helpers[0].kind = RirStringifyHelperKind::Enum {
+        enm: RirEnumId::from_index(0),
+        variants: vec![],
+    };
+    assert_rir_error(malformed, RirVerifyErrorKind::UnsupportedRValueType);
+    let mut malformed = program.clone();
+    malformed.stringify_helpers[0].kind = RirStringifyHelperKind::Flag {
+        flag: RirFlagId::from_index(0),
+        empty: RirStringLiteralId::from_index(0),
+        members: vec![],
+    };
+    assert_rir_error(malformed, RirVerifyErrorKind::UnsupportedRValueType);
 
-    assert!(
-        source.contains("fn stringify_inner<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, value: &Inner)")
+    let mut malformed = program.clone();
+    let mut duplicate = malformed.stringify_reqs[0].clone();
+    duplicate.id = RirStringifyReqId::from_index(2);
+    malformed.stringify_reqs.push(duplicate);
+    assert_rir_error(malformed, RirVerifyErrorKind::DuplicateStringifyReq);
+
+    let mut malformed = program;
+    malformed.stringify_reqs.pop();
+    assert_rir_error(
+        malformed,
+        RirVerifyErrorKind::InvalidStringifyHelperReferenceCount,
     );
-    assert!(
-        source.contains("fn stringify_outer<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, value: &Outer)")
-    );
-    assert!(source.contains("stringify_inner(rt, types, &value.inner)"));
 }
 
 #[test]
@@ -12203,11 +12584,13 @@ fn emit_propagates_fallible_native_calls() {
     let source = plan_source(fallible_call_program(false, false)).into_string();
 
     assert!(source.contains(
-        "fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
     assert!(source.contains("host::fallible(rt, 41)?;"));
     assert!(source.contains("fn main() -> Result<(), anvyx_runtime::RuntimeError>"));
-    assert!(source.contains("let _ = anv_f0_main(&mut rt, anv_entry.types, anv_entry.globals)?;"));
+    assert!(
+        source.contains("let _ = anv_f0_main(&mut rt, anv_entry.statics, anv_entry.globals)?;")
+    );
     assert!(!source.contains(".unwrap()"));
 }
 
@@ -12222,7 +12605,7 @@ fn emit_pins_generated_runtime_owner_before_attach() {
     assert!(source.contains("heap: anvyx_runtime::Heap<'cx>,"));
     assert!(source.contains("_pin: std::marker::PhantomPinned,"));
     assert!(source.contains(
-        "types: AnvTypes<'cx>,\n    globals: AnvGlobals<'cx>,\n    heap: anvyx_runtime::Heap<'cx>,"
+        "statics: AnvStatics<'cx>,\n    globals: AnvGlobals<'cx>,\n    heap: anvyx_runtime::Heap<'cx>,"
     ));
     assert!(source.contains("anvyx_runtime::Heap::scope_owned(|heap|"));
     assert!(source.contains("let mut runtime = AnvRuntime::new(heap);"));
@@ -12251,12 +12634,12 @@ fn emit_propagates_generated_fallibility_transitively() {
     let source = plan_source(fallible_call_program(true, false)).into_string();
 
     assert!(source.contains(
-        "fn anv_f0_leaf<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _types: &AnvTypes<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f0_leaf<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
     assert!(source.contains(
-        "fn anv_f1_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, types: &AnvTypes<'cx>, globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
+        "fn anv_f1_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
-    assert!(source.contains("anv_f0_leaf(rt, types, globals)?;"));
+    assert!(source.contains("anv_f0_leaf(rt, statics, globals)?;"));
 }
 
 #[test]
@@ -12272,6 +12655,8 @@ fn emit_borrows_string_literal_call_arg_without_owned_temp() {
     let source = plan_source(borrow_string_literal_program()).into_string();
 
     assert!(source.contains("anvyx_core::__anvyx_native::core_runtime::_println(rt, \"ready\");"));
+    assert!(source.contains("_statics: &AnvStatics<'cx>"));
+    assert!(!source.contains("string0: anvyx_runtime::AnvString"));
     assert!(!source.contains("String::from"));
     assert!(!source.contains("to_string()"));
 }
@@ -12310,7 +12695,9 @@ fn emit_formats_borrowed_string_param_without_owned_temp() {
     let source = plan_source(format_borrowed_string_program()).into_string();
 
     assert!(source.contains("v0: &str"));
-    assert!(source.contains("format!(\"{:*>5}\", v0)"));
+    assert!(source.contains("format_args!(\"{:*>5}\", v0)"));
+    assert!(source.contains("anvyx_runtime::AnvString::default()"));
+    assert!(!source.contains("AnvString::from(format!"));
     assert!(!source.contains("v0.as_str()"));
     assert!(!source.contains(".clone()"));
     assert!(!source.contains(".to_owned()"));
@@ -13366,11 +13753,11 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
             target::rt_heap_erase("rt", "&node")
         ),
         format!(
-            "let __anv_dataref_place_ops_0 = anvP0_Node_value_place {{ {}: types.NodeHeapType }};",
+            "let __anv_dataref_place_ops_0 = anvP0_Node_value_place {{ {}: statics.NodeHeapType }};",
             target::dataref_place_heap_type_field()
         ),
         format!(
-            "sink(rt, types, globals, {})",
+            "sink(rt, statics, globals, {})",
             target::mut_place_dataref("__anv_dataref_place_object_0", "&__anv_dataref_place_ops_0")
         ),
     ] {
@@ -16138,10 +16525,11 @@ fn set_global_string_payload(program: &mut RirProgram) -> (RirTypeId, RirConstId
     let string = RirTypeId::from_index(2);
     let value = RirConstId::from_index(1);
     program.types.push(RirType::String);
+    let literal = push_string_literal(program, "ready", true);
     program.consts.push(RirConst {
         id: value,
         ty: string,
-        value: RirConstValue::String("ready".into()),
+        value: RirConstValue::String(literal),
     });
     program.globals[0].ty = string;
     program.functions[0].ret.ty = string;
@@ -18026,12 +18414,6 @@ fn string_concat_program() -> Program {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
     let void = program.alloc_type(TypeData::Void);
-    let println = runtime_extern(
-        &mut program,
-        "_println",
-        vec![(string, ParamMode::SharedBorrow)],
-        void,
-    );
     let a = program.const_arena.alloc(ConstData {
         ty: string,
         value: ConstValue::String("a".into()),
@@ -18044,9 +18426,14 @@ fn string_concat_program() -> Program {
         ty: string,
         value: ConstValue::String("c".into()),
     });
+    let duplicate_a = program.const_arena.alloc(ConstData {
+        ty: string,
+        value: ConstValue::String("a".into()),
+    });
     let text = air::LocalId::from_index(0);
     let suffix = air::LocalId::from_index(1);
     let out = air::LocalId::from_index(2);
+    let again = air::LocalId::from_index(3);
     let module = program.alloc_module(root_module());
     let main = program.alloc_function(Function {
         name: Ident::new("main"),
@@ -18065,21 +18452,26 @@ fn string_concat_program() -> Program {
             },
             local(string, LocalKind::Temp),
             local(string, LocalKind::Temp),
+            local(string, LocalKind::Temp),
         ],
         body: structured_body(
             vec![
                 Statement::Init {
                     local: text,
                     value: RValue::StringConcat {
-                        parts: vec![Operand::Const(a), Operand::Const(b)],
+                        parts: vec![
+                            Operand::Const(a),
+                            Operand::Const(b),
+                            Operand::Const(duplicate_a),
+                        ],
                     },
                 },
-                Statement::Eval(RValue::Call {
-                    callee: Callee::Extern(println),
-                    args: vec![CallArg::SharedBorrow(place(text, string))],
-                }),
                 Statement::Init {
                     local: suffix,
+                    value: RValue::Use(Operand::Const(c)),
+                },
+                Statement::Init {
+                    local: again,
                     value: RValue::Use(Operand::Const(c)),
                 },
                 Statement::Init {
@@ -18091,10 +18483,6 @@ fn string_concat_program() -> Program {
                         ],
                     },
                 },
-                Statement::Eval(RValue::Call {
-                    callee: Callee::Extern(println),
-                    args: vec![CallArg::SharedBorrow(place(out, string))],
-                }),
                 Statement::Assign {
                     dst: place(text, string),
                     value: RValue::StringConcat {
@@ -18499,7 +18887,7 @@ mod enums {
 
         assert!(source.contains("enum anvT2_Message"));
         assert!(source.contains("Text(anvyx_runtime::AnvString)"));
-        assert!(source.contains("anvT2_Message::Text(anvyx_runtime::AnvString::from(\"x\"))"));
+        assert!(source.contains("anvT2_Message::Text(statics.string0.share())"));
         assert!(!source.contains("Text(String)"));
         assert!(!source.contains("Text(String::from"));
         assert!(!source.contains(".to_owned()"));
@@ -18539,15 +18927,32 @@ mod enums {
     }
 
     #[test]
-    fn enum_stringify_is_explicit_target_gap() {
+    fn enum_stringify_plans_one_enum_helper() {
         let program = enum_with_string_payload_program(true);
         let verified = air::verify(&program).expect("AIR verify failed");
-        let Err(err) = plan(&verified, RustPlanConfig::default()) else {
-            panic!("plan should reject stringify");
+        let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
+        assert!(matches!(
+            plan.program().stringify_helpers.as_slice(),
+            [RirStringifyHelper {
+                kind: RirStringifyHelperKind::Enum { .. },
+                ..
+            }]
+        ));
+        let mut forged = plan.program().clone();
+        let RirStringifyHelperKind::Enum { variants, .. } = &forged.stringify_helpers[0].kind
+        else {
+            unreachable!()
         };
+        let label = variants[0].label;
+        forged.string_literals[label.index()].text = "forged".to_string();
         assert!(
-            matches!(err, RustPlanError::TargetGaps(gaps) if gaps.iter().any(|gap| gap.kind == RustTargetGapKind::UnsupportedStructuralStringify))
+            rir::verify_with_air(&forged, &program)
+                .unwrap_err()
+                .iter()
+                .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
         );
+        let output = run_source(emit::emit(&plan.verified()));
+        assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
 
     #[test]
@@ -19853,7 +20258,7 @@ mod lists {
 
         let source = plan_source(program);
         let text = source.as_str();
-        assert!(text.contains("anvyx_runtime::AnvList::from_elems(rt, types.list_storage"));
+        assert!(text.contains("anvyx_runtime::AnvList::from_elems(rt, statics.list_storage"));
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
         assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
@@ -20219,7 +20624,7 @@ mod slices {
 }
 
 #[test]
-fn rir_verifies_raw_enum_metadata_and_cast() {
+fn rir_verifies_raw_enum_metadata_and_projection() {
     let mut program = RirProgram::default();
     let int = RirTypeId::from_index(0);
     let state = RirTypeId::from_index(1);
@@ -20241,7 +20646,7 @@ fn rir_verifies_raw_enum_metadata_and_cast() {
             symbol: RirSymbol::new("Idle"),
             display: RirSymbol::new("Idle"),
             kind: RirVariantKind::Unit,
-            raw_value: Some(rir::RirRawEnumValue::Int(0)),
+            raw_value: Some(RirRawEnumValue::Int(0)),
             fields: vec![],
         }],
     });
@@ -20266,7 +20671,7 @@ fn rir_verifies_raw_enum_metadata_and_cast() {
             payload_ref: false,
         }],
         body: RirStructuredBlock {
-            stmts: vec![RirStmt::Eval(RirRValue::Cast {
+            stmts: vec![RirStmt::Eval(RirRValue::RawProject {
                 value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], state)),
                 target: int,
             })],
@@ -20280,6 +20685,154 @@ fn rir_verifies_raw_enum_metadata_and_cast() {
     });
 
     assert!(rir::verify(&program).is_ok());
+
+    program.enums[0].repr = rir::RirEnumRepr::RawString;
+    let errors = rir::verify(&program).expect_err("mismatched raw representation verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawProject)
+    );
+    program.enums[0].repr = rir::RirEnumRepr::RawInt;
+
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::Cast {
+        value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], state)),
+        target: int,
+    });
+    let errors = rir::verify(&program).expect_err("raw enum accepted by numeric cast");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidNumericCast)
+    );
+
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawProject {
+        value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], state)),
+        target: state,
+    });
+    let errors = rir::verify(&program).expect_err("wrong raw backing accepted");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawProject)
+    );
+
+    let state_option = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::Option(state));
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
+        value: RirOperand::Const(RirConstId::from_index(0)),
+        target: state,
+        ty: state_option,
+    });
+    assert!(rir::verify(&program).is_ok());
+
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
+        value: RirOperand::Const(RirConstId::from_index(0)),
+        target: state,
+        ty: int,
+    });
+    let errors = rir::verify(&program).expect_err("wrong raw option verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawTryConstruct)
+    );
+
+    let string = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::String);
+    let literal = push_string_literal(&mut program, "idle", false);
+    let string_const = RirConstId::from_index(program.consts.len());
+    program.consts.push(RirConst {
+        id: string_const,
+        ty: string,
+        value: RirConstValue::String(literal),
+    });
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
+        value: RirOperand::Const(string_const),
+        target: state,
+        ty: state_option,
+    });
+    let errors = rir::verify(&program).expect_err("wrong raw source verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawTryConstruct)
+    );
+
+    let adt_id = RirEnumId::from_index(program.enums.len());
+    let adt = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::Enum(adt_id));
+    program.enums.push(RirEnum {
+        id: adt_id,
+        air_id: None,
+        native_path: None,
+        native_key: None,
+        core: None,
+        repr: rir::RirEnumRepr::Adt,
+        raw_type: None,
+        symbol: RirSymbol::new("Adt"),
+        display: RirSymbol::new("Adt"),
+        copyable: true,
+        variants: vec![],
+    });
+    let adt_option = RirTypeId::from_index(program.types.len());
+    program.types.push(RirType::Option(adt));
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
+        value: RirOperand::Const(RirConstId::from_index(0)),
+        target: adt,
+        ty: adt_option,
+    });
+    let errors = rir::verify(&program).expect_err("ADT raw construction verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawTryConstruct)
+    );
+
+    program.enums[0].repr = rir::RirEnumRepr::RawString;
+    program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
+        value: RirOperand::Const(RirConstId::from_index(0)),
+        target: state,
+        ty: state_option,
+    });
+    let errors = rir::verify(&program).expect_err("malformed raw target verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidRawTryConstruct)
+    );
+}
+
+#[test]
+fn rir_raw_enum_metadata_requires_matching_backing() {
+    let mut program = RirProgram::default();
+    let string = RirTypeId::from_index(1);
+    program.types.push(RirType::Int);
+    program.types.push(RirType::String);
+    program.enums.push(raw_int_rir_enum(RirVariant {
+        id: RirVariantId::from_index(0),
+        symbol: RirSymbol::new("Idle"),
+        display: RirSymbol::new("Idle"),
+        kind: RirVariantKind::Unit,
+        raw_value: Some(RirRawEnumValue::Int(0)),
+        fields: vec![],
+    }));
+
+    program.enums[0].raw_type = None;
+    let errors = rir::verify(&program).expect_err("raw enum without backing verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::RawEnumMissingRawType)
+    );
+
+    program.enums[0].raw_type = Some(string);
+    let errors = rir::verify(&program).expect_err("raw enum with wrong backing verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::RawEnumWrongRawType)
+    );
 }
 
 #[test]
@@ -20287,12 +20840,13 @@ fn rir_rejects_raw_enum_wrong_value_type() {
     let mut program = RirProgram::default();
     program.types.push(RirType::Int);
     program.types.push(RirType::Enum(RirEnumId::from_index(0)));
+    let literal = push_string_literal(&mut program, "bad", false);
     program.enums.push(raw_int_rir_enum(RirVariant {
         id: RirVariantId::from_index(0),
         symbol: RirSymbol::new("Bad"),
         display: RirSymbol::new("Bad"),
         kind: RirVariantKind::Unit,
-        raw_value: Some(rir::RirRawEnumValue::String("bad".into())),
+        raw_value: Some(RirRawEnumValue::String(literal)),
         fields: vec![],
     }));
 
@@ -20315,7 +20869,7 @@ fn rir_rejects_raw_enum_payload() {
         symbol: RirSymbol::new("Bad"),
         display: RirSymbol::new("Bad"),
         kind: RirVariantKind::Tuple,
-        raw_value: Some(rir::RirRawEnumValue::Int(0)),
+        raw_value: Some(RirRawEnumValue::Int(0)),
         fields: vec![RirField {
             id: RirFieldId::from_index(0),
             symbol: RirSymbol::new("f0"),
@@ -20417,116 +20971,31 @@ fn raw_string_air_enum(
 }
 
 #[test]
-fn raw_int_enum_cast_emits_repr_discriminants_and_cast() {
+fn rir_attests_raw_enum_values_against_air() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
-    let (enum_id, state) = raw_int_air_enum(&mut program, module, int, "State", vec![("Dead", -1)]);
-    let state_local = air::LocalId::from_index(0);
-    let raw_local = air::LocalId::from_index(1);
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
+    raw_int_air_enum(
+        &mut program,
         module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![local(state, LocalKind::Temp), local(int, LocalKind::Temp)],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: state_local,
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::EnumVariant {
-                            enum_id,
-                            variant: VariantId::from_index(0),
-                        },
-                        fields: vec![],
-                        ty: state,
-                    },
-                },
-                Statement::Init {
-                    local: raw_local,
-                    value: RValue::Cast {
-                        value: Operand::Place(place(state_local, state)),
-                        target: int,
-                    },
-                },
-            ],
-            air::AirTail::Return(Some(Operand::Place(place(raw_local, int)))),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-    program.set_entry(main);
-
-    let source = plan_source(program);
-    let text = source.as_str();
-    assert!(text.contains("#[repr(i64)]"));
-    assert!(text.contains("Dead = -1"));
-    assert!(text.contains("v0 as i64"));
+        int,
+        "State",
+        vec![("Idle", 0), ("Run", 2)],
+    );
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    let mut forged = plan.program().clone();
+    forged.enums[0].variants[1].raw_value = Some(RirRawEnumValue::Int(3));
+    assert!(
+        rir::verify_with_air(&forged, &program)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
+    );
 }
 
 #[test]
-fn raw_int_enum_cast_does_not_consume_source_place() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let module = program.alloc_module(root_module());
-    let (enum_id, state) = raw_int_air_enum(&mut program, module, int, "State", vec![("Idle", 0)]);
-    let state_local = air::LocalId::from_index(0);
-    let first = air::LocalId::from_index(1);
-    let second = air::LocalId::from_index(2);
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], int),
-        locals: vec![
-            local(state, LocalKind::Temp),
-            local(int, LocalKind::Temp),
-            local(int, LocalKind::Temp),
-        ],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: state_local,
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::EnumVariant {
-                            enum_id,
-                            variant: VariantId::from_index(0),
-                        },
-                        fields: vec![],
-                        ty: state,
-                    },
-                },
-                Statement::Init {
-                    local: first,
-                    value: RValue::Cast {
-                        value: Operand::Place(place(state_local, state)),
-                        target: int,
-                    },
-                },
-                Statement::Init {
-                    local: second,
-                    value: RValue::Cast {
-                        value: Operand::Place(place(state_local, state)),
-                        target: int,
-                    },
-                },
-            ],
-            air::AirTail::Return(Some(Operand::Place(place(second, int)))),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-    program.set_entry(main);
-
-    let output = run_source(plan_source(program));
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-}
-
-#[test]
-fn empty_raw_int_enum_cast_emits_impossible_match_without_repr() {
+fn empty_raw_int_enum_projection_emits_impossible_match_without_repr() {
     let mut program = Program::default();
     let int = program.alloc_type(TypeData::Int);
     let module = program.alloc_module(root_module());
@@ -20554,7 +21023,7 @@ fn empty_raw_int_enum_cast_emits_impossible_match_without_repr() {
         body: structured_body(
             vec![Statement::Init {
                 local: raw,
-                value: RValue::Cast {
+                value: RValue::RawProject {
                     value: Operand::Place(place(arg, never)),
                     target: int,
                 },
@@ -20585,55 +21054,135 @@ fn empty_raw_int_enum_cast_emits_impossible_match_without_repr() {
 }
 
 #[test]
-fn raw_string_enum_cast_emits_match() {
+fn repeated_raw_string_projection_uses_one_pooled_literal() {
     let mut program = Program::default();
     let string = program.alloc_type(TypeData::String);
+    let void = program.alloc_type(TypeData::Void);
     let module = program.alloc_module(root_module());
-    let (enum_id, anim) =
-        raw_string_air_enum(&mut program, module, string, "Anim", vec![("Idle", "idle")]);
-    let anim_local = air::LocalId::from_index(0);
-    let raw_local = air::LocalId::from_index(1);
-    let main = program.alloc_function(Function {
+    let (_, anim) = raw_string_air_enum(
+        &mut program,
+        module,
+        string,
+        "Animation",
+        vec![("Idle", "idle")],
+    );
+    let arg = air::LocalId::from_index(0);
+    let first = air::LocalId::from_index(1);
+    let second = air::LocalId::from_index(2);
+    let function = program.alloc_function(Function {
+        name: Ident::new("project"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("value")),
+                ty: anim,
+                mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
+                role: ParamRole::Normal,
+                local_id: arg,
+            }],
+            void,
+        ),
+        locals: vec![
+            local(anim, LocalKind::Arg),
+            local(string, LocalKind::Temp),
+            local(string, LocalKind::Temp),
+        ],
+        body: structured_body(
+            vec![
+                Statement::Init {
+                    local: first,
+                    value: RValue::RawProject {
+                        value: Operand::Place(place(arg, anim)),
+                        target: string,
+                    },
+                },
+                Statement::Init {
+                    local: second,
+                    value: RValue::RawProject {
+                        value: Operand::Place(place(arg, anim)),
+                        target: string,
+                    },
+                },
+            ],
+            air::AirTail::Return(None),
+        ),
+    });
+    program.module_mut(module).functions.push(function);
+
+    let verified = air::verify(&program).expect("AIR verify failed");
+    let plan = plan(&verified, rust_plan_config()).expect("plan failed");
+    assert_eq!(plan.program().string_literals.len(), 1);
+    assert!(plan.program().string_literals[0].needs_owned);
+    let source = emit::emit(&plan.verified()).into_string();
+    assert_eq!(
+        source.matches("string0: anvyx_runtime::AnvString,").count(),
+        1
+    );
+    assert_eq!(source.matches("statics.string0.share()").count(), 2);
+}
+
+#[test]
+fn empty_raw_string_enum_projection_does_not_retain_statics() {
+    let mut program = Program::default();
+    let string = program.alloc_type(TypeData::String);
+    let int = program.alloc_type(TypeData::Int);
+    let module = program.alloc_module(root_module());
+    let (_, never) = raw_string_air_enum(&mut program, module, string, "Never", vec![]);
+    let arg = air::LocalId::from_index(0);
+    let raw = air::LocalId::from_index(1);
+    let cast = program.alloc_function(Function {
+        name: Ident::new("raw"),
+        module,
+        kind: FunctionKind::Normal,
+        owner: None,
+        specialization: None,
+        signature: Signature::new(
+            vec![Param {
+                name: Some(Ident::new("value")),
+                ty: never,
+                mode: ParamMode::Value,
+                escape: ParamEscape::NonEscaping,
+                role: ParamRole::Normal,
+                local_id: arg,
+            }],
+            string,
+        ),
+        locals: vec![local(never, LocalKind::Arg), local(string, LocalKind::Temp)],
+        body: structured_body(
+            vec![Statement::Init {
+                local: raw,
+                value: RValue::RawProject {
+                    value: Operand::Place(place(arg, never)),
+                    target: string,
+                },
+            }],
+            air::AirTail::Return(Some(Operand::Place(place(raw, string)))),
+        ),
+    });
+    program.module_mut(module).functions.push(cast);
+    let zero = int_const(&mut program, int, 0);
+    let entry = program.alloc_function(Function {
         name: Ident::new("main"),
         module,
         kind: FunctionKind::Normal,
         owner: None,
         specialization: None,
-        signature: Signature::new(vec![], string),
-        locals: vec![local(anim, LocalKind::Temp), local(string, LocalKind::Temp)],
-        body: structured_body(
-            vec![
-                Statement::Init {
-                    local: anim_local,
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::EnumVariant {
-                            enum_id,
-                            variant: VariantId::from_index(0),
-                        },
-                        fields: vec![],
-                        ty: anim,
-                    },
-                },
-                Statement::Init {
-                    local: raw_local,
-                    value: RValue::Cast {
-                        value: Operand::Place(place(anim_local, anim)),
-                        target: string,
-                    },
-                },
-            ],
-            air::AirTail::Return(Some(Operand::Place(place(raw_local, string)))),
-        ),
+        signature: Signature::new(vec![], int),
+        locals: vec![],
+        body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(zero)))),
     });
-    program.module_mut(module).functions.push(main);
-    program.set_entry(main);
+    program.module_mut(module).functions.push(entry);
+    program.set_entry(entry);
 
-    let source = plan_source(program);
-    let text = source.as_str();
-    assert!(text.contains("match &v0"));
-    assert!(text.contains("=> anvyx_runtime::AnvString::from(\"idle\")"));
-    let output = run_source(source);
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
+    let source = plan_source(program).into_string();
+    assert!(source.contains("fn anv_f0_raw<'cx, 'rt>(_rt:"));
+    assert!(source.contains("_statics: &AnvStatics<'cx>"));
+    assert!(!source.contains("string0: anvyx_runtime::AnvString"));
+    assert!(source.contains("_ => unreachable!()"));
 }
 
 fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
@@ -23241,7 +23790,6 @@ fn test_type_abi(program: &Program, ty: air::TypeId) -> anvyx_runtime::ExternTyp
         TypeData::Float => ExternTypeExpr::Float,
         TypeData::String => ExternTypeExpr::String,
         TypeData::Char => ExternTypeExpr::Char,
-        TypeData::Any => ExternTypeExpr::Any,
         TypeData::Optional(inner) => {
             ExternTypeExpr::Option(Box::new(test_type_abi(program, *inner)))
         }
@@ -23292,8 +23840,11 @@ fn test_type_abi(program: &Program, ty: air::TypeId) -> anvyx_runtime::ExternTyp
                 args: vec![],
             }
         }
-        TypeData::Aggregate(_) | TypeData::Enum(_) | TypeData::DataRef(_) | TypeData::Dyn(_) => {
-            ExternTypeExpr::Any
-        }
+        TypeData::Any
+        | TypeData::Aggregate(_)
+        | TypeData::Enum(_)
+        | TypeData::Flag(_)
+        | TypeData::DataRef(_)
+        | TypeData::Dyn(_) => ExternTypeExpr::Any,
     }
 }

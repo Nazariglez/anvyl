@@ -1,0 +1,83 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// global
+// 2
+// tracked
+// read
+// both
+// 3
+// 2
+// true
+// true
+// @match-end
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+enum Mode: flag {
+    Fast,
+}
+
+type AccessAlias = Access;
+
+struct Tracked {
+    mask: Access,
+    values: [int],
+}
+
+lazy let GLOBAL_ACCESS: AccessAlias = Access.Write;
+lazy let GLOBAL_BITS: int = Access.Write;
+
+extend<E> enum E {
+    fn category(self) -> int { 1 }
+}
+
+extend<E> enum E: flag {
+    fn category(self) -> int { 2 }
+}
+
+extend Access {
+    fn exact_category(self) -> int { 3 }
+}
+
+fn local_owner<T, N: int>() {
+    enum Local: flag {
+        First,
+        Second,
+        Both = First | Second,
+    }
+    let value: Local = .Both;
+    println(value == Local.Both);
+}
+
+fn main() {
+    if GLOBAL_ACCESS == Access.Write {
+        println("global");
+    }
+    println(GLOBAL_BITS);
+    let tracked = Tracked { mask: Access.Both, values: [1, 2] };
+    if tracked.mask == Access.Both {
+        println("tracked");
+    }
+
+    let values: [AccessAlias] = [Access.Read, Access.Both];
+    println(if values[0] == Access.Read { "read" } else { "bad" });
+
+    var names: [Access: string] = [:];
+    names[Access.Read] = "read";
+    names[Access.Both] = "both";
+    names[Access.Read | Access.Write] = "both";
+    if let name? = names[Access.Both] {
+        println(name);
+    }
+
+    println(Access.Read.exact_category());
+    println(Mode.Fast.category());
+
+    local_owner<int, 1>();
+    local_owner<string, 2>();
+}

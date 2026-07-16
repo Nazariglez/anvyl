@@ -1,0 +1,42 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 3
+// 2
+// true
+// true
+// true
+// -1
+// idle!
+// idleidle
+// true
+// 3
+// state:idle
+// @match-end
+
+enum State: int {
+    Idle,
+    Running = 2,
+}
+
+enum Animation: string {
+    Idle = "idle",
+}
+
+fn main() {
+    println(State.Running + 1);
+    println(State.Running - State.Idle);
+    println(State.Running == 2);
+    println(State.Running == State.Running);
+    println(State.Idle < State.Running);
+    println(~State.Idle);
+    println(Animation.Idle + "!");
+    println(Animation.Idle + Animation.Idle);
+    println(Animation.Idle == "idle");
+    var total = 1;
+    total += State.Running;
+    println(total);
+    var label = "state:";
+    label += Animation.Idle;
+    println(label);
+}

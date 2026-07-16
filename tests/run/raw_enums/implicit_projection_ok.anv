@@ -1,0 +1,75 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 12
+// 10
+// 10
+// 10
+// 10
+// 10
+// 10
+// idle
+// idle
+// @match-end
+
+const FORWARD_RAW: int = ForwardSource.Value;
+
+enum ForwardTarget: int {
+    Value = FORWARD_RAW,
+}
+
+enum ForwardSource: int {
+    Value = 12,
+}
+
+enum State: int {
+    Idle,
+    Dead = 10,
+}
+
+enum Animation: string {
+    Idle = "idle",
+}
+
+const DEAD: int = State.Dead;
+lazy let GLOBAL_DEAD: int = State.Dead;
+
+struct Box<T> {
+    value: State,
+    marker: T,
+}
+
+fn project<T>(box: Box<T>) -> int {
+    box.value
+}
+
+fn raw(state: State) -> int {
+    state
+}
+
+fn print_raw(state: int) {
+    println(state);
+}
+
+fn print_default(animation: string = Animation.Idle) {
+    println(animation);
+}
+
+fn main() {
+    let forward: int = ForwardTarget.Value;
+    println(forward);
+    println(GLOBAL_DEAD);
+
+    let state = State.Dead;
+    print_raw(state);
+    println(raw(state));
+    let states: [int] = [state];
+    println(states[0]);
+    println(DEAD);
+    println(project<int>(Box<int> { value: state, marker: 1 }));
+
+    let animation = Animation.Idle;
+    let raw_animation: string = animation;
+    println(raw_animation);
+    print_default();
+}

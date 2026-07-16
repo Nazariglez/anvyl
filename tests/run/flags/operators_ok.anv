@@ -1,0 +1,45 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// true
+// true
+// true
+// true
+// true
+// true
+// true
+// true
+// true
+// @match-end
+
+enum Access: flag {
+    Read,
+    Write,
+    Execute,
+    Both = Read | Write,
+    All = Both | Execute,
+}
+
+fn nested(value: Access) -> Access {
+    ((value | Access.Write) & Access.All) ^ Access.Execute
+}
+
+fn main() {
+    let both = Access.Read | Access.Write;
+    println(both == Access.Both);
+    println(both != Access.All);
+    println((~Access.Read & Access.All) == (Access.Write | Access.Execute));
+    println(nested(Access.Read) == Access.All);
+    println((Access.Read | 8) == 9);
+    println((8 | Access.Read) == 9);
+    let inferred_binary: Access = .Read | .Write;
+    let inferred_unary: Access = ~.Read;
+    println(inferred_binary == Access.Both);
+    println(inferred_unary == (Access.Write | Access.Execute));
+
+    var current = Access.Read;
+    current |= Access.Write;
+    current ^= Access.Execute;
+    current &= Access.All;
+    println(current == Access.All);
+}

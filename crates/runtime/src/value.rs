@@ -32,12 +32,36 @@ impl AnvString {
         self.text.is_empty()
     }
 
+    pub fn push_str(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    pub fn push(&mut self, ch: char) {
+        self.text.push(ch);
+    }
+
+    pub fn push_float(&mut self, value: f64) {
+        use fmt::Write;
+
+        let start = self.len();
+        write!(self, "{value}").unwrap();
+        if anvyx_semantics::display_float_needs_decimal(value, &self.as_str()[start..]) {
+            self.push_str(".0");
+        }
+    }
+
+    pub fn from_float(value: f64) -> Self {
+        let mut text = Self::default();
+        text.push_float(value);
+        text
+    }
+
     pub fn concat(parts: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        let mut text = EcoString::new();
+        let mut text = Self::default();
         for part in parts {
             text.push_str(part.as_ref());
         }
-        Self { text }
+        text
     }
 }
 
@@ -74,6 +98,18 @@ impl fmt::Debug for AnvString {
 impl fmt::Display for AnvString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Write for AnvString {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.push_str(text);
+        Ok(())
+    }
+
+    fn write_char(&mut self, ch: char) -> fmt::Result {
+        self.push(ch);
+        Ok(())
     }
 }
 
@@ -1057,6 +1093,21 @@ mod tests {
 
     fn map_ty<'cx, K: 'cx, V: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, MapStorage<'cx, K, V>> {
         heap.register_untracked::<MapStorage<'_, K, V>>()
+    }
+
+    #[test]
+    fn string_builder_writes_directly() {
+        use std::fmt::Write;
+
+        let mut text = AnvString::default();
+        text.push_str("score: ");
+        write!(text, "{}", 42).unwrap();
+        text.push('!');
+
+        assert_eq!(text.as_str(), "score: 42!");
+        assert_eq!(AnvString::from_float(4.0).as_str(), "4.0");
+        assert_eq!(AnvString::from_float(4.5).as_str(), "4.5");
+        assert_eq!(AnvString::concat(["a", "b", "c"]).as_str(), "abc");
     }
 
     #[test]

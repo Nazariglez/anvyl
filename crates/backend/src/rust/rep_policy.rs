@@ -701,6 +701,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     .collect()
             }
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -835,6 +836,7 @@ impl<'a> RustRepresentationPlan<'a> {
             }
             let lifecycle = match plan.program.type_arena.data(ty) {
                 TypeData::Int
+                | TypeData::Flag(_)
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::Char
@@ -1123,9 +1125,11 @@ impl<'a> RustRepresentationPlan<'a> {
             }
             (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
                 match self.program.type_arena.data(ty) {
-                    TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::Char => {
-                        RustMaterialization::Copy
-                    }
+                    TypeData::Int
+                    | TypeData::Flag(_)
+                    | TypeData::Float
+                    | TypeData::Bool
+                    | TypeData::Char => RustMaterialization::Copy,
                     TypeData::DataRef(_) => RustMaterialization::CloneHandle,
                     TypeData::Dyn(_) => RustMaterialization::Share,
                     TypeData::Aggregate(_) | TypeData::Tuple(_) => self.materialization(ty),
@@ -1182,6 +1186,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     .flat_map(Self::variant_field_tys),
             ),
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -1254,6 +1259,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     .flat_map(Self::variant_field_tys),
             ),
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -1305,6 +1311,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     .flat_map(Self::variant_field_tys),
             ),
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -1402,6 +1409,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     })
             }
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -1441,6 +1449,7 @@ impl<'a> RustRepresentationPlan<'a> {
         }
         let result = match self.program.type_arena.data(ty) {
             TypeData::Int
+            | TypeData::Flag(_)
             | TypeData::Float
             | TypeData::Bool
             | TypeData::Char
@@ -1635,7 +1644,11 @@ impl<'a> RustRepresentationPlan<'a> {
             return false;
         }
         let supported = match self.program.type_arena.data(ty) {
-            TypeData::Int | TypeData::Bool | TypeData::String | TypeData::Char => true,
+            TypeData::Int
+            | TypeData::Flag(_)
+            | TypeData::Bool
+            | TypeData::String
+            | TypeData::Char => true,
             TypeData::Tuple(elems) => elems
                 .iter()
                 .all(|elem| self.map_key_supported_inner(*elem, active)),
@@ -1680,6 +1693,7 @@ impl<'a> RustRepresentationPlan<'a> {
                     .iter()
                     .all(|elem| self.supports_param_mode(*elem, mode)),
                 TypeData::Int
+                | TypeData::Flag(_)
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::Char
@@ -1709,6 +1723,7 @@ impl<'a> RustRepresentationPlan<'a> {
                 | TypeData::Map { .. }
                 | TypeData::Slice(_) => true,
                 TypeData::Int
+                | TypeData::Flag(_)
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::Char
@@ -1721,6 +1736,7 @@ impl<'a> RustRepresentationPlan<'a> {
                 TypeData::Optional(inner) => self.supports_param_mode(*inner, mode),
                 TypeData::Tuple(_)
                 | TypeData::Int
+                | TypeData::Flag(_)
                 | TypeData::Float
                 | TypeData::Bool
                 | TypeData::Char
@@ -1928,6 +1944,7 @@ impl<'a> StructuralKeyCx<'a> {
     fn const_value(value: &air::ConstValue) -> String {
         match value {
             air::ConstValue::Int(value) => format!("int:{value}"),
+            air::ConstValue::Flag { flag, bits } => format!("flag:{}:{bits}", flag.index()),
             air::ConstValue::Float(value) => format!("float:{:016x}", value.to_bits()),
             air::ConstValue::Bool(value) => format!("bool:{value}"),
             air::ConstValue::String(value) => format!("string:{value:?}"),
@@ -2040,6 +2057,13 @@ impl<'a> StructuralKeyCx<'a> {
                         &decl.type_args,
                         &decl.const_args
                     )
+                )
+            }
+            TypeData::Flag(id) => {
+                let decl = self.plan.program.flag_decl(*id);
+                format!(
+                    "flag:{}",
+                    self.named(decl.module, decl.name.as_str(), &[], &[])
                 )
             }
             TypeData::Extern(id) => {
@@ -2176,7 +2200,9 @@ impl ApproxLayoutCx<'_> {
             return Err(RustLayoutGap::RecursiveInline(ty));
         }
         let layout = (|| match self.plan.program.type_arena.data(ty) {
-            TypeData::Int | TypeData::Float => Ok(RustApproxLayout { size: 8, align: 8 }),
+            TypeData::Int | TypeData::Flag(_) | TypeData::Float => {
+                Ok(RustApproxLayout { size: 8, align: 8 })
+            }
             TypeData::Bool => Ok(RustApproxLayout { size: 1, align: 1 }),
             TypeData::Char => Ok(RustApproxLayout { size: 4, align: 4 }),
             TypeData::Void => Ok(RustApproxLayout { size: 0, align: 1 }),
@@ -2460,9 +2486,12 @@ impl<'a> RirRustRepPolicy<'a> {
 
     pub fn value_rep(self, ty: RirTypeId) -> RustValueRep {
         match self.ty(ty) {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Void => {
-                RustValueRep::InlineCopy
-            }
+            RirType::Int
+            | RirType::Flag(_)
+            | RirType::Float
+            | RirType::Bool
+            | RirType::Char
+            | RirType::Void => RustValueRep::InlineCopy,
             RirType::String => RustValueRep::CowString,
             RirType::Array { .. } => RustValueRep::InlineArray,
             RirType::List(_) => RustValueRep::CowList,
@@ -2587,9 +2616,13 @@ impl<'a> RirRustRepPolicy<'a> {
             }
             (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
                 match self.ty_opt(ty) {
-                    Some(RirType::Int | RirType::Float | RirType::Bool | RirType::Char) => {
-                        RustMaterialization::Copy
-                    }
+                    Some(
+                        RirType::Int
+                        | RirType::Flag(_)
+                        | RirType::Float
+                        | RirType::Bool
+                        | RirType::Char,
+                    ) => RustMaterialization::Copy,
                     Some(RirType::DataRef(_)) => RustMaterialization::CloneHandle,
                     Some(RirType::Enum(id)) if self.program.dyn_carrier_for_enum(id).is_some() => {
                         RustMaterialization::Share
@@ -2658,6 +2691,7 @@ impl<'a> RirRustRepPolicy<'a> {
             }
             Some(
                 RirType::Int
+                | RirType::Flag(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
@@ -2737,6 +2771,7 @@ impl<'a> RirRustRepPolicy<'a> {
             ),
             RirType::Slice(_) => RustMaterialization::BorrowGuard,
             RirType::Int
+            | RirType::Flag(_)
             | RirType::Float
             | RirType::Bool
             | RirType::Char
@@ -2791,6 +2826,7 @@ impl<'a> RirRustRepPolicy<'a> {
                 )
             }
             RirType::Int
+            | RirType::Flag(_)
             | RirType::Float
             | RirType::Bool
             | RirType::Char
@@ -2832,7 +2868,9 @@ impl<'a> RirRustRepPolicy<'a> {
             return false;
         }
         let supported = match self.ty_opt(ty) {
-            Some(RirType::Int | RirType::Bool | RirType::String | RirType::Char) => true,
+            Some(
+                RirType::Int | RirType::Bool | RirType::String | RirType::Char | RirType::Flag(_),
+            ) => true,
             Some(RirType::Struct(id)) => {
                 self.program.structs.get(id.index()).is_some_and(|strukt| {
                     strukt.native_path.is_none()
@@ -2936,12 +2974,16 @@ impl<'a> RirRustRepPolicy<'a> {
         derives
     }
 
+    pub fn flag_derives(self) -> Vec<&'static str> {
+        vec!["Clone", "Copy", "PartialEq", "Eq", "Hash"]
+    }
+
     pub fn enum_derives(self, enm: &RirEnum) -> Vec<&'static str> {
         if self.program.dyn_carrier_for_enum(enm.id).is_some() {
             return vec![];
         }
         let mut derives = vec!["Clone"];
-        if enm.repr == super::rir::RirEnumRepr::RawInt && !enm.variants.is_empty() {
+        if enm.copyable {
             derives.push("Copy");
         }
         let contains_dynamic = enm.variants.iter().any(|variant| {
@@ -3041,6 +3083,7 @@ impl<'a> RirRustRepPolicy<'a> {
             }),
             Some(
                 RirType::Int
+                | RirType::Flag(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
@@ -3081,6 +3124,7 @@ impl<'a> RirRustRepPolicy<'a> {
         let result = match self.ty_opt(ty) {
             Some(
                 RirType::Int
+                | RirType::Flag(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
@@ -3698,6 +3742,10 @@ impl<'a> RirRustRepPolicy<'a> {
                 self.program.enums[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
             ),
+            RirType::Flag(id) => Self::named_ty(
+                self.program.flags[id.index()].symbol.as_str(),
+                self.type_cx_dependent(ty),
+            ),
             RirType::Tuple(id) => Self::named_ty(
                 self.program.tuples[id.index()].symbol.as_str(),
                 self.type_cx_dependent(ty),
@@ -3869,6 +3917,7 @@ impl<'a> RirRustRepPolicy<'a> {
                     })
                 }),
             RirType::Int
+            | RirType::Flag(_)
             | RirType::Float
             | RirType::Bool
             | RirType::Char
@@ -3922,6 +3971,7 @@ impl<'a> RirRustRepPolicy<'a> {
                     })
                 }),
             RirType::Int
+            | RirType::Flag(_)
             | RirType::Float
             | RirType::Bool
             | RirType::Char
@@ -3946,7 +3996,12 @@ impl<'a> RirRustRepPolicy<'a> {
 
     fn copyable_inner(self, ty: RirTypeId, active: &mut BTreeSet<RirLambdaSigId>) -> bool {
         match self.ty(ty) {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Void => true,
+            RirType::Int
+            | RirType::Flag(_)
+            | RirType::Float
+            | RirType::Bool
+            | RirType::Char
+            | RirType::Void => true,
             RirType::String
             | RirType::DataRef(_)
             | RirType::List(_)
@@ -3968,6 +4023,7 @@ impl<'a> RirRustRepPolicy<'a> {
             RirParamSemantic::Value => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
                 RirType::Int
+                | RirType::Flag(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
@@ -3998,13 +4054,17 @@ impl<'a> RirRustRepPolicy<'a> {
                 | RirType::Map { .. }
                 | RirType::Slice(_)
                 | RirType::Lambda(_) => true,
-                RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Void => {
-                    false
-                }
+                RirType::Int
+                | RirType::Flag(_)
+                | RirType::Float
+                | RirType::Bool
+                | RirType::Char
+                | RirType::Void => false,
             },
             RirParamSemantic::MutBorrow => match ty {
                 RirType::Option(inner) => self.supports_param(inner, semantic),
                 RirType::Int
+                | RirType::Flag(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
@@ -4182,6 +4242,7 @@ impl RustTracePlan {
             }
             RirType::Lambda(id) => self.mark_lambda_sig(program, id),
             RirType::Int
+            | RirType::Flag(_)
             | RirType::Float
             | RirType::Bool
             | RirType::String

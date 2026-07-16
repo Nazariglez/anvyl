@@ -286,6 +286,8 @@ impl CompileCx<'_> {
             | RValue::Unary { value: operand, .. }
             | RValue::OptionalSome { value: operand, .. }
             | RValue::Cast { value: operand, .. }
+            | RValue::RawProject { value: operand, .. }
+            | RValue::RawTryConstruct { value: operand, .. }
             | RValue::Stringify { value: operand, .. }
             | RValue::Format { value: operand, .. }
             | RValue::CheckedIterCount { count: operand, .. } => {
@@ -300,7 +302,7 @@ impl CompileCx<'_> {
                     self.check_operand(function, field);
                 }
             }
-            RValue::Call { .. } => {}
+            RValue::Call { .. } | RValue::FlagStatic { .. } => {}
             RValue::Len { source }
             | RValue::ListPop { list: source, .. }
             | RValue::RangeListCopy { source, .. }
@@ -541,6 +543,7 @@ impl CompileCx<'_> {
             | TypeData::Char
             | TypeData::Void
             | TypeData::Any
+            | TypeData::Flag(_)
             | TypeData::Dyn(_) => false,
         }
     }

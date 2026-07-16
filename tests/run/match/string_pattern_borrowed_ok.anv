@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: success
+// @match: true
+
+fn is_go(text: string) -> bool {
+    match text {
+        "go" => true,
+        _ => false,
+    }
+}
+
+fn main() {
+    println(is_go("go"));
+}

@@ -7,16 +7,6 @@ enum State: int {
     Run = 1,
 }
 
-extend State {
-    cast? from(raw: int) {
-        match raw {
-            0 => State.Idle,
-            1 => State.Run,
-            _ => nil,
-        }
-    }
-}
-
 fn main() {
     if let state = 1 as? State {
         println(state as int);

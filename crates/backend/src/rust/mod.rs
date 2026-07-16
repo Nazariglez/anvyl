@@ -52,23 +52,25 @@ use self::{
         RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirDynCarrier, RirDynCarrierId,
         RirDynDispatchArm, RirDynDispatchOrigin, RirDynPayloadAction, RirDynReceiver,
         RirDynStorage, RirDynVariant, RirDynVariantId, RirDynWitnessOrigin, RirEnum, RirEnumId,
-        RirEnumRepr, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId,
-        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
-        RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda, RirLambdaCapture,
-        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
-        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
-        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
-        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
-        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionSubject,
-        RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
-        RirPatternAlternative, RirPatternArm, RirPatternBinding, RirPatternBindingMode,
-        RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace,
-        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
+        RirEnumRepr, RirEnumStringifyVariant, RirExtern, RirExternId, RirExternKind,
+        RirExternParam, RirField, RirFieldId, RirFlag, RirFlagId, RirFlagMember, RirFlagMemberId,
+        RirFlagStaticOp, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
+        RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda,
+        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
+        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
+        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
+        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
+        RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch,
+        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamAbi, RirParamEscape,
+        RirParamSemantic, RirPatternAlternative, RirPatternArm, RirPatternBinding,
+        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
+        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
         RirResolvedCallTarget, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
-        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringifyHelper,
-        RirStringifyHelperId, RirStringifyReq, RirStringifyReqId, RirStringifyReqKind, RirStruct,
-        RirStructId, RirStructuredBlock, RirSymbol, RirTerm, RirTuple, RirTupleId, RirType,
-        RirTypeId, RirVariant, RirVariantId, RirVariantKind, VerifiedRirProgram,
+        RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringLiteral, RirStringLiteralId,
+        RirStringifyHelper, RirStringifyHelperId, RirStringifyHelperKind, RirStringifyReq,
+        RirStringifyReqId, RirStringifyReqKind, RirStruct, RirStructId, RirStructuredBlock,
+        RirSymbol, RirTerm, RirTuple, RirTupleId, RirType, RirTypeId, RirVariant, RirVariantId,
+        RirVariantKind, VerifiedRirProgram,
     },
 };
 
@@ -330,6 +332,8 @@ struct PlanCx<'a> {
     type_map: HashMap<TypeId, RirTypeId>,
     lambda_sig_map: HashMap<TypeId, RirLambdaSigId>,
     const_map: HashMap<ConstId, RirConstId>,
+    string_literal_map: HashMap<String, RirStringLiteralId>,
+    stringify_in_progress: HashSet<RirTypeId>,
     function_map: HashMap<FunctionId, RirFunctionId>,
     global_map: HashMap<GlobalId, RirGlobalId>,
     function_lambda_map: HashMap<FunctionId, RirLambdaId>,
@@ -342,6 +346,7 @@ struct PlanCx<'a> {
     extern_map: HashMap<ExternId, RirExternId>,
     dataref_map: HashMap<air::AggregateId, RirDataRefId>,
     enum_map: HashMap<air::EnumId, RirEnumId>,
+    flag_map: HashMap<air::FlagId, RirFlagId>,
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
     dynamic_layout: Option<rep_policy::RustDynamicLayoutPlan>,
     dynamic_types: Vec<(TypeId, air::ContractSurfaceId, RirEnumId)>,
@@ -551,6 +556,8 @@ impl<'a> PlanCx<'a> {
             type_map: HashMap::new(),
             lambda_sig_map: HashMap::new(),
             const_map: HashMap::new(),
+            string_literal_map: HashMap::new(),
+            stringify_in_progress: HashSet::new(),
             function_map: HashMap::new(),
             global_map: HashMap::new(),
             function_lambda_map: HashMap::new(),
@@ -563,6 +570,7 @@ impl<'a> PlanCx<'a> {
             extern_map: HashMap::new(),
             dataref_map: HashMap::new(),
             enum_map: HashMap::new(),
+            flag_map: HashMap::new(),
             tuple_map: HashMap::new(),
             dynamic_layout: None,
             dynamic_types: vec![],
@@ -613,6 +621,10 @@ impl<'a> PlanCx<'a> {
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
             program.functions.push(self.plan_function(id, &program)?);
+        }
+        let owned = analysis::owned_string_literals(&program);
+        for literal in &mut program.string_literals {
+            literal.needs_owned = owned.contains(&literal.id);
         }
         program.entry = self.air.entry().map(|entry| self.function_map[&entry]);
         Ok(program)
@@ -704,6 +716,10 @@ impl<'a> PlanCx<'a> {
                     let enum_id = self.reserve_enum(program, type_id, *enm);
                     enum_types.push((type_id, *enm, enum_id));
                     RirType::Enum(enum_id)
+                }
+                TypeData::Flag(flag) => {
+                    let flag_id = self.reserve_flag(program, type_id, *flag);
+                    RirType::Flag(flag_id)
                 }
                 TypeData::DataRef(aggregate) => {
                     let dataref_id = self.reserve_dataref(program, type_id, *aggregate)?;
@@ -1195,6 +1211,46 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
+    fn reserve_flag(
+        &mut self,
+        program: &mut RirProgram,
+        type_id: TypeId,
+        flag: air::FlagId,
+    ) -> RirFlagId {
+        let decl = self.air.flag_decl(flag);
+        let id = RirFlagId::from_index(program.flags.len());
+        self.flag_map.insert(flag, id);
+        let mut seen = target::flag_reserved_associated_symbols()
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let members = decl
+            .members
+            .iter()
+            .map(|member| RirFlagMember {
+                id: RirFlagMemberId::from_index(member.id.index()),
+                symbol: scoped_symbol(&member.name.as_str().to_ascii_uppercase(), &mut seen),
+                display: RirSymbol::new(member.name.as_str()),
+                value: member.value,
+                atomic: member.atomic,
+            })
+            .collect();
+        program.flags.push(RirFlag {
+            id,
+            air_id: flag,
+            symbol: RirSymbol::new(format!(
+                "{}T{}_{}",
+                self.config.symbol_prefix,
+                type_id.index(),
+                sanitize(decl.name.as_str())
+            )),
+            display: RirSymbol::new(decl.name.as_str()),
+            known_bits: decl.known_bits,
+            members,
+        });
+        id
+    }
+
     fn reserve_enum(
         &mut self,
         program: &mut RirProgram,
@@ -1226,7 +1282,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn fill_enum(
-        &self,
+        &mut self,
         program: &mut RirProgram,
         type_id: TypeId,
         enm: air::EnumId,
@@ -1261,12 +1317,16 @@ impl<'a> PlanCx<'a> {
                     (RirVariantKind::Struct, fields)
                 }
             };
+            let raw_value = variant
+                .raw_value
+                .as_ref()
+                .map(|value| self.rir_raw_enum_value(program, value));
             variants.push(RirVariant {
                 id: RirVariantId::from_index(variant_index),
                 symbol: scoped_symbol(variant.name.as_str(), &mut seen_variants),
                 display: RirSymbol::new(variant.name.as_str()),
                 kind,
-                raw_value: variant.raw_value.as_ref().map(rir_raw_enum_value),
+                raw_value,
                 fields,
             });
         }
@@ -1663,7 +1723,7 @@ impl<'a> PlanCx<'a> {
         })
     }
 
-    fn plan_stringify_helpers(&self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+    fn plan_stringify_helpers(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
         let mut tys = vec![];
         for function in &self.air.functions {
             function.body.for_each_rvalue(&mut |value| {
@@ -1678,21 +1738,32 @@ impl<'a> PlanCx<'a> {
         Ok(())
     }
 
-    fn require_stringify(&self, program: &mut RirProgram, ty: TypeId) -> Result<(), RustPlanError> {
+    fn require_stringify(
+        &mut self,
+        program: &mut RirProgram,
+        ty: TypeId,
+    ) -> Result<(), RustPlanError> {
         let rir_ty = self.type_map[&ty];
+        if matches!(
+            self.air.type_arena.data(ty),
+            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::String | TypeData::Char
+        ) {
+            return Ok(());
+        }
+        if program.stringify_req(rir_ty).is_some() || !self.stringify_in_progress.insert(rir_ty) {
+            return Ok(());
+        }
         let kind = match self.air.type_arena.data(ty) {
-            TypeData::Int
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::String
-            | TypeData::Char => {
-                return Ok(());
-            }
             TypeData::Aggregate(aggregate) => {
-                if program.stringify_reqs.iter().any(|req| req.ty == rir_ty) {
-                    return Ok(());
-                }
                 self.classify_aggregate_stringify(program, ty, *aggregate)?
+            }
+            TypeData::Enum(enm) => {
+                let helper = self.require_enum_stringify_helper(program, ty, *enm)?;
+                RirStringifyReqKind::Helper(helper)
+            }
+            TypeData::Flag(flag) => {
+                let helper = self.require_flag_stringify_helper(program, ty, *flag);
+                RirStringifyReqKind::Helper(helper)
             }
             _ => {
                 return Err(Self::gap(
@@ -1701,6 +1772,7 @@ impl<'a> PlanCx<'a> {
                 ));
             }
         };
+        self.stringify_in_progress.remove(&rir_ty);
         let id = RirStringifyReqId::from_index(program.stringify_reqs.len());
         program.stringify_reqs.push(RirStringifyReq {
             id,
@@ -1711,7 +1783,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn classify_aggregate_stringify(
-        &self,
+        &mut self,
         program: &mut RirProgram,
         ty: TypeId,
         aggregate: air::AggregateId,
@@ -1743,23 +1815,16 @@ impl<'a> PlanCx<'a> {
             };
         }
         let helper = self.require_structural_helper(program, ty, aggregate)?;
-        Ok(RirStringifyReqKind::Structural(helper))
+        Ok(RirStringifyReqKind::Helper(helper))
     }
 
     fn require_structural_helper(
-        &self,
+        &mut self,
         program: &mut RirProgram,
         ty: TypeId,
         aggregate: air::AggregateId,
     ) -> Result<RirStringifyHelperId, RustPlanError> {
         let rir_ty = self.type_map[&ty];
-        if let Some(helper) = program
-            .stringify_helpers
-            .iter()
-            .find(|helper| helper.ty == rir_ty)
-        {
-            return Ok(helper.id);
-        }
         let decl = self.air.aggregate(aggregate);
         if decl.kind != air::AggregateKind::Struct {
             return Err(Self::gap(
@@ -1767,20 +1832,156 @@ impl<'a> PlanCx<'a> {
                 RustTargetGapKind::UnsupportedStructuralStringify,
             ));
         }
-        for field in &decl.fields {
-            self.require_stringify(program, field.ty)?;
+        let fields = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
+        for field in fields {
+            self.require_stringify(program, field)?;
         }
+        let RirType::Struct(strukt) = program.types[rir_ty.index()] else {
+            return Err(Self::gap(
+                RustTargetGapSite::Type(ty),
+                RustTargetGapKind::UnsupportedStructuralStringify,
+            ));
+        };
+        Ok(self.push_stringify_helper(program, rir_ty, RirStringifyHelperKind::Struct(strukt)))
+    }
+
+    fn require_enum_stringify_helper(
+        &mut self,
+        program: &mut RirProgram,
+        ty: TypeId,
+        enm: air::EnumId,
+    ) -> Result<RirStringifyHelperId, RustPlanError> {
+        let rir_ty = self.type_map[&ty];
+        let rir_enum = self.enum_map[&enm];
+        let fields = self
+            .air
+            .enum_decl(enm)
+            .variants
+            .iter()
+            .flat_map(|variant| match &variant.shape {
+                air::VariantShape::Unit => vec![],
+                air::VariantShape::Tuple(fields) => fields.clone(),
+                air::VariantShape::Struct(fields) => fields.iter().map(|field| field.ty).collect(),
+            })
+            .collect::<Vec<_>>();
+        for field in fields {
+            self.require_stringify(program, field)?;
+        }
+        let display = program.enums[rir_enum.index()].display.as_str().to_string();
+        let specs = program.enums[rir_enum.index()]
+            .variants
+            .iter()
+            .zip(&self.air.enum_decl(enm).variants)
+            .map(|(rir, air)| {
+                let fields = match &air.shape {
+                    air::VariantShape::Struct(fields) => fields
+                        .iter()
+                        .map(|field| format!("{}: ", field.name.as_str()))
+                        .collect(),
+                    air::VariantShape::Unit | air::VariantShape::Tuple(_) => vec![],
+                };
+                (format!("{display}.{}", rir.display.as_str()), fields)
+            })
+            .collect::<Vec<(String, Vec<String>)>>();
+        let mut variants = vec![];
+        for (label, fields) in specs {
+            variants.push(RirEnumStringifyVariant {
+                label: self.intern_string_literal(program, &label),
+                field_labels: fields
+                    .iter()
+                    .map(|field| self.intern_string_literal(program, field))
+                    .collect(),
+            });
+        }
+        Ok(self.push_stringify_helper(
+            program,
+            rir_ty,
+            RirStringifyHelperKind::Enum {
+                enm: rir_enum,
+                variants,
+            },
+        ))
+    }
+
+    fn require_flag_stringify_helper(
+        &mut self,
+        program: &mut RirProgram,
+        ty: TypeId,
+        flag: air::FlagId,
+    ) -> RirStringifyHelperId {
+        let rir_ty = self.type_map[&ty];
+        let rir_flag = self.flag_map[&flag];
+        let display = program.flags[rir_flag.index()].display.as_str().to_string();
+        let empty = self.intern_string_literal(program, &format!("{display}.empty()"));
+        let names = program.flags[rir_flag.index()]
+            .members
+            .iter()
+            .map(|member| format!("{display}.{}", member.display.as_str()))
+            .collect::<Vec<_>>();
+        let members = names
+            .iter()
+            .map(|name| self.intern_string_literal(program, name))
+            .collect();
+        self.push_stringify_helper(
+            program,
+            rir_ty,
+            RirStringifyHelperKind::Flag {
+                flag: rir_flag,
+                empty,
+                members,
+            },
+        )
+    }
+
+    fn push_stringify_helper(
+        &self,
+        program: &mut RirProgram,
+        ty: RirTypeId,
+        kind: RirStringifyHelperKind,
+    ) -> RirStringifyHelperId {
         let id = RirStringifyHelperId::from_index(program.stringify_helpers.len());
         program.stringify_helpers.push(RirStringifyHelper {
             id,
-            ty: rir_ty,
+            ty,
             symbol: RirSymbol::new(format!(
                 "{}stringify_{}",
                 self.config.symbol_prefix,
-                type_suffix(program, rir_ty)
+                type_suffix(program, ty)
             )),
+            kind,
         });
-        Ok(id)
+        id
+    }
+
+    fn intern_string_literal(
+        &mut self,
+        program: &mut RirProgram,
+        text: &str,
+    ) -> RirStringLiteralId {
+        if let Some(id) = self.string_literal_map.get(text) {
+            return *id;
+        }
+        let id = RirStringLiteralId::from_index(program.string_literals.len());
+        program.string_literals.push(RirStringLiteral {
+            id,
+            text: text.to_string(),
+            needs_owned: false,
+        });
+        self.string_literal_map.insert(text.to_string(), id);
+        id
+    }
+
+    fn rir_raw_enum_value(
+        &mut self,
+        program: &mut RirProgram,
+        value: &air::RawEnumValue,
+    ) -> RirRawEnumValue {
+        match value {
+            air::RawEnumValue::Int(value) => RirRawEnumValue::Int(*value),
+            air::RawEnumValue::String(value) => {
+                RirRawEnumValue::String(self.intern_string_literal(program, value))
+            }
+        }
     }
 
     fn plan_consts(&mut self, program: &mut RirProgram) {
@@ -1790,9 +1991,15 @@ impl<'a> PlanCx<'a> {
             let id = RirConstId::from_index(program.consts.len());
             let value = match &konst.value {
                 ConstValue::Int(value) => RirConstValue::Int(*value),
+                ConstValue::Flag { flag, bits } => RirConstValue::Flag {
+                    flag: self.flag_map[flag],
+                    bits: *bits,
+                },
                 ConstValue::Float(value) => RirConstValue::Float(*value),
                 ConstValue::Bool(value) => RirConstValue::Bool(*value),
-                ConstValue::String(value) => RirConstValue::String(value.to_string()),
+                ConstValue::String(value) => {
+                    RirConstValue::String(self.intern_string_literal(program, value))
+                }
                 ConstValue::Char(value) => RirConstValue::Char(*value),
                 ConstValue::Nil => RirConstValue::Nil,
             };
@@ -2659,6 +2866,17 @@ impl<'a> PlanCx<'a> {
 
     fn plan_pattern_test(&self, test: &air::AirPatternTest) -> RirPatternTest {
         match test {
+            air::AirPatternTest::Any { branches } => RirPatternTest::Any {
+                branches: branches
+                    .iter()
+                    .map(|tests| {
+                        tests
+                            .iter()
+                            .map(|test| self.plan_pattern_test(test))
+                            .collect()
+                    })
+                    .collect(),
+            },
             air::AirPatternTest::Literal { path, value } => RirPatternTest::Literal {
                 path: self.plan_pattern_path(path),
                 value: self.const_map[value],
@@ -2668,6 +2886,11 @@ impl<'a> PlanCx<'a> {
             },
             air::AirPatternTest::OptionalSome { path } => RirPatternTest::OptionalSome {
                 path: self.plan_pattern_path(path),
+            },
+            air::AirPatternTest::FlagValue { path, flag, bits } => RirPatternTest::FlagValue {
+                path: self.plan_pattern_path(path),
+                flag: self.flag_map[flag],
+                bits: *bits,
             },
             air::AirPatternTest::EnumVariant {
                 path,
@@ -3894,6 +4117,40 @@ impl<'a> PlanCx<'a> {
                     post_stmts: vec![],
                 }
             }
+            RValue::RawProject { value, target } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::RawProject {
+                        value: value.operand,
+                        target: self.type_map[target],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::RawTryConstruct { value, target, ty } => {
+                let value = self.plan_operand_read(function, value, locals);
+                PlannedRValue {
+                    stmts: value.stmts,
+                    value: RirRValue::RawTryConstruct {
+                        value: value.operand,
+                        target: self.type_map[target],
+                        ty: self.type_map[ty],
+                    },
+                    post_stmts: vec![],
+                }
+            }
+            RValue::FlagStatic { op, ty } => PlannedRValue {
+                stmts: vec![],
+                value: RirRValue::FlagStatic {
+                    op: match op {
+                        air::FlagStaticOp::Empty => RirFlagStaticOp::Empty,
+                        air::FlagStaticOp::All => RirFlagStaticOp::All,
+                    },
+                    ty: self.type_map[ty],
+                },
+                post_stmts: vec![],
+            },
             RValue::OptionalSome { value, ty } => {
                 let value = self.plan_operand_read(function, value, locals);
                 PlannedRValue {
@@ -5440,9 +5697,14 @@ impl<'a> PlanCx<'a> {
                     arg: RirCallArg::SharedBorrow(place),
                 })
             }
-            CallArg::SharedStringConst(id) => Ok(PlannedCallArg::from_arg(
-                RirCallArg::SharedStringConst(self.const_map[id]),
-            )),
+            CallArg::SharedStringConst(id) => {
+                let ConstValue::String(text) = &self.air.const_arena.get(*id).value else {
+                    unreachable!("shared string argument must reference a string constant")
+                };
+                Ok(PlannedCallArg::from_arg(RirCallArg::SharedStringConst(
+                    self.string_literal_map[text.as_ref()],
+                )))
+            }
             CallArg::MutBorrow(place) if expected == RirParamSemantic::MutPlace => {
                 self.plan_source_mut_place_arg(function, place, locals)
             }
@@ -6503,13 +6765,6 @@ fn rir_enum_repr(repr: air::EnumRepr) -> RirEnumRepr {
     }
 }
 
-fn rir_raw_enum_value(value: &air::RawEnumValue) -> RirRawEnumValue {
-    match value {
-        air::RawEnumValue::Int(value) => RirRawEnumValue::Int(*value),
-        air::RawEnumValue::String(value) => RirRawEnumValue::String(value.clone()),
-    }
-}
-
 fn native_path(path: &RustPath) -> Vec<String> {
     let mut out = vec![path.crate_name.clone()];
     out.extend(path.segments.clone());
@@ -6587,6 +6842,7 @@ fn type_suffix(program: &RirProgram, ty: RirTypeId) -> String {
         RirType::DataRef(id) => {
             named_type_suffix(ty.index(), &program.datarefs[id.index()].display)
         }
+        RirType::Flag(id) => named_type_suffix(ty.index(), &program.flags[id.index()].display),
         RirType::Enum(id) => {
             let enm = &program.enums[id.index()];
             if enm.core == Some(RirCoreEnumKind::Option) {
@@ -6615,6 +6871,7 @@ fn const_suffix(value: &ConstValue) -> String {
     match value {
         ConstValue::Int(value) if *value < 0 => format!("n_neg_{}", value.unsigned_abs()),
         ConstValue::Int(value) => format!("n{value}"),
+        ConstValue::Flag { flag, bits } => format!("flag{}_{}", flag.index(), bits),
         ConstValue::Float(value) => format!("f{:016x}", value.to_bits()),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::String(value) => sanitize(value).to_ascii_lowercase(),

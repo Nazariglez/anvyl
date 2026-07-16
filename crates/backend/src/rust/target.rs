@@ -1,4 +1,7 @@
-use super::{rir::RirCtxPlan, syntax};
+use super::{
+    rir::{RirCtxPlan, RirStringLiteralId},
+    syntax,
+};
 
 const RT: &str = "anvyx_runtime";
 
@@ -350,8 +353,8 @@ pub(super) fn result_ty(ret: &str) -> String {
     format!("Result<{ret}, {}>", runtime_error_ty())
 }
 
-pub(super) fn generated_types_symbol(ctx: &RirCtxPlan) -> &str {
-    ctx.types_symbol.as_str()
+pub(super) fn generated_statics_symbol(ctx: &RirCtxPlan) -> &str {
+    ctx.statics_symbol.as_str()
 }
 
 pub(super) fn generated_globals_symbol(ctx: &RirCtxPlan) -> &str {
@@ -362,8 +365,8 @@ pub(super) fn runtime_param_name() -> &'static str {
     "rt"
 }
 
-pub(super) fn types_param_name() -> &'static str {
-    "types"
+pub(super) fn statics_param_name() -> &'static str {
+    "statics"
 }
 
 pub(super) fn globals_param_name() -> &'static str {
@@ -382,8 +385,8 @@ pub(super) fn runtime_param(used: bool) -> &'static str {
     if used { "rt" } else { "_rt" }
 }
 
-pub(super) fn types_param(used: bool) -> &'static str {
-    if used { "types" } else { "_types" }
+pub(super) fn statics_param(used: bool) -> &'static str {
+    if used { "statics" } else { "_statics" }
 }
 
 pub(super) fn globals_param(used: bool) -> &'static str {
@@ -442,7 +445,7 @@ pub(super) fn runtime_ctx_from_raw_with_trace_roots_and_safepoint(
     )
 }
 
-pub(super) fn types_ref_ty(symbol: &str) -> String {
+pub(super) fn statics_ref_ty(symbol: &str) -> String {
     format!("&{symbol}<'cx>")
 }
 
@@ -503,7 +506,7 @@ fn generated_call_args_inner(
 ) -> Vec<String> {
     let mut context = vec![
         runtime_param_name().to_string(),
-        types_param_name().to_string(),
+        statics_param_name().to_string(),
         globals_param_name().to_string(),
     ];
     if retained_callbacks {
@@ -600,6 +603,42 @@ pub(super) fn anv_string_from(expr: &str) -> String {
     format!("{}::from({expr})", anv_string_ty())
 }
 
+pub(super) fn anv_string_builder() -> String {
+    format!("{}::default()", anv_string_ty())
+}
+
+pub(super) fn anv_string_from_float(value: &str) -> String {
+    format!("{}::from_float({value})", anv_string_ty())
+}
+
+pub(super) fn anv_string_push_float(out: &str, value: &str) -> String {
+    format!("{out}.push_float({value})")
+}
+
+pub(super) fn string_literal_field(id: RirStringLiteralId) -> String {
+    format!("string{}", id.index())
+}
+
+pub(super) fn string_literal_field_decl(id: RirStringLiteralId) -> String {
+    format!("{}: {},", string_literal_field(id), anv_string_ty())
+}
+
+pub(super) fn string_literal_init(id: RirStringLiteralId, rust_literal: &str) -> String {
+    format!(
+        "{}: {},",
+        string_literal_field(id),
+        anv_string_from(rust_literal)
+    )
+}
+
+pub(super) fn string_literal_share(statics: &str, id: RirStringLiteralId) -> String {
+    format!("{statics}.{}.share()", string_literal_field(id))
+}
+
+pub(super) fn string_literal_str(statics: &str, id: RirStringLiteralId) -> String {
+    format!("{statics}.{}.as_str()", string_literal_field(id))
+}
+
 pub(super) fn rust_option_map(option: &str, body: &str) -> String {
     format!("({option}).map(|value| {body})")
 }
@@ -642,7 +681,10 @@ pub(super) fn rust_tuple_field(value: &str, index: usize) -> String {
 }
 
 pub(super) fn anv_string_format(fmt: &str, arg: &str) -> String {
-    anv_string_from(&format!("format!({fmt}, {arg})"))
+    format!(
+        "{{ let mut out = {}; std::fmt::Write::write_fmt(&mut out, format_args!({fmt}, {arg})).unwrap(); out }}",
+        anv_string_builder()
+    )
 }
 
 pub(super) fn int_to_float(value: &str) -> String {
@@ -653,12 +695,74 @@ pub(super) fn float_to_int(value: &str) -> String {
     rt_path(&format!("float_to_int({value})"))
 }
 
-pub(super) fn float_const(value: f64) -> String {
-    format!("f64::from_bits(0x{:016x}u64)", value.to_bits())
+pub(super) fn raw_int_project(value: &str, target: &str) -> String {
+    format!("{value} as {target}")
 }
 
-pub(super) fn display_float(value: &str) -> String {
-    rt_path(&format!("display_float({value})"))
+pub(super) fn flag_reserved_associated_symbols() -> &'static [&'static str] {
+    &["KNOWN_BITS"]
+}
+
+pub(super) fn flag_type_decl(symbol: &str) -> String {
+    format!("#[repr(transparent)]\nstruct {symbol}(i64);")
+}
+
+pub(super) fn flag_member_const(symbol: &str, member: &str, bits: i64) -> String {
+    format!("const {member}: {symbol} = {symbol}({bits});")
+}
+
+pub(super) fn flag_known_bits_const(bits: i64) -> String {
+    format!("const KNOWN_BITS: i64 = {bits};")
+}
+
+pub(super) fn flag_bits_method() -> &'static str {
+    "const fn bits(self) -> i64 { self.0 }"
+}
+
+pub(super) fn flag_value(symbol: &str, bits: i64) -> String {
+    format!("{symbol}({bits})")
+}
+
+pub(super) fn flag_bits(value: &str) -> String {
+    format!("{value}.bits()")
+}
+
+pub(super) fn flag_empty(symbol: &str) -> String {
+    format!("{symbol}(0)")
+}
+
+pub(super) fn flag_all(symbol: &str) -> String {
+    format!("{symbol}({symbol}::KNOWN_BITS)")
+}
+
+pub(super) fn flag_pattern_eq(value: &str, bits: i64) -> String {
+    format!("{value}.bits() == {bits}")
+}
+
+pub(super) fn flag_try_construct(symbol: &str, value: &str) -> String {
+    format!(
+        "match {value} {{ bits if bits >= 0 && bits & !{symbol}::KNOWN_BITS == 0 => Some({symbol}(bits)), _ => None }}"
+    )
+}
+
+pub(super) fn flag_complement(symbol: &str, value: &str) -> String {
+    format!("{symbol}({symbol}::KNOWN_BITS ^ {value}.0)")
+}
+
+pub(super) fn flag_bitwise(symbol: &str, lhs: &str, op: &str, rhs: &str) -> String {
+    format!("{symbol}({lhs}.0 {op} {rhs}.0)")
+}
+
+pub(super) fn option_some(value: &str) -> String {
+    format!("Some({value})")
+}
+
+pub(super) fn option_none() -> &'static str {
+    "None"
+}
+
+pub(super) fn float_const(value: f64) -> String {
+    format!("f64::from_bits(0x{:016x}u64)", value.to_bits())
 }
 
 pub(super) fn anv_list_from_elems(rt: &str, storage_ty: &str, elems: &str) -> String {
@@ -950,8 +1054,8 @@ fn rt_heap_try_with_erased_op(
     ))
 }
 
-pub(super) fn heap_type_access(types: &str, heap_type: &str) -> String {
-    format!("{types}.{heap_type}")
+pub(super) fn heap_type_access(statics: &str, heap_type: &str) -> String {
+    format!("{statics}.{heap_type}")
 }
 
 pub(super) fn mut_place_local(slot: &str) -> String {
@@ -1260,15 +1364,15 @@ mod tests {
             "anvyx_runtime::AnvString::from(out)"
         );
         assert_eq!(
-            anv_map_from_entries("rt", "types.map_storage1", "(k, v)"),
-            "anvyx_runtime::AnvMap::from_entries(rt, types.map_storage1, [(k, v)])"
+            anv_map_from_entries("rt", "statics.map_storage1", "(k, v)"),
+            "anvyx_runtime::AnvMap::from_entries(rt, statics.map_storage1, [(k, v)])"
         );
         assert_eq!(trace_root_set_ty(), "anvyx_runtime::TraceRootSet");
         assert_eq!(safepoint_state_ty(), "anvyx_runtime::SafepointState");
         assert_eq!(visitor_ty("D"), "anvyx_runtime::Visitor<'cx, '_, D>");
         assert_eq!(
             generated_call("f", ["x".to_string()]),
-            "f(rt, types, globals, x)"
+            "f(rt, statics, globals, x)"
         );
         assert_eq!(
             global_set_or_replace_collection("globals.xs", "next"),
@@ -1336,7 +1440,7 @@ mod tests {
             runtime_validate_reentry("rt"),
             "rt.__anvyx_validate_reentry()?"
         );
-        assert_eq!(heap_type_access("types", "node"), "types.node");
+        assert_eq!(heap_type_access("statics", "node"), "statics.node");
         assert_eq!(
             mut_place_local("slot"),
             "anvyx_runtime::MutPlace::local(&mut slot)"
@@ -1355,8 +1459,8 @@ mod tests {
             "anvyx_runtime::MutPlace::heap_cell(cell.clone())"
         );
         assert_eq!(
-            mut_place_global("globals.g", "ginit(rt, types, globals)"),
-            "anvyx_runtime::MutPlace::global(&globals.g, &|rt| ginit(rt, types, globals))"
+            mut_place_global("globals.g", "ginit(rt, statics, globals)"),
+            "anvyx_runtime::MutPlace::global(&globals.g, &|rt| ginit(rt, statics, globals))"
         );
         assert_eq!(
             mut_place_scoped_cell("&cell"),

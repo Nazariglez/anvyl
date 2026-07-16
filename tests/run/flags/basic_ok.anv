@@ -1,0 +1,33 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 7
+// @match-end
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+extend<E> enum E: flag {
+    fn marker(self) -> int { 7 }
+}
+
+struct Holder {
+    access: Access,
+}
+
+fn generic<T>(value: T) -> Access { Access.Read }
+
+fn choose() -> Access { Access.Both }
+
+fn main() {
+    let inferred: Access = .Read;
+    let holder = Holder { access: inferred };
+    let returned = choose();
+    let specialized = generic<int>(1);
+    println(returned.marker());
+    println(specialized.marker());
+}

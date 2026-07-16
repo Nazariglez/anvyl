@@ -310,7 +310,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
                     w.line(format_args!(
                         "let lambda = {};",
                         target::map_heap_access_error(&format!(
-                            "inner.heap.try_with_erased(handle, inner.types.{}, |record| record.lambda.clone())",
+                            "inner.heap.try_with_erased(handle, inner.statics.{}, |record| record.lambda.clone())",
                             plan.heap_type_field()
                         ))
                     ));
@@ -358,18 +358,18 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
     }
 
     fn emit_runtime_context(w: &mut RustWriter, trace_globals: bool) {
-        w.line("let (heap, types, globals, safepoint, callbacks) = {");
+        w.line("let (heap, statics, globals, safepoint, callbacks) = {");
         w.indented(|w| {
             w.line("let inner = unsafe { inner_ptr.as_mut() };");
             w.line("let heap = std::ptr::NonNull::from(&mut inner.heap);");
-            w.line("let types = std::ptr::NonNull::from(&inner.types);");
+            w.line("let statics = std::ptr::NonNull::from(&inner.statics);");
             w.line("let globals = std::ptr::NonNull::from(&inner.globals);");
             w.line("let safepoint = std::ptr::NonNull::from(&inner.safepoint);");
             w.line("let callbacks = std::ptr::NonNull::from(&mut inner.callbacks);");
-            w.line("(heap, types, globals, safepoint, callbacks)");
+            w.line("(heap, statics, globals, safepoint, callbacks)");
         });
         w.line("};");
-        w.line("let types = unsafe { types.as_ref() };");
+        w.line("let statics = unsafe { statics.as_ref() };");
         w.line("let globals = unsafe { globals.as_ref() };");
         w.line("let safepoint = unsafe { safepoint.as_ref() };");
         w.line(format_args!(
@@ -406,7 +406,7 @@ impl<'a, 'w> RetainedCallbackEmitter<'a, 'w> {
         let sig = plan.sig(self.program);
         [
             "&mut rt".to_string(),
-            "types".to_string(),
+            "statics".to_string(),
             "globals".to_string(),
             "owner".to_string(),
             "callbacks".to_string(),

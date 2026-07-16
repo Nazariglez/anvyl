@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+import pkg:host.host { echo_bits };
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = Read | Write,
+}
+
+fn main() {
+    let access = Access.Both;
+    println(echo_bits(access));
+}

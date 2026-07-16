@@ -49,10 +49,9 @@ impl<'a> RustValues<'a> {
             RirCallArg::MovedValue { value: operand, .. } => self.operand(operand),
             RirCallArg::InitFieldOmitted => target::init_field_omitted(),
             RirCallArg::SharedBorrow(place) => self.borrow_arg(place),
-            RirCallArg::SharedStringConst(id) => match &self.program.consts[id.index()].value {
-                RirConstValue::String(value) => rust_string(value),
-                _ => unreachable!("verified shared string const"),
-            },
+            RirCallArg::SharedStringConst(id) => {
+                rust_string(&self.program.string_literal(*id).text)
+            }
             RirCallArg::MutBorrow(place) => self.mut_borrow_arg(place),
             RirCallArg::MutPlace(arg) => self.mut_place_arg(arg),
             RirCallArg::DynBorrow(_) => {
@@ -462,7 +461,7 @@ impl<'a> RustValues<'a> {
                     _ => self.place(place),
                 }
             }
-            RirOperand::Const(id) => Self::const_value(&self.program.consts[id.index()]),
+            RirOperand::Const(id) => self.const_value(&self.program.consts[id.index()]),
         }
     }
 
@@ -1114,7 +1113,7 @@ impl<'a> RustValues<'a> {
                 format!("(*({expr})).clone()")
             }
             RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
-                format!("match *({expr}) {{}}")
+                "unreachable!()".to_string()
             }
             RirType::Enum(_) => self.copy_enum_ref_expr(expr, ty),
             _ => unreachable!("verified shareable value"),
@@ -1173,8 +1172,10 @@ impl<'a> RustValues<'a> {
             RirOperand::Const(id) => {
                 let konst = &self.program.consts[id.index()];
                 match &konst.value {
-                    RirConstValue::String(value) => rust_string(value),
-                    _ => format!("{}.as_str()", Self::const_value(konst)),
+                    RirConstValue::String(id) => {
+                        rust_string(&self.program.string_literal(*id).text)
+                    }
+                    _ => format!("{}.as_str()", self.const_value(konst)),
                 }
             }
             RirOperand::Place(place) => self.borrow_arg(place),
@@ -1189,12 +1190,17 @@ impl<'a> RustValues<'a> {
         }
     }
 
-    pub(super) fn const_value(konst: &RirConst) -> String {
+    pub(super) fn const_value(&self, konst: &RirConst) -> String {
         match &konst.value {
             RirConstValue::Int(value) => value.to_string(),
+            RirConstValue::Flag { flag, bits } => {
+                target::flag_value(self.program.flags[flag.index()].symbol.as_str(), *bits)
+            }
             RirConstValue::Float(value) => target::float_const(*value),
             RirConstValue::Bool(value) => value.to_string(),
-            RirConstValue::String(value) => target::anv_string_from(&rust_string(value)),
+            RirConstValue::String(id) => {
+                target::string_literal_share(target::statics_param_name(), *id)
+            }
             RirConstValue::Char(value) => rust_char(*value),
             RirConstValue::Nil => "None".into(),
         }
@@ -1251,6 +1257,9 @@ impl<'a> RustValues<'a> {
             unreachable!("verified enum copy expression")
         };
         let enm = &self.program.enums[enum_id.index()];
+        if enm.variants.is_empty() {
+            return "unreachable!()".to_string();
+        }
         let arms = enm
             .variants
             .iter()
@@ -1297,7 +1306,9 @@ impl<'a> RustValues<'a> {
 
     fn copy_from_ref(&self, ty: RirTypeId, expr: &str) -> String {
         match self.program.types[ty.index()] {
-            RirType::Int | RirType::Float | RirType::Bool | RirType::Char => format!("*({expr})"),
+            RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Flag(_) => {
+                format!("*({expr})")
+            }
             RirType::Lambda(sig) if self.policy.lambda_sig_copyable(sig) => format!("*({expr})"),
             RirType::Lambda(_) => unreachable!("verified copyable lambda value"),
             RirType::Struct(id) => {
@@ -1319,7 +1330,7 @@ impl<'a> RustValues<'a> {
                 self.copy_record_from_ref(tuple.symbol.as_str(), &tuple.fields, expr)
             }
             RirType::Enum(id) if self.program.enums[id.index()].variants.is_empty() => {
-                format!("match *({expr}) {{}}")
+                "unreachable!()".to_string()
             }
             RirType::Enum(_) => self.copy_enum_ref_expr(expr, ty),
             RirType::Option(inner) => format!(

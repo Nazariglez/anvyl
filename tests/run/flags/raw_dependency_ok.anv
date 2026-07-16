@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match: 3
+
+enum Access: flag {
+    Read,
+    Write,
+    Both = State.Read | Write,
+}
+
+enum State: flag {
+    Read = Raw.Read,
+    Write = Raw.Write,
+}
+
+enum Raw: int {
+    Read = 1,
+    Write = 2,
+}
+
+fn main() {
+    println(Access.Both as int);
+}

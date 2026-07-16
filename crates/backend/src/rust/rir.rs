@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt};
 
 use anvyx_frontend::{
     air::{self, FunctionId, TypePassClasses},
@@ -41,11 +41,14 @@ rir_id!(RirExternId);
 rir_id!(RirGlobalId);
 rir_id!(RirTypeId);
 rir_id!(RirConstId);
+rir_id!(RirStringLiteralId);
 rir_id!(RirLocalId);
 rir_id!(RirLoopId);
 rir_id!(RirStructId);
 rir_id!(RirDataRefId);
 rir_id!(RirEnumId);
+rir_id!(RirFlagId);
+rir_id!(RirFlagMemberId);
 rir_id!(RirTupleId);
 rir_id!(RirVariantId);
 rir_id!(RirFieldId);
@@ -83,6 +86,7 @@ pub struct RirProgram {
     pub structs: Vec<RirStruct>,
     pub datarefs: Vec<RirDataRef>,
     pub enums: Vec<RirEnum>,
+    pub flags: Vec<RirFlag>,
     pub tuples: Vec<RirTuple>,
     pub lambda_sigs: Vec<RirLambdaSig>,
     pub lambdas: Vec<RirLambda>,
@@ -96,6 +100,7 @@ pub struct RirProgram {
     pub dyn_carriers: Vec<RirDynCarrier>,
     pub dyn_weakenings: Vec<RirDynWeakening>,
     pub consts: Vec<RirConst>,
+    pub string_literals: Vec<RirStringLiteral>,
     pub entry: Option<RirFunctionId>,
 }
 
@@ -230,6 +235,14 @@ pub struct RirDynWeakening {
 }
 
 impl RirProgram {
+    pub fn string_literal(&self, id: RirStringLiteralId) -> &RirStringLiteral {
+        &self.string_literals[id.index()]
+    }
+
+    pub fn stringify_req(&self, ty: RirTypeId) -> Option<&RirStringifyReq> {
+        self.stringify_reqs.iter().find(|req| req.ty == ty)
+    }
+
     pub fn dyn_borrow_symbol(&self, carrier: RirDynCarrierId) -> String {
         let carrier = &self.dyn_carriers[carrier.index()];
         let RirType::Enum(id) = self.types[carrier.storage_ty.index()] else {
@@ -403,6 +416,25 @@ impl RirEnum {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirFlag {
+    pub id: RirFlagId,
+    pub air_id: air::FlagId,
+    pub symbol: RirSymbol,
+    pub display: RirSymbol,
+    pub known_bits: i64,
+    pub members: Vec<RirFlagMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirFlagMember {
+    pub id: RirFlagMemberId,
+    pub symbol: RirSymbol,
+    pub display: RirSymbol,
+    pub value: i64,
+    pub atomic: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RirEnumRepr {
     Adt,
@@ -413,7 +445,7 @@ pub enum RirEnumRepr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RirRawEnumValue {
     Int(i64),
-    String(String),
+    String(RirStringLiteralId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,7 +666,7 @@ pub struct RirStringifyReq {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RirStringifyReqKind {
-    Structural(RirStringifyHelperId),
+    Helper(RirStringifyHelperId),
     Override {
         function: RirFunctionId,
         mode: RirParamSemantic,
@@ -646,18 +678,39 @@ pub struct RirStringifyHelper {
     pub id: RirStringifyHelperId,
     pub ty: RirTypeId,
     pub symbol: RirSymbol,
+    pub kind: RirStringifyHelperKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RirStringifyHelperKind {
+    Struct(RirStructId),
+    Enum {
+        enm: RirEnumId,
+        variants: Vec<RirEnumStringifyVariant>,
+    },
+    Flag {
+        flag: RirFlagId,
+        empty: RirStringLiteralId,
+        members: Vec<RirStringLiteralId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirEnumStringifyVariant {
+    pub label: RirStringLiteralId,
+    pub field_labels: Vec<RirStringLiteralId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RirCtxPlan {
-    pub types_symbol: RirSymbol,
+    pub statics_symbol: RirSymbol,
     pub globals_symbol: RirSymbol,
 }
 
 impl Default for RirCtxPlan {
     fn default() -> Self {
         Self {
-            types_symbol: RirSymbol::new("AnvTypes"),
+            statics_symbol: RirSymbol::new("AnvStatics"),
             globals_symbol: RirSymbol::new("AnvGlobals"),
         }
     }
@@ -1237,6 +1290,9 @@ pub enum RirPatternPathStep {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RirPatternTest {
+    Any {
+        branches: Vec<Vec<RirPatternTest>>,
+    },
     Literal {
         path: RirPatternPath,
         value: RirConstId,
@@ -1251,6 +1307,11 @@ pub enum RirPatternTest {
         path: RirPatternPath,
         enum_id: RirEnumId,
         variant: RirVariantId,
+    },
+    FlagValue {
+        path: RirPatternPath,
+        flag: RirFlagId,
+        bits: i64,
     },
 }
 
@@ -1359,6 +1420,12 @@ fn collection<'a>(
     use_: RirPlaceUse,
 ) {
     f(RirChild::Collection { collection, use_ });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RirFlagStaticOp {
+    Empty,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1484,6 +1551,19 @@ pub enum RirRValue {
     Cast {
         value: RirOperand,
         target: RirTypeId,
+    },
+    RawProject {
+        value: RirOperand,
+        target: RirTypeId,
+    },
+    RawTryConstruct {
+        value: RirOperand,
+        target: RirTypeId,
+        ty: RirTypeId,
+    },
+    FlagStatic {
+        op: RirFlagStaticOp,
+        ty: RirTypeId,
     },
     OptionalSome {
         value: RirOperand,
@@ -1660,7 +1740,9 @@ impl RirRValue {
                     }
                 }
             }
-            Self::CellGetCopy { .. } | Self::ScopedPlaceCellGet { .. } => {}
+            Self::CellGetCopy { .. }
+            | Self::ScopedPlaceCellGet { .. }
+            | Self::FlagStatic { .. } => {}
             Self::MutPlaceGetCopy { place, .. } => f(RirChild::MutPlace {
                 place,
                 use_: RirPlaceUse::Read,
@@ -1673,6 +1755,8 @@ impl RirRValue {
             }
             Self::Unary { value, .. }
             | Self::Cast { value, .. }
+            | Self::RawProject { value, .. }
+            | Self::RawTryConstruct { value, .. }
             | Self::Stringify { value, .. }
             | Self::Format { value, .. } => operand(f, value, RirValueUse::Read),
             Self::OptionalSome { value, .. } => operand(f, value, RirValueUse::Store),
@@ -1864,7 +1948,7 @@ pub enum RirCallArg {
     InitFieldProvided(RirOperand),
     InitFieldOmitted,
     SharedBorrow(RirPlace),
-    SharedStringConst(RirConstId),
+    SharedStringConst(RirStringLiteralId),
     MutBorrow(RirPlace),
     MutPlace(RirMutPlaceArg),
     DynBorrow(RirDynBorrow),
@@ -2226,6 +2310,7 @@ pub enum RirType {
     Struct(RirStructId),
     DataRef(RirDataRefId),
     Enum(RirEnumId),
+    Flag(RirFlagId),
     Tuple(RirTupleId),
     Array { elem: RirTypeId, len: u64 },
     List(RirTypeId),
@@ -2248,12 +2333,20 @@ pub struct RirConst {
     pub value: RirConstValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RirStringLiteral {
+    pub id: RirStringLiteralId,
+    pub text: String,
+    pub needs_owned: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RirConstValue {
     Int(i64),
+    Flag { flag: RirFlagId, bits: i64 },
     Float(f64),
     Bool(bool),
-    String(String),
+    String(RirStringLiteralId),
     Char(char),
     Nil,
 }
@@ -2408,6 +2501,32 @@ pub fn verify_with_air<'a>(
             errors.push(invalid());
         }
     }
+    for enm in &program.enums {
+        if let Some(air_id) = enm.air_id
+            && !air_enum_metadata_matches(air, program, air_id, enm)
+        {
+            errors.push(RirVerifyError {
+                site: RirVerifySite::Program,
+                kind: RirVerifyErrorKind::InvalidAirMetadata,
+            });
+        }
+    }
+    for flag in &program.flags {
+        if !air_flag_metadata_matches(air, flag) {
+            errors.push(RirVerifyError {
+                site: RirVerifySite::Program,
+                kind: RirVerifyErrorKind::InvalidAirMetadata,
+            });
+        }
+    }
+    for helper in &program.stringify_helpers {
+        if !air_stringify_metadata_matches(air, program, helper) {
+            errors.push(RirVerifyError {
+                site: RirVerifySite::Program,
+                kind: RirVerifyErrorKind::InvalidAirMetadata,
+            });
+        }
+    }
     for carrier in &program.dyn_carriers {
         let storage_matches = air.type_arena.iter().enumerate().any(|(index, ty)| {
             matches!(ty, air::TypeData::Dyn(surface) if *surface == carrier.air_surface)
@@ -2495,6 +2614,145 @@ pub fn verify_with_air<'a>(
     }
 }
 
+fn air_enum_metadata_matches(
+    air: &air::Program,
+    rir: &RirProgram,
+    air_id: air::EnumId,
+    enm: &RirEnum,
+) -> bool {
+    let Some(source) = air.enums.get(air_id.index()) else {
+        return false;
+    };
+    let repr_matches = matches!(
+        (source.repr, enm.repr),
+        (air::EnumRepr::Adt, RirEnumRepr::Adt)
+            | (air::EnumRepr::RawInt, RirEnumRepr::RawInt)
+            | (air::EnumRepr::RawString, RirEnumRepr::RawString)
+    );
+    repr_matches
+        && source.name.as_str() == enm.display.as_str()
+        && source.variants.len() == enm.variants.len()
+        && source
+            .variants
+            .iter()
+            .zip(&enm.variants)
+            .all(|(source, target)| {
+                source.name.as_str() == target.display.as_str()
+                    && match (&source.raw_value, &target.raw_value) {
+                        (None, None) => true,
+                        (Some(air::RawEnumValue::Int(a)), Some(RirRawEnumValue::Int(b))) => a == b,
+                        (Some(air::RawEnumValue::String(a)), Some(RirRawEnumValue::String(b))) => {
+                            rir.string_literals
+                                .get(b.index())
+                                .is_some_and(|literal| literal.text == *a)
+                        }
+                        _ => false,
+                    }
+            })
+}
+
+fn air_flag_metadata_matches(air: &air::Program, flag: &RirFlag) -> bool {
+    let Some(source) = air.flags.get(flag.air_id.index()) else {
+        return false;
+    };
+    source.name.as_str() == flag.display.as_str()
+        && source.known_bits == flag.known_bits
+        && source.members.len() == flag.members.len()
+        && source
+            .members
+            .iter()
+            .zip(&flag.members)
+            .all(|(source, target)| {
+                source.id.index() == target.id.index()
+                    && source.name.as_str() == target.display.as_str()
+                    && source.value == target.value
+                    && source.atomic == target.atomic
+            })
+}
+
+fn air_stringify_metadata_matches(
+    air: &air::Program,
+    rir: &RirProgram,
+    helper: &RirStringifyHelper,
+) -> bool {
+    match &helper.kind {
+        RirStringifyHelperKind::Struct(strukt) => {
+            let Some(target) = rir.structs.get(strukt.index()) else {
+                return false;
+            };
+            let Some(air_id) = target.air_id else {
+                return false;
+            };
+            let Some(source) = air.aggregates.get(air_id.index()) else {
+                return false;
+            };
+            source.kind == air::AggregateKind::Struct
+                && source.name.as_str() == target.display.as_str()
+                && source.fields.len() == target.fields.len()
+        }
+        RirStringifyHelperKind::Enum { enm, variants } => {
+            let Some(target) = rir.enums.get(enm.index()) else {
+                return false;
+            };
+            let Some(air_id) = target.air_id else {
+                return false;
+            };
+            let Some(source) = air.enums.get(air_id.index()) else {
+                return false;
+            };
+            variants.len() == source.variants.len()
+                && variants
+                    .iter()
+                    .zip(&source.variants)
+                    .all(|(plan, variant)| {
+                        let label = format!("{}.{}", source.name.as_str(), variant.name.as_str());
+                        rir.string_literals
+                            .get(plan.label.index())
+                            .is_some_and(|literal| literal.text == label)
+                            && match &variant.shape {
+                                air::VariantShape::Struct(fields) => {
+                                    plan.field_labels.len() == fields.len()
+                                        && plan.field_labels.iter().zip(fields).all(
+                                            |(id, field)| {
+                                                rir.string_literals.get(id.index()).is_some_and(
+                                                    |literal| {
+                                                        literal.text
+                                                            == format!("{}: ", field.name.as_str())
+                                                    },
+                                                )
+                                            },
+                                        )
+                                }
+                                air::VariantShape::Unit | air::VariantShape::Tuple(_) => {
+                                    plan.field_labels.is_empty()
+                                }
+                            }
+                    })
+        }
+        RirStringifyHelperKind::Flag {
+            flag,
+            empty,
+            members,
+        } => {
+            let Some(target) = rir.flags.get(flag.index()) else {
+                return false;
+            };
+            let Some(source) = air.flags.get(target.air_id.index()) else {
+                return false;
+            };
+            rir.string_literals
+                .get(empty.index())
+                .is_some_and(|literal| literal.text == format!("{}.empty()", source.name.as_str()))
+                && members.len() == source.members.len()
+                && members.iter().zip(&source.members).all(|(id, member)| {
+                    rir.string_literals.get(id.index()).is_some_and(|literal| {
+                        literal.text == format!("{}.{}", source.name.as_str(), member.name.as_str())
+                    })
+                })
+        }
+    }
+}
+
 fn air_rir_type_matches(
     air_program: &air::Program,
     rir: &RirProgram,
@@ -2554,6 +2812,10 @@ fn air_rir_type_matches(
                 .enums
                 .get(rir_id.index())
                 .is_some_and(|decl| decl.air_id == Some(*air_id)),
+            (air::TypeData::Flag(air_id), Some(RirType::Flag(rir_id))) => rir
+                .flags
+                .get(rir_id.index())
+                .is_some_and(|decl| decl.air_id == *air_id),
             (air::TypeData::Tuple(air_fields), Some(RirType::Tuple(rir_id))) => {
                 rir.tuples.get(rir_id.index()).is_some_and(|decl| {
                     decl.fields.len() == air_fields.len()
@@ -3145,6 +3407,7 @@ pub enum RirVerifySite {
     Global(RirGlobalId),
     Type(RirTypeId),
     Const(RirConstId),
+    StringLiteral(RirStringLiteralId),
     Extern(RirExternId),
     Function(RirFunctionId),
     Cell(RirCellId),
@@ -3505,6 +3768,10 @@ pub enum RirVerifyErrorKind {
     ConstTypeMismatch,
     VoidConst,
     DuplicateSymbol,
+    DuplicateStringLiteral,
+    StringLiteralOwnershipMismatch,
+    DuplicateStringifyReq,
+    InvalidStringifyHelperReferenceCount,
     ReturnValueRequired,
     UnexpectedReturnValue,
     ImmutableAssign,
@@ -3517,7 +3784,12 @@ pub enum RirVerifyErrorKind {
     InitCellTwice(RirCellId),
     UnsupportedAbi,
     UnsupportedRValueType,
+    InvalidNumericCast,
+    InvalidRawProject,
+    InvalidRawTryConstruct,
+    InvalidFlagStatic,
     InvalidDynOrigin,
+    InvalidAirMetadata,
     InvalidDynCarrier,
     InvalidDynVariant,
     InvalidDynStorage,
@@ -3545,6 +3817,13 @@ pub enum RirVerifyErrorKind {
     RawEnumWrongValue,
     RawEnumPayload,
     RawEnumDuplicateValue,
+    FlagInvalidKnownBits,
+    FlagInvalidValue,
+    FlagUnknownBits,
+    FlagPatternTypeMismatch,
+    FlagPatternUnknownBits,
+    FlagAtomicMismatch,
+    FlagDuplicateValue,
     NonCopyValueRequired,
     FieldCount {
         expected: usize,
@@ -4076,7 +4355,7 @@ impl VerifyCx<'_> {
         if let Some(entry) = self.program.entry {
             self.check_function_id(RirVerifySite::Program, entry);
         }
-        if self.program.ctx.types_symbol.as_str().is_empty()
+        if self.program.ctx.statics_symbol.as_str().is_empty()
             || self.program.ctx.globals_symbol.as_str().is_empty()
         {
             self.push(RirVerifySite::Context, RirVerifyErrorKind::BadId);
@@ -4088,6 +4367,7 @@ impl VerifyCx<'_> {
                 RirType::Struct(id) => self.check_struct_id(site, *id),
                 RirType::DataRef(id) => self.check_dataref_id(site, *id),
                 RirType::Enum(id) => self.check_enum_id(site, *id),
+                RirType::Flag(id) => self.check_flag_id(site, *id),
                 RirType::Tuple(id) => self.check_tuple_id(site, *id),
                 RirType::Array { elem, .. } => {
                     self.check_type_id(site, *elem);
@@ -4147,8 +4427,29 @@ impl VerifyCx<'_> {
         self.check_structs();
         self.check_datarefs();
         self.check_enums();
+        self.check_flags();
         self.check_tuples();
         self.check_stringify_helpers();
+        let mut string_texts = HashSet::new();
+        let owned_string_literals = super::analysis::owned_string_literals(self.program);
+        for (index, literal) in self.program.string_literals.iter().enumerate() {
+            let id = RirStringLiteralId::from_index(index);
+            if literal.id != id {
+                self.push(RirVerifySite::StringLiteral(id), RirVerifyErrorKind::BadId);
+            }
+            if !string_texts.insert(literal.text.as_str()) {
+                self.push(
+                    RirVerifySite::StringLiteral(id),
+                    RirVerifyErrorKind::DuplicateStringLiteral,
+                );
+            }
+            if literal.needs_owned != owned_string_literals.contains(&id) {
+                self.push(
+                    RirVerifySite::StringLiteral(id),
+                    RirVerifyErrorKind::StringLiteralOwnershipMismatch,
+                );
+            }
+        }
         for (index, konst) in self.program.consts.iter().enumerate() {
             let id = RirConstId::from_index(index);
             if konst.id != id {
@@ -4308,7 +4609,7 @@ impl VerifyCx<'_> {
     }
 
     fn check_globals(&mut self) {
-        let mut slots = std::collections::HashSet::new();
+        let mut slots = HashSet::new();
         for (index, global) in self.program.globals.iter().enumerate() {
             let id = RirGlobalId::from_index(index);
             let site = RirVerifySite::Global(id);
@@ -4690,7 +4991,7 @@ impl VerifyCx<'_> {
     }
 
     fn check_collection_storages(&mut self) {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for (index, storage) in self.program.collection_storages.iter().enumerate() {
             if storage.id != RirCollectionStorageId::from_index(index) {
                 self.push(RirVerifySite::Program, RirVerifyErrorKind::BadId);
@@ -5161,6 +5462,65 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn check_flags(&mut self) {
+        let mut symbols = Vec::new();
+        for (index, flag) in self.program.flags.iter().enumerate() {
+            let id = RirFlagId::from_index(index);
+            let site = self
+                .type_id(RirType::Flag(id))
+                .map_or(RirVerifySite::Program, RirVerifySite::Type);
+            if flag.id != id {
+                self.push(site, RirVerifyErrorKind::BadId);
+            }
+            if flag.symbol.as_str().is_empty()
+                || symbols.iter().any(|symbol| symbol == &flag.symbol)
+                || flag.display.as_str().is_empty()
+            {
+                self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+            }
+            symbols.push(flag.symbol.clone());
+            if flag.known_bits < 0 {
+                self.push(site, RirVerifyErrorKind::FlagInvalidKnownBits);
+            }
+
+            let mut member_symbols = Vec::new();
+            let mut values = HashSet::new();
+            let mut known_bits = 0;
+            for (member_index, member) in flag.members.iter().enumerate() {
+                if member.id != RirFlagMemberId::from_index(member_index) {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                }
+                if member.symbol.as_str().is_empty()
+                    || member.display.as_str().is_empty()
+                    || member_symbols.iter().any(|symbol| symbol == &member.symbol)
+                {
+                    self.push(site, RirVerifyErrorKind::DuplicateSymbol);
+                }
+                member_symbols.push(member.symbol.clone());
+                if member.value < 0 {
+                    self.push(site, RirVerifyErrorKind::FlagInvalidValue);
+                    continue;
+                }
+                let atomic = member.value > 0 && member.value & (member.value - 1) == 0;
+                if member.atomic != atomic {
+                    self.push(site, RirVerifyErrorKind::FlagAtomicMismatch);
+                }
+                if !atomic && member.value & !known_bits != 0 {
+                    self.push(site, RirVerifyErrorKind::FlagUnknownBits);
+                }
+                if !values.insert(member.value) {
+                    self.push(site, RirVerifyErrorKind::FlagDuplicateValue);
+                }
+                if atomic {
+                    known_bits |= member.value;
+                }
+            }
+            if known_bits != flag.known_bits {
+                self.push(site, RirVerifyErrorKind::FlagInvalidKnownBits);
+            }
+        }
+    }
+
     fn check_tuples(&mut self) {
         let mut symbols = Vec::new();
         for (index, tuple) in self.program.tuples.iter().enumerate() {
@@ -5246,14 +5606,19 @@ impl VerifyCx<'_> {
                 if Some(raw_type) != self.raw_enum_primitive_type(enm.repr) {
                     self.push(site, RirVerifyErrorKind::RawEnumWrongRawType);
                 }
-                let mut raw_values = std::collections::HashSet::new();
+                let mut raw_values = HashSet::new();
                 for variant in &enm.variants {
                     if variant.kind != RirVariantKind::Unit || !variant.fields.is_empty() {
                         self.push(site, RirVerifyErrorKind::RawEnumPayload);
                     }
                     match (enm.repr, variant.raw_value.as_ref()) {
-                        (RirEnumRepr::RawInt, Some(raw @ RirRawEnumValue::Int(_)))
-                        | (RirEnumRepr::RawString, Some(raw @ RirRawEnumValue::String(_))) => {
+                        (RirEnumRepr::RawInt, Some(raw @ RirRawEnumValue::Int(_))) => {
+                            if !raw_values.insert(raw) {
+                                self.push(site, RirVerifyErrorKind::RawEnumDuplicateValue);
+                            }
+                        }
+                        (RirEnumRepr::RawString, Some(raw @ RirRawEnumValue::String(id))) => {
+                            self.check_string_literal_id(site, *id);
                             if !raw_values.insert(raw) {
                                 self.push(site, RirVerifyErrorKind::RawEnumDuplicateValue);
                             }
@@ -5277,15 +5642,26 @@ impl VerifyCx<'_> {
     fn check_stringify_helpers(&mut self) {
         let mut symbols = Vec::new();
         let mut tys = Vec::new();
+        let mut req_tys = HashSet::new();
+        let mut helper_refs = vec![0; self.program.stringify_helpers.len()];
         for (index, req) in self.program.stringify_reqs.iter().enumerate() {
             let site = RirVerifySite::Type(req.ty);
             if req.id != RirStringifyReqId::from_index(index) {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
             self.check_type_id(site, req.ty);
+            if !req_tys.insert(req.ty) {
+                self.push(site, RirVerifyErrorKind::DuplicateStringifyReq);
+            }
             match (req.kind, self.ty(req.ty)) {
-                (RirStringifyReqKind::Structural(helper), Some(RirType::Struct(_))) => {
+                (
+                    RirStringifyReqKind::Helper(helper),
+                    Some(RirType::Struct(_) | RirType::Enum(_) | RirType::Flag(_)),
+                ) => {
                     self.check_stringify_helper_id(site, helper);
+                    if let Some(count) = helper_refs.get_mut(helper.index()) {
+                        *count += 1;
+                    }
                     if self
                         .program
                         .stringify_helpers
@@ -5342,6 +5718,12 @@ impl VerifyCx<'_> {
         }
         for (index, helper) in self.program.stringify_helpers.iter().enumerate() {
             let site = RirVerifySite::Type(helper.ty);
+            if helper_refs[index] != 1 {
+                self.push(
+                    site,
+                    RirVerifyErrorKind::InvalidStringifyHelperReferenceCount,
+                );
+            }
             if helper.id != RirStringifyHelperId::from_index(index) {
                 self.push(site, RirVerifyErrorKind::BadId);
             }
@@ -5356,29 +5738,65 @@ impl VerifyCx<'_> {
                 self.push(site, RirVerifyErrorKind::DuplicateSymbol);
             }
             tys.push(helper.ty);
-            match self.ty(helper.ty) {
-                Some(RirType::Struct(struct_id)) => {
-                    let Some(strukt) = self.program.structs.get(struct_id.index()) else {
-                        self.push(site, RirVerifyErrorKind::BadId);
-                        continue;
-                    };
-                    for field in &strukt.fields {
-                        if self.scalar(field.ty).is_some() {
-                            continue;
-                        }
-                        match self.ty(field.ty) {
-                            Some(RirType::Struct(_))
-                                if self.stringify_req(field.ty).is_some_and(|req| {
-                                    matches!(req.kind, RirStringifyReqKind::Structural(helper)
-                                        if self.program.stringify_helpers.get(helper.index()).is_some_and(|helper| helper.ty == field.ty))
-                                }) => {}
-                            Some(_) | None => {
-                                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
-                            }
-                        }
-                    }
+            let valid = match (&helper.kind, self.ty(helper.ty)) {
+                (RirStringifyHelperKind::Struct(kind_id), Some(RirType::Struct(struct_id)))
+                    if *kind_id == struct_id =>
+                {
+                    self.program
+                        .structs
+                        .get(struct_id.index())
+                        .is_some_and(|strukt| {
+                            strukt
+                                .fields
+                                .iter()
+                                .all(|field| self.stringify_field_supported(field.ty))
+                        })
                 }
-                _ => self.push(site, RirVerifyErrorKind::UnsupportedRValueType),
+                (
+                    RirStringifyHelperKind::Enum { enm, variants },
+                    Some(RirType::Enum(type_enum)),
+                ) if *enm == type_enum => self.program.enums.get(enm.index()).is_some_and(|enm| {
+                    variants.len() == enm.variants.len()
+                        && variants.iter().zip(&enm.variants).all(|(plan, variant)| {
+                            self.program
+                                .string_literals
+                                .get(plan.label.index())
+                                .is_some()
+                                && plan.field_labels.len()
+                                    == if variant.kind == RirVariantKind::Struct {
+                                        variant.fields.len()
+                                    } else {
+                                        0
+                                    }
+                                && plan.field_labels.iter().all(|id| {
+                                    self.program.string_literals.get(id.index()).is_some()
+                                })
+                                && variant
+                                    .fields
+                                    .iter()
+                                    .all(|field| self.stringify_field_supported(field.ty))
+                        })
+                }),
+                (
+                    RirStringifyHelperKind::Flag {
+                        flag,
+                        empty,
+                        members,
+                    },
+                    Some(RirType::Flag(type_flag)),
+                ) if *flag == type_flag => {
+                    self.program.flags.get(flag.index()).is_some_and(|flag| {
+                        members.len() == flag.members.len()
+                            && self.program.string_literals.get(empty.index()).is_some()
+                            && members
+                                .iter()
+                                .all(|id| self.program.string_literals.get(id.index()).is_some())
+                    })
+                }
+                _ => false,
+            };
+            if !valid {
+                self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
             }
         }
     }
@@ -5388,20 +5806,35 @@ impl VerifyCx<'_> {
         if matches!(self.ty(konst.ty), Some(RirType::Void)) {
             self.push(RirVerifySite::Const(id), RirVerifyErrorKind::VoidConst);
         }
-        let ok = matches!(
-            (self.ty(konst.ty), &konst.value),
-            (Some(RirType::Int), RirConstValue::Int(_))
-                | (Some(RirType::Float), RirConstValue::Float(_))
-                | (Some(RirType::Bool), RirConstValue::Bool(_))
-                | (Some(RirType::String), RirConstValue::String(_))
-                | (Some(RirType::Char), RirConstValue::Char(_))
-                | (Some(RirType::Option(_)), RirConstValue::Nil)
-        );
+        let flag_ok = match (self.ty(konst.ty), &konst.value) {
+            (Some(RirType::Flag(ty_flag)), RirConstValue::Flag { flag, bits })
+                if ty_flag == *flag =>
+            {
+                self.program
+                    .flags
+                    .get(flag.index())
+                    .is_some_and(|decl| *bits >= 0 && *bits & !decl.known_bits == 0)
+            }
+            _ => false,
+        };
+        let ok = flag_ok
+            || matches!(
+                (self.ty(konst.ty), &konst.value),
+                (Some(RirType::Int), RirConstValue::Int(_))
+                    | (Some(RirType::Float), RirConstValue::Float(_))
+                    | (Some(RirType::Bool), RirConstValue::Bool(_))
+                    | (Some(RirType::String), RirConstValue::String(_))
+                    | (Some(RirType::Char), RirConstValue::Char(_))
+                    | (Some(RirType::Option(_)), RirConstValue::Nil)
+            );
         if !ok {
             self.push(
                 RirVerifySite::Const(id),
                 RirVerifyErrorKind::ConstTypeMismatch,
             );
+        }
+        if let RirConstValue::String(literal) = konst.value {
+            self.check_string_literal_id(RirVerifySite::Const(id), literal);
         }
     }
 
@@ -5909,6 +6342,26 @@ impl VerifyCx<'_> {
         }
     }
 
+    fn pattern_disjunction_test_supported(test: &RirPatternTest) -> bool {
+        match test {
+            RirPatternTest::Any { branches } => branches
+                .iter()
+                .flatten()
+                .all(Self::pattern_disjunction_test_supported),
+            RirPatternTest::Literal { path, .. } | RirPatternTest::FlagValue { path, .. } => {
+                path.steps.iter().all(|step| {
+                    matches!(
+                        step,
+                        RirPatternPathStep::Field(_) | RirPatternPathStep::TupleField(_)
+                    )
+                })
+            }
+            RirPatternTest::Nil { .. }
+            | RirPatternTest::OptionalSome { .. }
+            | RirPatternTest::EnumVariant { .. } => false,
+        }
+    }
+
     fn check_pattern_test(
         &mut self,
         site: RirVerifySite,
@@ -5918,6 +6371,32 @@ impl VerifyCx<'_> {
         test: &RirPatternTest,
     ) {
         match test {
+            RirPatternTest::Any { branches } => {
+                if branches.is_empty()
+                    || branches
+                        .iter()
+                        .flatten()
+                        .any(|test| !Self::pattern_disjunction_test_supported(test))
+                {
+                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    return;
+                }
+                for tests in branches {
+                    let alternative = RirPatternAlternative {
+                        tests: tests.clone(),
+                        bindings: vec![],
+                    };
+                    let guards = Self::pattern_variant_guards(&alternative);
+                    self.check_pattern_variant_guards(site, &guards);
+                    let mut optional_guards = vec![];
+                    for test in tests {
+                        self.check_pattern_test(site, subject_ty, &guards, &optional_guards, test);
+                        if let RirPatternTest::OptionalSome { path } = test {
+                            optional_guards.push(path.steps.clone());
+                        }
+                    }
+                }
+            }
             RirPatternTest::Literal { path, value } => {
                 self.check_const_id(site, *value);
                 let Some(path_ty) =
@@ -5943,6 +6422,23 @@ impl VerifyCx<'_> {
                     && !matches!(self.ty(path_ty), Some(RirType::Option(_)))
                 {
                     self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                }
+            }
+            RirPatternTest::FlagValue { path, flag, bits } => {
+                let Some(flag_decl) = self.program.flags.get(flag.index()) else {
+                    self.push(site, RirVerifyErrorKind::BadId);
+                    return;
+                };
+                let Some(path_ty) =
+                    self.pattern_path_ty(site, subject_ty, guards, optional_guards, path)
+                else {
+                    return;
+                };
+                if !matches!(self.ty(path_ty), Some(RirType::Flag(found)) if found == *flag) {
+                    self.push(site, RirVerifyErrorKind::FlagPatternTypeMismatch);
+                }
+                if *bits < 0 || *bits & !flag_decl.known_bits != 0 {
+                    self.push(site, RirVerifyErrorKind::FlagPatternUnknownBits);
                 }
             }
             RirPatternTest::EnumVariant {
@@ -8813,9 +9309,32 @@ impl VerifyCx<'_> {
                 let value_ty = self.operand_ty(site, function, value);
                 self.check_type_id(site, *target);
                 if !self.cast_ok(value_ty, *target) {
-                    self.push(site, RirVerifyErrorKind::UnsupportedRValueType);
+                    self.push(site, RirVerifyErrorKind::InvalidNumericCast);
                 }
                 Some(*target)
+            }
+            RirRValue::RawProject { value, target } => {
+                let value_ty = self.operand_ty(site, function, value);
+                self.check_type_id(site, *target);
+                if !self.raw_project_ok(value_ty, *target) {
+                    self.push(site, RirVerifyErrorKind::InvalidRawProject);
+                }
+                Some(*target)
+            }
+            RirRValue::RawTryConstruct { value, target, ty } => {
+                let value_ty = self.operand_ty(site, function, value);
+                self.check_type_id(site, *target);
+                self.check_type_id(site, *ty);
+                if !self.raw_try_construct_ok(value_ty, *target, *ty) {
+                    self.push(site, RirVerifyErrorKind::InvalidRawTryConstruct);
+                }
+                Some(*ty)
+            }
+            RirRValue::FlagStatic { ty, .. } => {
+                if !matches!(self.ty(*ty), Some(RirType::Flag(_))) {
+                    self.push(site, RirVerifyErrorKind::InvalidFlagStatic);
+                }
+                Some(*ty)
             }
             RirRValue::OptionalSome { value, ty } => {
                 let value_ty = self.value_operand_ty(site, function, value);
@@ -9361,9 +9880,7 @@ impl VerifyCx<'_> {
             | RirCallArg::InitFieldProvided(operand) => operand_ty(operand),
             RirCallArg::InitFieldOmitted => None,
             RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => Some(place.ty),
-            RirCallArg::SharedStringConst(id) => {
-                self.program.consts.get(id.index()).map(|konst| konst.ty)
-            }
+            RirCallArg::SharedStringConst(_) => self.string_ty(),
             RirCallArg::MutPlace(place) => Some(place.ty),
             RirCallArg::DynBorrow(borrow) => self
                 .program
@@ -9574,7 +10091,7 @@ impl VerifyCx<'_> {
                     self.push(site, RirVerifyErrorKind::CallArgMode);
                 }
             }
-            RirCallArg::SharedStringConst(id) => self.check_const_id(site, *id),
+            RirCallArg::SharedStringConst(id) => self.check_string_literal_id(site, *id),
             RirCallArg::MutPlace(place) => {
                 self.check_mut_place_arg(site, function_id, function, place, MutPlaceUse::CallArg);
             }
@@ -9820,8 +10337,8 @@ impl VerifyCx<'_> {
                     }
                 }
                 RirCallArg::SharedStringConst(id) => {
-                    self.check_const_id(site, *id);
-                    self.program.consts.get(id.index()).map(|konst| konst.ty)
+                    self.check_string_literal_id(site, *id);
+                    self.string_ty()
                 }
             };
             if let Some(found) = found
@@ -10308,7 +10825,11 @@ impl VerifyCx<'_> {
     fn unary_ok(&self, op: UnaryOp, value: Option<RirTypeId>, ret: RirTypeId) -> bool {
         match (value.and_then(|ty| self.scalar(ty)), self.scalar(ret)) {
             (Some(value), Some(ret)) => op.scalar_result(value) == Some(ret),
-            _ => false,
+            _ => {
+                op == UnaryOp::BitNot
+                    && value == Some(ret)
+                    && matches!(self.ty(ret), Some(RirType::Flag(_)))
+            }
         }
     }
 
@@ -10325,6 +10846,15 @@ impl VerifyCx<'_> {
             self.scalar(ret),
         ) {
             (Some(lhs), Some(rhs), Some(ret)) => op.scalar_result(lhs, rhs) == Some(ret),
+            _ if lhs == rhs
+                && lhs.is_some_and(|ty| matches!(self.ty(ty), Some(RirType::Flag(_)))) =>
+            {
+                match op {
+                    BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor => lhs == Some(ret),
+                    BinaryOp::Eq | BinaryOp::NotEq => self.type_id(RirType::Bool) == Some(ret),
+                    _ => false,
+                }
+            }
             _ if matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
                 && self.type_id(RirType::Bool) == Some(ret) =>
             {
@@ -10349,34 +10879,79 @@ impl VerifyCx<'_> {
     }
 
     fn cast_ok(&self, value: Option<RirTypeId>, ret: RirTypeId) -> bool {
-        if matches!(
+        matches!(
             (value.and_then(|ty| self.ty(ty)), self.ty(ret)),
-            (
-                Some(RirType::Int | RirType::Float),
-                Some(RirType::Int | RirType::Float)
-            )
-        ) {
-            return true;
+            (Some(RirType::Int), Some(RirType::Float)) | (Some(RirType::Float), Some(RirType::Int))
+        )
+    }
+
+    fn raw_project_ok(&self, value: Option<RirTypeId>, ret: RirTypeId) -> bool {
+        match value.and_then(|ty| self.ty(ty)) {
+            Some(RirType::Flag(_)) => matches!(self.ty(ret), Some(RirType::Int)),
+            Some(RirType::Enum(enum_id)) => {
+                let Some(enm) = self.program.enums.get(enum_id.index()) else {
+                    return false;
+                };
+                let backing_matches = matches!(
+                    (enm.repr, self.ty(ret)),
+                    (RirEnumRepr::RawInt, Some(RirType::Int))
+                        | (RirEnumRepr::RawString, Some(RirType::String))
+                );
+                backing_matches && enm.raw_type == Some(ret)
+            }
+            _ => false,
         }
-        let Some(RirType::Enum(enum_id)) = value.and_then(|ty| self.ty(ty)) else {
-            return false;
+    }
+
+    fn raw_try_construct_ok(
+        &self,
+        value: Option<RirTypeId>,
+        target: RirTypeId,
+        result: RirTypeId,
+    ) -> bool {
+        let backing_matches = match self.ty(target) {
+            Some(RirType::Flag(_)) => {
+                matches!(value.and_then(|ty| self.ty(ty)), Some(RirType::Int))
+            }
+            Some(RirType::Enum(enum_id)) => {
+                let Some(enm) = self.program.enums.get(enum_id.index()) else {
+                    return false;
+                };
+                matches!(
+                    (enm.repr, value.and_then(|ty| self.ty(ty))),
+                    (RirEnumRepr::RawInt, Some(RirType::Int))
+                        | (RirEnumRepr::RawString, Some(RirType::String))
+                ) && enm.raw_type == value
+            }
+            _ => false,
         };
-        self.program
-            .enums
-            .get(enum_id.index())
-            .is_some_and(|enm| enm.raw_type == Some(ret))
+        backing_matches
+            && matches!(self.ty(result), Some(RirType::Option(inner)) if inner == target)
+    }
+
+    fn stringify_field_supported(&self, ty: RirTypeId) -> bool {
+        self.scalar(ty).is_some()
+            || matches!(
+                self.ty(ty),
+                Some(RirType::Struct(_) | RirType::Enum(_) | RirType::Flag(_))
+            ) && self.program.stringify_req(ty).is_some()
     }
 
     fn stringify_ok(&self, value: &RirOperand, source_ty: RirTypeId) -> bool {
         if self.scalar(source_ty).is_some() {
             return true;
         }
-        matches!(self.ty(source_ty), Some(RirType::Struct(_)))
-            && matches!(value, RirOperand::Place(_))
-            && matches!(
-                self.stringify_req(source_ty).map(|req| req.kind),
-                Some(RirStringifyReqKind::Structural(_) | RirStringifyReqKind::Override { .. })
-            )
+        match self.program.stringify_req(source_ty).map(|req| req.kind) {
+            Some(RirStringifyReqKind::Helper(_)) => matches!(
+                self.ty(source_ty),
+                Some(RirType::Struct(_) | RirType::Enum(_) | RirType::Flag(_))
+            ),
+            Some(RirStringifyReqKind::Override { .. }) => {
+                matches!(self.ty(source_ty), Some(RirType::Struct(_)))
+                    && matches!(value, RirOperand::Place(_))
+            }
+            None => false,
+        }
     }
 
     fn format_ok(&self, source_ty: RirTypeId, spec: RirFormatSpec) -> bool {
@@ -10645,6 +11220,12 @@ impl VerifyCx<'_> {
 
     fn check_enum_id(&mut self, site: RirVerifySite, id: RirEnumId) {
         if id.index() >= self.program.enums.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
+        }
+    }
+
+    fn check_flag_id(&mut self, site: RirVerifySite, id: RirFlagId) {
+        if id.index() >= self.program.flags.len() {
             self.push(site, RirVerifyErrorKind::BadId);
         }
     }
@@ -10995,10 +11576,6 @@ impl VerifyCx<'_> {
                 .any(|lambda| lambda.function == function)
     }
 
-    fn stringify_req(&self, ty: RirTypeId) -> Option<&RirStringifyReq> {
-        self.program.stringify_reqs.iter().find(|req| req.ty == ty)
-    }
-
     fn copyable_type(&self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
             Some(RirType::Struct(id)) if self.program.structs.get(id.index()).is_some() => {
@@ -11021,9 +11598,14 @@ impl VerifyCx<'_> {
 
     fn inherently_copyable_type(&self, ty: RirTypeId) -> bool {
         match self.ty(ty) {
-            Some(RirType::Int | RirType::Float | RirType::Bool | RirType::Char | RirType::Void) => {
-                true
-            }
+            Some(
+                RirType::Int
+                | RirType::Float
+                | RirType::Bool
+                | RirType::Char
+                | RirType::Void
+                | RirType::Flag(_),
+            ) => true,
             Some(RirType::Struct(id)) => {
                 self.program.structs.get(id.index()).is_some_and(|strukt| {
                     strukt
@@ -11057,6 +11639,20 @@ impl VerifyCx<'_> {
                 | RirType::String,
             )
             | None => false,
+        }
+    }
+
+    fn string_ty(&self) -> Option<RirTypeId> {
+        self.program
+            .types
+            .iter()
+            .position(|ty| *ty == RirType::String)
+            .map(RirTypeId::from_index)
+    }
+
+    fn check_string_literal_id(&mut self, site: RirVerifySite, id: RirStringLiteralId) {
+        if id.index() >= self.program.string_literals.len() {
+            self.push(site, RirVerifyErrorKind::BadId);
         }
     }
 

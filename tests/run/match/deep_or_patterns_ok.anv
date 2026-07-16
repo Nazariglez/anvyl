@@ -1,0 +1,67 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// nested
+// wide
+// fallback
+// root-or
+// @match-end
+
+enum Inner {
+    Left(bool),
+    Right,
+}
+
+enum Outer {
+    Wrapped(Inner),
+    Empty,
+}
+
+fn nested(value: Outer) -> string {
+    match value {
+        Outer.Wrapped(Inner.Left(true)) => "nested",
+        Outer.Wrapped(Inner.Left(false)) => "false",
+        Outer.Wrapped(Inner.Right) => "right",
+        Outer.Empty => "empty",
+    }
+}
+
+fn wide(value: (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool, bool)) -> string {
+    match value {
+        (
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+            true | false,
+        ) => "wide",
+    }
+}
+
+fn precedence(value: (int, int)) -> string {
+    match value {
+        (1 | 2, 3) => "hit",
+        _ => "fallback",
+    }
+}
+
+fn root_or(value: Inner) -> string {
+    match value {
+        Inner.Left(true) | Inner.Right => "root-or",
+        _ => "other",
+    }
+}
+
+fn main() {
+    println(nested(Outer.Wrapped(Inner.Left(true))));
+    println(wide((true, false, true, false, true, false, true, false, true, false, true, false)));
+    println(precedence((1, 4)));
+    println(root_or(Inner.Right));
+}
