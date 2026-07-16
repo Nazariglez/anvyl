@@ -524,16 +524,8 @@ impl<'a> Printer<'a> {
 
     fn format_lit(&mut self, lit: &ast::Lit) {
         match lit {
-            ast::Lit::Int(n) => self.write_fmt(n),
-            ast::Lit::Float(value) => {
-                let s = value.to_string();
-                if value.is_finite() && !s.contains('.') {
-                    self.write(&s);
-                    self.write(".0");
-                } else {
-                    self.write(&s);
-                }
-            }
+            ast::Lit::Int(n) => self.write(n.spelling()),
+            ast::Lit::Float(n) => self.write(n.spelling()),
             ast::Lit::Bool(b) => self.write(if *b { "true" } else { "false" }),
             ast::Lit::String(s) => {
                 self.write("\"");

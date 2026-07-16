@@ -584,9 +584,13 @@ impl Printer<'_> {
             this.write("enum ");
             this.write_fmt(decl.name);
             this.format_type_params(&decl.type_params, &decl.const_params);
-            if let Some(raw_backing) = &decl.raw_backing {
-                this.write(": ");
-                this.format_type(&raw_backing.node);
+            match &decl.mode {
+                ast::EnumMode::Adt => {}
+                ast::EnumMode::Backed(backing) => {
+                    this.write(": ");
+                    this.format_type(&backing.node);
+                }
+                ast::EnumMode::Flag(_) => this.write(": flag"),
             }
             this.write(" {");
             this.writeln();
@@ -642,12 +646,13 @@ impl Printer<'_> {
             self.write(" ");
         }
         self.format_type(&decl.ty);
-        if let Some(backing) = decl
+        if let Some(kind) = decl
             .target_constraint
-            .and_then(ast::ExtendTargetConstraint::backing)
+            .and_then(ast::ExtendTargetConstraint::enum_kind)
+            && let Some(keyword) = kind.keyword()
         {
             self.write(": ");
-            self.write(backing.keyword());
+            self.write(keyword);
         }
 
         self.write(" {");

@@ -1,0 +1,7 @@
+enum Layer: int {
+    None = 0x0000,
+    Player = 0b0001,
+    Enemy = 0b0010,
+    Terrain = 0X00_04,
+    Actors = Player | Enemy,
+}

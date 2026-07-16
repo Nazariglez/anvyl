@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: static method 'Read' already exists for type 'Access'
+
+enum Access: flag {
+    Read,
+}
+
+extend Access {
+    fn Read() -> Access { Access.Read }
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: enum value dependency cycle
+
+enum A: flag {
+    Value = B.Value,
+}
+
+enum B: flag {
+    Value = A.Value,
+}

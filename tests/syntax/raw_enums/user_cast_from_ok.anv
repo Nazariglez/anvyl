@@ -14,11 +14,14 @@ extend Wrapper {
 
 extend State {
     cast from(source: Source) { State.Idle }
-    cast from(raw: int) { State.Idle }
+}
+
+extend string {
+    cast from(state: State) { f"state:{state as int}" }
 }
 
 fn main() {
     let wrapped: Wrapper = State.Idle as Wrapper;
     let state: State = Source {} as State;
-    let from_int: State = 0 as State;
+    let label: string = state as string;
 }

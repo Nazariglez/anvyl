@@ -1,0 +1,30 @@
+// @mode: check
+// @expect: success
+
+enum State: int {
+    Idle,
+    Running = 2,
+}
+
+enum Animation: string {
+    Idle = "idle",
+}
+
+fn test() {
+    let add_left: int = State.Running + 1;
+    let add_right: int = 1 + State.Running;
+    let distance: int = State.Running - State.Idle;
+    let equal_raw: bool = State.Running == 2;
+    let equal_nominal: bool = State.Running == State.Idle;
+    let ordered: bool = State.Idle < State.Running;
+    let bits: int = State.Running | 4;
+    let negated: int = -State.Running;
+    let flipped: int = ~State.Running;
+    let text: string = Animation.Idle + "!";
+    let repeated: string = Animation.Idle + Animation.Idle;
+    let text_equal: bool = Animation.Idle == "idle";
+    var total = 1;
+    total += State.Running;
+    var label = "state:";
+    label += Animation.Idle;
+}

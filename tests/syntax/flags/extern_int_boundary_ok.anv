@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+enum Access: flag { Read }
+
+extern fn send(bits: int);
+
+fn main() {
+    send(Access.Read);
+}

@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: automatic values exceed bit 62
+
+enum Access: flag {
+    Highest = 1 << 62,
+    Overflow,
+}

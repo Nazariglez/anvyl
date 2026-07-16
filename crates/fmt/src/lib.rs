@@ -343,13 +343,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn float_literal_preserves_dot_zero() {
-        let source = "fn f() -> float { 4.0 }";
-        let formatted = format_source(source).expect("format failed");
-        assert!(formatted.contains("4.0"));
-    }
-
     // -------------------------------------------------------------------------
     // Blank line normalization
     // -------------------------------------------------------------------------

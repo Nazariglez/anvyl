@@ -23,7 +23,11 @@ fn formatter_snapshots() {
         let expected = fs::read_to_string(&expected).unwrap();
         let formatted = anvyx_fmt::format_source(&source).unwrap();
         assert_eq!(formatted, expected, "{}", input.display());
-        if name.starts_with("format_skip_") {
+        let requires_idempotency = name.starts_with("format_skip_")
+            || name.starts_with("numeric_literals_")
+            || name.starts_with("enum_numeric_")
+            || name.starts_with("enum_decls_");
+        if requires_idempotency {
             assert_eq!(
                 anvyx_fmt::format_source(&formatted).unwrap(),
                 formatted,

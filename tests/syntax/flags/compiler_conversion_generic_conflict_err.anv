@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: conflicts with compiler-provided raw enum conversion
+
+enum Access: flag { Read }
+
+extend<E> enum E: flag {
+    cast? from(raw: int) { nil }
+}

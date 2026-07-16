@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: raw projection produces a value, not a mutable place
+
+enum Access: flag { Read }
+
+fn clear(ref bits: int) { bits = 0; }
+
+fn main() {
+    var access = Access.Read;
+    clear(access);
+}

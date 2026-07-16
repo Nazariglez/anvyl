@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: unknown variable `Read`
+
+const LEAK = Read;
+
+enum Access: flag {
+    Read = 1,
+    Invalid = LEAK,
+}

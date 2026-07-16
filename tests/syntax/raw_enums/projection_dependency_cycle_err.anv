@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: enum value dependency cycle
+
+const A_RAW: int = B.Value;
+const B_RAW: int = A.Value;
+
+enum A: int {
+    Value = A_RAW,
+}
+
+enum B: int {
+    Value = B_RAW,
+}

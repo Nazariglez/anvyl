@@ -1,0 +1,14 @@
+// @mode: check
+// @expect: error
+// @contains: non-exhaustive match
+
+enum State {
+    Value { left: bool, right: bool },
+}
+
+fn describe(state: State) -> string {
+    match state {
+        State.Value { left: true, .. } => "left",
+        State.Value { left: false, right: true } => "right",
+    }
+}

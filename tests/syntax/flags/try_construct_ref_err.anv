@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: raw enum construction cannot be bound with `ref`
+
+enum Access: flag { Read }
+
+fn main() {
+    var raw = 1;
+    if ref access = raw as? Access {}
+}

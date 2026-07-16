@@ -16,7 +16,7 @@ impl Printer<'_> {
 
     fn format_const_arg(&mut self, arg: &ast::ConstArg) {
         match arg {
-            ast::ConstArg::Value(value) => self.write_fmt(value),
+            ast::ConstArg::Value(value) => self.write(value.spelling()),
             ast::ConstArg::Name(name) => self.write_fmt(name),
             ast::ConstArg::Param(id) => {
                 if let Some(name) = self.const_param_names.get(id) {
@@ -181,7 +181,7 @@ impl Printer<'_> {
 
     fn format_array_len(&mut self, len: &ast::ArrayLen) {
         match len {
-            ast::ArrayLen::Fixed(n) => self.write_fmt(n),
+            ast::ArrayLen::Fixed(n) => self.write(n.spelling()),
             ast::ArrayLen::Infer => self.write("_"),
             ast::ArrayLen::Named(ident) => self.write_fmt(ident),
             ast::ArrayLen::Param(id) => {

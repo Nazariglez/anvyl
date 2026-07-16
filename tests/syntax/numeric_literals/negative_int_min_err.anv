@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: integer literal overflow
+
+fn main() {
+    match 0 {
+        -9223372036854775808 => {},
+        _ => {},
+    }
+}

@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: cannot cast from 'Wrapped' to 'int'
+
+enum State: int { Idle }
+struct Wrapped { @as embed state: State }
+
+fn main() {
+    let wrapped = Wrapped { state: State.Idle };
+    let raw = wrapped as int;
+}

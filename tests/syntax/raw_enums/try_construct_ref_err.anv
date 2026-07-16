@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: raw enum construction cannot be bound with `ref`
+
+enum State: int { Idle }
+
+fn main() {
+    var raw = 0;
+    if ref state = raw as? State {}
+}

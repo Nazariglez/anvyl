@@ -1,0 +1,49 @@
+// @mode: check
+// @expect: success
+
+enum Access: flag {
+    None = 0,
+    Read,
+    Write,
+    Both = Read | Write,
+    Execute = 8,
+    All = Both | Execute,
+}
+
+extend<E> enum E: flag {
+    fn marker(self) -> int { 1 }
+}
+
+struct Holder {
+    access: Access,
+}
+
+fn choose(read: bool) -> Access {
+    if read { Access.Read } else { .Write }
+}
+
+fn shadowed_owner_const<N: int>() {
+    const Read = N;
+    enum Local: flag {
+        Read = 1,
+        Write = 2,
+        All = Read | Write,
+    }
+}
+
+fn main() {
+    let inferred: Access = .Both;
+    let qualified = Access.Execute;
+    let holder = Holder { access: inferred };
+    let returned = choose(true);
+    let marker = qualified.marker();
+    let same = Access.Read == .Read;
+
+    enum Local: flag {
+        First,
+        Second,
+        Both = First | Second,
+    }
+    let local: Local = .Both;
+    shadowed_owner_const<4>();
+}

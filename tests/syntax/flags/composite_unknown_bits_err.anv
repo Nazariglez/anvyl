@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: composites may use only earlier atomic bits
+
+enum Access: flag {
+    Invalid = 3,
+}

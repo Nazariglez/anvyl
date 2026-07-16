@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: flag values cannot be matched with `ref`
+
+enum Access: flag { Read }
+
+fn main() {
+    var value = Access.Read;
+    match ref value {
+        .Read => {},
+        _ => {},
+    }
+}

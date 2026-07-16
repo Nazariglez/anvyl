@@ -1,0 +1,26 @@
+// @mode: check
+// @expect: success
+
+enum Never {}
+
+enum TupleOuter {
+    Impossible(Never),
+    Present,
+}
+
+enum StructOuter {
+    Impossible { value: Never },
+    Present,
+}
+
+fn tuple_value(value: TupleOuter) -> int {
+    match value {
+        TupleOuter.Present => 1,
+    }
+}
+
+fn struct_value(value: StructOuter) -> int {
+    match value {
+        StructOuter.Present => 1,
+    }
+}

@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: expected `Access`, found `Feature`
+
+enum Access: flag { Read }
+enum Feature: flag { Read }
+
+fn main() {
+    let invalid = Access.Read | Feature.Read;
+}

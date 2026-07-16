@@ -1,0 +1,33 @@
+// @mode: check
+// @expect: success
+
+enum State: int {
+    Idle,
+}
+
+struct Box<T> {
+    value: State,
+    marker: T,
+}
+
+fn take_state(state: State) {}
+
+fn make() -> State {
+    State.Idle
+}
+
+fn id<T>(value: T) -> T {
+    value
+}
+
+fn project<T>(box: Box<T>) -> int {
+    box.value
+}
+
+fn test() {
+    let state = State.Idle;
+    take_state(state);
+    let from_call: int = make();
+    let from_generic: int = id(State.Idle);
+    let raw = project<int>(Box<int> { value: state, marker: 1 });
+}

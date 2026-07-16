@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: flag member 'PayloadFlag.Read' cannot have a payload
+
+enum PayloadFlag: flag {
+    Read(int),
+}

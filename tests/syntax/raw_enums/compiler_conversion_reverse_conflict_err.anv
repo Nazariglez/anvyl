@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: conflicts with compiler-provided raw enum conversion
+
+enum State: int { Idle }
+
+extend int {
+    cast from(state: State) { state as int }
+}

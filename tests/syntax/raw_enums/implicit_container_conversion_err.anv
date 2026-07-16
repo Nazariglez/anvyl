@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+enum State: int { Idle }
+
+fn test() {
+    let states: [State] = [State.Idle];
+    let raw: [int] = states;
+}

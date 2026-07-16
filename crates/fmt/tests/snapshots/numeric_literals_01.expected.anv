@@ -1,0 +1,17 @@
+fn demo<T, N: int>(value: int) {
+    let decimal = 1_000_000;
+    let leading = 00042;
+    let hex = 0XDe_AD;
+    let binary = 0b0010_1010;
+    let octal = 0O00_77;
+    let fraction = 1_2.30_0;
+    let exponent = 1.0E+0_4;
+    let negative = -0x0F;
+    let _: [int; 0x0_F] = [];
+    let _ = first<int, 0b0011>([]);
+    match value {
+        -0x0F => {},
+        -1_000..=-2 => {},
+        _ => {},
+    }
+}

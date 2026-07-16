@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: requires int
+
+enum State: int { Idle, Run }
+
+fn main() {
+    let _ = f"{State.Run:X}";
+}

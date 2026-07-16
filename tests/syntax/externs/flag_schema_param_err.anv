@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: is not supported in extern schemas; use 'int' at the boundary
+
+enum Access: flag { Read }
+
+extern fn send(access: Access);

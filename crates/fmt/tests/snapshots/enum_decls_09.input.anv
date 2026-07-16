@@ -1,0 +1,2 @@
+enum Layer:flag{None=0x0000,Player=0b0001,}
+extend<E> enum E:flag{fn empty(self)->bool{return false;}}

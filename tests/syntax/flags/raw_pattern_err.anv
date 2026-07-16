@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: invalid literal pattern: mismatch expected 'Access', found 'int'
+
+enum Access: flag { Read }
+
+fn main() {
+    match Access.Read {
+        1 => {},
+        _ => {},
+    }
+}

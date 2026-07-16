@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+enum State: int { Idle }
+
+fn test(state: State) {
+    let raw: string = state;
+}

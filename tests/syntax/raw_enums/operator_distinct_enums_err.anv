@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: error
+// @contains: mismatched types
+
+enum State: int { Idle }
+enum ErrorCode: int { None }
+
+fn test() {
+    let equal = State.Idle == ErrorCode.None;
+}

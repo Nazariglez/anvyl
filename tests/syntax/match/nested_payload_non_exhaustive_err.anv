@@ -1,0 +1,15 @@
+// @mode: check
+// @expect: error
+// @contains: non-exhaustive match
+
+enum State {
+    Enabled(bool),
+    Disabled,
+}
+
+fn describe(state: State) -> string {
+    match state {
+        State.Enabled(true) => "enabled",
+        State.Disabled => "disabled",
+    }
+}

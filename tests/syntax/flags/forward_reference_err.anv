@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: unknown constant 'Read'
+
+enum Access: flag {
+    Both = Read | Write,
+    Read = 1,
+    Write = 2,
+}

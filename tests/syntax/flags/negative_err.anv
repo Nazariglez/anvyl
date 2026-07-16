@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: values must be nonnegative
+
+enum Access: flag {
+    Invalid = -1,
+}

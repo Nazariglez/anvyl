@@ -1,0 +1,12 @@
+// @mode: check
+// @expect: error
+// @contains: raw projection produces a value, not a mutable place
+
+enum State: int { Idle }
+
+fn touch(ref raw: int) {}
+
+fn test() {
+    var state = State.Idle;
+    touch(state);
+}

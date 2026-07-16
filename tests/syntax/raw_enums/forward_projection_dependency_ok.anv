@@ -1,0 +1,67 @@
+// @mode: check
+// @expect: success
+
+const LATER_RAW: int = Later.Value;
+
+enum Earlier: int {
+    Value = LATER_RAW,
+}
+
+enum Later: int {
+    Value = 7,
+}
+
+const EXPLICIT_LATER_RAW: int = ExplicitLater.Value as int;
+
+enum ExplicitEarlier: int {
+    Value = EXPLICIT_LATER_RAW,
+}
+
+enum ExplicitLater: int {
+    Value = 8,
+}
+
+const OPERATOR_LATER_RAW: int = OperatorLater.Value + 1;
+
+enum OperatorEarlier: int {
+    Value = OPERATOR_LATER_RAW,
+}
+
+enum OperatorLater: int {
+    Value = 11,
+}
+
+fn test() {
+    const LOCAL_LATER_RAW: int = LocalLater.Value;
+
+    enum LocalEarlier: int {
+        Value = LOCAL_LATER_RAW,
+    }
+
+    enum LocalLater: int {
+        Value = 9,
+    }
+
+    const LOCAL_EXPLICIT_RAW: int = LocalExplicitLater.Value as int;
+
+    enum LocalExplicitEarlier: int {
+        Value = LOCAL_EXPLICIT_RAW,
+    }
+
+    enum LocalExplicitLater: int {
+        Value = 10,
+    }
+
+    const LOCAL_OPERATOR_RAW: int = -LocalOperatorLater.Value;
+
+    enum LocalOperatorEarlier: int {
+        Value = LOCAL_OPERATOR_RAW,
+    }
+
+    enum LocalOperatorLater: int {
+        Value = 12,
+    }
+
+    let earlier: int = Earlier.Value;
+    let local: int = LocalEarlier.Value;
+}

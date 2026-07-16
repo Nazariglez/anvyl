@@ -1,0 +1,13 @@
+// @mode: check
+// @expect: error
+// @contains: flag enum 'LocalFlag' cannot depend on owner generic parameters
+
+fn declare<T, N: int>() {
+    enum LocalFlag: flag {
+        Read = N,
+    }
+}
+
+fn main() {
+    declare<int, 1>();
+}

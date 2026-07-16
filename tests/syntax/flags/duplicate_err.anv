@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: value is already named
+
+enum Access: flag {
+    Read = 1,
+    Alias = 1,
+}

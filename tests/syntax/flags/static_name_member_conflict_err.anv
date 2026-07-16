@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: flag member 'Access.empty' conflicts with compiler static method 'empty'
+
+enum Access: flag {
+    empty,
+}

@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown variant 'empty' for enum 'Access'
+
+enum Access: flag { Read }
+
+fn main() {
+    let invalid = Access.empty;
+}

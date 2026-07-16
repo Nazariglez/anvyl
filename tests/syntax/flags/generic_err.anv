@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: flag enum 'GenericFlag' cannot be generic
+
+enum GenericFlag<T>: flag {
+    Read,
+}

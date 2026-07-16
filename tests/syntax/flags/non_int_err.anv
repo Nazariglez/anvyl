@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: flag value must be an int constant
+
+enum Access: flag {
+    Invalid = "read",
+}

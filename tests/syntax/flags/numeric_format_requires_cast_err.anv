@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: requires int
+
+enum Access: flag { Read }
+
+fn main() {
+    let _ = f"{Access.Read:X}";
+}

@@ -1,0 +1,56 @@
+// @mode: check
+// @expect: success
+
+enum State: int {
+    Idle,
+    Running = 2,
+}
+
+struct Slot {
+    state: int,
+}
+
+struct DefaultSlot {
+    state: int = State.Idle,
+}
+
+dataref RefSlot {
+    state: int,
+}
+
+enum Event {
+    State(int),
+}
+
+const IDLE: int = State.Idle;
+
+fn take(state: int) {}
+fn take_cast(state: as int) {}
+fn default_arg(state: int = State.Idle) {}
+
+fn raw(state: State) -> int {
+    state
+}
+
+fn branch(cond: bool, state: State) -> int {
+    if cond { state } else { 4 }
+}
+
+fn test(cond: bool) {
+    let state = State.Running;
+    let typed: int = state;
+    var assigned = 0;
+    assigned = state;
+    take(state);
+    take_cast(state);
+    let pair: (int, int) = (state, 1);
+    let list: [int] = [state];
+    let array: [int; 1] = [state];
+    let map: [int: int] = [state: state];
+    let slot = Slot { state: state };
+    let ref_slot = RefSlot { state: state };
+    let event = Event.State(state);
+    let selected: int = if cond { state } else { 3 };
+    let default_slot = DefaultSlot {};
+    default_arg();
+}

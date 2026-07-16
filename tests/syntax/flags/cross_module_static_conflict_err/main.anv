@@ -1,0 +1,9 @@
+// @mode: check
+// @expect: error
+// @contains: static method 'all' already exists for type 'Access'
+
+import helper { Access };
+
+extend Access {
+    fn all() -> Access { Access.Read }
+}

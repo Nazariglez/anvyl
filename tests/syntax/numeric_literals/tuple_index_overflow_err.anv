@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: error
+// @contains: Unexpected token '4294967296'
+
+fn main() {
+    let pair = (1, 2);
+    let _ = pair.4294967296;
+}
