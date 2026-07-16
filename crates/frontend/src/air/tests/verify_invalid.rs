@@ -1,6 +1,6 @@
 use verify::{
-    BadCall, BadConst, BadContract, BadExtern, BadFunction, BadModule, BadPlace, BadRValue,
-    BadReference, BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError,
+    BadCall, BadConst, BadContract, BadEnum, BadExtern, BadFlag, BadFunction, BadModule, BadPlace,
+    BadRValue, BadReference, BadStatement, BadType, ModuleItem, PrimitiveKind, VerifyError,
     VerifyErrorKind as EK, VerifySite,
 };
 
@@ -12,8 +12,8 @@ use crate::{
         ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId,
         ContractSurfaceDecl, ContractSurfaceId, ContractWeakeningDecl, ContractWitnessDecl,
         ContractWitnessKey, ContractWitnessSlotDecl, ContractWitnessTarget, ExternBindingDecl,
-        ExternStaticDecl, ExternTypeId, FunctionSpecialization, FunctionValueCapability,
-        GlobalInitEffect, Module,
+        ExternStaticDecl, ExternTypeId, FlagDecl, FlagId, FlagMemberDecl, FlagMemberId,
+        FlagStaticOp, FunctionSpecialization, FunctionValueCapability, GlobalInitEffect, Module,
     },
     ast::Ident,
 };
@@ -4898,7 +4898,116 @@ fn rvalue_binary_and_cast_invariants() {
 }
 
 #[test]
-fn raw_enum_cast_must_match_backing() {
+fn raw_enum_metadata_requires_matching_backing() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (enum_id, enum_ty) = builder.raw_int_enum(module, "State", vec![("Idle", 0)]);
+    let mut fb = FunctionBuilder::new("main", module, FunctionKind::Normal, void_ty);
+    let state = fb.push_param("state", enum_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(
+        block,
+        stmt_eval(RValue::RawProject {
+            value: op_place(state, enum_ty),
+            target: int_ty,
+        }),
+    );
+    let entry = builder.alloc_function(fb.finish());
+    builder.set_entry(entry);
+    let mut program = builder.finish();
+
+    program.enum_decl_mut(enum_id).repr = crate::air::EnumRepr::RawString;
+    let errors = verify(&program).expect_err("mismatched raw representation verified");
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadRValue(BadRValue::RawProjectMustMatchBacking { value, target })
+            if value == enum_ty && target == int_ty
+    )));
+
+    program.enum_decl_mut(enum_id).repr = crate::air::EnumRepr::RawInt;
+    program.enum_decl_mut(enum_id).raw_type = None;
+    let errors = verify(&program).expect_err("raw enum without backing verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.kind == EK::BadEnum(BadEnum::RawMissingRawType))
+    );
+
+    program.enum_decl_mut(enum_id).raw_type = Some(string_ty);
+    let errors = verify(&program).expect_err("raw enum with wrong backing verified");
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.kind == EK::BadEnum(BadEnum::RawTypeMismatch(string_ty)) })
+    );
+}
+
+#[test]
+fn raw_try_construct_requires_backing_target_and_option() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let string_ty = builder.string_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let (_, state_ty) = builder.raw_int_enum(module, "State", vec![("Idle", 0)]);
+    let (_, adt_ty) = builder.unit_enum(module, "Adt");
+    let (malformed_id, malformed_ty) = builder.raw_int_enum(module, "Malformed", vec![("Idle", 0)]);
+    let state_option = builder.alloc_type(TypeData::Optional(state_ty));
+    let adt_option = builder.alloc_type(TypeData::Optional(adt_ty));
+    let malformed_option = builder.alloc_type(TypeData::Optional(malformed_ty));
+    let int_option = builder.alloc_type(TypeData::Optional(int_ty));
+
+    let mut fb = FunctionBuilder::new("bad_raw_try", module, FunctionKind::Normal, void_ty);
+    let raw_int = fb.push_param("raw_int", int_ty, ParamRole::Normal);
+    let raw_string = fb.push_param("raw_string", string_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return_void());
+    for value in [
+        RValue::RawTryConstruct {
+            value: op_place(raw_string, string_ty),
+            target: state_ty,
+            ty: state_option,
+        },
+        RValue::RawTryConstruct {
+            value: op_place(raw_int, int_ty),
+            target: adt_ty,
+            ty: adt_option,
+        },
+        RValue::RawTryConstruct {
+            value: op_place(raw_int, int_ty),
+            target: state_ty,
+            ty: int_option,
+        },
+        RValue::RawTryConstruct {
+            value: op_place(raw_int, int_ty),
+            target: malformed_ty,
+            ty: malformed_option,
+        },
+    ] {
+        fb.add_statement(block, stmt_eval(value));
+    }
+    let entry = builder.alloc_function(fb.finish());
+    builder.set_entry(entry);
+    let mut program = builder.finish();
+    program.enum_decl_mut(malformed_id).repr = crate::air::EnumRepr::RawString;
+
+    let errors = verify(&program).expect_err("invalid raw construction verified");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| matches!(
+                error.kind,
+                EK::BadRValue(BadRValue::RawTryConstructMustMatch { .. })
+            ))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn raw_enum_projection_must_match_backing() {
     let mut builder = ProgramBuilder::default();
     let string_ty = builder.string_ty();
     let void_ty = builder.void_ty();
@@ -4909,7 +5018,7 @@ fn raw_enum_cast_must_match_backing() {
         let state = fb.push_param("state", enum_ty, ParamRole::Normal);
         fb.add_statement(
             bb0,
-            stmt_eval(RValue::Cast {
+            stmt_eval(RValue::RawProject {
                 value: op_place(state, enum_ty),
                 target: string_ty,
             }),
@@ -4918,13 +5027,13 @@ fn raw_enum_cast_must_match_backing() {
 
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+        EK::BadRValue(BadRValue::RawProjectMustMatchBacking { value, target })
             if value == enum_ty && target == string_ty
     )));
 }
 
 #[test]
-fn non_raw_enum_cast_to_primitive_is_invalid() {
+fn non_raw_enum_projection_to_primitive_is_invalid() {
     let mut builder = ProgramBuilder::default();
     let int_ty = builder.int_ty();
     let void_ty = builder.void_ty();
@@ -4935,7 +5044,7 @@ fn non_raw_enum_cast_to_primitive_is_invalid() {
         let state = fb.push_param("state", enum_ty, ParamRole::Normal);
         fb.add_statement(
             bb0,
-            stmt_eval(RValue::Cast {
+            stmt_eval(RValue::RawProject {
                 value: op_place(state, enum_ty),
                 target: int_ty,
             }),
@@ -4944,7 +5053,7 @@ fn non_raw_enum_cast_to_primitive_is_invalid() {
 
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+        EK::BadRValue(BadRValue::RawProjectMustMatchBacking { value, target })
             if value == enum_ty && target == int_ty
     )));
 }
@@ -4961,7 +5070,7 @@ fn primitive_cast_to_enum_is_invalid() {
         let raw = fb.push_param("raw", int_ty, ParamRole::Normal);
         fb.add_statement(
             bb0,
-            stmt_eval(RValue::Cast {
+            stmt_eval(RValue::RawProject {
                 value: op_place(raw, int_ty),
                 target: enum_ty,
             }),
@@ -4970,7 +5079,7 @@ fn primitive_cast_to_enum_is_invalid() {
 
     assert!(errors.iter().any(|e| matches!(
         e.kind,
-        EK::BadRValue(BadRValue::CastMustConvertIntAndFloat { value, target })
+        EK::BadRValue(BadRValue::RawProjectMustMatchBacking { value, target })
             if value == int_ty && target == enum_ty
     )));
 }
@@ -7912,4 +8021,192 @@ fn pattern_match_alias_binding_does_not_escape_arm() {
         e.kind,
         EK::BadStatement(BadStatement::ReadUninitializedLocal(local)) if local == binding
     )));
+}
+
+#[test]
+fn flag_operations_reject_scalar_and_mismatched_shapes() {
+    let mut builder = ProgramBuilder::default();
+    let int_ty = builder.int_ty();
+    let bool_ty = builder.bool_ty();
+    let void_ty = builder.void_ty();
+    let module = test_module(&mut builder);
+    let flag = builder.alloc_flag(FlagDecl {
+        name: Ident::new("Access"),
+        module,
+        known_bits: 1,
+        members: vec![FlagMemberDecl {
+            id: FlagMemberId::from_index(0),
+            name: Ident::new("Read"),
+            value: 1,
+            atomic: true,
+        }],
+    });
+    let flag_ty = builder.alloc_type(TypeData::Flag(flag));
+    let mut fb = FunctionBuilder::new("bad_flag_ops", module, FunctionKind::Normal, void_ty);
+    let value = fb.push_param("value", flag_ty, ParamRole::Normal);
+    let raw = fb.push_param("raw", int_ty, ParamRole::Normal);
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(
+        block,
+        stmt_eval(RValue::Binary {
+            op: crate::ast::BinaryOp::Add,
+            lhs: op_place(value, flag_ty),
+            rhs: op_place(value, flag_ty),
+            ty: flag_ty,
+        }),
+    );
+    fb.add_statement(
+        block,
+        stmt_eval(RValue::Binary {
+            op: crate::ast::BinaryOp::BitOr,
+            lhs: op_place(value, flag_ty),
+            rhs: op_place(value, flag_ty),
+            ty: bool_ty,
+        }),
+    );
+    fb.add_statement(
+        block,
+        stmt_eval(RValue::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            value: op_place(value, flag_ty),
+            ty: int_ty,
+        }),
+    );
+    fb.add_statement(
+        block,
+        stmt_eval(RValue::FlagStatic {
+            op: FlagStaticOp::Empty,
+            ty: int_ty,
+        }),
+    );
+    for (subject, subject_ty, bits) in [(value, flag_ty, 2), (raw, int_ty, 1)] {
+        fb.add_statement(
+            block,
+            AirStmt::PatternMatch(AirPatternMatch {
+                subject: place(subject, subject_ty),
+                arms: vec![AirPatternArm {
+                    alternatives: vec![AirPatternAlternative {
+                        tests: vec![AirPatternTest::FlagValue {
+                            path: AirPatternPath::default(),
+                            flag,
+                            bits,
+                        }],
+                        bindings: vec![],
+                    }],
+                    block: AirBlock::default(),
+                }],
+            }),
+        );
+    }
+    let entry = builder.alloc_function(fb.finish());
+    builder.set_entry(entry);
+
+    let errors = verify(&builder.finish()).expect_err("malformed flag operations verified");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| matches!(
+                error.kind,
+                EK::BadRValue(
+                    BadRValue::BinaryTypeMismatch { .. } | BadRValue::UnaryTypeMismatch { .. }
+                )
+            ))
+            .count(),
+        3
+    );
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadRValue(BadRValue::FlagStaticMustBeFlag(ty)) if ty == int_ty
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::PatternUnknownBits { flag: found, bits: 2 }) if found == flag
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::PatternTypeMismatch { flag: found, found: ty })
+            if found == flag && ty == int_ty
+    )));
+}
+
+#[test]
+fn flag_metadata_requires_valid_member_domain() {
+    let mut program = Program::default();
+    let module = program.alloc_module(Module::default());
+    let flag = program.alloc_flag(FlagDecl {
+        name: Ident::new("Access"),
+        module,
+        known_bits: 3,
+        members: vec![
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(7),
+                name: Ident::new("Read"),
+                value: 1,
+                atomic: true,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(1),
+                name: Ident::new("Negative"),
+                value: -1,
+                atomic: false,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(2),
+                name: Ident::new("Duplicate"),
+                value: 1,
+                atomic: true,
+            },
+            FlagMemberDecl {
+                id: FlagMemberId::from_index(3),
+                name: Ident::new("All"),
+                value: 5,
+                atomic: true,
+            },
+        ],
+    });
+    program.module_mut(module).flags.push(flag);
+    let ty = program.type_arena.alloc(TypeData::Flag(flag));
+    program
+        .type_arena
+        .alloc(TypeData::Flag(FlagId::from_index(99)));
+    program.const_arena.alloc(ConstData {
+        ty,
+        value: ConstValue::Flag { flag, bits: 8 },
+    });
+
+    let errors = verify(&program).unwrap_err();
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::UnknownCompositeBits(FlagMemberId(3)))
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::AtomicMismatch(FlagMemberId(3)))
+    )));
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadFlag(BadFlag::KnownBitsMismatch)))
+    );
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::MemberIdMismatch(FlagMemberId(7)))
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::NegativeValue(FlagMemberId(1)))
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadFlag(BadFlag::DuplicateValue(FlagMemberId(2)))
+    )));
+    assert!(errors.iter().any(|error| matches!(
+        error.kind,
+        EK::BadReference(BadReference::InvalidFlag(FlagId(99)))
+    )));
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, EK::BadConst(BadConst::InvalidFlagValue)))
+    );
 }

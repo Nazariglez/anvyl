@@ -5,6 +5,7 @@ pub mod diagnostic;
 pub mod externs;
 pub mod lexer;
 pub mod lint;
+pub mod numeric_literal;
 pub mod parser;
 pub mod pipeline;
 pub mod resolve;

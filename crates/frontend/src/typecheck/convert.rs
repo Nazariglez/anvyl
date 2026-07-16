@@ -1,6 +1,7 @@
 use super::{
-    CastConversionMatch, CastFromConversion, CheckedType, DynContainerConversionKind, EnumRepr,
-    TypeChecker, TypeError, TypeHandle, check_value_expr_checked_with_hint, checked_from_type,
+    CastConversionMatch, CastFromConversion, CheckedType, DynContainerConversionKind,
+    RawProjectionFact, RawTryConstructFact, TypeChecker, TypeError, TypeHandle,
+    check_value_expr_checked_with_hint, checked_from_type,
     contracts::{self, ContractMatchError, RequirementError},
     downcast,
     projection::{
@@ -26,6 +27,7 @@ pub(super) enum ExplicitCast {
 
 pub(super) enum ResolvedFailableCast {
     DynamicDowncast,
+    RawTryConstruct,
     CastFrom(CastFromConversion),
 }
 
@@ -52,27 +54,41 @@ impl TypeChecker {
             .add_handle_equal(self.error_span(span), left, right);
     }
 
-    fn explicit_cast_conversion(&mut self, source: &Type, target: &Type) -> Option<ExplicitCast> {
+    fn explicit_cast_conversion(
+        &mut self,
+        source: &Type,
+        target: &Type,
+    ) -> Result<Option<ExplicitCast>, RawEnumCastRejection> {
         if source == target {
-            return Some(ExplicitCast::Identity);
+            return Ok(Some(ExplicitCast::Identity));
         }
         if builtin_numeric_cast(source, target) {
-            return Some(ExplicitCast::Builtin);
+            return Ok(Some(ExplicitCast::Builtin));
         }
-        match classify_raw_enum_cast(&self.decls, source, target) {
-            Some(RawEnumCast::Accept) => return Some(ExplicitCast::RawEnum),
-            Some(RawEnumCast::Reject) => return None,
-            None => {}
+        let raw_rejection = match classify_raw_enum_cast(&self.decls, source, target) {
+            Some(RawEnumCast::Accept) => return Ok(Some(ExplicitCast::RawEnum)),
+            Some(RawEnumCast::Reject(
+                rejection @ (RawEnumCastRejection::WrongBacking { .. }
+                | RawEnumCastRejection::NonRaw),
+            )) => Some(rejection),
+            None => None,
+        };
+        match self.cast_from_conversion(source, target) {
+            Some(conversion) => Ok(Some(ExplicitCast::CastFrom(conversion))),
+            None => match raw_rejection {
+                Some(rejection) => Err(rejection),
+                None => Ok(None),
+            },
         }
-        self.cast_from_conversion(source, target)
-            .map(ExplicitCast::CastFrom)
     }
 
     pub(super) fn explicit_cast_plan_without_effects(
         &mut self,
+        span: Span,
         source: &Type,
         target: &Type,
-    ) -> Option<ExplicitCast> {
+    ) -> Result<Option<ExplicitCast>, RawEnumCastRejection> {
+        self.ensure_pending_enum_values_for_type(source, span);
         self.probe_compatibility_without_effects(|tc| tc.explicit_cast_conversion(source, target))
     }
 
@@ -107,6 +123,17 @@ pub(super) fn resolve_failable_cast(
     target: &Type,
     tc: &mut TypeChecker,
 ) -> Option<ResolvedFailableCast> {
+    tc.ensure_pending_enum_values_for_type(target, cast.span);
+    if tc.decls.enum_schema_for_type(target).is_some_and(|schema| {
+        schema
+            .body
+            .kind
+            .raw()
+            .is_some_and(|raw| raw.backing.ty() == *source)
+            || (schema.body.kind.flag().is_some() && *source == Type::Int)
+    }) {
+        return Some(ResolvedFailableCast::RawTryConstruct);
+    }
     if matches!(source, Type::Dyn(_)) && downcast::runtime_target_valid(tc, target) {
         return Some(ResolvedFailableCast::DynamicDowncast);
     }
@@ -559,7 +586,13 @@ fn requirement_error_detail(name: Ident, error: &RequirementError) -> String {
 
 enum RawEnumCast {
     Accept,
-    Reject,
+    Reject(RawEnumCastRejection),
+}
+
+#[derive(Clone)]
+pub(super) enum RawEnumCastRejection {
+    WrongBacking { expected: Box<Type> },
+    NonRaw,
 }
 
 fn classify_raw_enum_cast(
@@ -567,50 +600,47 @@ fn classify_raw_enum_cast(
     source: &Type,
     target: &Type,
 ) -> Option<RawEnumCast> {
-    if matches!(target, Type::Int | Type::String)
-        && let Some(key) = decls.key_for_type(source)
-        && decls
-            .enum_repr_for_key(&key)
-            .is_some_and(|repr| repr != EnumRepr::Adt)
-    {
-        return Some(if decls.raw_enum_raw_type(&key).as_ref() == Some(target) {
-            RawEnumCast::Accept
-        } else {
-            RawEnumCast::Reject
-        });
+    if !matches!(target, Type::Int | Type::String) {
+        return None;
     }
-    None
+    let kind = &decls.enum_schema_for_type(source)?.body.kind;
+    let Some(expected) = kind
+        .raw()
+        .map(|raw| raw.backing.ty())
+        .or_else(|| kind.flag().map(|_| Type::Int))
+    else {
+        return Some(RawEnumCast::Reject(RawEnumCastRejection::NonRaw));
+    };
+    Some(if expected == *target {
+        RawEnumCast::Accept
+    } else {
+        RawEnumCast::Reject(RawEnumCastRejection::WrongBacking {
+            expected: Box::new(expected),
+        })
+    })
 }
 
-fn push_raw_enum_cast_error(tc: &mut TypeChecker, span: Span, from: &Type, to: &Type) -> bool {
-    let from_key = tc.decls.key_for_type(from);
-    if let Some(key) = from_key
-        && matches!(to, Type::Int | Type::String)
-    {
-        match tc.decls.enum_repr_for_key(&key) {
-            Some(EnumRepr::RawInt | EnumRepr::RawString) => {
-                if let Some(raw_ty) = tc.decls.raw_enum_raw_type(&key) {
-                    tc.push_error(TypeError::RawEnumWrongRawCast {
-                        enum_ty: from.clone(),
-                        expected: raw_ty,
-                        found: to.clone(),
-                        span: tc.error_span(span),
-                    });
-                    return true;
-                }
-            }
-            Some(EnumRepr::Adt) => {
-                tc.push_error(TypeError::NonRawEnumRawCast {
-                    enum_ty: from.clone(),
-                    raw_ty: to.clone(),
-                    span: tc.error_span(span),
-                });
-                return true;
-            }
-            None => {}
-        }
-    }
-    false
+fn push_raw_enum_cast_error(
+    tc: &mut TypeChecker,
+    span: Span,
+    from: &Type,
+    to: &Type,
+    rejection: RawEnumCastRejection,
+) {
+    let error = match rejection {
+        RawEnumCastRejection::WrongBacking { expected } => TypeError::RawEnumWrongRawCast {
+            enum_ty: from.clone(),
+            expected: *expected,
+            found: to.clone(),
+            span: tc.error_span(span),
+        },
+        RawEnumCastRejection::NonRaw => TypeError::NonRawEnumRawCast {
+            enum_ty: from.clone(),
+            raw_ty: to.clone(),
+            span: tc.error_span(span),
+        },
+    };
+    tc.push_error(error);
 }
 
 fn builtin_numeric_cast(source: &Type, target: &Type) -> bool {
@@ -636,16 +666,24 @@ pub(super) fn check_cast_expr(
         ExpectedProjectionMode::ExplicitCast,
     ) {
         ExpectedFit::SourceAccepted(SourceAcceptance::ExplicitCast { conversion }) => {
-            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            apply_explicit_cast_effects(expr, cast, &from, &target, conversion, tc);
             cast_expr_checked(expr, target, checked.contains_extern_any, tc)
         }
         ExpectedFit::Project {
             projection,
             acceptance: SourceAcceptance::ExplicitCast { conversion },
         } => {
+            if matches!(conversion, ExplicitCast::RawEnum) {
+                tc.push_error(TypeError::InvalidCast {
+                    from,
+                    to: target,
+                    span: tc.error_span(cast.span),
+                });
+                return cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc);
+            }
             let projected =
                 apply_value_projection(tc, &cast.node.expr, &checked, &from, projection);
-            apply_explicit_cast_effects(expr, cast, conversion, tc);
+            apply_explicit_cast_effects(expr, cast, &projected.ty, &target, conversion, tc);
             cast_expr_checked(expr, target, projected.contains_extern_any, tc)
         }
         ExpectedFit::Deferred if matches!(from, Type::Infer) || matches!(target, Type::Infer) => {
@@ -662,29 +700,34 @@ pub(super) fn check_cast_expr(
                 super::projection::ExpectedProjectionDecision::Failed => {}
                 super::projection::ExpectedProjectionDecision::SourceAccepted
                 | super::projection::ExpectedProjectionDecision::NotNeeded
-                | super::projection::ExpectedProjectionDecision::Project(_) => unreachable!(),
+                | super::projection::ExpectedProjectionDecision::Project(_)
+                | super::projection::ExpectedProjectionDecision::RawProject(_) => unreachable!(),
             }
+            cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
+        }
+        ExpectedFit::ExplicitCastRejected(rejection) => {
+            push_raw_enum_cast_error(tc, cast.span, &from, &target, rejection);
             cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
         ExpectedFit::Deferred | ExpectedFit::Mismatch => {
-            if !push_raw_enum_cast_error(tc, cast.span, &from, &target) {
-                if tc.cast_from_ambiguous(&from, &target) {
-                    tc.push_error(TypeError::AmbiguousCast {
-                        from,
-                        to: target,
-                        span: tc.error_span(cast.span),
-                    });
-                } else {
-                    tc.push_error(TypeError::InvalidCast {
-                        from,
-                        to: target,
-                        span: tc.error_span(cast.span),
-                    });
-                }
+            if tc.cast_from_ambiguous(&from, &target) {
+                tc.push_error(TypeError::AmbiguousCast {
+                    from,
+                    to: target,
+                    span: tc.error_span(cast.span),
+                });
+            } else {
+                tc.push_error(TypeError::InvalidCast {
+                    from,
+                    to: target,
+                    span: tc.error_span(cast.span),
+                });
             }
             cast_expr_checked(expr, Type::Infer, checked.contains_extern_any, tc)
         }
-        ExpectedFit::SourceAccepted(_) | ExpectedFit::Project { .. } => unreachable!(),
+        ExpectedFit::SourceAccepted(_)
+        | ExpectedFit::Project { .. }
+        | ExpectedFit::RawProject(_) => unreachable!(),
     }
 }
 
@@ -710,6 +753,19 @@ pub(super) fn check_failable_cast_expr(
             }
             downcast::check_expr_with_source(expr, cast, target, expected, checked, tc)
         }
+        Some(ResolvedFailableCast::RawTryConstruct) => {
+            if let Some(local) = tc.direct_local_id(&cast.node.expr) {
+                tc.record_local_use(cast.node.expr.node.id, local, super::LocalUseMode::Read);
+            }
+            tc.record_raw_try_construct(RawTryConstructFact {
+                expr_id: expr.node.id,
+                source_expr: cast.node.expr.node.id,
+                source_ty: source,
+                target_ty: target,
+                result_ty: ty.clone(),
+            });
+            cast_expr_checked(expr, ty, checked.contains_extern_any, tc)
+        }
         Some(ResolvedFailableCast::CastFrom(conversion)) => {
             tc.record_user_cast_conversion(expr.node.id, cast.node.expr.node.id, &conversion);
             cast_expr_checked(expr, ty, checked.contains_extern_any, tc)
@@ -721,6 +777,8 @@ pub(super) fn check_failable_cast_expr(
 fn apply_explicit_cast_effects(
     expr: &ExprNode,
     cast: &CastNode,
+    source_ty: &Type,
+    target_ty: &Type,
     conversion: ExplicitCast,
     tc: &mut TypeChecker,
 ) {
@@ -734,7 +792,13 @@ fn apply_explicit_cast_effects(
             tc.record_conversion_escape(&cast.node.expr, conversion.escape);
             tc.record_user_cast_conversion(expr.node.id, cast.node.expr.node.id, &conversion);
         }
-        ExplicitCast::Builtin | ExplicitCast::RawEnum => {}
+        ExplicitCast::RawEnum => tc.record_raw_projection(RawProjectionFact {
+            expr_id: expr.node.id,
+            source_expr: cast.node.expr.node.id,
+            source_ty: source_ty.clone(),
+            target_ty: target_ty.clone(),
+        }),
+        ExplicitCast::Builtin => {}
     }
 }
 

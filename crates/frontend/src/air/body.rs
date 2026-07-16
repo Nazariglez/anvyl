@@ -289,6 +289,9 @@ pub enum AirPatternPathStep {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AirPatternTest {
+    Any {
+        branches: Vec<Vec<AirPatternTest>>,
+    },
     Literal {
         path: AirPatternPath,
         value: ConstId,
@@ -303,6 +306,11 @@ pub enum AirPatternTest {
         path: AirPatternPath,
         enum_id: EnumId,
         variant: VariantId,
+    },
+    FlagValue {
+        path: AirPatternPath,
+        flag: FlagId,
+        bits: i64,
     },
 }
 
@@ -496,6 +504,12 @@ pub enum IterCountCheck {
     StepByPositive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagStaticOp {
+    Empty,
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
@@ -551,6 +565,19 @@ pub enum RValue {
     Cast {
         value: Operand,
         target: TypeId,
+    },
+    RawProject {
+        value: Operand,
+        target: TypeId,
+    },
+    RawTryConstruct {
+        value: Operand,
+        target: TypeId,
+        ty: TypeId,
+    },
+    FlagStatic {
+        op: FlagStaticOp,
+        ty: TypeId,
     },
     Aggregate {
         kind: AggregateCtor,
@@ -973,6 +1000,8 @@ impl RValue {
             Self::Unary { value, .. }
             | Self::OptionalSome { value, .. }
             | Self::Cast { value, .. }
+            | Self::RawProject { value, .. }
+            | Self::RawTryConstruct { value, .. }
             | Self::Stringify { value, .. }
             | Self::Format { value, .. }
             | Self::CheckedIterCount { count: value, .. } => emit_operand(f, value, ValueUse::Read),
@@ -1044,7 +1073,7 @@ impl RValue {
                 emit_place(f, map, PlaceUse::Read);
                 f(AirChild::LocalRead(*index));
             }
-            Self::FunctionRef { .. } => {}
+            Self::FunctionRef { .. } | Self::FlagStatic { .. } => {}
             Self::MakeLambda { captures, .. } => {
                 for capture in captures {
                     f(AirChild::LambdaCapture(capture));

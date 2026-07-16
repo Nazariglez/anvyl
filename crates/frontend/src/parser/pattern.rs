@@ -10,6 +10,7 @@ use super::{
 use crate::{
     ast,
     lexer::{Delimiter, Keyword, Op, Token},
+    numeric_literal::NumericLiteral,
     span::{SourceSpan, Spanned},
 };
 
@@ -87,11 +88,18 @@ pub(super) fn pattern<'src>() -> BoxedParser<'src, ast::PatternNode> {
             minus
                 .or_not()
                 .then(literal())
-                .try_map(|(neg, lit), span| match (&neg, &lit) {
-                    (Some(()), ast::Lit::Int(n)) => Ok(ast::Lit::Int(-n)),
-                    (Some(()), ast::Lit::Float(value)) => Ok(ast::Lit::Float(-value)),
+                .try_map(|(neg, lit), span| match (neg, lit) {
+                    (Some(()), ast::Lit::Int(n)) => n
+                        .value()
+                        .checked_neg()
+                        .map(|value| ast::Lit::Int(NumericLiteral::new(format!("-{n}"), value)))
+                        .ok_or_else(|| Rich::custom(span, "integer literal overflow")),
+                    (Some(()), ast::Lit::Float(n)) => Ok(ast::Lit::Float(NumericLiteral::new(
+                        format!("-{n}"),
+                        -n.into_value(),
+                    ))),
                     (Some(()), _) => Err(Rich::custom(span, "cannot negate non-numeric literal")),
-                    (None, _) => Ok(lit),
+                    (None, lit) => Ok(lit),
                 });
 
         let range_op = select! {

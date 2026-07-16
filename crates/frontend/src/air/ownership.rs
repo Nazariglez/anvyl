@@ -100,9 +100,12 @@ impl TypePassClassAnalyzer<'_> {
             return TypePassClass::Opaque;
         };
         match data {
-            TypeData::Int | TypeData::Float | TypeData::Bool | TypeData::Char | TypeData::Void => {
-                TypePassClass::Immediate
-            }
+            TypeData::Int
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::Void
+            | TypeData::Flag(_) => TypePassClass::Immediate,
             TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
                 TypePassClass::ManagedBuffer
             }
@@ -221,7 +224,9 @@ impl TypePassClassAnalyzer<'_> {
     fn copy_layout(&mut self, ty: TypeId) -> LayoutResult {
         match self.classify(ty) {
             TypePassClass::Immediate => LayoutResult::Copy(match self.program.type_arena.get(ty) {
-                Some(TypeData::Int | TypeData::Float) => AirCopyLayout { size: 8, align: 8 },
+                Some(TypeData::Int | TypeData::Float | TypeData::Flag(_)) => {
+                    AirCopyLayout { size: 8, align: 8 }
+                }
                 Some(TypeData::Bool) => AirCopyLayout { size: 1, align: 1 },
                 Some(TypeData::Char) => AirCopyLayout { size: 4, align: 4 },
                 Some(TypeData::Void) => AirCopyLayout { size: 0, align: 1 },

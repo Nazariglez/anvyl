@@ -55,6 +55,7 @@ pub enum VerifySite {
     Const(ConstId),
     Aggregate(AggregateId),
     Enum(EnumId),
+    Flag(FlagId),
     ExternType(ExternTypeId),
     Extern(ExternId),
     Lambda(LambdaId),
@@ -91,6 +92,7 @@ pub enum VerifyErrorKind {
     BadConst(BadConst),
     BadModule(BadModule),
     BadEnum(BadEnum),
+    BadFlag(BadFlag),
     BadRValue(BadRValue),
     BadStatement(BadStatement),
     BadExtern(BadExtern),
@@ -177,12 +179,19 @@ pub enum BadType {
         first: TypeId,
         duplicate: TypeId,
     },
+    MissingFlag(FlagId),
+    DuplicateFlag {
+        flag: FlagId,
+        first: TypeId,
+        duplicate: TypeId,
+    },
     Recursive(TypeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadConst {
     TypeMismatch { expected: TypeId, found: TypeId },
+    InvalidFlagValue,
     NilMustBeOptional(TypeId),
     MissingPrimitive(PrimitiveKind),
 }
@@ -198,6 +207,19 @@ pub enum BadEnum {
     RawIntVariantValueType(VariantId),
     RawStringVariantValueType(VariantId),
     DuplicateRawValue(VariantId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BadFlag {
+    KnownBitsNegative,
+    MemberIdMismatch(FlagMemberId),
+    NegativeValue(FlagMemberId),
+    AtomicMismatch(FlagMemberId),
+    DuplicateValue(FlagMemberId),
+    UnknownCompositeBits(FlagMemberId),
+    PatternTypeMismatch { flag: FlagId, found: TypeId },
+    PatternUnknownBits { flag: FlagId, bits: i64 },
+    KnownBitsMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +239,7 @@ pub enum ModuleItem {
     Global(GlobalId),
     Aggregate(AggregateId),
     Enum(EnumId),
+    Flag(FlagId),
     ExternType(ExternTypeId),
     Extern(ExternId),
 }
@@ -238,6 +261,16 @@ pub enum BadRValue {
         value: TypeId,
         target: TypeId,
     },
+    RawProjectMustMatchBacking {
+        value: TypeId,
+        target: TypeId,
+    },
+    RawTryConstructMustMatch {
+        value: TypeId,
+        target: TypeId,
+        result: TypeId,
+    },
+    FlagStaticMustBeFlag(TypeId),
     StringConcatPartMustBeString(TypeId),
     StringifyOperandTypeMismatch {
         operand: TypeId,
@@ -350,6 +383,7 @@ pub enum BadStatement {
     AssignUninitializedCaptureCell(CaptureCellId),
     InitImmutableLocalTwice(LocalId),
     InvalidDynMatch,
+    InvalidPatternMatch,
     DynMatchRootUsed,
     DynMatchAliasEscapes(LocalId),
 }
@@ -364,6 +398,7 @@ pub enum BadReference {
     InvalidExternType(ExternTypeId),
     InvalidAggregate(AggregateId),
     InvalidEnum(EnumId),
+    InvalidFlag(FlagId),
     InvalidType(TypeId),
     InvalidConst(ConstId),
     InvalidLocal(LocalId),
@@ -891,6 +926,10 @@ impl<'a> VerifyCx<'a> {
         id.index() < self.program.enums.len()
     }
 
+    fn has_flag(&self, id: FlagId) -> bool {
+        id.index() < self.program.flags.len()
+    }
+
     fn has_extern_type(&self, id: ExternTypeId) -> bool {
         id.index() < self.program.extern_types.len()
     }
@@ -1358,6 +1397,9 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
     for (id, _) in cx.program.enums.iter().enumerate() {
         verify_enum(cx, EnumId::from_index(id));
     }
+    for (id, _) in cx.program.flags.iter().enumerate() {
+        verify_flag(cx, FlagId::from_index(id));
+    }
     for (id, _) in cx.program.extern_types.iter().enumerate() {
         verify_extern_type(cx, ExternTypeId::from_index(id));
     }
@@ -1389,6 +1431,7 @@ fn collect_errors(cx: &mut VerifyCx<'_>) {
 fn verify_nominal_type_identity(cx: &mut VerifyCx<'_>) {
     let mut aggregates = std::collections::HashMap::new();
     let mut enums = std::collections::HashMap::new();
+    let mut flags = std::collections::HashMap::new();
     for (index, ty) in cx.program.type_arena.iter().enumerate() {
         let current = TypeId::from_index(index);
         match ty {
@@ -1433,6 +1476,18 @@ fn verify_nominal_type_identity(cx: &mut VerifyCx<'_>) {
                     );
                 }
             }
+            TypeData::Flag(flag) => {
+                if let Some(first) = flags.insert(*flag, current) {
+                    cx.push(
+                        VerifySite::Type(current),
+                        VerifyErrorKind::BadType(BadType::DuplicateFlag {
+                            flag: *flag,
+                            first,
+                            duplicate: current,
+                        }),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1451,6 +1506,15 @@ fn verify_nominal_type_identity(cx: &mut VerifyCx<'_>) {
             cx.push(
                 VerifySite::Program,
                 VerifyErrorKind::BadType(BadType::MissingEnum(enm)),
+            );
+        }
+    }
+    for index in 0..cx.program.flags.len() {
+        let flag = FlagId::from_index(index);
+        if !flags.contains_key(&flag) {
+            cx.push(
+                VerifySite::Program,
+                VerifyErrorKind::BadType(BadType::MissingFlag(flag)),
             );
         }
     }
@@ -1939,6 +2003,9 @@ fn verify_module(cx: &mut VerifyCx<'_>, id: ModuleId) {
     verify_module_items(cx, &site, id, &module.enums, |cx, item| {
         cx.program.enums.get(item.index()).map(|decl| decl.module)
     });
+    verify_module_items(cx, &site, id, &module.flags, |cx, item| {
+        cx.program.flags.get(item.index()).map(|decl| decl.module)
+    });
     verify_module_items(cx, &site, id, &module.extern_types, |cx, item| {
         cx.program
             .extern_types
@@ -2005,6 +2072,7 @@ impl_module_ref!(FunctionId, InvalidFunction, Function);
 impl_module_ref!(GlobalId, InvalidGlobal, Global);
 impl_module_ref!(AggregateId, InvalidAggregate, Aggregate);
 impl_module_ref!(EnumId, InvalidEnum, Enum);
+impl_module_ref!(FlagId, InvalidFlag, Flag);
 impl_module_ref!(ExternTypeId, InvalidExternType, ExternType);
 impl_module_ref!(ExternId, InvalidExtern, Extern);
 
@@ -3000,6 +3068,29 @@ fn verify_const(cx: &mut VerifyCx<'_>, id: ConstId) {
     }
     let expected = match &konst.value {
         ConstValue::Int(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Int),
+        ConstValue::Flag { flag, bits } => {
+            let valid = cx
+                .program
+                .flags
+                .get(flag.index())
+                .is_some_and(|decl| *bits >= 0 && *bits & !decl.known_bits == 0);
+            if !valid {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadConst(BadConst::InvalidFlagValue),
+                );
+            }
+            match cx.program.type_data(konst.ty) {
+                TypeData::Flag(found) if found == flag => Some(konst.ty),
+                _ => {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadConst(BadConst::InvalidFlagValue),
+                    );
+                    None
+                }
+            }
+        }
         ConstValue::Float(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Float),
         ConstValue::Bool(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::Bool),
         ConstValue::String(_) => required_const_primitive(cx, site.clone(), PrimitiveKind::String),
@@ -3321,6 +3412,63 @@ fn verify_extern_variants(cx: &mut VerifyCx<'_>, site: &VerifySite, ty: &super::
         for field_abi in &abi.fields {
             verify_extern_abi(cx, site, field_abi, AbiPosition::Field);
         }
+    }
+}
+
+fn verify_flag(cx: &mut VerifyCx<'_>, id: FlagId) {
+    let flag = cx.program.flag_decl(id);
+    let site = VerifySite::Flag(id);
+    cx.verify_module_ref(site.clone(), flag.module);
+    verify_decl_listed_once(cx, site.clone(), flag.module, id, |m| &m.flags);
+    if flag.known_bits < 0 {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadFlag(BadFlag::KnownBitsNegative),
+        );
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut known_bits = 0;
+    for (index, member) in flag.members.iter().enumerate() {
+        let expected_id = FlagMemberId::from_index(index);
+        if member.id != expected_id {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFlag(BadFlag::MemberIdMismatch(member.id)),
+            );
+        }
+        if member.value < 0 {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFlag(BadFlag::NegativeValue(member.id)),
+            );
+            continue;
+        }
+        let atomic = member.value > 0 && member.value & (member.value - 1) == 0;
+        if member.atomic != atomic {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFlag(BadFlag::AtomicMismatch(member.id)),
+            );
+        }
+        if !atomic && member.value & !known_bits != 0 {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFlag(BadFlag::UnknownCompositeBits(member.id)),
+            );
+        }
+        if !seen.insert(member.value) {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadFlag(BadFlag::DuplicateValue(member.id)),
+            );
+        }
+        if atomic {
+            known_bits |= member.value;
+        }
+    }
+    if flag.known_bits != known_bits {
+        cx.push(site, VerifyErrorKind::BadFlag(BadFlag::KnownBitsMismatch));
     }
 }
 
@@ -5161,6 +5309,8 @@ fn verify_collection_loan_contract_rvalue(
         | RValue::FunctionValue { value: op, .. }
         | RValue::Unary { value: op, .. }
         | RValue::Cast { value: op, .. }
+        | RValue::RawProject { value: op, .. }
+        | RValue::RawTryConstruct { value: op, .. }
         | RValue::OptionalSome { value: op, .. }
         | RValue::Stringify { value: op, .. }
         | RValue::Format { value: op, .. } => verify_collection_loan_contract_operand(
@@ -5457,7 +5607,7 @@ fn verify_collection_loan_contract_rvalue(
             active_slots,
             false,
         ),
-        RValue::FunctionRef { .. } => {}
+        RValue::FunctionRef { .. } | RValue::FlagStatic { .. } => {}
         RValue::MakeLambda {
             lambda, captures, ..
         } => {
@@ -5837,6 +5987,13 @@ fn verify_air_pattern_match(
 
     let mut fallthrough = vec![];
     for arm in &match_.arms {
+        if arm.alternatives.is_empty() {
+            cx.push(
+                site.clone(),
+                VerifyErrorKind::BadStatement(BadStatement::InvalidPatternMatch),
+            );
+            continue;
+        }
         for alternative in &arm.alternatives {
             verify_air_pattern_alternative(cx, &site, function_id, subject_ty, alternative);
         }
@@ -6305,6 +6462,32 @@ fn verify_air_pattern_alternative(
     let mut optional_guards = Vec::new();
     for test in &alternative.tests {
         match test {
+            AirPatternTest::Any { branches } => {
+                if branches.is_empty()
+                    || branches
+                        .iter()
+                        .flatten()
+                        .any(|test| !pattern_disjunction_test_supported(test))
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadStatement(BadStatement::InvalidPatternMatch),
+                    );
+                    continue;
+                }
+                for tests in branches {
+                    verify_air_pattern_alternative(
+                        cx,
+                        site,
+                        function_id,
+                        subject_ty,
+                        &AirPatternAlternative {
+                            tests: tests.clone(),
+                            bindings: vec![],
+                        },
+                    );
+                }
+            }
             AirPatternTest::Literal { path, value } => {
                 if !cx.has_const(*value) {
                     cx.push(
@@ -6343,6 +6526,37 @@ fn verify_air_pattern_alternative(
                     optional_guards.push(path.clone());
                 }
             }
+            AirPatternTest::FlagValue { path, flag, bits } => {
+                if !cx.has_flag(*flag) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadReference(BadReference::InvalidFlag(*flag)),
+                    );
+                    continue;
+                }
+                if let Some(path_ty) =
+                    verify_pattern_path(cx, site, subject_ty, &guards, &optional_guards, path)
+                    && !matches!(cx.type_data(path_ty), Some(TypeData::Flag(found)) if found == flag)
+                {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFlag(BadFlag::PatternTypeMismatch {
+                            flag: *flag,
+                            found: path_ty,
+                        }),
+                    );
+                }
+                let known_bits = cx.program.flag_decl(*flag).known_bits;
+                if *bits < 0 || *bits & !known_bits != 0 {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadFlag(BadFlag::PatternUnknownBits {
+                            flag: *flag,
+                            bits: *bits,
+                        }),
+                    );
+                }
+            }
             AirPatternTest::EnumVariant {
                 path,
                 enum_id,
@@ -6375,6 +6589,26 @@ fn verify_air_pattern_alternative(
         }
     }
     let _ = function_id;
+}
+
+fn pattern_disjunction_test_supported(test: &AirPatternTest) -> bool {
+    match test {
+        AirPatternTest::Any { branches } => branches
+            .iter()
+            .flatten()
+            .all(pattern_disjunction_test_supported),
+        AirPatternTest::Literal { path, .. } | AirPatternTest::FlagValue { path, .. } => {
+            path.steps.iter().all(|step| {
+                matches!(
+                    step,
+                    AirPatternPathStep::Field(_) | AirPatternPathStep::TupleField(_)
+                )
+            })
+        }
+        AirPatternTest::Nil { .. }
+        | AirPatternTest::OptionalSome { .. }
+        | AirPatternTest::EnumVariant { .. } => false,
+    }
 }
 
 #[derive(Clone)]
@@ -7573,6 +7807,7 @@ fn verify_rvalue(
                     TypeData::Aggregate(_)
                         | TypeData::DataRef(_)
                         | TypeData::Enum(_)
+                        | TypeData::Flag(_)
                         | TypeData::Extern(_)
                 )
             );
@@ -7633,7 +7868,11 @@ fn verify_rvalue(
             if let Some(value_ty) = typing::operand_ty(cx.program, op) {
                 let valid = match (cx.primitives.scalar(value_ty), cx.primitives.scalar(*ty)) {
                     (Some(value), Some(result)) => unary.scalar_result(value) == Some(result),
-                    _ => false,
+                    _ => {
+                        unary == &UnaryOp::BitNot
+                            && value_ty == *ty
+                            && matches!(cx.type_data(value_ty), Some(TypeData::Flag(_)))
+                    }
                 };
                 if !valid {
                     cx.push(
@@ -7666,6 +7905,15 @@ fn verify_rvalue(
                 ) {
                     (Some(lhs), Some(rhs), Some(result)) => {
                         op.scalar_result(lhs, rhs) == Some(result)
+                    }
+                    _ if lhs_ty == rhs_ty
+                        && matches!(cx.type_data(lhs_ty), Some(TypeData::Flag(_))) =>
+                    {
+                        match op {
+                            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor => *ty == lhs_ty,
+                            BinaryOp::Eq | BinaryOp::NotEq => Some(*ty) == cx.primitives.bool(),
+                            _ => false,
+                        }
                     }
                     _ => {
                         matches!(op, BinaryOp::Eq | BinaryOp::NotEq)
@@ -7719,7 +7967,7 @@ fn verify_rvalue(
             verify_operand(cx, function_id, block_id, stmt_index, op);
             cx.verify_type_ref(site.clone(), *target);
             if let Some(value_ty) = typing::operand_ty(cx.program, op)
-                && !typing::valid_cast(cx.program, &cx.primitives, value_ty, *target)
+                && !typing::valid_cast(&cx.primitives, value_ty, *target)
             {
                 cx.push(
                     site,
@@ -7727,6 +7975,51 @@ fn verify_rvalue(
                         value: value_ty,
                         target: *target,
                     }),
+                );
+            }
+        }
+        RValue::RawProject { value: op, target } => {
+            verify_operand(cx, function_id, block_id, stmt_index, op);
+            cx.verify_type_ref(site.clone(), *target);
+            if let Some(value_ty) = typing::operand_ty(cx.program, op)
+                && !typing::valid_raw_project(cx.program, value_ty, *target)
+            {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::RawProjectMustMatchBacking {
+                        value: value_ty,
+                        target: *target,
+                    }),
+                );
+            }
+        }
+        RValue::RawTryConstruct {
+            value: op,
+            target,
+            ty,
+        } => {
+            verify_operand(cx, function_id, block_id, stmt_index, op);
+            cx.verify_type_ref(site.clone(), *target);
+            cx.verify_type_ref(site.clone(), *ty);
+            if let Some(value_ty) = typing::operand_ty(cx.program, op)
+                && !typing::valid_raw_try_construct(cx.program, value_ty, *target, *ty)
+            {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::RawTryConstructMustMatch {
+                        value: value_ty,
+                        target: *target,
+                        result: *ty,
+                    }),
+                );
+            }
+        }
+        RValue::FlagStatic { ty, .. } => {
+            cx.verify_type_ref(site.clone(), *ty);
+            if !matches!(cx.type_data(*ty), Some(TypeData::Flag(_))) {
+                cx.push(
+                    site,
+                    VerifyErrorKind::BadRValue(BadRValue::FlagStaticMustBeFlag(*ty)),
                 );
             }
         }
@@ -10258,6 +10551,14 @@ fn verify_type(cx: &mut VerifyCx<'_>, id: TypeId) {
                 cx.push(
                     VerifySite::Type(id),
                     VerifyErrorKind::BadReference(BadReference::InvalidEnum(enum_id)),
+                );
+            }
+        }
+        TypeData::Flag(flag_id) => {
+            if !cx.has_flag(flag_id) {
+                cx.push(
+                    VerifySite::Type(id),
+                    VerifyErrorKind::BadReference(BadReference::InvalidFlag(flag_id)),
                 );
             }
         }

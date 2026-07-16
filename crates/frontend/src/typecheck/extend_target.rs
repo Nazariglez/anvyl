@@ -2,8 +2,8 @@ use super::{
     GenericArgs, GenericParams, Specificity, generic_template_type, match_generic_template_args,
 };
 use crate::{
-    ast::{ExtendTargetConstraint, Ident, RawEnumBackingConstraint, Type},
-    typecheck::decls::{DeclarationIndex, EnumRepr, ExtendSchema},
+    ast::{EnumKindConstraint, ExtendTargetConstraint, Ident, Type},
+    typecheck::decls::{DeclarationIndex, ExtendSchema, RawEnumBacking},
 };
 
 pub(crate) struct ExtendTargetPattern<'a> {
@@ -67,23 +67,68 @@ fn type_satisfies_constraint(
     constraint: ExtendTargetConstraint,
 ) -> bool {
     decls.key_for_type(ty).is_some_and(|key| {
-        key.kind == constraint.nominal_kind() && backing_matches(decls, &key, constraint.backing())
+        key.kind == constraint.nominal_kind()
+            && enum_kind_matches(decls, &key, constraint.enum_kind())
     })
 }
 
-fn backing_matches(
+pub(crate) fn target_overlaps_raw_enum(
+    decls: &DeclarationIndex,
+    pattern: &ExtendTargetPattern<'_>,
+    backing: RawEnumBacking,
+) -> bool {
+    if decls
+        .enum_schema_for_type(pattern.target)
+        .is_some_and(|schema| {
+            schema
+                .body
+                .kind
+                .raw()
+                .is_some_and(|raw| raw.backing == backing)
+                || (backing == RawEnumBacking::Int && schema.body.kind.flag().is_some())
+        })
+    {
+        return true;
+    }
+    matches!(
+        pattern.target_constraint,
+        Some(ExtendTargetConstraint::Enum {
+            kind: EnumKindConstraint::Any,
+        })
+    ) || matches!(
+        (pattern.target_constraint, backing),
+        (
+            Some(ExtendTargetConstraint::Enum {
+                kind: EnumKindConstraint::RawInt | EnumKindConstraint::Flag,
+            }),
+            RawEnumBacking::Int,
+        ) | (
+            Some(ExtendTargetConstraint::Enum {
+                kind: EnumKindConstraint::RawString,
+            }),
+            RawEnumBacking::String,
+        )
+    )
+}
+
+fn enum_kind_matches(
     decls: &DeclarationIndex,
     key: &crate::typecheck::decls::NominalKey,
-    backing: Option<RawEnumBackingConstraint>,
+    kind: Option<EnumKindConstraint>,
 ) -> bool {
-    match backing {
-        None => true,
-        Some(RawEnumBackingConstraint::Int) => {
-            decls.enum_repr_for_key(key) == Some(EnumRepr::RawInt)
-        }
-        Some(RawEnumBackingConstraint::String) => {
-            decls.enum_repr_for_key(key) == Some(EnumRepr::RawString)
-        }
+    match kind {
+        None | Some(EnumKindConstraint::Any) => true,
+        Some(EnumKindConstraint::RawInt) => decls
+            .enum_schema(key)
+            .and_then(|schema| schema.body.kind.raw())
+            .is_some_and(|raw| raw.backing == RawEnumBacking::Int),
+        Some(EnumKindConstraint::RawString) => decls
+            .enum_schema(key)
+            .and_then(|schema| schema.body.kind.raw())
+            .is_some_and(|raw| raw.backing == RawEnumBacking::String),
+        Some(EnumKindConstraint::Flag) => decls
+            .enum_schema(key)
+            .is_some_and(|schema| schema.body.kind.flag().is_some()),
     }
 }
 
@@ -215,13 +260,17 @@ fn compare_constraint_specificity(
     match (a, b) {
         (a, b) if a == b => Specificity::Equal,
         (
-            ExtendTargetConstraint::Enum { backing: Some(_) },
-            ExtendTargetConstraint::Enum { backing: None },
-        ) => Specificity::MoreSpecific,
+            ExtendTargetConstraint::Enum { kind: a },
+            ExtendTargetConstraint::Enum {
+                kind: EnumKindConstraint::Any,
+            },
+        ) if a != EnumKindConstraint::Any => Specificity::MoreSpecific,
         (
-            ExtendTargetConstraint::Enum { backing: None },
-            ExtendTargetConstraint::Enum { backing: Some(_) },
-        ) => Specificity::LessSpecific,
+            ExtendTargetConstraint::Enum {
+                kind: EnumKindConstraint::Any,
+            },
+            ExtendTargetConstraint::Enum { kind: b },
+        ) if b != EnumKindConstraint::Any => Specificity::LessSpecific,
         _ => Specificity::Incomparable,
     }
 }

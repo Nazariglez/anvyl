@@ -240,7 +240,7 @@ pub fn build_air_packages<L: PackageSourceLoader>(
         )));
     }
     let air = air::lower::lower_with_source_index(
-        prepared.source_index,
+        &prepared.source_index,
         &prepared.semantic.program,
         facts,
         air::lower::AirLowerConfig {

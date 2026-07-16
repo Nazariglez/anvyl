@@ -997,20 +997,25 @@ fn postfix_expr<'src>(
         Token::Dot => (),
     }
     .ignore_then(select! {
-        Token::Literal(LitToken::Number(n)) => PostfixOp::TupleIndices(vec![n as u32]),
+        Token::Literal(LitToken::Number(n)) => n,
+    })
+    .try_map(|n, span| {
+        u32::try_from(*n.value())
+            .map(|n| PostfixOp::TupleIndices(vec![n]))
+            .map_err(|_| Rich::custom(span, "invalid tuple index"))
     });
 
     let chained_index = select! {
         Token::Dot => (),
     }
     .ignore_then(select! {
-        Token::Literal(LitToken::Float(s, _)) => s,
+        Token::Literal(LitToken::Float(n)) => n,
     })
-    .try_map(|s, span| {
-        let parts = s.as_ref().split('.').collect::<Vec<_>>();
+    .try_map(|n, span| {
+        let parts = n.spelling().split('.').collect::<Vec<_>>();
         let indices = parts
             .iter()
-            .map(|p| p.parse::<u32>())
+            .map(|p| p.replace('_', "").parse::<u32>())
             .collect::<Result<Vec<_>, _>>();
         indices
             .map(PostfixOp::TupleIndices)

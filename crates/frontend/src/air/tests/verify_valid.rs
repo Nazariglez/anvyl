@@ -1186,7 +1186,7 @@ fn raw_enum_to_raw_cast_is_valid() {
         bb0,
         stmt_init(
             out,
-            RValue::Cast {
+            RValue::RawProject {
                 value: op_place(state, enum_ty),
                 target: int_ty,
             },

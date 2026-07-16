@@ -307,7 +307,7 @@ pub(super) fn index_identity(index: &ExprNode, tc: &TypeChecker) -> PlaceIdentit
         return value.identity;
     }
     match &index.node.kind {
-        ExprKind::Lit(Lit::Int(value)) => PlaceIdentity::const_index(*value),
+        ExprKind::Lit(Lit::Int(value)) => PlaceIdentity::const_index(*value.value()),
         _ => PlaceIdentity::unknown(),
     }
 }

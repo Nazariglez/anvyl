@@ -1,7 +1,8 @@
 use super::{
-    CastFromConversion, CheckedType, ExpectedProjectionFact, ProjectionPath, TypeChecker,
-    TypeError, checked_from_type, checked_type, convert,
-    convert::{ExpectedDynPlan, ExplicitCast},
+    CastFromConversion, CheckedType, ExpectedProjectionFact, ProjectionPath, RawProjectionFact,
+    TypeChecker, TypeError, checked_from_type, checked_type, convert,
+    convert::{ExpectedDynPlan, ExplicitCast, RawEnumCastRejection},
+    flags,
     infer::{Solver, TypeHandle},
     place,
     type_ops::type_depends_on_generics,
@@ -15,6 +16,7 @@ pub(super) enum ExpectedProjectionDecision {
     SourceAccepted,
     NotNeeded,
     Project(ProjectionPath),
+    RawProject(RawProjectionPlan),
     Failed,
 }
 
@@ -28,6 +30,18 @@ impl ExpectedReturnConstraint {
     pub(super) fn failed(self) -> bool {
         matches!(self, Self::Committed { failed: true })
     }
+}
+
+#[derive(Clone)]
+pub(super) struct RawProjectionPlan {
+    source_ty: Type,
+    target_ty: Type,
+}
+
+pub(super) struct RawBinaryProjectionPlan {
+    left: Option<RawProjectionPlan>,
+    right: Option<RawProjectionPlan>,
+    result_ty: Type,
 }
 
 #[derive(Clone)]
@@ -45,11 +59,13 @@ pub(super) enum ExpectedFit {
         projection: ProjectionPath,
         acceptance: SourceAcceptance,
     },
+    RawProject(RawProjectionPlan),
     Ambiguous(Vec<ProjectionPath>),
     MissingProjection {
         paths: Vec<Vec<Ident>>,
     },
     Mismatch,
+    ExplicitCastRejected(RawEnumCastRejection),
 }
 
 #[derive(Clone, Copy)]
@@ -66,8 +82,15 @@ pub(super) fn classify_expected_fit(
     target: &Type,
     mode: ExpectedProjectionMode,
 ) -> ExpectedFit {
-    if let Some(acceptance) = source_acceptance_without_effects(tc, span, source, target, mode) {
-        return ExpectedFit::SourceAccepted(acceptance);
+    let source_rejection = match source_acceptance_without_effects(tc, span, source, target, mode) {
+        Ok(Some(acceptance)) => return ExpectedFit::SourceAccepted(acceptance),
+        Ok(None) => None,
+        Err(rejection) => Some(rejection),
+    };
+    if !matches!(mode, ExpectedProjectionMode::ExplicitCast)
+        && let Some(plan) = raw_projection_plan(tc, span, source, target)
+    {
+        return ExpectedFit::RawProject(plan);
     }
     if projection_probe_deferred(source, target) {
         return ExpectedFit::Deferred;
@@ -85,7 +108,7 @@ pub(super) fn classify_expected_fit(
         [] => {
             let paths = tc.decls.bare_embed_paths_to_type(source, target);
             if paths.is_empty() {
-                ExpectedFit::Mismatch
+                source_rejection.map_or(ExpectedFit::Mismatch, ExpectedFit::ExplicitCastRejected)
             } else {
                 ExpectedFit::MissingProjection { paths }
             }
@@ -114,7 +137,9 @@ pub(super) fn expected_projection_decision(
     match fit {
         ExpectedFit::SourceAccepted(_) => ExpectedProjectionDecision::SourceAccepted,
         ExpectedFit::Deferred | ExpectedFit::Mismatch => ExpectedProjectionDecision::NotNeeded,
+        ExpectedFit::ExplicitCastRejected(_) => unreachable!("explicit cast handled by caller"),
         ExpectedFit::Project { projection, .. } => ExpectedProjectionDecision::Project(projection),
+        ExpectedFit::RawProject(plan) => ExpectedProjectionDecision::RawProject(plan),
         ExpectedFit::Ambiguous(paths) => {
             tc.push_error(TypeError::AmbiguousProjection {
                 source: source.clone(),
@@ -236,13 +261,164 @@ fn projection_matches(
         .into_iter()
         .filter_map(|projection| {
             let acceptance =
-                source_acceptance_without_effects(tc, span, &projection.target_ty, target, mode)?;
+                source_acceptance_without_effects(tc, span, &projection.target_ty, target, mode)
+                    .ok()??;
             Some(ProjectionMatch {
                 projection,
                 acceptance,
             })
         })
         .collect()
+}
+
+pub(super) fn raw_binary_projection_plan(
+    tc: &mut TypeChecker,
+    op: crate::ast::BinaryOp,
+    left_expr: &ExprNode,
+    left: &Type,
+    right_expr: &ExprNode,
+    right: &Type,
+) -> Option<RawBinaryProjectionPlan> {
+    tc.ensure_pending_enum_values_for_type(left, left_expr.span);
+    tc.ensure_pending_enum_values_for_type(right, right_expr.span);
+    let left_flag = flags::is_type(tc, left_expr.span, left);
+    let right_flag = flags::is_type(tc, right_expr.span, right);
+    if left_flag && right_flag {
+        return None;
+    }
+    let left_backing = raw_backing(tc, left).or_else(|| left_flag.then_some(Type::Int));
+    let right_backing = raw_backing(tc, right).or_else(|| right_flag.then_some(Type::Int));
+    let (left_target, right_target, backing) = match (left_backing, right_backing) {
+        (Some(left_backing), Some(right_backing)) => {
+            if left != right || matches!(op, crate::ast::BinaryOp::Eq | crate::ast::BinaryOp::NotEq)
+            {
+                return None;
+            }
+            (
+                Some(left_backing.clone()),
+                Some(right_backing),
+                left_backing,
+            )
+        }
+        (Some(backing), None) if backing == *right => (Some(backing.clone()), None, backing),
+        (None, Some(backing)) if backing == *left => (None, Some(backing.clone()), backing),
+        _ => return None,
+    };
+    let scalar = backing.scalar_kind()?;
+    let result = if op == crate::ast::BinaryOp::Add && scalar == crate::ast::ScalarKind::String {
+        crate::ast::ScalarKind::String
+    } else {
+        op.scalar_result(scalar, scalar)?
+    };
+    Some(RawBinaryProjectionPlan {
+        left: left_target.map(|target_ty| RawProjectionPlan {
+            source_ty: left.clone(),
+            target_ty,
+        }),
+        right: right_target.map(|target_ty| RawProjectionPlan {
+            source_ty: right.clone(),
+            target_ty,
+        }),
+        result_ty: super::type_from_scalar(result),
+    })
+}
+
+pub(super) fn apply_raw_binary_projection(
+    tc: &mut TypeChecker,
+    left_expr: &ExprNode,
+    left: &CheckedType,
+    right_expr: &ExprNode,
+    right: &CheckedType,
+    plan: RawBinaryProjectionPlan,
+    project_left: bool,
+) -> CheckedType {
+    if project_left && let Some(projection) = plan.left {
+        apply_raw_projection(tc, left_expr, left, projection);
+    }
+    if let Some(projection) = plan.right {
+        apply_raw_projection(tc, right_expr, right, projection);
+    }
+    checked_type(plan.result_ty)
+}
+
+pub(super) fn raw_unary_projection_plan(
+    tc: &mut TypeChecker,
+    op: crate::ast::UnaryOp,
+    operand_expr: &ExprNode,
+    operand: &Type,
+) -> Option<(RawProjectionPlan, Type)> {
+    tc.ensure_pending_enum_values_for_type(operand, operand_expr.span);
+    let backing = raw_backing(tc, operand)?;
+    let result = op.scalar_result(backing.scalar_kind()?)?;
+    Some((
+        RawProjectionPlan {
+            source_ty: operand.clone(),
+            target_ty: backing,
+        },
+        super::type_from_scalar(result),
+    ))
+}
+
+fn raw_backing(tc: &TypeChecker, ty: &Type) -> Option<Type> {
+    Some(
+        tc.decls
+            .enum_schema_for_type(ty)?
+            .body
+            .kind
+            .raw()?
+            .backing
+            .ty(),
+    )
+}
+
+fn raw_projection_plan(
+    tc: &mut TypeChecker,
+    span: Span,
+    source: &Type,
+    target: &Type,
+) -> Option<RawProjectionPlan> {
+    tc.ensure_pending_enum_values_for_type(source, span);
+    let kind = &tc.decls.enum_schema_for_type(source)?.body.kind;
+    let backing = kind
+        .raw()
+        .map(|raw| raw.backing.ty())
+        .or_else(|| kind.flag().map(|_| Type::Int))?;
+    (backing == *target).then(|| RawProjectionPlan {
+        source_ty: source.clone(),
+        target_ty: target.clone(),
+    })
+}
+
+pub(super) fn apply_raw_projection(
+    tc: &mut TypeChecker,
+    expr: &ExprNode,
+    source_checked: &CheckedType,
+    plan: RawProjectionPlan,
+) -> CheckedType {
+    let source = tc.expr_place(expr.node.id).unwrap_or_else(|| {
+        let mut checked = checked_type(plan.source_ty.clone());
+        checked.contains_extern_any = source_checked.contains_extern_any;
+        place::PlaceValue::not_place(checked)
+    });
+    apply_raw_projection_from_place(tc, expr, &source, plan)
+}
+
+fn apply_raw_projection_from_place(
+    tc: &mut TypeChecker,
+    expr: &ExprNode,
+    source: &place::PlaceValue,
+    plan: RawProjectionPlan,
+) -> CheckedType {
+    let mut checked = checked_from_type(expr, plan.target_ty.clone(), tc);
+    checked.contains_extern_any = source.checked.contains_extern_any;
+    place::record_value_read(expr.node.id, source, tc);
+    tc.record_raw_projection(RawProjectionFact {
+        expr_id: expr.node.id,
+        source_expr: expr.node.id,
+        source_ty: plan.source_ty,
+        target_ty: plan.target_ty,
+    });
+    checked
 }
 
 pub(super) fn apply_value_projection(
@@ -276,6 +452,8 @@ pub(super) fn apply_value_projection(
 pub(super) enum ExpectedPlaceProjection {
     SourceAccepted,
     Projected(Box<place::PlaceValue>),
+    RawProjected(CheckedType),
+    RawValueRequired(RawProjectionPlan),
     NotNeeded,
     Failed,
 }
@@ -285,6 +463,7 @@ pub(super) fn expected_place_projection(
     expr: &ExprNode,
     source: &place::PlaceValue,
     target: &Type,
+    allow_raw_value: bool,
 ) -> ExpectedPlaceProjection {
     let source_ty = source.checked.ty.clone();
     match expected_projection(
@@ -298,9 +477,29 @@ pub(super) fn expected_place_projection(
         ExpectedProjectionDecision::Project(projection) => ExpectedPlaceProjection::Projected(
             Box::new(apply_place_projection(tc, expr, source, projection)),
         ),
+        ExpectedProjectionDecision::RawProject(plan) if allow_raw_value => {
+            ExpectedPlaceProjection::RawProjected(apply_raw_projection_from_place(
+                tc, expr, source, plan,
+            ))
+        }
+        ExpectedProjectionDecision::RawProject(plan) => {
+            ExpectedPlaceProjection::RawValueRequired(plan)
+        }
         ExpectedProjectionDecision::NotNeeded => ExpectedPlaceProjection::NotNeeded,
         ExpectedProjectionDecision::Failed => ExpectedPlaceProjection::Failed,
     }
+}
+
+pub(super) fn reject_raw_place_projection(
+    tc: &mut TypeChecker,
+    expr: &ExprNode,
+    plan: RawProjectionPlan,
+) {
+    tc.push_error(TypeError::RawProjectionRequiresValue {
+        source: plan.source_ty,
+        target: plan.target_ty,
+        span: tc.error_span(expr.span),
+    });
 }
 
 pub(super) fn apply_place_projection(
@@ -351,7 +550,8 @@ pub(super) fn satisfies_without_effects(
     target: &Type,
     mode: ExpectedProjectionMode,
 ) -> bool {
-    source_acceptance_without_effects(tc, span, source, target, mode).is_some()
+    source_acceptance_without_effects(tc, span, source, target, mode)
+        .is_ok_and(|acceptance| acceptance.is_some())
 }
 
 fn source_acceptance_without_effects(
@@ -360,8 +560,8 @@ fn source_acceptance_without_effects(
     source: &Type,
     target: &Type,
     mode: ExpectedProjectionMode,
-) -> Option<SourceAcceptance> {
-    match mode {
+) -> Result<Option<SourceAcceptance>, RawEnumCastRejection> {
+    let acceptance = match mode {
         ExpectedProjectionMode::Assignable => {
             assignable_acceptance_without_effects(tc, span, source, target)
         }
@@ -369,10 +569,15 @@ fn source_acceptance_without_effects(
             assignable_acceptance_without_effects(tc, span, source, target)
                 .or_else(|| cast_from_acceptance_without_effects(tc, source, target))
         }
-        ExpectedProjectionMode::ExplicitCast => tc
-            .explicit_cast_plan_without_effects(source, target)
-            .map(|conversion| SourceAcceptance::ExplicitCast { conversion }),
-    }
+        ExpectedProjectionMode::ExplicitCast => {
+            return tc
+                .explicit_cast_plan_without_effects(span, source, target)
+                .map(|conversion| {
+                    conversion.map(|conversion| SourceAcceptance::ExplicitCast { conversion })
+                });
+        }
+    };
+    Ok(acceptance)
 }
 
 fn assignable_acceptance_without_effects(

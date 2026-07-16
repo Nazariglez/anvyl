@@ -428,7 +428,7 @@ fn type_expr(
         Type::Array { elem, len } => match len {
             ast::ArrayLen::Fixed(len) => Ok(ExternTypeExpr::array(
                 type_expr(source, elem, span, SourceTypePosition::Nested)?,
-                *len as u64,
+                *len.value() as u64,
             )),
             ast::ArrayLen::Infer
             | ast::ArrayLen::Named(_)

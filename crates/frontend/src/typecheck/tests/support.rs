@@ -12,7 +12,8 @@ use crate::{
         ConstValueMap, ContractWitnessMap, ContractWitnessStructuralKeyMap, DeprecatedUseKind,
         DynCallMap, DynConversionMap, DynDowncastMap, DynWeakeningMap, ExpectedProjectionFact,
         ExpectedProjectionMap, ExternUseMap, GlobalAccessMap, LambdaCaptureMap, LambdaEscapeMap,
-        MemberPathMap, SemanticBodyFacts, SemanticCheckOutput, SemanticProgram, TypeError,
+        MemberPathMap, RawProjectionMap, SemanticBodyFacts, SemanticCheckOutput, SemanticProgram,
+        TypeError,
         decls::{DeclarationIndex, ModuleScope, nominal_type},
     },
 };
@@ -88,6 +89,10 @@ impl TypecheckTestResult {
 
     pub(crate) fn expected_projections(&self) -> &ExpectedProjectionMap {
         &self.flat_facts.expected_projections
+    }
+
+    pub(crate) fn raw_projections(&self) -> &RawProjectionMap {
+        &self.flat_facts.raw_projections
     }
 
     pub(crate) fn contract_witnesses(&self) -> &ContractWitnessMap {

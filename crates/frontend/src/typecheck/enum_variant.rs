@@ -277,15 +277,24 @@ pub(super) fn resolve_pattern(
     span: Span,
     expected: &Type,
 ) -> Option<ResolvedEnumVariant> {
+    let key = resolve_pattern_owner(tc, qualifier, span, expected)?;
+    resolve_use(tc, &key, variant, span)
+}
+
+pub(super) fn resolve_pattern_owner(
+    tc: &mut TypeChecker,
+    qualifier: Option<Ident>,
+    span: Span,
+    expected: &Type,
+) -> Option<NominalKey> {
     let expected_key = tc
         .decls
         .key_for_type(expected)
         .filter(|key| key.kind == NominalKind::Enum);
-    let key = match qualifier {
-        Some(name) => resolve_explicit_pattern(tc, name, expected_key.as_ref(), expected, span)?,
-        None => resolve_inferred_pattern(tc, expected_key, span)?,
-    };
-    resolve_use(tc, &key, variant, span)
+    match qualifier {
+        Some(name) => resolve_explicit_pattern(tc, name, expected_key.as_ref(), expected, span),
+        None => resolve_inferred_pattern(tc, expected_key, span),
+    }
 }
 
 fn resolve_explicit_pattern(

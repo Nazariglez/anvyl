@@ -2640,7 +2640,7 @@ mod tests {
     fn roundtrip_array_lens() {
         assert_roundtrip(Type::Array {
             elem: Box::new(Type::Int),
-            len: ArrayLen::Fixed(3),
+            len: ArrayLen::fixed(3),
         });
         assert_roundtrip(Type::Array {
             elem: Box::new(Type::Float),
@@ -2671,7 +2671,7 @@ mod tests {
             },
         ];
         let const_args = vec![
-            ConstArg::Value(ConstValue::Int(3)),
+            ConstArg::value(ConstValue::Int(3)),
             ConstArg::Name(ident("CAP")),
             ConstArg::Param(const_param(9)),
         ];
@@ -2735,7 +2735,7 @@ mod tests {
             NominalKind::Struct,
             ident("FixedBuf"),
             vec![Type::Int],
-            vec![ConstArg::Value(ConstValue::Int(4))],
+            vec![ConstArg::value(ConstValue::Int(4))],
             origin.clone(),
         );
         let solver_ty = Ty::from_recovery_type(&ty);
@@ -2753,7 +2753,7 @@ mod tests {
                 NominalKind::Struct,
                 ident("FixedBuf"),
                 vec![Type::Int],
-                vec![ConstArg::Value(ConstValue::Int(4))],
+                vec![ConstArg::value(ConstValue::Int(4))],
                 origin,
             ))
         );
@@ -2799,7 +2799,7 @@ mod tests {
             name: ident("Thing"),
             generic_args: vec![
                 GenericArg::Type(Type::Var(type_var(3))),
-                GenericArg::Const(ConstArg::Value(ConstValue::Int(8))),
+                GenericArg::Const(ConstArg::value(ConstValue::Int(8))),
             ],
         });
     }
@@ -2992,11 +2992,11 @@ mod tests {
         let mut solver = Solver::default();
         let left = Type::Array {
             elem: Box::new(Type::Int),
-            len: ArrayLen::Fixed(3),
+            len: ArrayLen::fixed(3),
         };
         let right = Type::Array {
             elem: Box::new(Type::Int),
-            len: ArrayLen::Fixed(4),
+            len: ArrayLen::fixed(4),
         };
         solver.add_handle_equal(
             span(1, 2),

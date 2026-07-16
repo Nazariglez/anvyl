@@ -4,8 +4,8 @@ use anvyx_semantics::{display_float, float_to_int, int_to_float};
 
 use super::{
     CallableTemplateEnv, CheckedType, DeprecatedUseKind, LocalConstId, LocalConstInfo, LocalSymbol,
-    ModuleScope, TypeChecker, TypeError, ValueDecl, VarInfo, body::with_callable_body_env,
-    checked_from_type, const_term::ConstTerm,
+    ModuleScope, RawEnumValue, TypeChecker, TypeError, ValueDecl, VarInfo,
+    body::with_callable_body_env, checked_from_type, const_term::ConstTerm,
 };
 use crate::{
     ast::{
@@ -250,10 +250,10 @@ impl TypeChecker {
             },
             ConstTerm::Value(_) | ConstTerm::Name(_) => self
                 .require_usize_const(term, span, true)
-                .map(ArrayLen::Fixed),
+                .map(ArrayLen::fixed),
             ConstTerm::Expr(expr) => match self.normalize_symbolic_const_expr(expr, span)? {
                 ConstExpr::Value(value) => const_usize(&value, self.error_span(span))
-                    .map(ArrayLen::Fixed)
+                    .map(ArrayLen::fixed)
                     .map_err(|error| self.push_error(error))
                     .ok(),
                 expr => Some(ArrayLen::Expr(expr)),
@@ -477,18 +477,31 @@ impl TypeChecker {
         expr: &ExprNode,
         params: &HashSet<Ident>,
     ) -> bool {
-        self.expr_depends_on_const_params_inner(expr, params, None, &mut HashSet::new())
+        self.expr_depends_on_const_params_with_shadowed(expr, params, &HashSet::new())
+    }
+
+    pub(super) fn expr_depends_on_const_params_with_shadowed(
+        &self,
+        expr: &ExprNode,
+        params: &HashSet<Ident>,
+        shadowed: &HashSet<Ident>,
+    ) -> bool {
+        self.expr_depends_on_const_params_inner(expr, params, shadowed, None, &mut HashSet::new())
     }
 
     fn expr_depends_on_const_params_inner(
         &self,
         expr: &ExprNode,
         params: &HashSet<Ident>,
+        shadowed: &HashSet<Ident>,
         env: Option<&CallableTemplateEnv>,
         visiting: &mut HashSet<LocalConstId>,
     ) -> bool {
         match &expr.node.kind {
             ExprKind::Ident(name) => {
+                if shadowed.contains(name) {
+                    return false;
+                }
                 if params.contains(name) {
                     return true;
                 }
@@ -502,6 +515,7 @@ impl TypeChecker {
                     self.expr_depends_on_const_params_inner(
                         &entry.value,
                         params,
+                        &HashSet::new(),
                         Some(&entry.env),
                         visiting,
                     )
@@ -509,43 +523,63 @@ impl TypeChecker {
                 visiting.remove(&id);
                 depends
             }
-            ExprKind::Unary(node) => {
-                self.expr_depends_on_const_params_inner(&node.node.expr, params, env, visiting)
-            }
+            ExprKind::Unary(node) => self.expr_depends_on_const_params_inner(
+                &node.node.expr,
+                params,
+                shadowed,
+                env,
+                visiting,
+            ),
             ExprKind::Binary(node) => {
-                self.expr_depends_on_const_params_inner(&node.node.left, params, env, visiting)
-                    || self.expr_depends_on_const_params_inner(
-                        &node.node.right,
-                        params,
-                        env,
-                        visiting,
-                    )
+                self.expr_depends_on_const_params_inner(
+                    &node.node.left,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                ) || self.expr_depends_on_const_params_inner(
+                    &node.node.right,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                )
             }
-            ExprKind::Cast(node) | ExprKind::FailableCast(node) => {
-                self.expr_depends_on_const_params_inner(&node.node.expr, params, env, visiting)
-            }
+            ExprKind::Cast(node) | ExprKind::FailableCast(node) => self
+                .expr_depends_on_const_params_inner(
+                    &node.node.expr,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                ),
             ExprKind::Ternary(node) => {
-                self.expr_depends_on_const_params_inner(&node.node.cond, params, env, visiting)
-                    || self.expr_depends_on_const_params_inner(
-                        &node.node.then_expr,
-                        params,
-                        env,
-                        visiting,
-                    )
-                    || self.expr_depends_on_const_params_inner(
-                        &node.node.else_expr,
-                        params,
-                        env,
-                        visiting,
-                    )
+                self.expr_depends_on_const_params_inner(
+                    &node.node.cond,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                ) || self.expr_depends_on_const_params_inner(
+                    &node.node.then_expr,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                ) || self.expr_depends_on_const_params_inner(
+                    &node.node.else_expr,
+                    params,
+                    shadowed,
+                    env,
+                    visiting,
+                )
             }
             ExprKind::StringInterp(parts) => parts.iter().any(|part| match part {
                 StringPart::Expr(expr, _) => {
-                    self.expr_depends_on_const_params_inner(expr, params, env, visiting)
+                    self.expr_depends_on_const_params_inner(expr, params, shadowed, env, visiting)
                 }
                 StringPart::Text(_) => false,
             }),
-            ExprKind::Lit(_) | ExprKind::Field(_) => false,
             _ => false,
         }
     }
@@ -573,13 +607,26 @@ impl TypeChecker {
         expr: &ExprNode,
         warn_deprecated: bool,
     ) -> ConstEvalResult<ConstValue> {
+        if let Some(value) = self.raw_projection_const(expr) {
+            return Ok(value);
+        }
         match &expr.node.kind {
             ExprKind::Lit(lit) => self.eval_const_lit(lit, expr.span),
             ExprKind::Ident(name) => {
+                if let Some(value) = self
+                    .flag_initializer_values
+                    .last()
+                    .and_then(|values| values.get(name))
+                {
+                    return Ok(ConstValue::Int(*value));
+                }
+                let flag_values = self.flag_initializer_values.pop();
                 if warn_deprecated {
                     self.warn_named_const_deprecated(*name, expr.span);
                 }
-                match self.lookup_visible_const_name(*name, expr.span) {
+                let lookup = self.lookup_visible_const_name(*name, expr.span);
+                self.flag_initializer_values.extend(flag_values);
+                match lookup {
                     ConstNameLookup::Value(value) => Ok(value),
                     ConstNameLookup::RuntimeGlobal(global) => {
                         const_error(TypeError::RuntimeGlobalInConstPosition {
@@ -667,6 +714,68 @@ impl TypeChecker {
         }
     }
 
+    fn raw_projection_const(&self, expr: &ExprNode) -> Option<ConstValue> {
+        let fact = self
+            .semantic_facts
+            .body(&self.current_body())?
+            .raw_projections
+            .get(&expr.node.id)?;
+        let source = if fact.source_expr == expr.node.id {
+            expr
+        } else {
+            let ExprKind::Cast(cast) = &expr.node.kind else {
+                return None;
+            };
+            if cast.node.expr.node.id != fact.source_expr {
+                return None;
+            }
+            &cast.node.expr
+        };
+        let kind = &self.decls.enum_schema_for_type(&fact.source_ty)?.body.kind;
+        if let Some(flag) = kind.flag() {
+            return self
+                .flag_const_bits(source, flag.known_bits)
+                .map(ConstValue::Int);
+        }
+        let raw = kind.raw()?;
+        let ExprKind::Field(field) = &source.node.kind else {
+            return None;
+        };
+        match raw.value(field.node.field)? {
+            RawEnumValue::Int(value) => Some(ConstValue::Int(*value)),
+            RawEnumValue::String(value) => Some(ConstValue::String(value.clone())),
+        }
+    }
+
+    fn flag_const_bits(&self, expr: &ExprNode, known_bits: i64) -> Option<i64> {
+        let facts = self.semantic_facts.body(&self.current_body())?;
+        if let Some(member) = facts.flag_members.get(&expr.node.id) {
+            return Some(member.value);
+        }
+        if let Some(static_) = facts.flag_statics.get(&expr.node.id) {
+            return Some(match static_.op {
+                super::FlagStaticOp::Empty => 0,
+                super::FlagStaticOp::All => known_bits,
+            });
+        }
+        match &expr.node.kind {
+            ExprKind::Binary(binary) => {
+                let left = self.flag_const_bits(&binary.node.left, known_bits)?;
+                let right = self.flag_const_bits(&binary.node.right, known_bits)?;
+                match binary.node.op {
+                    BinaryOp::BitAnd => Some(left & right),
+                    BinaryOp::BitOr => Some(left | right),
+                    BinaryOp::Xor => Some(left ^ right),
+                    _ => None,
+                }
+            }
+            ExprKind::Unary(unary) if unary.node.op == UnaryOp::BitNot => {
+                Some(known_bits ^ self.flag_const_bits(&unary.node.expr, known_bits)?)
+            }
+            _ => None,
+        }
+    }
+
     fn eval_const_field(
         &mut self,
         node: &FieldAccessNode,
@@ -680,6 +789,30 @@ impl TypeChecker {
         let ExprKind::Ident(module) = &node.node.target.node.kind else {
             return const_error(TypeError::NonConstExpression { span: err_span });
         };
+        if let Some(owner) = self.visible_type_subject(*module, node.node.target.span) {
+            self.ensure_pending_enum_values_for_type(&owner, node.node.target.span);
+            if let Some(schema) = self.decls.enum_schema_for_type(&owner) {
+                if let Some(value) = schema
+                    .body
+                    .kind
+                    .raw()
+                    .and_then(|raw| raw.value(node.node.field))
+                {
+                    return Ok(match value {
+                        RawEnumValue::Int(value) => ConstValue::Int(*value),
+                        RawEnumValue::String(value) => ConstValue::String(value.clone()),
+                    });
+                }
+                if let Some(member) = schema
+                    .body
+                    .kind
+                    .flag()
+                    .and_then(|flag| flag.member(node.node.field))
+                {
+                    return Ok(ConstValue::Int(member.value));
+                }
+            }
+        }
         let Some(scope) = self.lookup_module_alias(*module) else {
             return const_error(TypeError::NonConstExpression { span: err_span });
         };

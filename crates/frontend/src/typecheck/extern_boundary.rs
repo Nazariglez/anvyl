@@ -7,7 +7,10 @@ use super::{
     infer::TypeHandle,
     literal::check_unknown_nominal_fields,
     nominal_type, place,
-    projection::{ExpectedPlaceProjection, constrain_expected_return, expected_place_projection},
+    projection::{
+        ExpectedPlaceProjection, constrain_expected_return, expected_place_projection,
+        reject_raw_place_projection,
+    },
     solve_and_checked_from_handle,
     type_ops::{type_closure_facts, type_contains_dyn_value},
 };
@@ -88,13 +91,23 @@ pub(super) fn check_arg(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut Ty
 
 fn check_arg_borrow(arg: &ExprNode, param: &ResolvedExternParam, tc: &mut TypeChecker) -> bool {
     let checked = check_place(arg, tc);
-    check_projected_place_arg(
-        arg,
-        param,
-        &checked.value,
-        place::record_immutable_borrow,
-        tc,
-    )
+    match expected_place_projection(tc, arg, &checked.value, &param.ty.ty, true) {
+        ExpectedPlaceProjection::Projected(projected) => {
+            place::record_immutable_borrow(arg.node.id, &projected, tc);
+            check_checked_value(arg, &projected.checked, &param.ty, tc)
+        }
+        ExpectedPlaceProjection::RawProjected(projected) => {
+            check_checked_value(arg, &projected, &param.ty, tc)
+        }
+        ExpectedPlaceProjection::Failed => false,
+        ExpectedPlaceProjection::RawValueRequired(_) => {
+            unreachable!("raw value projection enabled for immutable borrow")
+        }
+        ExpectedPlaceProjection::SourceAccepted | ExpectedPlaceProjection::NotNeeded => {
+            place::record_immutable_borrow(arg.node.id, &checked.value, tc);
+            check_checked_value(arg, &checked.value.checked, &param.ty, tc)
+        }
+    }
 }
 
 fn check_projected_place_arg(
@@ -104,12 +117,17 @@ fn check_projected_place_arg(
     record: fn(ExprId, &place::PlaceValue, &mut TypeChecker),
     tc: &mut TypeChecker,
 ) -> bool {
-    match expected_place_projection(tc, arg, value, &param.ty.ty) {
+    match expected_place_projection(tc, arg, value, &param.ty.ty, false) {
         ExpectedPlaceProjection::Projected(projected) => {
             record(arg.node.id, &projected, tc);
             check_checked_value(arg, &projected.checked, &param.ty, tc)
         }
         ExpectedPlaceProjection::Failed => false,
+        ExpectedPlaceProjection::RawProjected(_) => unreachable!("raw ref projection disabled"),
+        ExpectedPlaceProjection::RawValueRequired(plan) => {
+            reject_raw_place_projection(tc, arg, plan);
+            false
+        }
         ExpectedPlaceProjection::SourceAccepted | ExpectedPlaceProjection::NotNeeded => {
             record(arg.node.id, value, tc);
             check_checked_value(arg, &value.checked, &param.ty, tc)

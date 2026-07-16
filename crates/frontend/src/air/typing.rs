@@ -1,5 +1,5 @@
 use super::{
-    ConstValue, Program, TypeData,
+    ConstValue, EnumRepr, Program, TypeData,
     body::{CallArg, Callee, Operand, RValue},
     ids::{ConstId, ExternId, FieldId, FunctionId, TypeId},
 };
@@ -192,22 +192,55 @@ pub(crate) fn const_is_string(program: &Program, primitives: &PrimitiveTypes, id
     })
 }
 
-pub(crate) fn valid_cast(
+pub(crate) fn valid_cast(primitives: &PrimitiveTypes, source: TypeId, target: TypeId) -> bool {
+    (primitives.is_int(source) && primitives.is_float(target))
+        || (primitives.is_float(source) && primitives.is_int(target))
+}
+
+pub(crate) fn valid_raw_project(program: &Program, source: TypeId, target: TypeId) -> bool {
+    match program.type_arena.get(source) {
+        Some(TypeData::Flag(_)) => matches!(program.type_arena.get(target), Some(TypeData::Int)),
+        Some(TypeData::Enum(enum_id)) => {
+            let Some(enm) = program.enums.get(enum_id.index()) else {
+                return false;
+            };
+            let backing_matches = match enm.repr {
+                EnumRepr::RawInt => matches!(program.type_arena.get(target), Some(TypeData::Int)),
+                EnumRepr::RawString => {
+                    matches!(program.type_arena.get(target), Some(TypeData::String))
+                }
+                EnumRepr::Adt => false,
+            };
+            backing_matches && enm.raw_type == Some(target)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn valid_raw_try_construct(
     program: &Program,
-    primitives: &PrimitiveTypes,
     source: TypeId,
     target: TypeId,
+    result: TypeId,
 ) -> bool {
-    if (primitives.is_int(source) && primitives.is_float(target))
-        || (primitives.is_float(source) && primitives.is_int(target))
-    {
-        return true;
-    }
-    let Some(TypeData::Enum(enum_id)) = program.type_arena.get(source) else {
-        return false;
+    let backing_matches = match program.type_arena.get(target) {
+        Some(TypeData::Flag(_)) => matches!(program.type_arena.get(source), Some(TypeData::Int)),
+        Some(TypeData::Enum(enum_id)) => {
+            let Some(enm) = program.enums.get(enum_id.index()) else {
+                return false;
+            };
+            let backing_matches = match enm.repr {
+                EnumRepr::RawInt => matches!(program.type_arena.get(source), Some(TypeData::Int)),
+                EnumRepr::RawString => {
+                    matches!(program.type_arena.get(source), Some(TypeData::String))
+                }
+                EnumRepr::Adt => false,
+            };
+            backing_matches && enm.raw_type == Some(source)
+        }
+        _ => false,
     };
-    program.enums.get(enum_id.index()).is_some()
-        && program.raw_enum_raw_type(*enum_id) == Some(target)
+    backing_matches && optional_inner(program, result) == Some(target)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,8 +348,10 @@ pub(crate) fn rvalue_ty(
         | RValue::MapValueAt { ty, .. }
         | RValue::SliceView { ty, .. }
         | RValue::FunctionRef { ty, .. }
-        | RValue::MakeLambda { ty, .. } => Some(*ty),
-        RValue::Cast { target, .. } => Some(*target),
+        | RValue::MakeLambda { ty, .. }
+        | RValue::RawTryConstruct { ty, .. }
+        | RValue::FlagStatic { ty, .. } => Some(*ty),
+        RValue::Cast { target, .. } | RValue::RawProject { target, .. } => Some(*target),
         RValue::Call { callee, .. } => callee_return_ty(program, callee),
         RValue::DynCall { surface, slot, .. } => program
             .contract_surfaces

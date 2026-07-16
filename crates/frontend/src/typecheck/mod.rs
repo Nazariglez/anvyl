@@ -9,6 +9,7 @@ pub(crate) use self::{
     annotation::DeprecatedUseKind,
     const_term::ConstTerm,
     decls::*,
+    flags::FlagStaticOp,
     generic::*,
     infer::SemanticLocalId,
     result::*,
@@ -85,6 +86,7 @@ mod extend_target;
 mod extern_boundary;
 mod extern_ops;
 mod field_check;
+pub(crate) mod flags;
 mod generic;
 mod generic_bind;
 mod globals;
@@ -180,8 +182,7 @@ pub(crate) enum ResolvedNominal<'a> {
 impl<'a> ResolvedNominal<'a> {
     pub(crate) fn key(&self) -> &NominalKey {
         match self {
-            Self::Aggregate { key, .. } => key,
-            Self::Enum { key, .. } => key,
+            Self::Aggregate { key, .. } | Self::Enum { key, .. } => key,
             Self::Extern { ty, .. } => &ty.nominal,
         }
     }
@@ -192,7 +193,7 @@ impl<'a> ResolvedNominal<'a> {
 
     pub(crate) fn variants(&self) -> Option<&'a NamedSchemas<VariantSchema>> {
         match self {
-            Self::Enum { schema, .. } => Some(&schema.variants),
+            Self::Enum { schema, .. } => Some(&schema.body.variants),
             Self::Aggregate { .. } | Self::Extern { .. } => None,
         }
     }
@@ -237,6 +238,11 @@ pub(crate) enum TypeError {
     TypeMismatch {
         expected: Type,
         found: Type,
+        span: Option<SourceSpan>,
+    },
+    RawProjectionRequiresValue {
+        source: Type,
+        target: Type,
         span: Option<SourceSpan>,
     },
     ConstMismatch {
@@ -779,6 +785,10 @@ pub(crate) enum TypeError {
         found: Type,
         span: Option<SourceSpan>,
     },
+    FlagExpectedIntValue {
+        found: Type,
+        span: Option<SourceSpan>,
+    },
     RawEnumExpectedStringValue {
         found: Type,
         span: Option<SourceSpan>,
@@ -874,6 +884,7 @@ impl TypeError {
             TypeError::ExternCatalog(error) => error.span(),
             TypeError::UndefinedVariable { span, .. }
             | TypeError::TypeMismatch { span, .. }
+            | TypeError::RawProjectionRequiresValue { span, .. }
             | TypeError::ConstMismatch { span, .. }
             | TypeError::RecursiveInference { span, .. }
             | TypeError::CannotInferType { span, .. }
@@ -1005,6 +1016,7 @@ impl TypeError {
             | TypeError::RefParamDefault { span, .. }
             | TypeError::ConstTypeMismatch { span, .. }
             | TypeError::RawEnumExpectedIntValue { span, .. }
+            | TypeError::FlagExpectedIntValue { span, .. }
             | TypeError::RawEnumExpectedStringValue { span, .. }
             | TypeError::InvalidConstCast { span, .. }
             | TypeError::ConstFloatToInt { span, .. }
@@ -1437,6 +1449,8 @@ struct TypeChecker {
     consts: HashMap<(ModuleScope, Ident), const_eval::ConstEntry>,
     local_consts: Vec<const_eval::LocalConstEntry>,
     default_fact_bodies: HashMap<DefaultExprSite, Vec<BodyInstanceKey>>,
+    enum_value_resolution: Option<decl_validate::EnumValueResolution>,
+    flag_initializer_values: Vec<HashMap<Ident, i64>>,
     next_alias_alt_group: u32,
     next_binding_id: u32,
 }
@@ -1489,6 +1503,8 @@ impl TypeChecker {
             consts: HashMap::new(),
             local_consts: vec![],
             default_fact_bodies: HashMap::new(),
+            enum_value_resolution: None,
+            flag_initializer_values: vec![],
             next_alias_alt_group: 0,
             next_binding_id: 0,
         }
@@ -2546,6 +2562,31 @@ impl TypeChecker {
             .record_expected_projection(self.current_body(), fact);
     }
 
+    fn record_raw_projection(&mut self, fact: RawProjectionFact) {
+        self.semantic_facts
+            .record_raw_projection(self.current_body(), fact);
+    }
+
+    fn record_flag_member(&mut self, fact: FlagMemberFact) {
+        self.semantic_facts
+            .record_flag_member(self.current_body(), fact);
+    }
+
+    fn record_flag_static(&mut self, fact: FlagStaticFact) {
+        self.semantic_facts
+            .record_flag_static(self.current_body(), fact);
+    }
+
+    fn record_conditional_pattern(&mut self, pattern: CheckedConditionalPattern) {
+        self.semantic_facts
+            .record_conditional_pattern(self.current_body(), pattern);
+    }
+
+    fn record_raw_try_construct(&mut self, fact: RawTryConstructFact) {
+        self.semantic_facts
+            .record_raw_try_construct(self.current_body(), fact);
+    }
+
     fn record_expr_place(&mut self, expr_id: ExprId, value: &place::PlaceValue) {
         self.expr_places.insert(expr_id, value.clone());
     }
@@ -3223,7 +3264,7 @@ impl TypeChecker {
             debug_assert_eq!(callable.def.id, id);
             callable
         } else {
-            let id = CallableId::local_function(module.scope.clone(), func.name, site.clone());
+            let id = CallableId::local_function(module.scope.clone(), func.name, *site);
             let Some(local) = self.local_callables.get(&id) else {
                 return;
             };
@@ -3838,7 +3879,7 @@ impl TypeChecker {
         };
         let mut added = false;
         let generics = schema.all_generics();
-        for variant in schema.variants.values() {
+        for variant in schema.body.variants.values() {
             variant.payload.for_each_type(|payload_ty| {
                 let payload_ty = substitute_aggregate_member(ty, &generics, payload_ty);
                 added |= self.ensure_type_stringify_override_specializations(&payload_ty, seen);
@@ -4026,7 +4067,7 @@ impl TypeChecker {
             NominalKind::Enum => {
                 if let Some(schema) = decls.enum_schema(key).cloned() {
                     let (type_subst, const_subst) = schema.all_generics().substitutions(all_args);
-                    for variant in schema.variants.values() {
+                    for variant in schema.body.variants.values() {
                         match &variant.payload {
                             VariantPayload::Unit => {}
                             VariantPayload::Tuple(params) => {
@@ -4210,8 +4251,18 @@ fn typechecker_for_modules(
         });
     }
 
-    tc.with_current_module(&root_scope, |tc| tc.eval_module_consts(&root_scope));
     tc.finalize_declarations();
+    body::with_callable_body_env(
+        &root_scope,
+        &CallableTemplateEnv::SourceModule,
+        &mut tc,
+        |tc| tc.eval_module_consts(&root_scope),
+    );
+    for (module, _) in &module_bodies {
+        body::with_callable_body_env(module, &CallableTemplateEnv::SourceModule, &mut tc, |tc| {
+            tc.eval_module_consts(module);
+        });
+    }
     tc.seed_global_types();
     tc.with_current_module(&root_scope, |tc| {
         check_decl_param_order(program, tc);
@@ -4505,6 +4556,10 @@ fn check_expected_value_expr_inner(
             checked = projection::apply_value_projection(tc, expr, &checked, &source, projection);
             true
         }
+        projection::ExpectedProjectionDecision::RawProject(plan) => {
+            checked = projection::apply_raw_projection(tc, expr, &checked, plan);
+            true
+        }
         projection::ExpectedProjectionDecision::Failed => false,
     };
     if accepted && enforce {
@@ -4529,7 +4584,10 @@ pub(in crate::typecheck) fn validate_const_expr_type(
     tc: &mut TypeChecker,
 ) -> Result<Type, Box<TypeError>> {
     let error_count = tc.errors.len();
-    let checked = check_value_expr_checked_with_hint(expr, expected.clone(), tc);
+    let checked = match expected.clone() {
+        Some(expected) => check_expected_value_expr(expr, expected, tc),
+        None => check_value_expr_checked_with_hint(expr, None, tc),
+    };
     if let Some(expected) = expected {
         tc.expect_assignable_expr(expr.span, expr.node.id, checked.handle, expected);
         tc.solve_constraints();
@@ -4736,9 +4794,11 @@ fn check_expr_checked_with_hint(
             &check_binary(expr.node.id, bin_node, expected.as_ref(), tc),
             tc,
         ),
-        ExprKind::Unary(unary_node) => {
-            checked_from_checked(expr, &check_unary(expr.node.id, unary_node, tc), tc)
-        }
+        ExprKind::Unary(unary_node) => checked_from_checked(
+            expr,
+            &check_unary(expr.node.id, unary_node, expected.as_ref(), tc),
+            tc,
+        ),
         ExprKind::Try(try_node) => {
             checked_from_checked(expr, &check_try(try_node, expected, tc), tc)
         }
@@ -5054,7 +5114,7 @@ fn try_operand_field_carrier_ty(expr: &ExprNode, tc: &TypeChecker) -> Option<Typ
     let carrier_ty = tc.solver.handle_to_partial_type(&field);
     let key = tc.decls.key_for_type(&carrier_ty)?;
     let schema = tc.decls.enum_schema(&key)?;
-    schema.variants.get(node.node.field)?;
+    schema.body.variants.get(node.node.field)?;
 
     let Type::Nominal(mut nominal) = carrier_ty else {
         return None;
@@ -5312,8 +5372,36 @@ fn check_binary(
         return checked;
     }
 
-    let left = check_expr_checked(&bin.node.left, tc);
-    let right = check_expr_checked(&bin.node.right, tc);
+    let left_inferred = matches!(bin.node.left.node.kind, ExprKind::InferredEnum(_));
+    let right_inferred = matches!(bin.node.right.node.kind, ExprKind::InferredEnum(_));
+    let (left, right) = match (left_inferred, right_inferred) {
+        (false, true) => {
+            let left = check_expr_checked(&bin.node.left, tc);
+            let expected = TypeChecker::type_handle(&left.ty);
+            let right = check_value_expr_checked_with_hint(&bin.node.right, Some(expected), tc);
+            (left, right)
+        }
+        (true, false) => {
+            let right = check_expr_checked(&bin.node.right, tc);
+            let expected = TypeChecker::type_handle(&right.ty);
+            let left = check_value_expr_checked_with_hint(&bin.node.left, Some(expected), tc);
+            (left, right)
+        }
+        (true, true) => {
+            let hint = expected
+                .map(|expected| tc.handle_type(expected))
+                .filter(|ty| flags::is_type(tc, bin.span, ty))
+                .map(|ty| TypeChecker::type_handle(&ty));
+            (
+                check_value_expr_checked_with_hint(&bin.node.left, hint.clone(), tc),
+                check_value_expr_checked_with_hint(&bin.node.right, hint, tc),
+            )
+        }
+        (false, false) => (
+            check_expr_checked(&bin.node.left, tc),
+            check_expr_checked(&bin.node.right, tc),
+        ),
+    };
     check_binary_checked(
         expr_id,
         bin.node.op,
@@ -5322,6 +5410,7 @@ fn check_binary(
         &bin.node.right,
         right,
         bin.span,
+        false,
         tc,
     )
 }
@@ -5372,6 +5461,7 @@ fn check_nil_equality(
         &bin.node.right,
         right,
         bin.span,
+        false,
         tc,
     ))
 }
@@ -5449,10 +5539,43 @@ fn check_binary_checked(
     right_expr: &ExprNode,
     right: CheckedType,
     span: Span,
+    compound: bool,
     tc: &mut TypeChecker,
 ) -> CheckedType {
     if tc.checked_is_poison(&left) || tc.checked_is_poison(&right) {
         return checked_type(Type::Infer);
+    }
+
+    let equality = matches!(op, BinaryOp::Eq | BinaryOp::NotEq);
+    if let Some(result) = flags::classify_binary(
+        tc,
+        op,
+        (&left.ty, left_expr.span),
+        (&right.ty, right_expr.span),
+    ) {
+        return checked_type(result);
+    }
+    if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor)
+        && flags::is_type(tc, left_expr.span, &left.ty)
+        && flags::is_type(tc, right_expr.span, &right.ty)
+    {
+        tc.push_error(TypeError::TypeMismatch {
+            expected: left.ty,
+            found: right.ty,
+            span: tc.error_span(span),
+        });
+        return checked_type(Type::Infer);
+    }
+    if equality && left.ty == right.ty {
+        return check_equality(expr_id, op, left_expr, left, right_expr, right, span, tc);
+    }
+
+    if let Some(plan) =
+        projection::raw_binary_projection_plan(tc, op, left_expr, &left.ty, right_expr, &right.ty)
+    {
+        return projection::apply_raw_binary_projection(
+            tc, left_expr, &left, right_expr, &right, plan, !compound,
+        );
     }
 
     if op == BinaryOp::Add
@@ -5466,7 +5589,7 @@ fn check_binary_checked(
         return checked_type(Type::String);
     }
 
-    if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+    if equality {
         return check_equality(expr_id, op, left_expr, left, right_expr, right, span, tc);
     }
 
@@ -5617,8 +5740,18 @@ fn type_mismatch(
     fallback
 }
 
-fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> CheckedType {
-    let operand = check_expr_checked(&unary.node.expr, tc);
+fn check_unary(
+    expr_id: ExprId,
+    unary: &UnaryNode,
+    expected: Option<&TypeHandle>,
+    tc: &mut TypeChecker,
+) -> CheckedType {
+    let hint = matches!(unary.node.expr.node.kind, ExprKind::InferredEnum(_))
+        .then(|| expected.map(|expected| tc.handle_type(expected)))
+        .flatten()
+        .filter(|ty| flags::is_type(tc, unary.span, ty))
+        .map(|ty| TypeChecker::type_handle(&ty));
+    let operand = check_value_expr_checked_with_hint(&unary.node.expr, hint, tc);
     if tc.checked_is_poison(&operand) {
         return checked_type(Type::Infer);
     }
@@ -5626,6 +5759,17 @@ fn check_unary(expr_id: ExprId, unary: &UnaryNode, tc: &mut TypeChecker) -> Chec
         && let Some(result) = unary.node.op.scalar_result(value)
     {
         return checked_type(type_from_scalar(result));
+    }
+    if let Some(result) =
+        flags::classify_unary(tc, unary.node.op, &operand.ty, unary.node.expr.span)
+    {
+        return checked_type(result);
+    }
+    if let Some((plan, result)) =
+        projection::raw_unary_projection_plan(tc, unary.node.op, &unary.node.expr, &operand.ty)
+    {
+        projection::apply_raw_projection(tc, &unary.node.expr, &operand, plan);
+        return checked_type(result);
     }
     extern_ops::check_unary(expr_id, unary.node.op, &operand, tc).unwrap_or_else(|| {
         tc.push_error(TypeError::InvalidOperand {
@@ -5722,6 +5866,7 @@ fn check_assign(expr_id: ExprId, assign: &AssignNode, tc: &mut TypeChecker) {
         &assign.node.value,
         value,
         assign.span,
+        true,
         tc,
     );
     if !target.checked().ty.is_void() && !result.ty.is_void() {

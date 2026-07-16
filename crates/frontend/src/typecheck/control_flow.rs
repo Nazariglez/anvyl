@@ -134,6 +134,7 @@ fn check_bool_condition(
         }
         projection::ExpectedProjectionDecision::Failed => {}
         projection::ExpectedProjectionDecision::SourceAccepted
+        | projection::ExpectedProjectionDecision::RawProject(_)
         | projection::ExpectedProjectionDecision::NotNeeded => {
             tc.push_error(condition_not_bool(kind, cond.ty, tc.error_span(expr.span)));
         }
@@ -644,12 +645,8 @@ fn check_match_with_policy(
                 body
             },
         );
-        let outcomes = heads
-            .iter()
-            .map(|head| head.outcome.clone())
-            .collect::<Vec<_>>();
+        match_coverage::check(&scrutinee.checked.ty, &heads, match_node.span, tc);
         record_checked_match_plan(parent, heads, mode, tc);
-        match_coverage::check(&scrutinee.checked.ty, &outcomes, match_node.span, tc);
         arms
     };
 

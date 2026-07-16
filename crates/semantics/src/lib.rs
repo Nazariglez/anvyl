@@ -6,10 +6,14 @@ pub enum FloatToIntError {
 
 pub fn display_float(float: f64) -> String {
     let mut text = float.to_string();
-    if float.is_finite() && !text.contains(['.', 'e', 'E']) {
+    if display_float_needs_decimal(float, &text) {
         text.push_str(".0");
     }
     text
+}
+
+pub fn display_float_needs_decimal(float: f64, text: &str) -> bool {
+    float.is_finite() && !text.contains(['.', 'e', 'E'])
 }
 
 pub fn int_to_float(int: i64) -> f64 {

@@ -15,25 +15,17 @@ use super::{
     place,
     place::{MutableUseKind, PlaceAccess, PlaceIdentity, PlaceUseFacts, check_alias_scrutinee},
     semantic_use::{
-        CheckedBindingOccurrence, CheckedEnumPayload, CheckedLiteralPattern, CheckedPattern,
-        CheckedPatternAlias, CheckedPatternAlternative, CheckedPatternBinding,
-        CheckedPatternBindingKind, CheckedPatternBindings, CheckedPatternOwner, CheckedPatternPath,
-        CheckedPatternPathSegment, CheckedStructField, ExternUseTarget,
+        CheckedBindingOccurrence, CheckedConditionalPattern, CheckedEnumPayload,
+        CheckedLiteralPattern, CheckedPattern, CheckedPatternAlias, CheckedPatternAlternative,
+        CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternBindings,
+        CheckedPatternOwner, CheckedPatternPath, CheckedPatternPathSegment, CheckedStructField,
+        ExternUseTarget,
     },
 };
 use crate::{
     ast::*,
     span::{SourceSpan, Span},
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PatternCover {
-    CatchAll,
-    Bool(bool),
-    EnumVariant { key: NominalKey, variant: Ident },
-    Or(Vec<PatternCover>),
-    Unsupported,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refutability {
@@ -60,7 +52,6 @@ pub(crate) enum PatternContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PatternOutcome {
-    pub(crate) cover: PatternCover,
     pub(crate) had_error: bool,
     pub(crate) refutability: Refutability,
 }
@@ -258,17 +249,15 @@ impl PatternInput {
 }
 
 impl PatternOutcome {
-    fn refutable(cover: PatternCover) -> Self {
+    fn refutable() -> Self {
         Self {
-            cover,
             had_error: false,
             refutability: Refutability::Refutable,
         }
     }
 
-    fn irrefutable(cover: PatternCover) -> Self {
+    fn irrefutable() -> Self {
         Self {
-            cover,
             had_error: false,
             refutability: Refutability::Irrefutable,
         }
@@ -276,7 +265,6 @@ impl PatternOutcome {
 
     pub(super) fn error() -> Self {
         Self {
-            cover: PatternCover::Unsupported,
             had_error: true,
             refutability: Refutability::Unknown,
         }
@@ -477,6 +465,7 @@ fn canonicalize_pattern_bindings(pattern: &mut CheckedPattern, bindings: &Checke
         }
         CheckedPattern::Wildcard
         | CheckedPattern::Literal(_)
+        | CheckedPattern::FlagValue { .. }
         | CheckedPattern::Nil
         | CheckedPattern::Unsupported => {}
     }
@@ -531,24 +520,32 @@ impl BindingAlternatives {
     }
 
     fn product(&self, other: &Self, tc: &mut TypeChecker) -> Self {
-        let mut envs = vec![];
-        for left in &self.envs {
-            for right in &other.envs {
-                envs.push(left.clone().merge(right.clone(), tc));
-            }
-        }
+        let left = self.envs.first().cloned().unwrap_or_default();
+        let right = other.envs.first().cloned().unwrap_or_default();
+        let mut envs = self
+            .envs
+            .iter()
+            .cloned()
+            .map(|env| env.merge(right.clone(), tc))
+            .collect::<Vec<_>>();
+        envs.extend(
+            other
+                .envs
+                .iter()
+                .skip(1)
+                .cloned()
+                .map(|env| left.clone().merge(env, tc)),
+        );
         Self { envs }
     }
 
     fn or(alternatives: &[PatternCheckResult], span: Span, tc: &mut TypeChecker) -> (Self, bool) {
-        let Some((first, _)) = alternatives.split_first() else {
+        let Some(expected) = alternatives
+            .first()
+            .and_then(|alternative| alternative.bindings.envs.first())
+        else {
             return (Self::single_empty(), true);
         };
-        let expected = first
-            .bindings
-            .envs
-            .first()
-            .expect("pattern alternatives are never empty");
         let mut valid = true;
         let mut envs = vec![];
         for alternative in alternatives {
@@ -631,15 +628,6 @@ impl BindingEnv {
             bindings: self
                 .iter()
                 .map(|(name, binding)| checked_binding(name, binding, tc, require_facts))
-                .collect(),
-        }
-    }
-
-    fn preliminary_checked_bindings(&self, tc: &TypeChecker) -> CheckedPatternBindings {
-        CheckedPatternBindings {
-            bindings: self
-                .iter()
-                .map(|(name, binding)| preliminary_checked_binding(name, binding, tc))
                 .collect(),
         }
     }
@@ -731,7 +719,7 @@ impl<'tc> PatternChecker<'tc> {
             self.tc,
         );
         PatternCheckResult {
-            outcome: PatternOutcome::irrefutable(PatternCover::CatchAll),
+            outcome: PatternOutcome::irrefutable(),
             bindings: BindingAlternatives::single(env),
             checked_bindings: CheckedPatternBindings::default(),
             checked: CheckedPattern::Binding(CheckedBindingOccurrence {
@@ -749,7 +737,7 @@ impl<'tc> PatternChecker<'tc> {
         match &pattern.node {
             Pattern::Ident(name) => self.check_ident(*name, input, pattern.span),
             Pattern::Wildcard => {
-                let mut outcome = PatternOutcome::irrefutable(PatternCover::CatchAll);
+                let mut outcome = PatternOutcome::irrefutable();
                 if input.map_entry_alias {
                     self.tc.push_error(TypeError::CompileError {
                         message: "map entry aliases require a `?` payload pattern".to_string(),
@@ -828,21 +816,15 @@ impl<'tc> PatternChecker<'tc> {
         let (bindings, valid) = BindingAlternatives::or(&checked, span, self.tc);
         had_error |= !valid;
         let refutability = or_refutability(checked.iter().map(|alt| alt.outcome.refutability));
-        let covers = checked
-            .iter()
-            .map(|alternative| alternative.outcome.cover.clone())
-            .collect();
         let alternatives = checked
             .into_iter()
-            .zip(bindings.envs.iter())
-            .map(|(alternative, env)| CheckedPatternAlternative {
+            .map(|alternative| CheckedPatternAlternative {
+                bindings: alternative.bindings.checked_bindings(self.tc, false),
                 pattern: alternative.checked,
-                bindings: env.preliminary_checked_bindings(self.tc),
             })
             .collect();
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::Or(covers),
                 had_error,
                 refutability,
             },
@@ -936,7 +918,6 @@ impl<'tc> PatternChecker<'tc> {
         }
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::Unsupported,
                 had_error,
                 refutability,
             },
@@ -960,11 +941,7 @@ impl<'tc> PatternChecker<'tc> {
             });
             return PatternOutcome::error();
         }
-        let cover = match lit {
-            Lit::Bool(value) => PatternCover::Bool(*value),
-            _ => PatternCover::Unsupported,
-        };
-        PatternOutcome::refutable(cover)
+        PatternOutcome::refutable()
     }
 
     fn check_nil(&mut self, span: Span, expected: &Type) -> PatternOutcome {
@@ -974,10 +951,7 @@ impl<'tc> PatternChecker<'tc> {
             });
             return PatternOutcome::error();
         }
-        PatternOutcome::refutable(
-            self.option_cover(expected, "None")
-                .unwrap_or(PatternCover::CatchAll),
-        )
+        PatternOutcome::refutable()
     }
 
     fn check_optional(&mut self, inner: &PatternNode, input: &PatternInput) -> PatternCheckResult {
@@ -1045,9 +1019,6 @@ impl<'tc> PatternChecker<'tc> {
         let result = self.check(inner, inner_input);
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: self
-                    .option_cover(&input.expected_ty, "Some")
-                    .unwrap_or(result.outcome.cover),
                 had_error: result.outcome.had_error,
                 refutability: Refutability::Refutable,
             },
@@ -1055,13 +1026,6 @@ impl<'tc> PatternChecker<'tc> {
             checked_bindings: CheckedPatternBindings::default(),
             checked: CheckedPattern::OptionalSome(Box::new(result.checked)),
         }
-    }
-
-    fn option_cover(&self, expected: &Type, variant: &str) -> Option<PatternCover> {
-        Some(PatternCover::EnumVariant {
-            key: self.tc.decls.semantic_option_key(expected)?,
-            variant: Ident::new(variant),
-        })
     }
 
     fn validate_optional_payload_pattern(&mut self, pattern: &PatternNode) -> bool {
@@ -1265,7 +1229,6 @@ impl<'tc> PatternChecker<'tc> {
         }
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::CatchAll,
                 had_error,
                 refutability,
             },
@@ -1353,20 +1316,52 @@ impl<'tc> PatternChecker<'tc> {
         span: Span,
         expected: &Type,
     ) -> (PatternOutcome, CheckedPattern) {
-        let Some(resolved) =
-            enum_variant::resolve_pattern(self.tc, qualifier, variant, span, expected)
+        let Some(key) = enum_variant::resolve_pattern_owner(self.tc, qualifier, span, expected)
         else {
+            return (PatternOutcome::error(), CheckedPattern::Unsupported);
+        };
+        let flag_member = self
+            .tc
+            .decls
+            .enum_schema(&key)
+            .and_then(|schema| schema.body.kind.flag())
+            .and_then(|flag| flag.member(variant))
+            .cloned();
+        if let Some(member) = flag_member {
+            if matches!(self.mode, PatternBindMode::Alias) {
+                self.tc.push_error(TypeError::CompileError {
+                    message: "flag values cannot be matched with `ref`".to_string(),
+                    span: self.tc.error_span(span),
+                });
+                return (PatternOutcome::error(), CheckedPattern::Unsupported);
+            }
+            self.tc.check_access_policy(
+                &member.policy,
+                super::MemberAccessKind::Field,
+                variant,
+                expected,
+                &key.module,
+                span,
+            );
+            return (
+                PatternOutcome::refutable(),
+                CheckedPattern::FlagValue {
+                    owner: CheckedPatternOwner {
+                        key,
+                        ty: expected.clone(),
+                    },
+                    value: member.value,
+                },
+            );
+        }
+        let Some(resolved) = enum_variant::resolve_use(self.tc, &key, variant, span) else {
             return (PatternOutcome::error(), CheckedPattern::Unsupported);
         };
         if !enum_variant::expect_unit(self.tc, &resolved, span) {
             return (PatternOutcome::error(), CheckedPattern::Unsupported);
         }
-        let key = resolved.key;
         (
-            PatternOutcome::refutable(PatternCover::EnumVariant {
-                key: key.clone(),
-                variant,
-            }),
+            PatternOutcome::refutable(),
             CheckedPattern::Enum {
                 owner: CheckedPatternOwner {
                     key,
@@ -1427,10 +1422,6 @@ impl<'tc> PatternChecker<'tc> {
         }
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::EnumVariant {
-                    key: key.clone(),
-                    variant,
-                },
                 had_error,
                 refutability: Refutability::Refutable,
             },
@@ -1504,10 +1495,6 @@ impl<'tc> PatternChecker<'tc> {
         }
         PatternCheckResult {
             outcome: PatternOutcome {
-                cover: PatternCover::EnumVariant {
-                    key: key.clone(),
-                    variant,
-                },
                 had_error,
                 refutability: Refutability::Refutable,
             },
@@ -1699,13 +1686,11 @@ fn check_roots_detailed(
 ) -> PatternCheckResult {
     let Some(first) = roots.first() else {
         return PatternCheckResult::empty_checked(
-            PatternOutcome::irrefutable(PatternCover::CatchAll),
+            PatternOutcome::irrefutable(),
             CheckedPattern::Wildcard,
         );
     };
     let span = first.pattern.span;
-    let single_root = roots.len() == 1;
-    let mut cover = PatternCover::Unsupported;
     let mut had_error = false;
     let mut refutability = Refutability::Irrefutable;
     let mut bindings = BindingAlternatives::single_empty();
@@ -1740,9 +1725,6 @@ fn check_roots_detailed(
         }
         had_error |= result.outcome.had_error;
         refutability = combine_refutability(refutability, result.outcome.refutability);
-        if single_root {
-            cover = result.outcome.cover;
-        }
         checked_patterns.push(result.checked);
         bindings = bindings.product(&result.bindings, checker.tc);
     }
@@ -1767,7 +1749,6 @@ fn check_roots_detailed(
     };
     let mut result = PatternCheckResult {
         outcome: PatternOutcome {
-            cover,
             had_error,
             refutability,
         },
@@ -2068,7 +2049,7 @@ pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecke
     let mode = mode_for_conditional_access(node.head);
     let value = check_pattern_scrutinee(&node.value, mode, tc);
     tc.push_scope();
-    check_place_at(
+    let checked = check_place_at_detailed(
         &node.pattern,
         value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
         mode,
@@ -2076,6 +2057,11 @@ pub(super) fn check_while_let(while_let_node: &WhileLetNode, tc: &mut TypeChecke
         PatternContext::WhileLet,
         tc,
     );
+    tc.record_conditional_pattern(CheckedConditionalPattern {
+        value: node.value.node.id,
+        pattern: checked.checked,
+        bindings: checked.checked_bindings,
+    });
     control_flow::check_loop_body(&node.body, tc);
     tc.pop_scope();
 }
@@ -2178,6 +2164,13 @@ fn check_if_let_ref_failable_cast(
                 downcast::check_conditional_place(cast, target, source, binding.map(|_| &site), tc);
             check_if_let_ref_downcast_checked(node, binding, checked, expected, tc)
         }
+        Some(convert::ResolvedFailableCast::RawTryConstruct) => {
+            tc.push_error(TypeError::CompileError {
+                message: "raw enum construction cannot be bound with `ref`".to_string(),
+                span: tc.error_span(if_let_node.node.pattern.span),
+            });
+            check_downcast_branches(node, None, &Type::Infer, expected, tc)
+        }
         Some(convert::ResolvedFailableCast::CastFrom(_)) => {
             tc.push_error(TypeError::CompileError {
                 message: "user failable casts cannot be bound with `ref`".to_string(),
@@ -2260,7 +2253,7 @@ pub(super) fn check_if_let_checked_with_hint(
     let then_expected = expected.clone();
     check_if_let_branches(node, expected, tc, |tc| {
         tc.push_scope();
-        check_place_at(
+        let checked = check_place_at_detailed(
             &node.pattern,
             value.pattern_place(value.checked.handle.clone(), value.checked.ty.clone()),
             mode,
@@ -2268,6 +2261,11 @@ pub(super) fn check_if_let_checked_with_hint(
             PatternContext::IfLet,
             tc,
         );
+        tc.record_conditional_pattern(CheckedConditionalPattern {
+            value: node.value.node.id,
+            pattern: checked.checked,
+            bindings: checked.checked_bindings,
+        });
         let then = check_block_checked_with_hint(&node.then_block, then_expected, tc);
         tc.pop_scope();
         then

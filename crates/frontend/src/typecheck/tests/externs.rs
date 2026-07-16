@@ -664,6 +664,33 @@ mod projection {
     }
 
     #[test]
+    fn provider_borrow_accepts_raw_projection() {
+        let result = check_with_provider(
+            r"
+            import ext:host { touch };
+            enum State: int { Idle }
+            fn main() {
+                let state = State.Idle;
+                touch(state);
+            }
+            ",
+            provider(ExternModuleDescriptor {
+                path: extern_path(&["host"]),
+                types: vec![],
+                functions: vec![function(
+                    "touch",
+                    vec![flow_param("state", ExternTypeExpr::Int, ParamFlow::Borrow)],
+                    ExternTypeExpr::Void,
+                )],
+            }),
+        )
+        .expect("typecheck failed");
+
+        assert_eq!(result.raw_projections().len(), 1);
+        assert_typecheck_closed(&result);
+    }
+
+    #[test]
     fn source_extern_projected_return_records_use() {
         let result = check(
             r"

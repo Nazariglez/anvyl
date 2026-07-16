@@ -9,7 +9,7 @@ use chumsky::{
 };
 use internment::Intern;
 
-use crate::{ast, source::SourceId, span::SourceSpan};
+use crate::{ast, numeric_literal::NumericLiteral, source::SourceId, span::SourceSpan};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -71,8 +71,8 @@ impl Display for Token {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LitToken {
-    Number(i64),
-    Float(Intern<String>, f64),
+    Number(NumericLiteral<i64>),
+    Float(NumericLiteral<f64>),
     String(Intern<String>),
     Char(char),
 }
@@ -81,7 +81,8 @@ impl Display for LitToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LitToken::Number(n) => write!(f, "{n}"),
-            LitToken::Float(s, _) | LitToken::String(s) => write!(f, "{s}"),
+            LitToken::Float(n) => write!(f, "{n}"),
+            LitToken::String(s) => write!(f, "{s}"),
             LitToken::Char(c) => write!(f, "{c:?}"),
         }
     }
@@ -613,6 +614,14 @@ fn validate_numeric_underscores(s: &str) -> bool {
         && !s.ends_with('_')
 }
 
+fn validate_decimal_underscores(s: &str) -> bool {
+    validate_numeric_underscores(s)
+        && !s.contains("_e")
+        && !s.contains("_E")
+        && !s.contains("e_")
+        && !s.contains("E_")
+}
+
 fn strip_underscores(s: &str) -> String {
     s.chars().filter(|c| *c != '_').collect()
 }
@@ -719,6 +728,7 @@ fn is_digit_for_radix(c: char, radix: u32) -> bool {
 fn parse_prefixed_digits<'src, 'p>(
     input: &mut InputRef<'src, 'p, &'src str, Extra<'src>>,
     start: &Cursor<'src, 'p, &'src str>,
+    prefix: char,
     radix: u32,
 ) -> Result<LitToken, LexErr<'src>> {
     let base_name = match radix {
@@ -772,9 +782,12 @@ fn parse_prefixed_digits<'src, 'p>(
     }
 
     let cleaned = strip_underscores(&buf);
-    i64::from_str_radix(&cleaned, radix)
-        .map(LitToken::Number)
-        .map_err(|_| Rich::custom(input.span_since(start), "integer literal overflow"))
+    let value = i64::from_str_radix(&cleaned, radix)
+        .map_err(|_| Rich::custom(input.span_since(start), "integer literal overflow"))?;
+    Ok(LitToken::Number(NumericLiteral::new(
+        format!("0{prefix}{buf}"),
+        value,
+    )))
 }
 
 fn decimal_int<'src>(buf: &str, span: SimpleSpan<usize>) -> Result<LitToken, LexErr<'src>> {
@@ -786,10 +799,10 @@ fn decimal_int<'src>(buf: &str, span: SimpleSpan<usize>) -> Result<LitToken, Lex
     }
 
     let cleaned = strip_underscores(buf);
-    cleaned
+    let value = cleaned
         .parse::<i64>()
-        .map(LitToken::Number)
-        .map_err(|_| Rich::custom(span, "integer literal overflow"))
+        .map_err(|_| Rich::custom(span, "integer literal overflow"))?;
+    Ok(LitToken::Number(NumericLiteral::new(buf, value)))
 }
 
 fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
@@ -808,15 +821,16 @@ fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
         };
 
         if first == '0' {
-            let radix = match input.peek() {
+            let prefix = input.peek();
+            let radix = match prefix {
                 Some('x' | 'X') => Some(16),
                 Some('b' | 'B') => Some(2),
                 Some('o' | 'O') => Some(8),
                 _ => None,
             };
-            if let Some(radix) = radix {
+            if let (Some(prefix), Some(radix)) = (prefix, radix) {
                 input.skip();
-                return parse_prefixed_digits(input, &start, radix);
+                return parse_prefixed_digits(input, &start, prefix, radix);
             }
         }
 
@@ -840,7 +854,7 @@ fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
         if !has_fraction && !has_exponent {
             return decimal_int(&buf, input.span_since(&start));
         }
-        if !validate_numeric_underscores(&buf) {
+        if !validate_decimal_underscores(&buf) {
             return Err(Rich::custom(
                 input.span_since(&start),
                 "invalid underscore placement in numeric literal",
@@ -851,10 +865,10 @@ fn lit_number<'src>() -> impl Parser<'src, &'src str, LitToken, Extra<'src>> {
         let value = text
             .parse::<f64>()
             .map_err(|_| Rich::custom(input.span_since(&start), "invalid float literal"))?;
-        Ok(LitToken::Float(Intern::new(text), value))
+        Ok(LitToken::Float(NumericLiteral::new(buf, value)))
     })
     .validate(|token, extra, emitter| {
-        if matches!(token, LitToken::Float(_, value) if !value.is_finite()) {
+        if matches!(&token, LitToken::Float(value) if !value.value().is_finite()) {
             emitter.emit(Rich::custom(extra.span(), "float literal overflow"));
         }
         token
@@ -1083,13 +1097,36 @@ mod tests {
     }
 
     #[test]
+    fn numeric_literals_retain_exact_spelling() {
+        let tokens = tokenize_tokens("0XDe_AD 0b01_01 0012 1_2.30E+04");
+        let spellings = tokens
+            .iter()
+            .map(|token| match token {
+                Token::Literal(LitToken::Number(n)) => n.spelling(),
+                Token::Literal(LitToken::Float(n)) => n.spelling(),
+                _ => panic!("expected numeric token"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(spellings, ["0XDe_AD", "0b01_01", "0012", "1_2.30E+04"]);
+    }
+
+    #[test]
+    fn decimal_exponent_rejects_adjacent_underscores() {
+        for source in ["1_e2", "1_E2", "1e_2", "1E_2"] {
+            assert!(tokenize_test(source).is_err(), "accepted {source:?}");
+        }
+        assert!(tokenize_test("0xE_F").is_ok());
+    }
+
+    #[test]
     fn numeric_boundaries_do_not_consume_invalid_exponents() {
         for source in ["1e", "1e+", "1efoo", "1.5e", "1.5e-", "1.5efoo"] {
             let tokens = tokenize_tokens(source);
             assert!(
                 matches!(
                     tokens[0],
-                    Token::Literal(LitToken::Number(_) | LitToken::Float(_, _))
+                    Token::Literal(LitToken::Number(_) | LitToken::Float(_))
                 ),
                 "missing leading number token for {source:?}: {tokens:?}"
             );

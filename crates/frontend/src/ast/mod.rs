@@ -5,7 +5,10 @@ use std::fmt::Display;
 use internment::Intern;
 pub(crate) use type_walk::{TypeFolder, TypeVisitor};
 
-use crate::span::{Span, Spanned};
+use crate::{
+    numeric_literal::NumericLiteral,
+    span::{Span, Spanned},
+};
 
 pub type ModulePath = std::rc::Rc<[String]>;
 
@@ -135,9 +138,19 @@ impl Display for ConstValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstArg {
-    Value(ConstValue),
+    Value(NumericLiteral<ConstValue>),
     Name(Ident),
     Param(ConstParamId),
+}
+
+impl ConstArg {
+    pub fn value(value: ConstValue) -> Self {
+        let value = match value {
+            ConstValue::Float(value) => NumericLiteral::from(value).map(ConstValue::Float),
+            value => NumericLiteral::new(value.to_string(), value),
+        };
+        Self::Value(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -175,11 +188,17 @@ pub enum ConstExpr {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
-    Fixed(usize),
+    Fixed(NumericLiteral<usize>),
     Infer,
     Named(Ident),
     Param(ConstParamId),
     Expr(ConstExpr),
+}
+
+impl ArrayLen {
+    pub fn fixed(value: usize) -> Self {
+        Self::Fixed(value.into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -278,25 +297,27 @@ pub enum NominalKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RawEnumBackingConstraint {
-    Int,
-    String,
+pub enum EnumKindConstraint {
+    Any,
+    RawInt,
+    RawString,
+    Flag,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExtendTargetConstraint {
-    Enum {
-        backing: Option<RawEnumBackingConstraint>,
-    },
+    Enum { kind: EnumKindConstraint },
     Struct,
     DataRef,
 }
 
-impl RawEnumBackingConstraint {
-    pub fn keyword(self) -> &'static str {
+impl EnumKindConstraint {
+    pub fn keyword(self) -> Option<&'static str> {
         match self {
-            Self::Int => "int",
-            Self::String => "string",
+            Self::Any => None,
+            Self::RawInt => Some("int"),
+            Self::RawString => Some("string"),
+            Self::Flag => Some("flag"),
         }
     }
 }
@@ -310,9 +331,9 @@ impl ExtendTargetConstraint {
         }
     }
 
-    pub fn backing(self) -> Option<RawEnumBackingConstraint> {
+    pub fn enum_kind(self) -> Option<EnumKindConstraint> {
         match self {
-            Self::Enum { backing } => backing,
+            Self::Enum { kind } => Some(kind),
             Self::Struct | Self::DataRef => None,
         }
     }
@@ -1187,6 +1208,13 @@ pub struct EnumVariant {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum EnumMode {
+    Adt,
+    Backed(Spanned<Type>),
+    Flag(Span),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
     pub annotations: Vec<AnnotationNode>,
     pub doc: Option<String>,
@@ -1194,7 +1222,7 @@ pub struct EnumDecl {
     pub visibility: Visibility,
     pub type_params: Vec<TypeParam>,
     pub const_params: Vec<ConstParam>,
-    pub raw_backing: Option<Spanned<Type>>,
+    pub mode: EnumMode,
     pub variants: Vec<EnumVariant>,
 }
 
@@ -1908,8 +1936,8 @@ impl ExprKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lit {
-    Int(i64),
-    Float(f64),
+    Int(NumericLiteral<i64>),
+    Float(NumericLiteral<f64>),
     Bool(bool),
     String(String),
     Char(char),
@@ -1917,10 +1945,18 @@ pub enum Lit {
 }
 
 impl Lit {
+    pub fn int(value: i64) -> Self {
+        Self::Int(value.into())
+    }
+
+    pub fn float(value: f64) -> Self {
+        Self::Float(value.into())
+    }
+
     pub fn const_value(&self) -> Option<ConstValue> {
         match self {
-            Self::Int(value) => Some(ConstValue::Int(*value)),
-            Self::Float(value) => Some(ConstValue::Float(*value)),
+            Self::Int(value) => Some(ConstValue::Int(*value.value())),
+            Self::Float(value) => Some(ConstValue::Float(*value.value())),
             Self::Bool(value) => Some(ConstValue::Bool(*value)),
             Self::String(value) => Some(ConstValue::String(value.clone())),
             Self::Char(value) => Some(ConstValue::Char(*value)),
@@ -2057,14 +2093,7 @@ impl AggregateKind {
         matches!(self, Self::DataRef)
     }
 
-    pub fn make_type(
-        self,
-        name: Ident,
-        type_args: Vec<Type>,
-        const_args: Vec<ConstArg>,
-        origin: Option<ModulePath>,
-    ) -> Type {
-        debug_assert!(origin.is_none());
+    pub fn make_type(self, name: Ident, type_args: Vec<Type>, const_args: Vec<ConstArg>) -> Type {
         let generic_args = type_args
             .into_iter()
             .map(GenericArg::Type)
@@ -2213,7 +2242,7 @@ mod tests {
             .into_iter()
             .collect();
         let const_args = (kind != NominalKind::Extern)
-            .then_some(ConstArg::Value(ConstValue::Int(1)))
+            .then_some(ConstArg::value(ConstValue::Int(1)))
             .into_iter()
             .collect();
         crate::test_support::test_nominal_type(
@@ -2238,7 +2267,7 @@ mod tests {
             NominalKind::Struct,
             Ident::new("Foo"),
             vec![Type::Bool],
-            vec![ConstArg::Value(ConstValue::Int(1))],
+            vec![ConstArg::value(ConstValue::Int(1))],
             Some(ModuleOrigin::Module(origin("a"))),
         );
         let const_arg = crate::test_support::test_nominal_type(
@@ -2247,7 +2276,7 @@ mod tests {
             NominalKind::Struct,
             Ident::new("Foo"),
             vec![Type::Int],
-            vec![ConstArg::Value(ConstValue::Int(2))],
+            vec![ConstArg::value(ConstValue::Int(2))],
             Some(ModuleOrigin::Module(origin("a"))),
         );
 
@@ -2264,7 +2293,7 @@ mod tests {
         assert_eq!(nominal.kind, NominalKind::Struct);
         assert_eq!(nominal.name, Ident::new("Foo"));
         assert_eq!(nominal.type_args, [Type::Int]);
-        assert_eq!(nominal.const_args, [ConstArg::Value(ConstValue::Int(1))]);
+        assert_eq!(nominal.const_args, [ConstArg::value(ConstValue::Int(1))]);
         assert_eq!(nominal.origin, Some(ModuleOrigin::Module(origin("a"))));
         assert!(Type::Int.as_nominal().is_none());
     }
@@ -2275,7 +2304,7 @@ mod tests {
         let aggregate = ty.as_aggregate().expect("expected aggregate");
         assert_eq!(aggregate.kind, AggregateKind::Struct);
         assert_eq!(aggregate.type_args, [Type::Int]);
-        assert_eq!(aggregate.const_args, [ConstArg::Value(ConstValue::Int(1))]);
+        assert_eq!(aggregate.const_args, [ConstArg::value(ConstValue::Int(1))]);
 
         assert!(nominal(2, NominalKind::Enum, None).as_aggregate().is_none());
         assert!(

@@ -302,7 +302,7 @@ mod tests {
     }
 
     fn int_arg(value: i64) -> GenericArg {
-        GenericArg::Const(ConstArg::Value(ConstValue::Int(value)))
+        GenericArg::Const(ConstArg::value(ConstValue::Int(value)))
     }
 
     fn type_arg(ty: Type) -> GenericArg {

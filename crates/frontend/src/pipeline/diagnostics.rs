@@ -607,6 +607,11 @@ pub(super) fn diagnose_type_error(
         TypeError::TypeMismatch {
             expected, found, ..
         } => render_type_mismatch(expected, found, type_ctx),
+        TypeError::RawProjectionRequiresValue { source, target, .. } => format!(
+            "cannot use '{}' as mutable '{}'; raw projection produces a value, not a mutable place",
+            render_surface_type(source, type_ctx),
+            render_surface_type(target, type_ctx),
+        ),
         TypeError::ConstMismatch {
             expected, found, ..
         } => format!(
@@ -1033,6 +1038,9 @@ pub(super) fn diagnose_type_error(
         }
         TypeError::RawEnumExpectedIntValue { found, .. } => {
             format!("raw int enum value must be an int constant, found '{}'", render_surface_type(found, type_ctx))
+        }
+        TypeError::FlagExpectedIntValue { found, .. } => {
+            format!("flag value must be an int constant, found '{}'", render_surface_type(found, type_ctx))
         }
         TypeError::RawEnumExpectedStringValue { found, .. } => {
             format!("raw string enum value must be a string constant, found '{}'", render_surface_type(found, type_ctx))
@@ -1842,6 +1850,10 @@ fn render_extern_catalog_error(
                     "extern map key type '{}' is not keyable in {item}",
                     render_surface_type(ty, type_ctx)
                 ),
+                InvalidExternTypeReason::UnsupportedFlag => format!(
+                    "flag type '{}' is not supported in extern schemas; use 'int' at the boundary in {item}",
+                    render_surface_type(ty, type_ctx)
+                ),
             }
         }
         ExternCatalogError::InvalidAbiType {
@@ -2086,6 +2098,14 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
                 owner.name
             )
         }
+        DeclError::EnumValueDependencyCycle { cycle, .. } => {
+            let cycle = cycle
+                .iter()
+                .map(|key| key.name.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            format!("enum value dependency cycle: {cycle}")
+        }
         DeclError::RawEnumValueWithoutBacking { owner, variant, .. } => {
             format!(
                 "variant '{}.{variant}' cannot have a raw value without enum backing",
@@ -2122,6 +2142,47 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
                 owner.name
             )
         }
+        DeclError::FlagGenericParams { owner, .. } => {
+            format!("flag enum '{}' cannot be generic", owner.name)
+        }
+        DeclError::FlagOwnerDependency { owner, .. } => {
+            format!(
+                "flag enum '{}' cannot depend on owner generic parameters",
+                owner.name
+            )
+        }
+        DeclError::FlagPayloadMember { owner, member, .. } => {
+            format!(
+                "flag member '{}.{member}' cannot have a payload",
+                owner.name
+            )
+        }
+        DeclError::FlagStaticMemberConflict { owner, member, .. } => format!(
+            "flag member '{}.{member}' conflicts with compiler static method '{member}'",
+            owner.name
+        ),
+        DeclError::FlagInvalidValue {
+            owner,
+            member,
+            kind,
+            ..
+        } => {
+            let reason = match kind {
+                crate::typecheck::flags::FlagResolveErrorKind::Negative => {
+                    "values must be nonnegative"
+                }
+                crate::typecheck::flags::FlagResolveErrorKind::Duplicate => {
+                    "value is already named"
+                }
+                crate::typecheck::flags::FlagResolveErrorKind::UnknownCompositeBits => {
+                    "composites may use only earlier atomic bits"
+                }
+                crate::typecheck::flags::FlagResolveErrorKind::AutomaticOverflow => {
+                    "automatic values exceed bit 62"
+                }
+            };
+            format!("invalid flag value for '{}.{member}': {reason}", owner.name)
+        }
         DeclError::DuplicateVariantField {
             owner,
             variant,
@@ -2151,6 +2212,17 @@ fn render_decl_error(error: &DeclError, type_ctx: &TypeDiagnosticContext) -> Str
         ),
         DeclError::ConflictingCastFrom { source, target, .. } => format!(
             "cast from and cast? from conflict for '{}' to '{}'",
+            render_surface_type(source, type_ctx),
+            render_surface_type(target, type_ctx)
+        ),
+        DeclError::CompilerRawConversionConflict {
+            kind,
+            source,
+            target,
+            ..
+        } => format!(
+            "{} '{}' to '{}' conflicts with compiler-provided raw enum conversion",
+            kind.syntax(),
             render_surface_type(source, type_ctx),
             render_surface_type(target, type_ctx)
         ),

@@ -19,8 +19,8 @@ pub use decl::*;
 pub use ids::{
     AggregateId, AirLoopId, BindingId, BlockId, CaptureCellId, ConstId, ContractSlotId,
     ContractSurfaceId, ContractWeakeningId, ContractWitnessId, DynBorrowParamId, EnumId, ExternId,
-    ExternTypeId, FieldId, FunctionId, GlobalId, LambdaCaptureSlotId, LambdaId, LocalId, ModuleId,
-    ScopedBorrowId, TypeId, VariantId,
+    ExternTypeId, FieldId, FlagId, FlagMemberId, FunctionId, GlobalId, LambdaCaptureSlotId,
+    LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId, VariantId,
 };
 pub use ownership::*;
 pub use types::*;
@@ -66,6 +66,7 @@ pub struct Program {
     pub extern_types: Vec<ExternTypeDecl>,
     pub aggregates: Vec<AggregateDecl>,
     pub enums: Vec<EnumDecl>,
+    pub flags: Vec<FlagDecl>,
     pub contract_surfaces: Vec<ContractSurfaceDecl>,
     pub contract_witnesses: Vec<ContractWitnessDecl>,
     pub contract_weakenings: Vec<ContractWeakeningDecl>,
@@ -395,6 +396,20 @@ impl Program {
         &mut self.aggregates[id.index()]
     }
 
+    pub fn alloc_flag(&mut self, flag: FlagDecl) -> FlagId {
+        let id = FlagId::from_index(self.flags.len());
+        self.flags.push(flag);
+        id
+    }
+
+    pub fn flag_decl(&self, id: FlagId) -> &FlagDecl {
+        &self.flags[id.index()]
+    }
+
+    pub fn flag_decl_mut(&mut self, id: FlagId) -> &mut FlagDecl {
+        &mut self.flags[id.index()]
+    }
+
     pub fn alloc_enum(&mut self, enm: EnumDecl) -> EnumId {
         let id = EnumId::from_index(self.enums.len());
         self.enums.push(enm);
@@ -574,6 +589,10 @@ impl Program {
                     &decl.const_args,
                     mode,
                 )
+            }
+            (_, TypeData::Flag(id)) => {
+                let decl = self.flag_decl(*id);
+                self.render_named_type(decl.module, decl.name, &[], &[], mode)
             }
             (_, TypeData::Extern(id)) => {
                 let decl = self.extern_type(*id);

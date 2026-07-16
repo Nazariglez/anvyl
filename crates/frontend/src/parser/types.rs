@@ -68,16 +68,18 @@ fn generic_arg_contains_slice(arg: &ast::GenericArg) -> bool {
 
 fn const_value_arg<'src>() -> BoxedParser<'src, ast::ConstArg> {
     select! {
-        Token::Literal(LitToken::Number(n)) => ast::ConstArg::Value(ast::ConstValue::Int(n)),
-        Token::Literal(LitToken::Float(_, value)) => {
-            ast::ConstArg::Value(ast::ConstValue::Float(value))
+        Token::Literal(LitToken::Number(n)) => {
+            ast::ConstArg::Value(n.map(ast::ConstValue::Int))
+        },
+        Token::Literal(LitToken::Float(n)) => {
+            ast::ConstArg::Value(n.map(ast::ConstValue::Float))
         },
         Token::Literal(LitToken::String(s)) => {
-            ast::ConstArg::Value(ast::ConstValue::String(s.to_string()))
+            ast::ConstArg::value(ast::ConstValue::String(s.to_string()))
         },
-        Token::Literal(LitToken::Char(c)) => ast::ConstArg::Value(ast::ConstValue::Char(c)),
-        Token::Keyword(Keyword::True) => ast::ConstArg::Value(ast::ConstValue::Bool(true)),
-        Token::Keyword(Keyword::False) => ast::ConstArg::Value(ast::ConstValue::Bool(false)),
+        Token::Literal(LitToken::Char(c)) => ast::ConstArg::value(ast::ConstValue::Char(c)),
+        Token::Keyword(Keyword::True) => ast::ConstArg::value(ast::ConstValue::Bool(true)),
+        Token::Keyword(Keyword::False) => ast::ConstArg::value(ast::ConstValue::Bool(false)),
     }
     .labelled("const argument")
     .as_context()
@@ -232,8 +234,9 @@ fn type_ident_inner<'src>(context: TypeContext) -> BoxedParser<'src, Type> {
             param_type_ident()
         };
 
-        let array_len_fixed =
-            select! { Token::Literal(LitToken::Number(n)) => ast::ArrayLen::Fixed(n as usize) };
+        let array_len_fixed = select! {
+            Token::Literal(LitToken::Number(n)) => ast::ArrayLen::Fixed(n.map(|n| n as usize))
+        };
         let array_len_ident = identifier().map(|ident| {
             if ident.0.as_ref() == "_" {
                 ast::ArrayLen::Infer

@@ -97,6 +97,7 @@ pub struct Module {
     pub globals: Vec<GlobalId>,
     pub aggregates: Vec<AggregateId>,
     pub enums: Vec<EnumId>,
+    pub flags: Vec<FlagId>,
     pub extern_types: Vec<ExternTypeId>,
     pub externs: Vec<ExternId>,
 }
@@ -396,6 +397,22 @@ impl EnumDecl {
             .iter()
             .all(|variant| matches!(variant.shape, VariantShape::Unit))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagDecl {
+    pub name: Ident,
+    pub module: ModuleId,
+    pub known_bits: i64,
+    pub members: Vec<FlagMemberDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagMemberDecl {
+    pub id: FlagMemberId,
+    pub name: Ident,
+    pub value: i64,
+    pub atomic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

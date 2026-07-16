@@ -10,6 +10,7 @@ use super::{
     extend_target::{
         ExtendTargetPattern, MatchedTargetPattern, match_exact_target, most_specific_target_match,
     },
+    flags::FlagResolveErrorKind,
     generic_template_type, match_cast_conversion, substitute,
     surface::{dependent_embed_template_valid, projection_path_valid},
     type_ops::type_depends_on_generics,
@@ -539,6 +540,10 @@ pub(crate) enum DeclError {
         owner: NominalKey,
         span: Option<SourceSpan>,
     },
+    EnumValueDependencyCycle {
+        cycle: Vec<NominalKey>,
+        span: Option<SourceSpan>,
+    },
     RawEnumValueWithoutBacking {
         owner: NominalKey,
         variant: Ident,
@@ -565,6 +570,30 @@ pub(crate) enum DeclError {
         variant: Ident,
         span: Option<SourceSpan>,
     },
+    FlagGenericParams {
+        owner: NominalKey,
+        span: Option<SourceSpan>,
+    },
+    FlagOwnerDependency {
+        owner: NominalKey,
+        span: Option<SourceSpan>,
+    },
+    FlagPayloadMember {
+        owner: NominalKey,
+        member: Ident,
+        span: Option<SourceSpan>,
+    },
+    FlagStaticMemberConflict {
+        owner: NominalKey,
+        member: Ident,
+        span: Option<SourceSpan>,
+    },
+    FlagInvalidValue {
+        owner: NominalKey,
+        member: Ident,
+        kind: FlagResolveErrorKind,
+        span: Option<SourceSpan>,
+    },
     DuplicateVariantField {
         owner: NominalKey,
         variant: Ident,
@@ -588,6 +617,12 @@ pub(crate) enum DeclError {
         span: Option<SourceSpan>,
     },
     ConflictingCastFrom {
+        target: Type,
+        source: Type,
+        span: Option<SourceSpan>,
+    },
+    CompilerRawConversionConflict {
+        kind: CastKind,
         target: Type,
         source: Type,
         span: Option<SourceSpan>,
@@ -760,16 +795,23 @@ impl DeclError {
             | DeclError::RawEnumInvalidBacking { span, .. }
             | DeclError::RawEnumGenericParams { span, .. }
             | DeclError::RawEnumOwnerDependency { span, .. }
+            | DeclError::EnumValueDependencyCycle { span, .. }
             | DeclError::RawEnumValueWithoutBacking { span, .. }
             | DeclError::RawEnumPayloadVariant { span, .. }
             | DeclError::RawEnumMissingStringValue { span, .. }
             | DeclError::RawEnumDuplicateValue { span, .. }
             | DeclError::RawEnumIntOverflow { span, .. }
+            | DeclError::FlagGenericParams { span, .. }
+            | DeclError::FlagOwnerDependency { span, .. }
+            | DeclError::FlagPayloadMember { span, .. }
+            | DeclError::FlagStaticMemberConflict { span, .. }
+            | DeclError::FlagInvalidValue { span, .. }
             | DeclError::DuplicateVariantField { span, .. }
             | DeclError::DuplicateContractRequirement { span, .. }
             | DeclError::DuplicateExtendMethod { span, .. }
             | DeclError::DuplicateCastFrom { span, .. }
             | DeclError::ConflictingCastFrom { span, .. }
+            | DeclError::CompilerRawConversionConflict { span, .. }
             | DeclError::PointlessCastFrom { span, .. }
             | DeclError::CastFromReturnMismatch { span, .. }
             | DeclError::UnsupportedExtendTarget { span, .. }
@@ -853,8 +895,15 @@ pub(crate) struct DeclarationIndex {
 #[derive(Clone)]
 pub(super) struct PendingRawEnum {
     pub(super) source: SourceId,
+    pub(super) kind: PendingEnumKind,
     pub(super) backing: Option<Spanned<Type>>,
     pub(super) variants: Vec<PendingRawVariant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingEnumKind {
+    Raw,
+    Flag,
 }
 
 #[derive(Clone)]
@@ -1521,13 +1570,13 @@ pub(crate) struct CallableRef {
     pub(crate) is_stringify_override: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct NamedSchemas<T> {
     entries: Vec<NamedSchema<T>>,
     by_name: HashMap<Ident, usize>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct NamedSchema<T> {
     name: Ident,
     schema: T,
@@ -1562,11 +1611,6 @@ impl<T> NamedSchemas<T> {
         self.by_name
             .get(&name)
             .map(|slot| &self.entries[*slot].schema)
-    }
-
-    fn get_mut(&mut self, name: Ident) -> Option<&mut T> {
-        let slot = *self.by_name.get(&name)?;
-        Some(&mut self.entries[slot].schema)
     }
 
     pub(crate) fn contains_key(&self, name: Ident) -> bool {
@@ -1754,9 +1798,130 @@ pub(crate) enum RawEnumValue {
     String(String),
 }
 
-pub(super) struct VerifiedRawEnumMetadata {
-    pub(super) repr: EnumRepr,
-    pub(super) values: Vec<(Ident, RawEnumValue)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RawEnumBacking {
+    Int,
+    String,
+}
+
+impl RawEnumBacking {
+    pub(crate) fn ty(self) -> Type {
+        match self {
+            Self::Int => Type::Int,
+            Self::String => Type::String,
+        }
+    }
+
+    pub(crate) fn repr(self) -> EnumRepr {
+        match self {
+            Self::Int => EnumRepr::RawInt,
+            Self::String => EnumRepr::RawString,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RawEnumMetadata {
+    pub(crate) backing: RawEnumBacking,
+    by_variant: HashMap<Ident, RawEnumValue>,
+    by_value: HashMap<RawEnumValue, Ident>,
+}
+
+impl RawEnumMetadata {
+    pub(super) fn from_values(backing: RawEnumBacking, values: Vec<(Ident, RawEnumValue)>) -> Self {
+        let by_variant = values.iter().cloned().collect();
+        let by_value = values
+            .into_iter()
+            .map(|(name, value)| (value, name))
+            .collect();
+        Self {
+            backing,
+            by_variant,
+            by_value,
+        }
+    }
+
+    pub(crate) fn value(&self, variant: Ident) -> Option<&RawEnumValue> {
+        self.by_variant.get(&variant)
+    }
+
+    pub(crate) fn variant(&self, value: &RawEnumValue) -> Option<Ident> {
+        self.by_value.get(value).copied()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlagMemberSchema {
+    pub(crate) policy: AccessPolicy,
+    pub(crate) value: i64,
+    pub(crate) atomic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolvedFlagMember {
+    pub(super) name: Ident,
+    pub(super) value: i64,
+    pub(super) atomic: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedFlagValues {
+    pub(super) members: Vec<ResolvedFlagMember>,
+    pub(super) known_bits: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlagMetadata {
+    pub(crate) members: NamedSchemas<FlagMemberSchema>,
+    by_value: HashMap<i64, Ident>,
+    pub(crate) known_bits: i64,
+}
+
+impl FlagMetadata {
+    pub(crate) fn member(&self, name: Ident) -> Option<&FlagMemberSchema> {
+        self.members.get(name)
+    }
+
+    pub(crate) fn named_value(&self, value: i64) -> Option<Ident> {
+        self.by_value.get(&value).copied()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedEnumKind {
+    Adt,
+    Raw(RawEnumMetadata),
+    Flag(FlagMetadata),
+}
+
+impl ResolvedEnumKind {
+    pub(crate) fn repr(&self) -> EnumRepr {
+        match self {
+            Self::Adt => EnumRepr::Adt,
+            Self::Raw(raw) => raw.backing.repr(),
+            Self::Flag(_) => unreachable!("flag enum reached AIR before flag lowering"),
+        }
+    }
+
+    pub(crate) fn raw(&self) -> Option<&RawEnumMetadata> {
+        match self {
+            Self::Raw(raw) => Some(raw),
+            Self::Adt | Self::Flag(_) => None,
+        }
+    }
+
+    pub(crate) fn flag(&self) -> Option<&FlagMetadata> {
+        match self {
+            Self::Flag(flag) => Some(flag),
+            Self::Adt | Self::Raw(_) => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct EnumBody {
+    pub(crate) kind: ResolvedEnumKind,
+    pub(crate) variants: NamedSchemas<VariantSchema>,
 }
 
 #[derive(Clone)]
@@ -1764,8 +1929,7 @@ pub(crate) struct EnumSchema {
     pub(crate) owner_generics: GenericParams,
     pub(crate) generics: GenericParams,
     pub(crate) generic_context: GenericTypeContext,
-    pub(crate) repr: EnumRepr,
-    pub(crate) variants: NamedSchemas<VariantSchema>,
+    pub(crate) body: EnumBody,
     pub(crate) policy: AccessPolicy,
 }
 
@@ -1786,7 +1950,6 @@ fn combine_nominal_generics(owner: &GenericParams, declaration: &GenericParams) 
 pub(crate) struct VariantSchema {
     pub(crate) policy: AccessPolicy,
     pub(crate) payload: VariantPayload,
-    pub(crate) raw_value: Option<RawEnumValue>,
 }
 
 #[derive(Clone)]
@@ -2253,7 +2416,7 @@ impl DeclarationIndex {
             };
             map_generic_bounds(&key.module, span, &generics, &mut schema.generics, &mut f);
             let type_params = schema.all_generics().type_params;
-            for variant in schema.variants.values_mut() {
+            for variant in schema.body.variants.values_mut() {
                 match &mut variant.payload {
                     VariantPayload::Unit => {}
                     VariantPayload::Tuple(types) => {
@@ -2830,7 +2993,6 @@ impl DeclarationIndex {
             let schema = VariantSchema {
                 policy: variant_policy,
                 payload,
-                raw_value: None,
             };
             if variants.insert(variant.name, schema).is_err() {
                 self.errors.push(DeclError::DuplicateEnumVariant {
@@ -2840,31 +3002,56 @@ impl DeclarationIndex {
                 });
             }
         }
-        let pending = (enm.raw_backing.is_some()
-            || enm
-                .variants
-                .iter()
-                .any(|variant| variant.raw_value.is_some()))
-        .then(|| PendingRawEnum {
-            source,
-            backing: enm.raw_backing.clone(),
-            variants: enm
-                .variants
-                .iter()
-                .map(|variant| PendingRawVariant {
-                    name: variant.name,
-                    span: variant.span,
-                    value: variant.raw_value.clone(),
+        let pending = match &enm.mode {
+            ast::EnumMode::Flag(_) => Some(PendingRawEnum {
+                source,
+                kind: PendingEnumKind::Flag,
+                backing: None,
+                variants: enm
+                    .variants
+                    .iter()
+                    .map(|variant| PendingRawVariant {
+                        name: variant.name,
+                        span: variant.span,
+                        value: variant.raw_value.clone(),
+                    })
+                    .collect(),
+            }),
+            ast::EnumMode::Adt | ast::EnumMode::Backed(_) => {
+                let backing = match &enm.mode {
+                    ast::EnumMode::Backed(backing) => Some(backing.clone()),
+                    _ => None,
+                };
+                (backing.is_some()
+                    || enm
+                        .variants
+                        .iter()
+                        .any(|variant| variant.raw_value.is_some()))
+                .then(|| PendingRawEnum {
+                    source,
+                    kind: PendingEnumKind::Raw,
+                    backing,
+                    variants: enm
+                        .variants
+                        .iter()
+                        .map(|variant| PendingRawVariant {
+                            name: variant.name,
+                            span: variant.span,
+                            value: variant.raw_value.clone(),
+                        })
+                        .collect(),
                 })
-                .collect(),
-        });
+            }
+        };
         (
             EnumSchema {
                 owner_generics,
                 generics: generic_params(&enm.type_params, &enm.const_params),
                 generic_context,
-                repr: EnumRepr::Adt,
-                variants,
+                body: EnumBody {
+                    kind: ResolvedEnumKind::Adt,
+                    variants,
+                },
                 policy,
             },
             pending,
@@ -4001,33 +4188,25 @@ impl DeclarationIndex {
         self.enum_schema(&key)
     }
 
+    pub(crate) fn is_flag_enum_type(&self, ty: &Type) -> bool {
+        let Some(key) = self.key_for_type(ty) else {
+            return false;
+        };
+        self.enum_schema(&key)
+            .is_some_and(|schema| schema.body.kind.flag().is_some())
+            || self
+                .pending_raw_enums
+                .get(&key.id)
+                .is_some_and(|pending| pending.kind == PendingEnumKind::Flag)
+    }
+
     fn enum_schema_invariants_hold(&self, key: &NominalKey, schema: &EnumSchema) -> bool {
-        if !schema.variants.invariants_hold()
-            || self.enum_repr_for_key(key) != Some(schema.repr)
-            || self.enum_repr_for_type(&nominal_type(key)) != Some(schema.repr)
-        {
+        if !schema.body.variants.invariants_hold() {
             return false;
         }
-        match (schema.repr, self.raw_enum_raw_type(key)) {
-            (EnumRepr::Adt, None)
-            | (EnumRepr::RawInt, Some(Type::Int))
-            | (EnumRepr::RawString, Some(Type::String)) => {}
-            _ => return false,
-        }
-        let mut raw_values = HashSet::new();
-        for (slot, (name, variant)) in schema.variants.iter().enumerate() {
+        for (slot, (name, variant)) in schema.body.variants.iter().enumerate() {
             if self.enum_variant_index(key, name) != Some(slot) {
                 return false;
-            }
-            match (schema.repr, variant.raw_value.as_ref()) {
-                (EnumRepr::Adt, None) => {}
-                (EnumRepr::RawInt, Some(raw @ RawEnumValue::Int(_)))
-                | (EnumRepr::RawString, Some(raw @ RawEnumValue::String(_))) => {
-                    if !matches!(variant.payload, VariantPayload::Unit) || !raw_values.insert(raw) {
-                        return false;
-                    }
-                }
-                _ => return false,
             }
             if let VariantPayload::Struct(fields) = &variant.payload
                 && (!fields.invariants_hold()
@@ -4038,17 +4217,26 @@ impl DeclarationIndex {
                 return false;
             }
         }
-        match schema.repr {
-            EnumRepr::Adt => self.raw_enum_values(key).is_none(),
-            EnumRepr::RawInt | EnumRepr::RawString => {
-                self.raw_enum_values(key).is_some_and(|mut values| {
-                    values.all(|(name, value)| {
-                        self.raw_enum_value(key, name) == Some(value)
-                            && self.raw_enum_variant_from_value(key, value).is_some()
-                    })
-                })
-            }
+        let Some(raw) = schema.body.kind.raw() else {
+            return true;
+        };
+        if raw.by_variant.len() != schema.body.variants.entries.len()
+            || raw.by_value.len() != raw.by_variant.len()
+        {
+            return false;
         }
+        schema.body.variants.iter().all(|(name, variant)| {
+            let Some(value) = raw.value(name) else {
+                return false;
+            };
+            matches!(variant.payload, VariantPayload::Unit)
+                && raw.variant(value) == Some(name)
+                && matches!(
+                    (raw.backing, value),
+                    (RawEnumBacking::Int, RawEnumValue::Int(_))
+                        | (RawEnumBacking::String, RawEnumValue::String(_))
+                )
+        })
     }
 
     pub(crate) fn aggregate_fields(&self, key: &NominalKey) -> Option<&NamedSchemas<FieldSchema>> {
@@ -4056,66 +4244,18 @@ impl DeclarationIndex {
     }
 
     pub(crate) fn enum_variants(&self, key: &NominalKey) -> Option<&NamedSchemas<VariantSchema>> {
-        self.enums.get(&key.id).map(|schema| &schema.variants)
+        self.enums.get(&key.id).map(|schema| &schema.body.variants)
     }
 
-    pub(crate) fn enum_repr_for_key(&self, key: &NominalKey) -> Option<EnumRepr> {
-        Some(self.enums.get(&key.id)?.repr)
-    }
-
-    pub(crate) fn enum_repr_for_type(&self, ty: &Type) -> Option<EnumRepr> {
-        self.enum_repr_for_key(&self.key_for_type(ty)?)
-    }
-
-    pub(crate) fn raw_enum_raw_type(&self, key: &NominalKey) -> Option<Type> {
-        match self.enum_repr_for_key(key)? {
-            EnumRepr::Adt => None,
-            EnumRepr::RawInt => Some(Type::Int),
-            EnumRepr::RawString => Some(Type::String),
-        }
-    }
-
-    pub(crate) fn raw_enum_value(&self, key: &NominalKey, variant: Ident) -> Option<&RawEnumValue> {
-        if self.enum_repr_for_key(key)? == EnumRepr::Adt {
-            return None;
-        }
-        self.enums
-            .get(&key.id)?
-            .variants
-            .get(variant)?
-            .raw_value
-            .as_ref()
-    }
-
-    pub(crate) fn raw_enum_variant_from_value(
-        &self,
-        key: &NominalKey,
-        value: &RawEnumValue,
-    ) -> Option<Ident> {
-        if self.enum_repr_for_key(key)? == EnumRepr::Adt {
-            return None;
-        }
-        self.enums
-            .get(&key.id)?
-            .variants
-            .iter()
-            .find_map(|(name, variant)| (variant.raw_value.as_ref() == Some(value)).then_some(name))
-    }
-
-    pub(crate) fn raw_enum_values(
-        &self,
-        key: &NominalKey,
-    ) -> Option<impl Iterator<Item = (Ident, &RawEnumValue)>> {
-        if self.enum_repr_for_key(key)? == EnumRepr::Adt {
-            return None;
-        }
-        Some(
-            self.enums
-                .get(&key.id)?
-                .variants
-                .iter()
-                .filter_map(|(name, variant)| Some((name, variant.raw_value.as_ref()?))),
-        )
+    pub(crate) fn enum_declares_member(&self, key: &NominalKey, name: Ident) -> bool {
+        self.enum_schema(key).is_some_and(|schema| {
+            schema.body.variants.contains_key(name)
+                || schema
+                    .body
+                    .kind
+                    .flag()
+                    .is_some_and(|flag| flag.member(name).is_some())
+        })
     }
 
     pub(crate) fn enum_struct_fields(
@@ -4123,7 +4263,7 @@ impl DeclarationIndex {
         key: &NominalKey,
         variant: Ident,
     ) -> Option<&NamedSchemas<FieldSchema>> {
-        let variant = self.enums.get(&key.id)?.variants.get(variant)?;
+        let variant = self.enums.get(&key.id)?.body.variants.get(variant)?;
         match &variant.payload {
             VariantPayload::Struct(fields) => Some(fields),
             VariantPayload::Unit | VariantPayload::Tuple(_) => None,
@@ -4178,35 +4318,73 @@ impl DeclarationIndex {
         pending
     }
 
-    pub(super) fn sanitize_raw_enum(&mut self, key: &NominalKey) {
+    pub(super) fn install_flag_metadata(
+        &mut self,
+        key: &NominalKey,
+        values: ResolvedFlagValues,
+    ) -> bool {
         let Some(schema) = self.enums.get_mut(&key.id) else {
-            return;
+            return false;
         };
-        schema.repr = EnumRepr::Adt;
-        for variant in schema.variants.values_mut() {
-            variant.raw_value = None;
+        if values.members.len() != schema.body.variants.entries.len() {
+            return false;
         }
+
+        let variants = std::mem::take(&mut schema.body.variants);
+        let mut members = NamedSchemas::default();
+        let mut by_value = HashMap::new();
+        for resolved in values.members {
+            let variant = variants
+                .get(resolved.name)
+                .expect("resolved flag member missing declaration schema");
+            let member = FlagMemberSchema {
+                policy: variant.policy.clone(),
+                value: resolved.value,
+                atomic: resolved.atomic,
+            };
+            members
+                .insert(resolved.name, member)
+                .expect("resolved flag members are unique");
+            by_value.insert(resolved.value, resolved.name);
+        }
+        schema.body.kind = ResolvedEnumKind::Flag(FlagMetadata {
+            members,
+            by_value,
+            known_bits: values.known_bits,
+        });
+        let flag = schema
+            .body
+            .kind
+            .flag()
+            .expect("installed flag metadata missing");
+        debug_assert!(flag.known_bits >= 0);
+        debug_assert!(flag.members.entries.iter().all(|entry| {
+            let source = variants
+                .get(entry.name)
+                .expect("installed flag member missing source schema");
+            let member = flag
+                .member(entry.name)
+                .expect("installed flag member missing lookup");
+            member.policy == source.policy
+                && member.atomic == (member.value > 0 && member.value & (member.value - 1) == 0)
+                && flag.named_value(member.value) == Some(entry.name)
+        }));
+        true
     }
 
     pub(super) fn install_raw_enum_metadata(
         &mut self,
         key: &NominalKey,
-        metadata: VerifiedRawEnumMetadata,
+        metadata: RawEnumMetadata,
     ) -> bool {
         let Some(schema) = self.enums.get_mut(&key.id) else {
             return false;
         };
-        debug_assert_ne!(metadata.repr, EnumRepr::Adt);
-        debug_assert_eq!(metadata.values.len(), schema.variants.entries.len());
-        schema.repr = metadata.repr;
-        for variant in schema.variants.values_mut() {
-            variant.raw_value = None;
-        }
-        for (name, raw) in metadata.values {
-            if let Some(variant) = schema.variants.get_mut(name) {
-                variant.raw_value = Some(raw);
-            }
-        }
+        debug_assert_eq!(
+            metadata.by_variant.len(),
+            schema.body.variants.entries.len()
+        );
+        schema.body.kind = ResolvedEnumKind::Raw(metadata);
         true
     }
 
@@ -4462,6 +4640,7 @@ impl DeclarationIndex {
         let schema = self.enum_schema(key)?;
         let generics = schema.all_generics();
         schema
+            .body
             .variants
             .values()
             .find_map(|variant| match &variant.payload {

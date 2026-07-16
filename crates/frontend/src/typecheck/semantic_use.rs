@@ -9,6 +9,7 @@ use super::{
         ContractSlotId, ContractSurfaceId, ContractSurfaceSchemas, ContractWeakening,
     },
     decls::{CallableId, ExtendId, GlobalKey, NominalKey, nominal_id_for_type},
+    flags::FlagStaticOp,
     infer::{SemanticLocalId, TypeHandle},
     type_ops::type_has_unfinished_facts,
 };
@@ -31,6 +32,10 @@ pub(crate) type DefaultFieldMap = HashMap<ExprId, Vec<DefaultFieldFact>>;
 pub(crate) type ExternUseMap = HashMap<ExprId, Vec<ExternUseTarget>>;
 pub(crate) type MemberPathMap = HashMap<ExprId, MemberPathFact>;
 pub(crate) type ExpectedProjectionMap = HashMap<ExprId, ExpectedProjectionFact>;
+pub(crate) type RawProjectionMap = HashMap<ExprId, RawProjectionFact>;
+pub(crate) type RawTryConstructMap = HashMap<ExprId, RawTryConstructFact>;
+pub(crate) type FlagMemberMap = HashMap<ExprId, FlagMemberFact>;
+pub(crate) type FlagStaticMap = HashMap<ExprId, FlagStaticFact>;
 pub(crate) type ContractWitnessMap = HashMap<WitnessId, ContractWitnessFact>;
 pub(crate) type ContractWitnessStructuralKeyMap = HashMap<WitnessId, ContractWitnessStructuralKey>;
 pub(crate) type DynConversionMap = HashMap<ExprId, DynConversionFact>;
@@ -45,6 +50,7 @@ pub(crate) type LambdaCaptureMap = HashMap<(ExprId, BindingId), LambdaCaptureFac
 pub(crate) type CaptureCellRequirementMap = HashMap<BindingId, CaptureCellRequirementFact>;
 pub(crate) type IterRuntimeCheckMap = HashMap<ExprId, IterRuntimeCheckFact>;
 pub(crate) type CheckedMatchPlanMap = HashMap<ExprId, CheckedMatchPlan>;
+pub(crate) type CheckedConditionalPatternMap = HashMap<ExprId, CheckedConditionalPattern>;
 pub(crate) type CheckedDynMatchPlanMap = HashMap<ExprId, CheckedDynMatchPlan>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +84,13 @@ pub(crate) struct CheckedMatchPlan {
     pub(crate) expr: ExprId,
     pub(crate) access: CheckedMatchAccess,
     pub(crate) arms: Vec<CheckedMatchArm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedConditionalPattern {
+    pub(crate) value: ExprId,
+    pub(crate) pattern: CheckedPattern,
+    pub(crate) bindings: CheckedPatternBindings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +176,10 @@ pub(crate) enum CheckedPattern {
         variant: Ident,
         payload: CheckedEnumPayload,
     },
+    FlagValue {
+        owner: CheckedPatternOwner,
+        value: i64,
+    },
     Or(Vec<CheckedPatternAlternative>),
     Unsupported,
 }
@@ -224,6 +241,13 @@ impl CheckedMatchPlan {
     }
 }
 
+impl CheckedConditionalPattern {
+    fn finish_types(&mut self, locals: &LocalFacts) {
+        self.pattern.finish_types(locals);
+        self.bindings.finish_types(locals);
+    }
+}
+
 impl CheckedMatchArm {
     fn finish_types(&mut self, locals: &LocalFacts) {
         self.pattern.finish_types(locals);
@@ -255,7 +279,11 @@ impl CheckedPatternBinding {
 impl CheckedPattern {
     fn finish_types(&mut self, locals: &LocalFacts) {
         match self {
-            Self::Wildcard | Self::Literal(_) | Self::Nil | Self::Unsupported => {}
+            Self::Wildcard
+            | Self::Literal(_)
+            | Self::FlagValue { .. }
+            | Self::Nil
+            | Self::Unsupported => {}
             Self::Binding(binding) => binding.finish_type(locals),
             Self::OptionalSome(pattern) => pattern.finish_types(locals),
             Self::Tuple(fields) => {
@@ -283,6 +311,7 @@ impl CheckedPattern {
             Self::Wildcard
             | Self::Binding(_)
             | Self::Literal(_)
+            | Self::FlagValue { .. }
             | Self::Nil
             | Self::Unsupported => {}
             Self::OptionalSome(pattern) => pattern.validate(finished),
@@ -685,6 +714,10 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) extern_uses: ExternUseMap,
     pub(crate) member_paths: MemberPathMap,
     pub(crate) expected_projections: ExpectedProjectionMap,
+    pub(crate) raw_projections: RawProjectionMap,
+    pub(crate) raw_try_constructs: RawTryConstructMap,
+    pub(crate) flag_members: FlagMemberMap,
+    pub(crate) flag_statics: FlagStaticMap,
     pub(crate) dyn_conversions: DynConversionMap,
     pub(crate) dyn_weakenings: DynWeakeningMap,
     pub(super) pending_dyn_weakenings: HashMap<ExprId, PendingDynWeakeningFact>,
@@ -696,6 +729,7 @@ pub(crate) struct SemanticBodyFacts {
     pub(crate) stringifies: StringifyMap,
     pub(crate) iter_runtime_checks: IterRuntimeCheckMap,
     pub(crate) match_patterns: CheckedMatchPlanMap,
+    pub(crate) conditional_patterns: CheckedConditionalPatternMap,
     pub(crate) dyn_matches: CheckedDynMatchPlanMap,
     pub(crate) locals: LocalFacts,
 }
@@ -712,6 +746,10 @@ impl SemanticBodyFacts {
         self.extern_uses.extend(facts.extern_uses);
         self.member_paths.extend(facts.member_paths);
         self.expected_projections.extend(facts.expected_projections);
+        self.raw_projections.extend(facts.raw_projections);
+        self.raw_try_constructs.extend(facts.raw_try_constructs);
+        self.flag_members.extend(facts.flag_members);
+        self.flag_statics.extend(facts.flag_statics);
         self.dyn_conversions.extend(facts.dyn_conversions);
         self.dyn_weakenings.extend(facts.dyn_weakenings);
         self.pending_dyn_weakenings
@@ -725,6 +763,7 @@ impl SemanticBodyFacts {
         self.stringifies.extend(facts.stringifies);
         self.iter_runtime_checks.extend(facts.iter_runtime_checks);
         self.match_patterns.extend(facts.match_patterns);
+        self.conditional_patterns.extend(facts.conditional_patterns);
         self.dyn_matches.extend(facts.dyn_matches);
     }
 
@@ -738,6 +777,10 @@ impl SemanticBodyFacts {
         }
         for (expr_id, plan) in &self.match_patterns {
             plan.validate(*expr_id, false);
+        }
+        for (expr_id, pattern) in &self.conditional_patterns {
+            debug_assert_eq!(*expr_id, pattern.value);
+            pattern.pattern.validate(false);
         }
         for (expr_id, plan) in &self.dyn_matches {
             debug_assert_eq!(*expr_id, plan.expr);
@@ -775,6 +818,25 @@ impl SemanticBodyFacts {
         }
         for (expr_id, fact) in &self.expected_projections {
             debug_assert_eq!(*expr_id, fact.expr_id);
+        }
+        for (expr_id, fact) in &self.raw_projections {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+            debug_assert!(!type_has_unfinished_facts(&fact.source_ty));
+            debug_assert!(!type_has_unfinished_facts(&fact.target_ty));
+        }
+        for (expr_id, fact) in &self.flag_members {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+            debug_assert!(!type_has_unfinished_facts(&fact.owner_ty));
+        }
+        for (expr_id, fact) in &self.flag_statics {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+            debug_assert!(!type_has_unfinished_facts(&fact.owner_ty));
+        }
+        for (expr_id, fact) in &self.raw_try_constructs {
+            debug_assert_eq!(*expr_id, fact.expr_id);
+            debug_assert!(!type_has_unfinished_facts(&fact.source_ty));
+            debug_assert!(!type_has_unfinished_facts(&fact.target_ty));
+            debug_assert!(!type_has_unfinished_facts(&fact.result_ty));
         }
         for (expr_id, fact) in &self.dyn_conversions {
             debug_assert_eq!(*expr_id, fact.expr_id);
@@ -891,6 +953,64 @@ impl SemanticBodyFacts {
                 continue;
             };
             debug_assert_eq!(ty, &projection.target_ty);
+        }
+        #[cfg(debug_assertions)]
+        for (expr_id, projection) in &self.raw_projections {
+            let Some(expr) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "raw projection missing expression type in body");
+                continue;
+            };
+            let Some(ty) = expr.ty.as_ref() else {
+                debug_assert!(false, "raw projection expression type not finalized");
+                continue;
+            };
+            debug_assert_eq!(ty, &projection.target_ty);
+        }
+        #[cfg(debug_assertions)]
+        for (expr_id, fact) in &self.flag_members {
+            let Some(expr) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "flag member missing expression type in body");
+                continue;
+            };
+            let Some(ty) = expr.ty.as_ref() else {
+                debug_assert!(false, "flag member expression type not finalized");
+                continue;
+            };
+            if let Some(projection) = self.raw_projections.get(expr_id) {
+                debug_assert_eq!(&projection.source_ty, &fact.owner_ty);
+                debug_assert_eq!(ty, &projection.target_ty);
+            } else {
+                debug_assert_eq!(ty, &fact.owner_ty);
+            }
+        }
+        #[cfg(debug_assertions)]
+        for (expr_id, fact) in &self.flag_statics {
+            let Some(expr) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "flag static missing expression type in body");
+                continue;
+            };
+            let Some(ty) = expr.ty.as_ref() else {
+                debug_assert!(false, "flag static expression type not finalized");
+                continue;
+            };
+            if let Some(projection) = self.raw_projections.get(expr_id) {
+                debug_assert_eq!(&projection.source_ty, &fact.owner_ty);
+                debug_assert_eq!(ty, &projection.target_ty);
+            } else {
+                debug_assert_eq!(ty, &fact.owner_ty);
+            }
+        }
+        #[cfg(debug_assertions)]
+        for (expr_id, fact) in &self.raw_try_constructs {
+            let Some(expr) = self.expr_types.get(expr_id) else {
+                debug_assert!(false, "raw try construct missing expression type in body");
+                continue;
+            };
+            let Some(ty) = expr.ty.as_ref() else {
+                debug_assert!(false, "raw try construct expression type not finalized");
+                continue;
+            };
+            debug_assert_eq!(ty, &fact.result_ty);
         }
     }
 }
@@ -1050,6 +1170,16 @@ impl SemanticFactMaps {
             .insert(site.expr, plan);
     }
 
+    pub(crate) fn record_conditional_pattern(
+        &mut self,
+        body: BodyInstanceKey,
+        pattern: CheckedConditionalPattern,
+    ) {
+        self.body_mut(body)
+            .conditional_patterns
+            .insert(pattern.value, pattern);
+    }
+
     pub(crate) fn record_dyn_match_plan(
         &mut self,
         site: SemanticExprSite,
@@ -1116,6 +1246,30 @@ impl SemanticFactMaps {
     ) {
         self.body_mut(body)
             .expected_projections
+            .insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_raw_projection(&mut self, body: BodyInstanceKey, fact: RawProjectionFact) {
+        self.body_mut(body)
+            .raw_projections
+            .insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_flag_member(&mut self, body: BodyInstanceKey, fact: FlagMemberFact) {
+        self.body_mut(body).flag_members.insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_flag_static(&mut self, body: BodyInstanceKey, fact: FlagStaticFact) {
+        self.body_mut(body).flag_statics.insert(fact.expr_id, fact);
+    }
+
+    pub(crate) fn record_raw_try_construct(
+        &mut self,
+        body: BodyInstanceKey,
+        fact: RawTryConstructFact,
+    ) {
+        self.body_mut(body)
+            .raw_try_constructs
             .insert(fact.expr_id, fact);
     }
 
@@ -1197,10 +1351,14 @@ impl SemanticFactMaps {
             let SemanticBodyFacts {
                 locals,
                 match_patterns,
+                conditional_patterns,
                 ..
             } = body;
             for plan in match_patterns.values_mut() {
                 plan.finish_types(locals);
+            }
+            for pattern in conditional_patterns.values_mut() {
+                pattern.finish_types(locals);
             }
         }
     }
@@ -1665,6 +1823,37 @@ pub(crate) struct ExpectedProjectionFact {
     pub(crate) expr_id: ExprId,
     pub(crate) path: Vec<Ident>,
     pub(crate) target_ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawProjectionFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) source_expr: ExprId,
+    pub(crate) source_ty: Type,
+    pub(crate) target_ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlagMemberFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) owner_ty: Type,
+    pub(crate) value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlagStaticFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) owner_ty: Type,
+    pub(crate) op: FlagStaticOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawTryConstructFact {
+    pub(crate) expr_id: ExprId,
+    pub(crate) source_expr: ExprId,
+    pub(crate) source_ty: Type,
+    pub(crate) target_ty: Type,
+    pub(crate) result_ty: Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

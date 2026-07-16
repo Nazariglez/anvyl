@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::{
-    CheckedType, TypeChecker, TypeError, VariantShape,
+    CheckedType, FlagMemberFact, MemberAccessKind, TypeChecker, TypeError, VariantShape,
     annotation::DeprecatedUseKind,
     check_default_stringify_conversion, check_expected_value_expr, check_expr_checked,
     check_unprojected_expected, check_value_expr_checked_with_hint, checked_from_type, const_eval,
@@ -63,11 +63,11 @@ fn expected_map(
 fn collection_literal_handle(
     kind: CollectionLiteralKind,
     elem: &TypeHandle,
-    len: ArrayLen,
+    len: &ArrayLen,
     tc: &mut TypeChecker,
 ) -> TypeHandle {
     match kind {
-        CollectionLiteralKind::Array => tc.array_handle(elem, &len),
+        CollectionLiteralKind::Array => tc.array_handle(elem, len),
         CollectionLiteralKind::List => tc.list_handle(elem),
     }
 }
@@ -98,7 +98,7 @@ enum LiteralMapKey {
 
 fn literal_map_key(expr: &ExprNode) -> Option<LiteralMapKey> {
     match &expr.node.kind {
-        ExprKind::Lit(Lit::Int(value)) => Some(LiteralMapKey::Int(*value)),
+        ExprKind::Lit(Lit::Int(value)) => Some(LiteralMapKey::Int(*value.value())),
         ExprKind::Lit(Lit::Bool(value)) => Some(LiteralMapKey::Bool(*value)),
         ExprKind::Lit(Lit::String(value)) => Some(LiteralMapKey::String(value.clone())),
         ExprKind::Lit(Lit::Char(value)) => Some(LiteralMapKey::Char(*value)),
@@ -203,7 +203,7 @@ pub(super) fn check_array_lit_hint(
         elem
     };
     let array =
-        collection_literal_handle(kind, &elem, ArrayLen::Fixed(lit.node.elements.len()), tc);
+        collection_literal_handle(kind, &elem, &ArrayLen::fixed(lit.node.elements.len()), tc);
     let mut contains_extern_any = false;
     let mut contains_poison = false;
     for value in &lit.node.elements {
@@ -229,7 +229,7 @@ pub(super) fn check_array_fill_hint(
     let len = match tc.eval_const_expr(&fill.node.len, true) {
         Ok(const_value) => {
             match const_eval::const_usize(&const_value, tc.error_span(fill.node.len.span)) {
-                Ok(len) => ArrayLen::Fixed(len),
+                Ok(len) => ArrayLen::fixed(len),
                 Err(err) => {
                     tc.push_error(err);
                     ArrayLen::Infer
@@ -255,7 +255,7 @@ pub(super) fn check_array_fill_hint(
     });
     let value = check_expected_value_expr(&fill.node.value, elem.clone(), tc);
     tc.record_aggregate_elem_escape(expr.node.id, &fill.node.value);
-    let array = collection_literal_handle(kind, &elem, len, tc);
+    let array = collection_literal_handle(kind, &elem, &len, tc);
     let mut checked = solve_and_checked_from_handle(expr, &array, tc);
     checked.contains_extern_any = value.contains_extern_any;
     checked
@@ -568,8 +568,43 @@ pub(super) fn check_inferred_enum_hint(
         return cannot_infer_inferred_enum(expr, node, tc);
     };
 
-    if tc.decls.enum_schema(&key).is_none() {
+    let Some(schema) = tc.decls.enum_schema(&key).cloned() else {
         return checked_from_type(expr, Type::Infer, tc);
+    };
+    if let Some(flag) = schema.body.kind.flag() {
+        let Some(member) = flag.member(node.node.variant) else {
+            tc.push_error(TypeError::UnknownEnumVariant {
+                enum_name: key.name,
+                variant: node.node.variant,
+                span: tc.error_span(node.span),
+            });
+            check_inferred_enum_args(&node.node.args, tc);
+            return checked_from_type(expr, Type::Infer, tc);
+        };
+        if !matches!(node.node.args, InferredEnumArgs::Unit) {
+            tc.push_error(TypeError::EnumVariantShapeMismatch {
+                enum_name: key.name,
+                variant: node.node.variant,
+                expected: VariantShape::Unit,
+                span: tc.error_span(node.span),
+            });
+            check_inferred_enum_args(&node.node.args, tc);
+            return checked_from_type(expr, Type::Infer, tc);
+        }
+        tc.check_access_policy(
+            &member.policy,
+            MemberAccessKind::Field,
+            node.node.variant,
+            &expected_ty,
+            &key.module,
+            node.span,
+        );
+        tc.record_flag_member(FlagMemberFact {
+            expr_id: expr.node.id,
+            owner_ty: expected_ty.clone(),
+            value: member.value,
+        });
+        return solve_and_checked_from_handle(expr, &expected, tc);
     }
     let Some(resolved) = enum_variant::resolve_use(tc, &key, node.node.variant, node.span) else {
         check_inferred_enum_args(&node.node.args, tc);
@@ -952,7 +987,7 @@ fn struct_literal_target_from_expanded(
 fn literal_target_seeds(generics: &GenericParams, args: &GenericArgs) -> GenericSolverSeeds {
     let mut seeds = GenericSolverSeeds::default();
     for (param, ty) in generics.type_params.iter().zip(&args.type_args) {
-        if !type_depends_on_generics(&ty) {
+        if !type_depends_on_generics(ty) {
             seeds.type_args.insert(param.id, ty.clone());
         }
     }
@@ -1041,7 +1076,17 @@ pub(super) fn check_string_interp(
         let checked = check_value_expr_checked_with_hint(inner, None, tc);
         if let Some(spec) = spec {
             tc.reject_dyn_format(&checked.ty, inner.span);
-            validate_format_spec(&checked.ty, &spec.node, spec.span, tc);
+            let stringify = spec.node.kind == FormatKind::Default
+                && spec.node.sign == FormatSign::Default
+                && spec.node.precision.is_none()
+                && tc.decls.enum_schema_for_type(&checked.ty).is_some();
+            if stringify {
+                check_default_stringify_conversion(&checked, inner.span, tc);
+                tc.record_stringify(inner.node.id, inner.node.id);
+                validate_format_spec(&Type::String, &spec.node, spec.span, tc);
+            } else {
+                validate_format_spec(&checked.ty, &spec.node, spec.span, tc);
+            }
         } else if !checked.ty.is_str() {
             check_default_stringify_conversion(&checked, inner.span, tc);
             tc.record_stringify(inner.node.id, inner.node.id);

@@ -204,6 +204,7 @@ fn nominal_contains_dyn_value(
             };
             let (type_subst, const_subst) = schema.all_generics().substitutions(&args);
             schema
+                .body
                 .variants
                 .values()
                 .any(|variant| match &variant.payload {

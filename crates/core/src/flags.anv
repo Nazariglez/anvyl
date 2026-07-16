@@ -1,0 +1,8 @@
+pub extend<E> enum E: flag {
+    fn contains(self, other: E) -> bool { (self & other) == other }
+    fn intersects(self, other: E) -> bool { (self & other) != E.empty() }
+    fn is_empty(self) -> bool { self == E.empty() }
+    fn insert(ref self, other: E) { self |= other; }
+    fn remove(ref self, other: E) { self &= ~other; }
+    fn toggle(ref self, other: E) { self ^= other; }
+}

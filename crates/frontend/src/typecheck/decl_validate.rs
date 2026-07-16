@@ -2,27 +2,59 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     CastConversionSchema, DeclError, DeclTypeSite, DeclTypeUseKind, DeclarationIndex, DynInference,
-    EnumRepr, ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind,
-    GenericParams, MethodKey, MethodSurface, ModuleScope, NominalKey, PendingRawEnum, RawEnumValue,
-    TypeAliasDef, TypeChecker, TypeError, VariantPayload, VerifiedRawEnumMetadata,
+    ExtendSchema, GenericContextError, GenericOwnerFrame, GenericParamKind, GenericParams,
+    MethodKey, MethodSurface, ModuleScope, NominalKey, PendingEnumKind, PendingRawEnum,
+    RawEnumBacking, RawEnumMetadata, RawEnumValue, TypeAliasDef, TypeChecker, TypeError,
+    VariantPayload,
     body::{CallableTemplateEnv, LocalNominalTemplate, with_callable_body_env},
     const_eval::const_type,
     contracts,
-    extend_target::{ExtendTargetPattern, same_target_pattern, validate_constrained_target},
+    extend_target::{
+        ExtendTargetPattern, same_target_pattern, target_overlaps_raw_enum,
+        validate_constrained_target,
+    },
+    flags::FlagStaticOp,
     same_extend_target,
     type_refs::GenericParamError,
 };
 use crate::{
     ast::{
         AggregateKind, ArrayLen, CastKind, ConstArg, ConstParam, ConstParamId, ConstValue,
-        ContractRef, EscapeMode, Func, FuncParam, Ident, MethodReceiver, MethodSig, Mutability,
-        NominalKind, Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam, TypeVarId,
-        TypeVisitor,
+        ContractRef, EscapeMode, ExprNode, Func, FuncParam, Ident, MethodReceiver, MethodSig,
+        Mutability, NominalKind, Param, Program, ReturnSpec, Stmt, StructDecl, Type, TypeParam,
+        TypeVarId, TypeVisitor,
     },
     semantic_id::NominalId,
     source::SourceId,
     span::{SourceSpan, Span},
 };
+
+pub(super) struct EnumValueResolution {
+    nodes: HashMap<NominalId, EnumValueResolutionNode>,
+    order: Vec<NominalId>,
+    stack: Vec<NominalId>,
+    cycle_ids: HashSet<Vec<NominalId>>,
+    cycles: Vec<(Vec<NominalKey>, Option<SourceSpan>)>,
+    dependency_failures: usize,
+}
+
+#[derive(Clone)]
+struct EnumValueResolutionNode {
+    key: NominalKey,
+    pending: PendingRawEnum,
+    env: CallableTemplateEnv,
+    owner: GenericOwnerFrame,
+    state: EnumValueResolutionState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumValueResolutionState {
+    Unresolved,
+    Resolving,
+    Done,
+    Failed,
+}
+
 pub(super) fn check_finite_size_cycles(ids: &HashSet<NominalId>, tc: &mut TypeChecker) {
     let graph = finite_size_graph(&tc.decls);
     let mut visiting = HashSet::new();
@@ -104,7 +136,7 @@ fn finite_size_graph(decls: &DeclarationIndex) -> HashMap<NominalId, Vec<Nominal
     }
     for (key, schema) in decls.enums() {
         let mut edges = vec![];
-        for variant in schema.variants.values() {
+        for variant in schema.body.variants.values() {
             match &variant.payload {
                 VariantPayload::Unit => {}
                 VariantPayload::Tuple(types) => {
@@ -398,6 +430,14 @@ fn validate_cast_froms(
                 span: Some(cast.span),
             }));
         }
+        if compiler_raw_conversion_conflict(decls, extend, cast) {
+            errors.push(TypeError::Decl(DeclError::CompilerRawConversionConflict {
+                kind: cast.kind,
+                target: extend.target.clone(),
+                source: cast.param.ty.clone(),
+                span: Some(cast.span),
+            }));
+        }
         let (duplicate, conflicting) = cast_from_conflicts(decls, extend, cast);
         if duplicate {
             errors.push(TypeError::Decl(DeclError::DuplicateCastFrom {
@@ -415,6 +455,38 @@ fn validate_cast_froms(
             }));
         }
     }
+}
+
+fn compiler_raw_conversion_conflict(
+    decls: &DeclarationIndex,
+    extend: &ExtendSchema,
+    cast: &CastConversionSchema,
+) -> bool {
+    let target = ExtendTargetPattern::from(extend);
+    let inverse_overlap = match cast.param.ty {
+        Type::Int => target_overlaps_raw_enum(decls, &target, RawEnumBacking::Int),
+        Type::String => target_overlaps_raw_enum(decls, &target, RawEnumBacking::String),
+        _ => false,
+    };
+    if inverse_overlap {
+        return true;
+    }
+
+    let backing = match extend.target {
+        Type::Int => RawEnumBacking::Int,
+        Type::String => RawEnumBacking::String,
+        _ => return false,
+    };
+    decls
+        .enum_schema_for_type(&cast.param.ty)
+        .is_some_and(|schema| {
+            schema
+                .body
+                .kind
+                .raw()
+                .is_some_and(|raw| raw.backing == backing)
+                || (backing == RawEnumBacking::Int && schema.body.kind.flag().is_some())
+        })
 }
 
 fn validate_cast_from_param(cast: &CastConversionSchema, errors: &mut Vec<TypeError>) {
@@ -480,6 +552,18 @@ fn validate_extend_method_conflicts(
     let Some(key) = decls.key_for_type(&extend.target) else {
         return;
     };
+    let is_flag = decls
+        .enum_schema(&key)
+        .is_some_and(|schema| schema.body.kind.flag().is_some());
+    if is_flag {
+        for method_key in extend.methods.keys() {
+            if method_key.surface == MethodSurface::Static
+                && FlagStaticOp::from_name(method_key.name).is_some()
+            {
+                push_extend_method_conflict(errors, extend, *method_key);
+            }
+        }
+    }
     if key.module != extend.origin {
         return;
     }
@@ -490,10 +574,11 @@ fn validate_extend_method_conflicts(
             }
         }
     }
-    if let Some(enum_schema) = decls.enum_schema(&key) {
+    if decls.enum_schema(&key).is_some() {
         for method_key in extend.methods.keys() {
             if method_key.surface == MethodSurface::Static
-                && enum_schema.variants.contains_key(method_key.name)
+                && FlagStaticOp::from_name(method_key.name).is_none()
+                && decls.enum_declares_member(&key, method_key.name)
             {
                 push_extend_method_conflict(errors, extend, *method_key);
             }
@@ -858,10 +943,10 @@ fn check_method_generic_shadow(
     });
 }
 
-fn raw_backing_repr(backing: &Type) -> Option<EnumRepr> {
+fn raw_enum_backing(backing: &Type) -> Option<RawEnumBacking> {
     match backing {
-        Type::Int => Some(EnumRepr::RawInt),
-        Type::String => Some(EnumRepr::RawString),
+        Type::Int => Some(RawEnumBacking::Int),
+        Type::String => Some(RawEnumBacking::String),
         _ => None,
     }
 }
@@ -999,7 +1084,7 @@ impl TypeChecker {
             });
         }
 
-        self.validate_raw_enum_declarations(&ids, envs);
+        self.resolve_enum_values(&ids, envs);
 
         let mut decls = std::mem::take(&mut self.decls);
         for error in decls.build_projection_edges(&ids) {
@@ -1022,32 +1107,273 @@ impl TypeChecker {
         }
     }
 
-    fn validate_raw_enum_declarations(
+    fn resolve_flag_declaration(
+        &mut self,
+        key: &NominalKey,
+        pending: &PendingRawEnum,
+        owner: &GenericOwnerFrame,
+    ) -> bool {
+        let Some(schema) = self.decls.enum_schema(key).cloned() else {
+            return false;
+        };
+        let span = self
+            .decls
+            .type_span(key)
+            .map(|span| raw_span(pending, span));
+        let mut valid = true;
+        if !schema.generics.is_empty() {
+            self.push_error(TypeError::Decl(DeclError::FlagGenericParams {
+                owner: key.clone(),
+                span,
+            }));
+            valid = false;
+        }
+        let owner_consts = owner
+            .params
+            .const_params
+            .iter()
+            .map(|param| param.name)
+            .collect::<HashSet<_>>();
+        let mut earlier_members = HashSet::new();
+        let mut depends_on_owner = false;
+        for member in &pending.variants {
+            depends_on_owner |= member.value.as_ref().is_some_and(|value| {
+                self.expr_depends_on_const_params_with_shadowed(
+                    value,
+                    &owner_consts,
+                    &earlier_members,
+                )
+            });
+            earlier_members.insert(member.name);
+        }
+        if depends_on_owner {
+            self.push_error(TypeError::Decl(DeclError::FlagOwnerDependency {
+                owner: key.clone(),
+                span,
+            }));
+            valid = false;
+        }
+        for pending_member in &pending.variants {
+            if FlagStaticOp::from_name(pending_member.name).is_some() {
+                self.push_error(TypeError::Decl(DeclError::FlagStaticMemberConflict {
+                    owner: key.clone(),
+                    member: pending_member.name,
+                    span: Some(raw_span(pending, pending_member.span)),
+                }));
+                valid = false;
+            }
+            let Some(member) = schema.body.variants.get(pending_member.name) else {
+                continue;
+            };
+            if !matches!(member.payload, VariantPayload::Unit) {
+                self.push_error(TypeError::Decl(DeclError::FlagPayloadMember {
+                    owner: key.clone(),
+                    member: pending_member.name,
+                    span: Some(raw_span(pending, pending_member.span)),
+                }));
+                valid = false;
+            }
+        }
+        if !valid {
+            return false;
+        }
+
+        let (values, errors) = super::flags::resolve_values(self, &pending.variants);
+        for error in errors {
+            self.push_error(TypeError::Decl(DeclError::FlagInvalidValue {
+                owner: key.clone(),
+                member: error.member,
+                kind: error.kind,
+                span: Some(raw_span(pending, error.span)),
+            }));
+        }
+        values.is_some_and(|values| self.decls.install_flag_metadata(key, values))
+    }
+
+    fn resolve_enum_values(
         &mut self,
         ids: &HashSet<NominalId>,
         envs: &HashMap<NominalId, LocalNominalTemplate>,
     ) {
         let pending = self.decls.take_pending_raw_enums(ids);
-        for (key, pending) in pending {
-            let (env, owner) = envs
-                .get(&key.id)
-                .cloned()
-                .expect("raw enum missing declaration environment");
-            let module = key.module.clone();
-            with_callable_body_env(&module, &env, self, |tc| {
-                tc.validate_raw_enum_declaration(&key, &pending, &owner);
-            });
+        let order = pending.iter().map(|(key, _)| key.id.clone()).collect();
+        let nodes = pending
+            .into_iter()
+            .map(|(key, pending)| {
+                let (env, owner) = envs
+                    .get(&key.id)
+                    .cloned()
+                    .expect("enum value declaration missing environment");
+                (
+                    key.id.clone(),
+                    EnumValueResolutionNode {
+                        key,
+                        pending,
+                        env,
+                        owner,
+                        state: EnumValueResolutionState::Unresolved,
+                    },
+                )
+            })
+            .collect();
+        self.enum_value_resolution = Some(EnumValueResolution {
+            nodes,
+            order,
+            stack: vec![],
+            cycle_ids: HashSet::new(),
+            cycles: vec![],
+            dependency_failures: 0,
+        });
+        let order = std::mem::take(
+            &mut self
+                .enum_value_resolution
+                .as_mut()
+                .expect("enum value resolver installed")
+                .order,
+        );
+        for id in order {
+            self.resolve_pending_enum_values(&id, None);
+        }
+        let resolver = self
+            .enum_value_resolution
+            .take()
+            .expect("enum value resolver installed");
+        for (cycle, span) in resolver.cycles {
+            self.push_error_once(TypeError::Decl(DeclError::EnumValueDependencyCycle {
+                cycle,
+                span,
+            }));
         }
     }
 
+    pub(super) fn ensure_pending_enum_values_for_type(&mut self, ty: &Type, span: Span) {
+        let Some(key) = self.decls.key_for_type(ty) else {
+            return;
+        };
+        self.resolve_pending_enum_values(&key.id, Some(span));
+    }
+
+    pub(super) fn eval_enum_value(&mut self, expr: &ExprNode) -> Option<ConstValue> {
+        let failures = self
+            .enum_value_resolution
+            .as_ref()
+            .map_or(0, |resolver| resolver.dependency_failures);
+        match self.eval_const_expr(expr, true) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let dependency_failed = self
+                    .enum_value_resolution
+                    .as_ref()
+                    .is_some_and(|resolver| resolver.dependency_failures != failures);
+                if !dependency_failed {
+                    self.push_error(error);
+                }
+                None
+            }
+        }
+    }
+
+    fn resolve_pending_enum_values(&mut self, id: &NominalId, span: Option<Span>) -> bool {
+        let Some(state) = self
+            .enum_value_resolution
+            .as_ref()
+            .and_then(|resolver| resolver.nodes.get(id))
+            .map(|node| node.state)
+        else {
+            return true;
+        };
+        match state {
+            EnumValueResolutionState::Done => return true,
+            EnumValueResolutionState::Failed => {
+                self.enum_value_resolution
+                    .as_mut()
+                    .expect("enum value resolver active")
+                    .dependency_failures += 1;
+                return false;
+            }
+            EnumValueResolutionState::Resolving => {
+                self.report_enum_value_dependency_cycle(id, span);
+                self.enum_value_resolution
+                    .as_mut()
+                    .expect("enum value resolver active")
+                    .dependency_failures += 1;
+                return false;
+            }
+            EnumValueResolutionState::Unresolved => {}
+        }
+
+        let node = {
+            let resolver = self
+                .enum_value_resolution
+                .as_mut()
+                .expect("enum value resolver active");
+            let node = resolver.nodes.get_mut(id).expect("enum value node exists");
+            node.state = EnumValueResolutionState::Resolving;
+            resolver.stack.push(id.clone());
+            node.clone()
+        };
+        let module = node.key.module.clone();
+        let valid =
+            with_callable_body_env(&module, &node.env, self, |tc| match node.pending.kind {
+                PendingEnumKind::Raw => {
+                    tc.validate_raw_enum_declaration(&node.key, &node.pending, &node.owner)
+                }
+                PendingEnumKind::Flag => {
+                    tc.resolve_flag_declaration(&node.key, &node.pending, &node.owner)
+                }
+            });
+        let resolver = self
+            .enum_value_resolution
+            .as_mut()
+            .expect("enum value resolver active");
+        let popped = resolver.stack.pop();
+        debug_assert_eq!(popped.as_ref(), Some(id));
+        resolver
+            .nodes
+            .get_mut(id)
+            .expect("enum value node exists")
+            .state = if valid {
+            EnumValueResolutionState::Done
+        } else {
+            EnumValueResolutionState::Failed
+        };
+        valid
+    }
+
+    fn report_enum_value_dependency_cycle(&mut self, id: &NominalId, span: Option<Span>) {
+        let (ids, cycle) = {
+            let resolver = self
+                .enum_value_resolution
+                .as_ref()
+                .expect("enum value resolver active");
+            let start = resolver
+                .stack
+                .iter()
+                .position(|entry| entry == id)
+                .unwrap_or(0);
+            let mut ids = resolver.stack[start..].to_vec();
+            ids.push(id.clone());
+            let cycle = ids
+                .iter()
+                .filter_map(|id| resolver.nodes.get(id).map(|node| node.key.clone()))
+                .collect();
+            (ids, cycle)
+        };
+        let span = span.and_then(|span| self.error_span(span));
+        let resolver = self
+            .enum_value_resolution
+            .as_mut()
+            .expect("enum value resolver active");
+        if resolver.cycle_ids.insert(ids) {
+            resolver.cycles.push((cycle, span));
+        }
+    }
     fn validate_raw_enum_declaration(
         &mut self,
         key: &NominalKey,
         pending: &PendingRawEnum,
         owner: &GenericOwnerFrame,
-    ) {
-        let saved_module = self.current_module.clone();
-        self.current_module = key.module.clone();
+    ) -> bool {
         let schema = self.decls.enum_schema(key).cloned();
         let owner_const_names = owner
             .params
@@ -1086,12 +1412,10 @@ impl TypeChecker {
         };
         if let Some(error) = error {
             self.push_error(TypeError::Decl(error));
-            self.decls.sanitize_raw_enum(key);
-            self.current_module = saved_module;
-            return;
+            return false;
         }
-        let valid = match &pending.backing {
-            Some(backing) => match raw_backing_repr(&backing.node) {
+        match &pending.backing {
+            Some(backing) => match raw_enum_backing(&backing.node) {
                 Some(repr) => self.resolve_raw_enum_values(key, pending, repr),
                 None => {
                     self.push_error(TypeError::Decl(DeclError::RawEnumInvalidBacking {
@@ -1113,25 +1437,21 @@ impl TypeChecker {
                 }
                 false
             }
-        };
-        if !valid {
-            self.decls.sanitize_raw_enum(key);
         }
-        self.current_module = saved_module;
     }
 
     fn resolve_raw_enum_values(
         &mut self,
         key: &NominalKey,
         pending: &PendingRawEnum,
-        repr: EnumRepr,
+        backing: RawEnumBacking,
     ) -> bool {
         let Some(schema) = self.decls.enum_schema(key).cloned() else {
             return false;
         };
         let mut valid = true;
         for raw_variant in &pending.variants {
-            let Some(variant) = schema.variants.get(raw_variant.name) else {
+            let Some(variant) = schema.body.variants.get(raw_variant.name) else {
                 continue;
             };
             if !matches!(variant.payload, VariantPayload::Unit) {
@@ -1144,15 +1464,14 @@ impl TypeChecker {
             }
         }
 
-        let values = match repr {
-            EnumRepr::Adt => unreachable!(),
-            EnumRepr::RawInt => self.resolve_raw_int_values(key, pending, &mut valid),
-            EnumRepr::RawString => self.resolve_raw_string_values(key, pending, &mut valid),
+        let values = match backing {
+            RawEnumBacking::Int => self.resolve_raw_int_values(key, pending, &mut valid),
+            RawEnumBacking::String => self.resolve_raw_string_values(key, pending, &mut valid),
         };
         valid
             && self
                 .decls
-                .install_raw_enum_metadata(key, VerifiedRawEnumMetadata { repr, values })
+                .install_raw_enum_metadata(key, RawEnumMetadata::from_values(backing, values))
     }
 
     fn resolve_raw_int_values(
@@ -1166,9 +1485,9 @@ impl TypeChecker {
         let mut next = Some(0_i64);
         for variant in &pending.variants {
             let value = match &variant.value {
-                Some(expr) => match self.eval_const_expr(expr, true) {
-                    Ok(ConstValue::Int(value)) => value,
-                    Ok(other) => {
+                Some(expr) => match self.eval_enum_value(expr) {
+                    Some(ConstValue::Int(value)) => value,
+                    Some(other) => {
                         self.push_error(TypeError::RawEnumExpectedIntValue {
                             found: const_type(&other),
                             span: self.error_span(expr.span),
@@ -1176,8 +1495,7 @@ impl TypeChecker {
                         *valid = false;
                         continue;
                     }
-                    Err(error) => {
-                        self.push_error(error);
+                    None => {
                         *valid = false;
                         continue;
                     }
@@ -1229,9 +1547,9 @@ impl TypeChecker {
                 *valid = false;
                 continue;
             };
-            let value = match self.eval_const_expr(expr, true) {
-                Ok(ConstValue::String(value)) => value,
-                Ok(other) => {
+            let value = match self.eval_enum_value(expr) {
+                Some(ConstValue::String(value)) => value,
+                Some(other) => {
                     self.push_error(TypeError::RawEnumExpectedStringValue {
                         found: const_type(&other),
                         span: self.error_span(expr.span),
@@ -1239,8 +1557,7 @@ impl TypeChecker {
                     *valid = false;
                     continue;
                 }
-                Err(error) => {
-                    self.push_error(error);
+                None => {
                     *valid = false;
                     continue;
                 }

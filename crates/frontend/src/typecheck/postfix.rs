@@ -1,10 +1,10 @@
 use anvyx_externs::ReceiverMode;
 
 use super::{
-    CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, FunctionValueArgFact,
-    FunctionValueCallFact, FunctionValueKind, FunctionValueOrigin, GenericArgs, GenericParams,
-    MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess, TypeChecker, TypeError,
-    TypeSubst,
+    CallForm, CallTarget, CheckedType, ConstSubst, Exposure, ExternUseTarget, FlagMemberFact,
+    FunctionValueArgFact, FunctionValueCallFact, FunctionValueKind, FunctionValueOrigin,
+    GenericArgs, GenericParams, MemberAccessKind, MemberPathFact, MemberPathKind, PlaceAccess,
+    TypeChecker, TypeError, TypeSubst,
     annotation::{AccessPolicyOutput, emit_access_policy},
     body::check_specialized_callable_body,
     check_arg_count, check_arg_range, check_expected_value_expr, check_expr_checked,
@@ -18,14 +18,15 @@ use super::{
     },
     enum_variant::{self, ResolvedEnumVariant},
     extern_boundary,
+    flags::{self, FlagStaticOp},
     generic_bind::{GenericSolveSession, bind_prefix_generic_seeds},
     infer::{GenericSolverSeeds, GenericSolverVars, SemanticLocalId, TypeHandle},
     member,
     place::{self, MutableUseKind, PlaceUseFacts, PlaceValue},
     projection::{
         ExpectedFit, ExpectedPlaceProjection, ExpectedProjectionDecision, ExpectedProjectionMode,
-        SourceAcceptance, apply_value_projection, classify_expected_fit, constrain_expected_return,
-        expected_place_projection,
+        SourceAcceptance, apply_raw_projection, apply_value_projection, classify_expected_fit,
+        constrain_expected_return, expected_place_projection, reject_raw_place_projection,
     },
 };
 use crate::{
@@ -54,6 +55,14 @@ enum Subject {
         callee: Box<CallableRef>,
         surface_ty: Type,
         receiver: Option<SourceReceiver>,
+    },
+    FlagMember {
+        owner_ty: Type,
+        value: i64,
+    },
+    FlagStatic {
+        owner_ty: Type,
+        op: FlagStaticOp,
     },
     EnumVariant {
         resolved: ResolvedEnumVariant,
@@ -432,6 +441,14 @@ pub(super) fn check_postfix_chain_place(
     }
 
     match &subject {
+        Subject::FlagMember { owner_ty, value } => {
+            tc.record_flag_member(FlagMemberFact {
+                expr_id: expr.node.id,
+                owner_ty: owner_ty.clone(),
+                value: *value,
+            });
+            return PlaceValue::not_place(checked_from_type(expr, owner_ty.clone(), tc));
+        }
         Subject::EnumVariant {
             resolved,
             owner_args,
@@ -611,6 +628,9 @@ fn subject_type(subject: &Subject) -> Type {
         Subject::Callable { surface_ty: ty, .. } | Subject::EnumVariant { surface_ty: ty, .. } => {
             ty.clone()
         }
+        Subject::FlagMember { owner_ty, .. } | Subject::FlagStatic { owner_ty, .. } => {
+            owner_ty.clone()
+        }
         Subject::ExternMethod { signature, .. } | Subject::ExternStatic { signature, .. } => {
             signature.to_func_type()
         }
@@ -727,7 +747,26 @@ fn apply_field(
             apply_module_field(scope, field.node.field, field_id, field.span, kind, tc)
         }
         Subject::Type(ty) => apply_type_field(ty, field.node.field, field.span, kind, expected, tc),
+        Subject::FlagMember { owner_ty, value } => {
+            tc.record_flag_member(FlagMemberFact {
+                expr_id: field.node.target.node.id,
+                owner_ty: owner_ty.clone(),
+                value: *value,
+            });
+            let target =
+                PlaceValue::not_place(checked_from_type(&field.node.target, owner_ty.clone(), tc));
+            apply_value_field(
+                &target,
+                field.node.target.node.id,
+                field_id,
+                field.node.field,
+                field.span,
+                kind,
+                tc,
+            )
+        }
         Subject::Callable { .. }
+        | Subject::FlagStatic { .. }
         | Subject::EnumVariant { .. }
         | Subject::QualifiedExtend { .. }
         | Subject::ExternMethod { .. }
@@ -1372,6 +1411,9 @@ fn apply_type_field(
     tc: &mut TypeChecker,
 ) -> Subject {
     let has_static_extend = tc.find_static_extend_method(target, name).is_some();
+    let flag_static = (kind == MemberAccessKind::Method)
+        .then(|| flags::static_op(tc, target, name))
+        .flatten();
     let mut enum_key = None;
     let mut has_instance = false;
 
@@ -1387,8 +1429,25 @@ fn apply_type_field(
     }
 
     if let Some(key) = tc.decls.key_for_type(target) {
+        let declared_enum_member = tc.decls.enum_declares_member(&key, name);
         if let Some(schema) = tc.decls.enum_schema(&key) {
-            let has_variant = schema.variants.contains_key(name);
+            if let Some(member) = schema
+                .body
+                .kind
+                .flag()
+                .and_then(|flag| flag.member(name))
+                .cloned()
+            {
+                if has_static_extend {
+                    return static_extend_conflict(target, name, span, tc);
+                }
+                tc.check_access_policy(&member.policy, kind, name, target, &key.module, span);
+                return Subject::FlagMember {
+                    owner_ty: target.clone(),
+                    value: member.value,
+                };
+            }
+            let has_variant = declared_enum_member;
             if has_variant && has_static_extend {
                 return static_extend_conflict(target, name, span, tc);
             }
@@ -1427,6 +1486,16 @@ fn apply_type_field(
                 );
             }
         }
+    }
+
+    if let Some(op) = flag_static {
+        if has_static_extend {
+            return static_extend_conflict(target, name, span, tc);
+        }
+        return Subject::FlagStatic {
+            owner_ty: target.clone(),
+            op,
+        };
     }
 
     if has_static_extend {
@@ -1602,6 +1671,9 @@ fn apply_call(
             expected,
             tc,
         )),
+        Subject::FlagStatic { owner_ty, op } => {
+            PlaceValue::not_place(flags::check_static_call(*op, owner_ty, call, call_id, tc))
+        }
         Subject::ExternStatic {
             static_ref,
             signature,
@@ -1618,7 +1690,7 @@ fn apply_call(
             place::record_value_read(call.node.func.node.id, value, tc);
             call_value(value.checked.ty.clone(), call, call_id, expected, tc).into_place_value()
         }
-        Subject::Module(_) | Subject::Type(_) => {
+        Subject::Module(_) | Subject::Type(_) | Subject::FlagMember { .. } => {
             PlaceValue::not_place(checked_type(not_callable(subject_type(subject), call, tc)))
         }
         Subject::Error => {
@@ -2136,13 +2208,21 @@ fn check_mutable_arg(arg: &ExprNode, param: &CallParam, tc: &mut TypeChecker) ->
         return reject_ref_arg(arg, param, &place.value.checked, tc);
     }
 
-    match expected_place_projection(tc, arg, &place.value, &target) {
+    match expected_place_projection(tc, arg, &place.value, &target, false) {
         ExpectedPlaceProjection::SourceAccepted => finish_ref_arg(arg, param, &place.value, tc),
         ExpectedPlaceProjection::Projected(projected) => finish_ref_arg(arg, param, &projected, tc),
         ExpectedPlaceProjection::Failed => SourceArgCheck {
             failed: true,
             mutable_arg: None,
         },
+        ExpectedPlaceProjection::RawProjected(_) => unreachable!("raw ref projection disabled"),
+        ExpectedPlaceProjection::RawValueRequired(plan) => {
+            reject_raw_place_projection(tc, arg, plan);
+            SourceArgCheck {
+                failed: true,
+                mutable_arg: None,
+            }
+        }
         ExpectedPlaceProjection::NotNeeded => reject_ref_arg(arg, param, &place.into_checked(), tc),
     }
 }
@@ -2216,6 +2296,15 @@ fn check_cast_accept_arg(
         ExpectedFit::SourceAccepted(acceptance) => {
             finish_cast_accept_arg(arg, param, checked, acceptance, tc)
         }
+        ExpectedFit::RawProject(plan) => {
+            let checked = apply_raw_projection(tc, arg, &checked, plan);
+            tc.reject_extern_any_escape(&checked, arg.span);
+            tc.expect_assignable_expr(arg.span, arg.node.id, checked.handle, param.ty.clone());
+            SourceArgCheck {
+                failed: tc.solve_constraints(),
+                mutable_arg: None,
+            }
+        }
         ExpectedFit::Project {
             projection,
             acceptance,
@@ -2235,14 +2324,15 @@ fn check_cast_accept_arg(
                 ExpectedProjectionDecision::Failed => {}
                 ExpectedProjectionDecision::SourceAccepted
                 | ExpectedProjectionDecision::NotNeeded
-                | ExpectedProjectionDecision::Project(_) => unreachable!(),
+                | ExpectedProjectionDecision::Project(_)
+                | ExpectedProjectionDecision::RawProject(_) => unreachable!(),
             }
             SourceArgCheck {
                 failed: true,
                 mutable_arg: None,
             }
         }
-        ExpectedFit::Deferred | ExpectedFit::Mismatch => {
+        ExpectedFit::Deferred | ExpectedFit::Mismatch | ExpectedFit::ExplicitCastRejected(_) => {
             finish_unaccepted_cast_arg(arg, param, checked, tc)
         }
     }
@@ -3118,7 +3208,7 @@ fn check_index_access_inner(
         Type::Array {
             elem,
             len: ArrayLen::Fixed(len),
-        } => check_sequence_scalar_index(node, target, elem, Some(*len), tc),
+        } => check_sequence_scalar_index(node, target, elem, Some(*len.value()), tc),
         Type::List { elem } | Type::Array { elem, .. } | Type::Slice { elem } => {
             check_sequence_scalar_index(node, target, elem, None, tc)
         }

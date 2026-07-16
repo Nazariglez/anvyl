@@ -64,6 +64,7 @@ pub enum TypeData {
     Dyn(ContractSurfaceId),
     Aggregate(AggregateId),
     Enum(EnumId),
+    Flag(FlagId),
     DataRef(AggregateId),
     Extern(ExternTypeId),
 }
@@ -193,6 +194,7 @@ pub struct ConstData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     Int(i64),
+    Flag { flag: FlagId, bits: i64 },
     Float(f64),
     Bool(bool),
     String(Box<str>),

@@ -306,6 +306,21 @@ fn rvalue_children_have_roles() {
             vec!["o:Read"],
         ),
         (
+            RValue::RawProject {
+                value: operand(0),
+                target: ty(0),
+            },
+            vec!["o:Read"],
+        ),
+        (
+            RValue::RawTryConstruct {
+                value: operand(0),
+                target: ty(0),
+                ty: ty(1),
+            },
+            vec!["o:Read"],
+        ),
+        (
             RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
                 fields: vec![operand(0), operand(1)],

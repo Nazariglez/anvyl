@@ -23,6 +23,8 @@ define_id!(LambdaCaptureSlotId);
 define_id!(BindingId);
 define_id!(AggregateId);
 define_id!(EnumId);
+define_id!(FlagId);
+define_id!(FlagMemberId);
 define_id!(ExternId);
 define_id!(ExternTypeId);
 define_id!(TypeId);

@@ -19,14 +19,15 @@ use super::{
     DynOwnedUse, DynReceiver, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl,
     ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp,
     ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
-    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, Function,
-    FunctionId, FunctionKind, FunctionOwner, FunctionSpecialization, FunctionValueCapability,
-    GlobalDecl, GlobalId, GlobalInitEffect, IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl,
-    LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind,
-    MapWriteKind, Module, ModuleId, Mutability as AirMutability, Operand, Param, ParamEscape,
-    ParamMode, ParamRole, ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode,
-    ScopedBorrowDecl, ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData,
-    TypeId, VariantDecl, VariantShape, VerifyError, ownership, place_model,
+    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, FlagDecl,
+    FlagMemberDecl, FlagMemberId, FlagStaticOp, Function, FunctionId, FunctionKind, FunctionOwner,
+    FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect,
+    IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
+    LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
+    Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
+    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
+    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
+    VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -44,21 +45,21 @@ use crate::{
     typecheck::{
         BindingId, BodyInstanceKey, CallForm, CallTarget, CallableId, CallableInstanceKey,
         CallableKind, CallableParent, CaptureStorageOrigin, CastFromInstanceKey, CastFromSignature,
-        CheckedDynMatchBinding, CheckedDynMatchPlan, CheckedEnumPayload, CheckedLiteralPattern,
-        CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan, CheckedPattern,
-        CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternOwner, ConstTerm,
-        ContractParamSchema, ContractReturnSchema, ContractSurfaceId as SemanticContractSurfaceId,
-        ContractSurfaceSchemas, ContractTypeSchema, CoreRangeKind, DeclarationIndex,
-        DefaultArgFact, DefaultExprSite, DynCallFact, DynDowncastSource, EnumRepr as TcEnumRepr,
-        ExternUseTarget, FunctionValueEscapeCapability, FunctionValueKind, FunctionValueOrigin,
-        GenericArgs, GlobalAccessFact, GlobalAccessMode, GlobalInitEffect as TcGlobalInitEffect,
-        GlobalKey, GlobalSig, IterRuntimeCheckKind, LambdaBodyKey, LambdaCaptureFact,
-        LambdaCaptureRuntimePlan, LambdaEscapeFact, LambdaEscapeKind, LocalDefFact, LocalDefKind,
-        LocalUseFact, LocalUseMode, MemberPathKind, MethodMode, MethodSurface, ModuleScope,
-        NominalKey, RawEnumValue as TcRawEnumValue, SemanticBodyFacts,
-        SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram, TypecheckFacts,
-        UserCastSite, VariantPayload, WitnessId as SemanticWitnessId, WitnessSlotTarget,
-        generic_args_are_concrete, nominal_generic_args, nominal_id_for_type,
+        CheckedConditionalPattern, CheckedDynMatchBinding, CheckedDynMatchPlan, CheckedEnumPayload,
+        CheckedLiteralPattern, CheckedMatchAccess, CheckedMatchArm, CheckedMatchPlan,
+        CheckedPattern, CheckedPatternBinding, CheckedPatternBindingKind, CheckedPatternOwner,
+        ConstTerm, ContractParamSchema, ContractReturnSchema,
+        ContractSurfaceId as SemanticContractSurfaceId, ContractSurfaceSchemas, ContractTypeSchema,
+        CoreRangeKind, DeclarationIndex, DefaultArgFact, DefaultExprSite, DynCallFact,
+        DynDowncastSource, EnumRepr as TcEnumRepr, ExternUseTarget, FunctionValueEscapeCapability,
+        FunctionValueKind, FunctionValueOrigin, GenericArgs, GlobalAccessFact, GlobalAccessMode,
+        GlobalInitEffect as TcGlobalInitEffect, GlobalKey, GlobalSig, IterRuntimeCheckKind,
+        LambdaBodyKey, LambdaCaptureFact, LambdaCaptureRuntimePlan, LambdaEscapeFact,
+        LambdaEscapeKind, LocalDefFact, LocalDefKind, LocalUseFact, LocalUseMode, MemberPathKind,
+        MethodMode, MethodSurface, ModuleScope, NominalKey, RawEnumValue as TcRawEnumValue,
+        SemanticBodyFacts, SemanticFunctionInstanceFact, SemanticLocalId, SemanticProgram,
+        TypecheckFacts, UserCastSite, VariantPayload, WitnessId as SemanticWitnessId,
+        WitnessSlotTarget, generic_args_are_concrete, nominal_generic_args, nominal_id_for_type,
         nominal_type_with_args, substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
@@ -342,7 +343,7 @@ impl TypeLowerer {
                 };
                 TypeData::Array {
                     elem: self.lower_with_env(program, elem, env)?,
-                    len: *len,
+                    len: *len.value(),
                 }
             }
             Type::Map { key, value } => TypeData::Map {
@@ -518,9 +519,32 @@ impl TypeLowerer {
         if let Some(id) = self.cache.get(&cache_key).copied() {
             return Ok(id);
         }
-        let raw_type = decls
-            .raw_enum_raw_type(key)
-            .map(|ty| self.lower_with_env(program, &ty, env.reborrow()))
+        if let Some(flag) = schema.body.kind.flag() {
+            let members = flag
+                .members
+                .iter()
+                .enumerate()
+                .map(|(index, (name, member))| FlagMemberDecl {
+                    id: FlagMemberId::from_index(index),
+                    name,
+                    value: member.value,
+                    atomic: member.atomic,
+                })
+                .collect();
+            let flag_id = program.alloc_flag(FlagDecl {
+                name: key.name,
+                module,
+                known_bits: flag.known_bits,
+                members,
+            });
+            program.module_mut(module).flags.push(flag_id);
+            let id = program.alloc_type(TypeData::Flag(flag_id));
+            self.cache.insert(cache_key, id);
+            return Ok(id);
+        }
+        let raw = schema.body.kind.raw();
+        let raw_type = raw
+            .map(|raw| self.lower_with_env(program, &raw.backing.ty(), env.reborrow()))
             .transpose()?;
         let enum_id = program.alloc_enum(EnumDecl {
             name: key.name,
@@ -528,7 +552,7 @@ impl TypeLowerer {
             type_args,
             const_args,
             core: enum_core_kind(decls, key),
-            repr: lower_enum_repr(schema.repr),
+            repr: lower_enum_repr(schema.body.kind.repr()),
             raw_type,
             variants: vec![],
         });
@@ -537,6 +561,7 @@ impl TypeLowerer {
         self.cache.insert(cache_key, id);
         let generics = schema.all_generics();
         let variants = schema
+            .body
             .variants
             .iter()
             .map(|(name, variant)| {
@@ -568,7 +593,9 @@ impl TypeLowerer {
                 Ok(VariantDecl {
                     name,
                     shape,
-                    raw_value: variant.raw_value.as_ref().map(lower_raw_enum_value),
+                    raw_value: raw
+                        .and_then(|raw| raw.value(name))
+                        .map(lower_raw_enum_value),
                 })
             })
             .collect::<Result<Vec<_>, LowerError>>()?;
@@ -2339,6 +2366,7 @@ struct FunctionLowerer<'cx, 'facts, 'tc> {
     terminated: bool,
     next_loop: u32,
     active_loops: Vec<AirLoopId>,
+    type_overrides: HashMap<ExprId, Type>,
 }
 
 impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
@@ -2418,6 +2446,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             terminated: false,
             next_loop: 0,
             active_loops: vec![],
+            type_overrides: HashMap::new(),
         })
     }
 
@@ -2586,6 +2615,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
+        if self
+            .flag_conditional_pattern(if_let.node.value.node.id)
+            .is_some()
+        {
+            return self.lower_flag_if_let_effect(if_let);
+        }
         if let Some(pattern) = direct_dyn_failable_alias_pattern(if_let)
             && self
                 .facts
@@ -2636,6 +2671,56 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn flag_conditional_pattern(&self, value: ExprId) -> Option<&CheckedConditionalPattern> {
+        self.facts
+            .conditional_patterns
+            .get(&value)
+            .filter(|pattern| checked_pattern_has_flag_value(&pattern.pattern))
+    }
+
+    fn lower_flag_if_let_effect(&mut self, if_let: &ast::IfLetNode) -> Result<(), LowerError> {
+        let pattern = self
+            .flag_conditional_pattern(if_let.node.value.node.id)
+            .cloned()
+            .ok_or(LowerError::MissingTypecheckFacts)?;
+        let subject = self.lower_pattern_subject(
+            &if_let.node.value,
+            &if_let.node.value,
+            CheckedMatchAccess::Owned,
+        )?;
+        let matched =
+            self.with_nested_block(|this| this.lower_block_effect(&if_let.node.then_block))?;
+        let fallback = self.with_nested_block(|this| {
+            this.lower_optional_else_effect(if_let.node.else_block.as_ref())
+        })?;
+        let arms =
+            self.lower_flag_conditional_arms(&if_let.node.value, &pattern, matched, fallback)?;
+        self.push_pattern_match(subject, arms)
+    }
+
+    fn lower_flag_conditional_arms(
+        &mut self,
+        owner: &ExprNode,
+        pattern: &CheckedConditionalPattern,
+        matched: AirBlock,
+        fallback: AirBlock,
+    ) -> Result<Vec<AirPatternArm>, LowerError> {
+        let checked = CheckedMatchArm {
+            bindings: pattern.bindings.clone(),
+            pattern: pattern.pattern.clone(),
+        };
+        Ok(vec![
+            AirPatternArm {
+                alternatives: self.lower_pattern_alternatives(owner, &checked)?,
+                block: matched,
+            },
+            AirPatternArm {
+                alternatives: vec![AirPatternAlternative::default()],
+                block: fallback,
+            },
+        ])
+    }
+
     fn lower_if_let_value(
         &mut self,
         expr: &ExprNode,
@@ -2646,6 +2731,29 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         let result_ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
         let result = self.temp(result_ty);
+        if let Some(pattern) = self
+            .flag_conditional_pattern(if_let.node.value.node.id)
+            .cloned()
+        {
+            let subject = self.lower_pattern_subject(
+                &if_let.node.value,
+                &if_let.node.value,
+                CheckedMatchAccess::Owned,
+            )?;
+            let matched = self.with_nested_block(|this| {
+                this.lower_if_let_result(&if_let.node.then_block, result, result_ty, expr)
+            })?;
+            let fallback = self.with_nested_block(|this| {
+                this.lower_if_let_result(else_block, result, result_ty, expr)
+            })?;
+            let arms =
+                self.lower_flag_conditional_arms(&if_let.node.value, &pattern, matched, fallback)?;
+            self.push_pattern_match(subject, arms)?;
+            if self.terminated {
+                return self.dummy_operand(self.function.signature.return_type());
+            }
+            return Ok(self.operand_place(result));
+        }
         if let Some(pattern) = direct_dyn_failable_alias_pattern(if_let)
             && self
                 .facts
@@ -3300,8 +3408,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_int_expr(&mut self, expr: &ExprNode, int_ty: TypeId) -> Result<Operand, LowerError> {
-        if let ExprKind::Lit(Lit::Int(value)) = expr.node.kind {
-            return self.int_const(value);
+        if let ExprKind::Lit(Lit::Int(value)) = &expr.node.kind {
+            return self.int_const(*value.value());
         }
         self.lower_value_to(expr, int_ty, expr)
     }
@@ -3772,10 +3880,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         default_check: IterCountCheck,
     ) -> Result<Operand, LowerError> {
-        if let ExprKind::Lit(Lit::Int(value)) = expr.node.kind
-            && iter_count_check_accepts(default_check, value)
+        if let ExprKind::Lit(Lit::Int(value)) = &expr.node.kind
+            && iter_count_check_accepts(default_check, *value.value())
         {
-            return self.int_const(value);
+            return self.int_const(*value.value());
         }
         let int_ty = self.cx.lower_ty(&Type::Int)?;
         let value = self.lower_value_to(expr, int_ty, expr)?;
@@ -4221,6 +4329,25 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         id: AirLoopId,
         while_let: &ast::WhileLet,
     ) -> Result<(), LowerError> {
+        if let Some(pattern) = self
+            .flag_conditional_pattern(while_let.value.node.id)
+            .cloned()
+        {
+            let subject = self.lower_pattern_subject(
+                &while_let.value,
+                &while_let.value,
+                CheckedMatchAccess::Owned,
+            )?;
+            let matched =
+                self.with_nested_block(|this| this.lower_loop_body_continue(id, &while_let.body))?;
+            let fallback = AirBlock {
+                stmts: vec![],
+                tail: AirTail::Break(id),
+            };
+            let arms =
+                self.lower_flag_conditional_arms(&while_let.value, &pattern, matched, fallback)?;
+            return self.push_pattern_match(subject, arms);
+        }
         let alias = while_let.head.is_ref();
         let subject =
             self.lower_optional_pattern_subject(&while_let.value, &while_let.value, alias)?;
@@ -4759,6 +4886,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             && let Ok(place) = self.lower_shared_slice_call_arg(expr, ty)
         {
             return Ok(CallArg::SharedBorrow(place));
+        }
+        if self.facts.raw_projections.contains_key(&expr.node.id) {
+            let value = self.lower_value_to(expr, ty, expr)?;
+            return self
+                .materialize_shared_operand(expr, value, ty)
+                .map(CallArg::SharedBorrow);
         }
         match self.lower_place_arg(expr, false) {
             Ok(place) if place.ty == ty => Ok(CallArg::SharedBorrow(place)),
@@ -5534,6 +5667,99 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        if let Some(fact) = self.facts.raw_try_constructs.get(&expr.node.id).cloned() {
+            if fact.expr_id != expr.node.id {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let ExprKind::FailableCast(cast) = &expr.node.kind else {
+                return Err(LowerError::MissingTypecheckFacts);
+            };
+            if cast.node.expr.node.id != fact.source_expr {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let source = self.cx.lower_ty(&fact.source_ty)?;
+            let target = self.cx.lower_ty(&fact.target_ty)?;
+            let ty = self.cx.lower_ty(&fact.result_ty)?;
+            let value = self.lower_value(&cast.node.expr)?;
+            if typing::operand_ty(&self.cx.program, &value) != Some(source) {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            return self.emit_temp(RValue::RawTryConstruct { value, target, ty });
+        }
+        let Some(fact) = self.facts.raw_projections.get(&expr.node.id).cloned() else {
+            return self.lower_unprojected_value(expr);
+        };
+        if fact.expr_id != expr.node.id {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        let source = self.cx.lower_ty(&fact.source_ty)?;
+        let target = self.cx.lower_ty(&fact.target_ty)?;
+        let value = if fact.source_expr == expr.node.id {
+            self.lower_unprojected_value_as(expr, fact.source_ty.clone())?
+        } else {
+            let ExprKind::Cast(cast) = &expr.node.kind else {
+                return Err(LowerError::MissingTypecheckFacts);
+            };
+            if cast.node.expr.node.id != fact.source_expr {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            self.lower_value(&cast.node.expr)?
+        };
+        if typing::operand_ty(&self.cx.program, &value) != Some(source) {
+            return Err(LowerError::MissingTypecheckFacts);
+        }
+        self.emit_temp(RValue::RawProject { value, target })
+    }
+
+    fn lower_unprojected_value_as(
+        &mut self,
+        expr: &ExprNode,
+        ty: Type,
+    ) -> Result<Operand, LowerError> {
+        let previous = self.type_overrides.insert(expr.node.id, ty);
+        let result = self.lower_unprojected_value(expr);
+        match previous {
+            Some(previous) => {
+                self.type_overrides.insert(expr.node.id, previous);
+            }
+            None => {
+                self.type_overrides.remove(&expr.node.id);
+            }
+        }
+        result
+    }
+
+    fn lower_unprojected_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
+        if let Some(fact) = self.facts.flag_statics.get(&expr.node.id).cloned() {
+            if fact.expr_id != expr.node.id {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let ty = self.cx.lower_ty(&fact.owner_ty)?;
+            if !matches!(self.cx.program.type_data(ty), TypeData::Flag(_)) {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let op = match fact.op {
+                crate::typecheck::FlagStaticOp::Empty => FlagStaticOp::Empty,
+                crate::typecheck::FlagStaticOp::All => FlagStaticOp::All,
+            };
+            return self.emit_temp(RValue::FlagStatic { op, ty });
+        }
+        if let Some(fact) = self.facts.flag_members.get(&expr.node.id).cloned() {
+            if fact.expr_id != expr.node.id {
+                return Err(LowerError::MissingTypecheckFacts);
+            }
+            let ty = self.cx.lower_ty(&fact.owner_ty)?;
+            let TypeData::Flag(flag) = self.cx.program.type_data(ty) else {
+                return Err(LowerError::MissingTypecheckFacts);
+            };
+            return Ok(Operand::Const(self.cx.program.alloc_const(ConstData {
+                ty,
+                value: ConstValue::Flag {
+                    flag: *flag,
+                    bits: fact.value,
+                },
+            })));
+        }
         if let Some(fact) = self.facts.dyn_downcasts.get(&expr.node.id).cloned() {
             if fact.mutable {
                 return Err(unsupported_expr(expr));
@@ -5834,18 +6060,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ExprKind::IfLet(if_let) => self.lower_if_let_value(expr, if_let),
             ExprKind::Match(match_expr) => self.lower_match_value(expr, match_expr),
             ExprKind::Unary(unary) => {
-                self.require_builtin_scalar(expr)?;
                 let value = self.lower_value(&unary.node.expr)?;
-                let ty = self.lower_expr_ty(expr.node.id)?;
-                let value_scalar = self
-                    .operand_type(&value)
-                    .scalar_kind()
-                    .ok_or_else(|| unsupported_expr(expr))?;
-                let result_scalar = ty.scalar_kind().ok_or_else(|| unsupported_expr(expr))?;
-                if unary.node.op.scalar_result(value_scalar) != Some(result_scalar) {
-                    return Err(unsupported_expr(expr));
+                let result_ty = self.lower_expr_ty(expr.node.id)?;
+                let value_ty = self.operand_ty(&value);
+                let ty = self.cx.lower_ty(&result_ty)?;
+                let flag_not = unary.node.op == ast::UnaryOp::BitNot
+                    && value_ty == ty
+                    && matches!(self.cx.program.type_data(ty), TypeData::Flag(_));
+                if !flag_not {
+                    self.require_builtin_scalar(expr)?;
+                    let value_scalar = self
+                        .operand_type(&value)
+                        .scalar_kind()
+                        .ok_or_else(|| unsupported_expr(expr))?;
+                    let result_scalar = result_ty
+                        .scalar_kind()
+                        .ok_or_else(|| unsupported_expr(expr))?;
+                    if unary.node.op.scalar_result(value_scalar) != Some(result_scalar) {
+                        return Err(unsupported_expr(expr));
+                    }
                 }
-                let ty = self.cx.lower_ty(&ty)?;
                 self.emit_temp(RValue::Unary {
                     op: unary.node.op,
                     value,
@@ -5876,22 +6110,36 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 {
                     return Ok(value);
                 }
-                self.require_builtin_scalar(expr)?;
                 let lhs = self.lower_value(&binary.node.left)?;
                 let rhs = self.lower_value(&binary.node.right)?;
-                let lhs_ty = self.operand_type(&lhs);
-                let rhs_ty = self.operand_type(&rhs);
-                let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
-                    lhs_ty.scalar_kind(),
-                    rhs_ty.scalar_kind(),
-                    result_ty.scalar_kind(),
-                ) else {
-                    return Err(unsupported_expr(expr));
-                };
-                if binary.node.op.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
-                    return Err(unsupported_expr(expr));
-                }
+                let lhs_air_ty = self.operand_ty(&lhs);
+                let rhs_air_ty = self.operand_ty(&rhs);
                 let ty = self.cx.lower_ty(&result_ty)?;
+                let same_flag = lhs_air_ty == rhs_air_ty
+                    && matches!(self.cx.program.type_data(lhs_air_ty), TypeData::Flag(_));
+                let flag_op = same_flag
+                    && match binary.node.op {
+                        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor => ty == lhs_air_ty,
+                        BinaryOp::Eq | BinaryOp::NotEq => {
+                            matches!(self.cx.program.type_data(ty), TypeData::Bool)
+                        }
+                        _ => false,
+                    };
+                if !flag_op {
+                    self.require_builtin_scalar(expr)?;
+                    let lhs_ty = self.operand_type(&lhs);
+                    let rhs_ty = self.operand_type(&rhs);
+                    let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
+                        lhs_ty.scalar_kind(),
+                        rhs_ty.scalar_kind(),
+                        result_ty.scalar_kind(),
+                    ) else {
+                        return Err(unsupported_expr(expr));
+                    };
+                    if binary.node.op.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
+                        return Err(unsupported_expr(expr));
+                    }
+                }
                 self.emit_temp(RValue::Binary {
                     op: binary.node.op,
                     lhs,
@@ -6378,7 +6626,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Ok(value);
         }
         let primitives = PrimitiveTypes::scan(&self.cx.program);
-        if !typing::valid_cast(&self.cx.program, &primitives, source, target) {
+        if !typing::valid_cast(&primitives, source, target) {
             return Err(unsupported_expr(expr));
         }
         self.emit_temp(RValue::Cast { value, target })
@@ -7590,6 +7838,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 | TypeData::Optional(_)
                 | TypeData::Tuple(_)
                 | TypeData::Enum(_)
+                | TypeData::Flag(_)
         ) {
             return Err(unsupported_expr(owner));
         }
@@ -7920,7 +8169,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .find(|binding| binding.ty == fact.target)
             .ok_or(LowerError::MissingTypecheckFacts)?;
         let binding = self
-            .lower_checked_pattern_binding(owner, checked_binding, AirPatternPath::default())?
+            .lower_checked_pattern_binding(checked_binding, AirPatternPath::default())?
             .local;
         let some_block = match output {
             MatchOutput::Effect => self.lower_nested_expr_effect(some_body)?,
@@ -7986,18 +8235,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         owner: &ExprNode,
         arm: &CheckedMatchArm,
     ) -> Result<Vec<AirPatternAlternative>, LowerError> {
-        let alternatives = self.lower_checked_pattern_branches(
+        self.lower_checked_pattern_branches(
             owner,
             &arm.pattern,
             &arm.bindings.bindings,
             &AirPatternPath::default(),
             vec![AirPatternAlternative::default()],
-        )?;
-        if alternatives.iter().all(Self::pattern_alternative_supported) {
-            Ok(alternatives)
-        } else {
-            Err(unsupported_expr(owner))
-        }
+        )
     }
 
     fn lower_checked_pattern_branches(
@@ -8010,6 +8254,46 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     ) -> Result<Vec<AirPatternAlternative>, LowerError> {
         match pattern {
             CheckedPattern::Or(branches) => {
+                let mut branch_plans = Vec::with_capacity(branches.len());
+                let mut structural = true;
+                let mut common_bindings = None;
+                for branch in branches {
+                    let mut plans = self.lower_checked_pattern_branches(
+                        owner,
+                        &branch.pattern,
+                        &branch.bindings.bindings,
+                        path,
+                        vec![AirPatternAlternative::default()],
+                    )?;
+                    if plans.len() != 1
+                        || !plans[0]
+                            .tests
+                            .iter()
+                            .all(Self::pattern_disjunction_test_supported)
+                    {
+                        structural = false;
+                    } else if let Some(expected) = &common_bindings {
+                        structural &= expected == &plans[0].bindings;
+                    } else {
+                        common_bindings = Some(plans[0].bindings.clone());
+                    }
+                    branch_plans.append(&mut plans);
+                }
+                if structural {
+                    let branches: Vec<Vec<AirPatternTest>> =
+                        branch_plans.into_iter().map(|plan| plan.tests).collect();
+                    let bindings = common_bindings.unwrap_or_default();
+                    return Ok(alternatives
+                        .into_iter()
+                        .map(|mut alternative| {
+                            alternative.tests.push(AirPatternTest::Any {
+                                branches: branches.clone(),
+                            });
+                            alternative.bindings.extend(bindings.clone());
+                            alternative
+                        })
+                        .collect());
+                }
                 let mut lowered = vec![];
                 for alternative in alternatives {
                     for branch in branches {
@@ -8068,6 +8352,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     &some_path,
                     Self::add_optional_some_test(alternatives, path),
                 )
+            }
+            CheckedPattern::FlagValue {
+                owner: flag_owner,
+                value,
+            } => {
+                let ty = self.cx.lower_ty(&flag_owner.ty)?;
+                let TypeData::Flag(flag) = self.cx.program.type_data(ty) else {
+                    return Err(unsupported_expr(owner));
+                };
+                Ok(alternatives
+                    .into_iter()
+                    .map(|mut alternative| {
+                        alternative.tests.push(AirPatternTest::FlagValue {
+                            path: path.clone(),
+                            flag: *flag,
+                            bits: *value,
+                        });
+                        alternative
+                    })
+                    .collect())
             }
             CheckedPattern::Enum {
                 owner: enum_owner,
@@ -8143,27 +8447,21 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
             }
             CheckedPattern::Wildcard => Ok(alternatives),
-            CheckedPattern::Binding(binding) => alternatives
-                .into_iter()
-                .map(|mut alternative| {
-                    alternative
-                        .bindings
-                        .push(self.lower_checked_pattern_binding(
-                            owner,
-                            &CheckedPatternBinding {
-                                name: binding.name,
-                                span: binding.span,
-                                local: binding.local,
-                                binding_id: binding.binding_id,
-                                ty: binding.ty.clone(),
-                                mutable: binding.mutable,
-                                kind: Self::checked_pattern_binding_kind(bindings, binding.local),
-                            },
-                            path.clone(),
-                        )?);
-                    Ok(alternative)
-                })
-                .collect(),
+            CheckedPattern::Binding(binding) => {
+                let binding = bindings
+                    .iter()
+                    .find(|candidate| candidate.local == binding.local)
+                    .ok_or(LowerError::MissingTypecheckFacts)?;
+                alternatives
+                    .into_iter()
+                    .map(|mut alternative| {
+                        alternative
+                            .bindings
+                            .push(self.lower_checked_pattern_binding(binding, path.clone())?);
+                        Ok(alternative)
+                    })
+                    .collect()
+            }
             CheckedPattern::Literal(literal) => alternatives
                 .into_iter()
                 .map(|mut alternative| {
@@ -8189,6 +8487,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
     }
 
+    fn pattern_disjunction_test_supported(test: &AirPatternTest) -> bool {
+        match test {
+            AirPatternTest::Any { branches } => branches
+                .iter()
+                .flatten()
+                .all(Self::pattern_disjunction_test_supported),
+            AirPatternTest::Literal { path, .. } | AirPatternTest::FlagValue { path, .. } => {
+                path.steps.iter().all(|step| {
+                    matches!(
+                        step,
+                        AirPatternPathStep::Field(_) | AirPatternPathStep::TupleField(_)
+                    )
+                })
+            }
+            AirPatternTest::Nil { .. }
+            | AirPatternTest::OptionalSome { .. }
+            | AirPatternTest::EnumVariant { .. } => false,
+        }
+    }
+
     fn add_optional_some_test(
         alternatives: Vec<AirPatternAlternative>,
         path: &AirPatternPath,
@@ -8202,44 +8520,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 alternative
             })
             .collect()
-    }
-
-    fn pattern_alternative_supported(alternative: &AirPatternAlternative) -> bool {
-        alternative.tests.iter().all(|test| match test {
-            AirPatternTest::Literal { path, .. }
-            | AirPatternTest::Nil { path }
-            | AirPatternTest::OptionalSome { path } => Self::pattern_path_supported(path),
-            AirPatternTest::EnumVariant { path, .. } => path.steps.is_empty(),
-        }) && alternative
-            .bindings
-            .iter()
-            .all(|binding| Self::pattern_path_supported(&binding.path))
-    }
-
-    fn pattern_path_supported(path: &AirPatternPath) -> bool {
-        path.steps
-            .iter()
-            .enumerate()
-            .filter(|(_, step)| {
-                matches!(
-                    step,
-                    AirPatternPathStep::EnumTupleField { .. }
-                        | AirPatternPathStep::EnumStructField { .. }
-                )
-            })
-            .all(|(index, _)| index == 0)
-    }
-
-    fn checked_pattern_binding_kind(
-        bindings: &[CheckedPatternBinding],
-        local: SemanticLocalId,
-    ) -> CheckedPatternBindingKind {
-        bindings
-            .iter()
-            .find(|binding| binding.local == local)
-            .map_or(CheckedPatternBindingKind::Owned, |binding| {
-                binding.kind.clone()
-            })
     }
 
     fn checked_pattern_owner_is_optional(
@@ -8320,22 +8600,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
 
     fn lower_checked_pattern_binding(
         &mut self,
-        owner: &ExprNode,
         binding: &CheckedPatternBinding,
         path: AirPatternPath,
     ) -> Result<AirPatternBinding, LowerError> {
         let ty = self.cx.lower_ty(&binding.ty)?;
         let mode = match &binding.kind {
             CheckedPatternBindingKind::Owned => AirPatternBindingMode::Owned,
-            CheckedPatternBindingKind::Alias(_) => {
-                if !Self::pattern_alias_path_supported(&path) {
-                    return Err(LowerError::UnsupportedExpr {
-                        expr_id: owner.node.id,
-                        kind: "Match",
-                    });
-                }
-                AirPatternBindingMode::Alias
-            }
+            CheckedPatternBindingKind::Alias(_) => AirPatternBindingMode::Alias,
         };
         let local = match self.existing_semantic_local(binding.local) {
             Some(local) => local,
@@ -8368,14 +8639,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty,
             mode,
         })
-    }
-
-    fn pattern_alias_path_supported(path: &AirPatternPath) -> bool {
-        matches!(
-            path.steps.as_slice(),
-            [AirPatternPathStep::EnumTupleField { .. }
-                | AirPatternPathStep::EnumStructField { .. }]
-        )
     }
 
     fn push_pattern_match(
@@ -8487,7 +8750,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 ast::StringPart::Text(text) if text.is_empty() => {}
                 ast::StringPart::Text(text) => operands.push(self.string_const(text)?),
                 ast::StringPart::Expr(expr, Some(spec)) => {
-                    let value = self.lower_value(expr)?;
+                    let value = if let Some(fact) = self.facts.stringifies.get(&expr.node.id) {
+                        let source = fact.source_ty.clone();
+                        self.lower_stringify_value(expr, &source)?
+                    } else {
+                        self.lower_value(expr)?
+                    };
                     let string_ty = self.string_ty()?;
                     operands.push(self.emit_typed_temp(
                         string_ty,
@@ -10228,20 +10496,26 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     }
                     return Ok(());
                 }
-                self.require_builtin_scalar(expr)?;
                 let lhs = Operand::Place(dst.clone());
                 let rhs = self.lower_value(&assign.node.value)?;
-                let lhs_ty = self.operand_type(&lhs);
-                let rhs_ty = self.operand_type(&rhs);
-                let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
-                    lhs_ty.scalar_kind(),
-                    rhs_ty.scalar_kind(),
-                    result_ty.scalar_kind(),
-                ) else {
-                    return Err(unsupported_expr(&assign.node.target));
-                };
-                if binary.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
-                    return Err(unsupported_expr(&assign.node.target));
+                let rhs_air_ty = self.operand_ty(&rhs);
+                let flag_op = dst.ty == rhs_air_ty
+                    && matches!(self.cx.program.type_data(dst.ty), TypeData::Flag(_))
+                    && matches!(binary, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::Xor);
+                if !flag_op {
+                    self.require_builtin_scalar(expr)?;
+                    let lhs_ty = self.operand_type(&lhs);
+                    let rhs_ty = self.operand_type(&rhs);
+                    let (Some(lhs_scalar), Some(rhs_scalar), Some(result_scalar)) = (
+                        lhs_ty.scalar_kind(),
+                        rhs_ty.scalar_kind(),
+                        result_ty.scalar_kind(),
+                    ) else {
+                        return Err(unsupported_expr(&assign.node.target));
+                    };
+                    if binary.scalar_result(lhs_scalar, rhs_scalar) != Some(result_scalar) {
+                        return Err(unsupported_expr(&assign.node.target));
+                    }
                 }
                 let tmp = self.emit_temp(RValue::Binary {
                     op: binary,
@@ -10319,6 +10593,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             || self.facts.extern_uses.contains_key(&id)
             || self.facts.member_paths.contains_key(&id)
             || self.facts.expected_projections.contains_key(&id)
+            || self.facts.raw_projections.contains_key(&id)
+            || self.facts.raw_try_constructs.contains_key(&id)
+            || self.facts.flag_members.contains_key(&id)
+            || self.facts.flag_statics.contains_key(&id)
     }
 
     fn returns_void(&self) -> bool {
@@ -10329,6 +10607,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
     }
 
     fn lower_expr_ty(&self, expr_id: ExprId) -> Result<Type, LowerError> {
+        if let Some(ty) = self.type_overrides.get(&expr_id) {
+            return Ok(ty.clone());
+        }
         self.facts
             .expr_types
             .get(&expr_id)
@@ -10629,6 +10910,16 @@ fn direct_failable_payload_pattern(
     match if_let.node.pattern.node {
         Pattern::Ident(_) => Ok(Some(&if_let.node.pattern)),
         _ => Ok(None),
+    }
+}
+
+fn checked_pattern_has_flag_value(pattern: &CheckedPattern) -> bool {
+    match pattern {
+        CheckedPattern::FlagValue { .. } => true,
+        CheckedPattern::Or(alternatives) => alternatives
+            .iter()
+            .any(|alternative| checked_pattern_has_flag_value(&alternative.pattern)),
+        _ => false,
     }
 }
 
@@ -11037,17 +11328,17 @@ pub(crate) fn lower_with_modules(
     config: AirLowerConfig,
 ) -> Result<Program, LowerError> {
     let source_index = crate::source_ast::SourceAstIndex::new(root, resolved);
-    lower_with_source_index(source_index, semantic, typecheck_facts, config)
+    lower_with_source_index(&source_index, semantic, typecheck_facts, config)
 }
 
 pub(crate) fn lower_with_source_index(
-    source_index: crate::source_ast::SourceAstIndex,
+    source_index: &crate::source_ast::SourceAstIndex,
     semantic: &SemanticProgram,
     typecheck_facts: &TypecheckFacts,
     config: AirLowerConfig,
 ) -> Result<Program, LowerError> {
     validate_lambda_fact_carrier(typecheck_facts);
-    let index = SourceProgramIndex::new(&source_index, semantic);
+    let index = SourceProgramIndex::new(source_index, semantic);
     let callable_facts = SemanticCallableFacts::new(semantic);
     let AirLowerConfig { roots } = config;
     let entry = roots.entry.clone();
@@ -12859,7 +13150,7 @@ fn enqueue_nominal_stringify_override(
         return;
     };
     let generics = schema.all_generics();
-    for variant in schema.variants.values() {
+    for variant in schema.body.variants.values() {
         variant.payload.for_each_type(|payload_ty| {
             let payload_ty = substitute_aggregate_member(ty, &generics, payload_ty);
             enqueue_type_stringify_overrides(
@@ -14306,10 +14597,10 @@ mod tests {
             .expect("missing Marker declaration")
             .id
             .clone();
-        let nan_a = ast::ConstArg::Value(ast::ConstValue::Float(f64::from_bits(
+        let nan_a = ast::ConstArg::value(ast::ConstValue::Float(f64::from_bits(
             0x7ff8_0000_0000_0001,
         )));
-        let nan_b = ast::ConstArg::Value(ast::ConstValue::Float(f64::from_bits(
+        let nan_b = ast::ConstArg::value(ast::ConstValue::Float(f64::from_bits(
             0x7ff8_0000_0000_0002,
         )));
         assert_eq!(nan_a.to_string(), nan_b.to_string());
@@ -14530,6 +14821,7 @@ mod tests {
                 vec!["result"],
                 vec!["range"],
                 vec!["collections"],
+                vec!["flags"],
                 vec!["runtime"],
                 vec!["core_int"],
                 vec!["core_float"],
@@ -14557,6 +14849,7 @@ mod tests {
                 "result",
                 "range",
                 "collections",
+                "flags",
             ]
         );
     }
@@ -15476,6 +15769,25 @@ mod tests {
             statement,
             AirStmt::Eval(RValue::Call { args, .. })
                 if matches!(args.as_slice(), [CallArg::SharedBorrow(Place { root: PlaceRoot::Global(GlobalId(0)), .. })])
+        )));
+    }
+
+    #[test]
+    fn raw_enum_extern_borrow_materializes_projection() {
+        let air = lower_raw_enum_extern_borrow();
+        let statements = program_statements(&air).collect::<Vec<_>>();
+
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Init {
+                value: RValue::RawProject { .. },
+                ..
+            }
+        )));
+        assert!(statements.iter().any(|statement| matches!(
+            statement,
+            AirStmt::Eval(RValue::Call { args, .. })
+                if matches!(args.as_slice(), [CallArg::SharedBorrow(_)])
         )));
     }
 
@@ -19253,6 +19565,37 @@ fn main() {}
         provider: ProviderDescriptor,
     ) -> (ast::Program, ResolveResult, typecheck::SemanticCheckOutput) {
         checked_with_providers(source, vec![provider])
+    }
+
+    fn lower_raw_enum_extern_borrow() -> Program {
+        let provider = ProviderDescriptor {
+            provider: ProviderId {
+                name: "host".to_string(),
+            },
+            modules: vec![ExternModuleDescriptor {
+                path: anvyx_externs::ModulePath {
+                    segments: vec!["host".to_string()],
+                },
+                types: vec![],
+                functions: vec![ExternFunctionDescriptor {
+                    name: "touch".to_string(),
+                    doc: None,
+                    signature: ExternSignature {
+                        params: vec![ExternParam {
+                            name: Some("value".to_string()),
+                            ty: ExternTypeExpr::Int,
+                            flow: ParamFlow::Borrow,
+                            escape: CallbackEscape::NonEscaping,
+                        }],
+                        ret: ExternTypeExpr::Void,
+                    },
+                    effects: ExternEffects::default(),
+                }],
+            }],
+        };
+        let source = "import ext:host { touch }; enum State: int { Idle } fn main() { let state = State.Idle; touch(state); }";
+        let (root, resolved, semantic) = checked_with_provider(source, provider);
+        lower_checked_roots(&root, &resolved, &semantic, &["main"]).expect("lower failed")
     }
 
     fn lower_global_extern_arg(flow: ParamFlow, global: &str) -> Program {

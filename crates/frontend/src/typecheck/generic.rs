@@ -604,7 +604,7 @@ fn substitute_array_len(len: ArrayLen, consts: &ConstSubst) -> ArrayLen {
             let expr = substitute_const_expr(expr, consts);
             match expr {
                 ConstExpr::Value(ConstValue::Int(value)) => usize::try_from(value)
-                    .map(ArrayLen::Fixed)
+                    .map(ArrayLen::fixed)
                     .unwrap_or(ArrayLen::Expr(ConstExpr::Value(ConstValue::Int(value)))),
                 expr => ArrayLen::Expr(expr),
             }
@@ -808,7 +808,7 @@ mod tests {
     }
 
     fn carg(n: i64) -> ConstArg {
-        ConstArg::Value(ConstValue::Int(n))
+        ConstArg::value(ConstValue::Int(n))
     }
 
     fn cterm(n: usize) -> ConstTerm {
@@ -871,7 +871,7 @@ mod tests {
         let cs = HashMap::from([(cp(0), cterm(4))]);
         let ty = array_ty(Type::Int, ArrayLen::Param(cp(0)));
         let result = substitute(&ty, &HashMap::new(), &cs);
-        assert_eq!(result, array_ty(Type::Int, ArrayLen::Fixed(4)));
+        assert_eq!(result, array_ty(Type::Int, ArrayLen::fixed(4)));
     }
 
     #[test]
@@ -880,7 +880,7 @@ mod tests {
         let cs = HashMap::from([(cp(1), cterm(3))]);
         let ty = array_ty(Type::Var(tv(0)), ArrayLen::Param(cp(1)));
         let result = substitute(&ty, &ts, &cs);
-        assert_eq!(result, array_ty(Type::String, ArrayLen::Fixed(3)));
+        assert_eq!(result, array_ty(Type::String, ArrayLen::fixed(3)));
     }
 
     #[test]
@@ -894,7 +894,7 @@ mod tests {
                 40,
                 "Flag",
                 vec![],
-                vec![ConstArg::Value(ConstValue::Bool(true))],
+                vec![ConstArg::value(ConstValue::Bool(true))],
             ),
         );
     }
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn spec_const() {
-        let exact = array_ty(Type::Var(tv(0)), ArrayLen::Fixed(3));
+        let exact = array_ty(Type::Var(tv(0)), ArrayLen::fixed(3));
         let generic = array_ty(Type::Var(tv(0)), ArrayLen::Param(cp(0)));
         assert_eq!(
             compare_specificity(&exact, &generic),
@@ -1056,13 +1056,13 @@ mod tests {
             40,
             "Flag",
             vec![],
-            vec![ConstArg::Value(ConstValue::Bool(true))],
+            vec![ConstArg::value(ConstValue::Bool(true))],
         );
         let b = struct_const(
             40,
             "Flag",
             vec![],
-            vec![ConstArg::Value(ConstValue::Bool(true))],
+            vec![ConstArg::value(ConstValue::Bool(true))],
         );
         assert_eq!(compare_specificity(&a, &b), Specificity::Equal);
     }
@@ -1075,16 +1075,16 @@ mod tests {
         ]);
         let same = Type::Tuple(vec![
             struct_const(43, "Buf", vec![], vec![carg(3)]),
-            array_ty(Type::Int, ArrayLen::Fixed(3)),
+            array_ty(Type::Int, ArrayLen::fixed(3)),
         ]);
         let different = Type::Tuple(vec![
             struct_const(
                 43,
                 "Buf",
                 vec![],
-                vec![ConstArg::Value(ConstValue::Bool(true))],
+                vec![ConstArg::value(ConstValue::Bool(true))],
             ),
-            array_ty(Type::Int, ArrayLen::Fixed(1)),
+            array_ty(Type::Int, ArrayLen::fixed(1)),
         ]);
         assert_eq!(
             compare_specificity(&same, &repeated),
@@ -1104,7 +1104,7 @@ mod tests {
         ]);
         let negative = Type::Tuple(vec![
             struct_const(43, "Buf", vec![], vec![carg(-1)]),
-            array_ty(Type::Int, ArrayLen::Fixed(0)),
+            array_ty(Type::Int, ArrayLen::fixed(0)),
         ]);
         assert_eq!(
             compare_specificity(&negative, &repeated),

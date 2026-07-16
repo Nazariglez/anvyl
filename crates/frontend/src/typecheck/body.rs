@@ -540,7 +540,7 @@ fn register_local_type_headers(stmts: &[StmtNode], tc: &mut TypeChecker) {
                 tc,
             ),
             Stmt::Enum(enm) => {
-                register_local_nominal_header(enm.node.name, NominalKind::Enum, enm.span, tc)
+                register_local_nominal_header(enm.node.name, NominalKind::Enum, enm.span, tc);
             }
             _ => {}
         }
@@ -2141,7 +2141,6 @@ fn with_source_module_scope<R>(
             tc.push_scope();
             if let Some(program) = tc.module_programs.get(module).map(Rc::clone) {
                 register_declarations(program.as_ref(), tc);
-                tc.eval_module_consts(module);
             }
             let ret = f(tc);
             tc.restore_scope_state(state);

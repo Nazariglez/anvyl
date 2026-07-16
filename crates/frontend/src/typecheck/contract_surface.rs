@@ -940,7 +940,7 @@ fn encode_const_arg(out: &mut Vec<u8>, arg: &ConstArg) {
     match arg {
         ConstArg::Value(value) => {
             out.push(0);
-            match value {
+            match value.value() {
                 ConstValue::Int(value) => {
                     out.push(0);
                     out.extend(value.to_le_bytes());
@@ -975,7 +975,7 @@ fn encode_array_len(out: &mut Vec<u8>, len: ArrayLen) {
     match len {
         ArrayLen::Fixed(len) => {
             out.push(0);
-            push_len(out, len);
+            push_len(out, *len.value());
         }
         ArrayLen::Infer => out.push(1),
         ArrayLen::Named(name) => {
@@ -997,7 +997,7 @@ fn encode_const_expr(out: &mut Vec<u8>, expr: &ConstExpr) {
     match expr {
         ConstExpr::Value(value) => {
             out.push(0);
-            encode_const_arg(out, &ConstArg::Value(value.clone()));
+            encode_const_arg(out, &ConstArg::value(value.clone()));
         }
         ConstExpr::Param(id) => {
             out.push(1);

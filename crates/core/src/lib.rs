@@ -57,6 +57,11 @@ pub const MODULES: &[SourceFile] = &[
         code: include_str!("collections.anv"),
     },
     SourceFile {
+        path: &["flags"],
+        label: "crates/core/src/flags.anv",
+        code: include_str!("flags.anv"),
+    },
+    SourceFile {
         path: &["runtime"],
         label: "crates/core/src/runtime.anv",
         code: include_str!("runtime.anv"),

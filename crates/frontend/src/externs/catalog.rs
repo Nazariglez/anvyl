@@ -9,7 +9,7 @@ use anvyx_externs::{
 };
 
 use crate::{
-    ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, ReturnSpec, Type},
+    ast::{ArrayLen, EscapeMode, FuncParam, GenericArg, Ident, ReturnSpec, Type, TypeVisitor},
     externs::{
         extern_module_path, extern_module_scope,
         raw::{
@@ -945,6 +945,7 @@ pub(crate) enum InvalidExternTypeReason {
     MissingCoreOption,
     MissingCoreResult,
     NonKeyableMapKey,
+    UnsupportedFlag,
 }
 
 fn visit_extern_signature_with_context<'a>(
@@ -1489,7 +1490,7 @@ impl<'a> CatalogBuilder<'a> {
                 len: ArrayLen::Fixed(len),
             } => Some(ExternTypeExpr::array(
                 self.abi_from_resolved_ty(elem)?,
-                *len as u64,
+                *len.value() as u64,
             )),
             Type::Func { params, ret } => Some(ExternTypeExpr::Callback(ExternCallbackSignature {
                 params: params
@@ -1593,7 +1594,7 @@ impl<'a> CatalogBuilder<'a> {
             ),
             ExternTypeExpr::Array { elem, len } => Type::Array {
                 elem: Box::new(self.resolve_ty(ctx, elem).ty),
-                len: ArrayLen::Fixed(usize::try_from(*len).unwrap_or(usize::MAX)),
+                len: ArrayLen::fixed(usize::try_from(*len).unwrap_or(usize::MAX)),
             },
             ExternTypeExpr::Slice(elem) => Type::Slice {
                 elem: Box::new(self.resolve_ty(ctx, elem).ty),
@@ -1921,6 +1922,7 @@ fn validate_ty(
     errors: &mut Vec<ExternCatalogError>,
 ) {
     validate_type_facts(context, &ty.ty, site, errors);
+    validate_source_schema_flags(context, &ty.ty, site, decls, errors);
     validate_abi_type(context, &ty.abi, position, site, errors);
     validate_map_keys(context, &ty.ty, site, decls, errors);
 }
@@ -1943,6 +1945,34 @@ fn validate_abi_type(
                 site,
             })
         }));
+    }
+}
+
+struct FlagTypeVisitor<'a> {
+    decls: &'a DeclarationIndex,
+}
+
+impl TypeVisitor for FlagTypeVisitor<'_> {
+    fn visit_type_leaf(&mut self, ty: &Type) -> bool {
+        self.decls.is_flag_enum_type(ty)
+    }
+}
+
+fn validate_source_schema_flags(
+    context: &ExternCatalogContext,
+    ty: &Type,
+    site: RawExternSite,
+    decls: &DeclarationIndex,
+    errors: &mut Vec<ExternCatalogError>,
+) {
+    let mut flags = FlagTypeVisitor { decls };
+    if matches!(context.provenance, ExternProvenance::Source { .. }) && flags.visit_type(ty) {
+        errors.push(invalid_type(
+            context,
+            ty,
+            InvalidExternTypeReason::UnsupportedFlag,
+            site,
+        ));
     }
 }
 

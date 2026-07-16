@@ -184,7 +184,7 @@ pub(crate) enum TypeRefError {
         expected: &'static str,
     },
     ExpectedIntConst {
-        found: Type,
+        found: Box<Type>,
     },
     AliasCycle {
         name: Ident,
@@ -267,7 +267,10 @@ pub(super) fn type_ref_error(error: TypeRefError, span: Option<SourceSpan>) -> T
         TypeRefError::GenericArgKindMismatch { expected } => {
             TypeError::GenericArgKindMismatch { expected, span }
         }
-        TypeRefError::ExpectedIntConst { found } => TypeError::ExpectedIntConst { found, span },
+        TypeRefError::ExpectedIntConst { found } => TypeError::ExpectedIntConst {
+            found: *found,
+            span,
+        },
         TypeRefError::AliasCycle { name } => TypeError::CompileError {
             message: format!("type alias '{name}' depends on itself"),
             span,
@@ -1576,7 +1579,9 @@ impl ExplicitGenericBinder for TypeRefGenericBinder<'_, '_> {
     }
 
     fn push_expected_int_const(&mut self, found: Type, _span: Span) {
-        self.error = Some(TypeRefError::ExpectedIntConst { found });
+        self.error = Some(TypeRefError::ExpectedIntConst {
+            found: Box::new(found),
+        });
     }
 
     fn const_term_arg(&mut self, arg: &GenericArg, _span: Span) -> Option<ConstTerm> {

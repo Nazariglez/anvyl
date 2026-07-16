@@ -1,14 +1,14 @@
 use super::super::{
     AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData,
     ContractSurfaceDecl, ContractWeakeningDecl, ContractWitnessDecl, DynBorrowParamDecl, EnumDecl,
-    EnumRepr, ExternDecl, ExternTypeDecl, Function, FunctionKind, GlobalDecl, LambdaDecl, Local,
-    LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
+    EnumRepr, ExternDecl, ExternTypeDecl, FlagDecl, Function, FunctionKind, GlobalDecl, LambdaDecl,
+    Local, LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
     PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, ScopedBorrowSource, Signature,
     TypeData, VariantDecl, VariantShape,
     ids::{
         AggregateId, BindingId, BlockId, CaptureCellId, ConstId, ContractSurfaceId,
         ContractWeakeningId, ContractWitnessId, DynBorrowParamId, EnumId, ExternId, ExternTypeId,
-        FunctionId, GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
+        FlagId, FunctionId, GlobalId, LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId,
     },
 };
 use crate::{
@@ -95,6 +95,13 @@ impl ProgramBuilder {
 
     pub fn alloc_enum_raw(&mut self, decl: EnumDecl) -> EnumId {
         self.program.alloc_enum(decl)
+    }
+
+    pub fn alloc_flag(&mut self, decl: FlagDecl) -> FlagId {
+        let module = decl.module;
+        let id = self.program.alloc_flag(decl);
+        self.program.module_mut(module).flags.push(id);
+        id
     }
 
     pub fn alloc_enum(&mut self, decl: EnumDecl) -> EnumId {

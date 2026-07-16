@@ -17,7 +17,7 @@ pub(crate) enum ConstTerm {
 impl ConstTerm {
     pub(crate) fn from_arg(arg: &ConstArg) -> Self {
         match arg {
-            ConstArg::Value(value) => Self::Value(value.clone()),
+            ConstArg::Value(value) => Self::Value(value.value().clone()),
             ConstArg::Name(name) => Self::Name(*name),
             ConstArg::Param(id) => Self::Param(*id),
         }
@@ -29,7 +29,7 @@ impl ConstTerm {
 
     pub(crate) fn from_array_len(len: ArrayLen) -> Self {
         match len {
-            ArrayLen::Fixed(value) => Self::from_usize(value),
+            ArrayLen::Fixed(value) => Self::from_usize(*value.value()),
             ArrayLen::Infer => Self::ArrayInfer,
             ArrayLen::Named(name) => Self::Name(name),
             ArrayLen::Param(id) => Self::Param(id),
@@ -44,7 +44,7 @@ impl ConstTerm {
 
     pub(crate) fn to_arg_no_infer(&self) -> Option<ConstArg> {
         match self {
-            Self::Value(value) => Some(ConstArg::Value(value.clone())),
+            Self::Value(value) => Some(ConstArg::value(value.clone())),
             Self::Name(name) => Some(ConstArg::Name(*name)),
             Self::Param(id) => Some(ConstArg::Param(*id)),
             Self::Expr(_) | Self::ArrayInfer | Self::Infer(_) => None,
@@ -58,7 +58,7 @@ impl ConstTerm {
     pub(crate) fn to_array_len_no_infer(&self) -> Option<ArrayLen> {
         match self {
             Self::Value(ConstValue::Int(value)) => {
-                usize::try_from(*value).ok().map(ArrayLen::Fixed)
+                usize::try_from(*value).ok().map(ArrayLen::fixed)
             }
             Self::Value(_) | Self::Infer(_) => None,
             Self::Name(name) => Some(ArrayLen::Named(*name)),
@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn const_args_roundtrip() {
         let args = [
-            ConstArg::Value(ConstValue::Int(3)),
-            ConstArg::Value(ConstValue::Bool(true)),
+            ConstArg::value(ConstValue::Int(3)),
+            ConstArg::value(ConstValue::Bool(true)),
             ConstArg::Name(ident("N")),
             ConstArg::Param(cp(1)),
         ];
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn array_lens_roundtrip() {
         let lens = [
-            ArrayLen::Fixed(3),
+            ArrayLen::fixed(3),
             ArrayLen::Named(ident("N")),
             ArrayLen::Param(cp(1)),
             ArrayLen::Infer,
@@ -127,8 +127,8 @@ mod tests {
     #[test]
     fn fixed_len_matches_int_arg() {
         assert_eq!(
-            ConstTerm::from_arg(&ConstArg::Value(ConstValue::Int(3))),
-            ConstTerm::from_array_len(ArrayLen::Fixed(3)),
+            ConstTerm::from_arg(&ConstArg::value(ConstValue::Int(3))),
+            ConstTerm::from_array_len(ArrayLen::fixed(3)),
         );
     }
 

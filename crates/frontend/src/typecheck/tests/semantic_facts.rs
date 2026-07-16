@@ -926,7 +926,7 @@ fn const_generic_function_fact_uses_concrete_array_len() {
         .expect("missing generic function fact");
     let expected = Type::Array {
         elem: Box::new(Type::Int),
-        len: ArrayLen::Fixed(3),
+        len: ArrayLen::fixed(3),
     };
 
     assert_eq!(fact.args.const_args.len(), 1);

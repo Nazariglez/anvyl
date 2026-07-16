@@ -87,6 +87,7 @@ mod tests {
                 path(&["result"]),
                 path(&["range"]),
                 path(&["collections"]),
+                path(&["flags"]),
                 path(&["runtime"]),
                 path(&["core_int"]),
                 path(&["core_float"]),

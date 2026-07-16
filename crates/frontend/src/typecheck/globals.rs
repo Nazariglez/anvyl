@@ -1,7 +1,8 @@
 use super::{
     CheckedType, DeclarationIndex, GlobalAccessFact, GlobalAccessMode, GlobalKey, GlobalSig,
-    NominalPlacement, Type, TypeChecker, TypeError, ValueDecl, check_value_expr_checked_with_hint,
-    push_type_closure_error, register_declarations, type_closure_facts,
+    NominalPlacement, Type, TypeChecker, TypeError, ValueDecl, check_expected_value_expr,
+    check_value_expr_checked_with_hint, push_type_closure_error, register_declarations,
+    type_closure_facts,
 };
 use crate::{
     ast::{ExprId, GlobalDeclNode, Program, Stmt, TypeVisitor},
@@ -147,18 +148,24 @@ fn check_global_initializer(module: &ModuleScope, global: &GlobalDeclNode, tc: &
     let expected = tc.global_handle(&key);
 
     tc.with_global_initializer_body(key, |tc| {
-        let value =
-            check_value_expr_checked_with_hint(&global.node.value, Some(expected.clone()), tc);
+        let inferred = matches!(tc.handle_type(&expected), Type::Infer);
+        let value = if inferred {
+            check_value_expr_checked_with_hint(&global.node.value, Some(expected.clone()), tc)
+        } else {
+            check_expected_value_expr(&global.node.value, expected.clone(), tc)
+        };
         tc.record_call_return_function_value(&global.node.value, &tc.handle_type(&expected));
         tc.record_global_initializer_escape(&global.node.value);
         tc.reject_extern_any_escape(&value, global.node.value.span);
-        tc.expect_assignable_expr(
-            global.node.value.span,
-            global.node.value.node.id,
-            value.handle,
-            expected.clone(),
-        );
-        tc.solve_constraints();
+        if inferred {
+            tc.expect_assignable_expr(
+                global.node.value.span,
+                global.node.value.node.id,
+                value.handle,
+                expected.clone(),
+            );
+            tc.solve_constraints();
+        }
     });
 
     let ty = tc.handle_type(&expected);

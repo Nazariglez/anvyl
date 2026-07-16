@@ -11,7 +11,7 @@ use super::{
 use crate::{
     ast,
     lexer::{Delimiter, Keyword, LitToken, Op, Token},
-    span::Spanned,
+    span::{SourceSpan, Spanned},
 };
 
 pub const SELF_TYPE: &str = "Self";
@@ -1267,7 +1267,6 @@ fn aggregate_declaration<'src>(
                         .iter()
                         .map(|cp| ast::ConstArg::Param(cp.id))
                         .collect(),
-                    None,
                 );
 
                 let fields = raw_fields
@@ -1470,15 +1469,22 @@ fn enum_declaration_with_policy<'src>(
     stmt: impl AnvParser<'src, ast::StmtNode>,
     policy: DeclPolicy,
 ) -> BoxedParser<'src, ast::EnumDeclNode> {
-    let raw_backing = select! { Token::Colon => () }
-        .ignore_then(type_ident().map_with(|ty, e| Spanned::new(ty, e.span().byte())))
-        .or_not();
+    let enum_mode = select! { Token::Colon => () }
+        .ignore_then(choice((
+            select! { Token::Ident(id) if id.0.as_ref() == "flag" => () }.map_with(|(), e| {
+                let span: SourceSpan = e.span();
+                ast::EnumMode::Flag(span.byte())
+            }),
+            type_ident().map_with(|ty, e| ast::EnumMode::Backed(Spanned::new(ty, e.span().byte()))),
+        )))
+        .or_not()
+        .map(|mode| mode.unwrap_or(ast::EnumMode::Adt));
 
     declaration_header(policy)
         .then_ignore(select! { Token::Keyword(Keyword::Enum) => () })
         .then(identifier())
         .then(generic_params())
-        .then(raw_backing)
+        .then(enum_mode)
         .then(
             select! { Token::Open(Delimiter::Brace) => () }
                 .ignore_then(
@@ -1489,7 +1495,7 @@ fn enum_declaration_with_policy<'src>(
                 )
                 .then_ignore(select! { Token::Close(Delimiter::Brace) => () }),
         )
-        .map_with(|((((header, name), gp), raw_backing), variants), e| {
+        .map_with(|((((header, name), gp), mode), variants), e| {
             let s = e.span();
             let GenericParams {
                 type_params,
@@ -1557,7 +1563,7 @@ fn enum_declaration_with_policy<'src>(
                     visibility: header.visibility,
                     type_params,
                     const_params,
-                    raw_backing,
+                    mode,
                     variants: resolved_variants,
                 },
                 s.byte(),
@@ -1688,15 +1694,19 @@ pub(super) fn extend_declaration<'src>(
         target_constraint: Option<ast::ExtendTargetConstraint>,
     }
 
-    let raw_enum_backing = select! { Token::Colon => () }.ignore_then(select! {
-        Token::Keyword(Keyword::Int) => ast::RawEnumBackingConstraint::Int,
-        Token::Keyword(Keyword::String) => ast::RawEnumBackingConstraint::String,
+    let enum_kind = select! { Token::Colon => () }.ignore_then(select! {
+        Token::Keyword(Keyword::Int) => ast::EnumKindConstraint::RawInt,
+        Token::Keyword(Keyword::String) => ast::EnumKindConstraint::RawString,
+        Token::Ident(id) if id.0.as_ref() == "flag" => ast::EnumKindConstraint::Flag,
     });
 
     let enum_target = select! { Token::Keyword(Keyword::Enum) => () }
         .ignore_then(extend_type_ident())
-        .then(raw_enum_backing.or_not())
-        .map(|(ty, backing)| (ty, Some(ast::ExtendTargetConstraint::Enum { backing })));
+        .then(enum_kind.or_not())
+        .map(|(ty, kind)| {
+            let kind = kind.unwrap_or(ast::EnumKindConstraint::Any);
+            (ty, Some(ast::ExtendTargetConstraint::Enum { kind }))
+        });
     let struct_target = select! { Token::Keyword(Keyword::Struct) => () }
         .ignore_then(extend_type_ident())
         .map(|ty| (ty, Some(ast::ExtendTargetConstraint::Struct)));
