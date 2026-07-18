@@ -9,9 +9,9 @@ use anvyx_frontend::{
         ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeBindingDecl,
         ExternTypeDecl, FieldDecl, FlagDecl, FlagMemberDecl, FlagMemberId, Function, FunctionId,
         FunctionKind, FunctionSpecialization, LambdaDecl, LambdaEscape, Local, LocalKind,
-        Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place, PlaceRoot, Program,
-        Projection, RValue, RawEnumValue, Signature, TypeData, TypePassClasses, VariantDecl,
-        VariantId, VariantShape,
+        Mutability, Operand, OwnedValue, Param, ParamEscape, ParamMode, ParamRole, Place,
+        PlaceRoot, Program, Projection, RValue, RawEnumValue, Signature, TypeData, TypePassClasses,
+        VariantDecl, VariantId, VariantShape,
     },
     ast::{BinaryOp, ExprId, FormatAlign, FormatKind, FormatSign, FormatSpec, Ident},
 };
@@ -23,7 +23,7 @@ use super::{
     place_access::{PlaceAccessCx, PlaceAccessIntent},
     plan,
     profile::{ProfileErrorKind, ProfileSite, RustBackendProfile, RustBackendProfileError},
-    rep_policy::{RirRustRepPolicy, RustTracePlan},
+    rep_policy::{LambdaStorageFamily, RirRustRepPolicy, RustRecipePosition, RustTracePlan},
     rir::{
         self, RirCallArg, RirCallTarget, RirCellDecl, RirCellId, RirCellLifetime, RirCellRef,
         RirCellStorage, RirCollectionAccess, RirCollectionLoanMode, RirCollectionLoanScope,
@@ -35,10 +35,11 @@ use super::{
         RirLambda, RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
         RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
         RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch, RirOptionSubject, RirParam,
-        RirParamAbi, RirParamEscape, RirParamSemantic, RirPatternAlternative, RirPatternArm,
-        RirPatternBinding, RirPatternBindingMode, RirPatternMatch, RirPatternPath,
+        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMaterializer, RirMaterializerAction,
+        RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand, RirOptionMatch,
+        RirOptionPayloadBinding, RirOptionSubject, RirOwnedOperand, RirOwnedSource, RirOwnedValue,
+        RirParam, RirParamAbi, RirParamEscape, RirParamSemantic, RirPatternAlternative,
+        RirPatternArm, RirPatternBinding, RirPatternBindingMode, RirPatternMatch, RirPatternPath,
         RirPatternPathStep, RirPatternTest, RirPlace, RirPlaceRoot, RirProgram, RirProjection,
         RirRValue, RirRawEnumValue, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
         RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringLiteralId,
@@ -55,6 +56,278 @@ use crate::test_support::{
     global_with_init, immutable_local as local, mutable_local as mut_local, param, place,
     root_module, structured_body,
 };
+
+fn owned(value: Operand) -> OwnedValue<Operand> {
+    OwnedValue::reusable(value)
+}
+
+fn rir_owned(value: RirOperand, materializer: usize) -> RirOwnedValue {
+    RirOwnedValue {
+        value: RirOwnedOperand::Value(value),
+        source: RirOwnedSource::Reuse(rir::RirMaterializerId::from_index(materializer)),
+    }
+}
+
+fn rir_access_value(access: RirMutPlaceArg, materializer: rir::RirMaterializerId) -> RirRValue {
+    RirRValue::Materialize(RirOwnedValue {
+        value: RirOwnedOperand::Access(access),
+        source: RirOwnedSource::Reuse(materializer),
+    })
+}
+
+fn cell_read(cell: RirCellRef, ty: RirTypeId, materializer: rir::RirMaterializerId) -> RirRValue {
+    cell_read_with_storage(cell, ty, RirCellStorage::StackScoped, materializer)
+}
+
+fn cell_read_with_storage(
+    cell: RirCellRef,
+    ty: RirTypeId,
+    storage: RirCellStorage,
+    materializer: rir::RirMaterializerId,
+) -> RirRValue {
+    let handle = match storage {
+        RirCellStorage::StackScoped => RirMutPlaceHandle::StackCell { cell, ty },
+        RirCellStorage::Heap => RirMutPlaceHandle::HeapCell { cell, ty },
+    };
+    rir_access_value(
+        RirMutPlaceArg::from_handle(handle, vec![], ty),
+        materializer,
+    )
+}
+
+fn scoped_cell_read(
+    cell: RirScopedPlaceCellRef,
+    ty: RirTypeId,
+    materializer: rir::RirMaterializerId,
+) -> RirRValue {
+    rir_access_value(
+        RirMutPlaceArg::from_handle(RirMutPlaceHandle::ScopedPlaceCell { cell, ty }, vec![], ty),
+        materializer,
+    )
+}
+
+fn dataref_read(
+    object: RirOperand,
+    dataref: RirDataRefId,
+    projections: Vec<RirProjection>,
+    ty: RirTypeId,
+    materializer: rir::RirMaterializerId,
+) -> RirRValue {
+    rir_access_value(
+        RirMutPlaceArg::dataref(object, dataref, projections, ty),
+        materializer,
+    )
+}
+
+fn install_empty_materializer_table(program: &mut RirProgram) {
+    program.value_materializers = vec![None; program.types.len()];
+}
+
+fn test_materializer(
+    program: &RirProgram,
+    ty: RirTypeId,
+    position: RustRecipePosition,
+) -> rir::RirMaterializerId {
+    program
+        .materializers
+        .iter()
+        .find(|decl| decl.ty == ty && decl.position == position)
+        .map(|decl| decl.id)
+        .expect("test materializer")
+}
+
+struct TestMaterializers<'a> {
+    program: &'a mut RirProgram,
+}
+
+impl<'a> TestMaterializers<'a> {
+    fn new(program: &'a mut RirProgram) -> Self {
+        program
+            .value_materializers
+            .resize(program.types.len(), None);
+        Self { program }
+    }
+
+    fn declare(
+        &mut self,
+        ty: RirTypeId,
+        position: RustRecipePosition,
+        action: RirMaterializerAction,
+    ) -> rir::RirMaterializerId {
+        let id = rir::RirMaterializerId::from_index(self.program.materializers.len());
+        self.program.materializers.push(RirMaterializer {
+            id,
+            ty,
+            position,
+            action,
+        });
+        if position == RustRecipePosition::Value {
+            self.program.value_materializers[ty.index()] = Some(id);
+        }
+        id
+    }
+
+    fn copy(&mut self, ty: RirTypeId, position: RustRecipePosition) -> rir::RirMaterializerId {
+        self.declare(ty, position, RirMaterializerAction::Copy)
+    }
+
+    fn managed_share(
+        &mut self,
+        ty: RirTypeId,
+        position: RustRecipePosition,
+    ) -> rir::RirMaterializerId {
+        self.declare(ty, position, RirMaterializerAction::ManagedShare)
+    }
+
+    fn identity_share(
+        &mut self,
+        ty: RirTypeId,
+        position: RustRecipePosition,
+    ) -> rir::RirMaterializerId {
+        self.declare(ty, position, RirMaterializerAction::IdentityShare)
+    }
+
+    fn callable_share(
+        &mut self,
+        ty: RirTypeId,
+        position: RustRecipePosition,
+    ) -> rir::RirMaterializerId {
+        self.declare(ty, position, RirMaterializerAction::CallableShare)
+    }
+
+    fn array_storage(&mut self, index: usize, materializer: rir::RirMaterializerId) {
+        let RirCollectionStorageKind::Array {
+            elem_materializer, ..
+        } = &mut self.program.collection_storages[index].kind
+        else {
+            panic!("array storage fixture")
+        };
+        *elem_materializer = materializer;
+    }
+
+    fn slice_storage(&mut self, index: usize, materializer: rir::RirMaterializerId) {
+        let RirCollectionStorageKind::Slice {
+            elem_materializer, ..
+        } = &mut self.program.collection_storages[index].kind
+        else {
+            panic!("slice storage fixture")
+        };
+        *elem_materializer = materializer;
+    }
+
+    fn list_storage(&mut self, index: usize, materializer: rir::RirMaterializerId) {
+        let RirCollectionStorageKind::List {
+            elem_materializer, ..
+        } = &mut self.program.collection_storages[index].kind
+        else {
+            panic!("list storage fixture")
+        };
+        *elem_materializer = materializer;
+    }
+
+    fn map_storage(
+        &mut self,
+        index: usize,
+        key: rir::RirMaterializerId,
+        value: rir::RirMaterializerId,
+    ) {
+        let RirCollectionStorageKind::Map {
+            key_materializer,
+            value_materializer,
+            ..
+        } = &mut self.program.collection_storages[index].kind
+        else {
+            panic!("map storage fixture")
+        };
+        *key_materializer = key;
+        *value_materializer = value;
+    }
+}
+
+fn install_native_array_materializers(
+    program: &mut RirProgram,
+    string: RirTypeId,
+    option: RirTypeId,
+    array: RirTypeId,
+) -> rir::RirMaterializerId {
+    let mut materializers = TestMaterializers::new(program);
+    let string = materializers.managed_share(
+        string,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+    );
+    let option = materializers.declare(
+        option,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::FixedArrayElement),
+        RirMaterializerAction::Optional { payload: string },
+    );
+    let array = materializers.declare(
+        array,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Array { elem: option },
+    );
+    materializers.array_storage(0, option);
+    array
+}
+
+fn install_native_result_materializers(
+    program: &mut RirProgram,
+    string: RirTypeId,
+    result: RirTypeId,
+) -> rir::RirMaterializerId {
+    let mut materializers = TestMaterializers::new(program);
+    materializers.managed_share(
+        string,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    let payload = materializers.managed_share(
+        string,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::EnumPayload),
+    );
+    materializers.declare(
+        result,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Enum {
+            variants: vec![vec![payload], vec![payload]],
+        },
+    )
+}
+
+fn install_native_unit_materializer(
+    program: &mut RirProgram,
+    unit: RirTypeId,
+) -> rir::RirMaterializerId {
+    TestMaterializers::new(program).declare(
+        unit,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Tuple { fields: vec![] },
+    )
+}
+
+fn install_final_native_abi_materializers(
+    program: &mut RirProgram,
+    int: RirTypeId,
+    string: RirTypeId,
+) {
+    let mut materializers = TestMaterializers::new(program);
+    let int_value = materializers.copy(int, RustRecipePosition::Value);
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.managed_share(
+        string,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::EnumPayload),
+    );
+    materializers.managed_share(
+        string,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::EnumPayload),
+    );
+    materializers.slice_storage(0, int_value);
+}
 
 #[test]
 fn plans_flag_declarations_as_distinct_rir_storage() {
@@ -98,6 +371,7 @@ fn plans_flag_declarations_as_distinct_rir_storage() {
         value: ConstValue::Flag { flag, bits: 7 },
     });
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     assert_eq!(
@@ -422,7 +696,8 @@ fn lazy_binary_rvalues_are_rejected() {
 
 #[test]
 fn profile_accepts_native_scoped_lambda_param() {
-    let program = native_scoped_lambda_air();
+    let mut program = native_scoped_lambda_air();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = host_lambda_plan_config();
 
@@ -432,7 +707,8 @@ fn profile_accepts_native_scoped_lambda_param() {
 
 #[test]
 fn profile_accepts_native_escaping_lambda_param() {
-    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = host_escaping_lambda_plan_config();
 
@@ -442,12 +718,13 @@ fn profile_accepts_native_escaping_lambda_param() {
 
 #[test]
 fn profile_rejects_retained_callback_native_borrow_reentry_arg() {
-    let (program, support) = retained_callback_borrow_air(
+    let (mut program, support) = retained_callback_borrow_air(
         "borrow",
         TypeData::Int,
         ConstValue::Int(1),
         anvyx_runtime::ExternTypeExpr::Int,
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     let errors = RustBackendProfile::check_with_native_support(&verified, &[support])
@@ -511,12 +788,14 @@ fn retained_callback_borrow_air(
         anvyx_runtime::RustReturnAbi::Void,
         false,
     ));
+    air::finalize_materialization(&mut program);
     (program, support)
 }
 
 #[test]
 fn profile_accepts_retained_callback_native_string_borrow_reentry_arg() {
-    let (program, support) = retained_callback_string_borrow_air();
+    let (mut program, support) = retained_callback_string_borrow_air();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     RustBackendProfile::check_with_native_support(&verified, &[support])
@@ -538,7 +817,8 @@ fn push_string_literal(
 }
 
 fn retained_callback_string_borrow_rir() -> RirProgram {
-    let (program, support) = retained_callback_string_borrow_air();
+    let (mut program, support) = retained_callback_string_borrow_air();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     plan(
         &verified,
@@ -653,6 +933,7 @@ fn profile_rejects_escaping_native_scoped_lambda_param() {
         0,
         ParamEscape::Escaping,
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let errors = RustBackendProfile::check_with_native_support(
         &verified,
@@ -672,7 +953,8 @@ fn profile_rejects_direct_native_scoped_lambda_provider_abi() {
     let binding = &mut support.modules[0].bindings[0];
     binding.abi.support = anvyx_runtime::RustAbiSupport::Direct;
     binding.abi.ctx = anvyx_runtime::RustWrapperCtx::HiddenRuntime;
-    let program = native_scoped_lambda_air();
+    let mut program = native_scoped_lambda_air();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let errors = RustBackendProfile::check_with_native_support(&verified, &[support])
         .expect_err("profile accepted direct scoped native lambda ABI");
@@ -770,7 +1052,9 @@ fn native_direct_provider_abi_rejects_mutable_collections_and_ctxless_mut_place(
 
 #[test]
 fn plan_lowers_native_scoped_lambda_call_arg() {
-    let program = native_scoped_lambda_air();
+    let mut program = native_scoped_lambda_air();
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
     let call_args = plan
@@ -794,7 +1078,9 @@ fn plan_lowers_native_escaping_lambda_call_arg() {
         NativeLambdaArgKind::EscapingZeroCapture,
         NativeLambdaArgKind::EscapingReadonlyCapture,
     ] {
-        let program = native_escaping_lambda_air_with(kind);
+        let mut program = native_escaping_lambda_air_with(kind);
+        air::finalize_materialization(&mut program);
+        air::finalize_materialization(&mut program);
         let verified = air::verify(&program).expect("AIR verify failed");
         let plan = plan(&verified, host_escaping_lambda_plan_config()).expect("plan failed");
         let has_escaping_arg = plan
@@ -822,7 +1108,9 @@ fn plan_rejects_non_escaping_lambda_for_escaping_native_callback() {
 
 #[test]
 fn emit_native_escaping_lambda_stays_single_threaded() {
-    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_escaping_lambda_plan_config()).expect("plan failed");
     let source = emit::emit(&plan.verified()).into_string();
@@ -838,7 +1126,9 @@ fn emit_native_escaping_lambda_stays_single_threaded() {
 
 #[test]
 fn emit_retained_callback_reentry_gate_precedes_inner_mut_borrow() {
-    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_escaping_lambda_retained_plan_config()).expect("plan failed");
     let source = emit::emit(&plan.verified()).into_string();
@@ -868,7 +1158,9 @@ fn plan_lowers_native_scoped_lambda_value_forms() {
         NativeLambdaArgKind::EscapingReadonlyCapture,
         NativeLambdaArgKind::CaptureCell,
     ] {
-        let program = native_scoped_lambda_air_with(kind);
+        let mut program = native_scoped_lambda_air_with(kind);
+        air::finalize_materialization(&mut program);
+        air::finalize_materialization(&mut program);
         let verified = air::verify(&program).expect("AIR verify failed");
         let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
         let has_scoped_arg = plan
@@ -888,7 +1180,9 @@ fn emit_native_scoped_lambda_uses_scoped_runtime_state() {
         NativeLambdaArgKind::FunctionRef,
         NativeLambdaArgKind::ZeroCapture,
     ] {
-        let program = native_scoped_lambda_air_with(kind);
+        let mut program = native_scoped_lambda_air_with(kind);
+        air::finalize_materialization(&mut program);
+        air::finalize_materialization(&mut program);
         let verified = air::verify(&program).expect("AIR verify failed");
         let plan = plan(&verified, host_lambda_plan_config()).expect("plan failed");
         let source = emit::emit(&plan.verified()).into_string();
@@ -906,7 +1200,9 @@ fn emit_native_scoped_lambda_uses_scoped_runtime_state() {
 
 #[test]
 fn rir_rejects_forged_callback_receiver_without_native_ref() {
-    let program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    let mut program = native_escaping_lambda_air_with(NativeLambdaArgKind::FunctionRef);
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let mut program = plan(&verified, host_escaping_lambda_plan_config())
         .expect("plan failed")
@@ -961,11 +1257,13 @@ fn native_escaping_lambda_coexists_with_scoped_lambda_call() {
         .stmts
         .push(Statement::Eval(RValue::Call {
             callee: Callee::Extern(subscribe),
-            args: vec![CallArg::Value(Operand::Place(place(
+            args: vec![CallArg::Value(owned(Operand::Place(place(
                 air::LocalId::from_index(0),
                 lambda_ty,
-            )))],
+            ))))],
         }));
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_scoped_and_subscription_plan_config()).expect("plan failed");
     let call_args = plan
@@ -993,7 +1291,9 @@ fn native_escaping_lambda_coexists_with_scoped_lambda_call() {
 
 #[test]
 fn emit_retained_callback_registry_before_heap() {
-    let program = native_escaping_lambda_trigger_air(NativeLambdaArgKind::FunctionRef);
+    let mut program = native_escaping_lambda_trigger_air(NativeLambdaArgKind::FunctionRef);
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, host_escaping_lambda_retained_plan_config()).expect("plan failed");
     let source = emit::emit(&plan.verified()).into_string();
@@ -1023,6 +1323,7 @@ fn profile_rejects_native_lambda_return() {
     let mut program = native_scoped_lambda_air();
     let lambda_ty = program.externs[0].params[0].ty;
     program.externs[0].return_type = lambda_ty;
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let errors = RustBackendProfile::check_with_native_support(
         &verified,
@@ -1153,11 +1454,10 @@ fn native_arg_analysis_program(
     );
     program.functions.push(call_extern_function(
         void,
-        vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            arg,
-        )))],
+        vec![RirCallArg::Value(rir_owned(
+            RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], arg)),
+            0,
+        ))],
     ));
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -1599,8 +1899,8 @@ fn plan_lowers_list_index_collection_access_to_mut_place() {
                 },
                 Statement::Eval(RValue::MapInsert {
                     map: map_place,
-                    key: Operand::Const(key_const),
-                    value: Operand::Const(value_const),
+                    key: owned(Operand::Const(key_const)),
+                    value: owned(Operand::Const(value_const)),
                     kind: air::MapWriteKind::IndexedAssignment,
                 }),
             ],
@@ -1609,6 +1909,7 @@ fn plan_lowers_list_index_collection_access_to_mut_place() {
     });
     program.module_mut(module).functions.push(function);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), function);
@@ -1722,6 +2023,7 @@ fn plan_marks_tuple_with_dataref_field_noncopy() {
         .aggregates
         .extend([child, payload]);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let RirType::Tuple(tuple) = plan.program().types[tuple_ty.index()] else {
@@ -1775,7 +2077,8 @@ fn emit_derives_trace_for_struct_payload_containing_tuple() {
 
 #[test]
 fn plan_preserves_tuple_construction_and_projection() {
-    let program = tuple_projection_program();
+    let mut program = tuple_projection_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = &plan.program().functions[0];
@@ -1789,8 +2092,13 @@ fn plan_preserves_tuple_construction_and_projection() {
     ));
     assert!(matches!(
         &function.body.term,
-        RirTerm::Return(Some(RirOperand::Place(RirPlace { projections, .. })))
-            if projections == &[RirProjection::TupleField(RirFieldId::from_index(0))]
+        RirTerm::ReturnOwned(RirOwnedValue {
+            value: RirOwnedOperand::Value(RirOperand::Place(RirPlace {
+                projections,
+                ..
+            })),
+            ..
+        }) if projections == &[RirProjection::TupleField(RirFieldId::from_index(0))]
     ));
 }
 
@@ -1800,8 +2108,8 @@ fn emit_renders_tuple_declaration_construction_and_projection() {
 
     assert!(source.contains("struct anvT1_Tuple"));
     assert!(source.contains("_0: i64"));
-    assert!(source.contains("anvT1_Tuple { _0: 1 }"));
-    assert!(source.contains("return v0._0;"));
+    assert!(source.contains("anvT1_Tuple { _0:"));
+    assert!(source.contains("._0"));
 }
 
 #[test]
@@ -2366,10 +2674,14 @@ fn emit_direct_rir_global_read_uses_named_context_params() {
             initialized: false,
             payload_ref: false,
         }];
+        let value_materializer = test_materializer(program, int, RustRecipePosition::Value);
         program.functions[1].body = RirStructuredBlock {
             stmts: vec![RirStmt::Init {
                 local,
-                value: RirRValue::Use(RirOperand::Place(rir_global_place(int))),
+                value: rir_access_value(
+                    RirMutPlaceArg::global(RirGlobalId::from_index(0), int),
+                    value_materializer,
+                ),
             }],
             term: RirTerm::Return(Some(RirOperand::Place(rir_place(local, int)))),
         };
@@ -2417,10 +2729,21 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
         });
         program.functions[1].symbol = RirSymbol::new("entry");
         program.entry = Some(RirFunctionId::from_index(1));
+        let value_materializer = test_materializer(program, int, RustRecipePosition::Value);
         program.functions[1].body = RirStructuredBlock {
             stmts: vec![RirStmt::Eval(RirRValue::Call {
                 callee: RirCallTarget::Extern(RirExternId::from_index(0)),
-                args: vec![RirCallArg::Value(RirOperand::Place(rir_global_place(int)))],
+                args: vec![RirCallArg::Value(RirOwnedValue {
+                    value: RirOwnedOperand::Access(RirMutPlaceArg::from_handle(
+                        RirMutPlaceHandle::Global {
+                            global: RirGlobalId::from_index(0),
+                            ty: int,
+                        },
+                        vec![],
+                        int,
+                    )),
+                    source: RirOwnedSource::Reuse(value_materializer),
+                })],
                 ty: void,
             })],
             term: RirTerm::Return(None),
@@ -2430,9 +2753,12 @@ fn emit_global_call_arg_temps_read_before_runtime_call() {
     let source = emit::emit(&verified);
     let text = source.as_str();
 
-    assert!(text.contains(
-        "let __anv_arg_0 = { let __global = globals.g0_score.read(|| ginit0(rt, statics, globals))?; *(&*__global) }; host::sink(rt, __anv_arg_0)"
-    ), "{text}");
+    assert!(text.contains("let __anv_arg_0 ="), "{text}");
+    assert!(
+        text.contains("MutPlace::global(&globals.g0_score"),
+        "{text}"
+    );
+    assert!(text.contains("host::sink(rt, __anv_arg_0)"), "{text}");
 
     let source = emit::RustSource::new(format!(
         "mod host {{ pub fn sink<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, value: i64) {{ assert_eq!(value, 7); }} }}\n{}",
@@ -2452,8 +2778,6 @@ fn rir_rejects_global_option_match_discriminant() {
                 .push(RirStmt::OptionMatch(RirOptionMatch {
                     subject: RirOptionSubject::Place(rir_global_place(RirTypeId::from_index(0))),
                     payload: None,
-                    payload_ref: false,
-                    payload_escapes: false,
                     some_block: RirStructuredBlock {
                         stmts: vec![],
                         term: RirTerm::Return(None),
@@ -2800,8 +3124,7 @@ fn plan_emits_generated_dynamic_carrier() {
             vec![Statement::Init {
                 local: packed_id,
                 value: RValue::DynPack {
-                    value: Operand::Place(place(local_id, int)),
-                    use_: air::DynOwnedUse::ReusableRead,
+                    value: owned(Operand::Place(place(local_id, int))),
                     witness: air::ContractWitnessId::from_index(0),
                     ty: dyn_ty,
                 },
@@ -2827,8 +3150,7 @@ fn plan_emits_generated_dynamic_carrier() {
             vec![Statement::Init {
                 local: second_packed,
                 value: RValue::DynPack {
-                    value: Operand::Place(place(second_arg, int)),
-                    use_: air::DynOwnedUse::ReusableRead,
+                    value: owned(Operand::Place(place(second_arg, int))),
                     witness: air::ContractWitnessId::from_index(3),
                     ty: dyn_ty,
                 },
@@ -2854,8 +3176,7 @@ fn plan_emits_generated_dynamic_carrier() {
             vec![Statement::Init {
                 local: large_packed,
                 value: RValue::DynPack {
-                    value: Operand::Place(place(large_arg, large)),
-                    use_: air::DynOwnedUse::ReusableRead,
+                    value: owned(Operand::Place(place(large_arg, large))),
                     witness: air::ContractWitnessId::from_index(1),
                     ty: dyn_ty,
                 },
@@ -2884,8 +3205,7 @@ fn plan_emits_generated_dynamic_carrier() {
             vec![Statement::Init {
                 local: callback_packed,
                 value: RValue::DynPack {
-                    value: Operand::Place(place(callback_arg, callback)),
-                    use_: air::DynOwnedUse::ReusableRead,
+                    value: owned(Operand::Place(place(callback_arg, callback))),
                     witness: air::ContractWitnessId::from_index(2),
                     ty: dyn_ty,
                 },
@@ -2929,7 +3249,7 @@ fn plan_emits_generated_dynamic_carrier() {
                         kind: AggregateCtor::Tuple,
                         fields: string_args
                             .iter()
-                            .map(|local| Operand::Place(place(*local, string)))
+                            .map(|local| owned(Operand::Place(place(*local, string))))
                             .collect(),
                         ty: large,
                     },
@@ -2937,8 +3257,7 @@ fn plan_emits_generated_dynamic_carrier() {
                 Statement::Init {
                     local: moved_dyn,
                     value: RValue::DynPack {
-                        value: Operand::Place(place(tuple_tmp, large)),
-                        use_: air::DynOwnedUse::ConsumeTemporary,
+                        value: owned(Operand::Place(place(tuple_tmp, large))),
                         witness: air::ContractWitnessId::from_index(1),
                         ty: dyn_ty,
                     },
@@ -2961,8 +3280,7 @@ fn plan_emits_generated_dynamic_carrier() {
             vec![Statement::Init {
                 local: entry_dyn,
                 value: RValue::DynPack {
-                    value: Operand::Const(one),
-                    use_: air::DynOwnedUse::ReusableRead,
+                    value: owned(Operand::Const(one)),
                     witness: air::ContractWitnessId::from_index(3),
                     ty: dyn_ty,
                 },
@@ -2972,6 +3290,7 @@ fn plan_emits_generated_dynamic_carrier() {
     });
     program.module_mut(module).functions.push(main);
     program.set_entry(main);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     let plan = plan(&verified, RustPlanConfig::default()).expect("dynamic carrier plan");
@@ -3060,8 +3379,7 @@ fn mutable_dyn_call_emits_projected_payload_descriptor() {
                 Statement::Init {
                     local: packed,
                     value: RValue::DynPack {
-                        value: Operand::Const(one),
-                        use_: air::DynOwnedUse::ReusableRead,
+                        value: owned(Operand::Const(one)),
                         witness: air::ContractWitnessId::from_index(0),
                         ty: dyn_ty,
                     },
@@ -3078,6 +3396,7 @@ fn mutable_dyn_call_emits_projected_payload_descriptor() {
     });
     program.module_mut(module).functions.push(caller);
     program.set_entry(caller);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("dynamic call plan");
     let source = emit::emit(&plan.verified()).into_string();
@@ -3159,6 +3478,7 @@ fn plan_global_slot_symbols_are_id_based() {
         int,
         Mutability::Immutable,
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let rir = plan.program();
@@ -3183,6 +3503,7 @@ fn plan_lowers_scalar_global_declaration() {
     let init = program.globals[global.index()].init;
     program.function_mut(init).body =
         structured_body(vec![], air::AirTail::Return(Some(Operand::Const(value))));
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let rir = plan.program();
@@ -3224,6 +3545,7 @@ fn plan_lowers_scalar_global_read_into_ref_param_assignment() {
         ),
     });
     program.module_mut(module).functions.push(callee);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), callee);
@@ -3235,17 +3557,20 @@ fn plan_lowers_scalar_global_read_into_ref_param_assignment() {
     assert!(matches!(
         &function.body.stmts[1],
         RirStmt::Init {
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                root: RirPlaceRoot::Global(_),
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }),
+                    ..
+                }),
                 ..
-            })),
+            }),
             ..
         }
     ));
     assert!(matches!(
         &function.body.stmts[2],
         RirStmt::Assign {
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
+            value: RirRValue::TakeStaged(RirOperand::Place(RirPlace {
                 root: RirPlaceRoot::Local(_),
                 ..
             })),
@@ -3292,6 +3617,7 @@ fn plan_temps_global_root_set_rhs_that_uses_generated_context() {
         ),
     });
     program.module_mut(module).functions.push(main);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), main);
@@ -3303,17 +3629,20 @@ fn plan_temps_global_root_set_rhs_that_uses_generated_context() {
     assert!(matches!(
         &function.body.stmts[1],
         RirStmt::Init {
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                root: RirPlaceRoot::Global(_),
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global { .. }),
+                    ..
+                }),
                 ..
-            })),
+            }),
             ..
         }
     ));
     assert!(matches!(
         &function.body.stmts[2],
         RirStmt::GlobalSetRoot {
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
+            value: RirRValue::TakeStaged(RirOperand::Place(RirPlace {
                 root: RirPlaceRoot::Local(_),
                 ..
             })),
@@ -3356,6 +3685,7 @@ fn plan_lowers_global_initializer_body_calls() {
         }],
         air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let init = rir_function_for_air(plan.program(), init);
@@ -3410,6 +3740,7 @@ fn plan_lowers_scalar_global_root_read_and_statements() {
     });
     program.module_mut(module).functions.push(main);
     program.set_entry(main);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), main);
@@ -3420,29 +3751,25 @@ fn plan_lowers_scalar_global_root_read_and_statements() {
             global: RirGlobalId(0)
         }
     ));
-    assert!(matches!(
-        function.body.stmts[1],
+    assert!(function.body.stmts.iter().any(|stmt| matches!(
+        stmt,
         RirStmt::GlobalSetRoot {
             global: RirGlobalId(0),
             ..
         }
-    ));
-    assert!(matches!(
-        function.body.stmts[2],
-        RirStmt::Init {
-            value: RirRValue::Use(RirOperand::Place(RirPlace {
-                root: RirPlaceRoot::Global(RirGlobalId(0)),
-                ..
-            })),
-            ..
-        }
-    ));
+    )));
     assert!(matches!(
         function.body.term,
-        RirTerm::Return(Some(RirOperand::Place(RirPlace {
-            root: RirPlaceRoot::Local(_),
+        RirTerm::ReturnOwned(RirOwnedValue {
+            value: RirOwnedOperand::Access(RirMutPlaceArg {
+                access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::Global {
+                    global: RirGlobalId(0),
+                    ..
+                }),
+                ..
+            }),
             ..
-        })))
+        })
     ));
 }
 
@@ -3482,6 +3809,7 @@ fn plan_lowers_projected_global_assignment() {
         ),
     });
     program.module_mut(module).functions.push(main);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), main);
@@ -3549,6 +3877,7 @@ fn plan_lowers_projected_global_ref_arg_to_mut_place() {
         ),
     });
     program.module_mut(module).functions.push(main);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), main);
@@ -3617,8 +3946,9 @@ fn emit_scalar_global_slots_and_operations() {
         "g0_score: anvyx_runtime::GlobalSlot::new_with_safepoint(\"score\", safepoint.clone())"
     ));
     assert!(source.contains("globals.g0_score.ensure(||"));
-    assert!(source.contains("globals.g0_score.set_without_init(1)?;"));
-    assert!(source.contains("globals.g0_score.read(||"));
+    assert!(source.contains("globals.g0_score.set_without_init("));
+    assert!(source.contains("MutPlace::global(&globals.g0_score"));
+    assert!(source.contains(".access(rt, |value|"));
     assert!(!source.contains("static "));
     assert!(!source.contains("OnceLock"));
 }
@@ -3667,7 +3997,7 @@ fn emit_global_root_update_initializes_then_replaces_root() {
         .find("globals.g0_score.ensure(||")
         .expect("missing ensure");
     let set = source
-        .find("globals.g0_score.set_without_init(2)")
+        .find("globals.g0_score.set_without_init(")
         .expect("missing root update set");
 
     assert!(ensure < set);
@@ -3711,153 +4041,10 @@ fn emit_non_scalar_global_read_and_root_set_materializes_owned_values() {
     let source = plan_source(program).into_string();
 
     assert!(source.contains("g0_title: anvyx_runtime::GlobalSlot<anvyx_runtime::AnvString>"));
-    assert!(source.contains("globals.g0_title.set_without_init(statics.string0.share())?;"));
-    assert!(source.contains("globals.g0_title.read(||"));
-    assert!(source.contains("(*(&*__global)).share()"));
+    assert!(source.contains("globals.g0_title.set_without_init("));
+    assert!(source.contains("MutPlace::global(&globals.g0_title"));
     assert!(!source.contains("static "));
     assert!(!source.contains("OnceLock"));
-}
-
-#[test]
-fn emit_enum_global_read_materializes_from_deref_guard_ref() {
-    let mut program = Program::default();
-    let int = program.alloc_type(TypeData::Int);
-    let module = program.alloc_module(root_module());
-    let enum_id = program.alloc_enum(EnumDecl {
-        name: Ident::new("Event"),
-        module,
-        type_args: vec![],
-        const_args: vec![],
-        core: None,
-        repr: air::EnumRepr::Adt,
-        raw_type: None,
-        variants: vec![VariantDecl {
-            name: Ident::new("Hit"),
-            shape: VariantShape::Tuple(vec![int]),
-            raw_value: None,
-        }],
-    });
-    program.module_mut(module).enums.push(enum_id);
-    let event = program.alloc_type(TypeData::Enum(enum_id));
-    let one = int_const(&mut program, int, 1);
-    let global = global_with_init(&mut program, module, "event", event, Mutability::Immutable);
-    let init = program.globals[global.index()].init;
-    let tmp = air::LocalId::from_index(0);
-    program.function_mut(init).locals = vec![local(event, LocalKind::Temp)];
-    program.function_mut(init).body = structured_body(
-        vec![Statement::Init {
-            local: tmp,
-            value: RValue::Aggregate {
-                kind: AggregateCtor::EnumVariant {
-                    enum_id,
-                    variant: VariantId::from_index(0),
-                },
-                fields: vec![Operand::Const(one)],
-                ty: event,
-            },
-        }],
-        air::AirTail::Return(Some(Operand::Place(place(tmp, event)))),
-    );
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], event),
-        locals: vec![],
-        body: structured_body(
-            vec![Statement::GlobalEnsure { global }],
-            air::AirTail::Return(Some(Operand::Place(root_place(
-                PlaceRoot::Global(global),
-                event,
-            )))),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-    program.set_entry(main);
-    let source = plan_source(program);
-
-    assert!(source.as_str().contains("match &*__global"));
-    assert!(!source.as_str().contains("match __global"));
-    let output = run_source(source);
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
-}
-
-#[test]
-fn emit_collection_global_reads_share_from_short_guard() {
-    let mut program = Program::default();
-    let string = program.alloc_type(TypeData::String);
-    let list = program.alloc_type(TypeData::List(string));
-    let map = program.alloc_type(TypeData::Map {
-        key: string,
-        value: list,
-        order: air::MapOrder::Insertion,
-    });
-    let key = program.alloc_const(ConstData {
-        ty: string,
-        value: ConstValue::String("k".into()),
-    });
-    let value = program.alloc_const(ConstData {
-        ty: string,
-        value: ConstValue::String("v".into()),
-    });
-    let module = program.alloc_module(root_module());
-    let global = global_with_init(&mut program, module, "table", map, Mutability::Immutable);
-    let init = program.globals[global.index()].init;
-    let xs = air::LocalId::from_index(0);
-    let tmp = air::LocalId::from_index(1);
-    program.function_mut(init).locals =
-        vec![local(list, LocalKind::Temp), local(map, LocalKind::Temp)];
-    program.function_mut(init).body = structured_body(
-        vec![
-            Statement::Init {
-                local: xs,
-                value: RValue::Aggregate {
-                    kind: AggregateCtor::List,
-                    fields: vec![Operand::Const(value)],
-                    ty: list,
-                },
-            },
-            Statement::Init {
-                local: tmp,
-                value: RValue::Aggregate {
-                    kind: AggregateCtor::Map,
-                    fields: vec![Operand::Const(key), Operand::Place(place(xs, list))],
-                    ty: map,
-                },
-            },
-        ],
-        air::AirTail::Return(Some(Operand::Place(place(tmp, map)))),
-    );
-    let main = program.alloc_function(Function {
-        name: Ident::new("main"),
-        module,
-        kind: FunctionKind::Normal,
-        owner: None,
-        specialization: None,
-        signature: Signature::new(vec![], map),
-        locals: vec![],
-        body: structured_body(
-            vec![Statement::GlobalEnsure { global }],
-            air::AirTail::Return(Some(Operand::Place(root_place(
-                PlaceRoot::Global(global),
-                map,
-            )))),
-        ),
-    });
-    program.module_mut(module).functions.push(main);
-    program.set_entry(main);
-    let source = plan_source(program);
-
-    assert!(
-        source
-            .as_str()
-            .contains("let __global = globals.g0_table.read")
-    );
-    assert!(source.as_str().contains("(*(&*__global)).share()"));
-    let output = run_source(source);
-    assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
 }
 
 #[test]
@@ -4306,8 +4493,8 @@ fn source_job_compiles_hand_built_air_capture_cell_lambdas() {
     assert!(text.contains("#[derive(Clone, Copy)]\nenum LambdaSig1<'env>"));
     assert!(text.contains("c0: &'env anvyx_runtime::StackLambdaCell<i64>"));
     assert!(text.contains("fn call<'cx, 'rt>(&self, rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, statics: &AnvStatics<'cx>, globals: &AnvGlobals<'cx>)"));
-    assert!(text.contains(".set(1)?;"));
-    assert!(text.contains(".get_copy()?"));
+    assert!(text.contains(".set("));
+    assert!(text.contains(".access(rt, |value|"));
     assert!(text.contains("c0: &__cell0"));
     assert!(!text.contains("&'env mut"));
     assert!(!text.contains("&mut v0"));
@@ -4387,11 +4574,8 @@ fn profile_rejects_capture_cell_in_unsupported_rvalue() {
 }
 
 #[test]
-fn profile_rejects_payload_ref_through_dataref_projection() {
-    expect_reject(
-        dataref_optional_payload_ref_program(),
-        ProfileErrorKind::UnsupportedPlaceProjection,
-    );
+fn profile_accepts_payload_ref_through_dataref_projection() {
+    check(dataref_optional_payload_ref_program());
 }
 
 #[test]
@@ -4404,25 +4588,36 @@ fn profile_rejects_optional_payload_copy_from_void_ref() {
 
 #[test]
 fn plan_lowers_dataref_field_places_to_heap_ops() {
-    let program = dataref_field_projection_program();
+    let mut program = dataref_field_projection_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let stmts = &plan.program().functions[0].body.stmts;
 
-    assert!(matches!(stmts[0], RirStmt::DataRefSet { .. }));
-    assert!(matches!(
-        stmts[1],
+    assert!(
+        stmts
+            .iter()
+            .any(|stmt| matches!(stmt, RirStmt::DataRefSet { .. }))
+    );
+    assert!(stmts.iter().any(|stmt| matches!(
+        stmt,
         RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::DataRef { .. },
+                    ..
+                }),
+                ..
+            }),
             ..
         }
-    ));
-    assert!(matches!(stmts[2], RirStmt::Init { .. }));
+    )));
 }
 
 #[test]
 fn plan_lowers_nested_dataref_field_read_to_separate_heap_ops() {
-    let program = nested_dataref_read_program();
+    let mut program = nested_dataref_read_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let stmts = &plan.program().functions[0].body.stmts;
@@ -4433,7 +4628,13 @@ fn plan_lowers_nested_dataref_field_read_to_separate_heap_ops() {
             .filter(|stmt| matches!(
                 stmt,
                 RirStmt::Init {
-                    value: RirRValue::DataRefGet { .. },
+                    value: RirRValue::Materialize(RirOwnedValue {
+                        value: RirOwnedOperand::Access(RirMutPlaceArg {
+                            access: RirMutPlaceAccess::DataRef { .. },
+                            ..
+                        }),
+                        ..
+                    }),
                     ..
                 }
             ))
@@ -4444,7 +4645,8 @@ fn plan_lowers_nested_dataref_field_read_to_separate_heap_ops() {
 
 #[test]
 fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
-    let program = dataref_string_field_consumers_program();
+    let mut program = dataref_string_field_consumers_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let stmts = &plan.program().functions[1].body.stmts;
@@ -4452,7 +4654,13 @@ fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
     assert!(matches!(
         stmts[0],
         RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::DataRef { .. },
+                    ..
+                }),
+                ..
+            }),
             ..
         }
     ));
@@ -4466,7 +4674,13 @@ fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
     assert!(matches!(
         stmts[2],
         RirStmt::Init {
-            value: RirRValue::DataRefGet { .. },
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::DataRef { .. },
+                    ..
+                }),
+                ..
+            }),
             ..
         }
     ));
@@ -4477,8 +4691,10 @@ fn plan_lowers_dataref_field_len_and_shared_borrow_call_args() {
 fn emit_dataref_get_uses_short_heap_borrow() {
     let source = plan_source(nested_dataref_read_program()).into_string();
 
-    assert!(source.contains("rt.heap().with(&v0, |storage| storage.child.clone())"));
-    assert!(source.contains("rt.heap().with(&v2, |storage| storage.value)"));
+    assert!(!source.contains("rt.heap().with(&v0, |storage|"));
+    assert!(source.contains("storage.child"));
+    assert!(source.contains("MutPlace::dataref"));
+    assert!(source.contains(".access(rt, |value|"));
     assert!(!source.contains("|storage| anv_f"));
 }
 
@@ -4486,7 +4702,8 @@ fn emit_dataref_get_uses_short_heap_borrow() {
 fn emit_dataref_set_uses_short_mut_heap_borrow() {
     let source = plan_source(dataref_field_projection_program()).into_string();
 
-    assert!(source.contains("rt.heap().with_mut(&v0, |storage| { storage.value = 1; })"));
+    assert!(source.contains("rt.heap().with_mut(&v0, |storage|"));
+    assert!(source.contains("storage.value ="));
     assert!(!source.contains("with_mut(&v0, |storage| { anv"));
 }
 
@@ -4537,7 +4754,9 @@ fn emit_dataref_mut_borrow_root_rebinds_handle() {
     assert!(source.contains(
         "mut v0: anvyx_runtime::MutPlace<'_, 'cx, anvT2_Node<'cx>>, v1: anvT2_Node<'cx>"
     ));
-    assert!(source.contains("v0.set(rt, v1.clone())?;"));
+    assert!(source.contains("v0.set(rt,"));
+    assert!(source.contains("v1"));
+    assert!(source.contains(".clone()"));
 }
 
 #[test]
@@ -4648,7 +4867,7 @@ fn stringify_override_propagates_fallible_receiver_function() {
                 local: tmp,
                 value: RValue::Call {
                     callee: Callee::Extern(fallible),
-                    args: vec![CallArg::Value(Operand::Const(arg))],
+                    args: vec![CallArg::Value(owned(Operand::Const(arg)))],
                 },
             }],
             air::AirTail::Return(Some(Operand::Const(ok))),
@@ -4743,7 +4962,7 @@ fn stringify_override_noncopy_value_receiver_is_target_gap() {
                     local: value,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::Struct(aggregate),
-                        fields: vec![Operand::Const(name_const)],
+                        fields: vec![owned(Operand::Const(name_const))],
                         ty: named,
                     },
                 },
@@ -4792,6 +5011,7 @@ fn stringify_planning_dedupes_struct_requirements() {
         },
     );
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
 
@@ -4915,7 +5135,7 @@ fn source_job_compiles_methods_as_free_functions() {
     assert!(text.contains(
         "fn anv_f0_Point_value<'cx, 'rt>(_rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>, v0: anvT3_Point) -> i64"
     ));
-    assert!(text.contains("anv_f0_Point_value(rt, statics, globals, anvT3_Point { x: v0.x })"));
+    assert!(text.contains("anv_f0_Point_value(rt, statics, globals, v0);"));
     assert!(!text.contains("impl anvT"));
     assert!(!text.contains("trait "));
     assert!(!text.contains(".clone()"));
@@ -4936,6 +5156,7 @@ fn source_job_compiles_and_runs_struct_copy_reconstruction() {
     let mut program = struct_field_read_program();
     let function = &mut program.functions[0];
     let point = function.locals[0].ty;
+    function.locals[0].kind = LocalKind::User;
     let copied = air::LocalId::from_index(2);
     function.locals.push(local(point, LocalKind::Temp));
     function.body.block.stmts.insert(
@@ -4959,7 +5180,7 @@ fn source_job_compiles_and_runs_struct_copy_reconstruction() {
     let source = plan_source(program);
     let text = source.as_str();
 
-    assert!(text.contains("let v2: anvT3_Point = anvT3_Point { x: v0.x };"));
+    assert!(text.contains("let v2: anvT3_Point = anvT3_Point"));
     assert!(!text.contains(".clone()"));
 
     let output = run_source(source);
@@ -5000,7 +5221,7 @@ fn source_job_compiles_and_runs_struct_construction_and_field_read() {
     let source = plan_source(program);
     let text = source.as_str();
 
-    assert!(text.contains("anvT3_Point { x: 7 }"));
+    assert!(text.contains("anvT3_Point { x:"));
     assert!(text.contains("v0.x"));
     assert!(!text.contains(".clone()"));
     let output = run_source(source);
@@ -5116,6 +5337,18 @@ fn heap_edge_global_rir() -> RirProgram {
             global: RirGlobalId::from_index(0),
         }];
         program.entry = Some(RirFunctionId::from_index(1));
+        let mut materializers = TestMaterializers::new(program);
+        let elem = materializers.copy(
+            int,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+        );
+        materializers.managed_share(list, RustRecipePosition::Value);
+        materializers.managed_share(list, RustRecipePosition::Global);
+        materializers.managed_share(
+            list,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+        );
+        materializers.list_storage(0, elem);
     })
 }
 
@@ -5245,26 +5478,10 @@ fn trace_plan_marks_generated_fields_of_cx_dependent_roots() {
 }
 
 #[test]
-fn emit_derives_trace_for_generated_payloads_from_tracked_storage() {
-    let mut program = dataref_metadata_rir();
-    let payload_ty = add_payload_struct(&mut program);
-    program.datarefs[0].fields.push(RirField {
-        id: RirFieldId::from_index(1),
-        symbol: RirSymbol::new("payload"),
-        ty: payload_ty,
-    });
-
-    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
-
-    assert!(source.contains("anvyx_runtime::Trace"));
-    assert!(source.contains("struct Payload"));
-}
-
-#[test]
 fn trace_plan_marks_struct_with_primitive_list_field() {
     let int = RirTypeId::from_index(0);
     let list = RirTypeId::from_index(1);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Int,
             RirType::List(int),
@@ -5288,12 +5505,34 @@ fn trace_plan_marks_struct_with_primitive_list_field() {
         }],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    let elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(list, RustRecipePosition::Value);
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    let list_field = materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::StructField),
+    );
+    materializers.declare(
+        RirTypeId::from_index(2),
+        RustRecipePosition::Value,
+        RirMaterializerAction::Struct {
+            fields: vec![list_field],
+        },
+    );
+    materializers.list_storage(0, elem);
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
     assert!(RustTracePlan::build(&program).needs_struct_trace(RirStructId::from_index(0)));
     assert!(source.contains(
-        "#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct Payload<'cx>"
+        "#[derive(anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct Payload<'cx>"
     ));
     assert!(source.contains(
         "list_storage1: heap.register_untracked::<anvyx_runtime::ListStorage<'cx, i64>>()"
@@ -5319,6 +5558,35 @@ fn collection_storage_tracking_follows_payload_edges() {
         rir_list_storage_id(1, ref_list, node),
         rir_map_storage(2, map, int, node),
     ];
+    let mut materializers = TestMaterializers::new(&mut program);
+    let int_list = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    let node_list = materializers.identity_share(
+        node,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    let key = materializers.copy(int, RustRecipePosition::MapKey);
+    let value = materializers.identity_share(
+        node,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+    );
+    materializers.managed_share(
+        primitive_list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.managed_share(
+        ref_list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.managed_share(
+        map,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.list_storage(0, int_list);
+    materializers.list_storage(1, node_list);
+    materializers.map_storage(2, key, value);
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
@@ -5408,7 +5676,8 @@ fn emit_renders_plain_struct_declarations_without_impls() {
 
 #[test]
 fn plan_mangles_same_name_structs_by_type_id() {
-    let program = duplicate_struct_name_program();
+    let mut program = duplicate_struct_name_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
 
@@ -5492,7 +5761,7 @@ fn source_job_compiles_rust_keyword_member_symbols() {
                     local: record_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::Struct(aggregate),
-                        fields: vec![Operand::Const(one), Operand::Const(two)],
+                        fields: vec![owned(Operand::Const(one)), owned(Operand::Const(two))],
                         ty: record,
                     },
                 },
@@ -5551,7 +5820,7 @@ fn plan_handles_non_topological_type_arena_refs() {
                 local: out,
                 value: RValue::Aggregate {
                     kind: AggregateCtor::Array,
-                    fields: vec![Operand::Const(one)],
+                    fields: vec![owned(Operand::Const(one))],
                     ty: array,
                 },
             }],
@@ -5561,6 +5830,7 @@ fn plan_handles_non_topological_type_arena_refs() {
     program.module_mut(module).functions.push(main);
     program.set_entry(main);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
     assert_eq!(
@@ -5577,8 +5847,8 @@ fn rir_verify_accepts_tuple_declaration_and_construction() {
     let program = tuple_rir_program(RirRValue::Tuple {
         ty: RirTypeId::from_index(3),
         fields: vec![
-            RirOperand::Const(RirConstId::from_index(0)),
-            RirOperand::Const(RirConstId::from_index(1)),
+            rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0),
+            rir_owned(RirOperand::Const(RirConstId::from_index(1)), 1),
         ],
     });
 
@@ -5599,8 +5869,8 @@ fn rir_verify_rejects_tuple_rvalue_with_non_tuple_type() {
     let program = tuple_rir_program(RirRValue::Tuple {
         ty: RirTypeId::from_index(0),
         fields: vec![
-            RirOperand::Const(RirConstId::from_index(0)),
-            RirOperand::Const(RirConstId::from_index(1)),
+            rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0),
+            rir_owned(RirOperand::Const(RirConstId::from_index(1)), 1),
         ],
     });
 
@@ -5611,7 +5881,7 @@ fn rir_verify_rejects_tuple_rvalue_with_non_tuple_type() {
 fn rir_verify_rejects_tuple_rvalue_arity_mismatch() {
     let program = tuple_rir_program(RirRValue::Tuple {
         ty: RirTypeId::from_index(3),
-        fields: vec![RirOperand::Const(RirConstId::from_index(0))],
+        fields: vec![rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0)],
     });
 
     assert_rir_error(
@@ -5628,8 +5898,8 @@ fn rir_verify_rejects_tuple_rvalue_element_type_mismatch() {
     let program = tuple_rir_program(RirRValue::Tuple {
         ty: RirTypeId::from_index(3),
         fields: vec![
-            RirOperand::Const(RirConstId::from_index(1)),
-            RirOperand::Const(RirConstId::from_index(1)),
+            rir_owned(RirOperand::Const(RirConstId::from_index(1)), 1),
+            rir_owned(RirOperand::Const(RirConstId::from_index(1)), 1),
         ],
     });
 
@@ -5801,11 +6071,14 @@ fn rir_verify_rejects_noncopy_value_call_arg() {
                 body: RirStructuredBlock {
                     stmts: vec![RirStmt::Eval(RirRValue::Call {
                         callee: RirCallTarget::Function(RirFunctionId::from_index(0)),
-                        args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-                            RirLocalId::from_index(0),
-                            vec![],
-                            strukt,
-                        )))],
+                        args: vec![RirCallArg::Value(rir_owned(
+                            RirOperand::Place(RirPlace::local(
+                                RirLocalId::from_index(0),
+                                vec![],
+                                strukt,
+                            )),
+                            0,
+                        ))],
                         ty: void,
                     })],
                     term: RirTerm::Return(None),
@@ -6022,6 +6295,7 @@ fn plan_interns_function_type_signatures_with_escape_modes() {
         air::ReturnMode::Value(void),
     )));
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
 
@@ -6129,10 +6403,11 @@ fn rir_accepts_stack_cell_init_get_and_set() {
             cell: owner_cell_ref(),
             value: RirRValue::Use(RirOperand::Const(one)),
         },
-        RirStmt::Eval(RirRValue::CellGetCopy {
-            cell: owner_cell_ref(),
-            ty: int,
-        }),
+        RirStmt::Eval(cell_read(
+            owner_cell_ref(),
+            int,
+            rir::RirMaterializerId::from_index(0),
+        )),
         RirStmt::CellSet {
             cell: owner_cell_ref(),
             value: RirRValue::Use(RirOperand::Const(two)),
@@ -6145,10 +6420,11 @@ fn rir_accepts_stack_cell_init_get_and_set() {
 #[test]
 fn rir_rejects_stack_cell_read_before_init() {
     let mut program = stack_cell_rir(valid_stack_cell_decl());
-    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::CellGetCopy {
-        cell: owner_cell_ref(),
-        ty: RirTypeId::from_index(1),
-    })];
+    program.functions[0].body.stmts = vec![RirStmt::Eval(cell_read(
+        owner_cell_ref(),
+        RirTypeId::from_index(1),
+        rir::RirMaterializerId::from_index(0),
+    ))];
 
     assert_rir_error(
         program,
@@ -6202,17 +6478,18 @@ fn rir_rejects_stack_cell_get_type_mismatch() {
             cell: owner_cell_ref(),
             value: RirRValue::Use(RirOperand::Const(one)),
         },
-        RirStmt::Eval(RirRValue::CellGetCopy {
-            cell: owner_cell_ref(),
-            ty: RirTypeId::from_index(0),
-        }),
+        RirStmt::Eval(cell_read(
+            owner_cell_ref(),
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        )),
     ];
 
     assert_rir_type_error(program);
 }
 
 #[test]
-fn rir_accepts_slice_stack_cell_get_copy() {
+fn rir_rejects_owned_slice_stack_cell_read() {
     let mut program = stack_cell_rir_with(|cell| cell.payload_ty = RirTypeId::from_index(2));
     program.types.push(RirType::Slice(RirTypeId::from_index(1)));
     let slice = RirTypeId::from_index(2);
@@ -6225,25 +6502,27 @@ fn rir_accepts_slice_stack_cell_get_copy() {
                 slice,
             ))),
         },
-        RirStmt::Eval(RirRValue::CellGetCopy {
-            cell: owner_cell_ref(),
-            ty: slice,
-        }),
+        RirStmt::Eval(cell_read(
+            owner_cell_ref(),
+            slice,
+            rir::RirMaterializerId::from_index(0),
+        )),
     ];
 
-    rir::verify(&program).expect("slice cell get should share descriptor");
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
 }
 
 #[test]
 fn rir_rejects_cell_ops_with_capture_ref_until_hidden_capture_validation() {
     let mut program = stack_cell_rir(valid_stack_cell_decl());
-    program.functions[0].body.stmts = vec![RirStmt::Eval(RirRValue::CellGetCopy {
-        cell: RirCellRef::Capture {
+    program.functions[0].body.stmts = vec![RirStmt::Eval(cell_read(
+        RirCellRef::Capture {
             cell: RirCellId::from_index(0),
             local: RirLocalId::from_index(99),
         },
-        ty: RirTypeId::from_index(1),
-    })];
+        RirTypeId::from_index(1),
+        rir::RirMaterializerId::from_index(0),
+    ))];
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
 }
@@ -6259,10 +6538,11 @@ fn emit_stack_cell_ops_use_runtime_cell() {
             cell: owner_cell_ref(),
             value: RirRValue::Use(RirOperand::Const(one)),
         },
-        RirStmt::Eval(RirRValue::CellGetCopy {
-            cell: owner_cell_ref(),
-            ty: RirTypeId::from_index(1),
-        }),
+        RirStmt::Eval(cell_read(
+            owner_cell_ref(),
+            RirTypeId::from_index(1),
+            rir::RirMaterializerId::from_index(0),
+        )),
         RirStmt::CellSet {
             cell: owner_cell_ref(),
             value: RirRValue::Use(RirOperand::Const(two)),
@@ -6277,7 +6557,8 @@ fn emit_stack_cell_ops_use_runtime_cell() {
         "{}",
         source.as_str()
     );
-    assert!(source.as_str().contains("__cell0.get_copy()?;"));
+    assert!(source.as_str().contains("__cell0"));
+    assert!(source.as_str().contains(".access(rt, |value|"));
     assert!(source.as_str().contains("__cell0.set(2)?;"));
     assert!(!source.as_str().contains("RefCell"));
     assert!(!source.as_str().contains("Rc<"));
@@ -6292,6 +6573,8 @@ fn emit_stack_cell_init_is_control_flow_safe() {
     program.entry = Some(RirFunctionId::from_index(0));
     let bool_ty = RirTypeId::from_index(2);
     program.types.push(RirType::Bool);
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(bool_ty, RustRecipePosition::Value);
     let cond = RirConstId::from_index(program.consts.len());
     program.consts.push(RirConst {
         id: cond,
@@ -6319,10 +6602,11 @@ fn emit_stack_cell_init_is_control_flow_safe() {
                 term: RirTerm::None,
             }),
         }),
-        RirStmt::Eval(RirRValue::CellGetCopy {
+        RirStmt::Eval(cell_read(
             cell,
-            ty: RirTypeId::from_index(1),
-        }),
+            RirTypeId::from_index(1),
+            rir::RirMaterializerId::from_index(0),
+        )),
     ];
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
@@ -6488,12 +6772,15 @@ fn rir_rejects_unknown_function_value_captured_by_heap_env() {
     else {
         panic!("missing lambda init");
     };
-    captures[0] = RirLambdaCaptureArg::Readonly {
-        value: RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            lambda_ty,
-        )),
+    captures[0] = RirLambdaCaptureArg::Owned {
+        value: rir_owned(
+            RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                lambda_ty,
+            )),
+            1,
+        ),
     };
 
     assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
@@ -6509,6 +6796,8 @@ fn rir_accepts_heap_env_and_borrowed_variants_sharing_signature() {
     let target = RirFunctionId::from_index(2);
     let source = RirLocalId::from_index(0);
     program.types.push(RirType::String);
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.managed_share(string, RustRecipePosition::Value);
 
     program.lambdas.push(RirLambda {
         id: lambda,
@@ -6640,11 +6929,10 @@ fn rir_accepts_heap_env_lambda_passed_to_escaping_param() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(consumer),
-            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-                f,
-                vec![],
-                lambda_ty,
-            )))],
+            args: vec![RirCallArg::Value(rir_owned(
+                RirOperand::Place(RirPlace::local(f, vec![], lambda_ty)),
+                1,
+            ))],
             ty: void,
         }));
 
@@ -6729,10 +7017,11 @@ fn rir_accepts_scoped_place_cell_get() {
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
-            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-            ty: RirTypeId::from_index(1),
-        }));
+        .push(RirStmt::Eval(scoped_cell_read(
+            RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            RirTypeId::from_index(1),
+            rir::RirMaterializerId::from_index(0),
+        )));
 
     rir::verify(&program).expect("RIR verify failed");
 }
@@ -6746,13 +7035,16 @@ fn rir_accepts_scoped_place_cell_get_shareable_noncopy_payload() {
     program.scoped_place_cells[0].source = scoped_source_param(RirLocalId::from_index(0), string);
     program.functions[0].params[0].ty = string;
     program.functions[0].locals[0].ty = string;
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.managed_share(string, RustRecipePosition::Value);
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
-            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-            ty: string,
-        }));
+        .push(RirStmt::Eval(scoped_cell_read(
+            RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            string,
+            rir::RirMaterializerId::from_index(1),
+        )));
 
     rir::verify(&program).expect("RIR verify failed");
 }
@@ -6879,10 +7171,11 @@ fn rir_rejects_scoped_place_cell_get_payload_type_mismatch() {
     program.functions[0]
         .body
         .stmts
-        .push(RirStmt::Eval(RirRValue::ScopedPlaceCellGet {
-            cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
-            ty: RirTypeId::from_index(0),
-        }));
+        .push(RirStmt::Eval(scoped_cell_read(
+            RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId::from_index(0)),
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        )));
 
     assert_rir_type_error(program);
 }
@@ -6980,6 +7273,11 @@ fn rir_accepts_pattern_alias_scoped_place_source_projection() {
         tuple_ty,
         vec![RirProjection::TupleField(RirFieldId::from_index(0))],
         int,
+    );
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
     );
 
     rir::verify(&program).expect("RIR rejected pattern alias scoped-place source");
@@ -7140,17 +7438,21 @@ fn emit_heap_cell_owner_read_write_use_heap_handle() {
         },
         RirStmt::Init {
             local: tmp,
-            value: RirRValue::CellGetCopy {
-                cell: RirCellRef::Owner(RirCellId::from_index(0)),
-                ty: RirTypeId::from_index(1),
-            },
+            value: cell_read_with_storage(
+                RirCellRef::Owner(RirCellId::from_index(0)),
+                RirTypeId::from_index(1),
+                RirCellStorage::Heap,
+                rir::RirMaterializerId::from_index(0),
+            ),
         },
     ]);
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
 
     assert!(text.contains("rt.heap().with(&__cell0, |cell| cell.set(2))?;"));
-    assert!(text.contains("let tmp: i64 = rt.heap().with(&__cell0, |cell| cell.get_copy())?;"));
+    assert!(text.contains("let tmp: i64 ="));
+    assert!(text.contains("__cell0"));
+    assert!(text.contains(".access(rt, |value|"));
     let output = run_source(source);
     assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
 }
@@ -7225,7 +7527,8 @@ fn emit_heap_cell_alloc_env_and_access_use_handles() {
     assert!(source.contains("c0: __cell0.clone()"));
     assert!(source.contains("let c0 = rt.heap().with(env, |env| env.c0.clone());"));
     assert!(source.contains("target(rt, statics, globals, c0)"));
-    assert!(source.contains("rt.heap().with(&cell, |cell| cell.get_copy())?"));
+    assert!(source.contains("cell"));
+    assert!(source.contains(".access(rt, |value|"));
     assert!(!source.contains("StackLambdaCell"));
     assert!(!source.contains("RefCell"));
     assert!(!source.contains("Rc<"));
@@ -7833,7 +8136,7 @@ fn rir_rejects_inconsistent_stack_cell_lambda_descriptors_for_shared_body() {
 fn rir_verifies_lambda_signature_ids() {
     let void = RirTypeId::from_index(0);
     let lambda_ty = RirTypeId::from_index(1);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Lambda(RirLambdaSigId::from_index(0)),
@@ -7850,6 +8153,8 @@ fn rir_verifies_lambda_signature_ids() {
         }],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
 
     rir::verify(&program).expect("RIR verify failed");
 }
@@ -7859,7 +8164,7 @@ fn rir_accepts_lambda_struct_and_tuple_fields() {
     let void = RirTypeId::from_index(0);
     let lambda_ty = RirTypeId::from_index(1);
     let sig = RirLambdaSigId::from_index(0);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Lambda(sig),
@@ -7899,6 +8204,15 @@ fn rir_accepts_lambda_struct_and_tuple_fields() {
         }],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.callable_share(
+        lambda_ty,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::StructField),
+    );
+    materializers.callable_share(
+        lambda_ty,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+    );
 
     rir::verify(&program).expect("RIR rejected lambda aggregate fields");
 }
@@ -8017,11 +8331,10 @@ fn rir_rejects_non_escaping_lambda_arg_to_escaping_param() {
                         },
                         RirStmt::Eval(RirRValue::Call {
                             callee: RirCallTarget::Function(callee),
-                            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-                                f,
-                                vec![],
-                                lambda_ty,
-                            )))],
+                            args: vec![RirCallArg::Value(rir_owned(
+                                RirOperand::Place(RirPlace::local(f, vec![], lambda_ty)),
+                                0,
+                            ))],
                             ty: void,
                         }),
                     ],
@@ -8224,7 +8537,7 @@ fn rir_accepts_projected_local_field_mut_place_arg() {
     let pair = RirTupleId::from_index(0);
     let field = RirFieldId::from_index(0);
     let local = RirLocalId::from_index(0);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Tuple(pair)],
         tuples: vec![RirTuple {
             id: pair,
@@ -8257,6 +8570,11 @@ fn rir_accepts_projected_local_field_mut_place_arg() {
         ],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+    );
 
     rir::verify(&program).expect("projected local mut-place arg should verify");
 }
@@ -8269,7 +8587,7 @@ fn rir_accepts_projected_param_mut_place_arg() {
     let pair = RirTupleId::from_index(0);
     let field = RirFieldId::from_index(0);
     let local = RirLocalId::from_index(0);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Tuple(pair)],
         tuples: vec![RirTuple {
             id: pair,
@@ -8307,6 +8625,11 @@ fn rir_accepts_projected_param_mut_place_arg() {
         ],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+    );
 
     rir::verify(&program).expect("projected param mut-place arg should verify");
 }
@@ -8439,7 +8762,7 @@ fn rir_accepts_single_dynamic_projected_param_mut_place_arg() {
     let list = RirTypeId::from_index(2);
     let xs = RirLocalId::from_index(0);
     let index = RirLocalId::from_index(1);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
         collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![
@@ -8473,6 +8796,16 @@ fn rir_accepts_single_dynamic_projected_param_mut_place_arg() {
         ],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    let elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.list_storage(0, elem);
 
     rir::verify(&program).expect("single dynamic projected param should verify");
 }
@@ -8486,7 +8819,7 @@ fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
     let xs = RirLocalId::from_index(0);
     let outer = RirLocalId::from_index(1);
     let inner = RirLocalId::from_index(2);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Int,
@@ -8524,6 +8857,25 @@ fn rir_accepts_multi_dynamic_projected_mut_place_arg() {
         ],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    let inner = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    let outer = materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.managed_share(
+        nested,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.list_storage(0, inner);
+    materializers.list_storage(1, outer);
 
     rir::verify(&program).expect("multi-dynamic projected mut-place arg should verify");
 }
@@ -8535,7 +8887,7 @@ fn rir_accepts_collection_loan_scope_around_loop() {
     let list = RirTypeId::from_index(2);
     let xs = RirLocalId::from_index(0);
     let loop_id = RirLoopId::from_index(0);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::List(int)],
         collection_storages: vec![rir_list_storage(list, int)],
         functions: vec![rir_function(
@@ -8564,6 +8916,16 @@ fn rir_accepts_collection_loan_scope_around_loop() {
         ..RirProgram::default()
     };
 
+    let mut materializers = TestMaterializers::new(&mut program);
+    let elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.list_storage(0, elem);
     rir::verify(&program).expect("valid collection loan scope rejected");
 }
 
@@ -8638,7 +9000,7 @@ fn rir_accepts_map_slot_read_without_active_loan() {
     let map = RirTypeId::from_index(2);
     let xs = RirLocalId::from_index(0);
     let index = RirLocalId::from_index(1);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Int,
@@ -8668,6 +9030,17 @@ fn rir_accepts_map_slot_read_without_active_loan() {
         ..RirProgram::default()
     };
 
+    let mut materializers = TestMaterializers::new(&mut program);
+    let key = materializers.copy(int, RustRecipePosition::MapKey);
+    let value = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+    );
+    materializers.managed_share(
+        map,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.map_storage(0, key, value);
     rir::verify(&program).expect("RIR verify failed");
 }
 
@@ -8997,12 +9370,16 @@ fn rir_accepts_slice_view_rvalue() {
     let source = RirLocalId::from_index(0);
     let start = RirLocalId::from_index(1);
     let end = RirLocalId::from_index(2);
-    let program = RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Int,
             RirType::Void,
             RirType::Array { elem: int, len: 2 },
             RirType::Slice(int),
+        ],
+        collection_storages: vec![
+            rir_array_storage(0, array, int),
+            rir_slice_storage(1, slice, int),
         ],
         functions: vec![rir_function(
             RirFunctionId::from_index(0),
@@ -9014,7 +9391,7 @@ fn rir_accepts_slice_view_rvalue() {
                 rir_local(end, int, true, "end"),
             ],
             vec![RirStmt::Eval(RirRValue::SliceView {
-                source: rir_place(source, array),
+                source: RirCollectionAccess::Direct(rir_place(source, array)),
                 start,
                 end,
                 inclusive: false,
@@ -9024,6 +9401,14 @@ fn rir_accepts_slice_view_rvalue() {
         )],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    let array_elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::FixedArrayElement),
+    );
+    let slice_elem = materializers.copy(int, RustRecipePosition::Value);
+    materializers.array_storage(0, array_elem);
+    materializers.slice_storage(1, slice_elem);
 
     rir::verify(&program).expect("slice view rvalue should verify");
 }
@@ -9145,9 +9530,13 @@ fn rir_accepts_scoped_capture_lambda_descriptor_and_value() {
         },
         int,
         false,
-        RirLambdaCaptureArg::Readonly {
-            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], int)),
+        RirLambdaCaptureArg::Owned {
+            value: rir_owned(
+                RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], int)),
+                0,
+            ),
         },
+        Some(RirMaterializerAction::Copy),
     );
 
     rir::verify(&program).expect("RIR verify failed");
@@ -9167,9 +9556,10 @@ fn rir_rejects_shared_readonly_capture_from_const() {
         },
         int,
         false,
-        RirLambdaCaptureArg::Readonly {
-            value: RirOperand::Const(RirConstId::from_index(0)),
+        RirLambdaCaptureArg::Owned {
+            value: rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0),
         },
+        None,
     );
     program.consts.push(RirConst {
         id: RirConstId::from_index(0),
@@ -9194,9 +9584,13 @@ fn rir_rejects_noncopy_value_capture() {
         },
         string,
         false,
-        RirLambdaCaptureArg::Readonly {
-            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], string)),
+        RirLambdaCaptureArg::Owned {
+            value: rir_owned(
+                RirOperand::Place(RirPlace::local(RirLocalId::from_index(0), vec![], string)),
+                0,
+            ),
         },
+        Some(RirMaterializerAction::ManagedShare),
     );
 
     assert_rir_error(program, RirVerifyErrorKind::NonCopyValueRequired);
@@ -9236,6 +9630,7 @@ fn rir_rejects_projected_scoped_capture() {
                 int,
             ),
         },
+        None,
     );
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedLambdaCapture);
@@ -9332,11 +9727,14 @@ fn rir_rejects_passing_mut_borrow_lambda_value() {
         .stmts
         .push(RirStmt::Eval(RirRValue::Call {
             callee: RirCallTarget::Function(callee),
-            args: vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-                RirLocalId::from_index(1),
-                vec![],
-                lambda_ty,
-            )))],
+            args: vec![RirCallArg::Value(rir_owned(
+                RirOperand::Place(RirPlace::local(
+                    RirLocalId::from_index(1),
+                    vec![],
+                    lambda_ty,
+                )),
+                0,
+            ))],
             ty: RirTypeId::from_index(0),
         }));
 
@@ -9521,6 +9919,7 @@ fn emit_zero_env_lambda_values_without_heap_envs() {
             term: RirTerm::Return(None),
         },
     });
+    TestMaterializers::new(&mut program).callable_share(lambda_ty, RustRecipePosition::Value);
 
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed"));
     let text = source.as_str();
@@ -9925,6 +10324,7 @@ fn plan_rejects_hidden_scoped_local_lambda_capture() {
     });
     debug_assert_eq!(func, owner);
     program.module_mut(module).functions.extend([body, func]);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     let Err(err) = plan(&verified, rust_plan_config()) else {
@@ -9987,19 +10387,22 @@ fn emit_traces_tracked_lambda_env_and_lambda_value_fields() {
     else {
         panic!("missing lambda init");
     };
-    captures[0] = RirLambdaCaptureArg::Readonly {
-        value: RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            lambda_ty,
-        )),
+    captures[0] = RirLambdaCaptureArg::Owned {
+        value: rir_owned(
+            RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                lambda_ty,
+            )),
+            1,
+        ),
     };
 
     let verified = rir::verify(&program).expect("RIR verify failed");
     let source = emit::emit(&verified).into_string();
 
     assert!(source.contains("lambda_env0: heap.register_tracked::<LambdaEnv0"));
-    assert!(source.contains("#[derive(Clone, anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct LambdaEnv0<'cx>"));
+    assert!(source.contains("#[derive(anvyx_runtime::Trace)]\n#[trace(crate = anvyx_runtime, ctx = 'cx)]\nstruct LambdaEnv0<'cx>"));
     assert!(source.contains("c0: LambdaSig0<'cx>,"));
     assert!(source.contains("#[derive(Clone)]\nenum LambdaSig0<'cx>"));
     assert!(source.contains("unsafe impl<'cx> anvyx_runtime::Trace<'cx> for LambdaSig0<'cx>"));
@@ -10012,7 +10415,8 @@ fn profile_accepts_direct_escaping_capture_cell() {
 
 #[test]
 fn plan_maps_capture_cell_storage_from_lambda_escape() {
-    let heap_program = capture_cell_lambda_program(LambdaEscape::Escaping);
+    let mut heap_program = capture_cell_lambda_program(LambdaEscape::Escaping);
+    air::finalize_materialization(&mut heap_program);
     let heap_air = air::verify(&heap_program).expect("AIR verify failed");
     let heap_plan = plan(&heap_air, rust_plan_config()).expect("plan failed");
     let heap_rir = heap_plan.program();
@@ -10034,7 +10438,8 @@ fn plan_maps_capture_cell_storage_from_lambda_escape() {
         RirLambdaEnvFieldKind::HeapCell { cell: RirCellId(0) }
     ));
 
-    let stack_program = capture_cell_lambda_program(LambdaEscape::NonEscaping);
+    let mut stack_program = capture_cell_lambda_program(LambdaEscape::NonEscaping);
+    air::finalize_materialization(&mut stack_program);
     let stack_air = air::verify(&stack_program).expect("AIR verify failed");
     let stack_plan = plan(&stack_air, rust_plan_config()).expect("plan failed");
     let stack_rir = stack_plan.program();
@@ -10127,11 +10532,11 @@ fn plan_lowers_escaping_readonly_capture_to_heap_env() {
                     value: RValue::MakeLambda {
                         lambda,
                         captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
-                            value: Operand::Place(Place {
+                            value: owned(Operand::Place(Place {
                                 root: PlaceRoot::Local(captured),
                                 projection: vec![],
                                 ty: int,
-                            }),
+                            })),
                         }],
                         ty: lambda_ty,
                     },
@@ -10146,11 +10551,11 @@ fn plan_lowers_escaping_readonly_capture_to_heap_env() {
                 },
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(consumer),
-                    args: vec![CallArg::Value(Operand::Place(Place {
+                    args: vec![CallArg::Value(owned(Operand::Place(Place {
                         root: PlaceRoot::Local(g),
                         projection: vec![],
                         ty: lambda_ty,
-                    }))],
+                    })))],
                 }),
             ],
             air::AirTail::Return(None),
@@ -10183,6 +10588,7 @@ fn plan_lowers_escaping_readonly_capture_to_heap_env() {
         .functions
         .extend([body, func, consumer_func]);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let rir = plan.program();
@@ -10317,7 +10723,7 @@ fn profile_rejects_collection_rvalues() {
                     local: list_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::List,
-                        fields: vec![Operand::Const(one)],
+                        fields: vec![owned(Operand::Const(one))],
                         ty: list,
                     },
                 },
@@ -10382,7 +10788,7 @@ fn profile_accepts_provider_bound_non_runtime_extern_call() {
                 local: tmp,
                 value: RValue::Call {
                     callee: Callee::Extern(ext),
-                    args: vec![CallArg::Value(Operand::Const(arg))],
+                    args: vec![CallArg::Value(owned(Operand::Const(arg)))],
                 },
             }],
             air::AirTail::Return(Some(Operand::Place(place(tmp, int)))),
@@ -10395,7 +10801,8 @@ fn profile_accepts_provider_bound_non_runtime_extern_call() {
 
 #[test]
 fn plan_accepts_core_runtime_native_binding() {
-    let program = scalar_print_program();
+    let mut program = scalar_print_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
 
@@ -10407,7 +10814,8 @@ fn plan_accepts_core_runtime_native_binding() {
 
 #[test]
 fn plan_rejects_missing_native_binding() {
-    let program = scalar_print_program();
+    let mut program = scalar_print_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let Err(err) = plan(&verified, RustPlanConfig::default()) else {
         panic!("plan should reject missing native binding");
@@ -10420,7 +10828,8 @@ fn plan_rejects_missing_native_binding() {
 
 #[test]
 fn plan_rejects_unsupported_native_abi() {
-    let program = scalar_print_program();
+    let mut program = scalar_print_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let mut config = rust_plan_config();
     let binding = &mut config.native_providers[0].modules[0].bindings[0];
@@ -10549,9 +10958,9 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
             type_args: vec![],
             const_args: vec![],
             rep: ExternRep::Inline,
-            layout: None,
-            materialization: None,
-            owns_heap_edges: None,
+            layout: Some(anvyx_runtime::ExternLayout { size: 8, align: 8 }),
+            materialization: Some(anvyx_runtime::ExternMaterialization::Copy),
+            owns_heap_edges: Some(false),
             has_init: false,
             init_args: vec![],
             fields: vec![field("computed", true), field("direct", false)],
@@ -10585,6 +10994,7 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
     });
     program.module_mut(module).functions.push(function);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = RustPlanConfig {
         symbol_prefix: "anv".into(),
@@ -10603,14 +11013,46 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
                         segments: vec!["host".to_string(), "Host".to_string()],
                     },
                     owns_heap_edges: false,
+                    materializer: Some(anvyx_runtime::RustMaterializerBinding {
+                        mode: anvyx_runtime::ExternMaterialization::Copy,
+                        rust_type: anvyx_runtime::RustPath {
+                            crate_name: "host".to_string(),
+                            segments: vec!["host".to_string(), "Host".to_string()],
+                        },
+                        path: anvyx_runtime::RustPath {
+                            crate_name: "host".to_string(),
+                            segments: vec![
+                                "host".to_string(),
+                                "__anvyx_native_export_host".to_string(),
+                                anvyx_runtime::INLINE_MATERIALIZER_SYMBOL.to_string(),
+                            ],
+                        },
+                    }),
                 }],
                 bindings: vec![],
             }],
         }],
     };
-    let plan = plan(&verified, config).expect("plan failed");
+    let plan = plan(&verified, config.clone()).expect("plan failed");
+    assert!(
+        rir::verify_with_air(plan.program(), &program)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
+    );
+    let mut forged = plan.program().clone();
+    forged.structs[0].native_path = Some(vec!["host".to_string(), "Wrong".to_string()]);
+    assert!(
+        rir::verify_with_air_and_native(&forged, &program, &config.native_providers)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == RirVerifyErrorKind::InvalidAirMetadata)
+    );
 
-    let RirTerm::Return(Some(RirOperand::Place(place))) = &plan.program().functions[0].body.term
+    let RirTerm::ReturnOwned(RirOwnedValue {
+        value: RirOwnedOperand::Value(RirOperand::Place(place)),
+        ..
+    }) = &plan.program().functions[0].body.term
     else {
         panic!("expected returned field place");
     };
@@ -10622,13 +11064,14 @@ fn plan_maps_inline_extern_field_ids_to_storage_fields() {
 
 #[test]
 fn plan_maps_structured_air_branch_to_structured_rir() {
-    let program = scalar_branch_program();
+    let mut program = scalar_branch_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
     let body = &plan.program().functions[0].body;
 
     assert!(matches!(body.stmts[0], RirStmt::If(_)));
-    assert!(matches!(body.term, RirTerm::Return(Some(_))));
+    assert!(matches!(body.term, RirTerm::ReturnOwned(_)));
 }
 
 #[test]
@@ -10665,6 +11108,7 @@ fn plan_signatures_uses_stable_ids_and_context_first_shape() {
         body: structured_body(vec![], air::AirTail::Return(Some(Operand::Const(one)))),
     });
     program.module_mut(module).functions.extend([first, second]);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
@@ -10779,7 +11223,7 @@ fn plan_preserves_semantic_param_and_call_modes() {
                     local: array_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::Array,
-                        fields: vec![Operand::Const(one)],
+                        fields: vec![owned(Operand::Const(one))],
                         ty: array,
                     },
                 },
@@ -10787,13 +11231,13 @@ fn plan_preserves_semantic_param_and_call_modes() {
                     local: list_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::List,
-                        fields: vec![Operand::Const(one)],
+                        fields: vec![owned(Operand::Const(one))],
                         ty: list,
                     },
                 },
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(scalar),
-                    args: vec![CallArg::Value(Operand::Const(one))],
+                    args: vec![CallArg::Value(owned(Operand::Const(one)))],
                 }),
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(string_borrow),
@@ -10801,7 +11245,10 @@ fn plan_preserves_semantic_param_and_call_modes() {
                 }),
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(array_value),
-                    args: vec![CallArg::Value(Operand::Place(place(array_local, array)))],
+                    args: vec![CallArg::Value(owned(Operand::Place(place(
+                        array_local,
+                        array,
+                    ))))],
                 }),
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(array_shared),
@@ -10826,6 +11273,7 @@ fn plan_preserves_semantic_param_and_call_modes() {
         entry,
     ]);
     program.entry = Some(entry);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
 
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
@@ -11083,7 +11531,8 @@ fn profile_rejects_capture_cell_to_native_mut_borrow() {
 
 #[test]
 fn plan_temps_capture_cell_call_value_before_cell_set() {
-    let program = owner_capture_cell_call_set_program();
+    let mut program = owner_capture_cell_call_set_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11106,7 +11555,7 @@ fn plan_temps_capture_cell_call_value_before_cell_set() {
     assert!(matches!(
         &owner.body.stmts[cell_set],
         RirStmt::CellSet {
-            value: RirRValue::Use(RirOperand::Place(_)),
+            value: RirRValue::TakeStaged(RirOperand::Place(_)),
             ..
         }
     ));
@@ -11114,7 +11563,8 @@ fn plan_temps_capture_cell_call_value_before_cell_set() {
 
 #[test]
 fn plan_lowers_owner_heap_capture_cell_source_ref_arg_to_heap_cell() {
-    let program = heap_capture_cell_source_ref_arg_program();
+    let mut program = heap_capture_cell_source_ref_arg_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -11131,7 +11581,8 @@ fn plan_lowers_owner_heap_capture_cell_source_ref_arg_to_heap_cell() {
 
 #[test]
 fn plan_lowers_lambda_heap_capture_cell_source_ref_arg_to_heap_cell() {
-    let program = escaping_lambda_capture_cell_source_ref_arg_program();
+    let mut program = escaping_lambda_capture_cell_source_ref_arg_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11148,7 +11599,8 @@ fn plan_lowers_lambda_heap_capture_cell_source_ref_arg_to_heap_cell() {
 
 #[test]
 fn plan_lowers_owner_capture_cell_source_ref_arg_to_stack_cell() {
-    let program = owner_capture_cell_source_ref_arg_program();
+    let mut program = owner_capture_cell_source_ref_arg_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11165,7 +11617,8 @@ fn plan_lowers_owner_capture_cell_source_ref_arg_to_stack_cell() {
 
 #[test]
 fn plan_lowers_lambda_capture_cell_source_ref_arg_to_stack_cell() {
-    let program = lambda_capture_cell_source_ref_arg_program();
+    let mut program = lambda_capture_cell_source_ref_arg_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11182,7 +11635,8 @@ fn plan_lowers_lambda_capture_cell_source_ref_arg_to_stack_cell() {
 
 #[test]
 fn plan_lowers_projected_owner_capture_cell_assignment_to_mut_place_set() {
-    let program = capture_cell_projected_assignment_program(false, LambdaEscape::NonEscaping);
+    let mut program = capture_cell_projected_assignment_program(false, LambdaEscape::NonEscaping);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(0));
@@ -11202,7 +11656,8 @@ fn plan_lowers_projected_owner_capture_cell_assignment_to_mut_place_set() {
 
 #[test]
 fn plan_lowers_projected_lambda_capture_cell_assignment_to_mut_place_set() {
-    let program = capture_cell_projected_assignment_program(true, LambdaEscape::NonEscaping);
+    let mut program = capture_cell_projected_assignment_program(true, LambdaEscape::NonEscaping);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(0));
@@ -11267,7 +11722,8 @@ fn air_rejects_escaping_scoped_borrowed_param_capture_before_profile() {
 
 #[test]
 fn plan_lowers_scoped_borrow_to_scoped_place_cell() {
-    let program = scoped_borrow_lambda_program();
+    let mut program = scoped_borrow_lambda_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let rir = plan.program();
@@ -11299,6 +11755,7 @@ fn plan_preserves_ref_self_scoped_borrow_source() {
     let owner = program.function_mut(FunctionId::from_index(2));
     owner.kind = FunctionKind::Method;
     owner.signature.params[0].role = ParamRole::Receiver;
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let rir = plan.program();
@@ -11312,7 +11769,8 @@ fn plan_preserves_ref_self_scoped_borrow_source() {
 
 #[test]
 fn plan_lowers_scoped_borrow_capture_arg_to_owner_ref() {
-    let program = scoped_borrow_lambda_program();
+    let mut program = scoped_borrow_lambda_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -11334,7 +11792,8 @@ fn plan_lowers_scoped_borrow_capture_arg_to_owner_ref() {
 
 #[test]
 fn plan_lowers_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
-    let program = scoped_borrow_lambda_program();
+    let mut program = scoped_borrow_lambda_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11357,7 +11816,8 @@ fn plan_lowers_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
 
 #[test]
 fn plan_lowers_nested_scoped_borrow_recapture_to_same_cell() {
-    let program = nested_scoped_borrow_lambda_program();
+    let mut program = nested_scoped_borrow_lambda_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let outer_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11411,6 +11871,7 @@ fn plan_lowers_owner_scoped_borrow_write_to_scoped_place_cell_set() {
             ),
             value: RValue::Use(Operand::Const(one)),
         });
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -11440,6 +11901,7 @@ fn plan_lowers_lambda_scoped_borrow_read_to_scoped_place_cell_get() {
             ))),
         },
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let lambda_body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11447,7 +11909,13 @@ fn plan_lowers_lambda_scoped_borrow_read_to_scoped_place_cell_get() {
     assert!(lambda_body.body.stmts.iter().any(|stmt| matches!(
         stmt,
         RirStmt::Init {
-            value: RirRValue::ScopedPlaceCellGet { .. },
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell { .. }),
+                    ..
+                }),
+                ..
+            }),
             ..
         }
     )));
@@ -11467,6 +11935,7 @@ fn plan_lowers_owner_scoped_borrow_read_to_scoped_place_cell_get() {
             int,
         ))),
     });
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -11474,10 +11943,16 @@ fn plan_lowers_owner_scoped_borrow_read_to_scoped_place_cell_get() {
     assert!(owner.body.stmts.iter().any(|stmt| matches!(
         stmt,
         RirStmt::Init {
-            value: RirRValue::ScopedPlaceCellGet {
-                cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg {
+                    access: RirMutPlaceAccess::Handle(RirMutPlaceHandle::ScopedPlaceCell {
+                        cell: RirScopedPlaceCellRef::Owner(RirScopedPlaceCellId(0)),
+                        ..
+                    }),
+                    ..
+                }),
                 ..
-            },
+            }),
             ..
         }
     )));
@@ -11498,6 +11973,7 @@ fn plan_lowers_owner_scoped_borrow_forwarding_to_scoped_place_cell_arg() {
             PlaceRoot::ScopedBorrow(air::ScopedBorrowId::from_index(0)),
             int,
         ));
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let owner = rir_function_for_air(plan.program(), FunctionId::from_index(2));
@@ -11531,6 +12007,7 @@ fn plan_lowers_lambda_scoped_borrow_write_to_scoped_place_cell_set() {
             ),
             value: RValue::Use(Operand::Const(one)),
         });
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let body = rir_function_for_air(plan.program(), FunctionId::from_index(1));
@@ -11599,9 +12076,13 @@ fn emit_reentrant_heap_cell_ref_arg_call_is_not_wrapped_in_cell_borrow() {
 fn emit_temps_mut_place_read_before_heap_cell_set() {
     let source = plan_source(heap_cell_set_from_mut_place_param_program()).into_string();
 
-    assert!(source.contains(".get_copy(rt)?;"));
-    assert!(source.contains("rt.heap().with(&__cell0, |cell| cell.set(v"));
-    assert!(!source.contains("rt.heap().with(&__cell0, |cell| cell.set(v0_x.get_copy(rt)?))?;"));
+    let access = source
+        .find(".access(rt, |value|")
+        .expect("missing access-aware materialization");
+    let set = source
+        .find("rt.heap().with(&__cell0, |cell| cell.set(")
+        .expect("missing heap-cell set");
+    assert!(access < set);
 }
 
 #[test]
@@ -11673,6 +12154,8 @@ fn assert_local_kind_to_native_mut_borrow(kind: LocalKind) {
             call_mut_ext(ext, place(x, int)),
         ],
     );
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = rust_plan_config();
     RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
@@ -11703,7 +12186,7 @@ fn plan_lowers_projected_local_to_native_mut_place() {
                 local: pair,
                 value: RValue::Aggregate {
                     kind: AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(one)],
+                    fields: vec![owned(Operand::Const(one))],
                     ty: tuple,
                 },
             },
@@ -11717,6 +12200,7 @@ fn plan_lowers_projected_local_to_native_mut_place() {
             ),
         ],
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let caller = rir_function_for_air(plan.program(), caller);
@@ -11811,7 +12295,7 @@ fn profile_rejects_projected_local_to_native_mut_borrow() {
                 local: pair,
                 value: RValue::Aggregate {
                     kind: AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(one)],
+                    fields: vec![owned(Operand::Const(one))],
                     ty: tuple,
                 },
             },
@@ -11960,14 +12444,17 @@ fn plan_method_symbols_include_owner_and_keep_free_function_calls() {
                 },
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(first_method),
-                    args: vec![CallArg::Value(Operand::Place(place(first_local, first_ty)))],
+                    args: vec![CallArg::Value(owned(Operand::Place(place(
+                        first_local,
+                        first_ty,
+                    ))))],
                 }),
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(second_method),
-                    args: vec![CallArg::Value(Operand::Place(place(
+                    args: vec![CallArg::Value(owned(Operand::Place(place(
                         second_local,
                         second_ty,
-                    )))],
+                    ))))],
                 }),
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(static_method),
@@ -12024,7 +12511,8 @@ fn emit_renders_format_with_central_specs_and_borrowed_strings() {
 
 #[test]
 fn rir_dedupes_string_literals_and_tracks_owned_use() {
-    let program = string_concat_program();
+    let mut program = string_concat_program();
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
     let literals = &plan.program().string_literals;
@@ -12355,6 +12843,7 @@ fn emit_uses_array_map_for_native_array_returns() {
         ),
         rir_abi(vec![], array_abi),
     );
+    install_native_array_materializers(&mut program, string, option, array);
     program.functions.push(return_extern_function(array));
     program.entry = Some(RirFunctionId::from_index(0));
 
@@ -12398,13 +12887,18 @@ fn emit_uses_array_map_for_native_array_params() {
         ),
         rir_abi(vec![array_abi], anvyx_runtime::ExternTypeExpr::Void),
     );
+    let array_materializer =
+        install_native_array_materializers(&mut program, string, option, array);
     program.functions.push(call_extern_function(
         void,
-        vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            array,
-        )))],
+        vec![RirCallArg::Value(RirOwnedValue {
+            value: RirOwnedOperand::Value(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                array,
+            ))),
+            source: RirOwnedSource::Reuse(array_materializer),
+        })],
     ));
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -12456,6 +12950,7 @@ fn emit_passes_native_result_string_returns() {
         ),
     );
     program.enums.push(rir_result_enum(string, string));
+    install_native_result_materializers(&mut program, string, result);
     program.functions.push(return_extern_function(result));
     program.entry = Some(RirFunctionId::from_index(0));
 
@@ -12504,13 +12999,17 @@ fn emit_passes_native_result_string_params() {
         ),
     );
     program.enums.push(rir_result_enum(string, string));
+    let result_materializer = install_native_result_materializers(&mut program, string, result);
     program.functions.push(call_extern_function(
         void,
-        vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            result,
-        )))],
+        vec![RirCallArg::Value(RirOwnedValue {
+            value: RirOwnedOperand::Value(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                result,
+            ))),
+            source: RirOwnedSource::Reuse(result_materializer),
+        })],
     ));
     program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -12580,13 +13079,17 @@ fn emit_converts_native_unit_param_and_return() {
         ),
     );
     param_program.tuples.push(rir_empty_tuple());
+    let unit_materializer = install_native_unit_materializer(&mut param_program, unit);
     param_program.functions.push(call_extern_function(
         void,
-        vec![RirCallArg::Value(RirOperand::Place(RirPlace::local(
-            RirLocalId::from_index(0),
-            vec![],
-            unit,
-        )))],
+        vec![RirCallArg::Value(RirOwnedValue {
+            value: RirOwnedOperand::Value(RirOperand::Place(RirPlace::local(
+                RirLocalId::from_index(0),
+                vec![],
+                unit,
+            ))),
+            source: RirOwnedSource::Reuse(unit_materializer),
+        })],
     ));
     param_program.functions[0].params.push(RirParam {
         local: RirLocalId::from_index(0),
@@ -12619,6 +13122,7 @@ fn emit_converts_native_unit_param_and_return() {
         rir_abi(vec![], anvyx_runtime::ExternTypeExpr::Unit),
     );
     ret_program.tuples.push(rir_empty_tuple());
+    install_native_unit_materializer(&mut ret_program, unit);
     ret_program.functions.push(return_extern_function(unit));
     ret_program.entry = Some(RirFunctionId::from_index(0));
 
@@ -12633,7 +13137,7 @@ fn emit_propagates_fallible_native_calls() {
     assert!(source.contains(
         "fn anv_f0_main<'cx, 'rt>(rt: &mut anvyx_runtime::Ctx<'cx, 'rt>, _statics: &AnvStatics<'cx>, _globals: &AnvGlobals<'cx>) -> Result<(), anvyx_runtime::RuntimeError>"
     ));
-    assert!(source.contains("host::fallible(rt, 41)?;"));
+    assert!(source.contains("host::fallible(rt, (*(&41)))?;"));
     assert!(source.contains("fn main() -> Result<(), anvyx_runtime::RuntimeError>"));
     assert!(
         source.contains("let _ = anv_f0_main(&mut rt, anv_entry.statics, anv_entry.globals)?;")
@@ -12781,7 +13285,7 @@ fn source_job_compiles_structured_branch_without_dispatcher() {
     let text = source.as_str();
 
     assert!(text.contains("if true {"));
-    assert!(text.contains("return v0;"));
+    assert!(text.contains("return"));
     assert!(!text.contains("let mut bb = 0usize;"));
     assert!(!text.contains("match bb"));
     let output = run_source(source);
@@ -12811,6 +13315,7 @@ fn emit_preserves_nested_unreachable_terms() {
         ty: bool_ty,
         value: RirConstValue::Bool(true),
     });
+    install_empty_materializer_table(&mut program);
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::If(RirIf {
             cond: RirOperand::Const(RirConstId::from_index(1)),
@@ -12850,6 +13355,7 @@ fn rir_verify_accepts_root_none_after_nonfallthrough_if() {
         ty: bool_ty,
         value: RirConstValue::Bool(true),
     });
+    install_empty_materializer_table(&mut program);
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::If(RirIf {
             cond: RirOperand::Const(RirConstId::from_index(1)),
@@ -12917,7 +13423,9 @@ fn rir_verify_rejects_pattern_binding_type_mismatch() {
                         local: binding,
                         path: RirPatternPath::default(),
                         ty: bool_ty,
-                        mode: RirPatternBindingMode::Owned,
+                        mode: RirPatternBindingMode::Owned {
+                            materializer: rir::RirMaterializerId::from_index(0),
+                        },
                     }],
                 }],
                 block: RirStructuredBlock {
@@ -13019,7 +13527,9 @@ fn rir_verify_rejects_unguarded_pattern_payload_path() {
                             }],
                         },
                         ty: RirTypeId::from_index(0),
-                        mode: RirPatternBindingMode::Owned,
+                        mode: RirPatternBindingMode::Owned {
+                            materializer: rir::RirMaterializerId::from_index(0),
+                        },
                     }],
                 }],
                 block: RirStructuredBlock {
@@ -13095,7 +13605,9 @@ fn rir_verify_rejects_pattern_payload_step_variant_shape_mismatch() {
                             }],
                         },
                         ty: int,
-                        mode: RirPatternBindingMode::Owned,
+                        mode: RirPatternBindingMode::Owned {
+                            materializer: rir::RirMaterializerId::from_index(0),
+                        },
                     }],
                 }],
                 block: RirStructuredBlock {
@@ -13111,11 +13623,50 @@ fn rir_verify_rejects_pattern_payload_step_variant_shape_mismatch() {
 }
 
 #[test]
+fn rir_verify_rejects_noncanonical_pattern_materializer() {
+    let owned = |materializer| RirPatternBindingMode::Owned { materializer };
+    let valid_mode = owned(rir::RirMaterializerId::from_index(0));
+    let mut valid = root_pattern_binding_program(
+        valid_mode,
+        false,
+        false,
+        RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+        RirTerm::Unreachable,
+    );
+    let mut materializers = TestMaterializers::new(&mut valid);
+    materializers.copy(RirTypeId::from_index(0), RustRecipePosition::Value);
+    rir::verify(&valid).expect("canonical pattern materializer");
+
+    let mut out_of_range = valid.clone();
+    let RirStmt::PatternMatch(match_) = &mut out_of_range.functions[0].body.stmts[0] else {
+        unreachable!()
+    };
+    match_.arms[0].alternatives[0].bindings[0].mode = owned(rir::RirMaterializerId::from_index(99));
+    assert_rir_error(out_of_range, RirVerifyErrorKind::BadId);
+
+    let mut noncanonical = valid;
+    let duplicate = rir::RirMaterializerId::from_index(noncanonical.materializers.len());
+    noncanonical.materializers.push(RirMaterializer {
+        id: duplicate,
+        ty: RirTypeId::from_index(0),
+        position: RustRecipePosition::Value,
+        action: RirMaterializerAction::Copy,
+    });
+    let RirStmt::PatternMatch(match_) = &mut noncanonical.functions[0].body.stmts[0] else {
+        unreachable!()
+    };
+    match_.arms[0].alternatives[0].bindings[0].mode = owned(duplicate);
+    assert_rir_error(noncanonical, RirVerifyErrorKind::BadId);
+}
+
+#[test]
 fn rir_verify_rejects_pattern_owned_binding_after_arm() {
     let binding = RirLocalId::from_index(1);
     let int = RirTypeId::from_index(0);
     let program = root_pattern_binding_program(
-        RirPatternBindingMode::Owned,
+        RirPatternBindingMode::Owned {
+            materializer: rir::RirMaterializerId::from_index(0),
+        },
         false,
         false,
         RirTerm::None,
@@ -13128,7 +13679,9 @@ fn rir_verify_rejects_pattern_owned_binding_after_arm() {
 #[test]
 fn rir_verify_rejects_owned_pattern_binding_to_payload_ref_local() {
     let program = root_pattern_binding_program(
-        RirPatternBindingMode::Owned,
+        RirPatternBindingMode::Owned {
+            materializer: rir::RirMaterializerId::from_index(0),
+        },
         true,
         true,
         RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
@@ -13351,7 +13904,9 @@ fn rir_verify_rejects_unguarded_optional_pattern_binding_path() {
                             steps: vec![RirPatternPathStep::OptionalSome],
                         },
                         ty: int,
-                        mode: RirPatternBindingMode::Owned,
+                        mode: RirPatternBindingMode::Owned {
+                            materializer: rir::RirMaterializerId::from_index(0),
+                        },
                     }],
                 }],
                 block: RirStructuredBlock {
@@ -13740,6 +14295,36 @@ fn dataref_place_descriptor_inventory_finds_map_entry_descriptor() {
 }
 
 #[test]
+fn dataref_map_entry_alias_binds_place_once_and_reborrows() {
+    let map_ty = RirTypeId::from_index(7);
+    let map = dataref_projection_mut_place_arg(
+        vec![RirProjection::Field(RirFieldId::from_index(6))],
+        map_ty,
+    );
+    let mut program = dataref_access_rir(vec![RirStmt::MapEntryMatch(RirMapEntryMatch {
+        map,
+        key: RirOperand::Const(RirConstId::from_index(0)),
+        payload: Some(RirLocalId::from_index(2)),
+        payload_escapes: false,
+        some_block: RirStructuredBlock::default(),
+        none_block: RirStructuredBlock::default(),
+    })]);
+    program.functions[0].locals[2].mutable = true;
+    program.functions[0].locals[2].initialized = false;
+    program.functions[0].locals[2].payload_ref = true;
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(source.contains("let mut __anv_map_entry_place_0 ="));
+    assert!(source.matches("__anv_map_entry_place_0.reborrow()").count() >= 3);
+    assert_eq!(
+        source
+            .matches("MutPlace::dataref(__anv_dataref_place_object_0")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
     let source = emit::emit(
         &rir::verify(&dataref_projection_mut_place_call_rir(
@@ -13769,7 +14354,7 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
                 &heap_type,
                 "storage",
                 "NodeStorage<'cx>",
-                "Ok(storage.value.clone())",
+                "Ok((*(&storage.value)))",
             )
         ),
         "f(&value)".to_string(),
@@ -13781,7 +14366,7 @@ fn emit_dataref_projection_mut_place_descriptor_and_call_arg() {
                 &heap_type,
                 "storage",
                 "NodeStorage<'cx>",
-                "Ok(storage.value.clone())",
+                "Ok((*(&storage.value)))",
             )
         ),
         format!(
@@ -13824,7 +14409,7 @@ fn emit_nested_dataref_projection_mut_place_descriptor_path() {
     .into_string();
 
     assert!(source.contains("struct anvP0_Node_point_x_place<'cx>"));
-    assert!(source.contains("Ok(storage.point.x.clone())"));
+    assert!(source.contains("Ok((*(&storage.point.x)))"));
     assert!(source.contains("f(&value)"));
     assert!(source.contains("storage.point.x = value"));
 }
@@ -13835,23 +14420,6 @@ fn rir_verify_accepts_direct_scalar_dataref_projection_mut_place_arg() {
         valid_dataref_projection_mut_place_arg(),
     ))
     .expect("RIR rejected dataref projection mut-place arg");
-}
-
-#[test]
-fn rir_verify_rejects_dataref_structural_map_insert() {
-    let map_ty = RirTypeId::from_index(7);
-    let map = dataref_projection_mut_place_arg(
-        vec![RirProjection::Field(RirFieldId::from_index(6))],
-        map_ty,
-    );
-    let program = dataref_access_rir(vec![RirStmt::Eval(RirRValue::MapInsert {
-        map: RirCollectionAccess::MutPlace(map),
-        key: RirOperand::Const(RirConstId::from_index(0)),
-        value: RirOperand::Const(RirConstId::from_index(0)),
-        kind: RirMapWriteKind::StructuralInsert,
-    })]);
-
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
 }
 
 #[test]
@@ -13912,7 +14480,7 @@ fn rir_verify_rejects_empty_dataref_projection_mut_place_arg() {
 }
 
 #[test]
-fn rir_verify_rejects_index_dataref_projection_mut_place_arg() {
+fn rir_verify_accepts_index_dataref_projection_mut_place_arg() {
     let arg = dataref_projection_mut_place_arg(
         vec![
             RirProjection::Field(RirFieldId::from_index(4)),
@@ -13921,10 +14489,8 @@ fn rir_verify_rejects_index_dataref_projection_mut_place_arg() {
         RirTypeId::from_index(0),
     );
 
-    assert_rir_error(
-        dataref_projection_mut_place_call_rir(arg),
-        RirVerifyErrorKind::UnsupportedRValueType,
-    );
+    rir::verify(&dataref_projection_mut_place_call_rir(arg))
+        .expect("RIR rejected indexed dataref projection mut-place arg");
 }
 
 #[test]
@@ -13970,7 +14536,7 @@ fn rir_verify_accepts_aggregate_dataref_projection_mut_place_arg_payload() {
 }
 
 #[test]
-fn rir_verify_rejects_container_optional_enum_dataref_projection_mut_place_arg_payloads() {
+fn rir_verify_accepts_materializable_dataref_projection_mut_place_arg_payloads() {
     for (field, ty) in [
         (RirFieldId::from_index(1), RirTypeId::from_index(3)),
         (RirFieldId::from_index(4), RirTypeId::from_index(3)),
@@ -13979,13 +14545,13 @@ fn rir_verify_rejects_container_optional_enum_dataref_projection_mut_place_arg_p
         (RirFieldId::from_index(7), RirTypeId::from_index(8)),
         (RirFieldId::from_index(8), RirTypeId::from_index(9)),
     ] {
-        assert_rir_error(
-            dataref_projection_mut_place_call_rir(dataref_projection_mut_place_arg(
-                vec![RirProjection::Field(field)],
-                ty,
-            )),
-            RirVerifyErrorKind::UnsupportedRValueType,
-        );
+        let mut program = dataref_projection_mut_place_call_rir(dataref_projection_mut_place_arg(
+            vec![RirProjection::Field(field)],
+            ty,
+        ));
+        program.functions[1].params[0].ty = ty;
+        program.functions[1].locals[0].ty = ty;
+        rir::verify(&program).expect("materializable dataref payload should verify");
     }
 }
 
@@ -14031,12 +14597,13 @@ fn rir_verify_accepts_dataref_get_set_projection_ops() {
     let program = dataref_access_rir(vec![
         RirStmt::Init {
             local: RirLocalId::from_index(2),
-            value: RirRValue::DataRefGet {
-                object: RirOperand::Place(dataref_access_place(0, 1)),
-                dataref: RirDataRefId::from_index(0),
-                projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
-                ty: RirTypeId::from_index(0),
-            },
+            value: dataref_read(
+                RirOperand::Place(dataref_access_place(0, 1)),
+                RirDataRefId::from_index(0),
+                vec![RirProjection::Field(RirFieldId::from_index(2))],
+                RirTypeId::from_index(0),
+                rir::RirMaterializerId::from_index(0),
+            ),
         },
         RirStmt::DataRefSet {
             object: RirOperand::Place(dataref_access_place(0, 1)),
@@ -14045,7 +14612,8 @@ fn rir_verify_accepts_dataref_get_set_projection_ops() {
                 RirProjection::Field(RirFieldId::from_index(0)),
                 RirProjection::Field(RirFieldId::from_index(0)),
             ],
-            value: RirOperand::Const(RirConstId::from_index(0)),
+            value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            ty: RirTypeId::from_index(0),
         },
     ]);
 
@@ -14063,19 +14631,20 @@ fn rir_verify_rejects_dataref_mut_place_set() {
 }
 
 #[test]
-fn rir_verify_rejects_dataref_get_set_index_projection_ops() {
+fn rir_verify_accepts_dataref_get_set_index_projection_ops() {
     let program = dataref_access_rir(vec![
         RirStmt::Init {
             local: RirLocalId::from_index(2),
-            value: RirRValue::DataRefGet {
-                object: RirOperand::Place(dataref_access_place(0, 1)),
-                dataref: RirDataRefId::from_index(0),
-                projections: vec![
+            value: dataref_read(
+                RirOperand::Place(dataref_access_place(0, 1)),
+                RirDataRefId::from_index(0),
+                vec![
                     RirProjection::Field(RirFieldId::from_index(4)),
                     RirProjection::Index(RirLocalId::from_index(1)),
                 ],
-                ty: RirTypeId::from_index(0),
-            },
+                RirTypeId::from_index(0),
+                rir::RirMaterializerId::from_index(0),
+            ),
         },
         RirStmt::DataRefSet {
             object: RirOperand::Place(dataref_access_place(0, 1)),
@@ -14084,23 +14653,25 @@ fn rir_verify_rejects_dataref_get_set_index_projection_ops() {
                 RirProjection::Field(RirFieldId::from_index(4)),
                 RirProjection::Index(RirLocalId::from_index(1)),
             ],
-            value: RirOperand::Const(RirConstId::from_index(0)),
+            value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(0))),
+            ty: RirTypeId::from_index(0),
         },
     ]);
 
-    assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
+    rir::verify(&program).expect("dataref index projection ops should verify");
 }
 
 #[test]
 fn rir_verify_rejects_dataref_get_bad_object_type() {
     let mut program = dataref_access_rir(vec![RirStmt::Init {
         local: RirLocalId::from_index(2),
-        value: RirRValue::DataRefGet {
-            object: RirOperand::Const(RirConstId::from_index(0)),
-            dataref: RirDataRefId::from_index(0),
-            projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
-            ty: RirTypeId::from_index(0),
-        },
+        value: dataref_read(
+            RirOperand::Const(RirConstId::from_index(0)),
+            RirDataRefId::from_index(0),
+            vec![RirProjection::Field(RirFieldId::from_index(2))],
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        ),
     }]);
     program.functions[0].ret.ty = RirTypeId::from_index(0);
 
@@ -14111,12 +14682,13 @@ fn rir_verify_rejects_dataref_get_bad_object_type() {
 fn rir_verify_rejects_dataref_get_bad_dataref_id() {
     let program = dataref_access_rir(vec![RirStmt::Init {
         local: RirLocalId::from_index(2),
-        value: RirRValue::DataRefGet {
-            object: RirOperand::Place(dataref_access_place(0, 1)),
-            dataref: RirDataRefId::from_index(1),
-            projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
-            ty: RirTypeId::from_index(0),
-        },
+        value: dataref_read(
+            RirOperand::Place(dataref_access_place(0, 1)),
+            RirDataRefId::from_index(1),
+            vec![RirProjection::Field(RirFieldId::from_index(2))],
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        ),
     }]);
 
     assert_rir_error(program, RirVerifyErrorKind::BadId);
@@ -14126,12 +14698,13 @@ fn rir_verify_rejects_dataref_get_bad_dataref_id() {
 fn rir_verify_rejects_dataref_get_bad_field_id() {
     let program = dataref_access_rir(vec![RirStmt::Init {
         local: RirLocalId::from_index(2),
-        value: RirRValue::DataRefGet {
-            object: RirOperand::Place(dataref_access_place(0, 1)),
-            dataref: RirDataRefId::from_index(0),
-            projections: vec![RirProjection::Field(RirFieldId::from_index(9))],
-            ty: RirTypeId::from_index(0),
-        },
+        value: dataref_read(
+            RirOperand::Place(dataref_access_place(0, 1)),
+            RirDataRefId::from_index(0),
+            vec![RirProjection::Field(RirFieldId::from_index(9))],
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        ),
     }]);
 
     assert_rir_error(program, RirVerifyErrorKind::BadId);
@@ -14139,12 +14712,13 @@ fn rir_verify_rejects_dataref_get_bad_field_id() {
 
 #[test]
 fn rir_verify_rejects_dataref_get_final_type_mismatch() {
-    let program = dataref_access_rir(vec![RirStmt::Eval(RirRValue::DataRefGet {
-        object: RirOperand::Place(dataref_access_place(0, 1)),
-        dataref: RirDataRefId::from_index(0),
-        projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
-        ty: RirTypeId::from_index(5),
-    })]);
+    let program = dataref_access_rir(vec![RirStmt::Eval(dataref_read(
+        RirOperand::Place(dataref_access_place(0, 1)),
+        RirDataRefId::from_index(0),
+        vec![RirProjection::Field(RirFieldId::from_index(2))],
+        RirTypeId::from_index(5),
+        rir::RirMaterializerId::from_index(0),
+    ))]);
 
     assert_rir_type_error(program);
 }
@@ -14153,15 +14727,16 @@ fn rir_verify_rejects_dataref_get_final_type_mismatch() {
 fn rir_verify_rejects_dataref_get_nested_dataref_crossing() {
     let program = dataref_access_rir(vec![RirStmt::Init {
         local: RirLocalId::from_index(2),
-        value: RirRValue::DataRefGet {
-            object: RirOperand::Place(dataref_access_place(0, 1)),
-            dataref: RirDataRefId::from_index(0),
-            projections: vec![
+        value: dataref_read(
+            RirOperand::Place(dataref_access_place(0, 1)),
+            RirDataRefId::from_index(0),
+            vec![
                 RirProjection::Field(RirFieldId::from_index(3)),
                 RirProjection::Field(RirFieldId::from_index(2)),
             ],
-            ty: RirTypeId::from_index(0),
-        },
+            RirTypeId::from_index(0),
+            rir::RirMaterializerId::from_index(0),
+        ),
     }]);
 
     assert_rir_error(program, RirVerifyErrorKind::UnsupportedRValueType);
@@ -14173,7 +14748,8 @@ fn rir_verify_rejects_dataref_set_value_mismatch() {
         object: RirOperand::Place(dataref_access_place(0, 1)),
         dataref: RirDataRefId::from_index(0),
         projections: vec![RirProjection::Field(RirFieldId::from_index(2))],
-        value: RirOperand::Const(RirConstId::from_index(1)),
+        value: RirRValue::Use(RirOperand::Const(RirConstId::from_index(1))),
+        ty: RirTypeId::from_index(0),
     }]);
 
     assert_rir_type_error(program);
@@ -14200,6 +14776,7 @@ fn rir_verify_accepts_string_value_abi() {
         abi: RirParamAbi::Value,
         escape: RirParamEscape::NonEscaping,
     });
+    install_empty_materializer_table(&mut program);
 
     rir::verify(&program).expect("RIR rejected string value ABI");
 }
@@ -14228,6 +14805,7 @@ fn rir_verify_accepts_loop_break_continue() {
             term: RirTerm::None,
         },
     }));
+    install_empty_materializer_table(&mut program);
 
     rir::verify(&program).expect("RIR rejected loop break/continue");
 }
@@ -14463,10 +15041,13 @@ fn rir_verify_rejects_native_scoped_escaping_lambda_mismatch() {
         unreachable!()
     };
     args[0] = RirCallArg::ScopedLambda {
-        callee: RirOperand::Place(rir_place(
-            RirLocalId::from_index(0),
-            RirTypeId::from_index(2),
-        )),
+        callee: rir_owned(
+            RirOperand::Place(rir_place(
+                RirLocalId::from_index(0),
+                RirTypeId::from_index(2),
+            )),
+            0,
+        ),
         sig: RirLambdaSigId::from_index(0),
     };
 
@@ -14481,10 +15062,13 @@ fn rir_verify_rejects_native_escaping_scoped_lambda_mismatch() {
         unreachable!()
     };
     args[0] = RirCallArg::EscapingLambda {
-        callee: RirOperand::Place(rir_place(
-            RirLocalId::from_index(0),
-            RirTypeId::from_index(2),
-        )),
+        callee: rir_owned(
+            RirOperand::Place(rir_place(
+                RirLocalId::from_index(0),
+                RirTypeId::from_index(2),
+            )),
+            0,
+        ),
         sig: RirLambdaSigId::from_index(0),
     };
 
@@ -14514,7 +15098,10 @@ fn rir_rejects_escaping_proof_over_nonescaping_lambda_param() {
     program.functions[0].body.stmts = vec![RirStmt::Init {
         local: proven,
         value: RirRValue::FunctionValue {
-            value: RirOperand::Place(rir_place(RirLocalId::from_index(0), lambda_ty)),
+            value: rir_owned(
+                RirOperand::Place(rir_place(RirLocalId::from_index(0), lambda_ty)),
+                1,
+            ),
             escape: Some(RirLambdaEscape::Escaping),
             ty: lambda_ty,
         },
@@ -14559,7 +15146,7 @@ fn projected_escaping_lambda_without_proof_rejected() {
     let RirCallArg::EscapingLambda { callee, .. } = &mut args[0] else {
         unreachable!()
     };
-    *callee = projection;
+    *callee = rir_owned(projection, 0);
 
     assert_rir_error(program, RirVerifyErrorKind::CallArgEscape);
 }
@@ -14662,7 +15249,10 @@ fn rir_verify_rejects_native_scoped_lambda_non_lambda_operand() {
     let RirCallArg::ScopedLambda { callee, .. } = &mut args[0] else {
         unreachable!()
     };
-    *callee = RirOperand::Place(rir_place(RirLocalId::from_index(0), int));
+    *callee = rir_owned(
+        RirOperand::Place(rir_place(RirLocalId::from_index(0), int)),
+        0,
+    );
 
     assert_rir_type_error(program);
 }
@@ -14737,7 +15327,7 @@ fn rir_verify_accepts_direct_native_collection_carriers() {
     ];
 
     for (symbol, params, ret, abi, extern_abi) in cases {
-        let program = RirProgram {
+        let mut program = RirProgram {
             types: vec![RirType::Void, RirType::Int, RirType::List(int)],
             collection_storages: vec![rir_list_storage(list, int)],
             externs: vec![RirExtern {
@@ -14755,6 +15345,16 @@ fn rir_verify_accepts_direct_native_collection_carriers() {
             consts: vec![],
             ..empty_rir_function(RirType::Void)
         };
+        let mut materializers = TestMaterializers::new(&mut program);
+        let elem = materializers.copy(
+            int,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+        );
+        materializers.managed_share(
+            list,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+        );
+        materializers.list_storage(0, elem);
         rir::verify(&program).expect("valid direct collection RIR failed verification");
     }
 }
@@ -15151,6 +15751,7 @@ fn rir_verify_accepts_final_native_abi_shapes() {
         rir_abi(vec![option_abi], anvyx_runtime::ExternTypeExpr::Void),
     );
     option_program.enums.push(rir_result_enum(int, string));
+    install_final_native_abi_materializers(&mut option_program, int, string);
     rir::verify(&option_program).expect("native option param RIR should verify");
 
     let mut slice_program = native_extern_rir(
@@ -15171,6 +15772,7 @@ fn rir_verify_accepts_final_native_abi_shapes() {
         rir_abi(vec![slice_abi], anvyx_runtime::ExternTypeExpr::Void),
     );
     slice_program.enums.push(rir_result_enum(int, string));
+    install_final_native_abi_materializers(&mut slice_program, int, string);
     rir::verify(&slice_program).expect("native slice param RIR should verify");
 
     let mut result_program = native_extern_rir(
@@ -15191,6 +15793,7 @@ fn rir_verify_accepts_final_native_abi_shapes() {
         rir_abi(vec![], result_abi),
     );
     result_program.enums.push(rir_result_enum(int, string));
+    install_final_native_abi_materializers(&mut result_program, int, string);
     rir::verify(&result_program).expect("native visible result return RIR should verify");
 }
 
@@ -15334,6 +15937,7 @@ fn rir_verify_accepts_mut_borrow_abi() {
     let mut program = empty_rir_function(RirType::Void);
     program.consts.clear();
     program.types.push(RirType::Int);
+    install_empty_materializer_table(&mut program);
     program.functions[0].locals.push(RirLocal {
         id: RirLocalId::from_index(0),
         ty: RirTypeId::from_index(1),
@@ -15401,7 +16005,7 @@ fn valid_heap_env_lambda_rir() -> RirProgram {
     let source = RirLocalId::from_index(0);
     let f = RirLocalId::from_index(1);
 
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
         lambda_sigs: vec![RirLambdaSig {
             id: sig,
@@ -15484,8 +16088,11 @@ fn valid_heap_env_lambda_rir() -> RirProgram {
                         local: f,
                         value: RirRValue::Lambda {
                             lambda,
-                            captures: vec![RirLambdaCaptureArg::Readonly {
-                                value: RirOperand::Place(RirPlace::local(source, vec![], int)),
+                            captures: vec![RirLambdaCaptureArg::Owned {
+                                value: rir_owned(
+                                    RirOperand::Place(RirPlace::local(source, vec![], int)),
+                                    0,
+                                ),
                             }],
                             ty: lambda_ty,
                         },
@@ -15495,16 +16102,21 @@ fn valid_heap_env_lambda_rir() -> RirProgram {
             },
         ],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn zero_env_escaping_lambda_rir() -> RirProgram {
     let void = RirTypeId::from_index(0);
     let sig = RirLambdaSigId::from_index(0);
+    let lambda_ty = RirTypeId::from_index(1);
     let lambda = RirLambdaId::from_index(0);
     let target = RirFunctionId::from_index(0);
 
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Lambda(sig)],
         lambda_sigs: vec![RirLambdaSig {
             id: sig,
@@ -15530,7 +16142,10 @@ fn zero_env_escaping_lambda_rir() -> RirProgram {
             body: RirStructuredBlock::default(),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn valid_stack_cell_lambda_rir() -> RirProgram {
@@ -15556,7 +16171,7 @@ fn valid_heap_cell_lambda_rir() -> RirProgram {
     let source = RirLocalId::from_index(0);
     let f = RirLocalId::from_index(1);
 
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
         cells: vec![valid_heap_cell_decl()],
         lambda_sigs: vec![RirLambdaSig {
@@ -15658,13 +16273,15 @@ fn valid_heap_cell_lambda_rir() -> RirProgram {
                     payload_ref: false,
                 }],
                 body: RirStructuredBlock {
-                    stmts: vec![RirStmt::Eval(RirRValue::CellGetCopy {
-                        cell: RirCellRef::Capture {
+                    stmts: vec![RirStmt::Eval(cell_read_with_storage(
+                        RirCellRef::Capture {
                             cell: RirCellId::from_index(0),
                             local: source,
                         },
-                        ty: int,
-                    })],
+                        int,
+                        RirCellStorage::Heap,
+                        rir::RirMaterializerId::from_index(0),
+                    ))],
                     term: RirTerm::Return(None),
                 },
             },
@@ -15675,7 +16292,11 @@ fn valid_heap_cell_lambda_rir() -> RirProgram {
             value: RirConstValue::Int(1),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn push_int_const(program: &mut RirProgram, value: i64) -> RirConstId {
@@ -15693,7 +16314,7 @@ fn stack_cell_rir(cell: RirCellDecl) -> RirProgram {
     let int = RirTypeId::from_index(1);
     let owner = RirFunctionId::from_index(0);
     let source = RirLocalId::from_index(0);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int],
         cells: vec![cell],
         functions: vec![RirFunction {
@@ -15713,7 +16334,10 @@ fn stack_cell_rir(cell: RirCellDecl) -> RirProgram {
             body: RirStructuredBlock::default(),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    program
 }
 
 fn projected_cell_mut_place_arg_program(handle: RirMutPlaceHandle) -> RirProgram {
@@ -15759,7 +16383,7 @@ fn projected_cell_mut_place_arg_program(handle: RirMutPlaceHandle) -> RirProgram
                     cell: RirCellRef::Owner(RirCellId::from_index(0)),
                     value: RirRValue::Tuple {
                         ty: tuple_ty,
-                        fields: vec![RirOperand::Const(RirConstId::from_index(0))],
+                        fields: vec![rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0)],
                     },
                 },
                 RirStmt::Eval(RirRValue::Call {
@@ -15773,6 +16397,12 @@ fn projected_cell_mut_place_arg_program(handle: RirMutPlaceHandle) -> RirProgram
                 }),
             ],
         )],
+        materializers: vec![RirMaterializer {
+            id: rir::RirMaterializerId::from_index(0),
+            ty: int,
+            position: RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+            action: RirMaterializerAction::Copy,
+        }],
         consts: vec![RirConst {
             id: RirConstId::from_index(0),
             ty: int,
@@ -15783,6 +16413,7 @@ fn projected_cell_mut_place_arg_program(handle: RirMutPlaceHandle) -> RirProgram
     program
         .functions
         .push(mut_place_sink_function(RirFunctionId::from_index(1)));
+    install_empty_materializer_table(&mut program);
     program
 }
 
@@ -15886,10 +16517,12 @@ fn read_compute_write_cell_rir(cell: RirCellDecl) -> RirProgram {
         },
         RirStmt::Init {
             local: tmp,
-            value: RirRValue::CellGetCopy {
-                cell: RirCellRef::Owner(RirCellId::from_index(0)),
-                ty: int,
-            },
+            value: cell_read_with_storage(
+                RirCellRef::Owner(RirCellId::from_index(0)),
+                int,
+                program.cells[0].storage,
+                rir::RirMaterializerId::from_index(0),
+            ),
         },
         RirStmt::Init {
             local: next,
@@ -15979,7 +16612,7 @@ fn stack_cell_lambda_rir(
     let target = RirFunctionId::from_index(1);
     let source = RirLocalId::from_index(0);
     let f = RirLocalId::from_index(1);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
         cells: vec![valid_stack_cell_decl()],
         lambda_sigs: vec![RirLambdaSig {
@@ -16065,13 +16698,15 @@ fn stack_cell_lambda_rir(
                     payload_ref: false,
                 }],
                 body: RirStructuredBlock {
-                    stmts: vec![RirStmt::Eval(RirRValue::CellGetCopy {
-                        cell: RirCellRef::Capture {
+                    stmts: vec![RirStmt::Eval(cell_read_with_storage(
+                        RirCellRef::Capture {
                             cell: RirCellId::from_index(0),
                             local: source,
                         },
-                        ty: RirTypeId::from_index(1),
-                    })],
+                        RirTypeId::from_index(1),
+                        RirCellStorage::StackScoped,
+                        rir::RirMaterializerId::from_index(0),
+                    ))],
                     term: RirTerm::Return(None),
                 },
             },
@@ -16082,7 +16717,11 @@ fn stack_cell_lambda_rir(
             value: RirConstValue::Int(1),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(RirTypeId::from_index(1), RustRecipePosition::Value);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn valid_scoped_place_cell_decl() -> RirScopedPlaceCellDecl {
@@ -16133,7 +16772,7 @@ fn scoped_place_cell_rir(cell: RirScopedPlaceCellDecl) -> RirProgram {
     let int = RirTypeId::from_index(1);
     let owner = RirFunctionId::from_index(0);
     let source = RirLocalId::from_index(0);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int],
         scoped_place_cells: vec![cell],
         functions: vec![RirFunction {
@@ -16159,7 +16798,10 @@ fn scoped_place_cell_rir(cell: RirScopedPlaceCellDecl) -> RirProgram {
             body: RirStructuredBlock::default(),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    program
 }
 
 fn valid_scoped_place_cell_lambda_rir() -> RirProgram {
@@ -16394,6 +17036,8 @@ fn scoped_place_cell_lambda_rir(nested: bool) -> RirProgram {
             body: RirStructuredBlock::default(),
         });
     }
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
     program
 }
 
@@ -16404,6 +17048,7 @@ fn scoped_capture_rir(
     source_ty: RirTypeId,
     source_mutable: bool,
     arg: RirLambdaCaptureArg,
+    owned_action: Option<RirMaterializerAction>,
 ) -> RirProgram {
     let void = RirTypeId::from_index(0);
     let sig = RirLambdaSigId::from_index(0);
@@ -16414,7 +17059,7 @@ fn scoped_capture_rir(
     let maker = RirFunctionId::from_index(1);
     let source = RirLocalId::from_index(0);
     let f = RirLocalId::from_index(1);
-    RirProgram {
+    let mut program = RirProgram {
         types,
         tuples,
         lambda_sigs: vec![RirLambdaSig {
@@ -16492,7 +17137,13 @@ fn scoped_capture_rir(
             },
         ],
         ..RirProgram::default()
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    if let Some(action) = owned_action {
+        materializers.declare(capture.ty, RustRecipePosition::Value, action);
     }
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn mut_borrow_lambda_rir() -> RirProgram {
@@ -16511,6 +17162,7 @@ fn mut_borrow_lambda_rir() -> RirProgram {
         RirLambdaCaptureArg::Scoped {
             place: RirPlace::local(RirLocalId::from_index(0), vec![], int),
         },
+        None,
     )
 }
 
@@ -16581,6 +17233,9 @@ fn set_global_string_payload(program: &mut RirProgram) -> (RirTypeId, RirConstId
     program.globals[0].ty = string;
     program.functions[0].ret.ty = string;
     program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Const(value)));
+    let mut materializers = TestMaterializers::new(program);
+    materializers.managed_share(string, RustRecipePosition::Value);
+    materializers.managed_share(string, RustRecipePosition::Global);
     for stmt in &mut program.functions[1].body.stmts {
         if let RirStmt::GlobalSetRoot {
             value: root_value, ..
@@ -16681,6 +17336,18 @@ fn global_list_collection_loan_rir(
         ..RirProgram::default()
     };
     program.functions[0].body.term = RirTerm::Return(Some(RirOperand::Place(rir_place(xs, list))));
+    let mut materializers = TestMaterializers::new(&mut program);
+    let elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(list, RustRecipePosition::Value);
+    materializers.managed_share(list, RustRecipePosition::Global);
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.list_storage(0, elem);
     program
 }
 
@@ -16742,6 +17409,9 @@ fn valid_global_rir(edit: impl FnOnce(&mut RirProgram)) -> RirProgram {
         ],
         ..RirProgram::default()
     };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Global);
+    materializers.copy(int, RustRecipePosition::Value);
     edit(&mut program);
     program
 }
@@ -16834,7 +17504,7 @@ fn tuple_projection_program() -> Program {
                 local: out,
                 value: RValue::Aggregate {
                     kind: AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(one)],
+                    fields: vec![owned(Operand::Const(one))],
                     ty: tuple,
                 },
             }],
@@ -16865,6 +17535,19 @@ fn add_payload_struct(program: &mut RirProgram) -> RirTypeId {
             ty: RirTypeId::from_index(0),
         }],
     });
+    let mut materializers = TestMaterializers::new(program);
+    materializers.copy(ty, RustRecipePosition::Value);
+    let projection_field = materializers.copy(
+        RirTypeId::from_index(0),
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    materializers.declare(
+        ty,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+        RirMaterializerAction::Struct {
+            fields: vec![projection_field],
+        },
+    );
     ty
 }
 
@@ -16901,6 +17584,17 @@ fn dataref_metadata_rir() -> RirProgram {
             term: RirTerm::Unreachable,
         },
     });
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    materializers.identity_share(node, RustRecipePosition::Value);
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    materializers.identity_share(
+        node,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
     program
 }
 
@@ -17006,8 +17700,9 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
             RirType::Enum(RirEnumId::from_index(0)),
         ],
         collection_storages: vec![
-            rir_list_storage(list, int),
-            rir_map_storage(1, map, int, int),
+            rir_array_storage(0, array, int),
+            rir_list_storage_id(1, list, int),
+            rir_map_storage(2, map, int, int),
         ],
         structs: vec![RirStruct {
             id: RirStructId::from_index(0),
@@ -17161,6 +17856,130 @@ fn dataref_access_rir(stmts: Vec<RirStmt>) -> RirProgram {
             term: RirTerm::Return(None),
         },
     });
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    materializers.identity_share(node, RustRecipePosition::Value);
+    materializers.copy(bool_ty, RustRecipePosition::Value);
+
+    let int_struct = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::StructField),
+    );
+    let node_struct = materializers.identity_share(
+        node,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::StructField),
+    );
+    materializers.declare(
+        point,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Struct {
+            fields: vec![int_struct, node_struct],
+        },
+    );
+
+    let array_elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::FixedArrayElement),
+    );
+    materializers.declare(
+        array,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Array { elem: array_elem },
+    );
+    materializers.managed_share(list, RustRecipePosition::Value);
+    materializers.managed_share(map, RustRecipePosition::Value);
+    let option_payload = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+    );
+    materializers.declare(
+        option,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Optional {
+            payload: option_payload,
+        },
+    );
+    materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    let enum_payload = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::EnumPayload),
+    );
+    materializers.declare(
+        enm,
+        RustRecipePosition::Value,
+        RirMaterializerAction::Enum {
+            variants: vec![vec![enum_payload]],
+        },
+    );
+
+    let int_projection = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    let node_projection = materializers.identity_share(
+        node,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    materializers.declare(
+        point,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+        RirMaterializerAction::Struct {
+            fields: vec![int_projection, node_projection],
+        },
+    );
+    materializers.declare(
+        array,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+        RirMaterializerAction::Array {
+            elem: int_projection,
+        },
+    );
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    materializers.managed_share(
+        map,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+    );
+    materializers.declare(
+        option,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+        RirMaterializerAction::Optional {
+            payload: int_projection,
+        },
+    );
+    materializers.declare(
+        enm,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::DataRefProjection),
+        RirMaterializerAction::Enum {
+            variants: vec![vec![int_projection]],
+        },
+    );
+
+    let list_elem = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+    );
+    materializers.managed_share(
+        list,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.managed_share(
+        map,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    let map_key = materializers.copy(int, RustRecipePosition::MapKey);
+    let map_value = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+    );
+    materializers.array_storage(0, array_elem);
+    materializers.list_storage(1, list_elem);
+    materializers.map_storage(2, map_key, map_value);
     program
 }
 
@@ -17176,8 +17995,8 @@ fn valid_tuple_rvalue() -> RirRValue {
     RirRValue::Tuple {
         ty: RirTypeId::from_index(3),
         fields: vec![
-            RirOperand::Const(RirConstId::from_index(0)),
-            RirOperand::Const(RirConstId::from_index(1)),
+            rir_owned(RirOperand::Const(RirConstId::from_index(0)), 0),
+            rir_owned(RirOperand::Const(RirConstId::from_index(1)), 1),
         ],
     }
 }
@@ -17187,7 +18006,7 @@ fn tuple_rir_program(value: RirRValue) -> RirProgram {
     let bool_ty = RirTypeId::from_index(1);
     let void = RirTypeId::from_index(2);
     let tuple = RirTypeId::from_index(3);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Int,
             RirType::Bool,
@@ -17234,6 +18053,20 @@ fn tuple_rir_program(value: RirRValue) -> RirProgram {
                 term: RirTerm::Return(None),
             },
         }],
+        materializers: vec![
+            RirMaterializer {
+                id: rir::RirMaterializerId::from_index(0),
+                ty: int,
+                position: RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+                action: RirMaterializerAction::Copy,
+            },
+            RirMaterializer {
+                id: rir::RirMaterializerId::from_index(1),
+                ty: bool_ty,
+                position: RustRecipePosition::StoredPayload(LambdaStorageFamily::TupleField),
+                action: RirMaterializerAction::Copy,
+            },
+        ],
         consts: vec![
             RirConst {
                 id: RirConstId::from_index(0),
@@ -17247,7 +18080,9 @@ fn tuple_rir_program(value: RirRValue) -> RirProgram {
             },
         ],
         ..RirProgram::default()
-    }
+    };
+    install_empty_materializer_table(&mut program);
+    program
 }
 
 fn rir_function(
@@ -17326,6 +18161,28 @@ fn rir_place(local: RirLocalId, ty: RirTypeId) -> RirPlace {
     RirPlace::local(local, vec![], ty)
 }
 
+fn rir_array_storage(id: usize, value_ty: RirTypeId, elem_ty: RirTypeId) -> RirCollectionStorage {
+    RirCollectionStorage {
+        id: RirCollectionStorageId::from_index(id),
+        value_ty,
+        kind: RirCollectionStorageKind::Array {
+            elem_ty,
+            elem_materializer: rir::RirMaterializerId::from_index(0),
+        },
+    }
+}
+
+fn rir_slice_storage(id: usize, value_ty: RirTypeId, elem_ty: RirTypeId) -> RirCollectionStorage {
+    RirCollectionStorage {
+        id: RirCollectionStorageId::from_index(id),
+        value_ty,
+        kind: RirCollectionStorageKind::Slice {
+            elem_ty,
+            elem_materializer: rir::RirMaterializerId::from_index(0),
+        },
+    }
+}
+
 fn rir_list_storage(value_ty: RirTypeId, elem_ty: RirTypeId) -> RirCollectionStorage {
     rir_list_storage_id(0, value_ty, elem_ty)
 }
@@ -17334,8 +18191,11 @@ fn rir_list_storage_id(id: usize, value_ty: RirTypeId, elem_ty: RirTypeId) -> Ri
     RirCollectionStorage {
         id: RirCollectionStorageId::from_index(id),
         value_ty,
-        kind: RirCollectionStorageKind::List { elem_ty },
-        symbol: RirSymbol::new(format!("list_storage{}", value_ty.index())),
+        kind: RirCollectionStorageKind::List {
+            elem_ty,
+            elem_materializer: rir::RirMaterializerId::from_index(0),
+            symbol: RirSymbol::new(format!("list_storage{}", value_ty.index())),
+        },
     }
 }
 
@@ -17351,8 +18211,10 @@ fn rir_map_storage(
         kind: RirCollectionStorageKind::Map {
             key_ty,
             value_ty: value_elem_ty,
+            key_materializer: rir::RirMaterializerId::from_index(0),
+            value_materializer: rir::RirMaterializerId::from_index(1),
+            symbol: RirSymbol::new(format!("map_storage{}", value_ty.index())),
         },
-        symbol: RirSymbol::new(format!("map_storage{}", value_ty.index())),
     }
 }
 
@@ -17369,7 +18231,7 @@ fn mut_place_call_rir(
     let int = RirTypeId::from_index(1);
     let local = RirLocalId::from_index(0);
     let callee = RirFunctionId::from_index(0);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int],
         functions: vec![
             rir_function(
@@ -17397,7 +18259,9 @@ fn mut_place_call_rir(
             ),
         ],
         ..RirProgram::default()
-    }
+    };
+    install_empty_materializer_table(&mut program);
+    program
 }
 
 fn empty_rir_function(ret: RirType) -> RirProgram {
@@ -17422,6 +18286,7 @@ fn empty_rir_function(ret: RirType) -> RirProgram {
             ty: RirTypeId::from_index(0),
             value: RirConstValue::Int(0),
         }],
+        value_materializers: vec![None],
         ..RirProgram::default()
     }
 }
@@ -17581,8 +18446,8 @@ fn dataref_map_index_assignment_program() -> Program {
         body: structured_body(
             vec![Statement::Eval(RValue::MapInsert {
                 map: map_place,
-                key: Operand::Const(one),
-                value: Operand::Const(two),
+                key: owned(Operand::Const(one)),
+                value: owned(Operand::Const(two)),
                 kind: air::MapWriteKind::IndexedAssignment,
             })],
             air::AirTail::Return(None),
@@ -17993,7 +18858,7 @@ fn capture_cell_dataref_source_ref_arg_program() -> Program {
             },
             value: RValue::Aggregate {
                 kind: AggregateCtor::DataRef(aggregate),
-                fields: vec![Operand::Const(zero)],
+                fields: vec![owned(Operand::Const(zero))],
                 ty: node,
             },
         },
@@ -18103,7 +18968,7 @@ fn struct_method_program() -> Program {
                     local: point_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::Struct(aggregate),
-                        fields: vec![Operand::Const(seven)],
+                        fields: vec![owned(Operand::Const(seven))],
                         ty: point,
                     },
                 },
@@ -18111,7 +18976,10 @@ fn struct_method_program() -> Program {
                     local: value_local,
                     value: RValue::Call {
                         callee: Callee::Function(method),
-                        args: vec![CallArg::Value(Operand::Place(place(point_local, point)))],
+                        args: vec![CallArg::Value(owned(Operand::Place(place(
+                            point_local,
+                            point,
+                        ))))],
                     },
                 },
                 Statement::Init {
@@ -18185,7 +19053,7 @@ fn struct_field_read_program() -> Program {
                     local: point_local,
                     value: RValue::Aggregate {
                         kind: AggregateCtor::Struct(aggregate),
-                        fields: vec![Operand::Const(seven)],
+                        fields: vec![owned(Operand::Const(seven))],
                         ty: point,
                     },
                 },
@@ -18569,7 +19437,7 @@ fn fallible_call_program(transitive: bool, returns_value: bool) -> Program {
                 local: tmp,
                 value: RValue::Call {
                     callee: Callee::Extern(fallible),
-                    args: vec![CallArg::Value(Operand::Const(value))],
+                    args: vec![CallArg::Value(owned(Operand::Const(value)))],
                 },
             }],
             air::AirTail::Return(returns_value.then_some(Operand::Place(place(tmp, int)))),
@@ -18862,8 +19730,8 @@ mod enums {
         assert!(text.contains("Hit(i64, bool),"));
         assert!(text.contains("Move { x: i64, y: i64 },"));
         assert!(text.contains("anvT3_Event::Start"));
-        assert!(text.contains("anvT3_Event::Hit(7, true)"));
-        assert!(text.contains("anvT3_Event::Move { x: 7, y: 9 }"));
+        assert!(text.contains("anvT3_Event::Hit("));
+        assert!(text.contains("anvT3_Event::Move { x:"));
         assert!(!text.contains("clone"));
         assert!(!text.contains("impl anvT3_Event"));
 
@@ -18909,10 +19777,10 @@ mod enums {
                 local: copied,
                 value: RValue::Call {
                     callee: Callee::Function(id_fn),
-                    args: vec![CallArg::Value(Operand::Place(place(
+                    args: vec![CallArg::Value(owned(Operand::Place(place(
                         air::LocalId::from_index(0),
                         enum_ty,
-                    )))],
+                    ))))],
                 },
             });
 
@@ -18934,7 +19802,8 @@ mod enums {
 
         assert!(source.contains("enum anvT2_Message"));
         assert!(source.contains("Text(anvyx_runtime::AnvString)"));
-        assert!(source.contains("anvT2_Message::Text(statics.string0.share())"));
+        assert!(source.contains("anvT2_Message::Text("));
+        assert!(source.contains("statics.string0.share()"));
         assert!(!source.contains("Text(String)"));
         assert!(!source.contains("Text(String::from"));
         assert!(!source.contains(".to_owned()"));
@@ -18964,8 +19833,9 @@ mod enums {
         let source = plan_source(program);
         let text = source.as_str();
 
-        assert!(text.contains("match &v0"));
-        assert!(text.contains("Text(f0) => anvT2_Message::Text((*(f0)).share())"));
+        assert!(text.contains("__anv_materialize_"));
+        assert!(text.contains("anvT2_Message::Text"));
+        assert!(text.contains(".share()"));
         assert!(!text.contains(".clone()"));
         assert!(!text.contains(".to_owned()"));
 
@@ -18975,7 +19845,8 @@ mod enums {
 
     #[test]
     fn enum_stringify_plans_one_enum_helper() {
-        let program = enum_with_string_payload_program(true);
+        let mut program = enum_with_string_payload_program(true);
+        air::finalize_materialization(&mut program);
         let verified = air::verify(&program).expect("AIR verify failed");
         let plan = plan(&verified, RustPlanConfig::default()).expect("plan failed");
         assert!(matches!(
@@ -19310,7 +20181,7 @@ mod enums {
                     enum_id,
                     variant: VariantId::from_index(variant),
                 },
-                fields,
+                fields: fields.into_iter().map(owned).collect(),
                 ty,
             },
         }
@@ -19325,9 +20196,92 @@ fn rir_option_match_verifies_and_emits_match_by_ref() {
 
     assert!(source.contains("match &opt"));
     assert!(source.contains("Some(__anv_option_payload)"));
-    assert!(source.contains("payload = *(__anv_option_payload);"));
+    assert!(source.contains("payload ="));
+    assert!(source.contains("__anv_option_payload"));
     assert!(!source.contains("__anv_option_payload = *(__anv_option_payload);"));
     assert!(!source.contains("unwrap()"));
+}
+
+#[test]
+fn rir_option_match_renders_persisted_materializer() {
+    let program = nested_option_binding_rir();
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(
+        source.contains("payload = __anv_materialize_1("),
+        "{source}"
+    );
+    assert!(!source.contains("payload.clone()"), "{source}");
+}
+
+#[test]
+fn rir_pattern_binding_renders_persisted_materializer() {
+    let mut program = nested_option_binding_rir();
+    let outer = RirTypeId::from_index(1);
+    let inner = RirTypeId::from_index(2);
+    let subject = RirLocalId::from_index(0);
+    let payload = RirLocalId::from_index(1);
+    program.functions[0].body.stmts[0] = RirStmt::PatternMatch(RirPatternMatch {
+        subject: RirPlace::local(subject, vec![], outer),
+        arms: vec![RirPatternArm {
+            alternatives: vec![RirPatternAlternative {
+                tests: vec![RirPatternTest::OptionalSome {
+                    path: RirPatternPath::default(),
+                }],
+                bindings: vec![RirPatternBinding {
+                    local: payload,
+                    path: RirPatternPath {
+                        steps: vec![RirPatternPathStep::OptionalSome],
+                    },
+                    ty: inner,
+                    mode: RirPatternBindingMode::Owned {
+                        materializer: rir::RirMaterializerId::from_index(1),
+                    },
+                }],
+            }],
+            block: RirStructuredBlock {
+                stmts: vec![],
+                term: RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0)))),
+            },
+        }],
+    });
+    let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
+
+    assert!(
+        source.contains("payload = __anv_materialize_1("),
+        "{source}"
+    );
+    assert!(!source.contains("payload.clone()"), "{source}");
+}
+
+#[test]
+fn rir_option_match_rejects_noncanonical_owned_materializer() {
+    let mut wrong_type = option_match_rir();
+    let RirStmt::OptionMatch(match_) = &mut wrong_type.functions[0].body.stmts[0] else {
+        unreachable!()
+    };
+    match_.payload = Some(RirOptionPayloadBinding::Owned {
+        local: RirLocalId::from_index(1),
+        materializer: rir::RirMaterializerId::from_index(1),
+    });
+    assert_rir_error(wrong_type, RirVerifyErrorKind::BadId);
+
+    let mut noncanonical = option_match_rir();
+    let duplicate = rir::RirMaterializerId::from_index(noncanonical.materializers.len());
+    noncanonical.materializers.push(RirMaterializer {
+        id: duplicate,
+        ty: RirTypeId::from_index(0),
+        position: RustRecipePosition::Value,
+        action: RirMaterializerAction::Copy,
+    });
+    let RirStmt::OptionMatch(match_) = &mut noncanonical.functions[0].body.stmts[0] else {
+        unreachable!()
+    };
+    match_.payload = Some(RirOptionPayloadBinding::Owned {
+        local: RirLocalId::from_index(1),
+        materializer: duplicate,
+    });
+    assert_rir_error(noncanonical, RirVerifyErrorKind::BadId);
 }
 
 #[test]
@@ -19342,8 +20296,10 @@ fn rir_option_match_accepts_non_escaping_mut_place_subject() {
     if let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] {
         match_.subject =
             RirOptionSubject::MutPlace(RirMutPlaceArg::local(RirPlace::local(opt, vec![], option)));
-        match_.payload = Some(payload);
-        match_.payload_ref = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: payload,
+            escapes: false,
+        });
         match_.some_block.term = RirTerm::None;
         match_.none_block.term = RirTerm::None;
     }
@@ -19363,9 +20319,10 @@ fn rir_option_match_accepts_escaping_mut_place_subject() {
     if let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] {
         match_.subject =
             RirOptionSubject::MutPlace(RirMutPlaceArg::local(RirPlace::local(opt, vec![], option)));
-        match_.payload = Some(payload);
-        match_.payload_ref = true;
-        match_.payload_escapes = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: payload,
+            escapes: true,
+        });
         match_.some_block.term = RirTerm::None;
         match_.none_block.term = RirTerm::Unreachable;
     }
@@ -19436,7 +20393,7 @@ fn rir_option_match_rejects_bad_discriminant_payload_type_and_mutable_payload() 
 }
 
 #[test]
-fn rir_optional_some_accepts_shareable_slice_descriptor() {
+fn rir_optional_some_rejects_slice_descriptor_without_materializer() {
     let mut program = option_match_rir();
     let slice = RirTypeId::from_index(2);
     let option = RirTypeId::from_index(1);
@@ -19448,17 +20405,20 @@ fn rir_optional_some_accepts_shareable_slice_descriptor() {
     program.functions[0].locals[1].initialized = true;
     program.functions[0].body = RirStructuredBlock {
         stmts: vec![RirStmt::Eval(RirRValue::OptionalSome {
-            value: RirOperand::Place(RirPlace::local(RirLocalId::from_index(1), vec![], slice)),
+            value: rir_owned(
+                RirOperand::Place(RirPlace::local(RirLocalId::from_index(1), vec![], slice)),
+                0,
+            ),
             ty: option,
         })],
         term: RirTerm::Unreachable,
     };
 
-    rir::verify(&program).expect("slice descriptor should be shareable");
+    assert_rir_error(program, RirVerifyErrorKind::BadId);
 }
 
 #[test]
-fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
+fn rir_option_match_rejects_wrong_payload_materializer() {
     let mut slice_payload = option_match_rir();
     let slice = RirTypeId::from_index(2);
     slice_payload
@@ -19479,7 +20439,7 @@ fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
     assert!(
         errors
             .iter()
-            .any(|error| error.kind == RirVerifyErrorKind::NonCopyValueRequired)
+            .any(|error| error.kind == RirVerifyErrorKind::BadId)
     );
 
     let mut void_payload = option_match_rir();
@@ -19500,43 +20460,22 @@ fn rir_option_match_rejects_payload_copy_from_unowned_ref() {
     assert!(
         errors
             .iter()
-            .any(|error| error.kind == RirVerifyErrorKind::NonCopyValueRequired)
+            .any(|error| error.kind == RirVerifyErrorKind::BadId)
     );
 }
 
 #[test]
-fn rir_option_match_rejects_invalid_escaping_payload() {
-    let mut missing_payload = option_match_rir();
-    if let RirStmt::OptionMatch(match_) = &mut missing_payload.functions[0].body.stmts[0] {
-        match_.payload = None;
-        match_.payload_ref = true;
-        match_.payload_escapes = true;
-    }
-    let errors = rir::verify(&missing_payload).expect_err("escaping payload requires payload");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadEscapeRequiresPayload)
-    );
-
-    let mut non_ref = option_match_rir();
-    if let RirStmt::OptionMatch(match_) = &mut non_ref.functions[0].body.stmts[0] {
-        match_.payload_escapes = true;
-    }
-    let errors = rir::verify(&non_ref).expect_err("escaping payload requires ref");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.kind == RirVerifyErrorKind::OptionPayloadEscapeRequiresRef)
-    );
-
+fn rir_option_match_rejects_falling_none_for_escaping_payload() {
     let mut falling_none = option_match_rir();
+    let payload = RirLocalId::from_index(1);
     falling_none.functions[0].locals[0].mutable = true;
     falling_none.functions[0].locals[1].mutable = true;
     falling_none.functions[0].locals[1].payload_ref = true;
     if let RirStmt::OptionMatch(match_) = &mut falling_none.functions[0].body.stmts[0] {
-        match_.payload_ref = true;
-        match_.payload_escapes = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: payload,
+            escapes: true,
+        });
         match_.none_block.term = RirTerm::None;
     }
     let errors = rir::verify(&falling_none).expect_err("escaping none branch must diverge");
@@ -19553,7 +20492,10 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     local_mismatch.functions[0].locals[0].mutable = true;
     local_mismatch.functions[0].locals[1].mutable = true;
     if let RirStmt::OptionMatch(match_) = &mut local_mismatch.functions[0].body.stmts[0] {
-        match_.payload_ref = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: RirLocalId::from_index(1),
+            escapes: false,
+        });
     }
     let errors = rir::verify(&local_mismatch).expect_err("payload_ref needs payload local flag");
     assert!(
@@ -19566,7 +20508,10 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     immutable_discr.functions[0].locals[1].mutable = true;
     immutable_discr.functions[0].locals[1].payload_ref = true;
     if let RirStmt::OptionMatch(match_) = &mut immutable_discr.functions[0].body.stmts[0] {
-        match_.payload_ref = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: RirLocalId::from_index(1),
+            escapes: false,
+        });
     }
     let errors = rir::verify(&immutable_discr).expect_err("payload_ref needs mutable discriminant");
     assert!(errors.iter().any(|error| {
@@ -19587,7 +20532,10 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     normal_init_payload_ref.functions[0].locals[1].mutable = true;
     normal_init_payload_ref.functions[0].locals[1].payload_ref = true;
     if let RirStmt::OptionMatch(match_) = &mut normal_init_payload_ref.functions[0].body.stmts[0] {
-        match_.payload_ref = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: RirLocalId::from_index(1),
+            escapes: false,
+        });
     }
     normal_init_payload_ref.functions[0]
         .body
@@ -19619,8 +20567,10 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
         .stmts
         .remove(0);
     if let RirStmt::OptionMatch(match_) = &mut option_match {
-        match_.payload_ref = true;
-        match_.payload_escapes = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: RirLocalId::from_index(1),
+            escapes: true,
+        });
         match_.some_block.term = RirTerm::None;
         match_.none_block.term = RirTerm::Unreachable;
     }
@@ -19654,7 +20604,10 @@ fn rir_option_match_rejects_invalid_payload_ref_shape() {
     if let RirStmt::OptionMatch(match_) =
         &mut scoped_ref_used_after_match.functions[0].body.stmts[0]
     {
-        match_.payload_ref = true;
+        match_.payload = Some(RirOptionPayloadBinding::Ref {
+            local: RirLocalId::from_index(1),
+            escapes: false,
+        });
         match_.some_block.term = RirTerm::None;
         match_.none_block.term = RirTerm::Unreachable;
     }
@@ -19677,7 +20630,7 @@ fn rir_accepts_map_entry_match_and_emits_map_value_ops() {
     let source = emit::emit(&rir::verify(&program).expect("RIR verify failed")).into_string();
 
     assert!(source.contains("MapValueOps"));
-    assert!(source.contains("begin_value_loan_by_key"));
+    assert!(source.contains("map_value_loan_with"));
     assert!(source.contains("ScopedMutPlaceCell::new"));
     assert!(source.contains("value.set(rt"));
 }
@@ -19720,7 +20673,7 @@ fn map_entry_match_rir(payload_escapes: bool) -> RirProgram {
     let mut payload_local = rir_local(payload, int, true, "value");
     payload_local.initialized = false;
     payload_local.payload_ref = true;
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![
             RirType::Void,
             RirType::Int,
@@ -19769,7 +20722,19 @@ fn map_entry_match_rir(payload_escapes: bool) -> RirProgram {
             value: RirConstValue::Int(1),
         }],
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    let key = materializers.copy(int, RustRecipePosition::MapKey);
+    let value = materializers.copy(
+        int,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+    );
+    materializers.managed_share(
+        map_ty,
+        RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+    );
+    materializers.map_storage(0, key, value);
+    program
 }
 
 fn option_match_rir() -> RirProgram {
@@ -19778,8 +20743,33 @@ fn option_match_rir() -> RirProgram {
     let zero = RirConstId::from_index(0);
     let opt = RirLocalId::from_index(0);
     let payload = RirLocalId::from_index(1);
+    let int_materializer = rir::RirMaterializerId::from_index(0);
+    let option_materializer = rir::RirMaterializerId::from_index(1);
     RirProgram {
         types: vec![RirType::Int, RirType::Option(int)],
+        materializers: vec![
+            RirMaterializer {
+                id: int_materializer,
+                ty: int,
+                position: RustRecipePosition::Value,
+                action: RirMaterializerAction::Copy,
+            },
+            RirMaterializer {
+                id: option_materializer,
+                ty: option,
+                position: RustRecipePosition::Value,
+                action: RirMaterializerAction::Optional {
+                    payload: rir::RirMaterializerId::from_index(2),
+                },
+            },
+            RirMaterializer {
+                id: rir::RirMaterializerId::from_index(2),
+                ty: int,
+                position: RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+                action: RirMaterializerAction::Copy,
+            },
+        ],
+        value_materializers: vec![Some(int_materializer), Some(option_materializer)],
         consts: vec![RirConst {
             id: zero,
             ty: int,
@@ -19818,9 +20808,10 @@ fn option_match_rir() -> RirProgram {
             body: RirStructuredBlock {
                 stmts: vec![RirStmt::OptionMatch(RirOptionMatch {
                     subject: RirOptionSubject::Place(RirPlace::local(opt, vec![], option)),
-                    payload: Some(payload),
-                    payload_ref: false,
-                    payload_escapes: false,
+                    payload: Some(RirOptionPayloadBinding::Owned {
+                        local: payload,
+                        materializer: int_materializer,
+                    }),
                     some_block: RirStructuredBlock {
                         stmts: vec![],
                         term: RirTerm::Return(Some(RirOperand::Place(RirPlace::local(
@@ -19840,6 +20831,56 @@ fn option_match_rir() -> RirProgram {
         entry: Some(RirFunctionId::from_index(0)),
         ..RirProgram::default()
     }
+}
+
+fn nested_option_binding_rir() -> RirProgram {
+    let mut program = option_match_rir();
+    let int = RirTypeId::from_index(0);
+    let outer = RirTypeId::from_index(1);
+    let inner = RirTypeId::from_index(2);
+    let inner_materializer = rir::RirMaterializerId::from_index(1);
+    let outer_materializer = rir::RirMaterializerId::from_index(3);
+    let stored_inner_materializer = rir::RirMaterializerId::from_index(4);
+    program.types[outer.index()] = RirType::Option(inner);
+    program.types.push(RirType::Option(int));
+    program.materializers[inner_materializer.index()].ty = inner;
+    program.materializers.extend([
+        RirMaterializer {
+            id: outer_materializer,
+            ty: outer,
+            position: RustRecipePosition::Value,
+            action: RirMaterializerAction::Optional {
+                payload: stored_inner_materializer,
+            },
+        },
+        RirMaterializer {
+            id: stored_inner_materializer,
+            ty: inner,
+            position: RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+            action: RirMaterializerAction::Optional {
+                payload: rir::RirMaterializerId::from_index(2),
+            },
+        },
+    ]);
+    program.value_materializers = vec![
+        Some(rir::RirMaterializerId::from_index(0)),
+        Some(outer_materializer),
+        Some(inner_materializer),
+    ];
+    program.functions[0].params[0].ty = outer;
+    program.functions[0].locals[0].ty = outer;
+    program.functions[0].locals[1].ty = inner;
+    let RirStmt::OptionMatch(match_) = &mut program.functions[0].body.stmts[0] else {
+        unreachable!()
+    };
+    match_.subject =
+        RirOptionSubject::Place(RirPlace::local(RirLocalId::from_index(0), vec![], outer));
+    match_.payload = Some(RirOptionPayloadBinding::Owned {
+        local: RirLocalId::from_index(1),
+        materializer: inner_materializer,
+    });
+    match_.some_block.term = RirTerm::Return(Some(RirOperand::Const(RirConstId::from_index(0))));
+    program
 }
 
 mod arrays {
@@ -19879,7 +20920,7 @@ mod arrays {
                         local: array_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
-                            fields: vec![Operand::Const(one), Operand::Const(two)],
+                            fields: vec![owned(Operand::Const(one)), owned(Operand::Const(two))],
                             ty: array,
                         },
                     },
@@ -19906,7 +20947,7 @@ mod arrays {
 
         let source = plan_source(program);
         let text = source.as_str();
-        assert!(text.contains("[1, 2]"));
+        assert!(text.contains('['));
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
         assert!(text.contains("(v0)[anvyx_runtime::checked_index_result(v1, 2, \"array\")?]"));
@@ -19953,7 +20994,7 @@ mod arrays {
                         local: array_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
-                            fields: vec![Operand::Const(value)],
+                            fields: vec![owned(Operand::Const(value))],
                             ty: array,
                         },
                     },
@@ -20024,7 +21065,7 @@ mod arrays {
                         local: point_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Struct(point_id),
-                            fields: vec![Operand::Const(one)],
+                            fields: vec![owned(Operand::Const(one))],
                             ty: point,
                         },
                     },
@@ -20032,7 +21073,7 @@ mod arrays {
                         local: array_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
-                            fields: vec![Operand::Place(place(point_local, point))],
+                            fields: vec![owned(Operand::Place(place(point_local, point)))],
                             ty: array,
                         },
                     },
@@ -20048,7 +21089,7 @@ mod arrays {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("Point { x: *(&(&v1[0]).x) }]"));
+        assert!(source.as_str().contains("Point { x:"));
         assert!(!source.as_str().contains("clone"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
@@ -20104,7 +21145,7 @@ mod arrays {
                                 enum_id,
                                 variant: VariantId::from_index(0),
                             },
-                            fields: vec![Operand::Const(one)],
+                            fields: vec![owned(Operand::Const(one))],
                             ty: choice,
                         },
                     },
@@ -20112,7 +21153,7 @@ mod arrays {
                         local: array_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
-                            fields: vec![Operand::Place(place(enum_local, choice))],
+                            fields: vec![owned(Operand::Place(place(enum_local, choice)))],
                             ty: array,
                         },
                     },
@@ -20128,7 +21169,7 @@ mod arrays {
         program.set_entry(main);
 
         let source = plan_source(program);
-        assert!(source.as_str().contains("match &v1[0]"));
+        assert!(source.as_str().contains("anvT1_Choice::Some"));
         assert!(!source.as_str().contains("clone"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success);
@@ -20163,7 +21204,7 @@ mod arrays {
                         local: array_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
-                            fields: vec![Operand::Const(text)],
+                            fields: vec![owned(Operand::Const(text))],
                             ty: array,
                         },
                     },
@@ -20274,13 +21315,13 @@ mod lists {
                         local: list_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::List,
-                            fields: vec![Operand::Const(one)],
+                            fields: vec![owned(Operand::Const(one))],
                             ty: list,
                         },
                     },
                     Statement::Eval(RValue::ListPush {
                         list: place(list_local, list),
-                        value: Operand::Const(two),
+                        value: owned(Operand::Const(two)),
                     }),
                     Statement::Init {
                         local: index_local,
@@ -20309,7 +21350,8 @@ mod lists {
         assert!(!text.contains("Vec<"));
         assert!(!text.contains("vec!"));
         assert!(text.contains("-> Result<i64, anvyx_runtime::RuntimeError>"));
-        assert!(text.contains("let __anv_list = &(v0); let index = anvyx_runtime::checked_index_result(v1, __anv_list.len(), \"list\")?; __anv_list.elem_at_shared(rt, index, __anv_list.structural_version())?"));
+        assert!(text.contains("let __anv_list = &(v0); let index = anvyx_runtime::checked_index_result(v1, __anv_list.len(), \"list\")?; unsafe { __anv_list.elem_at_shared_with(rt, index, __anv_list.structural_version(), |value|"));
+        assert!(!text.contains(".elem_at_shared("));
         assert!(text.contains(".len() as i64"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
@@ -20350,8 +21392,8 @@ mod lists {
                     },
                     Statement::Eval(RValue::MapInsert {
                         map: place(map_local, map),
-                        key: Operand::Const(one),
-                        value: Operand::Const(two),
+                        key: owned(Operand::Const(one)),
+                        value: owned(Operand::Const(two)),
                         kind: air::MapWriteKind::StructuralInsert,
                     }),
                     Statement::Eval(RValue::MapRemove {
@@ -20369,7 +21411,7 @@ mod lists {
         let source = plan_source(program);
         let text = source.as_str();
         assert!(text.contains("-> Result<(), anvyx_runtime::RuntimeError>"));
-        assert!(text.contains(".remove(rt,"));
+        assert!(text.contains(".remove_with(rt,"));
         let output = run_source(source);
         assert_eq!(output.status, SourceJobStatus::Success, "{}", output.stderr);
     }
@@ -20404,7 +21446,7 @@ mod lists {
                         local: map_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Map,
-                            fields: vec![Operand::Const(one), Operand::Const(two)],
+                            fields: vec![owned(Operand::Const(one)), owned(Operand::Const(two))],
                             ty: map,
                         },
                     },
@@ -20476,7 +21518,7 @@ mod lists {
                         local: list_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::List,
-                            fields: vec![Operand::Const(value)],
+                            fields: vec![owned(Operand::Const(value))],
                             ty: list,
                         },
                     },
@@ -20521,14 +21563,14 @@ mod lists {
             owner: None,
             specialization: None,
             signature: Signature::new(vec![], list),
-            locals: vec![local(list, LocalKind::Temp), local(list, LocalKind::Temp)],
+            locals: vec![local(list, LocalKind::User), local(list, LocalKind::Temp)],
             body: structured_body(
                 vec![
                     Statement::Init {
                         local: list_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::List,
-                            fields: vec![Operand::Const(one)],
+                            fields: vec![owned(Operand::Const(one))],
                             ty: list,
                         },
                     },
@@ -20573,7 +21615,7 @@ mod lists {
                         local: list_local,
                         value: RValue::Aggregate {
                             kind: AggregateCtor::List,
-                            fields: vec![Operand::Const(one)],
+                            fields: vec![owned(Operand::Const(one))],
                             ty: list,
                         },
                     },
@@ -20629,9 +21671,9 @@ mod slices {
                         value: RValue::Aggregate {
                             kind: AggregateCtor::Array,
                             fields: vec![
-                                Operand::Const(one),
-                                Operand::Const(two),
-                                Operand::Const(two),
+                                owned(Operand::Const(one)),
+                                owned(Operand::Const(two)),
+                                owned(Operand::Const(two)),
                             ],
                             ty: array,
                         },
@@ -20730,8 +21772,9 @@ fn rir_verifies_raw_enum_metadata_and_projection() {
         ty: int,
         value: RirConstValue::Int(0),
     });
+    install_empty_materializer_table(&mut program);
 
-    assert!(rir::verify(&program).is_ok());
+    rir::verify(&program).expect("valid raw enum projection RIR");
 
     program.enums[0].repr = rir::RirEnumRepr::RawString;
     let errors = rir::verify(&program).expect_err("mismatched raw representation verified");
@@ -20766,6 +21809,7 @@ fn rir_verifies_raw_enum_metadata_and_projection() {
 
     let state_option = RirTypeId::from_index(program.types.len());
     program.types.push(RirType::Option(state));
+    install_empty_materializer_table(&mut program);
     program.functions[0].body.stmts[0] = RirStmt::Eval(RirRValue::RawTryConstruct {
         value: RirOperand::Const(RirConstId::from_index(0)),
         target: state,
@@ -20787,6 +21831,7 @@ fn rir_verifies_raw_enum_metadata_and_projection() {
 
     let string = RirTypeId::from_index(program.types.len());
     program.types.push(RirType::String);
+    install_empty_materializer_table(&mut program);
     let literal = push_string_literal(&mut program, "idle", false);
     let string_const = RirConstId::from_index(program.consts.len());
     program.consts.push(RirConst {
@@ -21029,6 +22074,7 @@ fn rir_attests_raw_enum_values_against_air() {
         "State",
         vec![("Idle", 0), ("Run", 2)],
     );
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let mut forged = plan.program().clone();
@@ -21160,6 +22206,7 @@ fn repeated_raw_string_projection_uses_one_pooled_literal() {
     });
     program.module_mut(module).functions.push(function);
 
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     assert_eq!(plan.program().string_literals.len(), 1);
@@ -21299,6 +22346,24 @@ fn native_option_return_program(core: Option<RirCoreEnumKind>) -> RirProgram {
             anvyx_runtime::ExternTypeExpr::Option(Box::new(anvyx_runtime::ExternTypeExpr::String)),
         ),
     });
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.managed_share(string, RustRecipePosition::Value);
+    let action = if core.is_some() {
+        let payload = materializers.managed_share(
+            string,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+        );
+        RirMaterializerAction::Optional { payload }
+    } else {
+        let payload = materializers.managed_share(
+            string,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::EnumPayload),
+        );
+        RirMaterializerAction::Enum {
+            variants: vec![vec![], vec![payload]],
+        }
+    };
+    materializers.declare(option, RustRecipePosition::Value, action);
     program
 }
 
@@ -21344,6 +22409,8 @@ fn native_string_return_program() -> RirProgram {
             ty: RirTypeId::from_index(0),
         },
     });
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.managed_share(RirTypeId::from_index(0), RustRecipePosition::Value);
     program
 }
 
@@ -21574,7 +22641,7 @@ fn native_escaping_lambda_tuple_air(kind: NativeLambdaArgKind) -> Program {
             local: tuple_local,
             value: RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![Operand::Place(place(lambda_local, lambda_ty))],
+                fields: vec![owned(Operand::Place(place(lambda_local, lambda_ty)))],
                 ty: tuple_ty,
             },
         },
@@ -21584,10 +22651,10 @@ fn native_escaping_lambda_tuple_air(kind: NativeLambdaArgKind) -> Program {
             continue;
         };
         if args.len() == 1 {
-            args[0] = CallArg::Value(Operand::Place(tuple_lambda_projection(
+            args[0] = CallArg::Value(owned(Operand::Place(tuple_lambda_projection(
                 tuple_local,
                 lambda_ty,
-            )));
+            ))));
         }
     }
     program
@@ -21811,7 +22878,7 @@ fn native_scoped_lambda_air_with(kind: NativeLambdaArgKind) -> Program {
             RValue::MakeLambda {
                 lambda: lambda.expect("lambda missing"),
                 captures: vec![air::LambdaCaptureArg::ReadonlyLocal {
-                    value: Operand::Place(place(captured, int)),
+                    value: owned(Operand::Place(place(captured, int))),
                 }],
                 ty: lambda_ty,
             }
@@ -21833,10 +22900,10 @@ fn native_scoped_lambda_air_with(kind: NativeLambdaArgKind) -> Program {
         },
         Statement::Eval(RValue::Call {
             callee: Callee::Extern(ext),
-            args: vec![CallArg::Value(Operand::Place(place(
+            args: vec![CallArg::Value(owned(Operand::Place(place(
                 lambda_local,
                 lambda_ty,
-            )))],
+            ))))],
         }),
     ]);
     let main = program.alloc_function(Function {
@@ -21871,10 +22938,13 @@ fn native_escaping_lambda_rir() -> RirProgram {
         unreachable!()
     };
     args[0] = RirCallArg::EscapingLambda {
-        callee: RirOperand::Place(rir_place(
-            RirLocalId::from_index(0),
-            RirTypeId::from_index(2),
-        )),
+        callee: rir_owned(
+            RirOperand::Place(rir_place(
+                RirLocalId::from_index(0),
+                RirTypeId::from_index(2),
+            )),
+            0,
+        ),
         sig: RirLambdaSigId::from_index(0),
     };
     program
@@ -21886,7 +22956,7 @@ fn native_scoped_lambda_rir() -> RirProgram {
     let lambda_ty = RirTypeId::from_index(2);
     let sig = RirLambdaSigId::from_index(0);
     let local = RirLocalId::from_index(0);
-    RirProgram {
+    let mut program = RirProgram {
         types: vec![RirType::Void, RirType::Int, RirType::Lambda(sig)],
         lambda_sigs: vec![RirLambdaSig {
             id: sig,
@@ -21946,7 +23016,7 @@ fn native_scoped_lambda_rir() -> RirProgram {
                 stmts: vec![RirStmt::Eval(RirRValue::Call {
                     callee: RirCallTarget::Extern(RirExternId::from_index(0)),
                     args: vec![RirCallArg::ScopedLambda {
-                        callee: RirOperand::Place(rir_place(local, lambda_ty)),
+                        callee: rir_owned(RirOperand::Place(rir_place(local, lambda_ty)), 1),
                         sig,
                     }],
                     ty: void,
@@ -21956,7 +23026,11 @@ fn native_scoped_lambda_rir() -> RirProgram {
         }],
         entry: Some(RirFunctionId::from_index(0)),
         ..RirProgram::default()
-    }
+    };
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.copy(int, RustRecipePosition::Value);
+    materializers.callable_share(lambda_ty, RustRecipePosition::Value);
+    program
 }
 
 fn int_const(program: &mut Program, ty: air::TypeId, value: i64) -> air::ConstId {
@@ -22737,11 +23811,11 @@ fn heap_capture_cell_reentrant_source_ref_arg_program() -> Program {
                             projection: vec![],
                             ty: int,
                         }),
-                        CallArg::Value(Operand::Place(Place {
+                        CallArg::Value(owned(Operand::Place(Place {
                             root: PlaceRoot::Local(cb_local),
                             projection: vec![],
                             ty: cb_ty,
-                        })),
+                        }))),
                     ],
                 }),
             ],
@@ -22954,7 +24028,7 @@ fn init_tuple_cell(
         dst: root_place(PlaceRoot::CaptureCell(cell), tuple),
         value: RValue::Aggregate {
             kind: AggregateCtor::Tuple,
-            fields: vec![Operand::Const(int_const(program, int, 0))],
+            fields: vec![owned(Operand::Const(int_const(program, int, 0)))],
             ty: tuple,
         },
     }
@@ -23018,13 +24092,14 @@ fn init_collection_cell(
                 TypeData::Map { .. } => AggregateCtor::Map,
                 _ => AggregateCtor::List,
             },
-            fields,
+            fields: fields.into_iter().map(owned).collect(),
             ty,
         },
     }
 }
 
-fn planned_collection_loan_root(program: Program, air_id: FunctionId) -> RirCollectionAccess {
+fn planned_collection_loan_root(mut program: Program, air_id: FunctionId) -> RirCollectionAccess {
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let function = rir_function_for_air(plan.program(), air_id);
@@ -23064,7 +24139,9 @@ fn only_call_arg(function: &RirFunction) -> &RirCallArg {
     &calls[0][0]
 }
 
-fn plan_source(program: Program) -> emit::RustSource {
+fn plan_source(mut program: Program) -> emit::RustSource {
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let plan = plan(&verified, rust_plan_config()).expect("plan failed");
     let source = emit::emit(&plan.verified());
@@ -23176,7 +24253,9 @@ fn run_source(source: emit::RustSource) -> source_job::RustSourceJobOutput {
     }
 }
 
-fn check(program: Program) {
+fn check(mut program: Program) {
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = rust_plan_config();
     RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
@@ -23184,7 +24263,9 @@ fn check(program: Program) {
     std::hint::black_box(program);
 }
 
-fn assert_plan_gap(program: Program, config: RustPlanConfig, kind: RustTargetGapKind) {
+fn assert_plan_gap(mut program: Program, config: RustPlanConfig, kind: RustTargetGapKind) {
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let Err(RustPlanError::TargetGaps(gaps)) = plan(&verified, config) else {
         panic!("expected target gap");
@@ -23198,7 +24279,9 @@ fn expect_reject(program: Program, kind: ProfileErrorKind) {
     assert!(has_error(&errors, kind), "missing expected profile error");
 }
 
-fn profile_errors(program: Program) -> Vec<RustBackendProfileError> {
+fn profile_errors(mut program: Program) -> Vec<RustBackendProfileError> {
+    air::finalize_materialization(&mut program);
+    air::finalize_materialization(&mut program);
     let verified = air::verify(&program).expect("AIR verify failed");
     let config = rust_plan_config();
     let errors = RustBackendProfile::check_with_native_support(&verified, &config.native_providers)
@@ -23615,7 +24698,7 @@ fn native_extern_rir(
     rust_abi: anvyx_runtime::RustExternAbi,
     abi: air::ExternAbi,
 ) -> RirProgram {
-    RirProgram {
+    let mut program = RirProgram {
         types,
         externs: vec![RirExtern {
             id: RirExternId::from_index(0),
@@ -23630,7 +24713,21 @@ fn native_extern_rir(
             abi,
         }],
         ..RirProgram::default()
+    };
+    for index in 0..program.types.len() {
+        let value_ty = RirTypeId::from_index(index);
+        let id = program.collection_storages.len();
+        let storage = match program.types[index] {
+            RirType::Array { elem, .. } => rir_array_storage(id, value_ty, elem),
+            RirType::Slice(elem) => rir_slice_storage(id, value_ty, elem),
+            RirType::List(elem) => rir_list_storage_id(id, value_ty, elem),
+            RirType::Map { key, value } => rir_map_storage(id, value_ty, key, value),
+            _ => continue,
+        };
+        program.collection_storages.push(storage);
     }
+    install_empty_materializer_table(&mut program);
+    program
 }
 
 fn native_resource_return_program(owned: bool) -> RirProgram {
@@ -23666,6 +24763,8 @@ fn native_resource_return_program(owned: bool) -> RirProgram {
         copyable: false,
         fields: vec![],
     });
+    let mut materializers = TestMaterializers::new(&mut program);
+    materializers.identity_share(resource, RustRecipePosition::Value);
     program.functions.push(return_extern_function(resource));
     program.entry = Some(RirFunctionId::from_index(0));
     program

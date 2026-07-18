@@ -254,6 +254,7 @@ impl CompileCx<'_> {
             | AirTail::Continue(_)
             | AirTail::Unreachable => {}
             AirTail::Return(Some(value)) => self.check_operand(function, value),
+            AirTail::ReturnOwned(owned) => self.check_operand(function, &owned.value),
         }
     }
 
@@ -282,9 +283,7 @@ impl CompileCx<'_> {
     fn check_rvalue(&mut self, function: FunctionId, value: &RValue) {
         match value {
             RValue::Use(operand)
-            | RValue::FunctionValue { value: operand, .. }
             | RValue::Unary { value: operand, .. }
-            | RValue::OptionalSome { value: operand, .. }
             | RValue::Cast { value: operand, .. }
             | RValue::RawProject { value: operand, .. }
             | RValue::RawTryConstruct { value: operand, .. }
@@ -293,13 +292,23 @@ impl CompileCx<'_> {
             | RValue::CheckedIterCount { count: operand, .. } => {
                 self.check_operand(function, operand);
             }
+            RValue::Materialize(owned)
+            | RValue::FunctionValue { value: owned, .. }
+            | RValue::OptionalSome { value: owned, .. } => {
+                self.check_operand(function, &owned.value);
+            }
             RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
                 self.check_operand(function, lhs);
                 self.check_operand(function, rhs);
             }
-            RValue::Aggregate { fields, .. } | RValue::StringConcat { parts: fields } => {
+            RValue::Aggregate { fields, .. } => {
                 for field in fields {
-                    self.check_operand(function, field);
+                    self.check_operand(function, &field.value);
+                }
+            }
+            RValue::StringConcat { parts } => {
+                for part in parts {
+                    self.check_operand(function, part);
                 }
             }
             RValue::Call { .. } | RValue::FlagStatic { .. } => {}
@@ -311,7 +320,7 @@ impl CompileCx<'_> {
             }
             RValue::ListPush { list, value } => {
                 self.check_place(function, list);
-                self.check_operand(function, value);
+                self.check_operand(function, &value.value);
             }
             RValue::MapGet { map, key, .. } | RValue::MapRemove { map, key, .. } => {
                 self.check_place(function, map);
@@ -324,8 +333,8 @@ impl CompileCx<'_> {
                 kind: _,
             } => {
                 self.check_place(function, map);
-                self.check_operand(function, key);
-                self.check_operand(function, value);
+                self.check_operand(function, &key.value);
+                self.check_operand(function, &value.value);
             }
             RValue::MapEntryAt { map, .. }
             | RValue::MapKeyAt { map, .. }
@@ -352,7 +361,9 @@ impl CompileCx<'_> {
             | LambdaCaptureArg::ScopedLocal { .. }
             | LambdaCaptureArg::ScopedBorrow { .. }
             | LambdaCaptureArg::CaptureCell { .. } => {}
-            LambdaCaptureArg::ReadonlyLocal { value } => self.check_operand(function, value),
+            LambdaCaptureArg::ReadonlyLocal { value } => {
+                self.check_operand(function, &value.value);
+            }
         }
         self.push_capture_gap(function, Self::capture_status(capture));
     }
@@ -437,9 +448,9 @@ impl CompileCx<'_> {
 
     fn compile_call_arg(&mut self, function: FunctionId, arg: &CallArg) -> VirCallArg {
         match arg {
-            CallArg::Value(operand) => {
-                self.check_operand(function, operand);
-                if let Some(ty) = self.program.operand_ty(operand) {
+            CallArg::Value(owned) => {
+                self.check_operand(function, &owned.value);
+                if let Some(ty) = self.program.operand_ty(&owned.value) {
                     if self.contains_function_payload(ty) {
                         self.push_function(function, VmCompileErrorKind::UnsupportedLambdaValue);
                     }
@@ -447,10 +458,10 @@ impl CompileCx<'_> {
                         self.push_function(function, VmCompileErrorKind::NonCheapValueArg);
                     }
                 }
-                VirCallArg::Value(operand.clone())
+                VirCallArg::Value(owned.value.clone())
             }
-            CallArg::InitFieldProvided(operand) => {
-                self.check_operand(function, operand);
+            CallArg::InitFieldProvided(owned) => {
+                self.check_operand(function, &owned.value);
                 self.unsupported_init_field(function)
             }
             CallArg::InitFieldOmitted => self.unsupported_init_field(function),

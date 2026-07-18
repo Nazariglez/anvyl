@@ -50,21 +50,22 @@ use self::{
         RirCollectionLoanScope, RirCollectionRootKind, RirCollectionStorage,
         RirCollectionStorageId, RirCollectionStorageKind, RirConst, RirConstId, RirConstValue,
         RirCoreEnumKind, RirCtxPlan, RirDataRef, RirDataRefId, RirDynCarrier, RirDynCarrierId,
-        RirDynDispatchArm, RirDynDispatchOrigin, RirDynPayloadAction, RirDynReceiver,
-        RirDynStorage, RirDynVariant, RirDynVariantId, RirDynWitnessOrigin, RirEnum, RirEnumId,
-        RirEnumRepr, RirEnumStringifyVariant, RirExtern, RirExternId, RirExternKind,
-        RirExternParam, RirField, RirFieldId, RirFlag, RirFlagId, RirFlagMember, RirFlagMemberId,
-        RirFlagStaticOp, RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction,
-        RirFunctionId, RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda,
-        RirLambdaCapture, RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField,
-        RirLambdaEnvFieldKind, RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId,
-        RirLambdaParam, RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal,
-        RirLocalId, RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess,
-        RirMutPlaceArg, RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch,
-        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirParam, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirPatternAlternative, RirPatternArm, RirPatternBinding,
-        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest,
-        RirPlace, RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
+        RirDynDispatchArm, RirDynDispatchOrigin, RirDynReceiver, RirDynStorage, RirDynVariant,
+        RirDynVariantId, RirDynWitnessOrigin, RirEnum, RirEnumId, RirEnumRepr,
+        RirEnumStringifyVariant, RirExtern, RirExternId, RirExternKind, RirExternParam, RirField,
+        RirFieldId, RirFlag, RirFlagId, RirFlagMember, RirFlagMemberId, RirFlagStaticOp,
+        RirFormatAlign, RirFormatKind, RirFormatSign, RirFormatSpec, RirFunction, RirFunctionId,
+        RirGlobal, RirGlobalId, RirIf, RirIterCountCheck, RirLambda, RirLambdaCapture,
+        RirLambdaCaptureArg, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
+        RirLambdaEnvId, RirLambdaEnvLayout, RirLambdaEscape, RirLambdaId, RirLambdaParam,
+        RirLambdaSig, RirLambdaSigId, RirLambdaSource, RirLambdaStorage, RirLocal, RirLocalId,
+        RirLoop, RirLoopId, RirMapEntryMatch, RirMapWriteKind, RirMutPlaceAccess, RirMutPlaceArg,
+        RirMutPlaceHandle, RirNativeExtern, RirOperand, RirOptionMatch, RirOptionPayloadBinding,
+        RirOptionSubject, RirOrdinalAdapter, RirOrdinalPlan, RirOwnedOperand, RirOwnedSource,
+        RirOwnedValue, RirParam, RirParamAbi, RirParamEscape, RirParamSemantic,
+        RirPatternAlternative, RirPatternArm, RirPatternBinding, RirPatternBindingMode,
+        RirPatternMatch, RirPatternPath, RirPatternPathStep, RirPatternTest, RirPlace,
+        RirPlaceRoot, RirProgram, RirProjection, RirRValue, RirRangeFor, RirRawEnumValue,
         RirResolvedCallTarget, RirReturn, RirScopedPlaceCellDecl, RirScopedPlaceCellId,
         RirScopedPlaceCellRef, RirScopedPlaceSource, RirStmt, RirStringLiteral, RirStringLiteralId,
         RirStringifyHelper, RirStringifyHelperId, RirStringifyHelperKind, RirStringifyReq,
@@ -114,7 +115,8 @@ pub fn plan(
     cx.check_support()?;
     let mut rir = cx.plan()?;
     exact_witness::propagate(&mut rir);
-    rir::verify_with_air(&rir, program.program()).map_err(RustPlanError::RirVerify)?;
+    rir::verify_with_air_and_native(&rir, program.program(), &cx.config.native_providers)
+        .map_err(RustPlanError::RirVerify)?;
     Ok(RirPlan { program: rir })
 }
 
@@ -192,7 +194,6 @@ pub enum RustTargetGapKind {
     UnsupportedDynamicLayout,
     UnsupportedDynamicLifecycle,
     UnsupportedDynamicPayload,
-    PendingDynamicFunctionCapability,
     UnsupportedCallee,
     UnsupportedExtern,
     UnsupportedExternMember,
@@ -341,6 +342,7 @@ struct PlanCx<'a> {
     function_type_copyable: HashMap<TypeId, bool>,
     function_type_shareable: HashMap<TypeId, bool>,
     lambda_runtime_capture_slots: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), usize>,
+    lambda_capture_semantics: HashMap<(air::LambdaId, air::LambdaCaptureSlotId), RirParamSemantic>,
     capture_cell_map: HashMap<air::CaptureCellId, RirCellId>,
     scoped_place_cell_map: HashMap<air::ScopedBorrowId, RirScopedPlaceCellId>,
     extern_map: HashMap<ExternId, RirExternId>,
@@ -348,6 +350,8 @@ struct PlanCx<'a> {
     enum_map: HashMap<air::EnumId, RirEnumId>,
     flag_map: HashMap<air::FlagId, RirFlagId>,
     tuple_map: HashMap<Vec<RirTypeId>, RirTupleId>,
+    materializers: rep_policy::RustMaterializerGraph,
+    materializer_map: HashMap<rep_policy::RustMaterializerId, rir::RirMaterializerId>,
     dynamic_layout: Option<rep_policy::RustDynamicLayoutPlan>,
     dynamic_types: Vec<(TypeId, air::ContractSurfaceId, RirEnumId)>,
     dyn_surface_map: HashMap<air::ContractSurfaceId, RirDynCarrierId>,
@@ -362,10 +366,11 @@ struct PlanCx<'a> {
         (
             RirDynCarrierId,
             RirDynVariantId,
-            RirDynPayloadAction,
+            rir::RirMaterializerId,
             RirTypeId,
         ),
     >,
+    dyn_reborrows: Vec<(LocalId, RirDynCarrierId)>,
 }
 
 struct PlannedTypeIds {
@@ -388,10 +393,6 @@ impl ZeroEnvFunctionValue {
             ty: self.ty,
         }
     }
-
-    fn ty(self) -> RirTypeId {
-        self.ty
-    }
 }
 
 struct PlannedLambdaCaptures {
@@ -402,7 +403,6 @@ struct PlannedLambdaCaptures {
 struct PlannedRValue {
     stmts: Vec<RirStmt>,
     value: RirRValue,
-    post_stmts: Vec<RirStmt>,
 }
 
 impl PlannedRValue {
@@ -410,7 +410,6 @@ impl PlannedRValue {
         Self {
             stmts: vec![],
             value,
-            post_stmts: vec![],
         }
     }
 }
@@ -418,6 +417,16 @@ impl PlannedRValue {
 struct PlannedOperand {
     stmts: Vec<RirStmt>,
     operand: RirOperand,
+}
+
+struct PlannedOwnedOperand {
+    stmts: Vec<RirStmt>,
+    operand: RirOwnedOperand,
+}
+
+struct PlannedOwnedValue {
+    stmts: Vec<RirStmt>,
+    value: RirOwnedValue,
 }
 
 impl PlannedOperand {
@@ -456,6 +465,7 @@ pub(super) enum CollectionAccessOp {
     Len,
     SequenceSlotRead,
     SequenceSlotWrite,
+    SliceView,
     MapGet,
     MapEntryRead,
     MapValueRead,
@@ -473,6 +483,7 @@ impl CollectionAccessOp {
             | Self::MapGet
             | Self::MapEntryRead
             | Self::MapValueRead => PlaceAccessIntent::ReadValue,
+            Self::SliceView => PlaceAccessIntent::SliceView,
             Self::SequenceSlotWrite | Self::MapValueWrite | Self::IndexedMapAssign => {
                 PlaceAccessIntent::Assign
             }
@@ -548,6 +559,8 @@ impl PlannedCallArg {
 impl<'a> PlanCx<'a> {
     fn new(program: &'a VerifiedProgram<'a>, config: RustPlanConfig) -> Self {
         let air = program.program();
+        let materializers =
+            rep_policy::RustMaterializerGraph::with_native_support(&config.native_providers);
         Self {
             verified: program,
             air,
@@ -565,6 +578,7 @@ impl<'a> PlanCx<'a> {
             function_type_copyable: HashMap::new(),
             function_type_shareable: HashMap::new(),
             lambda_runtime_capture_slots: HashMap::new(),
+            lambda_capture_semantics: HashMap::new(),
             capture_cell_map: HashMap::new(),
             scoped_place_cell_map: HashMap::new(),
             extern_map: HashMap::new(),
@@ -572,12 +586,15 @@ impl<'a> PlanCx<'a> {
             enum_map: HashMap::new(),
             flag_map: HashMap::new(),
             tuple_map: HashMap::new(),
+            materializers,
+            materializer_map: HashMap::new(),
             dynamic_layout: None,
             dynamic_types: vec![],
             dyn_surface_map: HashMap::new(),
             dyn_dispatch_map: HashMap::new(),
             dyn_weakening_map: HashMap::new(),
             dyn_witness_map: HashMap::new(),
+            dyn_reborrows: vec![],
         }
     }
 
@@ -598,7 +615,6 @@ impl<'a> PlanCx<'a> {
             ..RirProgram::default()
         };
         let type_ids = self.plan_types(&mut program)?;
-        Self::plan_collection_storages(&mut program);
         self.plan_consts(&mut program);
         self.plan_externs(&mut program)?;
         self.plan_function_ids();
@@ -607,16 +623,19 @@ impl<'a> PlanCx<'a> {
         self.plan_cells(&mut program);
         self.plan_scoped_place_cells(&mut program)?;
         self.plan_lambdas(&mut program)?;
-        self.check_lambda_env_storage_support(&program)?;
         self.check_lambda_value_capture_cycles(&program)?;
         self.plan_function_type_copyability(&program);
-        self.fill_dynamic_carriers(&mut program)?;
         self.finalize_copyable_flags(
             &mut program,
             &type_ids.structs,
             &type_ids.enums,
             &type_ids.tuples,
         );
+        self.finalize_callable_materializers();
+        self.plan_materializers(&mut program)?;
+        self.plan_collection_storages(&mut program)?;
+        self.check_lambda_env_storage_support(&program)?;
+        self.fill_dynamic_carriers(&mut program)?;
         self.plan_stringify_helpers(&mut program)?;
         for index in 0..self.air.functions.len() {
             let id = FunctionId::from_index(index);
@@ -630,19 +649,115 @@ impl<'a> PlanCx<'a> {
         Ok(program)
     }
 
-    fn plan_collection_storages(program: &mut RirProgram) {
-        for (index, ty) in program.types.iter().enumerate() {
-            let (kind, prefix) = match ty {
-                RirType::List(elem_ty) => {
-                    (RirCollectionStorageKind::List { elem_ty: *elem_ty }, "list")
+    fn plan_collection_storages(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        for index in 0..program.types.len() {
+            let ty = TypeId::from_index(index);
+            let rir_ty = program.types[index];
+            let plan = RustRepresentationPlan::new(self.air, &self.classes);
+            let kind = match (self.air.type_arena.data(ty), rir_ty) {
+                (TypeData::Array { elem, .. }, RirType::Array { elem: elem_ty, .. }) => {
+                    let source = self
+                        .materializers
+                        .action_for(
+                            plan,
+                            *elem,
+                            rep_policy::RustRecipePosition::StoredPayload(
+                                rep_policy::LambdaStorageFamily::FixedArrayElement,
+                            ),
+                        )
+                        .map_err(|_| {
+                            Self::gap(
+                                RustTargetGapSite::Type(ty),
+                                RustTargetGapKind::NonCopyValueRequired,
+                            )
+                        })?;
+                    let elem_materializer = self.lower_materializer(program, source, *elem)?;
+                    RirCollectionStorageKind::Array {
+                        elem_ty,
+                        elem_materializer,
+                    }
                 }
-                RirType::Map { key, value } => (
-                    RirCollectionStorageKind::Map {
-                        key_ty: *key,
-                        value_ty: *value,
+                (TypeData::Slice(elem), RirType::Slice(elem_ty)) => {
+                    let source = self
+                        .materializers
+                        .action_for(plan, *elem, rep_policy::RustRecipePosition::Value)
+                        .map_err(|_| {
+                            Self::gap(
+                                RustTargetGapSite::Type(ty),
+                                RustTargetGapKind::NonCopyValueRequired,
+                            )
+                        })?;
+                    let elem_materializer = self.lower_materializer(program, source, *elem)?;
+                    RirCollectionStorageKind::Slice {
+                        elem_ty,
+                        elem_materializer,
+                    }
+                }
+                (TypeData::List(elem), RirType::List(elem_ty)) => {
+                    let source = self
+                        .materializers
+                        .action_for(
+                            plan,
+                            *elem,
+                            rep_policy::RustRecipePosition::StoredPayload(
+                                rep_policy::LambdaStorageFamily::ListElement,
+                            ),
+                        )
+                        .map_err(|_| {
+                            Self::gap(
+                                RustTargetGapSite::Type(ty),
+                                RustTargetGapKind::NonCopyValueRequired,
+                            )
+                        })?;
+                    let elem_materializer = self.lower_materializer(program, source, *elem)?;
+                    RirCollectionStorageKind::List {
+                        elem_ty,
+                        elem_materializer,
+                        symbol: RirSymbol::new(format!("list_storage{index}")),
+                    }
+                }
+                (
+                    TypeData::Map { key, value, .. },
+                    RirType::Map {
+                        key: key_ty,
+                        value: value_ty,
                     },
-                    "map",
-                ),
+                ) => {
+                    let key_source = self
+                        .materializers
+                        .action_for(plan, *key, rep_policy::RustRecipePosition::MapKey)
+                        .map_err(|_| {
+                            Self::gap(
+                                RustTargetGapSite::Type(ty),
+                                RustTargetGapKind::UnsupportedMapKey,
+                            )
+                        })?;
+                    let value_source = self
+                        .materializers
+                        .action_for(
+                            plan,
+                            *value,
+                            rep_policy::RustRecipePosition::StoredPayload(
+                                rep_policy::LambdaStorageFamily::MapValue,
+                            ),
+                        )
+                        .map_err(|_| {
+                            Self::gap(
+                                RustTargetGapSite::Type(ty),
+                                RustTargetGapKind::NonCopyValueRequired,
+                            )
+                        })?;
+                    let key_materializer = self.lower_materializer(program, key_source, *key)?;
+                    let value_materializer =
+                        self.lower_materializer(program, value_source, *value)?;
+                    RirCollectionStorageKind::Map {
+                        key_ty,
+                        value_ty,
+                        key_materializer,
+                        value_materializer,
+                        symbol: RirSymbol::new(format!("map_storage{index}")),
+                    }
+                }
                 _ => continue,
             };
             let id = RirCollectionStorageId::from_index(program.collection_storages.len());
@@ -650,9 +765,9 @@ impl<'a> PlanCx<'a> {
                 id,
                 value_ty: RirTypeId::from_index(index),
                 kind,
-                symbol: RirSymbol::new(format!("{prefix}_storage{index}")),
             });
         }
+        Ok(())
     }
 
     fn plan_types(&mut self, program: &mut RirProgram) -> Result<PlannedTypeIds, RustPlanError> {
@@ -1057,6 +1172,7 @@ impl<'a> PlanCx<'a> {
         type_id: TypeId,
         ext: air::ExternTypeId,
     ) -> Result<RirStructId, RustPlanError> {
+        self.require_materializer(type_id)?;
         let decl = self.air.extern_type(ext);
         if !matches!(decl.rep, air::ExternRep::Inline | air::ExternRep::Shared) {
             return Err(Self::gap(
@@ -1129,6 +1245,7 @@ impl<'a> PlanCx<'a> {
         type_id: TypeId,
         ext: air::ExternTypeId,
     ) -> Result<RirEnumId, RustPlanError> {
+        self.require_materializer(type_id)?;
         let decl = self.air.extern_type(ext);
         if decl.rep != air::ExternRep::Inline {
             return Err(Self::gap(
@@ -1480,6 +1597,18 @@ impl<'a> PlanCx<'a> {
         enum_id: RirEnumId,
         plan: &rep_policy::RustDynamicCarrierPlan,
     ) -> Result<(), RustPlanError> {
+        self.materializers
+            .action_for(
+                RustRepresentationPlan::new(self.air, &self.classes),
+                type_id,
+                rep_policy::RustRecipePosition::Value,
+            )
+            .map_err(|_| {
+                Self::gap(
+                    RustTargetGapSite::Type(type_id),
+                    RustTargetGapKind::UnsupportedDynamicPayload,
+                )
+            })?;
         if let Err(gap) = plan.layout
             && !matches!(gap, rep_policy::RustLayoutGap::FunctionLayoutUnknown(_))
         {
@@ -1503,13 +1632,8 @@ impl<'a> PlanCx<'a> {
         let mut variants = Vec::with_capacity(plan.variants.len());
         let mut enum_variants = Vec::with_capacity(plan.variants.len());
         for (index, variant) in plan.variants.iter().enumerate() {
-            let function_payload = matches!(
-                self.air.type_arena.data(variant.concrete_ty),
-                TypeData::Function(_)
-            );
             if let Err(gap) = variant.payload_layout
-                && !(function_payload
-                    && matches!(gap, rep_policy::RustLayoutGap::FunctionLayoutUnknown(_)))
+                && !matches!(gap, rep_policy::RustLayoutGap::FunctionLayoutUnknown(_))
             {
                 return Err(Self::gap(
                     RustTargetGapSite::Type(variant.concrete_ty),
@@ -1517,47 +1641,36 @@ impl<'a> PlanCx<'a> {
                 ));
             }
             if let Err(gap) = variant.lifecycle
-                && !(function_payload
-                    && matches!(
-                        gap,
-                        rep_policy::RustLifecycleGap::FunctionMetadataUnknown(_)
-                    ))
+                && !matches!(
+                    gap,
+                    rep_policy::RustLifecycleGap::FunctionMetadataUnknown(_)
+                )
             {
                 return Err(Self::gap(
                     RustTargetGapSite::Type(variant.concrete_ty),
                     RustTargetGapKind::UnsupportedDynamicLifecycle,
                 ));
             }
-            let recipe = match variant.payload {
-                Ok(recipe) => recipe,
-                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_))
-                    if function_payload && self.function_type_copyable[&variant.concrete_ty] =>
-                {
-                    rep_policy::RustPhysicalRecipe::Copy
-                }
-                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_))
-                    if function_payload && self.function_type_shareable[&variant.concrete_ty] =>
-                {
-                    rep_policy::RustPhysicalRecipe::CloneLambda
-                }
-                Err(rep_policy::RustRecipeGap::FunctionCapabilityPending(_)) => {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Type(variant.concrete_ty),
-                        RustTargetGapKind::PendingDynamicFunctionCapability,
-                    ));
-                }
-                Err(_) => {
-                    return Err(Self::gap(
+            let materializer = self
+                .materializers
+                .action_for(
+                    RustRepresentationPlan::new(self.air, &self.classes),
+                    variant.concrete_ty,
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::DynamicPayload,
+                    ),
+                )
+                .map_err(|_| {
+                    Self::gap(
                         RustTargetGapSite::Type(variant.concrete_ty),
                         RustTargetGapKind::UnsupportedDynamicPayload,
-                    ));
-                }
-            };
-            let payload = if variant.recursive {
-                RirDynPayloadAction::CloneRecursive
-            } else {
-                recipe.into()
-            };
+                    )
+                })?;
+            let payload = self.lower_materializer(program, materializer, variant.concrete_ty)?;
+            let function_payload = matches!(
+                self.air.type_arena.data(variant.concrete_ty),
+                TypeData::Function(_)
+            );
             let storage = if function_payload {
                 RirDynStorage::Boxed
             } else {
@@ -2190,7 +2303,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_scoped_place_source(
-        &self,
+        &mut self,
         borrow: &air::ScopedBorrowDecl,
     ) -> Result<RirScopedPlaceSource, RustPlanError> {
         let ty = self.type_map[&borrow.ty];
@@ -2227,7 +2340,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_alias_scoped_place_source(
-        &self,
+        &mut self,
         owner: FunctionId,
         source: &Place,
     ) -> Result<RirMutPlaceArg, RustPlanError> {
@@ -2353,6 +2466,176 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn finalize_callable_materializers(&mut self) {
+        let callables = self
+            .function_type_shareable
+            .iter()
+            .filter_map(|(&ty, &shareable)| {
+                if self.function_type_copyable[&ty] {
+                    Some((ty, rep_policy::RustCallableMaterializer::Copy))
+                } else if shareable {
+                    Some((ty, rep_policy::RustCallableMaterializer::Share))
+                } else {
+                    None
+                }
+            });
+        self.materializers.set_callable_materializers(callables);
+    }
+
+    fn plan_materializers(&mut self, program: &mut RirProgram) -> Result<(), RustPlanError> {
+        program
+            .value_materializers
+            .resize(program.types.len(), None);
+        for index in 0..self.air.type_arena.len() {
+            let ty = TypeId::from_index(index);
+            for position in [
+                rep_policy::RustRecipePosition::Value,
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::UnknownOrigin,
+                ),
+                rep_policy::RustRecipePosition::Global,
+                rep_policy::RustRecipePosition::MapKey,
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::StructField,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::DataRefProjection,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::EnumPayload,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::FixedArrayElement,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::ListElement,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::TupleField,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::OptionalPayload,
+                ),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::MapValue,
+                ),
+            ] {
+                let plan = RustRepresentationPlan::new(self.air, &self.classes);
+                let Ok(action) = self.materializers.action_for(plan, ty, position) else {
+                    continue;
+                };
+                let materializer = self.lower_materializer(program, action, ty)?;
+                if position == rep_policy::RustRecipePosition::Value {
+                    program.value_materializers[index] = Some(materializer);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_materializer(
+        &mut self,
+        program: &mut RirProgram,
+        source: rep_policy::RustMaterializerId,
+        ty: TypeId,
+    ) -> Result<rir::RirMaterializerId, RustPlanError> {
+        if let Some(id) = self.materializer_map.get(&source).copied() {
+            return Ok(id);
+        }
+        let id = rir::RirMaterializerId::from_index(program.materializers.len());
+        self.materializer_map.insert(source, id);
+        program.materializers.push(rir::RirMaterializer {
+            id,
+            ty: self.type_map[&ty],
+            position: self.materializers.position(source),
+            action: rir::RirMaterializerAction::Copy,
+        });
+        let action = self.materializers.action(source).clone();
+        let action = match action {
+            rep_policy::RustMaterializerAction::Copy => rir::RirMaterializerAction::Copy,
+            rep_policy::RustMaterializerAction::ManagedShare => {
+                rir::RirMaterializerAction::ManagedShare
+            }
+            rep_policy::RustMaterializerAction::IdentityShare => {
+                rir::RirMaterializerAction::IdentityShare
+            }
+            rep_policy::RustMaterializerAction::CallableShare => {
+                rir::RirMaterializerAction::CallableShare
+            }
+            rep_policy::RustMaterializerAction::ProviderMaterialize { binding } => {
+                rir::RirMaterializerAction::ProviderMaterialize { binding }
+            }
+            rep_policy::RustMaterializerAction::Struct { fields } => {
+                rir::RirMaterializerAction::Struct {
+                    fields: self.lower_materializer_fields(program, fields)?,
+                }
+            }
+            rep_policy::RustMaterializerAction::Tuple { fields } => {
+                rir::RirMaterializerAction::Tuple {
+                    fields: self.lower_materializer_fields(program, fields)?,
+                }
+            }
+            rep_policy::RustMaterializerAction::Array { elem } => {
+                let elem_ty = match self.air.type_arena.data(ty) {
+                    TypeData::Array { elem, .. } => *elem,
+                    _ => unreachable!("array materializer type"),
+                };
+                rir::RirMaterializerAction::Array {
+                    elem: self.lower_materializer(program, elem, elem_ty)?,
+                }
+            }
+            rep_policy::RustMaterializerAction::Enum { variants } => {
+                let variants = variants
+                    .into_iter()
+                    .map(|fields| self.lower_materializer_fields(program, fields))
+                    .collect::<Result<_, _>>()?;
+                rir::RirMaterializerAction::Enum { variants }
+            }
+            rep_policy::RustMaterializerAction::Optional { payload } => {
+                let inner = match self.air.type_arena.data(ty) {
+                    TypeData::Optional(inner) => *inner,
+                    _ => unreachable!("optional materializer type"),
+                };
+                rir::RirMaterializerAction::Optional {
+                    payload: self.lower_materializer(program, payload, inner)?,
+                }
+            }
+            rep_policy::RustMaterializerAction::DynamicMaterialize { carrier, variants } => {
+                let variants = variants
+                    .into_iter()
+                    .map(|variant| {
+                        let witness = &self.air.contract_witnesses[variant.witness.index()];
+                        Ok(rir::RirDynamicMaterializerVariant {
+                            witness: variant.witness,
+                            payload: self.lower_materializer(
+                                program,
+                                variant.payload,
+                                witness.key.concrete_ty,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<_, RustPlanError>>()?;
+                rir::RirMaterializerAction::DynamicMaterialize {
+                    surface: carrier,
+                    variants,
+                }
+            }
+        };
+        program.materializers[id.index()].action = action;
+        Ok(id)
+    }
+
+    fn lower_materializer_fields(
+        &mut self,
+        program: &mut RirProgram,
+        fields: Vec<rep_policy::RustMaterializerId>,
+    ) -> Result<Vec<rir::RirMaterializerId>, RustPlanError> {
+        fields
+            .into_iter()
+            .map(|field| self.lower_materializer(program, field, self.materializers.ty(field)))
+            .collect()
+    }
+
     fn plan_function_type_copyability(&mut self, program: &RirProgram) {
         let policy = RirRustRepPolicy::new(program);
         self.function_type_copyable.clear();
@@ -2384,6 +2667,8 @@ impl<'a> PlanCx<'a> {
             let capture_index = captures.len();
             self.lambda_runtime_capture_slots
                 .insert((lambda, source_slot), capture_index);
+            self.lambda_capture_semantics
+                .insert((lambda, source_slot), capture.semantic);
             if decl.escape == air::LambdaEscape::Escaping {
                 env_fields.push(RirLambdaEnvField {
                     ty: capture.ty,
@@ -2425,7 +2710,7 @@ impl<'a> PlanCx<'a> {
             air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
                 let function_ty = matches!(self.air.type_data(*ty), TypeData::Function(_));
                 let ty = self.type_map[ty];
-                if !function_ty && !policy.shareable_value(ty) {
+                if !function_ty && !policy.capture_shareable(ty) {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(owner),
                         RustTargetGapKind::UnsupportedLambdaCapture,
@@ -2562,7 +2847,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_function(
-        &self,
+        &mut self,
         air_id: FunctionId,
         program: &RirProgram,
     ) -> Result<RirFunction, RustPlanError> {
@@ -2664,7 +2949,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_air_block(
-        &self,
+        &mut self,
         function: FunctionId,
         block: &air::AirBlock,
         locals: &mut Vec<RirLocal>,
@@ -2686,33 +2971,33 @@ impl<'a> PlanCx<'a> {
                 in_loop,
             )?);
         }
-        let (tail_stmts, term) = self.plan_air_tail(function, &block.tail, locals);
+        let (tail_stmts, term) = self.plan_air_tail(function, &block.tail, locals)?;
         stmts.extend(tail_stmts);
         Ok(RirStructuredBlock { stmts, term })
     }
 
     fn plan_global_root_value(
-        &self,
+        &mut self,
         function: FunctionId,
         global: GlobalId,
         value: &RValue,
         locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+        zero_env_function_values: &[Option<ZeroEnvFunctionValue>],
     ) -> Result<(Vec<RirStmt>, RirRValue), RustPlanError> {
         let planned = self.plan_rvalue(function, value, locals, zero_env_function_values)?;
         let mut stmts = planned.stmts;
-        let value = RirRValue::Use(self.rvalue_short_region_operand(
+        let value = self.rvalue_short_region_value(
             function,
             planned.value,
             self.air.globals[global.index()].ty,
             locals,
             &mut stmts,
-        ));
+        );
         Ok((stmts, value))
     }
 
     fn plan_ordinal_plan(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &air::AirOrdinalPlan,
         locals: &mut Vec<RirLocal>,
@@ -2749,7 +3034,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_pattern_match(
-        &self,
+        &mut self,
         function: FunctionId,
         match_: &air::AirPatternMatch,
         locals: &mut Vec<RirLocal>,
@@ -2805,8 +3090,8 @@ impl<'a> PlanCx<'a> {
                     alternatives: arm
                         .alternatives
                         .iter()
-                        .map(|alternative| self.plan_pattern_alternative(alternative))
-                        .collect(),
+                        .map(|alternative| self.plan_pattern_alternative(function, alternative))
+                        .collect::<Result<Vec<_>, RustPlanError>>()?,
                     block,
                 })
             })
@@ -2847,10 +3132,11 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_pattern_alternative(
-        &self,
+        &mut self,
+        function: FunctionId,
         alternative: &air::AirPatternAlternative,
-    ) -> RirPatternAlternative {
-        RirPatternAlternative {
+    ) -> Result<RirPatternAlternative, RustPlanError> {
+        Ok(RirPatternAlternative {
             tests: alternative
                 .tests
                 .iter()
@@ -2859,9 +3145,9 @@ impl<'a> PlanCx<'a> {
             bindings: alternative
                 .bindings
                 .iter()
-                .map(|binding| self.plan_pattern_binding(binding))
-                .collect(),
-        }
+                .map(|binding| self.plan_pattern_binding(function, binding))
+                .collect::<Result<Vec<_>, RustPlanError>>()?,
+        })
     }
 
     fn plan_pattern_test(&self, test: &air::AirPatternTest) -> RirPatternTest {
@@ -2904,16 +3190,27 @@ impl<'a> PlanCx<'a> {
         }
     }
 
-    fn plan_pattern_binding(&self, binding: &air::AirPatternBinding) -> RirPatternBinding {
-        RirPatternBinding {
+    fn plan_pattern_binding(
+        &mut self,
+        function: FunctionId,
+        binding: &air::AirPatternBinding,
+    ) -> Result<RirPatternBinding, RustPlanError> {
+        let mode = match binding.mode {
+            air::AirPatternBindingMode::Owned => RirPatternBindingMode::Owned {
+                materializer: self.reusable_materializer(
+                    function,
+                    binding.ty,
+                    rep_policy::RustRecipePosition::Value,
+                )?,
+            },
+            air::AirPatternBindingMode::Alias => RirPatternBindingMode::Alias,
+        };
+        Ok(RirPatternBinding {
             local: RirLocalId::from_index(binding.local.index()),
             path: self.plan_pattern_path(&binding.path),
             ty: self.type_map[&binding.ty],
-            mode: match binding.mode {
-                air::AirPatternBindingMode::Owned => RirPatternBindingMode::Owned,
-                air::AirPatternBindingMode::Alias => RirPatternBindingMode::Alias,
-            },
-        }
+            mode,
+        })
     }
 
     fn plan_pattern_path(&self, path: &air::AirPatternPath) -> RirPatternPath {
@@ -2953,7 +3250,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_air_stmt(
-        &self,
+        &mut self,
         function: FunctionId,
         index: usize,
         stmt: &air::AirStmt,
@@ -2978,7 +3275,6 @@ impl<'a> PlanCx<'a> {
                     local: RirLocalId::from_index(local.index()),
                     value: planned.value,
                 });
-                stmts.extend(planned.post_stmts);
                 Self::set_zero_env_function(
                     zero_env_function_values,
                     RirLocalId::from_index(local.index()),
@@ -3001,7 +3297,6 @@ impl<'a> PlanCx<'a> {
                     possible_cells,
                     in_loop,
                 )?;
-                stmts.extend(planned.post_stmts);
                 Self::set_place_zero_env_function(zero_env_function_values, dst, state);
                 Ok(stmts)
             }
@@ -3010,7 +3305,6 @@ impl<'a> PlanCx<'a> {
                     self.plan_rvalue(function, value, locals, zero_env_function_values)?;
                 let mut stmts = planned.stmts;
                 stmts.push(RirStmt::Eval(planned.value));
-                stmts.extend(planned.post_stmts);
                 Ok(stmts)
             }
             air::AirStmt::GlobalEnsure { global } => Ok(vec![RirStmt::GlobalEnsure {
@@ -3246,15 +3540,33 @@ impl<'a> PlanCx<'a> {
             ),
             air::AirStmt::OptionalMatch(match_) => {
                 let (mut stmts, subject) = self.plan_option_subject(function, match_, locals)?;
-                let payload = match_
-                    .payload
-                    .map(|payload| RirLocalId::from_index(payload.index()));
-                if match_.payload_ref
-                    && let Some(payload) = payload
-                    && let Some(local) = locals.get_mut(payload.index())
-                {
-                    local.payload_ref = true;
-                }
+                let payload = match match_.payload {
+                    Some(payload) if match_.payload_ref => {
+                        let local = RirLocalId::from_index(payload.index());
+                        if let Some(decl) = locals.get_mut(local.index()) {
+                            decl.payload_ref = true;
+                        }
+                        Some(RirOptionPayloadBinding::Ref {
+                            local,
+                            escapes: match_.payload_escapes,
+                        })
+                    }
+                    Some(payload) => {
+                        let TypeData::Optional(inner) = self.air.type_arena.data(match_.discr.ty)
+                        else {
+                            unreachable!("verified option match subject")
+                        };
+                        Some(RirOptionPayloadBinding::Owned {
+                            local: RirLocalId::from_index(payload.index()),
+                            materializer: self.reusable_materializer(
+                                function,
+                                *inner,
+                                rep_policy::RustRecipePosition::Value,
+                            )?,
+                        })
+                    }
+                    None => None,
+                };
                 let entry_functions = zero_env_function_values.clone();
                 let entry_cells = initialized_cells.to_vec();
                 let entry_possible = possible_cells.to_vec();
@@ -3302,8 +3614,6 @@ impl<'a> PlanCx<'a> {
                 stmts.push(RirStmt::OptionMatch(RirOptionMatch {
                     subject,
                     payload,
-                    payload_ref: match_.payload_ref,
-                    payload_escapes: match_.payload_escapes,
                     some_block,
                     none_block,
                 }));
@@ -3406,7 +3716,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_dyn_match(
-        &self,
+        &mut self,
         function: FunctionId,
         match_: &air::AirDynMatch,
         locals: &mut Vec<RirLocal>,
@@ -3451,32 +3761,16 @@ impl<'a> PlanCx<'a> {
                     )
                 }
             }
-            air::AirDynMatchSource::Owned { value, use_ } => {
-                let air_local =
-                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
-                        Operand::Place(place) => place
-                            .root
-                            .local()
-                            .expect("verified consumed dynamic match temporary"),
-                        Operand::Const(_) => {
-                            unreachable!("verified consumed dynamic match temporary")
-                        }
-                    });
-                let value = match use_ {
-                    air::DynOwnedUse::ConsumeTemporary => {
-                        PlannedOperand::from_operand(self.plan_operand(function, value))
-                    }
-                    air::DynOwnedUse::ReusableRead => {
-                        self.plan_operand_read(function, value, locals)
-                    }
-                };
+            air::AirDynMatchSource::Owned(value) => {
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 (
                     value.stmts,
-                    rir::RirDynMatchSource::Owned {
-                        value: value.operand,
-                        air_use: *use_,
-                        air_local,
-                    },
+                    rir::RirDynMatchSource::Owned(value.value),
                     false,
                     false,
                 )
@@ -3509,9 +3803,19 @@ impl<'a> PlanCx<'a> {
                 }
                 air::AirDynMatchTargetBinding::Take(local)
                 | air::AirDynMatchTargetBinding::Materialize(local)
-                    if !mutable =>
+                    if !mutable && !borrowed =>
                 {
-                    rir::RirDynMatchBinding::Owned(RirLocalId::from_index(local.index()))
+                    rir::RirDynMatchBinding::Take(RirLocalId::from_index(local.index()))
+                }
+                air::AirDynMatchTargetBinding::Materialize(local) if !mutable && borrowed => {
+                    rir::RirDynMatchBinding::Materialize {
+                        local: RirLocalId::from_index(local.index()),
+                        materializer: self.reusable_materializer(
+                            function,
+                            arm.target,
+                            rep_policy::RustRecipePosition::Value,
+                        )?,
+                    }
                 }
                 _ => unreachable!("verified dynamic match target binding"),
             };
@@ -3536,21 +3840,37 @@ impl<'a> PlanCx<'a> {
             });
         }
         let fallback_binding = match match_.fallback.binding {
-            air::AirDynMatchFallbackBinding::Discard => None,
-            air::AirDynMatchFallbackBinding::Alias(local) if mutable => {
+            air::AirDynMatchFallbackBinding::Discard => rir::RirDynMatchFallbackBinding::Discard,
+            air::AirDynMatchFallbackBinding::Alias(local) if mutable && !borrowed => {
                 let local = RirLocalId::from_index(local.index());
-                locals[local.index()].payload_ref = !borrowed;
-                Some(local)
+                locals[local.index()].payload_ref = true;
+                rir::RirDynMatchFallbackBinding::Alias(local)
             }
-            air::AirDynMatchFallbackBinding::Preserve(local) if !mutable => {
-                Some(RirLocalId::from_index(local.index()))
+            air::AirDynMatchFallbackBinding::Alias(local) if borrowed => {
+                rir::RirDynMatchFallbackBinding::Preserve(RirLocalId::from_index(local.index()))
+            }
+            air::AirDynMatchFallbackBinding::Preserve(local) if !mutable && !borrowed => {
+                rir::RirDynMatchFallbackBinding::Take(RirLocalId::from_index(local.index()))
+            }
+            air::AirDynMatchFallbackBinding::Preserve(local) if borrowed => {
+                rir::RirDynMatchFallbackBinding::Preserve(RirLocalId::from_index(local.index()))
             }
             _ => unreachable!("verified dynamic match fallback binding"),
         };
         let mut fallback_functions = entry_functions;
         let mut fallback_cells = entry_cells;
         let mut fallback_possible = entry_possible;
-        let mut fallback = self.plan_air_block(
+        let reborrow = match fallback_binding {
+            rir::RirDynMatchFallbackBinding::Preserve(local) => Some((
+                LocalId::from_index(local.index()),
+                self.dyn_surface_map[&match_.surface],
+            )),
+            _ => None,
+        };
+        if let Some(reborrow) = reborrow {
+            self.dyn_reborrows.push(reborrow);
+        }
+        let fallback = self.plan_air_block(
             function,
             &match_.fallback.block,
             locals,
@@ -3558,14 +3878,11 @@ impl<'a> PlanCx<'a> {
             &mut fallback_cells,
             &mut fallback_possible,
             in_loop,
-        )?;
-        if borrowed && let Some(local) = fallback_binding {
-            Self::rebind_dyn_borrow_block(
-                &mut fallback,
-                local,
-                self.dyn_surface_map[&match_.surface],
-            );
+        );
+        if reborrow.is_some() {
+            self.dyn_reborrows.pop();
         }
+        let fallback = fallback?;
         arm_states.push((fallback_functions, fallback_cells, fallback_possible));
         Self::merge_zero_env_function_values(
             zero_env_function_values,
@@ -3588,107 +3905,8 @@ impl<'a> PlanCx<'a> {
         Ok(stmts)
     }
 
-    fn rebind_dyn_borrow_block(
-        block: &mut RirStructuredBlock,
-        local: RirLocalId,
-        carrier: RirDynCarrierId,
-    ) {
-        for stmt in &mut block.stmts {
-            match stmt {
-                RirStmt::Init { value, .. }
-                | RirStmt::GlobalSetRoot { value, .. }
-                | RirStmt::GlobalUpdateRoot { value, .. }
-                | RirStmt::MutPlaceSet { value, .. }
-                | RirStmt::Assign { value, .. }
-                | RirStmt::CellInit { value, .. }
-                | RirStmt::CellSet { value, .. }
-                | RirStmt::ScopedPlaceCellSet { value, .. }
-                | RirStmt::Eval(value) => Self::rebind_dyn_borrow_rvalue(value, local, carrier),
-                RirStmt::If(branch) => {
-                    Self::rebind_dyn_borrow_block(&mut branch.then_block, local, carrier);
-                    if let Some(block) = &mut branch.else_block {
-                        Self::rebind_dyn_borrow_block(block, local, carrier);
-                    }
-                }
-                RirStmt::Loop(loop_) => {
-                    Self::rebind_dyn_borrow_block(&mut loop_.body, local, carrier);
-                }
-                RirStmt::RangeFor(for_) => {
-                    Self::rebind_dyn_borrow_block(&mut for_.body, local, carrier);
-                }
-                RirStmt::CollectionFor(for_) => {
-                    Self::rebind_dyn_borrow_block(&mut for_.body, local, carrier);
-                }
-                RirStmt::CollectionLoanScope(scope) => {
-                    Self::rebind_dyn_borrow_block(&mut scope.body, local, carrier);
-                }
-                RirStmt::CollectionSlotScope(block) => {
-                    Self::rebind_dyn_borrow_block(block, local, carrier);
-                }
-                RirStmt::PatternMatch(match_) => {
-                    for arm in &mut match_.arms {
-                        Self::rebind_dyn_borrow_block(&mut arm.block, local, carrier);
-                    }
-                }
-                RirStmt::DynMatch(match_) => {
-                    for arm in &mut match_.arms {
-                        Self::rebind_dyn_borrow_block(&mut arm.block, local, carrier);
-                    }
-                    Self::rebind_dyn_borrow_block(&mut match_.fallback, local, carrier);
-                }
-                RirStmt::OptionMatch(match_) => {
-                    Self::rebind_dyn_borrow_block(&mut match_.some_block, local, carrier);
-                    Self::rebind_dyn_borrow_block(&mut match_.none_block, local, carrier);
-                }
-                RirStmt::MapEntryMatch(match_) => {
-                    Self::rebind_dyn_borrow_block(&mut match_.some_block, local, carrier);
-                    Self::rebind_dyn_borrow_block(&mut match_.none_block, local, carrier);
-                }
-                RirStmt::GlobalEnsure { .. }
-                | RirStmt::ScopedPlaceCellInit { .. }
-                | RirStmt::DataRefSet { .. }
-                | RirStmt::SequenceSlotSet { .. }
-                | RirStmt::MapValueSet { .. } => {}
-            }
-        }
-    }
-
-    fn rebind_dyn_borrow_rvalue(
-        value: &mut RirRValue,
-        local: RirLocalId,
-        carrier: RirDynCarrierId,
-    ) {
-        let RirRValue::DynCall { receiver, .. } = value else {
-            return;
-        };
-        let uses_local = match receiver {
-            RirDynReceiver::MutPlace(place) => {
-                matches!(
-                    &place.access,
-                    RirMutPlaceAccess::Handle(RirMutPlaceHandle::Local { local: source, .. })
-                        if *source == local && place.projections.is_empty()
-                )
-            }
-            RirDynReceiver::Owned {
-                value: RirOperand::Place(place),
-                consume: false,
-            } => {
-                matches!(place.root, RirPlaceRoot::Local(source) if source == local)
-                    && place.projections.is_empty()
-            }
-            RirDynReceiver::Owned { .. } | RirDynReceiver::Borrowed(_) => false,
-        };
-        if uses_local {
-            *receiver = RirDynReceiver::Borrowed(rir::RirDynBorrow {
-                source: rir::RirDynBorrowSource::Reborrowed { local, carrier },
-                target: carrier,
-                air_weakening: None,
-            });
-        }
-    }
-
     fn plan_option_subject(
-        &self,
+        &mut self,
         function: FunctionId,
         match_: &air::AirOptionalMatch,
         locals: &mut Vec<RirLocal>,
@@ -3777,16 +3995,25 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_air_tail(
-        &self,
+        &mut self,
         function: FunctionId,
         tail: &air::AirTail,
         locals: &mut Vec<RirLocal>,
-    ) -> (Vec<RirStmt>, RirTerm) {
-        match tail {
+    ) -> Result<(Vec<RirStmt>, RirTerm), RustPlanError> {
+        Ok(match tail {
             air::AirTail::None => (vec![], RirTerm::None),
             air::AirTail::Return(Some(value)) => {
                 let planned = self.plan_operand_read(function, value, locals);
                 (planned.stmts, RirTerm::Return(Some(planned.operand)))
+            }
+            air::AirTail::ReturnOwned(owned) => {
+                let planned = self.plan_air_owned_value(
+                    function,
+                    owned,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
+                (planned.stmts, RirTerm::ReturnOwned(planned.value))
             }
             air::AirTail::Return(None) => (vec![], RirTerm::Return(None)),
             air::AirTail::Unreachable => (vec![], RirTerm::Unreachable),
@@ -3794,61 +4021,39 @@ impl<'a> PlanCx<'a> {
             air::AirTail::Continue(id) => {
                 (vec![], RirTerm::Continue(RirLoopId::from_index(id.index())))
             }
-        }
+        })
     }
 
     fn plan_rvalue(
-        &self,
+        &mut self,
         function: FunctionId,
         value: &RValue,
         locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
+        zero_env_function_values: &[Option<ZeroEnvFunctionValue>],
     ) -> Result<PlannedRValue, RustPlanError> {
         let planned = match value {
-            RValue::DynPack {
-                value,
-                use_,
-                witness,
-                ty: _,
-            } => {
-                let &(carrier, variant, action, ty) = self
+            RValue::DynPack { value, witness, .. } => {
+                let &(carrier, variant, _, ty) = self
                     .dyn_witness_map
                     .get(witness)
                     .expect("reachable verified dynamic witness");
-                let action = if *use_ == air::DynOwnedUse::ConsumeTemporary {
-                    RirDynPayloadAction::Move
-                } else {
-                    action
-                };
-                let air_local =
-                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
-                        Operand::Place(place) if place.projection.is_empty() => place
-                            .root
-                            .local()
-                            .expect("verified consumed dynamic pack temporary"),
-                        _ => unreachable!("verified consumed dynamic pack temporary"),
-                    });
-                let value = match use_ {
-                    air::DynOwnedUse::ConsumeTemporary => {
-                        PlannedOperand::from_operand(self.plan_operand(function, value))
-                    }
-                    air::DynOwnedUse::ReusableRead => {
-                        self.plan_operand_read(function, value, locals)
-                    }
-                };
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::DynamicPayload,
+                    ),
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::DynPack {
                         carrier,
                         variant,
                         air_witness: *witness,
-                        air_use: *use_,
-                        air_local,
-                        value: value.operand,
-                        action,
+                        value: value.value,
                         ty,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::DynCall {
@@ -3860,61 +4065,19 @@ impl<'a> PlanCx<'a> {
                 let carrier = self.dyn_surface_map[surface];
                 let (mut stmts, receiver) = match receiver {
                     air::DynReceiver::Owned(value) => {
-                        if let Operand::Place(place) = value {
-                            let read_plan = self
-                                .access()
-                                .plan(function, PlaceAccessIntent::ReadValue, place)
-                                .expect("profile verifies dynamic receiver place");
-                            if let Some(last) = read_plan.projection.last()
-                                && let PlaceProjectionKind::ListIndex(index) = last.kind
-                            {
-                                let mut root = place.clone();
-                                root.projection.pop();
-                                root.ty = last.source_ty;
-                                let collection = self.plan_collection_access(
-                                    function,
-                                    &root,
-                                    CollectionAccessOp::SequenceSlotRead,
-                                    locals,
-                                )?;
-                                let mut stmts = collection.stmts;
-                                let value = self.rvalue_temp(
-                                    RirRValue::SequenceSlotAt {
-                                        collection: collection.access,
-                                        index: RirLocalId::from_index(index.index()),
-                                        ty: self.type_map[&place.ty],
-                                    },
-                                    place.ty,
-                                    locals,
-                                    &mut stmts,
-                                );
-                                (
-                                    stmts,
-                                    RirDynReceiver::Owned {
-                                        value,
-                                        consume: false,
-                                    },
-                                )
-                            } else {
-                                let planned = self.plan_operand_read(function, value, locals);
-                                (
-                                    planned.stmts,
-                                    RirDynReceiver::Owned {
-                                        value: planned.operand,
-                                        consume: false,
-                                    },
-                                )
+                        let value = self.plan_air_owned_value(
+                            function,
+                            value,
+                            rep_policy::RustRecipePosition::Value,
+                            locals,
+                        )?;
+                        let receiver = match &value.value.value {
+                            RirOwnedOperand::DynBorrow(borrow) => {
+                                RirDynReceiver::Borrowed(borrow.clone())
                             }
-                        } else {
-                            let planned = self.plan_operand_read(function, value, locals);
-                            (
-                                planned.stmts,
-                                RirDynReceiver::Owned {
-                                    value: planned.operand,
-                                    consume: false,
-                                },
-                            )
-                        }
+                            _ => RirDynReceiver::Owned(value.value),
+                        };
+                        (value.stmts, receiver)
                     }
                     air::DynReceiver::Borrowed(borrow) => {
                         let planned = self.plan_dyn_borrow_arg(function, borrow, locals)?;
@@ -3924,20 +4087,23 @@ impl<'a> PlanCx<'a> {
                         (planned.stmts, RirDynReceiver::Borrowed(borrow))
                     }
                     air::DynReceiver::MutableOwned(place) => {
-                        let plan = self
-                            .access()
-                            .plan(function, PlaceAccessIntent::MutPlaceArg, place)
-                            .map_err(|gap| Self::access_gap(function, gap))?;
-                        let planned = self.plan_mut_place_arg(function, &plan, locals)?;
-                        (planned.stmts, RirDynReceiver::MutPlace(planned.arg))
+                        if let Some(borrow) = self.dyn_borrow_for_place(place) {
+                            (vec![], RirDynReceiver::Borrowed(borrow))
+                        } else {
+                            let plan = self
+                                .access()
+                                .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                                .map_err(|gap| Self::access_gap(function, gap))?;
+                            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+                            (planned.stmts, RirDynReceiver::MutPlace(planned.arg))
+                        }
                     }
                 };
                 let required = &self.air.contract_surfaces[surface.index()].slots[slot.index()];
                 let mut rir_args = Vec::with_capacity(args.len());
                 for (arg, param) in args.iter().zip(&required.params) {
                     let expected = rir::source_param_semantic(self.air, param.ty, param.mode);
-                    let planned =
-                        self.plan_arg(function, arg, expected, locals, zero_env_function_values)?;
+                    let planned = self.plan_arg(function, arg, expected, locals)?;
                     stmts.extend(planned.stmts);
                     rir_args.push(planned.arg);
                 }
@@ -3958,109 +4124,95 @@ impl<'a> PlanCx<'a> {
                         arms: self.dyn_dispatch_map[&(*surface, *slot)].clone(),
                         ty: self.type_map[&ret],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::DynWeaken {
                 value,
-                use_,
                 weakening,
                 ty,
             } => {
                 let (source, target, arms) = self
                     .dyn_weakening_map
                     .get(weakening)
+                    .cloned()
                     .expect("reachable verified dynamic weakening");
-                let air_local =
-                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
-                        Operand::Place(place) if place.projection.is_empty() => place
-                            .root
-                            .local()
-                            .expect("verified consumed dynamic weakening temporary"),
-                        _ => unreachable!("verified consumed dynamic weakening temporary"),
-                    });
-                let value = match use_ {
-                    air::DynOwnedUse::ConsumeTemporary => {
-                        PlannedOperand::from_operand(self.plan_operand(function, value))
-                    }
-                    air::DynOwnedUse::ReusableRead => {
-                        self.plan_operand_read(function, value, locals)
-                    }
-                };
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::DynWeaken {
-                        source: *source,
-                        target: *target,
+                        source,
+                        target,
                         air_weakening: *weakening,
-                        air_use: *use_,
-                        air_local,
-                        value: value.operand,
+                        value: value.value,
                         arms: arms.clone(),
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::DynDowncast {
                 value,
-                use_,
                 surface,
                 target,
                 ty,
             } => {
                 let carrier_id = self.dyn_surface_map[surface];
                 let variants = self.dyn_variants_for_target(*surface, *target);
-                let air_local =
-                    (*use_ == air::DynOwnedUse::ConsumeTemporary).then(|| match value {
-                        Operand::Place(place) => place
-                            .root
-                            .local()
-                            .expect("verified consumed dynamic downcast temporary"),
-                        Operand::Const(_) => {
-                            unreachable!("verified consumed dynamic downcast temporary")
-                        }
-                    });
-                let value = match use_ {
-                    air::DynOwnedUse::ConsumeTemporary => {
-                        PlannedOperand::from_operand(self.plan_operand(function, value))
-                    }
-                    air::DynOwnedUse::ReusableRead => {
-                        self.plan_operand_read(function, value, locals)
-                    }
-                };
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::DynDowncast {
                         carrier: carrier_id,
                         air_surface: *surface,
-                        air_use: *use_,
-                        air_local,
-                        value: value.operand,
+                        value: value.value,
                         target: self.type_map[target],
                         variants,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Use(operand) => {
                 return self.plan_use(function, operand, locals, zero_env_function_values);
             }
+            RValue::Materialize(owned) => {
+                let planned = self.plan_air_owned_value(
+                    function,
+                    owned,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
+                return Ok(PlannedRValue {
+                    stmts: planned.stmts,
+                    value: RirRValue::Materialize(planned.value),
+                });
+            }
             RValue::FunctionValue { value, capability } => {
                 let ty = self
                     .air
-                    .operand_ty(value)
+                    .operand_ty(&value.value)
                     .expect("verified function value operand has type");
-                let value = self.plan_operand_read(function, value, locals);
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::FunctionValue {
-                        value: value.operand,
+                        value: value.value,
                         escape: rir_function_value_escape(*capability),
                         ty: self.type_map[&ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Unary { op, value, ty } => {
@@ -4072,7 +4224,6 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Binary { op, lhs, rhs, ty } => {
@@ -4088,7 +4239,6 @@ impl<'a> PlanCx<'a> {
                         rhs: rhs.operand,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::SharedRefEq { lhs, rhs, negated } => {
@@ -4103,7 +4253,6 @@ impl<'a> PlanCx<'a> {
                         rhs: rhs.operand,
                         negated: *negated,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Cast { value, target } => {
@@ -4114,7 +4263,6 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         target: self.type_map[target],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::RawProject { value, target } => {
@@ -4125,7 +4273,6 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         target: self.type_map[target],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::RawTryConstruct { value, target, ty } => {
@@ -4137,7 +4284,6 @@ impl<'a> PlanCx<'a> {
                         target: self.type_map[target],
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::FlagStatic { op, ty } => PlannedRValue {
@@ -4149,22 +4295,25 @@ impl<'a> PlanCx<'a> {
                     },
                     ty: self.type_map[ty],
                 },
-                post_stmts: vec![],
             },
             RValue::OptionalSome { value, ty } => {
-                let value = self.plan_operand_read(function, value, locals);
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::OptionalPayload,
+                    ),
+                    locals,
+                )?;
                 PlannedRValue {
                     stmts: value.stmts,
                     value: RirRValue::OptionalSome {
-                        value: value.operand,
+                        value: value.value,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
-            RValue::Call { callee, args } => {
-                self.plan_call(function, callee, args, locals, zero_env_function_values)?
-            }
+            RValue::Call { callee, args } => self.plan_call(function, callee, args, locals)?,
             RValue::Stringify { value, source_ty } => {
                 let value = self.plan_operand_read(function, value, locals);
                 PlannedRValue {
@@ -4173,7 +4322,6 @@ impl<'a> PlanCx<'a> {
                         value: value.operand,
                         source_ty: self.type_map[source_ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::StringConcat { parts } => {
@@ -4183,7 +4331,6 @@ impl<'a> PlanCx<'a> {
                     value: RirRValue::StringConcat {
                         parts: parts.operands,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Format { value, spec } => {
@@ -4196,7 +4343,6 @@ impl<'a> PlanCx<'a> {
                         source_ty,
                         spec: rir_format_spec(*spec),
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Aggregate { kind, fields, ty } => {
@@ -4218,7 +4364,6 @@ impl<'a> PlanCx<'a> {
                     value: RirRValue::CollectionLen {
                         source: source.access,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::Len { source } => {
@@ -4231,21 +4376,26 @@ impl<'a> PlanCx<'a> {
                     value: RirRValue::Len {
                         source: source_place,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::ListPush { list, value } => {
                 let list = self.structural_collection_access(function, list, locals)?;
-                let value = self.plan_operand_read(function, value, locals);
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::ListElement,
+                    ),
+                    locals,
+                )?;
                 let mut stmts = list.stmts;
                 stmts.extend(value.stmts);
                 PlannedRValue {
                     stmts,
                     value: RirRValue::ListPush {
                         list: list.access,
-                        value: value.operand,
+                        value: value.value,
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::SliceView {
@@ -4254,14 +4404,25 @@ impl<'a> PlanCx<'a> {
                 end,
                 inclusive,
                 ty,
-            } => PlannedRValue::from_value(RirRValue::SliceView {
-                source: self.plan_slice_view_source(function, source)?,
-                start: RirLocalId::from_index(start.index()),
-                end: RirLocalId::from_index(end.index()),
-                inclusive: *inclusive,
-                mutable: false,
-                ty: self.type_map[ty],
-            }),
+            } => {
+                let source = self.plan_collection_access(
+                    function,
+                    source,
+                    CollectionAccessOp::SliceView,
+                    locals,
+                )?;
+                PlannedRValue {
+                    stmts: source.stmts,
+                    value: RirRValue::SliceView {
+                        source: source.access,
+                        start: RirLocalId::from_index(start.index()),
+                        end: RirLocalId::from_index(end.index()),
+                        inclusive: *inclusive,
+                        mutable: false,
+                        ty: self.type_map[ty],
+                    },
+                }
+            }
             RValue::RangeListCopy {
                 source,
                 start,
@@ -4282,7 +4443,6 @@ impl<'a> PlanCx<'a> {
                         inclusive: *inclusive,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapGet { map, key, ty } => {
@@ -4298,7 +4458,6 @@ impl<'a> PlanCx<'a> {
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapInsert {
@@ -4313,8 +4472,20 @@ impl<'a> PlanCx<'a> {
                     CollectionAccessOp::map_write(*kind),
                     locals,
                 )?;
-                let key = self.plan_operand_read(function, key, locals);
-                let value = self.plan_operand_read(function, value, locals);
+                let key = self.plan_air_owned_value(
+                    function,
+                    key,
+                    rep_policy::RustRecipePosition::MapKey,
+                    locals,
+                )?;
+                let value = self.plan_air_owned_value(
+                    function,
+                    value,
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::MapValue,
+                    ),
+                    locals,
+                )?;
                 let mut stmts = map.stmts;
                 stmts.extend(key.stmts);
                 stmts.extend(value.stmts);
@@ -4322,11 +4493,10 @@ impl<'a> PlanCx<'a> {
                     stmts,
                     value: RirRValue::MapInsert {
                         map: map.access,
-                        key: key.operand,
-                        value: value.operand,
+                        key: key.value,
+                        value: value.value,
                         kind: rir_map_write_kind(*kind),
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapRemove { map, key, ty } => {
@@ -4341,7 +4511,6 @@ impl<'a> PlanCx<'a> {
                         key: key.operand,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::CheckedIterCount { count, check } => {
@@ -4362,7 +4531,6 @@ impl<'a> PlanCx<'a> {
                             }
                         },
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::FunctionRef {
@@ -4378,7 +4546,8 @@ impl<'a> PlanCx<'a> {
                 captures,
                 ty,
             } => {
-                let captures = self.plan_lambda_capture_args(function, captures, locals)?;
+                let captures =
+                    self.plan_lambda_capture_args(function, *lambda, captures, locals)?;
                 PlannedRValue {
                     stmts: captures.stmts,
                     value: RirRValue::Lambda {
@@ -4386,7 +4555,6 @@ impl<'a> PlanCx<'a> {
                         captures: captures.captures,
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapEntryAt { map, index, ty } => {
@@ -4403,7 +4571,6 @@ impl<'a> PlanCx<'a> {
                         index: RirLocalId::from_index(index.index()),
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapKeyAt { map, index, ty } => {
@@ -4420,7 +4587,6 @@ impl<'a> PlanCx<'a> {
                         index: RirLocalId::from_index(index.index()),
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::MapValueAt { map, index, ty } => {
@@ -4437,7 +4603,6 @@ impl<'a> PlanCx<'a> {
                         index: RirLocalId::from_index(index.index()),
                         ty: self.type_map[ty],
                     },
-                    post_stmts: vec![],
                 }
             }
             RValue::ListPop { .. } => {
@@ -4451,7 +4616,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_loop_body(
-        &self,
+        &mut self,
         function: FunctionId,
         loop_id: air::AirLoopId,
         body: &air::AirBlock,
@@ -4505,22 +4670,52 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_lambda_capture_args(
-        &self,
+        &mut self,
         function: FunctionId,
+        lambda: air::LambdaId,
         captures: &[air::LambdaCaptureArg],
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedLambdaCaptureArgs, RustPlanError> {
         let mut stmts = vec![];
         let mut planned = vec![];
-        for capture in captures {
+        for (index, capture) in captures.iter().enumerate() {
             match capture {
                 air::LambdaCaptureArg::NoRuntime => {}
                 air::LambdaCaptureArg::ReadonlyLocal { value } => {
-                    let value = self.plan_operand_read(function, value, locals);
-                    stmts.extend(value.stmts);
-                    planned.push(RirLambdaCaptureArg::Readonly {
-                        value: value.operand,
-                    });
+                    let slot = air::LambdaCaptureSlotId::from_index(index);
+                    match self.lambda_capture_semantics[&(lambda, slot)] {
+                        RirParamSemantic::Value => {
+                            let value = self.plan_air_owned_value(
+                                function,
+                                value,
+                                rep_policy::RustRecipePosition::Value,
+                                locals,
+                            )?;
+                            stmts.extend(value.stmts);
+                            planned.push(RirLambdaCaptureArg::Owned { value: value.value });
+                        }
+                        RirParamSemantic::SharedBorrow => {
+                            if value.source != air::ValueSource::Reusable {
+                                return Err(Self::gap(
+                                    RustTargetGapSite::Function(function),
+                                    RustTargetGapKind::UnsupportedLambdaCapture,
+                                ));
+                            }
+                            let Operand::Place(place) = &value.value else {
+                                return Err(Self::gap(
+                                    RustTargetGapSite::Function(function),
+                                    RustTargetGapKind::UnsupportedLambdaCapture,
+                                ));
+                            };
+                            let value = self.lower_place_read(function, place, locals);
+                            stmts.extend(value.stmts);
+                            let RirOperand::Place(place) = value.operand else {
+                                unreachable!("place read returns a place operand")
+                            };
+                            planned.push(RirLambdaCaptureArg::Shared { place });
+                        }
+                        _ => unreachable!("readonly capture has value or shared semantic"),
+                    }
                 }
                 air::LambdaCaptureArg::ScopedLocal { .. } => {
                     return Err(Self::gap(
@@ -4558,8 +4753,17 @@ impl<'a> PlanCx<'a> {
         })
     }
 
-    fn air_place_value_readable(&self, ty: TypeId) -> bool {
-        self.rust_copyable_air_type(ty) || self.rust_shareable_air_type(ty)
+    fn air_place_value_readable(&mut self, place: &Place) -> bool {
+        let position =
+            if matches!(place.root, air::PlaceRoot::Global(_)) && place.projection.is_empty() {
+                rep_policy::RustRecipePosition::Global
+            } else {
+                rep_policy::RustRecipePosition::Value
+            };
+        let plan = RustRepresentationPlan::new(self.air, &self.classes);
+        self.materializers
+            .action_for(plan, place.ty, position)
+            .is_ok()
     }
 
     fn zero_env_function_rvalue(value: &RirRValue) -> Option<ZeroEnvFunctionValue> {
@@ -4594,28 +4798,8 @@ impl<'a> PlanCx<'a> {
         None
     }
 
-    fn compiler_temp_place(&self, function: FunctionId, place: &Place) -> bool {
-        place.projection.is_empty()
-            && place.root.local().is_some_and(|local| {
-                self.air.function(function).locals[local.index()].kind == LocalKind::Temp
-            })
-    }
-
-    fn unbound_movable_temp_place(&self, function: FunctionId, place: &Place) -> bool {
-        if !place.projection.is_empty() {
-            return false;
-        }
-        let Some(local) = place.root.local() else {
-            return false;
-        };
-        let local = &self.air.function(function).locals[local.index()];
-        local.kind == LocalKind::Temp
-            || (matches!(self.air.type_arena.data(place.ty), TypeData::Function(_))
-                && local.binding.is_none())
-    }
-
     fn plan_use(
-        &self,
+        &mut self,
         function: FunctionId,
         operand: &Operand,
         locals: &mut Vec<RirLocal>,
@@ -4626,20 +4810,6 @@ impl<'a> PlanCx<'a> {
                 self.plan_operand(function, operand),
             )));
         };
-        if place.projection.is_empty() {
-            if let Some(cell) = self.place_capture_cell(function, place) {
-                return Ok(PlannedRValue::from_value(RirRValue::CellGetCopy {
-                    cell: self.capture_cell_ref(function, cell),
-                    ty: self.type_map[&place.ty],
-                }));
-            }
-            if let Some(borrow) = self.place_scoped_borrow(function, place) {
-                return Ok(PlannedRValue::from_value(RirRValue::ScopedPlaceCellGet {
-                    cell: self.scoped_place_cell_ref(function, borrow),
-                    ty: self.type_map[&place.ty],
-                }));
-            }
-        }
         if self.unsupported_function_capture_value(place) {
             return Err(Self::gap(
                 RustTargetGapSite::Function(function),
@@ -4650,37 +4820,28 @@ impl<'a> PlanCx<'a> {
             .access()
             .plan(function, PlaceAccessIntent::ReadValue, place)
             .expect("profile verifies readable places");
-        if read_plan.dataref_plan().is_some() {
-            let planned = self.lower_place_read(function, place, locals);
-            return Ok(PlannedRValue {
-                stmts: planned.stmts,
-                value: RirRValue::Use(planned.operand),
-                post_stmts: vec![],
-            });
-        }
         if let Some(value) = self.projected_sequence_read(function, place, &read_plan, locals)? {
             return Ok(value);
         }
-        if let TypeData::Dyn(surface) = self.air.type_arena.data(place.ty) {
-            if self.unbound_movable_temp_place(function, place) {
-                return Ok(PlannedRValue::from_value(RirRValue::MoveValue {
-                    value: self.plan_operand(function, operand),
-                    air_local: place.root.local().expect("checked local temporary"),
-                    ty: self.type_map[&place.ty],
-                }));
-            }
-            let value = self.plan_operand_read(function, operand, locals);
-            return Ok(PlannedRValue {
-                stmts: value.stmts,
-                value: RirRValue::DynCopy {
-                    carrier: self.dyn_surface_map[surface],
-                    value: value.operand,
-                    ty: self.type_map[&place.ty],
-                },
-                post_stmts: vec![],
-            });
+        let physical = self.plan_place_in_function(function, place);
+        let payload_ref = matches!(
+            physical.root,
+            RirPlaceRoot::Local(local)
+                if locals.get(local.index()).is_some_and(|local| local.payload_ref)
+        );
+        let guarded = read_plan.dataref_plan().is_some()
+            || payload_ref
+            || !matches!(
+                read_plan.root,
+                PlaceAccessRoot::Local {
+                    source_mut_param: false,
+                    ..
+                } | PlaceAccessRoot::LambdaCapture(_)
+            );
+        if guarded || matches!(self.air.type_arena.data(place.ty), TypeData::Dyn(_)) {
+            return self.plan_implicit_owned_value(function, place, locals);
         }
-        if !self.air_place_value_readable(place.ty) {
+        if !self.air_place_value_readable(place) {
             if let Some(state) = self.zero_env_function_place(place, zero_env_function_values) {
                 return Ok(PlannedRValue::from_value(state.rvalue()));
             }
@@ -4691,7 +4852,7 @@ impl<'a> PlanCx<'a> {
                     | TypeData::Enum(_)
                     | TypeData::Array { .. }
             );
-            if !self.unbound_movable_temp_place(function, place) && !reconstructable {
+            if !reconstructable {
                 return Err(Self::gap(
                     RustTargetGapSite::Function(function),
                     RustTargetGapKind::NonCopyValueRequired,
@@ -4708,27 +4869,37 @@ impl<'a> PlanCx<'a> {
                 self.plan_operand(function, operand),
             )));
         };
-        let decl = self.air.aggregate(*aggregate);
-        Ok(PlannedRValue::from_value(RirRValue::Struct {
-            ty: self.type_map[&place.ty],
-            fields: decl
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    let mut field_place = place.clone();
-                    field_place
-                        .projection
-                        .push(air::Projection::Field(FieldId::from_index(index)));
-                    field_place.ty = field.ty;
-                    RirOperand::Place(self.plan_place_in_function(function, &field_place))
-                })
-                .collect(),
-        }))
+        let fields = self.air.aggregate(*aggregate).fields.clone();
+        let mut stmts = vec![];
+        let mut planned_fields = vec![];
+        for (index, field) in fields.iter().enumerate() {
+            let mut field_place = place.clone();
+            field_place
+                .projection
+                .push(air::Projection::Field(FieldId::from_index(index)));
+            field_place.ty = field.ty;
+            let planned = self.plan_air_owned_value(
+                function,
+                &air::OwnedValue::reusable(Operand::Place(field_place)),
+                rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::StructField,
+                ),
+                locals,
+            )?;
+            stmts.extend(planned.stmts);
+            planned_fields.push(planned.value);
+        }
+        Ok(PlannedRValue {
+            stmts,
+            value: RirRValue::Struct {
+                ty: self.type_map[&place.ty],
+                fields: planned_fields,
+            },
+        })
     }
 
     fn projected_sequence_read(
-        &self,
+        &mut self,
         function: FunctionId,
         place: &Place,
         read_plan: &PlaceAccessPlan,
@@ -4771,77 +4942,104 @@ impl<'a> PlanCx<'a> {
                 index: RirLocalId::from_index(index.index()),
                 ty: self.type_map[&place.ty],
             },
-            post_stmts: vec![],
         }))
     }
 
     fn plan_aggregate(
-        &self,
+        &mut self,
         function: FunctionId,
         kind: &AggregateCtor,
-        fields: &[Operand],
+        fields: &[air::OwnedValue<Operand>],
         ty: TypeId,
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedRValue, RustPlanError> {
-        let fields = self.plan_operands_read(function, fields, locals);
+        if matches!(kind, AggregateCtor::Map) && !fields.len().is_multiple_of(2) {
+            return Err(Self::gap(
+                RustTargetGapSite::Function(function),
+                RustTargetGapKind::UnsupportedRValue,
+            ));
+        }
+        let mut stmts = vec![];
+        let mut planned_fields = vec![];
+        for (index, field) in fields.iter().enumerate() {
+            let position = match kind {
+                AggregateCtor::Struct(_) => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::StructField,
+                ),
+                AggregateCtor::DataRef(_) => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::DataRefProjection,
+                ),
+                AggregateCtor::EnumVariant { .. } => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::EnumPayload,
+                ),
+                AggregateCtor::Array | AggregateCtor::ArrayFill => {
+                    rep_policy::RustRecipePosition::StoredPayload(
+                        rep_policy::LambdaStorageFamily::FixedArrayElement,
+                    )
+                }
+                AggregateCtor::List => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::ListElement,
+                ),
+                AggregateCtor::Tuple => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::TupleField,
+                ),
+                AggregateCtor::Map if index.is_multiple_of(2) => {
+                    rep_policy::RustRecipePosition::MapKey
+                }
+                AggregateCtor::Map => rep_policy::RustRecipePosition::StoredPayload(
+                    rep_policy::LambdaStorageFamily::MapValue,
+                ),
+            };
+            let planned = self.plan_air_owned_value(function, field, position, locals)?;
+            stmts.extend(planned.stmts);
+            planned_fields.push(planned.value);
+        }
         let value = match kind {
             AggregateCtor::Struct(_) => RirRValue::Struct {
                 ty: self.type_map[&ty],
-                fields: fields.operands,
+                fields: planned_fields,
             },
             AggregateCtor::EnumVariant { variant, .. } => RirRValue::EnumVariant {
                 ty: self.type_map[&ty],
                 variant: RirVariantId::from_index(variant.index()),
-                fields: fields.operands,
+                fields: planned_fields,
             },
-            AggregateCtor::Array => RirRValue::Array {
+            AggregateCtor::Array | AggregateCtor::ArrayFill => RirRValue::Array {
                 ty: self.type_map[&ty],
-                elems: fields.operands,
+                elems: planned_fields,
             },
             AggregateCtor::List => RirRValue::List {
                 ty: self.type_map[&ty],
-                elems: fields.operands,
+                elems: planned_fields,
             },
             AggregateCtor::Tuple => RirRValue::Tuple {
                 ty: self.type_map[&ty],
-                fields: fields.operands,
+                fields: planned_fields,
             },
-            AggregateCtor::Map if fields.operands.len().is_multiple_of(2) => RirRValue::Map {
+            AggregateCtor::Map => RirRValue::Map {
                 ty: self.type_map[&ty],
-                entries: fields
-                    .operands
+                entries: planned_fields
                     .chunks_exact(2)
                     .map(|entry| (entry[0].clone(), entry[1].clone()))
                     .collect(),
             },
             AggregateCtor::DataRef(_) => RirRValue::DataRefAlloc {
                 ty: self.type_map[&ty],
-                fields: fields.operands,
+                fields: planned_fields,
             },
-            AggregateCtor::Map => {
-                return Err(Self::gap(
-                    RustTargetGapSite::Function(function),
-                    RustTargetGapKind::UnsupportedRValue,
-                ));
-            }
         };
-        Ok(PlannedRValue {
-            stmts: fields.stmts,
-            value,
-            post_stmts: vec![],
-        })
+        Ok(PlannedRValue { stmts, value })
     }
 
     fn plan_call(
-        &self,
+        &mut self,
         function_id: FunctionId,
         callee: &Callee,
         args: &[CallArg],
         locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         if let Callee::Extern(id) = callee {
-            return self.plan_native_call(function_id, *id, args, locals, zero_env_function_values);
+            return self.plan_native_call(function_id, *id, args, locals);
         }
 
         let (target, ty, callee_stmts, expected_args) = match callee {
@@ -4894,8 +5092,7 @@ impl<'a> PlanCx<'a> {
             ));
         }
         for (arg, expected) in args.iter().zip(expected_args) {
-            let planned =
-                self.plan_arg(function_id, arg, expected, locals, zero_env_function_values)?;
+            let planned = self.plan_arg(function_id, arg, expected, locals)?;
             stmts.extend(planned.stmts);
             planned_args.push(planned.arg);
         }
@@ -4906,17 +5103,15 @@ impl<'a> PlanCx<'a> {
                 args: planned_args,
                 ty,
             },
-            post_stmts: vec![],
         })
     }
 
     fn plan_native_call(
-        &self,
+        &mut self,
         function_id: FunctionId,
         id: ExternId,
         args: &[CallArg],
         locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedRValue, RustPlanError> {
         let ext = self.air.extern_decl(id);
         let native = self.native_extern(id, ext)?;
@@ -4930,8 +5125,7 @@ impl<'a> PlanCx<'a> {
         let mut stmts = vec![];
         let mut planned_args = vec![];
         for (arg, param) in args.iter().zip(&native.params) {
-            let planned =
-                self.plan_native_arg(function_id, arg, *param, locals, zero_env_function_values)?;
+            let planned = self.plan_arg(function_id, arg, param.semantic, locals)?;
             stmts.extend(planned.stmts);
             planned_args.push(planned.arg);
         }
@@ -4943,29 +5137,11 @@ impl<'a> PlanCx<'a> {
                 args: planned_args,
                 ty: self.type_map[&ext.return_type],
             },
-            post_stmts: vec![],
         })
     }
 
-    fn plan_native_arg(
-        &self,
-        function: FunctionId,
-        arg: &CallArg,
-        param: native_call::NativeParamAbi,
-        locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
-    ) -> Result<PlannedCallArg, RustPlanError> {
-        self.plan_arg(
-            function,
-            arg,
-            param.semantic,
-            locals,
-            zero_env_function_values,
-        )
-    }
-
     fn plan_collection_slot_scope(
-        &self,
+        &mut self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
         locals: &mut Vec<RirLocal>,
@@ -5215,7 +5391,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn structural_collection_access(
-        &self,
+        &mut self,
         function: FunctionId,
         root: &Place,
         locals: &mut Vec<RirLocal>,
@@ -5229,7 +5405,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn collection_slot_access(
-        &self,
+        &mut self,
         function: FunctionId,
         scope: &air::AirCollectionSlotScope,
         locals: &mut Vec<RirLocal>,
@@ -5241,7 +5417,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_collection_access(
-        &self,
+        &mut self,
         function: FunctionId,
         root: &Place,
         op: CollectionAccessOp,
@@ -5261,7 +5437,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_collection_access_from_plan(
-        &self,
+        &mut self,
         function: FunctionId,
         site: RustTargetGapSite,
         plan: &PlaceAccessPlan,
@@ -5269,12 +5445,6 @@ impl<'a> PlanCx<'a> {
         locals: &mut Vec<RirLocal>,
     ) -> Result<PlannedCollectionAccess, RustPlanError> {
         if plan.dataref_plan().is_some() {
-            if matches!(op, CollectionAccessOp::ShapeLoan) {
-                return Err(Self::gap(
-                    site,
-                    RustTargetGapKind::UnsupportedMutablePlaceDataRef,
-                ));
-            }
             let planned = self.plan_mut_place_arg(function, plan, locals)?;
             return Ok(PlannedCollectionAccess {
                 stmts: planned.stmts,
@@ -5303,8 +5473,11 @@ impl<'a> PlanCx<'a> {
                 PlaceProjectionKind::ListIndex(_) | PlaceProjectionKind::SliceIndex(_)
             )
         });
+        let global_slice_view = matches!(op, CollectionAccessOp::SliceView)
+            && matches!(plan.root, PlaceAccessRoot::Global(_));
         let use_mut_place = payload_ref
             || dynamic_collection_projection
+            || global_slice_view
             || matches!(
                 plan.root,
                 PlaceAccessRoot::Local {
@@ -5487,21 +5660,8 @@ impl<'a> PlanCx<'a> {
             .is_some()
     }
 
-    fn moves_bound_noncopy_lambda(&self, function: FunctionId, operand: &Operand) -> bool {
-        let Operand::Place(place) = operand else {
-            return false;
-        };
-        let Some(local) = place.root.local() else {
-            return false;
-        };
-        self.air.function(function).locals[local.index()]
-            .binding
-            .is_some()
-            && !self.air_place_value_readable(place.ty)
-    }
-
     fn plan_dyn_borrow_arg(
-        &self,
+        &mut self,
         function: FunctionId,
         borrow: &air::DynBorrow,
         locals: &mut Vec<RirLocal>,
@@ -5524,21 +5684,25 @@ impl<'a> PlanCx<'a> {
                 )
             }
             air::DynBorrowSource::Owned(place) => {
-                let plan = self
-                    .access()
-                    .plan(function, PlaceAccessIntent::MutPlaceArg, place)
-                    .map_err(|gap| Self::access_gap(function, gap))?;
-                let planned = self.plan_mut_place_arg(function, &plan, locals)?;
-                let TypeData::Dyn(surface) = self.air.type_arena.data(place.ty) else {
-                    unreachable!("AIR verifies owned dynamic borrow source")
-                };
-                (
-                    planned.stmts,
-                    rir::RirDynBorrowSource::Owned {
-                        place: planned.arg,
-                        carrier: self.dyn_surface_map[surface],
-                    },
-                )
+                if let Some(reborrow) = self.dyn_borrow_for_place(place) {
+                    (vec![], reborrow.source)
+                } else {
+                    let plan = self
+                        .access()
+                        .plan(function, PlaceAccessIntent::MutPlaceArg, place)
+                        .map_err(|gap| Self::access_gap(function, gap))?;
+                    let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+                    let TypeData::Dyn(surface) = self.air.type_arena.data(place.ty) else {
+                        unreachable!("AIR verifies owned dynamic borrow source")
+                    };
+                    (
+                        planned.stmts,
+                        rir::RirDynBorrowSource::Owned {
+                            place: planned.arg,
+                            carrier: self.dyn_surface_map[surface],
+                        },
+                    )
+                }
             }
             air::DynBorrowSource::Borrowed(place) => {
                 let air::PlaceRoot::DynBorrowParam(id) = place.root else {
@@ -5565,16 +5729,15 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_arg(
-        &self,
+        &mut self,
         function: FunctionId,
         arg: &CallArg,
         expected: RirParamSemantic,
         locals: &mut Vec<RirLocal>,
-        zero_env_function_values: &mut Vec<Option<ZeroEnvFunctionValue>>,
     ) -> Result<PlannedCallArg, RustPlanError> {
         match arg {
             CallArg::DynBorrow(borrow) => self.plan_dyn_borrow_arg(function, borrow, locals),
-            CallArg::Value(operand)
+            CallArg::Value(owned)
                 if matches!(
                     expected,
                     RirParamSemantic::ScopedLambda
@@ -5582,14 +5745,14 @@ impl<'a> PlanCx<'a> {
                         | RirParamSemantic::AnvCallback
                 ) =>
             {
-                let air_ty = self.operand_ty(operand);
+                let air_ty = self.operand_ty(&owned.value);
                 let TypeData::Function(_) = self.air.type_arena.data(air_ty) else {
                     return Err(Self::gap(
                         RustTargetGapSite::Function(function),
                         RustTargetGapKind::UnsupportedLambdaExternBoundary,
                     ));
                 };
-                if let Operand::Place(place) = operand
+                if let Operand::Place(place) = &owned.value
                     && self.unsupported_function_capture_value(place)
                 {
                     return Err(Self::gap(
@@ -5597,19 +5760,24 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
                 }
-                let planned = self.plan_operand_read(function, operand, locals);
+                let planned = self.plan_air_owned_value(
+                    function,
+                    owned,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 let sig = self.lambda_sig_map[&air_ty];
                 let arg = match expected {
                     RirParamSemantic::ScopedLambda => RirCallArg::ScopedLambda {
-                        callee: planned.operand,
+                        callee: planned.value,
                         sig,
                     },
                     RirParamSemantic::EscapingLambda => RirCallArg::EscapingLambda {
-                        callee: planned.operand,
+                        callee: planned.value,
                         sig,
                     },
                     RirParamSemantic::AnvCallback => RirCallArg::AnvCallback {
-                        callee: planned.operand,
+                        callee: planned.value,
                         sig,
                     },
                     _ => unreachable!("checked expected callback semantic"),
@@ -5619,22 +5787,9 @@ impl<'a> PlanCx<'a> {
                     arg,
                 })
             }
-            CallArg::Value(operand @ Operand::Place(place))
-                if self.compiler_temp_place(function, place)
-                    && matches!(self.air.type_arena.data(place.ty), TypeData::Dyn(_)) =>
-            {
-                let planned = self.plan_operand_read(function, operand, locals);
-                Ok(PlannedCallArg {
-                    stmts: planned.stmts,
-                    arg: RirCallArg::MovedValue {
-                        value: planned.operand,
-                        air_local: place.root.local().expect("checked local temporary"),
-                    },
-                })
-            }
-            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
+            CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
                 let init_field = matches!(arg, CallArg::InitFieldProvided(_));
-                if let Operand::Place(place) = operand
+                if let Operand::Place(place) = &owned.value
                     && self.unsupported_function_capture_value(place)
                 {
                     return Err(Self::gap(
@@ -5642,49 +5797,33 @@ impl<'a> PlanCx<'a> {
                         RustTargetGapKind::UnsupportedLambdaCapture,
                     ));
                 }
-                if let Operand::Place(place) = operand
-                    && !self.air_place_value_readable(place.ty)
-                    && let Some(state) =
-                        self.zero_env_function_place(place, zero_env_function_values)
-                {
-                    let local = self.alloc_temp(locals, place.ty);
-                    Self::set_zero_env_function(zero_env_function_values, local, Some(state));
-                    let operand = RirOperand::Place(RirPlace::local(local, vec![], state.ty()));
-                    return Ok(PlannedCallArg {
-                        stmts: vec![RirStmt::Init {
-                            local,
-                            value: state.rvalue(),
-                        }],
-                        arg: if init_field {
-                            RirCallArg::InitFieldProvided(operand)
-                        } else {
-                            RirCallArg::Value(operand)
-                        },
-                    });
-                }
-                if self.moves_bound_noncopy_lambda(function, operand) {
-                    return Err(Self::gap(
-                        RustTargetGapSite::Function(function),
-                        RustTargetGapKind::NonCopyValueRequired,
-                    ));
-                }
-                let planned = self.plan_operand_read(function, operand, locals);
+                let planned = self.plan_air_owned_value(
+                    function,
+                    owned,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
                     arg: if init_field {
-                        RirCallArg::InitFieldProvided(planned.operand)
+                        RirCallArg::InitFieldProvided(planned.value)
                     } else {
-                        RirCallArg::Value(planned.operand)
+                        RirCallArg::Value(planned.value)
                     },
                 })
             }
             CallArg::InitFieldOmitted => Ok(PlannedCallArg::from_arg(RirCallArg::InitFieldOmitted)),
             CallArg::SharedBorrow(place) if expected == RirParamSemantic::Value => {
-                let planned =
-                    self.plan_operand_read(function, &Operand::Place(place.clone()), locals);
+                let owned = air::OwnedValue::reusable(Operand::Place(place.clone()));
+                let planned = self.plan_air_owned_value(
+                    function,
+                    &owned,
+                    rep_policy::RustRecipePosition::Value,
+                    locals,
+                )?;
                 Ok(PlannedCallArg {
                     stmts: planned.stmts,
-                    arg: RirCallArg::Value(planned.operand),
+                    arg: RirCallArg::Value(planned.value),
                 })
             }
             CallArg::SharedBorrow(place) => {
@@ -5712,8 +5851,232 @@ impl<'a> PlanCx<'a> {
         }
     }
 
+    fn reusable_materializer(
+        &mut self,
+        function: FunctionId,
+        ty: TypeId,
+        position: rep_policy::RustRecipePosition,
+    ) -> Result<rir::RirMaterializerId, RustPlanError> {
+        let plan = RustRepresentationPlan::new(self.air, &self.classes);
+        let action = self
+            .materializers
+            .action_for(plan, ty, position)
+            .map_err(|_| {
+                Self::gap(
+                    RustTargetGapSite::Function(function),
+                    RustTargetGapKind::NonCopyValueRequired,
+                )
+            })?;
+        self.materializer_map.get(&action).copied().ok_or_else(|| {
+            Self::gap(
+                RustTargetGapSite::Function(function),
+                RustTargetGapKind::NonCopyValueRequired,
+            )
+        })
+    }
+
+    fn plan_air_owned_value(
+        &mut self,
+        function: FunctionId,
+        owned: &air::OwnedValue<Operand>,
+        position: rep_policy::RustRecipePosition,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedOwnedValue, RustPlanError> {
+        let source = match owned.source {
+            air::ValueSource::Reusable => {
+                let ty = self
+                    .air
+                    .operand_ty(&owned.value)
+                    .expect("verified owned operand has type");
+                RirOwnedSource::Reuse(self.reusable_materializer(function, ty, position)?)
+            }
+            air::ValueSource::TransferTemp { local } => {
+                RirOwnedSource::Transfer { air_local: local }
+            }
+        };
+        let planned = match owned.source {
+            air::ValueSource::Reusable => {
+                self.plan_owned_operand(function, &owned.value, locals)?
+            }
+            air::ValueSource::TransferTemp { .. } => PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Value(self.plan_operand(function, &owned.value)),
+            },
+        };
+        Ok(PlannedOwnedValue {
+            stmts: planned.stmts,
+            value: RirOwnedValue {
+                value: planned.operand,
+                source,
+            },
+        })
+    }
+
+    fn dyn_borrow_for_place(&self, place: &Place) -> Option<rir::RirDynBorrow> {
+        if !place.projection.is_empty() {
+            return None;
+        }
+        let (source, carrier) = match place.root {
+            air::PlaceRoot::DynBorrowParam(id) => {
+                let decl = &self.air.dyn_borrow_params[id.index()];
+                let carrier = self.dyn_surface_map[&decl.surface];
+                (
+                    rir::RirDynBorrowSource::Borrowed {
+                        local: RirLocalId::from_index(decl.source.index()),
+                        carrier,
+                    },
+                    carrier,
+                )
+            }
+            air::PlaceRoot::Local(local) => {
+                let carrier = self
+                    .dyn_reborrows
+                    .iter()
+                    .rev()
+                    .find_map(|(binding, carrier)| (*binding == local).then_some(*carrier))?;
+                (
+                    rir::RirDynBorrowSource::Reborrowed {
+                        local: RirLocalId::from_index(local.index()),
+                        carrier,
+                    },
+                    carrier,
+                )
+            }
+            _ => return None,
+        };
+        Some(rir::RirDynBorrow {
+            source,
+            target: carrier,
+            air_weakening: None,
+        })
+    }
+
+    fn plan_owned_operand(
+        &mut self,
+        function: FunctionId,
+        operand: &Operand,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedOwnedOperand, RustPlanError> {
+        let Operand::Place(place) = operand else {
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Value(self.plan_operand(function, operand)),
+            });
+        };
+        if let Some(borrow) = self.dyn_borrow_for_place(place) {
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::DynBorrow(borrow),
+            });
+        }
+        let plan = self
+            .access()
+            .plan(function, PlaceAccessIntent::OwnedRead, place)
+            .map_err(|gap| Self::access_gap(function, gap))?;
+        if plan.dataref_plan().is_some() {
+            let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+            return Ok(PlannedOwnedOperand {
+                stmts: planned.stmts,
+                operand: RirOwnedOperand::Access(planned.arg),
+            });
+        }
+        if let Some(cell_id) = self.place_capture_cell(function, place) {
+            let ty = plan
+                .projection
+                .first()
+                .map_or(plan.ty, |projection| projection.source_ty);
+            let cell = self.capture_cell_ref(function, cell_id);
+            let handle = match self.classify_capture_cell_storage(cell_id) {
+                RirCellStorage::StackScoped => RirMutPlaceHandle::StackCell {
+                    cell,
+                    ty: self.type_map[&ty],
+                },
+                RirCellStorage::Heap => RirMutPlaceHandle::HeapCell {
+                    cell,
+                    ty: self.type_map[&ty],
+                },
+            };
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Access(RirMutPlaceArg::from_handle(
+                    handle,
+                    plan.projection
+                        .iter()
+                        .map(|projection| self.rir_place_projection(projection))
+                        .collect(),
+                    self.type_map[&plan.ty],
+                )),
+            });
+        }
+        if let Some(borrow) = self.place_scoped_borrow(function, place) {
+            let ty = plan
+                .projection
+                .first()
+                .map_or(plan.ty, |projection| projection.source_ty);
+            let handle = RirMutPlaceHandle::ScopedPlaceCell {
+                cell: self.scoped_place_cell_ref(function, borrow),
+                ty: self.type_map[&ty],
+            };
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Access(RirMutPlaceArg::from_handle(
+                    handle,
+                    plan.projection
+                        .iter()
+                        .map(|projection| self.rir_place_projection(projection))
+                        .collect(),
+                    self.type_map[&plan.ty],
+                )),
+            });
+        }
+        let physical = self.plan_place_in_function(function, place);
+        if let RirPlaceRoot::Local(local) = physical.root
+            && locals
+                .get(local.index())
+                .is_some_and(|local| local.payload_ref)
+        {
+            let ty = plan
+                .projection
+                .first()
+                .map_or(plan.ty, |projection| projection.source_ty);
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Access(RirMutPlaceArg::from_handle(
+                    RirMutPlaceHandle::Local {
+                        local,
+                        ty: self.type_map[&ty],
+                    },
+                    plan.projection
+                        .iter()
+                        .map(|projection| self.rir_place_projection(projection))
+                        .collect(),
+                    self.type_map[&plan.ty],
+                )),
+            });
+        }
+        let direct = plan.dataref_plan().is_none()
+            && matches!(
+                plan.root,
+                PlaceAccessRoot::Local {
+                    source_mut_param: false,
+                    ..
+                } | PlaceAccessRoot::LambdaCapture(_)
+            );
+        if direct {
+            return Ok(PlannedOwnedOperand {
+                stmts: vec![],
+                operand: RirOwnedOperand::Value(self.plan_operand(function, operand)),
+            });
+        }
+        let planned = self.plan_mut_place_arg(function, &plan, locals)?;
+        Ok(PlannedOwnedOperand {
+            stmts: planned.stmts,
+            operand: RirOwnedOperand::Access(planned.arg),
+        })
+    }
+
     fn plan_operand_read(
-        &self,
+        &mut self,
         function: FunctionId,
         operand: &Operand,
         locals: &mut Vec<RirLocal>,
@@ -5727,7 +6090,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn plan_operands_read(
-        &self,
+        &mut self,
         function: FunctionId,
         operands: &[Operand],
         locals: &mut Vec<RirLocal>,
@@ -5755,7 +6118,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn lower_place_read(
-        &self,
+        &mut self,
         function: FunctionId,
         place: &Place,
         locals: &mut Vec<RirLocal>,
@@ -5764,163 +6127,62 @@ impl<'a> PlanCx<'a> {
             .access()
             .plan(function, PlaceAccessIntent::ReadValue, place)
             .expect("profile verifies readable places");
-        if matches!(plan.root, PlaceAccessRoot::Global(_)) && plan.dataref_plan().is_none() {
-            let mut stmts = vec![];
-            let operand = self.rvalue_temp(
-                RirRValue::Use(RirOperand::Place(
-                    self.plan_place_in_function(function, place),
-                )),
-                place.ty,
-                locals,
-                &mut stmts,
-            );
-            return PlannedOperand { stmts, operand };
-        }
-        if plan.dataref_plan().is_none() {
-            match plan.root {
-                PlaceAccessRoot::CaptureCell(cell) => {
-                    if !place.projection.is_empty() {
-                        let planned = self
-                            .plan_mut_place_arg(function, &plan, locals)
-                            .expect("profile verifies projected capture-cell reads");
-                        let mut stmts = planned.stmts;
-                        let operand = self.rvalue_temp(
-                            RirRValue::MutPlaceGetCopy {
-                                place: planned.arg,
-                                ty: self.type_map[&place.ty],
-                            },
-                            place.ty,
-                            locals,
-                            &mut stmts,
-                        );
-                        return PlannedOperand { stmts, operand };
-                    }
-                    let root_ty = self.air.capture_cells[cell.index()].ty;
-                    return self.lower_temp_root_read(
-                        function,
-                        RirRValue::CellGetCopy {
-                            cell: self.capture_cell_ref(function, cell),
-                            ty: self.type_map[&root_ty],
-                        },
-                        root_ty,
-                        place,
-                        locals,
-                    );
-                }
-                PlaceAccessRoot::ScopedPlaceCell(borrow) => {
-                    if !place.projection.is_empty() {
-                        let planned = self
-                            .plan_mut_place_arg(function, &plan, locals)
-                            .expect("profile verifies projected scoped-place reads");
-                        let mut stmts = planned.stmts;
-                        let operand = self.rvalue_temp(
-                            RirRValue::MutPlaceGetCopy {
-                                place: planned.arg,
-                                ty: self.type_map[&place.ty],
-                            },
-                            place.ty,
-                            locals,
-                            &mut stmts,
-                        );
-                        return PlannedOperand { stmts, operand };
-                    }
-                    let root_ty = self.air.scoped_borrows[borrow.index()].ty;
-                    return self.lower_temp_root_read(
-                        function,
-                        RirRValue::ScopedPlaceCellGet {
-                            cell: self.scoped_place_cell_ref(function, borrow),
-                            ty: self.type_map[&root_ty],
-                        },
-                        root_ty,
-                        place,
-                        locals,
-                    );
-                }
+        let payload_ref = matches!(
+            plan.root,
+            PlaceAccessRoot::Local { local, .. }
+                if locals.get(local.index()).is_some_and(|local| local.payload_ref)
+        );
+        let direct = plan.dataref_plan().is_none()
+            && !payload_ref
+            && matches!(
+                plan.root,
                 PlaceAccessRoot::Local {
-                    source_mut_param: true,
+                    source_mut_param: false,
                     ..
-                } => {
-                    let mut stmts = vec![];
-                    let operand = self.rvalue_temp(
-                        RirRValue::Use(RirOperand::Place(
-                            self.plan_place_in_function(function, place),
-                        )),
-                        place.ty,
-                        locals,
-                        &mut stmts,
-                    );
-                    return PlannedOperand { stmts, operand };
-                }
-                PlaceAccessRoot::Local { .. } | PlaceAccessRoot::LambdaCapture(_) => {
-                    return PlannedOperand::from_operand(RirOperand::Place(
-                        self.plan_place_in_function(function, place),
-                    ));
-                }
-                PlaceAccessRoot::Global(_) => unreachable!("global roots returned above"),
-            }
-        }
-        self.lower_dataref_place_read(function, &plan, locals)
-    }
-
-    fn lower_dataref_place_read(
-        &self,
-        function: FunctionId,
-        plan: &PlaceAccessPlan,
-        locals: &mut Vec<RirLocal>,
-    ) -> PlannedOperand {
-        let dataref = plan.dataref_plan().expect("dataref reads have a plan");
-        let mut stmts = vec![];
-        let mut current_place =
-            self.dataref_plan_object_prefix(function, plan, dataref, locals, &mut stmts);
-        for (index, segment) in dataref.segments.iter().enumerate() {
-            let next = self.dataref_segment(
-                current_place,
-                segment,
-                index == 0 && dataref.object_prefix_can_fail,
+                } | PlaceAccessRoot::LambdaCapture(_)
             );
-            current_place = self.read_dataref_segment(function, next, locals, &mut stmts);
+        if direct {
+            return PlannedOperand::from_operand(RirOperand::Place(
+                self.plan_place_in_function(function, place),
+            ));
         }
-        for projection in &dataref.remaining {
-            current_place
-                .projections
-                .push(self.rir_place_projection(projection));
-            current_place.ty = self.type_map[&projection.ty];
-        }
-        PlannedOperand {
-            stmts,
-            operand: RirOperand::Place(current_place),
-        }
+        self.lower_implicit_owned_read(function, place, locals)
     }
 
-    fn lower_temp_root_read(
-        &self,
+    fn plan_implicit_owned_value(
+        &mut self,
         function: FunctionId,
-        value: RirRValue,
-        root_ty: TypeId,
+        place: &Place,
+        locals: &mut Vec<RirLocal>,
+    ) -> Result<PlannedRValue, RustPlanError> {
+        let planned = self.plan_owned_operand(function, &Operand::Place(place.clone()), locals)?;
+        let materializer =
+            self.reusable_materializer(function, place.ty, rep_policy::RustRecipePosition::Value)?;
+        Ok(PlannedRValue {
+            stmts: planned.stmts,
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: planned.operand,
+                source: RirOwnedSource::Reuse(materializer),
+            }),
+        })
+    }
+
+    fn lower_implicit_owned_read(
+        &mut self,
+        function: FunctionId,
         place: &Place,
         locals: &mut Vec<RirLocal>,
     ) -> PlannedOperand {
-        let mut stmts = vec![];
-        if place.projection.is_empty() {
-            let operand = self.rvalue_temp(value, place.ty, locals, &mut stmts);
-            return PlannedOperand { stmts, operand };
-        }
-        let root = self.rvalue_temp_place(value, root_ty, locals, &mut stmts);
-        let RirPlaceRoot::Local(root_local) = root.root else {
-            unreachable!("temporary roots are local")
-        };
-        PlannedOperand {
-            stmts,
-            operand: RirOperand::Place(RirPlace::local(
-                root_local,
-                self.rir_place_projections(function, place),
-                self.type_map[&place.ty],
-            )),
-        }
+        let planned = self
+            .plan_implicit_owned_value(function, place, locals)
+            .expect("profile verifies implicit owned reads");
+        let mut stmts = planned.stmts;
+        let operand = self.rvalue_temp(planned.value, place.ty, locals, &mut stmts);
+        PlannedOperand { stmts, operand }
     }
 
     fn lower_collection_loan_root(
-        &self,
+        &mut self,
         function: FunctionId,
         index: usize,
         loan: &air::AirCollectionLoan,
@@ -5980,7 +6242,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn lower_place_write(
-        &self,
+        &mut self,
         function: FunctionId,
         place: &Place,
         value: RirRValue,
@@ -6016,7 +6278,7 @@ impl<'a> PlanCx<'a> {
                 self.lower_capture_cell_write(
                     function,
                     cell,
-                    place,
+                    place.ty,
                     value,
                     locals,
                     stmts,
@@ -6026,10 +6288,11 @@ impl<'a> PlanCx<'a> {
                 )?;
             }
             AssignTarget::ScopedPlaceCell(borrow) => {
-                let value = self.rvalue_temp(value, place.ty, locals, stmts);
+                let value =
+                    self.rvalue_short_region_value(function, value, place.ty, locals, stmts);
                 stmts.push(RirStmt::ScopedPlaceCellSet {
                     cell: self.scoped_place_cell_ref(function, borrow),
-                    value: RirRValue::Use(value),
+                    value,
                 });
             }
             AssignTarget::ProjectedMutPlace => {
@@ -6056,9 +6319,7 @@ impl<'a> PlanCx<'a> {
             }
             AssignTarget::Assign { source_mut_param } => {
                 let value = if source_mut_param {
-                    RirRValue::Use(
-                        self.rvalue_short_region_operand(function, value, place.ty, locals, stmts),
-                    )
+                    self.rvalue_short_region_value(function, value, place.ty, locals, stmts)
                 } else {
                     value
                 };
@@ -6078,7 +6339,7 @@ impl<'a> PlanCx<'a> {
         &self,
         function: FunctionId,
         cell: air::CaptureCellId,
-        place: &Place,
+        ty: TypeId,
         value: RirRValue,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
@@ -6096,10 +6357,10 @@ impl<'a> PlanCx<'a> {
             .copied()
             .unwrap_or(false)
         {
-            let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
+            let value = self.rvalue_short_region_value(function, value, ty, locals, stmts);
             stmts.push(RirStmt::CellSet {
                 cell: cell_ref,
-                value: RirRValue::Use(value),
+                value,
             });
         } else if (!loop_local && in_loop)
             || possible_cells.get(cell.index()).copied().unwrap_or(false)
@@ -6124,7 +6385,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn lower_dataref_write(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         place: &Place,
@@ -6133,111 +6394,67 @@ impl<'a> PlanCx<'a> {
         stmts: &mut Vec<RirStmt>,
     ) {
         let segment = self.final_dataref_segment(function, plan, locals, stmts);
-        let value = self.rvalue_short_region_operand(function, value, place.ty, locals, stmts);
+        let value = self.rvalue_short_region_value(function, value, place.ty, locals, stmts);
         stmts.push(RirStmt::DataRefSet {
             object: segment.object,
             dataref: segment.dataref,
             projections: segment.projections,
             value,
+            ty: self.type_map[&place.ty],
         });
     }
 
-    fn plan_slice_view_source(
-        &self,
-        function: FunctionId,
-        place: &Place,
-    ) -> Result<RirPlace, RustPlanError> {
-        if self
-            .access()
-            .plan(function, PlaceAccessIntent::SliceView, place)
-            .is_err()
-        {
-            return Err(Self::gap(
-                RustTargetGapSite::Function(function),
-                RustTargetGapKind::UnsupportedSliceView,
-            ));
-        }
-        Ok(self.plan_place_in_function(function, place))
-    }
-
     fn dataref_runtime_root_place(
-        &self,
+        &mut self,
         function: FunctionId,
         root: PlaceAccessRoot,
         ty: TypeId,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
     ) -> (TypeId, RirPlace) {
-        match root {
-            PlaceAccessRoot::CaptureCell(cell) => {
-                let root = self.rvalue_temp_place(
-                    RirRValue::CellGetCopy {
-                        cell: self.capture_cell_ref(function, cell),
-                        ty: self.type_map[&ty],
-                    },
-                    ty,
-                    locals,
-                    stmts,
-                );
-                (ty, root)
-            }
-            PlaceAccessRoot::ScopedPlaceCell(borrow) => {
-                let root = self.rvalue_temp_place(
-                    RirRValue::ScopedPlaceCellGet {
-                        cell: self.scoped_place_cell_ref(function, borrow),
-                        ty: self.type_map[&ty],
-                    },
-                    ty,
-                    locals,
-                    stmts,
-                );
-                (ty, root)
-            }
+        let source = match root {
+            PlaceAccessRoot::CaptureCell(cell) => Some(air::PlaceRoot::CaptureCell(cell)),
+            PlaceAccessRoot::ScopedPlaceCell(borrow) => Some(air::PlaceRoot::ScopedBorrow(borrow)),
             PlaceAccessRoot::Local {
                 local,
-                source_mut_param,
+                source_mut_param: true,
                 ..
-            } => {
-                let root = self.rir_root_place(RirLocalId::from_index(local.index()), ty);
-                if source_mut_param {
-                    let root = self.rvalue_temp_place(
-                        RirRValue::Use(RirOperand::Place(root)),
-                        ty,
-                        locals,
-                        stmts,
-                    );
-                    (ty, root)
-                } else {
-                    (ty, root)
-                }
+            } => Some(air::PlaceRoot::Local(local)),
+            PlaceAccessRoot::Global(global) => Some(air::PlaceRoot::Global(global)),
+            PlaceAccessRoot::Local { local, .. } => {
+                return (
+                    ty,
+                    self.rir_root_place(RirLocalId::from_index(local.index()), ty),
+                );
             }
             PlaceAccessRoot::LambdaCapture(slot) => {
                 let air::FunctionKind::Lambda(lambda) = self.air.function(function).kind else {
                     unreachable!("AIR verifier rejects capture roots outside lambdas")
                 };
                 let runtime = self.lambda_runtime_capture_slots[&(lambda, slot)];
-                (
+                return (
                     ty,
                     self.rir_root_place(
                         RirLocalId::from_index(self.air.function(function).locals.len() + runtime),
                         ty,
                     ),
-                )
-            }
-            PlaceAccessRoot::Global(global) => {
-                let root = self.rvalue_temp_place(
-                    RirRValue::Use(RirOperand::Place(RirPlace::global(
-                        self.global_map[&global],
-                        vec![],
-                        self.type_map[&ty],
-                    ))),
-                    ty,
-                    locals,
-                    stmts,
                 );
-                (ty, root)
             }
-        }
+        };
+        let planned = self.lower_implicit_owned_read(
+            function,
+            &Place {
+                root: source.expect("guarded dataref root"),
+                projection: vec![],
+                ty,
+            },
+            locals,
+        );
+        stmts.extend(planned.stmts);
+        let RirOperand::Place(root) = planned.operand else {
+            unreachable!("implicit owned read stages a local")
+        };
+        (ty, root)
     }
 
     fn rir_root_place(&self, local: RirLocalId, ty: TypeId) -> RirPlace {
@@ -6245,7 +6462,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn dataref_mut_place_segment(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
@@ -6255,7 +6472,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn final_dataref_segment(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
@@ -6269,6 +6486,7 @@ impl<'a> PlanCx<'a> {
             .split_last()
             .expect("dataref plan has at least one segment");
         for (index, segment) in prefix.iter().enumerate() {
+            self.append_dataref_object_prefix(&mut current_place, segment);
             let next = self.dataref_segment(
                 current_place,
                 segment,
@@ -6276,6 +6494,7 @@ impl<'a> PlanCx<'a> {
             );
             current_place = self.read_dataref_segment(function, next, locals, stmts);
         }
+        self.append_dataref_object_prefix(&mut current_place, last);
         let segment = self.dataref_segment(
             current_place,
             last,
@@ -6285,7 +6504,7 @@ impl<'a> PlanCx<'a> {
     }
 
     fn dataref_plan_object_prefix(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         dataref: &DataRefProjectionPlan,
@@ -6301,6 +6520,15 @@ impl<'a> PlanCx<'a> {
             current_place.ty = self.type_map[&projection.ty];
         }
         current_place
+    }
+
+    fn append_dataref_object_prefix(&self, place: &mut RirPlace, segment: &DataRefSegmentPlan) {
+        for projection in &segment.object_prefix {
+            place
+                .projections
+                .push(self.rir_place_projection(projection));
+            place.ty = self.type_map[&projection.ty];
+        }
     }
 
     fn dataref_segment(
@@ -6342,40 +6570,45 @@ impl<'a> PlanCx<'a> {
     }
 
     fn read_dataref_segment(
-        &self,
+        &mut self,
         function: FunctionId,
         segment: DataRefSegment,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
     ) -> RirPlace {
         let segment = self.prepare_dataref_segment_object(function, segment, locals, stmts);
+        let materializer = self
+            .reusable_materializer(function, segment.ty, rep_policy::RustRecipePosition::Value)
+            .expect("profile verifies dataref segment materializer");
         let local = self.alloc_temp(locals, segment.ty);
         stmts.push(RirStmt::Init {
             local,
-            value: RirRValue::DataRefGet {
-                object: segment.object,
-                dataref: segment.dataref,
-                projections: segment.projections,
-                ty: self.type_map[&segment.ty],
-            },
+            value: RirRValue::Materialize(RirOwnedValue {
+                value: RirOwnedOperand::Access(RirMutPlaceArg::dataref(
+                    segment.object,
+                    segment.dataref,
+                    segment.projections,
+                    self.type_map[&segment.ty],
+                )),
+                source: RirOwnedSource::Reuse(materializer),
+            }),
         });
         self.rir_root_place(local, segment.ty)
     }
 
-    fn rvalue_short_region_operand(
+    fn rvalue_short_region_value(
         &self,
         function: FunctionId,
         value: RirRValue,
         ty: TypeId,
         locals: &mut Vec<RirLocal>,
         stmts: &mut Vec<RirStmt>,
-    ) -> RirOperand {
+    ) -> RirRValue {
         match value {
-            RirRValue::Use(operand) if self.operand_uses_ctx(function, &operand) => {
-                self.rvalue_temp(RirRValue::Use(operand), ty, locals, stmts)
+            RirRValue::Use(operand) if !self.operand_uses_ctx(function, &operand) => {
+                RirRValue::Use(operand)
             }
-            RirRValue::Use(operand) => operand,
-            value => self.rvalue_temp(value, ty, locals, stmts),
+            value => RirRValue::TakeStaged(self.rvalue_temp(value, ty, locals, stmts)),
         }
     }
 
@@ -6495,7 +6728,10 @@ impl<'a> PlanCx<'a> {
         function: FunctionId,
         place: &Place,
     ) -> Option<air::ScopedBorrowId> {
-        self.air.scoped_borrow_root(function, place.root)
+        match place.root {
+            air::PlaceRoot::ScopedBorrow(borrow) => Some(borrow),
+            root => self.air.scoped_borrow_root(function, root),
+        }
     }
 
     fn current_place_root(&self, function: FunctionId, place: &Place) -> (TypeId, RirLocalId) {
@@ -6632,15 +6868,21 @@ impl<'a> PlanCx<'a> {
         self.air_policy().copyable(ty)
     }
 
-    fn rust_shareable_air_type(&self, ty: TypeId) -> bool {
-        if matches!(self.air.type_arena.data(ty), TypeData::Function(_)) {
-            return self.function_type_shareable[&ty];
-        }
-        self.air_policy().value_place_shareable(ty)
-    }
-
     fn access(&self) -> PlaceAccessCx<'_> {
         PlaceAccessCx::new(self.air, &self.classes)
+    }
+
+    fn require_materializer(&mut self, ty: TypeId) -> Result<(), RustPlanError> {
+        let plan = RustRepresentationPlan::new(self.air, &self.classes);
+        self.materializers
+            .action_for(plan, ty, rep_policy::RustRecipePosition::Value)
+            .map(|_| ())
+            .map_err(|_| {
+                Self::gap(
+                    RustTargetGapSite::Type(ty),
+                    RustTargetGapKind::UnsupportedType,
+                )
+            })
     }
 
     fn air_policy(&self) -> RustRepresentationPlan<'_> {

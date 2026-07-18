@@ -41,25 +41,35 @@ impl DataRefPlaceDescriptors {
     }
 
     fn collect_block(&mut self, program: &RirProgram, block: &RirStructuredBlock) {
-        for stmt in &block.stmts {
-            stmt.for_each_child(&mut |child| match child {
-                RirChild::MutPlace { place, .. } => self.collect_mut_place_arg(program, place),
-                RirChild::Collection { collection, .. } => {
-                    self.collect_collection_access(program, collection);
-                }
-                RirChild::CallArg(arg) => match arg {
+        block.for_each_child(&mut |child| match child {
+            RirChild::MutPlace { place, .. } => self.collect_mut_place_arg(program, place),
+            RirChild::Collection { collection, .. } => {
+                self.collect_collection_access(program, collection);
+            }
+            RirChild::CallArg(arg) => {
+                arg.for_each_owned_value(&mut |owned| {
+                    if let super::rir::RirOwnedOperand::Access(place) = &owned.value {
+                        self.collect_mut_place_arg(program, place);
+                    }
+                });
+                match arg {
                     RirCallArg::MutPlace(place) => self.collect_mut_place_arg(program, place),
                     RirCallArg::DynBorrow(borrow) => self.collect_dyn_borrow(program, borrow),
                     _ => {}
-                },
-                RirChild::Block(block) => self.collect_block(program, block),
-                RirChild::Operand { .. }
-                | RirChild::Place { .. }
-                | RirChild::CaptureArg(_)
-                | RirChild::LocalRead(_)
-                | RirChild::Tail(_) => {}
-            });
-        }
+                }
+            }
+            RirChild::Block(block) => self.collect_block(program, block),
+            RirChild::CaptureArg(super::rir::RirLambdaCaptureArg::Owned { value }) => {
+                if let super::rir::RirOwnedOperand::Access(place) = &value.value {
+                    self.collect_mut_place_arg(program, place);
+                }
+            }
+            RirChild::Operand { .. }
+            | RirChild::Place { .. }
+            | RirChild::CaptureArg(_)
+            | RirChild::LocalRead(_)
+            | RirChild::Tail(_) => {}
+        });
     }
 
     fn collect_collection_access(&mut self, program: &RirProgram, access: &RirCollectionAccess) {
@@ -80,7 +90,12 @@ impl DataRefPlaceDescriptors {
 
     fn collect_mut_place_arg(&mut self, program: &RirProgram, arg: &RirMutPlaceArg) {
         if let RirMutPlaceAccess::DataRef { dataref, .. } = &arg.access {
-            self.intern(program, *dataref, &arg.projections, arg.ty);
+            let Ok((path, consumed)) =
+                RirPlaceModel::new(program).dataref_storage_prefix(*dataref, &arg.projections)
+            else {
+                return;
+            };
+            self.intern(program, *dataref, &arg.projections[..consumed], path.ty());
         }
     }
 

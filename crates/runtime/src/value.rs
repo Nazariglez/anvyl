@@ -176,12 +176,15 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
             .map_err(heap_access_error)?
     }
 
-    fn make_unique<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>) -> Result<(), RuntimeError>
-    where
-        T: Clone,
-    {
+    fn make_unique<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        materialize: &mut impl FnMut(&T) -> T,
+    ) -> Result<(), RuntimeError> {
         self.storage
-            .make_unique_in(ctx, self.storage_ty)
+            .reconstruct_if_shared_in(ctx, self.storage_ty, |storage| {
+                ListStorage::from_elems(storage.as_slice().iter().map(materialize))
+            })
             .map_err(heap_access_error)
     }
 
@@ -198,14 +201,12 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
     fn structurally_mutate_storage<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
+        materialize: &mut impl FnMut(&T) -> T,
         f: impl FnOnce(&mut ListStorage<'cx, T>) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        T: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         let loan = self.loan.clone();
         loan.structural_mutation_result(|| {
-            self.make_unique(ctx)?;
+            self.make_unique(ctx, materialize)?;
             let (result, len) = ctx
                 .heap()
                 .try_with_mut(self.storage.handle(), |storage| {
@@ -218,26 +219,59 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         })
     }
 
-    pub fn to_vec<'rt>(&self, ctx: &Ctx<'cx, 'rt>) -> Result<Vec<T>, RuntimeError>
-    where
-        T: Clone,
-    {
-        self.with_storage(ctx, |storage| Ok(storage.as_slice().to_vec()))
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this list while an element reference is live.
+    pub unsafe fn to_vec_with<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        mut materialize: impl FnMut(&T) -> T,
+    ) -> Result<Vec<T>, RuntimeError> {
+        self.with_storage(ctx, |storage| {
+            Ok(storage.as_slice().iter().map(&mut materialize).collect())
+        })
     }
 
-    pub fn checked_index<'rt>(&self, ctx: &Ctx<'cx, 'rt>, index: i64) -> Result<T, RuntimeError>
-    where
-        T: Clone,
-    {
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this list while the element reference is live.
+    pub unsafe fn checked_index_with<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: i64,
+        materialize: impl FnOnce(&T) -> T,
+    ) -> Result<T, RuntimeError> {
         let index = crate::check::checked_index(index, self.len());
         self.with_storage(ctx, |storage| {
-            storage.get(index).cloned().ok_or_else(|| {
+            storage.get(index).map(materialize).ok_or_else(|| {
                 RuntimeError::new(format!(
                     "list index {index} out of bounds for len {}",
                     self.len()
                 ))
             })
         })
+    }
+
+    /// # Safety
+    ///
+    /// The converter must not reenter Anvyx or access this list while an element reference is live.
+    pub unsafe fn copy_range_with<'rt, U: 'cx>(
+        &self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        storage_ty: HeapType<'cx, ListStorage<'cx, U>>,
+        range: Range<usize>,
+        mut convert: impl FnMut(&T) -> U,
+    ) -> Result<AnvList<'cx, U>, RuntimeError> {
+        if range.start > range.end || range.end > self.len {
+            return Err(RuntimeError::new("list range out of bounds"));
+        }
+        let elems = self.with_storage(ctx, |storage| {
+            Ok(storage.as_slice()[range]
+                .iter()
+                .map(&mut convert)
+                .collect::<Vec<_>>())
+        })?;
+        Ok(AnvList::from_elems(ctx, storage_ty, elems))
     }
 
     /// # Safety
@@ -271,14 +305,12 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         ctx: &mut Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
+        mut materialize: impl FnMut(&T) -> T,
         f: impl FnOnce(&mut T) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        T: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         self.loan.check_stable(expected_version)?;
         self.check_elem_index(index)?;
-        self.make_unique(ctx)?;
+        self.make_unique(ctx, &mut materialize)?;
         self.with_storage_mut(ctx, |storage| {
             let elem = storage
                 .get_mut(index)
@@ -318,25 +350,49 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
         }
     }
 
-    pub fn elem_at_shared<'rt>(
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_staged_owner(&self) -> Self {
+        Self {
+            storage: self.storage.stage(),
+            storage_ty: self.storage_ty,
+            loan: self.loan.clone(),
+            len: self.len,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_commit_staged_owner(mut self) -> Self {
+        self.storage = self.storage.commit_stage();
+        self
+    }
+
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this list while the element reference is live.
+    pub unsafe fn elem_at_shared_with<'rt>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
-    ) -> Result<T, RuntimeError>
-    where
-        T: Clone,
-    {
+        materialize: impl FnOnce(&T) -> T,
+    ) -> Result<T, RuntimeError> {
         unsafe {
-            self.with_elem_shared_short(ctx, index, expected_version, |elem| Ok(elem.clone()))
+            self.with_elem_shared_short(ctx, index, expected_version, |elem| Ok(materialize(elem)))
         }
     }
 
-    pub fn push<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>, elem: T) -> Result<(), RuntimeError>
-    where
-        T: Clone,
-    {
-        self.structurally_mutate_storage(ctx, |storage| {
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this list while storage is reconstructed.
+    pub unsafe fn push_with<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        elem: T,
+        mut materialize: impl FnMut(&T) -> T,
+    ) -> Result<(), RuntimeError> {
+        self.structurally_mutate_storage(ctx, &mut materialize, |storage| {
             storage.push(elem);
             Ok(())
         })
@@ -359,6 +415,7 @@ impl<'cx, T: 'cx> AnvList<'cx, T> {
     }
 }
 
+// Cloning shares the COW handle; it never materializes list payloads.
 impl<'cx, T: 'cx> Clone for AnvList<'cx, T> {
     fn clone(&self) -> Self {
         self.share()
@@ -414,20 +471,22 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         self.loan.begin_shape_loan()
     }
 
-    pub fn begin_value_loan_by_key<'rt>(
+    /// # Safety
+    ///
+    /// The materializers must not reenter Anvyx or access this map while storage is reconstructed.
+    /// Key materialization must preserve equality and hash identity.
+    pub unsafe fn begin_value_loan_by_key_with<'rt>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         key: &K,
-    ) -> Result<ValueLoanGuard, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+        mut materialize_key: impl FnMut(&K) -> K,
+        mut materialize_value: impl FnMut(&V) -> V,
+    ) -> Result<ValueLoanGuard, RuntimeError> {
         self.with_unloaned_storage(ctx, |storage| {
             storage.get_index_of(key).ok_or_else(Self::missing_key)?;
             Ok(())
         })?;
-        self.make_unique(ctx)?;
+        self.make_unique_with(ctx, &mut materialize_key, &mut materialize_value)?;
         self.loan.begin_value_loan()
     }
 
@@ -476,11 +535,16 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         RuntimeError::new("map entry key is missing")
     }
 
-    pub fn get<'rt>(&self, ctx: &Ctx<'cx, 'rt>, key: &K) -> Result<Option<V>, RuntimeError>
-    where
-        V: Clone,
-    {
-        self.with_unloaned_storage(ctx, |storage| Ok(storage.get(key).cloned()))
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this map while the value reference is live.
+    pub unsafe fn get_with<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        key: &K,
+        materialize: impl FnOnce(&V) -> V,
+    ) -> Result<Option<V>, RuntimeError> {
+        self.with_unloaned_storage(ctx, |storage| Ok(storage.get(key).map(materialize)))
     }
 
     pub fn with_value_shared_short<'rt, R>(
@@ -496,28 +560,43 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         self.with_unloaned_storage(ctx, |storage| Ok(storage.contains_key(key)))
     }
 
-    fn make_unique<'rt>(&mut self, ctx: &mut Ctx<'cx, 'rt>) -> Result<(), RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+    fn make_unique_with<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        materialize_key: &mut impl FnMut(&K) -> K,
+        materialize_value: &mut impl FnMut(&V) -> V,
+    ) -> Result<(), RuntimeError> {
         self.storage
-            .make_unique_in(ctx, self.storage_ty)
+            .reconstruct_if_shared_in(ctx, self.storage_ty, |storage| {
+                Self::materialize_storage(storage, materialize_key, materialize_value)
+            })
             .map_err(heap_access_error)
     }
 
-    fn structurally_mutate_storage<'rt, R>(
+    fn materialize_storage(
+        storage: &MapStorage<'cx, K, V>,
+        materialize_key: &mut impl FnMut(&K) -> K,
+        materialize_value: &mut impl FnMut(&V) -> V,
+    ) -> MapStorage<'cx, K, V> {
+        let materialized = MapStorage::from_entries(
+            storage
+                .iter()
+                .map(|(key, value)| (materialize_key(key), materialize_value(value))),
+        );
+        debug_assert_eq!(materialized.len(), storage.len());
+        materialized
+    }
+
+    fn structurally_mutate_storage_with<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
+        materialize_key: &mut impl FnMut(&K) -> K,
+        materialize_value: &mut impl FnMut(&V) -> V,
         f: impl FnOnce(&mut MapStorage<'cx, K, V>) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         let loan = self.loan.clone();
         loan.structural_mutation_result(|| {
-            self.make_unique(ctx)?;
+            self.make_unique_with(ctx, materialize_key, materialize_value)?;
             let (result, len) = self.with_storage_mut_unchecked(ctx, |storage| {
                 let result = f(storage)?;
                 Ok((result, storage.len()))
@@ -527,61 +606,64 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         })
     }
 
-    fn entry_at_checked<'rt>(
+    fn entry_index_error(&self, index: usize) -> RuntimeError {
+        RuntimeError::new(format!(
+            "map entry index {index} out of bounds for len {}",
+            self.len()
+        ))
+    }
+
+    /// # Safety
+    ///
+    /// The materializers must not reenter Anvyx or access this map while entry references are live.
+    pub unsafe fn entry_at_shared_with<'rt>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
-    ) -> Result<(K, V), RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+        materialize_key: impl FnOnce(&K) -> K,
+        materialize_value: impl FnOnce(&V) -> V,
+    ) -> Result<(K, V), RuntimeError> {
         self.loan.check_stable(expected_version)?;
         self.with_unloaned_storage(ctx, |storage| {
             storage
                 .get_index(index)
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .ok_or_else(|| {
-                    RuntimeError::new(format!(
-                        "map entry index {index} out of bounds for len {}",
-                        self.len()
-                    ))
-                })
+                .map(|(key, value)| (materialize_key(key), materialize_value(value)))
+                .ok_or_else(|| self.entry_index_error(index))
         })
     }
 
     /// # Safety
     ///
-    /// The callback must not access this map's storage while it receives the value reference.
-    pub unsafe fn with_value_mut_short<'rt, R>(
+    /// The materializers and callback must not reenter Anvyx or access this map while storage or the
+    /// value reference is live. Key materialization must preserve equality and hash identity.
+    pub unsafe fn with_value_mut_short_with<'rt, R>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
+        mut materialize_key: impl FnMut(&K) -> K,
+        mut materialize_value: impl FnMut(&V) -> V,
         f: impl FnOnce(&mut V) -> Result<R, RuntimeError>,
-    ) -> Result<R, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+    ) -> Result<R, RuntimeError> {
         self.loan.before_unloaned_storage_access()?;
         self.loan.check_stable(expected_version)?;
-        let len = self.len();
-        if index >= len {
-            return Err(RuntimeError::new(format!(
-                "map entry index {index} out of bounds for len {len}"
-            )));
-        }
-        self.make_unique(ctx)?;
+        self.check_entry_index(index)?;
+        self.make_unique_with(ctx, &mut materialize_key, &mut materialize_value)?;
         self.with_storage_mut_unchecked(ctx, |storage| {
-            let Some((_, value)) = storage.get_index_mut(index) else {
-                return Err(RuntimeError::new(format!(
-                    "map entry index {index} out of bounds for len {len}"
-                )));
-            };
+            let (_, value) = storage
+                .get_index_mut(index)
+                .expect("map storage length drifted from map length");
             f(value)
         })
+    }
+
+    fn check_entry_index(&self, index: usize) -> Result<(), RuntimeError> {
+        if index < self.len() {
+            Ok(())
+        } else {
+            Err(self.entry_index_error(index))
+        }
     }
 
     #[must_use]
@@ -594,32 +676,71 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         }
     }
 
-    pub fn key_at_shared<'rt>(
-        &self,
-        ctx: &Ctx<'cx, 'rt>,
-        index: usize,
-        expected_version: u64,
-    ) -> Result<K, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
-        self.entry_at_checked(ctx, index, expected_version)
-            .map(|(key, _)| key)
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_projection_owner(&self) -> Self {
+        Self {
+            storage: self.storage.share(),
+            storage_ty: self.storage_ty,
+            loan: self.loan.fresh_for_projection(),
+            len: self.len,
+        }
     }
 
-    pub fn value_at_shared<'rt>(
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_staged_owner(&self) -> Self {
+        Self {
+            storage: self.storage.stage(),
+            storage_ty: self.storage_ty,
+            loan: self.loan.clone(),
+            len: self.len,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __anvyx_commit_staged_owner(mut self) -> Self {
+        self.storage = self.storage.commit_stage();
+        self
+    }
+
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this map while the key reference is live.
+    pub unsafe fn key_at_shared_with<'rt>(
         &self,
         ctx: &Ctx<'cx, 'rt>,
         index: usize,
         expected_version: u64,
-    ) -> Result<V, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
-        self.entry_at_checked(ctx, index, expected_version)
-            .map(|(_, value)| value)
+        materialize: impl FnOnce(&K) -> K,
+    ) -> Result<K, RuntimeError> {
+        self.loan.check_stable(expected_version)?;
+        self.with_unloaned_storage(ctx, |storage| {
+            storage
+                .get_index(index)
+                .map(|(key, _)| materialize(key))
+                .ok_or_else(|| self.entry_index_error(index))
+        })
+    }
+
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access this map while the value reference is live.
+    pub unsafe fn value_at_shared_with<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: usize,
+        expected_version: u64,
+        materialize: impl FnOnce(&V) -> V,
+    ) -> Result<V, RuntimeError> {
+        self.loan.check_stable(expected_version)?;
+        self.with_unloaned_storage(ctx, |storage| {
+            storage
+                .get_index(index)
+                .map(|(_, value)| materialize(value))
+                .ok_or_else(|| self.entry_index_error(index))
+        })
     }
 
     pub fn with_value_shared_by_key<'rt, R>(
@@ -668,39 +789,52 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
         f(unsafe { &mut *value })
     }
 
-    pub fn insert<'rt>(
+    /// # Safety
+    ///
+    /// The materializers must not reenter Anvyx or access this map while storage is reconstructed.
+    /// Key materialization must preserve equality and hash identity.
+    pub unsafe fn insert_with<'rt>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         key: K,
         value: V,
-    ) -> Result<Option<V>, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+        mut materialize_key: impl FnMut(&K) -> K,
+        mut materialize_value: impl FnMut(&V) -> V,
+    ) -> Result<Option<V>, RuntimeError> {
         if self.contains_key(ctx, &key)? {
-            self.make_unique(ctx)?;
+            self.make_unique_with(ctx, &mut materialize_key, &mut materialize_value)?;
             return self.with_storage_mut_unchecked(ctx, |storage| Ok(storage.insert(key, value)));
         }
-        let old =
-            self.structurally_mutate_storage(ctx, |storage| Ok(storage.insert(key, value)))?;
+        let old = self.structurally_mutate_storage_with(
+            ctx,
+            &mut materialize_key,
+            &mut materialize_value,
+            |storage| Ok(storage.insert(key, value)),
+        )?;
         debug_assert!(old.is_none());
         Ok(None)
     }
 
-    pub fn remove<'rt>(
+    /// # Safety
+    ///
+    /// The materializers must not reenter Anvyx or access this map while storage is reconstructed.
+    /// Key materialization must preserve equality and hash identity.
+    pub unsafe fn remove_with<'rt>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         key: &K,
-    ) -> Result<Option<V>, RuntimeError>
-    where
-        K: Clone,
-        V: Clone,
-    {
+        mut materialize_key: impl FnMut(&K) -> K,
+        mut materialize_value: impl FnMut(&V) -> V,
+    ) -> Result<Option<V>, RuntimeError> {
         if !self.contains_key(ctx, key)? {
             return Ok(None);
         }
-        self.structurally_mutate_storage(ctx, |storage| Ok(storage.shift_remove(key)))
+        self.structurally_mutate_storage_with(
+            ctx,
+            &mut materialize_key,
+            &mut materialize_value,
+            |storage| Ok(storage.shift_remove(key)),
+        )
     }
 
     pub fn replace_with(&mut self, other: Self) -> Result<(), RuntimeError> {
@@ -720,6 +854,7 @@ impl<'cx, K: Eq + Hash + 'cx, V: 'cx> AnvMap<'cx, K, V> {
     }
 }
 
+// Cloning shares the COW handle; it never materializes map payloads.
 impl<'cx, K: Eq + Hash + 'cx, V: 'cx> Clone for AnvMap<'cx, K, V> {
     fn clone(&self) -> Self {
         self.share()
@@ -818,16 +953,17 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
         ))
     }
 
-    pub fn from_list_mut<'rt>(
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access the list while storage is reconstructed.
+    pub unsafe fn from_list_mut_with<'rt>(
         ctx: &mut Ctx<'cx, 'rt>,
         list: &mut AnvList<'cx, T>,
         start: usize,
         len: usize,
-    ) -> Result<Self, RuntimeError>
-    where
-        T: Clone,
-    {
-        list.make_unique(ctx)?;
+        mut materialize: impl FnMut(&T) -> T,
+    ) -> Result<Self, RuntimeError> {
+        list.make_unique(ctx, &mut materialize)?;
         let guard = list.begin_shape_loan()?;
         Ok(Self::new(
             SliceRoot::List {
@@ -905,21 +1041,26 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
         self.len == 0
     }
 
-    pub fn elem_at_shared<'rt>(&self, ctx: &Ctx<'cx, 'rt>, index: i64) -> Result<T, RuntimeError>
-    where
-        T: Clone,
-    {
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access the slice root while the element reference is live.
+    pub unsafe fn elem_at_shared_with<'rt>(
+        &self,
+        ctx: &Ctx<'cx, 'rt>,
+        index: i64,
+        materialize: impl FnOnce(&T) -> T,
+    ) -> Result<T, RuntimeError> {
         let index = self.check_view_index(index)?;
         let absolute = self.start + index;
         match self.root {
             SliceRoot::Raw { ptr, .. } => unsafe {
-                Ok(ptr.as_ptr().add(absolute).as_ref().unwrap().clone())
+                Ok(materialize(ptr.as_ptr().add(absolute).as_ref().unwrap()))
             },
             SliceRoot::List { ref storage, .. } => {
                 self.check_stable()?;
                 ctx.heap_ref()
                     .try_with(storage.handle(), |storage| {
-                        storage.get(absolute).cloned().ok_or_else(|| {
+                        storage.get(absolute).map(materialize).ok_or_else(|| {
                             RuntimeError::new(format!(
                                 "slice index {index} out of bounds for len {}",
                                 self.len
@@ -934,7 +1075,7 @@ impl<'cx, T: 'cx> AnvSlice<'cx, T> {
     /// # Safety
     ///
     ///  must not access, mutate, move, or invalidate the slice root while it receives element references.
-    pub unsafe fn copy_range_with<'rt, U: 'cx + Clone>(
+    pub unsafe fn copy_range_with<'rt, U: 'cx>(
         &self,
         ctx: &mut Ctx<'cx, 'rt>,
         storage_ty: HeapType<'cx, ListStorage<'cx, U>>,
@@ -1079,12 +1220,16 @@ unsafe impl<'cx, T> Trace<'cx> for AnvSlice<'cx, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::Cell,
+        hash::{Hash, Hasher},
+        rc::Rc,
+    };
 
     use super::{AnvList, AnvMap, AnvSlice, AnvString};
     use crate::{
-        Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, RuntimeError, Trace, TraceDriver,
-        Visitor,
+        Ctx, Handle, Heap, HeapType, ListStorage, MapStorage, MutPlace, RuntimeError, Trace,
+        TraceDriver, Visitor,
     };
 
     fn list_ty<'cx, T: 'cx>(heap: &mut Heap<'cx>) -> HeapType<'cx, ListStorage<'cx, T>> {
@@ -1147,9 +1292,12 @@ mod tests {
             let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
             let view = list.storage.view();
 
-            list.push(&mut ctx, 2).unwrap();
+            unsafe { list.push_with(&mut ctx, 2, |value| *value) }.unwrap();
 
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1, 2]);
+            assert_eq!(
+                unsafe { list.to_vec_with(&ctx, |value| *value) }.unwrap(),
+                vec![1, 2]
+            );
             assert_eq!(view.handle().strong_count(), 2);
             assert!(list.storage.is_unique());
         });
@@ -1164,13 +1312,402 @@ mod tests {
             let mut shared = list.share();
             let _guard = shared.begin_shape_loan().unwrap();
 
-            assert!(shared.push(&mut ctx, 2).is_err());
+            assert!(unsafe { shared.push_with(&mut ctx, 2, |value| *value) }.is_err());
 
             assert_eq!(list.storage.logical_owners(), 2);
             assert_eq!(shared.storage.logical_owners(), 2);
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![1]);
-            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1]);
+            assert_eq!(
+                unsafe { list.to_vec_with(&ctx, |value| *value) }.unwrap(),
+                vec![1]
+            );
+            assert_eq!(
+                unsafe { shared.to_vec_with(&ctx, |value| *value) }.unwrap(),
+                vec![1]
+            );
         });
+    }
+
+    #[test]
+    fn list_materializers_support_non_clone_payloads() {
+        struct NonClone(i64);
+
+        Heap::scope(|heap| {
+            let calls = Cell::new(0);
+            let ty = list_ty::<NonClone>(heap);
+            let mut ctx = Ctx::new(heap);
+            let list = AnvList::from_elems(&mut ctx, ty, [NonClone(1), NonClone(2)]);
+            let mut shared = list.share();
+            let materialize = |value: &NonClone| {
+                calls.set(calls.get() + 1);
+                NonClone(value.0)
+            };
+
+            unsafe { shared.push_with(&mut ctx, NonClone(3), materialize) }.unwrap();
+            assert_eq!(calls.get(), 2);
+            assert_eq!(
+                list.with_storage(&ctx, |storage| {
+                    Ok(storage
+                        .as_slice()
+                        .iter()
+                        .map(|value| value.0)
+                        .collect::<Vec<_>>())
+                })
+                .unwrap(),
+                [1, 2]
+            );
+            assert_eq!(
+                shared
+                    .with_storage(&ctx, |storage| {
+                        Ok(storage
+                            .as_slice()
+                            .iter()
+                            .map(|value| value.0)
+                            .collect::<Vec<_>>())
+                    })
+                    .unwrap(),
+                [1, 2, 3]
+            );
+
+            let value = unsafe {
+                shared.checked_index_with(&ctx, 1, |value| {
+                    calls.set(calls.get() + 1);
+                    NonClone(value.0)
+                })
+            }
+            .unwrap();
+            assert_eq!(value.0, 2);
+            assert_eq!(calls.get(), 3);
+
+            let values = unsafe {
+                list.to_vec_with(&ctx, |value| {
+                    calls.set(calls.get() + 1);
+                    NonClone(value.0)
+                })
+            }
+            .unwrap();
+            assert_eq!(
+                values.iter().map(|value| value.0).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(calls.get(), 5);
+
+            let copied = unsafe {
+                list.copy_range_with(&mut ctx, ty, 0..2, |value| {
+                    calls.set(calls.get() + 1);
+                    NonClone(value.0)
+                })
+            }
+            .unwrap();
+            assert_eq!(
+                copied
+                    .with_storage(&ctx, |storage| {
+                        Ok(storage
+                            .as_slice()
+                            .iter()
+                            .map(|value| value.0)
+                            .collect::<Vec<_>>())
+                    })
+                    .unwrap(),
+                [1, 2]
+            );
+            assert_eq!(calls.get(), 7);
+
+            let retained = shared.share();
+            let mut slice = unsafe {
+                AnvSlice::from_list_mut_with(&mut ctx, &mut shared, 0, 3, |value| {
+                    calls.set(calls.get() + 1);
+                    NonClone(value.0)
+                })
+            }
+            .unwrap();
+            assert_eq!(calls.get(), 10);
+            unsafe {
+                slice
+                    .with_elem_mut_leaf(&mut ctx, 0, |value| {
+                        value.0 = 9;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let value = unsafe {
+                slice.elem_at_shared_with(&ctx, 0, |value| {
+                    calls.set(calls.get() + 1);
+                    NonClone(value.0)
+                })
+            }
+            .unwrap();
+            assert_eq!(value.0, 9);
+            assert_eq!(calls.get(), 11);
+            drop(slice);
+            assert_eq!(
+                retained
+                    .with_storage(&ctx, |storage| {
+                        Ok(storage
+                            .as_slice()
+                            .iter()
+                            .map(|value| value.0)
+                            .collect::<Vec<_>>())
+                    })
+                    .unwrap(),
+                [1, 2, 3]
+            );
+        });
+    }
+
+    #[derive(Default)]
+    struct PayloadCounts {
+        created: Cell<u32>,
+        dropped: Cell<u32>,
+    }
+
+    struct MapKey {
+        id: i64,
+        counts: Rc<PayloadCounts>,
+    }
+
+    struct MapValue {
+        id: i64,
+        counts: Rc<PayloadCounts>,
+    }
+
+    impl MapKey {
+        fn tracked(id: i64, counts: &Rc<PayloadCounts>) -> Self {
+            counts.created.set(counts.created.get() + 1);
+            Self {
+                id,
+                counts: Rc::clone(counts),
+            }
+        }
+    }
+
+    impl MapValue {
+        fn tracked(id: i64, counts: &Rc<PayloadCounts>) -> Self {
+            counts.created.set(counts.created.get() + 1);
+            Self {
+                id,
+                counts: Rc::clone(counts),
+            }
+        }
+    }
+
+    impl PartialEq for MapKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for MapKey {}
+
+    impl Hash for MapKey {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    impl Drop for MapKey {
+        fn drop(&mut self) {
+            self.counts.dropped.set(self.counts.dropped.get() + 1);
+        }
+    }
+
+    impl Drop for MapValue {
+        fn drop(&mut self) {
+            self.counts.dropped.set(self.counts.dropped.get() + 1);
+        }
+    }
+
+    #[test]
+    fn map_materializers_support_non_clone_payloads() {
+        let key_counts = Rc::new(PayloadCounts::default());
+        let value_counts = Rc::new(PayloadCounts::default());
+        let key_materializations = Cell::new(0);
+        let value_materializations = Cell::new(0);
+
+        Heap::scope(|heap| {
+            let ty = map_ty::<MapKey, MapValue>(heap);
+            let mut ctx = Ctx::new(heap);
+            let key = |id| MapKey::tracked(id, &key_counts);
+            let value = |id| MapValue::tracked(id, &value_counts);
+            let materialize_key = |source: &MapKey| {
+                key_materializations.set(key_materializations.get() + 1);
+                key(source.id)
+            };
+            let materialize_value = |source: &MapValue| {
+                value_materializations.set(value_materializations.get() + 1);
+                value(source.id)
+            };
+            let mut map =
+                AnvMap::from_entries(&mut ctx, ty, [(key(1), value(10)), (key(2), value(20))]);
+            let original = map.share();
+            let version = map.structural_version();
+
+            let lookup = key(1);
+            let read = unsafe { map.get_with(&ctx, &lookup, materialize_value) }
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.id, 10);
+            let entry = unsafe {
+                map.entry_at_shared_with(&ctx, 1, version, materialize_key, materialize_value)
+            }
+            .unwrap();
+            assert_eq!((entry.0.id, entry.1.id), (2, 20));
+            assert_eq!(
+                unsafe { map.key_at_shared_with(&ctx, 0, version, materialize_key) }
+                    .unwrap()
+                    .id,
+                1
+            );
+            assert_eq!(
+                unsafe { map.value_at_shared_with(&ctx, 0, version, materialize_value) }
+                    .unwrap()
+                    .id,
+                10
+            );
+
+            let old = unsafe {
+                map.insert_with(
+                    &mut ctx,
+                    key(1),
+                    value(11),
+                    materialize_key,
+                    materialize_value,
+                )
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(old.id, 10);
+            assert_eq!(map.structural_version(), version);
+            assert_eq!(
+                original
+                    .with_value_shared_short(&ctx, &lookup, |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                10
+            );
+
+            let before_insert = map.share();
+            unsafe {
+                map.insert_with(
+                    &mut ctx,
+                    key(3),
+                    value(30),
+                    materialize_key,
+                    materialize_value,
+                )
+            }
+            .unwrap();
+            let inserted_version = map.structural_version();
+            assert!(!before_insert.contains_key(&ctx, &key(3)).unwrap());
+            assert_eq!(inserted_version, version + 1);
+            assert_eq!(
+                unsafe { map.key_at_shared_with(&ctx, 1, inserted_version, materialize_key) }
+                    .unwrap()
+                    .id,
+                2
+            );
+
+            let before_remove = map.share();
+            let removed =
+                unsafe { map.remove_with(&mut ctx, &key(2), materialize_key, materialize_value) }
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(removed.id, 20);
+            assert_eq!(
+                before_remove
+                    .with_value_shared_short(&ctx, &key(2), |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                20
+            );
+            let removed_version = map.structural_version();
+            assert_eq!(removed_version, inserted_version + 1);
+            assert_eq!(
+                unsafe { map.key_at_shared_with(&ctx, 1, removed_version, materialize_key) }
+                    .unwrap()
+                    .id,
+                3
+            );
+
+            let retained = map.share();
+            unsafe {
+                map.with_value_mut_short_with(
+                    &mut ctx,
+                    0,
+                    removed_version,
+                    materialize_key,
+                    materialize_value,
+                    |value| {
+                        value.id = 99;
+                        Ok(())
+                    },
+                )
+            }
+            .unwrap();
+            assert_eq!(map.structural_version(), removed_version);
+            assert_eq!(
+                retained
+                    .with_value_shared_short(&ctx, &lookup, |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                11
+            );
+            assert_eq!(
+                map.with_value_shared_short(&ctx, &lookup, |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                99
+            );
+
+            let loan_alias = map.share();
+            let loan = unsafe {
+                map.begin_value_loan_by_key_with(
+                    &mut ctx,
+                    &lookup,
+                    materialize_key,
+                    materialize_value,
+                )
+            }
+            .unwrap();
+            map.with_value_mut_by_key(&mut ctx, &lookup, loan.version(), loan.id(), |value| {
+                value.id = 100;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                loan_alias
+                    .with_value_shared_short(&ctx, &lookup, |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                99
+            );
+            drop(loan);
+            assert_eq!(
+                map.with_value_shared_short(&ctx, &lookup, |value| Ok(value.unwrap().id))
+                    .unwrap(),
+                100
+            );
+
+            assert_eq!(key_materializations.get(), 15);
+            assert_eq!(value_materializations.get(), 14);
+
+            let shape = map.begin_shape_loan().unwrap();
+            let key_calls = key_materializations.get();
+            let value_calls = value_materializations.get();
+            assert!(
+                unsafe {
+                    map.insert_with(
+                        &mut ctx,
+                        key(4),
+                        value(40),
+                        materialize_key,
+                        materialize_value,
+                    )
+                }
+                .is_err()
+            );
+            assert_eq!(key_materializations.get(), key_calls);
+            assert_eq!(value_materializations.get(), value_calls);
+            assert_eq!(map.structural_version(), removed_version);
+            drop(shape);
+        });
+
+        assert_eq!(key_counts.dropped.get(), key_counts.created.get());
+        assert_eq!(value_counts.dropped.get(), value_counts.created.get());
     }
 
     struct TraceChild {
@@ -1359,7 +1896,7 @@ mod tests {
             let mut shared = list.share();
             let replacement = AnvList::from_elems(&mut ctx, int_list_ty, [2_i64]);
 
-            shared.push(&mut ctx, replacement).unwrap();
+            unsafe { shared.push_with(&mut ctx, replacement, AnvList::share) }.unwrap();
 
             let original_inner_owners = list
                 .with_storage(&ctx, |storage| {
@@ -1394,7 +1931,8 @@ mod tests {
             let mut shared = map.share();
             let replacement = AnvList::from_elems(&mut ctx, list_ty, [2_i64]);
 
-            shared.insert(&mut ctx, 2, replacement).unwrap();
+            unsafe { shared.insert_with(&mut ctx, 2, replacement, |key| *key, AnvList::share) }
+                .unwrap();
 
             let original_inner_owners = map
                 .with_storage_unchecked(&ctx, |storage| {
@@ -1425,24 +1963,45 @@ mod tests {
             let mut ctx = Ctx::new(heap);
             let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
             let shared = map.share();
-            let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+            let guard = unsafe {
+                map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+            }
+            .unwrap();
             let version = guard.version();
 
-            assert!(map.insert(&mut ctx, "a", 2).is_err());
+            assert!(
+                unsafe { map.insert_with(&mut ctx, "a", 2, |key| *key, |value| *value) }.is_err()
+            );
             unsafe {
                 assert!(
-                    map.with_value_mut_short(&mut ctx, 0, version, |value| {
-                        *value = 3;
-                        Ok(())
-                    })
+                    map.with_value_mut_short_with(
+                        &mut ctx,
+                        0,
+                        version,
+                        |key| *key,
+                        |value| *value,
+                        |value| {
+                            *value = 3;
+                            Ok(())
+                        }
+                    )
                     .is_err()
                 );
             }
             drop(guard);
 
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(map.insert(&mut ctx, "a", 2).unwrap(), Some(1));
+            assert_eq!(
+                unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                unsafe { shared.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                unsafe { map.insert_with(&mut ctx, "a", 2, |key| *key, |value| *value) }.unwrap(),
+                Some(1)
+            );
         });
     }
 
@@ -1452,16 +2011,24 @@ mod tests {
             let ty = map_ty::<&str, i64>(heap);
             let mut ctx = Ctx::new(heap);
             let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
-            let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+            let guard = unsafe {
+                map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+            }
+            .unwrap();
             let version = guard.version();
 
-            assert!(map.get(&ctx, &"a").is_err());
+            assert!(unsafe { map.get_with(&ctx, &"a", |value| *value) }.is_err());
             assert!(map.contains_key(&ctx, &"a").is_err());
             assert!(map.begin_shape_loan().is_err());
-            assert!(map.key_at_shared(&ctx, 0, version).is_err());
-            assert!(map.value_at_shared(&ctx, 0, version).is_err());
-            assert!(map.insert(&mut ctx, "b", 2).is_err());
-            assert!(map.remove(&mut ctx, &"missing").is_err());
+            assert!(unsafe { map.key_at_shared_with(&ctx, 0, version, |key| *key) }.is_err());
+            assert!(unsafe { map.value_at_shared_with(&ctx, 0, version, |value| *value) }.is_err());
+            assert!(
+                unsafe { map.insert_with(&mut ctx, "b", 2, |key| *key, |value| *value) }.is_err()
+            );
+            assert!(
+                unsafe { map.remove_with(&mut ctx, &"missing", |key| *key, |value| *value) }
+                    .is_err()
+            );
 
             map.with_value_mut_by_key(&mut ctx, &"a", version, guard.id(), |value| {
                 *value = 3;
@@ -1470,7 +2037,10 @@ mod tests {
             .unwrap();
             drop(guard);
 
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
+            assert_eq!(
+                unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(3)
+            );
         });
     }
 
@@ -1480,7 +2050,10 @@ mod tests {
             let ty = map_ty::<&str, i64>(heap);
             let mut ctx = Ctx::new(heap);
             let mut map = AnvMap::from_entries(&mut ctx, ty, [("a", 1_i64)]);
-            let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+            let guard = unsafe {
+                map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+            }
+            .unwrap();
             let shared = map.share();
 
             assert!(
@@ -1492,8 +2065,14 @@ mod tests {
             );
             drop(guard);
 
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(1));
-            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(
+                unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                unsafe { shared.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(1)
+            );
         });
     }
 
@@ -1507,16 +2086,60 @@ mod tests {
             let version = map.structural_version();
 
             unsafe {
-                map.with_value_mut_short(&mut ctx, 0, version, |value| {
-                    *value = 3;
-                    Ok(())
-                })
+                map.with_value_mut_short_with(
+                    &mut ctx,
+                    0,
+                    version,
+                    |key| *key,
+                    |value| *value,
+                    |value| {
+                        *value = 3;
+                        Ok(())
+                    },
+                )
             }
             .unwrap();
 
-            assert_eq!(map.get(&ctx, &"a").unwrap(), Some(3));
-            assert_eq!(shared.get(&ctx, &"a").unwrap(), Some(1));
+            assert_eq!(
+                unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(3)
+            );
+            assert_eq!(
+                unsafe { shared.get_with(&ctx, &"a", |value| *value) }.unwrap(),
+                Some(1)
+            );
             assert_eq!(map.structural_version(), 0);
+        });
+    }
+
+    #[test]
+    fn mutable_slice_staging_preserves_list_loan_state() {
+        Heap::scope(|heap| {
+            let ty = list_ty::<i64>(heap);
+            let mut ctx = Ctx::new(heap);
+            let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
+            unsafe { list.push_with(&mut ctx, 2, |value| *value) }.unwrap();
+            let version = list.structural_version();
+            let guard = list.begin_shape_loan().unwrap();
+            let mut place = MutPlace::local(&mut list);
+            let slice = unsafe { place.slice_view_mut_with(&mut ctx, 0, 1, false, |value| *value) }
+                .unwrap();
+            drop(slice);
+            drop(place);
+
+            assert_eq!(list.structural_version(), version);
+            assert!(unsafe { list.push_with(&mut ctx, 3, |value| *value) }.is_err());
+            drop(guard);
+            unsafe { list.push_with(&mut ctx, 3, |value| *value) }.unwrap();
+            assert_eq!(list.structural_version(), version + 1);
+
+            let mut place = MutPlace::local(&mut list);
+            let staged_loan = unsafe { place.begin_shape_loan_with_ctx(&mut ctx) }.unwrap();
+            drop(place);
+            assert!(unsafe { list.push_with(&mut ctx, 4, |value| *value) }.is_err());
+            drop(staged_loan);
+            unsafe { list.push_with(&mut ctx, 4, |value| *value) }.unwrap();
+            assert_eq!(list.structural_version(), version + 2);
         });
     }
 
@@ -1526,20 +2149,32 @@ mod tests {
             let ty = list_ty::<i64>(heap);
             let mut ctx = Ctx::new(heap);
             let mut list = AnvList::from_elems(&mut ctx, ty, [1_i64]);
-            list.push(&mut ctx, 2).unwrap();
+            unsafe { list.push_with(&mut ctx, 2, |value| *value) }.unwrap();
             let version = list.structural_version();
             let mut owner = list.__anvyx_projection_owner();
 
             unsafe {
-                owner.with_elem_mut_leaf(&mut ctx, 0, version, |value| {
-                    *value = 3;
-                    Ok(())
-                })
+                owner.with_elem_mut_leaf(
+                    &mut ctx,
+                    0,
+                    version,
+                    |value| *value,
+                    |value| {
+                        *value = 3;
+                        Ok(())
+                    },
+                )
             }
             .unwrap();
 
-            assert_eq!(owner.elem_at_shared(&ctx, 0, version).unwrap(), 3);
-            assert_eq!(list.elem_at_shared(&ctx, 0, version).unwrap(), 1);
+            assert_eq!(
+                unsafe { owner.elem_at_shared_with(&ctx, 0, version, |value| *value) }.unwrap(),
+                3
+            );
+            assert_eq!(
+                unsafe { list.elem_at_shared_with(&ctx, 0, version, |value| *value) }.unwrap(),
+                1
+            );
         });
     }
 
@@ -1574,8 +2209,14 @@ mod tests {
             let slice = AnvSlice::from_list(&list, 1, 2).unwrap();
             drop(list);
 
-            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 2);
-            assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 3);
+            assert_eq!(
+                unsafe { slice.elem_at_shared_with(&ctx, 0, |value| *value) }.unwrap(),
+                2
+            );
+            assert_eq!(
+                unsafe { slice.elem_at_shared_with(&ctx, 1, |value| *value) }.unwrap(),
+                3
+            );
         });
     }
 
@@ -1596,7 +2237,10 @@ mod tests {
             }
             .unwrap_err();
             assert_eq!(err.message(), "early");
-            assert_eq!(slice.elem_at_shared(&ctx, 1).unwrap(), 4);
+            assert_eq!(
+                unsafe { slice.elem_at_shared_with(&ctx, 1, |value| *value) }.unwrap(),
+                4
+            );
             unsafe {
                 slice.with_elem_mut_leaf(&mut ctx, 1, |value| {
                     *value = 5;
@@ -1619,16 +2263,31 @@ mod tests {
             let slice = AnvSlice::from_list(&list, 0, 2).unwrap();
 
             unsafe {
-                list.with_elem_mut_leaf(&mut ctx, 0, version, |value| {
-                    *value = 10;
-                    Ok(())
-                })
+                list.with_elem_mut_leaf(
+                    &mut ctx,
+                    0,
+                    version,
+                    |value| *value,
+                    |value| {
+                        *value = 10;
+                        Ok(())
+                    },
+                )
             }
             .unwrap();
 
-            assert_eq!(list.to_vec(&ctx).unwrap(), vec![10, 2]);
-            assert_eq!(shared.to_vec(&ctx).unwrap(), vec![1, 2]);
-            assert_eq!(slice.elem_at_shared(&ctx, 0).unwrap(), 1);
+            assert_eq!(
+                unsafe { list.to_vec_with(&ctx, |value| *value) }.unwrap(),
+                vec![10, 2]
+            );
+            assert_eq!(
+                unsafe { shared.to_vec_with(&ctx, |value| *value) }.unwrap(),
+                vec![1, 2]
+            );
+            assert_eq!(
+                unsafe { slice.elem_at_shared_with(&ctx, 0, |value| *value) }.unwrap(),
+                1
+            );
         });
     }
 }

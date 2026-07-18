@@ -235,6 +235,20 @@ fn builtin_assembles_descriptor_and_native_support() {
     assert_eq!(support.types[0].key.module.segments, ["core_int"]);
     assert_eq!(support.types[0].path.crate_name, "crate");
     assert_eq!(support.types[0].path.segments, ["builtin", "Point"]);
+    let materializer = support.types[0].materializer.as_ref().unwrap();
+    assert_eq!(
+        materializer.mode,
+        anvyx_runtime::ExternMaterialization::Copy
+    );
+    assert_eq!(materializer.path.crate_name, "crate");
+    assert_eq!(
+        materializer.path.segments,
+        [
+            "builtin",
+            "__anvyx_native_export_point",
+            "__anvyx_materialize",
+        ]
+    );
     assert_eq!(
         support.bindings[0].path.segments,
         ["__anvyx_native", "int_abs"]
@@ -304,6 +318,21 @@ fn provider_package_aggregates_child_descriptors_and_prefixes_native_paths() {
             "__anvyx_native_package",
             "window",
             "WindowConfig",
+        ]
+    );
+    let materializer = supports[0].types[0].materializer.as_ref().unwrap();
+    assert_eq!(
+        materializer.rust_type.segments,
+        supports[0].types[0].path.segments
+    );
+    assert_eq!(
+        materializer.path.segments,
+        [
+            "package",
+            "__anvyx_native_package",
+            "window",
+            "__anvyx_native_export_windowconfig",
+            "__anvyx_materialize",
         ]
     );
     assert!(supports[0].bindings.iter().any(|binding| {

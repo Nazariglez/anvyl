@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt::Debug, path::PathBuf};
+use std::{any::type_name, collections::HashSet, fmt::Debug, path::PathBuf};
 
 pub use anvyx_externs::{
     AbiPosition, BinaryOp, CallbackEscape, CallbackPolicy, CallbackThread, ExternBindingKey,
@@ -8,8 +8,9 @@ pub use anvyx_externs::{
     ExternLayout, ExternMaterialization, ExternMemberKey, ExternMemberSelector,
     ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator, ExternOperatorDescriptor,
     ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor, ExternTypeDescriptor,
-    ExternTypeExpr, ExternTypeKey, ModulePath, ParamFlow, ProviderDescriptor, ProviderId,
-    ReceiverMode, UnaryOp, effective_callback_escape,
+    ExternTypeExpr, ExternTypeKey, INLINE_MATERIALIZER_SYMBOL, ModulePath, ParamFlow,
+    ProviderDescriptor, ProviderId, ReceiverMode, UnaryOp, effective_callback_escape,
+    native_materializer_module,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,15 +22,178 @@ pub struct FunctionExport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeExport {
-    pub rust_type_path: &'static str,
-    pub owns_heap_edges: bool,
+    rust_type_path: &'static str,
+    owns_heap_edges: bool,
+    inline_materialization: Option<InlineMaterializationAttestation>,
     pub descriptor: ExternTypeDescriptor,
     pub bindings: Vec<RustMemberBinding>,
 }
 
+impl TypeExport {
+    #[doc(hidden)]
+    pub fn copy<T: AnvyxInlineExport + 'static>(
+        rust_type_path: &'static str,
+        descriptor: ExternTypeDescriptor,
+        bindings: Vec<RustMemberBinding>,
+    ) -> Self {
+        Self::with_materialization(
+            rust_type_path,
+            T::OWNS_ANVYX_HEAP_EDGES,
+            descriptor,
+            bindings,
+            Some(InlineMaterializationAttestation::inline::<T>()),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn enumeration<T: AnvyxEnumExport + 'static>(
+        rust_type_path: &'static str,
+        descriptor: ExternTypeDescriptor,
+        bindings: Vec<RustMemberBinding>,
+    ) -> Self {
+        Self::with_materialization(
+            rust_type_path,
+            T::OWNS_ANVYX_HEAP_EDGES,
+            descriptor,
+            bindings,
+            Some(InlineMaterializationAttestation::enumeration::<T>()),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn shared<T: AnvyxRefExport>(
+        rust_type_path: &'static str,
+        descriptor: ExternTypeDescriptor,
+        bindings: Vec<RustMemberBinding>,
+    ) -> Self {
+        Self::with_materialization(
+            rust_type_path,
+            T::OWNS_ANVYX_HEAP_EDGES,
+            descriptor,
+            bindings,
+            None,
+        )
+    }
+
+    fn with_materialization(
+        rust_type_path: &'static str,
+        owns_heap_edges: bool,
+        descriptor: ExternTypeDescriptor,
+        bindings: Vec<RustMemberBinding>,
+        inline_materialization: Option<InlineMaterializationAttestation>,
+    ) -> Self {
+        let export = Self {
+            rust_type_path,
+            owns_heap_edges,
+            inline_materialization,
+            descriptor,
+            bindings,
+        };
+        validate_inline_materialization(&export);
+        export
+    }
+
+    pub fn rust_type_path(&self) -> &'static str {
+        self.rust_type_path
+    }
+
+    pub fn inline_materialization(&self) -> Option<InlineMaterializationAttestation> {
+        self.inline_materialization
+    }
+}
+
+/// Typed evidence for an inline provider value's reusable materializer.
+///
+/// The materializer is a trusted provider boundary: it must be infallible,
+/// panic-free, deterministic, non-reentrant, and called only on the Anvyx
+/// runtime thread.
+///
+/// The evidence can only be derived from an export trait's typed materializer;
+/// its native module and symbol follow the deterministic derive convention.
+///
+/// ```compile_fail
+/// use anvyx_runtime::{ExternMaterialization, InlineMaterializationAttestation};
+///
+/// let _forged = InlineMaterializationAttestation {
+///     mode: ExternMaterialization::Copy,
+///     rust_type_path: "forged::Type",
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineMaterializationAttestation {
+    mode: ExternMaterialization,
+    rust_type_path: &'static str,
+}
+
+impl InlineMaterializationAttestation {
+    fn inline<T: AnvyxInlineExport + 'static>() -> Self {
+        Self::new::<T>(ExternMaterialization::Copy)
+    }
+
+    fn enumeration<T: AnvyxEnumExport + 'static>() -> Self {
+        Self::new::<T>(ExternMaterialization::Materialize)
+    }
+
+    fn new<T: 'static>(mode: ExternMaterialization) -> Self {
+        Self {
+            mode,
+            rust_type_path: type_name::<T>(),
+        }
+    }
+
+    pub fn mode(self) -> ExternMaterialization {
+        self.mode
+    }
+
+    pub fn rust_type_path(self) -> &'static str {
+        self.rust_type_path
+    }
+
+    pub fn module(self) -> String {
+        native_materializer_module(self.rust_type_path)
+    }
+
+    pub fn symbol(self) -> &'static str {
+        INLINE_MATERIALIZER_SYMBOL
+    }
+}
+
+pub struct TypeMemberFragment {
+    pub name: String,
+    pub fields: Vec<ExternFieldDescriptor>,
+    pub init: Option<ExternInitDescriptor>,
+    pub methods: Vec<ExternMethodDescriptor>,
+    pub statics: Vec<ExternStaticDescriptor>,
+    pub operators: Vec<ExternOperatorDescriptor>,
+    pub bindings: Vec<RustMemberBinding>,
+}
+
+impl TypeMemberFragment {
+    #[doc(hidden)]
+    pub fn new(
+        name: String,
+        fields: Vec<ExternFieldDescriptor>,
+        init: Option<ExternInitDescriptor>,
+        methods: Vec<ExternMethodDescriptor>,
+        statics: Vec<ExternStaticDescriptor>,
+        operators: Vec<ExternOperatorDescriptor>,
+        bindings: Vec<RustMemberBinding>,
+    ) -> Self {
+        Self {
+            name,
+            fields,
+            init,
+            methods,
+            statics,
+            operators,
+            bindings,
+        }
+    }
+}
+
 pub struct TypeMemberExport {
     pub rust_type_path: &'static str,
-    pub export: fn() -> TypeExport,
+    pub export: fn() -> TypeMemberFragment,
 }
 
 inventory::collect!(TypeMemberExport);
@@ -42,57 +206,75 @@ pub fn merge_type_members(mut base: TypeExport) -> TypeExport {
             merge_member_fragment(&mut base, members);
         }
     }
+    validate_inline_materialization(&base);
     validate_type_members(&base.descriptor);
     base
 }
 
-fn merge_member_fragment(base: &mut TypeExport, mut members: TypeExport) {
-    base.descriptor
-        .fields
-        .append(&mut members.descriptor.fields);
-    if members.descriptor.init.is_some() {
-        assert!(base.descriptor.init.is_none(), "duplicate extern init");
-        base.descriptor.init = members.descriptor.init;
+fn validate_inline_materialization(export: &TypeExport) {
+    match (
+        export.descriptor.rep,
+        export.descriptor.materialization,
+        export.inline_materialization,
+    ) {
+        (ExternRep::Inline, Some(mode), Some(attestation)) => {
+            assert_eq!(
+                attestation.mode(),
+                mode,
+                "inline materialization mode mismatch"
+            );
+            assert_eq!(
+                attestation.rust_type_path(),
+                export.rust_type_path,
+                "inline materialization type mismatch"
+            );
+        }
+        (ExternRep::Inline | ExternRep::Shared, None, None) => {}
+        (ExternRep::Inline, Some(_), None) => {
+            panic!("inline type requires typed materialization evidence")
+        }
+        (ExternRep::Inline | ExternRep::Shared, None, Some(_)) => {
+            panic!("type has unexpected inline materialization evidence")
+        }
+        (ExternRep::Shared, Some(_), _) => {
+            panic!("shared type cannot define inline materialization")
+        }
     }
-    base.descriptor
-        .methods
-        .append(&mut members.descriptor.methods);
-    base.descriptor
-        .statics
-        .append(&mut members.descriptor.statics);
-    base.descriptor
-        .operators
-        .append(&mut members.descriptor.operators);
+}
+
+fn merge_member_fragment(base: &mut TypeExport, mut members: TypeMemberFragment) {
+    base.descriptor.fields.append(&mut members.fields);
+    if members.init.is_some() {
+        assert!(base.descriptor.init.is_none(), "duplicate extern init");
+        base.descriptor.init = members.init;
+    }
+    base.descriptor.methods.append(&mut members.methods);
+    base.descriptor.statics.append(&mut members.statics);
+    base.descriptor.operators.append(&mut members.operators);
     base.bindings.append(&mut members.bindings);
 }
 
-fn retarget_members(members: &mut TypeExport, target_name: &str) {
-    let source_name = members.descriptor.name.clone();
-    for field in &mut members.descriptor.fields {
-        retarget_type(&mut field.ty, &source_name, target_name);
+fn retarget_members(members: &mut TypeMemberFragment, target_name: &str) {
+    for field in &mut members.fields {
+        retarget_type(&mut field.ty, &members.name, target_name);
     }
-    for variant in &mut members.descriptor.variants {
-        for field in &mut variant.fields {
-            retarget_type(&mut field.ty, &source_name, target_name);
-        }
-    }
-    if let Some(init) = &mut members.descriptor.init {
+    if let Some(init) = &mut members.init {
         for param in &mut init.params {
-            retarget_type(&mut param.ty, &source_name, target_name);
+            retarget_type(&mut param.ty, &members.name, target_name);
         }
-        retarget_type(&mut init.ret, &source_name, target_name);
+        retarget_type(&mut init.ret, &members.name, target_name);
     }
-    for method in &mut members.descriptor.methods {
-        retarget_signature(&mut method.signature, &source_name, target_name);
+    for method in &mut members.methods {
+        retarget_signature(&mut method.signature, &members.name, target_name);
     }
-    for static_method in &mut members.descriptor.statics {
-        retarget_signature(&mut static_method.signature, &source_name, target_name);
+    for static_method in &mut members.statics {
+        retarget_signature(&mut static_method.signature, &members.name, target_name);
     }
-    for operator in &mut members.descriptor.operators {
-        retarget_signature(&mut operator.signature, &source_name, target_name);
+    for operator in &mut members.operators {
+        retarget_signature(&mut operator.signature, &members.name, target_name);
     }
     for binding in &mut members.bindings {
-        retarget_abi(&mut binding.abi, &source_name, target_name);
+        retarget_abi(&mut binding.abi, &members.name, target_name);
     }
 }
 
@@ -386,12 +568,38 @@ impl ModuleExportItem for TypeExport {
     }
 
     fn rust_type_bindings(self, module: ModulePath, crate_name: &str) -> Vec<RustTypeBinding> {
-        let segments = self
-            .rust_type_path
+        validate_inline_materialization(&self);
+        let rust_type_path = self
+            .inline_materialization
+            .map_or(self.rust_type_path, |attestation| {
+                attestation.rust_type_path()
+            });
+        let segments = rust_type_path
             .split("::")
             .skip(1)
             .map(str::to_string)
-            .collect();
+            .collect::<Vec<_>>();
+        let materializer = self.inline_materialization.map(|attestation| {
+            let mut segments = segments[..segments.len() - 1].to_vec();
+            segments.push(attestation.module());
+            segments.push(attestation.symbol().to_string());
+            RustMaterializerBinding {
+                mode: attestation.mode(),
+                rust_type: RustPath {
+                    crate_name: crate_name.to_string(),
+                    segments: attestation
+                        .rust_type_path()
+                        .split("::")
+                        .skip(1)
+                        .map(str::to_string)
+                        .collect(),
+                },
+                path: RustPath {
+                    crate_name: crate_name.to_string(),
+                    segments,
+                },
+            }
+        });
         vec![RustTypeBinding {
             key: ExternTypeKey {
                 module,
@@ -402,6 +610,7 @@ impl ModuleExportItem for TypeExport {
                 segments,
             },
             owns_heap_edges: self.owns_heap_edges,
+            materializer,
         }]
     }
 }
@@ -447,6 +656,53 @@ pub struct RustTypeBinding {
     pub key: ExternTypeKey,
     pub path: RustPath,
     pub owns_heap_edges: bool,
+    pub materializer: Option<RustMaterializerBinding>,
+}
+
+impl RustTypeBinding {
+    #[doc(hidden)]
+    pub fn validated_materializer(
+        &self,
+        mode: ExternMaterialization,
+    ) -> Option<&RustMaterializerBinding> {
+        let materializer = self.materializer.as_ref()?;
+        if materializer.mode != mode
+            || materializer.rust_type != self.path
+            || self.path.segments.is_empty()
+        {
+            return None;
+        }
+        let native_type = self.path.segments.last()?;
+        let mut expected = self.path.segments[..self.path.segments.len() - 1].to_vec();
+        expected.push(native_materializer_module(native_type));
+        expected.push(INLINE_MATERIALIZER_SYMBOL.to_string());
+        (materializer.path.crate_name == self.path.crate_name
+            && materializer.path.segments == expected)
+            .then_some(materializer)
+    }
+
+    pub fn retarget_crate(&mut self, crate_name: &str) {
+        self.path.crate_name = crate_name.to_string();
+        if let Some(materializer) = &mut self.materializer {
+            materializer.rust_type.crate_name = crate_name.to_string();
+            materializer.path.crate_name = crate_name.to_string();
+        }
+    }
+
+    pub fn retarget_prefix(&mut self, from: &[String], to: &[String]) {
+        self.path.retarget_prefix(from, to);
+        if let Some(materializer) = &mut self.materializer {
+            materializer.rust_type.retarget_prefix(from, to);
+            materializer.path.retarget_prefix(from, to);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustMaterializerBinding {
+    pub mode: ExternMaterialization,
+    pub rust_type: RustPath,
+    pub path: RustPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -934,9 +1190,10 @@ pub fn validate_rust_provider_support(
             .flat_map(|module| module.types.iter().cloned())
             .collect::<Vec<_>>();
         for module in &support.modules {
-            validate_native_module(descriptor, module, &types)?;
+            validate_native_module(descriptor, module, &types, &support.cargo.manifest_key)?;
         }
     }
+    validate_native_type_completeness(descriptors, supports)?;
     Ok(())
 }
 
@@ -978,10 +1235,41 @@ fn validate_unique_native_support(supports: &[RustProviderSupport]) -> Result<()
     Ok(())
 }
 
+fn validate_native_type_completeness(
+    descriptors: &[ProviderDescriptor],
+    supports: &[RustProviderSupport],
+) -> Result<(), String> {
+    for descriptor in descriptors {
+        for module in &descriptor.modules {
+            for decl in &module.types {
+                let found = supports.iter().any(|support| {
+                    support.provider == descriptor.provider
+                        && support.modules.iter().any(|supported_module| {
+                            supported_module.module == module.path
+                                && supported_module.types.iter().any(|ty| {
+                                    ty.key.module == module.path && ty.key.name == decl.name
+                                })
+                        })
+                });
+                if !found {
+                    return Err(format!(
+                        "native provider `{}` is missing type support for `{}::{}`",
+                        descriptor.provider.name,
+                        module.path.segments.join("::"),
+                        decl.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_native_module(
     descriptor: &ProviderDescriptor,
     support: &RustModuleSupport,
     types: &[RustTypeBinding],
+    crate_name: &str,
 ) -> Result<(), String> {
     let module = descriptor
         .modules
@@ -995,29 +1283,12 @@ fn validate_native_module(
         })?;
     for ty in &support.types {
         let Some(decl) = module.types.iter().find(|decl| decl.name == ty.key.name) else {
-            return Err(format!(
-                "native provider `{}` has support for unknown type `{}::{}`",
-                descriptor.provider.name,
-                ty.key.module.segments.join("::"),
-                ty.key.name
-            ));
+            return Err(unknown_type_support(descriptor, ty));
         };
         if ty.key.module != support.module {
-            return Err(format!(
-                "native provider `{}` has support for unknown type `{}::{}`",
-                descriptor.provider.name,
-                ty.key.module.segments.join("::"),
-                ty.key.name
-            ));
+            return Err(unknown_type_support(descriptor, ty));
         }
-        if decl.owns_heap_edges != Some(ty.owns_heap_edges) {
-            return Err(format!(
-                "native provider `{}` has inconsistent heap-edge metadata for type `{}::{}`",
-                descriptor.provider.name,
-                ty.key.module.segments.join("::"),
-                ty.key.name
-            ));
-        }
+        validate_native_type(descriptor, decl, ty, crate_name)?;
     }
     for binding in &support.bindings {
         let signature = native_binding_signature(module, &binding.key).ok_or_else(|| {
@@ -1030,6 +1301,96 @@ fn validate_native_module(
         validate_tracked_owned_return(&binding.key, &binding.abi.ret, types)?;
     }
     Ok(())
+}
+
+fn validate_native_type(
+    provider: &ProviderDescriptor,
+    decl: &ExternTypeDescriptor,
+    support: &RustTypeBinding,
+    crate_name: &str,
+) -> Result<(), String> {
+    let type_name = format!(
+        "{}::{}",
+        support.key.module.segments.join("::"),
+        support.key.name
+    );
+    if decl.owns_heap_edges != Some(support.owns_heap_edges) {
+        return Err(format!(
+            "native provider `{}` has inconsistent heap-edge metadata for type `{type_name}`",
+            provider.provider.name
+        ));
+    }
+    if support.path.crate_name.is_empty()
+        || support.path.crate_name != crate_name
+        || support.path.segments.is_empty()
+    {
+        return Err(format!(
+            "native provider `{}` has invalid native path for type `{type_name}`",
+            provider.provider.name
+        ));
+    }
+
+    match (decl.rep, decl.materialization, &support.materializer) {
+        (ExternRep::Inline, Some(mode), Some(materializer)) => {
+            if materializer.mode != mode {
+                return Err(format!(
+                    "native provider `{}` has mismatched materialization mode for type `{type_name}`",
+                    provider.provider.name
+                ));
+            }
+            if materializer.rust_type != support.path {
+                return Err(format!(
+                    "native provider `{}` has mismatched native path for type `{type_name}`",
+                    provider.provider.name
+                ));
+            }
+            let native_type = materializer
+                .rust_type
+                .segments
+                .last()
+                .expect("matched validated non-empty native type path");
+            let mut expected = support.path.segments[..support.path.segments.len() - 1].to_vec();
+            expected.push(native_materializer_module(native_type));
+            expected.push(INLINE_MATERIALIZER_SYMBOL.to_string());
+            let valid_path = materializer.path.crate_name == support.path.crate_name
+                && materializer.path.segments == expected;
+            if !valid_path {
+                return Err(format!(
+                    "native provider `{}` has mismatched materializer symbol for type `{type_name}`",
+                    provider.provider.name
+                ));
+            }
+        }
+        (ExternRep::Inline, Some(_), None) => {
+            return Err(format!(
+                "native provider `{}` is missing materializer support for type `{type_name}`",
+                provider.provider.name
+            ));
+        }
+        (ExternRep::Inline | ExternRep::Shared, None, None) => {}
+        (ExternRep::Inline | ExternRep::Shared, None, Some(_)) => {
+            return Err(format!(
+                "native provider `{}` has extra materializer support for type `{type_name}`",
+                provider.provider.name
+            ));
+        }
+        (ExternRep::Shared, Some(_), _) => {
+            return Err(format!(
+                "native provider `{}` has invalid shared materialization for type `{type_name}`",
+                provider.provider.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unknown_type_support(provider: &ProviderDescriptor, ty: &RustTypeBinding) -> String {
+    format!(
+        "native provider `{}` has support for unknown type `{}::{}`",
+        provider.provider.name,
+        ty.key.module.segments.join("::"),
+        ty.key.name
+    )
 }
 
 fn validate_tracked_owned_return(
@@ -1824,7 +2185,29 @@ fn native_abi_error(
     )
 }
 
-pub trait AnvyxInlineExport: Copy {}
+/// # Safety
+/// Manual implementations must set `OWNS_ANVYX_HEAP_EDGES` correctly and point
+/// `__ANVYX_MATERIALIZER` at the function exported under the deterministic native
+/// materializer module and symbol. The function must also satisfy
+/// [`InlineMaterializationAttestation`]'s trusted-boundary contract.
+///
+/// ```compile_fail
+/// use anvyx_runtime::AnvyxInlineExport;
+///
+/// #[derive(Clone, Copy)]
+/// struct Manual;
+///
+/// impl AnvyxInlineExport for Manual {
+///     const OWNS_ANVYX_HEAP_EDGES: bool = false;
+///     const __ANVYX_MATERIALIZER: fn(&Self) -> Self = |value| *value;
+/// }
+/// ```
+pub unsafe trait AnvyxInlineExport: Copy {
+    const OWNS_ANVYX_HEAP_EDGES: bool;
+
+    #[doc(hidden)]
+    const __ANVYX_MATERIALIZER: fn(&Self) -> Self;
+}
 
 /// # Safety
 /// Manual impls must set `OWNS_ANVYX_HEAP_EDGES` to true when the type owns any
@@ -1834,7 +2217,17 @@ pub unsafe trait AnvyxRefExport {
     const OWNS_ANVYX_HEAP_EDGES: bool = false;
 }
 
-pub trait AnvyxEnumExport: Clone + PartialEq + Eq + std::hash::Hash {}
+/// # Safety
+/// Manual implementations must set `OWNS_ANVYX_HEAP_EDGES` correctly and point
+/// `__ANVYX_MATERIALIZER` at the function exported under the deterministic native
+/// materializer module and symbol. The function must also satisfy
+/// [`InlineMaterializationAttestation`]'s trusted-boundary contract.
+pub unsafe trait AnvyxEnumExport {
+    const OWNS_ANVYX_HEAP_EDGES: bool;
+
+    #[doc(hidden)]
+    const __ANVYX_MATERIALIZER: fn(&Self) -> Self;
+}
 
 #[cfg(test)]
 mod tests {
@@ -1845,6 +2238,179 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("unknown binding"));
+    }
+
+    #[test]
+    fn validates_inline_materializer_support_matrix() {
+        type Mutate = fn(&mut ProviderDescriptor, &mut RustProviderSupport);
+
+        fn missing(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0].materializer = None;
+        }
+        fn missing_type(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types.clear();
+        }
+        fn missing_module(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules.clear();
+        }
+        fn wrong_provider(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.provider.name = "wrong".to_string();
+        }
+        fn wrong_module(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].module.segments = vec!["wrong".to_string()];
+        }
+        fn extra(descriptor: &mut ProviderDescriptor, _: &mut RustProviderSupport) {
+            descriptor.modules[0].types[0].materialization = None;
+        }
+        fn shared(descriptor: &mut ProviderDescriptor, _: &mut RustProviderSupport) {
+            descriptor.modules[0].types[0].rep = ExternRep::Shared;
+            descriptor.modules[0].types[0].materialization = None;
+        }
+        fn wrong_mode(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0]
+                .materializer
+                .as_mut()
+                .unwrap()
+                .mode = ExternMaterialization::Materialize;
+        }
+        fn wrong_symbol(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0]
+                .materializer
+                .as_mut()
+                .unwrap()
+                .path
+                .segments
+                .pop();
+            support.modules[0].types[0]
+                .materializer
+                .as_mut()
+                .unwrap()
+                .path
+                .segments
+                .push("wrong".to_string());
+        }
+        fn wrong_path(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0]
+                .materializer
+                .as_mut()
+                .unwrap()
+                .path
+                .crate_name = "wrong".to_string();
+        }
+        fn invalid_native_path(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0].path.segments.clear();
+        }
+        fn wrong_attested_path(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0]
+                .materializer
+                .as_mut()
+                .unwrap()
+                .rust_type
+                .segments
+                .insert(0, "wrong".to_string());
+        }
+        fn coherent_wrong_native_path(
+            _: &mut ProviderDescriptor,
+            support: &mut RustProviderSupport,
+        ) {
+            let ty = &mut support.modules[0].types[0];
+            *ty.path.segments.last_mut().unwrap() = "Other".to_string();
+            ty.materializer.as_mut().unwrap().path.segments = vec![
+                "native".to_string(),
+                "__anvyx_native_export_other".to_string(),
+                INLINE_MATERIALIZER_SYMBOL.to_string(),
+            ];
+        }
+        fn wrong_heap(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0].owns_heap_edges = true;
+        }
+        fn stale(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            support.modules[0].types[0].key.name = "Stale".to_string();
+        }
+        fn duplicate(_: &mut ProviderDescriptor, support: &mut RustProviderSupport) {
+            let duplicate = support.modules[0].types[0].clone();
+            support.modules[0].types.push(duplicate);
+        }
+
+        let descriptor = inline_descriptor();
+        let support = inline_support();
+        validate_rust_provider_support(
+            std::slice::from_ref(&descriptor),
+            std::slice::from_ref(&support),
+        )
+        .unwrap();
+
+        let cases: [(&str, Mutate, &str); 16] = [
+            ("missing", missing, "missing materializer support"),
+            ("missing type", missing_type, "missing type support"),
+            ("missing module", missing_module, "missing type support"),
+            ("wrong provider", wrong_provider, "has no descriptor"),
+            ("wrong module", wrong_module, "support for unknown module"),
+            ("extra", extra, "extra materializer support"),
+            ("shared", shared, "extra materializer support"),
+            ("wrong mode", wrong_mode, "mismatched materialization mode"),
+            (
+                "wrong symbol",
+                wrong_symbol,
+                "mismatched materializer symbol",
+            ),
+            ("wrong path", wrong_path, "mismatched materializer symbol"),
+            (
+                "invalid native path",
+                invalid_native_path,
+                "invalid native path",
+            ),
+            (
+                "wrong attested path",
+                wrong_attested_path,
+                "mismatched native path",
+            ),
+            (
+                "coherent wrong native path",
+                coherent_wrong_native_path,
+                "mismatched native path",
+            ),
+            ("wrong heap", wrong_heap, "inconsistent heap-edge metadata"),
+            ("stale", stale, "support for unknown type"),
+            ("duplicate", duplicate, "duplicate type support"),
+        ];
+        for (name, mutate, expected) in cases {
+            let mut descriptor = descriptor.clone();
+            let mut support = support.clone();
+            mutate(&mut descriptor, &mut support);
+            let error = validate_rust_provider_support(&[descriptor], &[support]).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{name}: expected {expected:?} in {error:?}"
+            );
+        }
+
+        let error =
+            validate_rust_provider_support(std::slice::from_ref(&descriptor), &[]).unwrap_err();
+        assert!(error.contains("missing type support"), "{error}");
+
+        let mut shared_descriptor = descriptor.clone();
+        shared_descriptor.modules[0].types[0].rep = ExternRep::Shared;
+        shared_descriptor.modules[0].types[0].materialization = None;
+        let mut shared_support = support.clone();
+        shared_support.modules[0].types[0].materializer = None;
+        validate_rust_provider_support(
+            std::slice::from_ref(&shared_descriptor),
+            std::slice::from_ref(&shared_support),
+        )
+        .unwrap();
+        shared_support.modules[0].types.clear();
+        let error =
+            validate_rust_provider_support(&[shared_descriptor], &[shared_support]).unwrap_err();
+        assert!(error.contains("missing type support"), "{error}");
+
+        let mut second = descriptor.clone();
+        second.provider.name = "second".to_string();
+        let error = validate_rust_provider_support(&[descriptor, second], &[support]).unwrap_err();
+        assert!(
+            error.contains("native provider `second` is missing type support"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1908,6 +2474,7 @@ mod tests {
                 segments: vec!["Thing".to_string()],
             },
             owns_heap_edges: true,
+            materializer: None,
         });
 
         let error = validate_rust_provider_support(&[descriptor], &[support]).unwrap_err();
@@ -1987,6 +2554,7 @@ mod tests {
                         segments: vec!["Thing".to_string()],
                     },
                     owns_heap_edges: true,
+                    materializer: None,
                 }],
                 bindings: vec![],
             },
@@ -2535,7 +3103,7 @@ mod tests {
                     rep: ExternRep::Shared,
                     layout: None,
                     materialization: None,
-                    owns_heap_edges: None,
+                    owns_heap_edges: Some(false),
                     fields: vec![],
                     variants: vec![],
                     init: None,
@@ -3130,7 +3698,24 @@ mod tests {
     }
 
     fn assert_abi_ok(descriptor: ProviderDescriptor, binding: RustExternBinding) {
-        validate_rust_provider_support(&[descriptor], &[support(binding)]).unwrap();
+        let mut support = support(binding);
+        support.modules[0].types = descriptor.modules[0]
+            .types
+            .iter()
+            .map(|ty| RustTypeBinding {
+                key: ExternTypeKey {
+                    module: descriptor.modules[0].path.clone(),
+                    name: ty.name.clone(),
+                },
+                path: RustPath {
+                    crate_name: "test".to_string(),
+                    segments: vec![ty.name.clone()],
+                },
+                owns_heap_edges: ty.owns_heap_edges.unwrap_or(false),
+                materializer: None,
+            })
+            .collect();
+        validate_rust_provider_support(&[descriptor], &[support]).unwrap();
     }
 
     fn assert_abi_error(descriptor: ProviderDescriptor, binding: RustExternBinding, message: &str) {
@@ -3312,6 +3897,71 @@ mod tests {
             args: vec![],
         });
         binding
+    }
+
+    fn inline_descriptor() -> ProviderDescriptor {
+        ProviderDescriptor {
+            provider: provider(),
+            modules: vec![ExternModuleDescriptor {
+                path: module(),
+                types: vec![ExternTypeDescriptor {
+                    name: "Value".to_string(),
+                    doc: None,
+                    rep: ExternRep::Inline,
+                    layout: Some(ExternLayout { size: 8, align: 8 }),
+                    materialization: Some(ExternMaterialization::Copy),
+                    owns_heap_edges: Some(false),
+                    fields: vec![],
+                    variants: vec![],
+                    init: None,
+                    methods: vec![],
+                    statics: vec![],
+                    operators: vec![],
+                }],
+                functions: vec![],
+            }],
+        }
+    }
+
+    fn inline_support() -> RustProviderSupport {
+        RustProviderSupport {
+            package: "test".to_string(),
+            provider: provider(),
+            cargo: RustProviderCargo {
+                manifest_key: "test".to_string(),
+                ..Default::default()
+            },
+            modules: vec![RustModuleSupport {
+                module: module(),
+                types: vec![RustTypeBinding {
+                    key: ExternTypeKey {
+                        module: module(),
+                        name: "Value".to_string(),
+                    },
+                    path: RustPath {
+                        crate_name: "test".to_string(),
+                        segments: vec!["native".to_string(), "HostValue".to_string()],
+                    },
+                    owns_heap_edges: false,
+                    materializer: Some(RustMaterializerBinding {
+                        mode: ExternMaterialization::Copy,
+                        rust_type: RustPath {
+                            crate_name: "test".to_string(),
+                            segments: vec!["native".to_string(), "HostValue".to_string()],
+                        },
+                        path: RustPath {
+                            crate_name: "test".to_string(),
+                            segments: vec![
+                                "native".to_string(),
+                                "__anvyx_native_export_hostvalue".to_string(),
+                                INLINE_MATERIALIZER_SYMBOL.to_string(),
+                            ],
+                        },
+                    }),
+                }],
+                bindings: vec![],
+            }],
+        }
     }
 
     fn support(binding: RustExternBinding) -> RustProviderSupport {

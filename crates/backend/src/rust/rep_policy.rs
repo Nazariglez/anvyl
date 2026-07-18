@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anvyx_frontend::air::{
     self, AggregateKind, ContractSurfaceId, ContractWitnessId, ContractWitnessTarget, ParamMode,
-    Program as AirProgram, TypeData, TypeId, TypePassClass, TypePassClasses, ValueUse,
-    VariantShape,
+    Program as AirProgram, TypeData, TypeId, TypePassClass, TypePassClasses, VariantShape,
 };
 
 use super::{
@@ -40,29 +39,7 @@ pub enum RustBorrowView {
     TargetGap,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustMaterialization {
-    Copy,
-    Share,
-    CloneHandle,
-    CloneLambda,
-    BorrowGuard,
-    Gap,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustPhysicalRecipe {
-    Copy,
-    ManagedShare,
-    CloneHandle,
-    CloneLambda,
-    CloneValue,
-    ReconstructAggregate,
-    BorrowView,
-    Move,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RustRecipePosition {
     Value,
     StoredPayload(LambdaStorageFamily),
@@ -74,7 +51,6 @@ pub enum RustRecipePosition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustRecipeGap {
     UnsupportedType(TypeId),
-    DynamicCarrierPending(TypeId),
     FunctionCapabilityPending(TypeId),
     UnsupportedStorage {
         ty: TypeId,
@@ -83,6 +59,396 @@ pub enum RustRecipeGap {
     UnsupportedMapKey(TypeId),
     UnsupportedGlobal(TypeId),
     UnsupportedHeapEdge(TypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RustMaterializerId(usize);
+
+impl RustMaterializerId {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustMaterializerAction {
+    Copy,
+    ManagedShare,
+    IdentityShare,
+    CallableShare,
+    ProviderMaterialize {
+        binding: anvyx_runtime::RustMaterializerBinding,
+    },
+    Struct {
+        fields: Vec<RustMaterializerId>,
+    },
+    Tuple {
+        fields: Vec<RustMaterializerId>,
+    },
+    Array {
+        elem: RustMaterializerId,
+    },
+    Enum {
+        variants: Vec<Vec<RustMaterializerId>>,
+    },
+    Optional {
+        payload: RustMaterializerId,
+    },
+    DynamicMaterialize {
+        carrier: ContractSurfaceId,
+        variants: Vec<RustDynamicMaterializerVariant>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustDynamicMaterializerVariant {
+    pub witness: ContractWitnessId,
+    pub payload: RustMaterializerId,
+}
+
+#[derive(Debug, Clone)]
+enum RustMaterializerNode {
+    Planning,
+    Ready(RustMaterializerAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustCallableMaterializer {
+    Copy,
+    Share,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RustMaterializerGraph {
+    nodes: Vec<RustMaterializerNode>,
+    types: Vec<TypeId>,
+    positions: Vec<RustRecipePosition>,
+    entries: BTreeMap<(TypeId, RustRecipePosition), RustMaterializerId>,
+    native_types: HashMap<
+        (
+            String,
+            anvyx_runtime::ProviderId,
+            anvyx_runtime::ExternTypeKey,
+        ),
+        anvyx_runtime::RustTypeBinding,
+    >,
+    callables: HashMap<TypeId, RustCallableMaterializer>,
+}
+
+impl RustMaterializerGraph {
+    pub fn with_native_support(supports: &[anvyx_runtime::RustProviderSupport]) -> Self {
+        let mut graph = Self::default();
+        for support in supports {
+            for module in &support.modules {
+                for ty in &module.types {
+                    graph.native_types.insert(
+                        (
+                            support.package.clone(),
+                            support.provider.clone(),
+                            ty.key.clone(),
+                        ),
+                        ty.clone(),
+                    );
+                }
+            }
+        }
+        graph
+    }
+
+    pub fn set_callable_materializers(
+        &mut self,
+        callables: impl IntoIterator<Item = (TypeId, RustCallableMaterializer)>,
+    ) {
+        self.nodes.clear();
+        self.types.clear();
+        self.positions.clear();
+        self.entries.clear();
+        self.callables.clear();
+        self.callables.extend(callables);
+    }
+
+    pub fn ty(&self, id: RustMaterializerId) -> TypeId {
+        self.types[id.index()]
+    }
+
+    pub fn position(&self, id: RustMaterializerId) -> RustRecipePosition {
+        self.positions[id.index()]
+    }
+
+    pub fn action(&self, id: RustMaterializerId) -> &RustMaterializerAction {
+        match &self.nodes[id.index()] {
+            RustMaterializerNode::Ready(action) => action,
+            RustMaterializerNode::Planning => panic!("materializer action is not executable"),
+        }
+    }
+
+    pub fn action_for(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        position: RustRecipePosition,
+    ) -> Result<RustMaterializerId, RustRecipeGap> {
+        plan.check_recipe_position(ty, position)?;
+        let key = (ty, position);
+        if let Some(id) = self.entries.get(&key).copied() {
+            return Ok(id);
+        }
+
+        let id = RustMaterializerId(self.nodes.len());
+        self.entries.insert(key, id);
+        self.nodes.push(RustMaterializerNode::Planning);
+        self.types.push(ty);
+        self.positions.push(position);
+        match self.build_action(plan, ty, position) {
+            Ok(action) => {
+                self.nodes[id.index()] = RustMaterializerNode::Ready(action);
+                Ok(id)
+            }
+            Err(gap) => {
+                self.nodes.truncate(id.index());
+                self.types.truncate(id.index());
+                self.positions.truncate(id.index());
+                self.entries.retain(|_, entry| entry.index() < id.index());
+                Err(gap)
+            }
+        }
+    }
+
+    fn build_action(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        position: RustRecipePosition,
+    ) -> Result<RustMaterializerAction, RustRecipeGap> {
+        if let TypeData::Extern(id) = plan.program.type_arena.data(ty) {
+            let decl = plan.program.extern_type(*id);
+            let native = decl.binding.as_ref().and_then(|binding| {
+                self.native_types.get(&(
+                    binding.package.as_str().to_string(),
+                    binding.provider.clone(),
+                    binding.key.clone(),
+                ))
+            });
+            return match (decl.rep, decl.materialization, native) {
+                (
+                    air::ExternRep::Inline,
+                    Some(mode @ anvyx_runtime::ExternMaterialization::Copy),
+                    Some(native),
+                ) if native.validated_materializer(mode).is_some() => {
+                    Ok(RustMaterializerAction::Copy)
+                }
+                (
+                    air::ExternRep::Inline,
+                    Some(mode @ anvyx_runtime::ExternMaterialization::Materialize),
+                    Some(native),
+                ) => native
+                    .validated_materializer(mode)
+                    .cloned()
+                    .map(|binding| RustMaterializerAction::ProviderMaterialize { binding })
+                    .ok_or(RustRecipeGap::UnsupportedType(ty)),
+                (air::ExternRep::Shared, None, Some(native)) if native.materializer.is_none() => {
+                    Ok(RustMaterializerAction::IdentityShare)
+                }
+                _ => Err(RustRecipeGap::UnsupportedType(ty)),
+            };
+        }
+        if matches!(
+            plan.program.type_arena.data(ty),
+            TypeData::Void | TypeData::Any | TypeData::Slice(_)
+        ) {
+            return Err(RustRecipeGap::UnsupportedType(ty));
+        }
+        if matches!(plan.program.type_arena.data(ty), TypeData::Function(_)) {
+            return match self.callables.get(&ty) {
+                Some(RustCallableMaterializer::Copy) => Ok(RustMaterializerAction::Copy),
+                Some(RustCallableMaterializer::Share) => Ok(RustMaterializerAction::CallableShare),
+                None => Err(RustRecipeGap::FunctionCapabilityPending(ty)),
+            };
+        }
+        if let TypeData::Dyn(carrier) = plan.program.type_arena.data(ty) {
+            let mut variants = vec![];
+            for (index, witness) in plan.program.contract_witnesses.iter().enumerate() {
+                if witness.key.surface != *carrier {
+                    continue;
+                }
+                let payload = self.action_for(
+                    plan,
+                    witness.key.concrete_ty,
+                    child_recipe_position(position, LambdaStorageFamily::DynamicPayload),
+                )?;
+                variants.push(RustDynamicMaterializerVariant {
+                    witness: ContractWitnessId::from_index(index),
+                    payload,
+                });
+            }
+            return Ok(RustMaterializerAction::DynamicMaterialize {
+                carrier: *carrier,
+                variants,
+            });
+        }
+        if Self::copy_action_supported(plan, ty, &mut BTreeSet::new()) {
+            return Ok(RustMaterializerAction::Copy);
+        }
+
+        match plan.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Flag(_)
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Char => unreachable!("immediate values are reusable-copyable"),
+            TypeData::String | TypeData::List(_) | TypeData::Map { .. } => {
+                Ok(RustMaterializerAction::ManagedShare)
+            }
+            TypeData::DataRef(_) => Ok(RustMaterializerAction::IdentityShare),
+            TypeData::Optional(inner) => {
+                let payload = self.action_for(
+                    plan,
+                    *inner,
+                    child_recipe_position(position, LambdaStorageFamily::OptionalPayload),
+                )?;
+                Ok(RustMaterializerAction::Optional { payload })
+            }
+            TypeData::Array { elem, .. } => {
+                let elem = self.action_for(
+                    plan,
+                    *elem,
+                    child_recipe_position(position, LambdaStorageFamily::FixedArrayElement),
+                )?;
+                Ok(RustMaterializerAction::Array { elem })
+            }
+            TypeData::Tuple(fields) => Ok(RustMaterializerAction::Tuple {
+                fields: self.field_actions(
+                    plan,
+                    fields.iter().copied(),
+                    position,
+                    LambdaStorageFamily::TupleField,
+                )?,
+            }),
+            TypeData::Aggregate(id) => {
+                let decl = plan.program.aggregate(*id);
+                let family = match decl.kind {
+                    AggregateKind::Struct => LambdaStorageFamily::StructField,
+                    AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
+                };
+                Ok(RustMaterializerAction::Struct {
+                    fields: self.field_actions(
+                        plan,
+                        decl.fields.iter().map(|field| field.ty),
+                        position,
+                        family,
+                    )?,
+                })
+            }
+            TypeData::Enum(id) => {
+                let variants = plan
+                    .program
+                    .enum_decl(*id)
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        self.field_actions(
+                            plan,
+                            RustRepresentationPlan::variant_field_tys(variant),
+                            position,
+                            LambdaStorageFamily::EnumPayload,
+                        )
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok(RustMaterializerAction::Enum { variants })
+            }
+            TypeData::Dyn(_) => {
+                unreachable!("dynamic materializers are handled before copyability")
+            }
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::Slice(_)
+            | TypeData::Extern(_)
+            | TypeData::Function(_) => Err(RustRecipeGap::UnsupportedType(ty)),
+        }
+    }
+
+    fn copy_action_supported(
+        plan: RustRepresentationPlan<'_>,
+        ty: TypeId,
+        active: &mut BTreeSet<TypeId>,
+    ) -> bool {
+        if !active.insert(ty) {
+            return true;
+        }
+        let supported = match plan.program.type_arena.data(ty) {
+            TypeData::Int
+            | TypeData::Flag(_)
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Char => true,
+            TypeData::Extern(_) => plan.copyable(ty),
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                plan.copyable(ty) && Self::copy_action_supported(plan, *inner, active)
+            }
+            TypeData::Tuple(fields) => {
+                plan.copyable(ty)
+                    && fields
+                        .iter()
+                        .all(|field| Self::copy_action_supported(plan, *field, active))
+            }
+            TypeData::Aggregate(id) => {
+                plan.copyable(ty)
+                    && plan
+                        .program
+                        .aggregate(*id)
+                        .fields
+                        .iter()
+                        .all(|field| Self::copy_action_supported(plan, field.ty, active))
+            }
+            TypeData::Enum(id) => {
+                plan.copyable(ty)
+                    && plan.program.enum_decl(*id).variants.iter().all(|variant| {
+                        RustRepresentationPlan::variant_field_tys(variant)
+                            .all(|field| Self::copy_action_supported(plan, field, active))
+                    })
+            }
+            TypeData::Void
+            | TypeData::Any
+            | TypeData::String
+            | TypeData::Function(_)
+            | TypeData::Slice(_)
+            | TypeData::List(_)
+            | TypeData::Map { .. }
+            | TypeData::DataRef(_)
+            | TypeData::Dyn(_) => false,
+        };
+        active.remove(&ty);
+        supported
+    }
+
+    fn field_actions(
+        &mut self,
+        plan: RustRepresentationPlan<'_>,
+        fields: impl IntoIterator<Item = TypeId>,
+        position: RustRecipePosition,
+        family: LambdaStorageFamily,
+    ) -> Result<Vec<RustMaterializerId>, RustRecipeGap> {
+        let position = child_recipe_position(position, family);
+        fields
+            .into_iter()
+            .map(|field| self.action_for(plan, field, position))
+            .collect()
+    }
+}
+
+pub(super) fn child_recipe_position(
+    parent: RustRecipePosition,
+    child: LambdaStorageFamily,
+) -> RustRecipePosition {
+    match parent {
+        RustRecipePosition::Value => RustRecipePosition::StoredPayload(child),
+        RustRecipePosition::StoredPayload(outer) => {
+            RustRecipePosition::StoredPayload(nested_storage_family(outer, child))
+        }
+        RustRecipePosition::MapKey => RustRecipePosition::MapKey,
+        RustRecipePosition::Global => RustRecipePosition::Global,
+        RustRecipePosition::HeapEdge => RustRecipePosition::HeapEdge,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +470,6 @@ pub struct RustDynamicCarrierPlan {
 pub struct RustDynamicCarrierVariant {
     pub witness: ContractWitnessId,
     pub concrete_ty: TypeId,
-    pub payload: Result<RustPhysicalRecipe, RustRecipeGap>,
     pub storage: RustPayloadStorage,
     pub recursive: bool,
     pub payload_layout: Result<RustApproxLayout, RustLayoutGap>,
@@ -158,27 +523,7 @@ pub enum RustLifecycleGap {
     ProviderInlineMetadataUnknown(air::ExternTypeId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustMaterialGap {
-    UnsupportedType,
-    UnsupportedRooting,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RustMaterialPlan {
-    pub materialization: RustMaterialization,
-    pub gap: Option<RustMaterialGap>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustMaterialSource {
-    Value,
-    ExactGlobalRoot,
-    StoredPayload,
-    DataRefMutPlace,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LambdaStorageFamily {
     StructField,
     TupleField,
@@ -205,20 +550,6 @@ pub enum LambdaStorageGap {
     GlobalRooting,
     MapKeyEqualityHash,
     UnsupportedType,
-}
-
-impl From<LambdaStorageGap> for RustMaterialGap {
-    fn from(gap: LambdaStorageGap) -> Self {
-        match gap {
-            LambdaStorageGap::GlobalRooting => RustMaterialGap::UnsupportedRooting,
-            LambdaStorageGap::StorageImplementation
-            | LambdaStorageGap::ProvenanceOrigin
-            | LambdaStorageGap::Lifetime
-            | LambdaStorageGap::Trace
-            | LambdaStorageGap::MapKeyEqualityHash
-            | LambdaStorageGap::UnsupportedType => RustMaterialGap::UnsupportedType,
-        }
-    }
 }
 
 impl LambdaStorageFamily {
@@ -262,6 +593,7 @@ impl LambdaStorageFamily {
             self,
             Self::StructField
                 | Self::TupleField
+                | Self::EnumPayload
                 | Self::DynamicPayload
                 | Self::OptionalPayload
                 | Self::FixedArrayElement
@@ -285,19 +617,13 @@ fn nested_storage_family(
         (
             LambdaStorageFamily::GlobalRoot
             | LambdaStorageFamily::GlobalProjection
+            | LambdaStorageFamily::DataRefProjection
             | LambdaStorageFamily::MapKey
             | LambdaStorageFamily::MapValue,
             _,
         ) => outer,
         _ => nested,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustMaterialIntent {
-    Read,
-    Store,
-    MutPlacePayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -347,13 +673,6 @@ pub(super) struct LambdaVariantLayout<'a> {
     pub storage: RirLambdaStorage,
     pub captures: &'a [RirLambdaCapture],
     pub trace_action: LambdaTraceAction,
-}
-
-fn materialization_is_owned_payload(materialization: RustMaterialization) -> bool {
-    matches!(
-        materialization,
-        RustMaterialization::Copy | RustMaterialization::Share | RustMaterialization::CloneHandle
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,11 +824,6 @@ impl<'a> RustRepresentationPlan<'a> {
             let variant = RustDynamicCarrierVariant {
                 witness: ContractWitnessId::from_index(index),
                 concrete_ty: witness.key.concrete_ty,
-                payload: self.recipe_for(
-                    witness.key.concrete_ty,
-                    ValueUse::Store,
-                    RustRecipePosition::StoredPayload(LambdaStorageFamily::DynamicPayload),
-                ),
                 storage: RustPayloadStorage::Inline,
                 recursive: false,
                 payload_layout: Err(RustLayoutGap::UnsupportedType(witness.key.concrete_ty)),
@@ -962,60 +1276,6 @@ impl<'a> RustRepresentationPlan<'a> {
         }
     }
 
-    pub fn recipe_for(
-        self,
-        ty: TypeId,
-        use_: ValueUse,
-        position: RustRecipePosition,
-    ) -> Result<RustPhysicalRecipe, RustRecipeGap> {
-        self.check_recipe_position(ty, position)?;
-        if matches!(self.program.type_arena.data(ty), TypeData::Dyn(_)) {
-            return Err(RustRecipeGap::DynamicCarrierPending(ty));
-        }
-        if let TypeData::Extern(id) = self.program.type_arena.data(ty) {
-            let decl = self.program.extern_type(*id);
-            if decl.rep == air::ExternRep::Inline {
-                return match decl.materialization {
-                    Some(anvyx_runtime::ExternMaterialization::Copy) => {
-                        Ok(RustPhysicalRecipe::Copy)
-                    }
-                    Some(anvyx_runtime::ExternMaterialization::Clone) => {
-                        Ok(RustPhysicalRecipe::CloneValue)
-                    }
-                    None => Err(RustRecipeGap::UnsupportedType(ty)),
-                };
-            }
-        }
-        if use_ == ValueUse::Consume {
-            return Ok(RustPhysicalRecipe::Move);
-        }
-        if matches!(self.program.type_arena.data(ty), TypeData::Function(_)) {
-            return if use_ == ValueUse::CallValue {
-                Ok(RustPhysicalRecipe::Copy)
-            } else {
-                Err(RustRecipeGap::FunctionCapabilityPending(ty))
-            };
-        }
-        if matches!(
-            self.program.type_arena.data(ty),
-            TypeData::Aggregate(_)
-                | TypeData::Tuple(_)
-                | TypeData::Enum(_)
-                | TypeData::Array { .. }
-        ) && !self.copyable(ty)
-        {
-            return Ok(RustPhysicalRecipe::ReconstructAggregate);
-        }
-        match self.materialization(ty) {
-            RustMaterialization::Copy => Ok(RustPhysicalRecipe::Copy),
-            RustMaterialization::BorrowGuard => Ok(RustPhysicalRecipe::BorrowView),
-            RustMaterialization::Share => Ok(RustPhysicalRecipe::ManagedShare),
-            RustMaterialization::CloneHandle => Ok(RustPhysicalRecipe::CloneHandle),
-            RustMaterialization::CloneLambda => Ok(RustPhysicalRecipe::CloneLambda),
-            RustMaterialization::Gap => Err(RustRecipeGap::UnsupportedType(ty)),
-        }
-    }
-
     fn check_recipe_position(
         self,
         ty: TypeId,
@@ -1028,18 +1288,61 @@ impl<'a> RustRepresentationPlan<'a> {
                 .map_err(|_| RustRecipeGap::UnsupportedStorage { ty, family }),
             RustRecipePosition::MapKey if self.map_key_supported(ty) => Ok(()),
             RustRecipePosition::MapKey => Err(RustRecipeGap::UnsupportedMapKey(ty)),
-            RustRecipePosition::Global
-                if !matches!(
-                    self.exact_root_global_materialization(ty),
-                    RustMaterialization::Gap
-                ) =>
-            {
-                Ok(())
-            }
+            RustRecipePosition::Global if self.global_storage_supported(ty) => Ok(()),
             RustRecipePosition::Global => Err(RustRecipeGap::UnsupportedGlobal(ty)),
             RustRecipePosition::HeapEdge if self.stored_payload_supported(ty) => Ok(()),
             RustRecipePosition::HeapEdge => Err(RustRecipeGap::UnsupportedHeapEdge(ty)),
         }
+    }
+
+    pub fn global_storage_supported(self, ty: TypeId) -> bool {
+        self.global_storage_supported_inner(ty, &mut BTreeSet::new())
+    }
+
+    fn global_storage_supported_inner(self, ty: TypeId, active: &mut BTreeSet<TypeId>) -> bool {
+        if !active.insert(ty) {
+            return true;
+        }
+        let supported = match self.program.type_arena.data(ty) {
+            TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
+            TypeData::Extern(id) => {
+                let ext = self.program.extern_type(*id);
+                ext.rep == air::ExternRep::Shared || ext.owns_heap_edges == Some(false)
+            }
+            TypeData::Function(_) => self
+                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
+                .is_ok(),
+            TypeData::List(elem) => self.global_storage_supported_inner(*elem, active),
+            TypeData::Map { key, value, .. } => {
+                self.map_key_supported(*key) && self.global_storage_supported_inner(*value, active)
+            }
+            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
+                self.global_storage_supported_inner(*inner, active)
+            }
+            TypeData::Tuple(fields) => fields
+                .iter()
+                .all(|field| self.global_storage_supported_inner(*field, active)),
+            TypeData::Aggregate(id) => self
+                .program
+                .aggregate(*id)
+                .fields
+                .iter()
+                .all(|field| self.global_storage_supported_inner(field.ty, active)),
+            TypeData::Enum(id) => self.program.enum_decl(*id).variants.iter().all(|variant| {
+                Self::variant_field_tys(variant)
+                    .all(|field| self.global_storage_supported_inner(field, active))
+            }),
+            TypeData::Int
+            | TypeData::Flag(_)
+            | TypeData::Float
+            | TypeData::Bool
+            | TypeData::Char
+            | TypeData::String
+            | TypeData::DataRef(_)
+            | TypeData::Dyn(_) => true,
+        };
+        active.remove(&ty);
+        supported
     }
 
     pub fn copyable(self, ty: TypeId) -> bool {
@@ -1069,17 +1372,6 @@ impl<'a> RustRepresentationPlan<'a> {
         })
     }
 
-    pub fn value_place_shareable(self, ty: TypeId) -> bool {
-        self.copyable(ty) || self.shareable_value(ty)
-    }
-
-    pub fn value_from_ref_supported(self, ty: TypeId) -> bool {
-        !matches!(
-            self.materialization_for(ty, RustMaterialSource::Value, RustMaterialIntent::Read),
-            RustMaterialization::BorrowGuard | RustMaterialization::Gap
-        )
-    }
-
     pub fn scoped_function_value_gap(
         self,
         ty: TypeId,
@@ -1092,279 +1384,6 @@ impl<'a> RustRepresentationPlan<'a> {
         } else {
             None
         }
-    }
-
-    pub fn materialization_for(
-        self,
-        ty: TypeId,
-        source: RustMaterialSource,
-        intent: RustMaterialIntent,
-    ) -> RustMaterialization {
-        self.materialization_plan_for(ty, source, intent)
-            .materialization
-    }
-
-    pub fn materialization_plan_for(
-        self,
-        ty: TypeId,
-        source: RustMaterialSource,
-        intent: RustMaterialIntent,
-    ) -> RustMaterialPlan {
-        let materialization = match (source, intent) {
-            (RustMaterialSource::Value, RustMaterialIntent::Read) => self.materialization(ty),
-            (
-                RustMaterialSource::ExactGlobalRoot,
-                RustMaterialIntent::Read | RustMaterialIntent::Store,
-            ) => self.exact_root_global_materialization(ty),
-            (RustMaterialSource::StoredPayload, RustMaterialIntent::Store) => {
-                if self.stored_payload_supported(ty) {
-                    self.materialization(ty)
-                } else {
-                    RustMaterialization::Gap
-                }
-            }
-            (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
-                match self.program.type_arena.data(ty) {
-                    TypeData::Int
-                    | TypeData::Flag(_)
-                    | TypeData::Float
-                    | TypeData::Bool
-                    | TypeData::Char => RustMaterialization::Copy,
-                    TypeData::DataRef(_) => RustMaterialization::CloneHandle,
-                    TypeData::Dyn(_) => RustMaterialization::Share,
-                    TypeData::Aggregate(_) | TypeData::Tuple(_) => self.materialization(ty),
-                    _ => RustMaterialization::Gap,
-                }
-            }
-            _ => RustMaterialization::Gap,
-        };
-        RustMaterialPlan {
-            materialization,
-            gap: matches!(materialization, RustMaterialization::Gap)
-                .then(|| self.material_gap(ty, source)),
-        }
-    }
-
-    fn material_gap(self, ty: TypeId, source: RustMaterialSource) -> RustMaterialGap {
-        match source {
-            RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
-            RustMaterialSource::StoredPayload => self
-                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-                .err()
-                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from),
-            _ => RustMaterialGap::UnsupportedType,
-        }
-    }
-
-    fn global_material_gap(self, ty: TypeId) -> RustMaterialGap {
-        if self.contains_function_payload(ty) {
-            return self
-                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
-                .err()
-                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from);
-        }
-        match self.program.type_arena.data(ty) {
-            TypeData::Void | TypeData::Any | TypeData::Function(_) => {
-                RustMaterialGap::UnsupportedType
-            }
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.global_material_gap(*inner)
-            }
-            TypeData::Tuple(elems) => self.first_global_material_gap(elems.iter().copied()),
-            TypeData::Aggregate(id) => self.first_global_material_gap(
-                self.program
-                    .aggregate(*id)
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
-            ),
-            TypeData::Enum(id) => self.first_global_material_gap(
-                self.program
-                    .enum_decl(*id)
-                    .variants
-                    .iter()
-                    .flat_map(Self::variant_field_tys),
-            ),
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char
-            | TypeData::String
-            | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Slice(_)
-            | TypeData::DataRef(_)
-            | TypeData::Extern(_)
-            | TypeData::Dyn(_) => RustMaterialGap::UnsupportedRooting,
-        }
-    }
-
-    fn first_global_material_gap(
-        self,
-        fields: impl IntoIterator<Item = TypeId>,
-    ) -> RustMaterialGap {
-        fields
-            .into_iter()
-            .find_map(|field| {
-                matches!(
-                    self.materialization_for(
-                        field,
-                        RustMaterialSource::ExactGlobalRoot,
-                        RustMaterialIntent::Read,
-                    ),
-                    RustMaterialization::Gap
-                )
-                .then(|| self.global_material_gap(field))
-            })
-            .unwrap_or(RustMaterialGap::UnsupportedRooting)
-    }
-
-    fn materialization(self, ty: TypeId) -> RustMaterialization {
-        if matches!(self.program.type_arena.data(ty), TypeData::Void) {
-            return RustMaterialization::Gap;
-        }
-        if self.copyable(ty) {
-            return RustMaterialization::Copy;
-        }
-        match self.program.type_arena.data(ty) {
-            TypeData::String | TypeData::List(_) | TypeData::Map { .. } | TypeData::Dyn(_) => {
-                RustMaterialization::Share
-            }
-            TypeData::DataRef(_) | TypeData::Extern(_) => RustMaterialization::CloneHandle,
-            TypeData::Slice(_) => RustMaterialization::BorrowGuard,
-            TypeData::Optional(inner) => self.composite_materialization([*inner]),
-            TypeData::Array { elem, .. } => self
-                .composite_storage_materialization([*elem], LambdaStorageFamily::FixedArrayElement),
-            TypeData::Tuple(elems) => self.composite_storage_materialization(
-                elems.iter().copied(),
-                LambdaStorageFamily::TupleField,
-            ),
-            TypeData::Aggregate(id) => {
-                let decl = self.program.aggregate(*id);
-                let family = match decl.kind {
-                    AggregateKind::Struct => LambdaStorageFamily::StructField,
-                    AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
-                };
-                self.composite_storage_materialization(
-                    decl.fields.iter().map(|field| field.ty),
-                    family,
-                )
-            }
-            TypeData::Enum(id) => self.composite_materialization(
-                self.program
-                    .enum_decl(*id)
-                    .variants
-                    .iter()
-                    .flat_map(Self::variant_field_tys),
-            ),
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char
-            | TypeData::Void
-            | TypeData::Any
-            | TypeData::Function(_) => RustMaterialization::Gap,
-        }
-    }
-
-    fn exact_root_global_materialization(self, ty: TypeId) -> RustMaterialization {
-        match self.program.type_arena.data(ty) {
-            TypeData::Function(_)
-                if self
-                    .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
-                    .is_ok() =>
-            {
-                self.materialization(ty)
-            }
-            TypeData::Void
-            | TypeData::Any
-            | TypeData::Slice(_)
-            | TypeData::Extern(_)
-            | TypeData::Function(_) => RustMaterialization::Gap,
-            TypeData::List(elem) if !self.exact_root_global_field_supported(*elem) => {
-                RustMaterialization::Gap
-            }
-            TypeData::Map { key, value, .. }
-                if !self.map_key_supported(*key)
-                    || !self.exact_root_global_field_supported(*value) =>
-            {
-                RustMaterialization::Gap
-            }
-            TypeData::Optional(inner) | TypeData::Array { elem: inner, .. } => {
-                self.composite_global_materialization([*inner])
-            }
-            TypeData::Tuple(elems) => self.composite_global_materialization(elems.iter().copied()),
-            TypeData::Aggregate(id) => self.composite_global_materialization(
-                self.program
-                    .aggregate(*id)
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
-            ),
-            TypeData::Enum(id) => self.composite_global_materialization(
-                self.program
-                    .enum_decl(*id)
-                    .variants
-                    .iter()
-                    .flat_map(Self::variant_field_tys),
-            ),
-            TypeData::Int
-            | TypeData::Flag(_)
-            | TypeData::Float
-            | TypeData::Bool
-            | TypeData::Char
-            | TypeData::String
-            | TypeData::DataRef(_)
-            | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Dyn(_) => self.materialization(ty),
-        }
-    }
-
-    fn composite_materialization(
-        self,
-        fields: impl IntoIterator<Item = TypeId>,
-    ) -> RustMaterialization {
-        self.composite_storage_materialization(fields, LambdaStorageFamily::UnknownOrigin)
-    }
-
-    fn composite_storage_materialization(
-        self,
-        fields: impl IntoIterator<Item = TypeId>,
-        family: LambdaStorageFamily,
-    ) -> RustMaterialization {
-        if fields.into_iter().all(|field| {
-            self.storage_supported(field, family).is_ok()
-                && !matches!(self.materialization(field), RustMaterialization::Gap)
-        }) {
-            RustMaterialization::Share
-        } else {
-            RustMaterialization::Gap
-        }
-    }
-
-    fn composite_global_materialization(
-        self,
-        fields: impl IntoIterator<Item = TypeId>,
-    ) -> RustMaterialization {
-        if fields
-            .into_iter()
-            .all(|field| self.exact_root_global_field_supported(field))
-        {
-            RustMaterialization::Share
-        } else {
-            RustMaterialization::Gap
-        }
-    }
-
-    fn exact_root_global_field_supported(self, ty: TypeId) -> bool {
-        materialization_is_owned_payload(self.materialization_for(
-            ty,
-            RustMaterialSource::ExactGlobalRoot,
-            RustMaterialIntent::Read,
-        ))
     }
 
     pub fn contains_function_payload(self, ty: TypeId) -> bool {
@@ -1572,60 +1591,12 @@ impl<'a> RustRepresentationPlan<'a> {
                 .is_ok()
     }
 
-    fn shareable_value(self, ty: TypeId) -> bool {
-        match self.program.type_arena.data(ty) {
-            TypeData::String
-            | TypeData::Dyn(_)
-            | TypeData::DataRef(_)
-            | TypeData::List(_)
-            | TypeData::Map { .. }
-            | TypeData::Slice(_) => true,
-            TypeData::Optional(inner) => self.embedded_air_shareable_value(*inner),
-            TypeData::Tuple(elems) => elems
-                .iter()
-                .all(|elem| self.embedded_air_shareable_value(*elem)),
-            TypeData::Aggregate(id) => self
-                .program
-                .aggregate(*id)
-                .fields
-                .iter()
-                .all(|field| self.embedded_air_shareable_value(field.ty)),
-            TypeData::Enum(id) => self.enum_shareable(*id),
-            TypeData::Extern(id) if self.program.extern_type(*id).rep == air::ExternRep::Shared => {
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn embedded_air_shareable_value(self, ty: TypeId) -> bool {
-        !matches!(self.program.type_arena.data(ty), TypeData::Slice(_))
-            && self.value_place_shareable(ty)
-    }
-
     fn variant_field_tys(variant: &air::VariantDecl) -> Box<dyn Iterator<Item = TypeId> + '_> {
         match &variant.shape {
             VariantShape::Unit => Box::new(std::iter::empty()),
             VariantShape::Tuple(fields) => Box::new(fields.iter().copied()),
             VariantShape::Struct(fields) => Box::new(fields.iter().map(|field| field.ty)),
         }
-    }
-
-    fn enum_shareable(self, id: air::EnumId) -> bool {
-        self.program.enum_decl(id).variants.iter().all(|variant| {
-            let fields: &[TypeId] = match &variant.shape {
-                VariantShape::Unit => &[],
-                VariantShape::Tuple(fields) => fields,
-                VariantShape::Struct(fields) => {
-                    return fields
-                        .iter()
-                        .all(|field| self.embedded_air_shareable_value(field.ty));
-                }
-            };
-            fields
-                .iter()
-                .all(|field| self.embedded_air_shareable_value(*field))
-        })
     }
 
     pub fn map_supported(self, ty: TypeId) -> bool {
@@ -2538,26 +2509,24 @@ impl<'a> RirRustRepPolicy<'a> {
             .then(|| self.param_abi(semantic))
     }
 
-    pub fn shareable_value(self, ty: RirTypeId) -> bool {
+    pub fn capture_shareable(self, ty: RirTypeId) -> bool {
         self.copyable(ty)
             || match self.ty(ty) {
-                RirType::String
-                | RirType::DataRef(_)
-                | RirType::List(_)
-                | RirType::Map { .. }
-                | RirType::Slice(_) => true,
+                RirType::String | RirType::DataRef(_) | RirType::List(_) | RirType::Map { .. } => {
+                    true
+                }
                 RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                    self.embedded_shareable_value(inner)
+                    self.embedded_capture_shareable(inner)
                 }
                 RirType::Lambda(sig) => self.lambda_sig_cloneable(sig),
                 RirType::Struct(id) => self.program.structs[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.embedded_shareable_value(field.ty)),
+                    .all(|field| self.embedded_capture_shareable(field.ty)),
                 RirType::Tuple(id) => self.program.tuples[id.index()]
                     .fields
                     .iter()
-                    .all(|field| self.embedded_shareable_value(field.ty)),
+                    .all(|field| self.embedded_capture_shareable(field.ty)),
                 RirType::Enum(id) if self.program.dyn_carrier_for_enum(id).is_some() => true,
                 RirType::Enum(id) => {
                     self.program.enums[id.index()]
@@ -2567,299 +2536,31 @@ impl<'a> RirRustRepPolicy<'a> {
                             variant
                                 .fields
                                 .iter()
-                                .all(|field| self.embedded_shareable_value(field.ty))
+                                .all(|field| self.embedded_capture_shareable(field.ty))
                         })
                 }
-                _ => false,
-            }
-    }
-
-    fn embedded_shareable_value(self, ty: RirTypeId) -> bool {
-        !matches!(self.ty(ty), RirType::Slice(_)) && self.shareable_value(ty)
-    }
-
-    pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
-        !matches!(
-            self.materialization_for(ty, RustMaterialSource::Value, RustMaterialIntent::Read),
-            RustMaterialization::BorrowGuard | RustMaterialization::Gap
-        )
-    }
-
-    pub fn materialization_for(
-        self,
-        ty: RirTypeId,
-        source: RustMaterialSource,
-        intent: RustMaterialIntent,
-    ) -> RustMaterialization {
-        self.materialization_plan_for(ty, source, intent)
-            .materialization
-    }
-
-    pub fn materialization_plan_for(
-        self,
-        ty: RirTypeId,
-        source: RustMaterialSource,
-        intent: RustMaterialIntent,
-    ) -> RustMaterialPlan {
-        let materialization = match (source, intent) {
-            (RustMaterialSource::Value, RustMaterialIntent::Read) => self.materialization(ty),
-            (
-                RustMaterialSource::ExactGlobalRoot,
-                RustMaterialIntent::Read | RustMaterialIntent::Store,
-            ) => self.exact_root_global_materialization(ty),
-            (RustMaterialSource::StoredPayload, RustMaterialIntent::Store) => {
-                if self.stored_payload_supported(ty) {
-                    self.materialization(ty)
-                } else {
-                    RustMaterialization::Gap
-                }
-            }
-            (RustMaterialSource::DataRefMutPlace, RustMaterialIntent::MutPlacePayload) => {
-                match self.ty_opt(ty) {
-                    Some(
-                        RirType::Int
-                        | RirType::Flag(_)
-                        | RirType::Float
-                        | RirType::Bool
-                        | RirType::Char,
-                    ) => RustMaterialization::Copy,
-                    Some(RirType::DataRef(_)) => RustMaterialization::CloneHandle,
-                    Some(RirType::Enum(id)) if self.program.dyn_carrier_for_enum(id).is_some() => {
-                        RustMaterialization::Share
-                    }
-                    Some(RirType::Struct(_) | RirType::Tuple(_)) => self.materialization(ty),
-                    _ => RustMaterialization::Gap,
-                }
-            }
-            _ => RustMaterialization::Gap,
-        };
-        RustMaterialPlan {
-            materialization,
-            gap: matches!(materialization, RustMaterialization::Gap)
-                .then(|| self.material_gap(ty, source)),
-        }
-    }
-
-    fn material_gap(self, ty: RirTypeId, source: RustMaterialSource) -> RustMaterialGap {
-        match source {
-            RustMaterialSource::ExactGlobalRoot => self.global_material_gap(ty),
-            RustMaterialSource::StoredPayload => self
-                .storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-                .err()
-                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from),
-            _ => RustMaterialGap::UnsupportedType,
-        }
-    }
-
-    fn global_material_gap(self, ty: RirTypeId) -> RustMaterialGap {
-        if self.contains_function_payload(ty) {
-            return self
-                .storage_supported(ty, LambdaStorageFamily::GlobalRoot)
-                .err()
-                .map_or(RustMaterialGap::UnsupportedType, RustMaterialGap::from);
-        }
-        match self.ty_opt(ty) {
-            Some(RirType::Void | RirType::Lambda(_)) | None => RustMaterialGap::UnsupportedType,
-            Some(RirType::Option(inner) | RirType::Array { elem: inner, .. }) => {
-                self.global_material_gap(inner)
-            }
-            Some(RirType::Struct(id)) => self
-                .program
-                .structs
-                .get(id.index())
-                .map_or(RustMaterialGap::UnsupportedType, |strukt| {
-                    self.first_global_material_gap(strukt.fields.iter().map(|field| field.ty))
-                }),
-            Some(RirType::Tuple(id)) => self
-                .program
-                .tuples
-                .get(id.index())
-                .map_or(RustMaterialGap::UnsupportedType, |tuple| {
-                    self.first_global_material_gap(tuple.fields.iter().map(|field| field.ty))
-                }),
-            Some(RirType::Enum(id)) => {
-                self.program
-                    .enums
-                    .get(id.index())
-                    .map_or(RustMaterialGap::UnsupportedType, |enm| {
-                        self.first_global_material_gap(
-                            enm.variants
-                                .iter()
-                                .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
-                        )
-                    })
-            }
-            Some(
-                RirType::Int
-                | RirType::Flag(_)
+                RirType::Slice(_)
                 | RirType::Float
                 | RirType::Bool
                 | RirType::Char
-                | RirType::String
-                | RirType::DataRef(_)
-                | RirType::List(_)
-                | RirType::Map { .. }
-                | RirType::Slice(_),
-            ) => RustMaterialGap::UnsupportedRooting,
-        }
+                | RirType::Int
+                | RirType::Flag(_)
+                | RirType::Void => false,
+            }
     }
 
-    fn first_global_material_gap(
-        self,
-        fields: impl IntoIterator<Item = RirTypeId>,
-    ) -> RustMaterialGap {
-        fields
-            .into_iter()
-            .find_map(|field| {
-                matches!(
-                    self.materialization_for(
-                        field,
-                        RustMaterialSource::ExactGlobalRoot,
-                        RustMaterialIntent::Read,
-                    ),
-                    RustMaterialization::Gap
-                )
-                .then(|| self.global_material_gap(field))
-            })
-            .unwrap_or(RustMaterialGap::UnsupportedRooting)
+    fn embedded_capture_shareable(self, ty: RirTypeId) -> bool {
+        !matches!(self.ty(ty), RirType::Slice(_)) && self.capture_shareable(ty)
     }
 
-    fn materialization(self, ty: RirTypeId) -> RustMaterialization {
-        if matches!(self.ty(ty), RirType::Void) {
-            return RustMaterialization::Gap;
-        }
-        if self.copyable(ty) {
-            return RustMaterialization::Copy;
-        }
-        match self.ty(ty) {
-            RirType::String | RirType::List(_) | RirType::Map { .. } => RustMaterialization::Share,
-            RirType::DataRef(_) => RustMaterialization::CloneHandle,
-            RirType::Lambda(sig) if self.lambda_sig_cloneable(sig) => {
-                RustMaterialization::CloneLambda
-            }
-            RirType::Option(inner) => self.composite_materialization([inner]),
-            RirType::Array { elem, .. } => self
-                .composite_storage_materialization([elem], LambdaStorageFamily::FixedArrayElement),
-            RirType::Struct(id) if self.program.structs[id.index()].native_path.is_some() => {
-                RustMaterialization::CloneHandle
-            }
-            RirType::Struct(id) => self.composite_storage_materialization(
-                self.program.structs[id.index()]
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
-                LambdaStorageFamily::StructField,
-            ),
-            RirType::Tuple(id) => self.composite_storage_materialization(
-                self.program.tuples[id.index()]
-                    .fields
-                    .iter()
-                    .map(|field| field.ty),
-                LambdaStorageFamily::TupleField,
-            ),
-            RirType::Enum(id) if self.program.dyn_carrier_for_enum(id).is_some() => {
-                RustMaterialization::Share
-            }
-            RirType::Enum(id) if self.program.enums[id.index()].native_path.is_some() => {
-                RustMaterialization::CloneHandle
-            }
-            RirType::Enum(id) => self.composite_materialization(
-                self.program.enums[id.index()]
-                    .variants
-                    .iter()
-                    .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
-            ),
-            RirType::Slice(_) => RustMaterialization::BorrowGuard,
-            RirType::Int
-            | RirType::Flag(_)
-            | RirType::Float
-            | RirType::Bool
-            | RirType::Char
-            | RirType::Void
-            | RirType::Lambda(_) => RustMaterialization::Gap,
-        }
+    pub fn value_from_ref_supported(self, ty: RirTypeId) -> bool {
+        self.program
+            .value_materializers
+            .get(ty.index())
+            .is_some_and(Option::is_some)
     }
 
-    fn exact_root_global_materialization(self, ty: RirTypeId) -> RustMaterialization {
-        let Some(data) = self.ty_opt(ty) else {
-            return RustMaterialization::Gap;
-        };
-        if matches!(data, RirType::Void | RirType::Slice(_)) {
-            return RustMaterialization::Gap;
-        }
-        if self.copyable(ty) {
-            return RustMaterialization::Copy;
-        }
-        match data {
-            RirType::String | RirType::DataRef(_) | RirType::Lambda(_) => self.materialization(ty),
-            RirType::List(elem) if self.exact_root_global_field_supported(elem) => {
-                self.materialization(ty)
-            }
-            RirType::Map { key, value }
-                if self.map_key_supported(key) && self.exact_root_global_field_supported(value) =>
-            {
-                self.materialization(ty)
-            }
-            RirType::Option(inner) | RirType::Array { elem: inner, .. } => {
-                self.composite_global_materialization([inner])
-            }
-            RirType::Struct(id) => {
-                let Some(strukt) = self.program.structs.get(id.index()) else {
-                    return RustMaterialization::Gap;
-                };
-                self.composite_global_materialization(strukt.fields.iter().map(|field| field.ty))
-            }
-            RirType::Tuple(id) => {
-                let Some(tuple) = self.program.tuples.get(id.index()) else {
-                    return RustMaterialization::Gap;
-                };
-                self.composite_global_materialization(tuple.fields.iter().map(|field| field.ty))
-            }
-            RirType::Enum(id) => {
-                let Some(enm) = self.program.enums.get(id.index()) else {
-                    return RustMaterialization::Gap;
-                };
-                self.composite_global_materialization(
-                    enm.variants
-                        .iter()
-                        .flat_map(|variant| variant.fields.iter().map(|field| field.ty)),
-                )
-            }
-            RirType::Int
-            | RirType::Flag(_)
-            | RirType::Float
-            | RirType::Bool
-            | RirType::Char
-            | RirType::Void
-            | RirType::List(_)
-            | RirType::Map { .. }
-            | RirType::Slice(_) => RustMaterialization::Gap,
-        }
-    }
-
-    fn composite_global_materialization(
-        self,
-        fields: impl IntoIterator<Item = RirTypeId>,
-    ) -> RustMaterialization {
-        if fields
-            .into_iter()
-            .all(|field| self.exact_root_global_field_supported(field))
-        {
-            RustMaterialization::Share
-        } else {
-            RustMaterialization::Gap
-        }
-    }
-
-    fn exact_root_global_field_supported(self, ty: RirTypeId) -> bool {
-        materialization_is_owned_payload(self.materialization_for(
-            ty,
-            RustMaterialSource::ExactGlobalRoot,
-            RustMaterialIntent::Read,
-        ))
-    }
-
-    fn map_key_supported(self, ty: RirTypeId) -> bool {
+    pub(super) fn map_key_supported(self, ty: RirTypeId) -> bool {
         self.map_key_supported_inner(ty, &mut BTreeSet::new())
     }
 
@@ -2961,15 +2662,16 @@ impl<'a> RirRustRepPolicy<'a> {
     }
 
     pub fn record_derives(self, fields: &[RirField], copyable: bool) -> Vec<&'static str> {
-        let mut derives = vec!["Clone"];
+        let mut derives = if copyable {
+            vec!["Clone", "Copy"]
+        } else {
+            vec![]
+        };
         let contains_dynamic = fields
             .iter()
             .any(|field| self.type_contains_dynamic(field.ty));
         if !contains_dynamic && self.record_key_supported(fields, &mut BTreeSet::new()) {
             derives.extend(["PartialEq", "Eq", "Hash"]);
-        }
-        if copyable {
-            derives.push("Copy");
         }
         derives
     }
@@ -2982,10 +2684,11 @@ impl<'a> RirRustRepPolicy<'a> {
         if self.program.dyn_carrier_for_enum(enm.id).is_some() {
             return vec![];
         }
-        let mut derives = vec!["Clone"];
-        if enm.copyable {
-            derives.push("Copy");
-        }
+        let mut derives = if enm.copyable {
+            vec!["Clone", "Copy"]
+        } else {
+            vec![]
+        };
         let contains_dynamic = enm.variants.iter().any(|variant| {
             variant
                 .fields
@@ -3000,28 +2703,6 @@ impl<'a> RirRustRepPolicy<'a> {
             derives.push("Hash");
         }
         derives
-    }
-
-    fn composite_materialization(
-        self,
-        fields: impl IntoIterator<Item = RirTypeId>,
-    ) -> RustMaterialization {
-        self.composite_storage_materialization(fields, LambdaStorageFamily::UnknownOrigin)
-    }
-
-    fn composite_storage_materialization(
-        self,
-        fields: impl IntoIterator<Item = RirTypeId>,
-        family: LambdaStorageFamily,
-    ) -> RustMaterialization {
-        if fields.into_iter().all(|field| {
-            self.storage_supported(field, family).is_ok()
-                && !matches!(self.materialization(field), RustMaterialization::Gap)
-        }) {
-            RustMaterialization::Share
-        } else {
-            RustMaterialization::Gap
-        }
     }
 
     pub fn contains_function_payload(self, ty: RirTypeId) -> bool {
@@ -3102,11 +2783,6 @@ impl<'a> RirRustRepPolicy<'a> {
         family: LambdaStorageFamily,
     ) -> Result<(), LambdaStorageGap> {
         self.storage_supported_inner(ty, family, false, &mut BTreeSet::new())
-    }
-
-    fn stored_payload_supported(self, ty: RirTypeId) -> bool {
-        self.storage_supported(ty, LambdaStorageFamily::UnknownOrigin)
-            .is_ok()
     }
 
     fn storage_supported_inner(
@@ -4155,17 +3831,17 @@ impl RustTracePlan {
             }
         }
         for storage in &program.collection_storages {
-            match storage.kind {
-                RirCollectionStorageKind::List { elem_ty }
-                    if policy.list_storage_tracked(elem_ty) =>
+            match &storage.kind {
+                RirCollectionStorageKind::List { elem_ty, .. }
+                    if policy.list_storage_tracked(*elem_ty) =>
                 {
-                    plan.mark_type(program, elem_ty);
+                    plan.mark_type(program, *elem_ty);
                 }
-                RirCollectionStorageKind::Map { key_ty, value_ty }
-                    if policy.map_storage_tracked(key_ty, value_ty) =>
-                {
-                    plan.mark_type(program, key_ty);
-                    plan.mark_type(program, value_ty);
+                RirCollectionStorageKind::Map {
+                    key_ty, value_ty, ..
+                } if policy.map_storage_tracked(*key_ty, *value_ty) => {
+                    plan.mark_type(program, *key_ty);
+                    plan.mark_type(program, *value_ty);
                 }
                 _ => {}
             }
@@ -4262,19 +3938,20 @@ mod tests {
 
     use super::{
         LambdaStorageFamily, LambdaStorageGap, RirRustRepPolicy, RustBorrowView,
-        RustCarrierDiscriminant, RustMaterialGap, RustMaterialIntent, RustMaterialSource,
-        RustMaterialization, RustPayloadStorage, RustPhysicalRecipe, RustRecipeGap,
-        RustRecipePosition, RustRepresentationPlan, RustRepresentationPlanError, RustTargetProfile,
-        RustTracePlan, RustValueRep,
+        RustCallableMaterializer, RustCarrierDiscriminant, RustMaterializerAction,
+        RustMaterializerGraph, RustPayloadStorage, RustRecipeGap, RustRecipePosition,
+        RustRepresentationPlan, RustRepresentationPlanError, RustTargetProfile, RustTracePlan,
+        RustValueRep,
     };
     use crate::rust::rir::{
         RirCellId, RirDataRef, RirDataRefId, RirEnum, RirEnumId, RirEnumRepr, RirExtern,
         RirExternId, RirExternKind, RirExternParam, RirField, RirFieldId, RirFunctionId, RirLambda,
         RirLambdaCapture, RirLambdaCaptureKind, RirLambdaEnvField, RirLambdaEnvFieldKind,
         RirLambdaEnvId, RirLambdaEscape, RirLambdaId, RirLambdaParam, RirLambdaSig, RirLambdaSigId,
-        RirLambdaSource, RirLambdaStorage, RirNativeExtern, RirParamAbi, RirParamEscape,
-        RirParamSemantic, RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId,
-        RirType, RirTypeId, RirVariant, RirVariantId, RirVariantKind,
+        RirLambdaSource, RirLambdaStorage, RirMaterializer, RirMaterializerAction,
+        RirMaterializerId, RirNativeExtern, RirParamAbi, RirParamEscape, RirParamSemantic,
+        RirProgram, RirStruct, RirStructId, RirSymbol, RirTuple, RirTupleId, RirType, RirTypeId,
+        RirVariant, RirVariantId, RirVariantKind,
     };
 
     fn surface(program: &mut Program, name: &str) -> air::ContractSurfaceId {
@@ -4347,43 +4024,372 @@ mod tests {
     }
 
     #[test]
-    fn representation_plan_maps_air_use_to_physical_recipe() {
+    fn materializer_graph_selects_category_actions_by_position() {
         let mut program = Program::default();
         let int = program.alloc_type(TypeData::Int);
         let string = program.alloc_type(TypeData::String);
         let tuple = program.alloc_type(TypeData::Tuple(vec![int, string]));
+        let optional = program.alloc_type(TypeData::Optional(tuple));
         let function = program.alloc_type(TypeData::Function(air::SignatureType::new(
             vec![],
             air::ReturnMode::Value(int),
         )));
-        let dyn_ty = program.alloc_type(TypeData::Dyn(air::ContractSurfaceId::from_index(0)));
+        let module = program.alloc_module(air::Module::default());
+        let dataref = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Ref"),
+            module,
+            kind: air::AggregateKind::DataRef,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![],
+            cycle_capable: false,
+            stringify_override: None,
+        });
+        let dataref = program.alloc_type(TypeData::DataRef(dataref));
+        let provider_id = anvyx_runtime::ProviderId {
+            name: "host".to_string(),
+        };
+        let provider_key = anvyx_runtime::ExternTypeKey {
+            module: anvyx_runtime::ModulePath {
+                segments: vec!["host".to_string()],
+            },
+            name: "ProviderValue".to_string(),
+        };
+        let provider = program.alloc_extern_type(air::ExternTypeDecl {
+            name: Ident::new("ProviderValue"),
+            module,
+            binding: Some(air::ExternTypeBindingDecl {
+                package: anvyx_frontend::resolve::PackageId::core(),
+                provider: provider_id.clone(),
+                key: provider_key.clone(),
+            }),
+            type_args: vec![],
+            const_args: vec![],
+            rep: air::ExternRep::Inline,
+            layout: Some(anvyx_runtime::ExternLayout { size: 8, align: 8 }),
+            materialization: Some(anvyx_runtime::ExternMaterialization::Materialize),
+            owns_heap_edges: Some(false),
+            has_init: false,
+            init_args: vec![],
+            fields: vec![],
+            variants: vec![],
+            variant_abis: vec![],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        });
+        let provider = program.alloc_type(TypeData::Extern(provider));
+        let resource_key = anvyx_runtime::ExternTypeKey {
+            module: provider_key.module.clone(),
+            name: "HostResource".to_string(),
+        };
+        let resource = program.alloc_extern_type(air::ExternTypeDecl {
+            name: Ident::new("HostResource"),
+            module,
+            binding: Some(air::ExternTypeBindingDecl {
+                package: anvyx_frontend::resolve::PackageId::core(),
+                provider: provider_id.clone(),
+                key: resource_key.clone(),
+            }),
+            type_args: vec![],
+            const_args: vec![],
+            rep: air::ExternRep::Shared,
+            layout: None,
+            materialization: None,
+            owns_heap_edges: Some(true),
+            has_init: false,
+            init_args: vec![],
+            fields: vec![],
+            variants: vec![],
+            variant_abis: vec![],
+            methods: vec![],
+            statics: vec![],
+            operators: vec![],
+        });
+        let resource = program.alloc_type(TypeData::Extern(resource));
+        let value_surface = surface(&mut program, "Value");
+        let dynamic = program.alloc_type(TypeData::Dyn(value_surface));
+        witness(&mut program, value_surface, optional);
+        let callable_surface = surface(&mut program, "Callable");
+        let callable_dynamic = program.alloc_type(TypeData::Dyn(callable_surface));
+        witness(&mut program, callable_surface, function);
+
+        let support = anvyx_runtime::RustProviderSupport {
+            package: anvyx_frontend::resolve::PackageId::core()
+                .as_str()
+                .to_string(),
+            provider: provider_id,
+            cargo: anvyx_runtime::RustProviderCargo::default(),
+            modules: vec![anvyx_runtime::RustModuleSupport {
+                module: provider_key.module.clone(),
+                types: vec![
+                    anvyx_runtime::RustTypeBinding {
+                        key: provider_key,
+                        path: anvyx_runtime::RustPath {
+                            crate_name: "host".to_string(),
+                            segments: vec!["ProviderValue".to_string()],
+                        },
+                        owns_heap_edges: false,
+                        materializer: Some(anvyx_runtime::RustMaterializerBinding {
+                            mode: anvyx_runtime::ExternMaterialization::Materialize,
+                            rust_type: anvyx_runtime::RustPath {
+                                crate_name: "host".to_string(),
+                                segments: vec!["ProviderValue".to_string()],
+                            },
+                            path: anvyx_runtime::RustPath {
+                                crate_name: "host".to_string(),
+                                segments: vec![
+                                    "__anvyx_native_export_providervalue".to_string(),
+                                    anvyx_runtime::INLINE_MATERIALIZER_SYMBOL.to_string(),
+                                ],
+                            },
+                        }),
+                    },
+                    anvyx_runtime::RustTypeBinding {
+                        key: resource_key,
+                        path: anvyx_runtime::RustPath {
+                            crate_name: "host".to_string(),
+                            segments: vec!["HostResource".to_string()],
+                        },
+                        owns_heap_edges: true,
+                        materializer: None,
+                    },
+                ],
+                bindings: vec![],
+            }],
+        };
         let classes = TypePassClasses::analyze(&program);
         let plan = RustRepresentationPlan::new(&program, &classes);
+        let mut collision = support.clone();
+        collision.package = "other".to_string();
+        collision.modules[0].types[0]
+            .materializer
+            .as_mut()
+            .unwrap()
+            .rust_type
+            .segments
+            .push("wrong".to_string());
+        let mut graph = RustMaterializerGraph::with_native_support(&[support.clone(), collision]);
+        graph.set_callable_materializers([(function, RustCallableMaterializer::Share)]);
+        let cases = [
+            (int, RustRecipePosition::Value, "copy"),
+            (string, RustRecipePosition::Value, "managed"),
+            (dataref, RustRecipePosition::Value, "identity"),
+            (function, RustRecipePosition::Value, "callable"),
+            (provider, RustRecipePosition::Value, "provider"),
+            (provider, RustRecipePosition::Global, "provider"),
+            (resource, RustRecipePosition::Global, "identity"),
+            (tuple, RustRecipePosition::Value, "tuple"),
+            (optional, RustRecipePosition::Value, "optional"),
+            (dynamic, RustRecipePosition::Value, "dynamic"),
+            (callable_dynamic, RustRecipePosition::Value, "dynamic"),
+            (int, RustRecipePosition::MapKey, "copy"),
+            (string, RustRecipePosition::Global, "managed"),
+            (dataref, RustRecipePosition::HeapEdge, "identity"),
+        ];
 
+        for (ty, position, expected) in cases {
+            let id = graph.action_for(plan, ty, position).unwrap();
+            let actual = match graph.action(id) {
+                RustMaterializerAction::Copy => "copy",
+                RustMaterializerAction::ManagedShare => "managed",
+                RustMaterializerAction::IdentityShare => "identity",
+                RustMaterializerAction::CallableShare => "callable",
+                RustMaterializerAction::ProviderMaterialize { .. } => "provider",
+                RustMaterializerAction::Tuple { .. } => "tuple",
+                RustMaterializerAction::Optional { .. } => "optional",
+                RustMaterializerAction::DynamicMaterialize { .. } => "dynamic",
+                RustMaterializerAction::Struct { .. }
+                | RustMaterializerAction::Array { .. }
+                | RustMaterializerAction::Enum { .. } => "aggregate",
+            };
+            assert_eq!(actual, expected, "{ty:?} at {position:?}");
+            assert_eq!(graph.action_for(plan, ty, position), Ok(id));
+        }
+
+        let positions = [
+            RustRecipePosition::Value,
+            RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
+            RustRecipePosition::MapKey,
+            RustRecipePosition::Global,
+            RustRecipePosition::HeapEdge,
+        ];
+        let position_cases = [
+            (int, [true, true, true, true, true]),
+            (string, [true, true, true, true, true]),
+            (dataref, [true, true, false, true, true]),
+            (function, [true, false, false, true, false]),
+            (provider, [true, true, false, true, true]),
+            (resource, [true, true, false, true, true]),
+            (tuple, [true, true, true, true, true]),
+            (optional, [true, true, false, true, true]),
+            (dynamic, [true, false, false, true, false]),
+            (callable_dynamic, [true, false, false, true, false]),
+        ];
+        for (ty, expected) in position_cases {
+            for (position, expected) in positions.into_iter().zip(expected) {
+                assert_eq!(
+                    graph.action_for(plan, ty, position).is_ok(),
+                    expected,
+                    "{ty:?} at {position:?}"
+                );
+            }
+        }
+
+        graph.set_callable_materializers([(function, RustCallableMaterializer::Copy)]);
+        let callable = graph
+            .action_for(plan, function, RustRecipePosition::Value)
+            .unwrap();
+        assert_eq!(graph.action(callable), &RustMaterializerAction::Copy);
+        let dynamic = graph
+            .action_for(plan, callable_dynamic, RustRecipePosition::Value)
+            .unwrap();
+        let RustMaterializerAction::DynamicMaterialize { variants, .. } = graph.action(dynamic)
+        else {
+            panic!("expected callable dynamic materializer");
+        };
         assert_eq!(
-            plan.recipe_for(int, air::ValueUse::Read, RustRecipePosition::Value),
-            Ok(RustPhysicalRecipe::Copy)
+            graph.action(variants[0].payload),
+            &RustMaterializerAction::Copy
         );
+
+        graph.set_callable_materializers([]);
+        let stable = graph
+            .action_for(plan, int, RustRecipePosition::Value)
+            .unwrap();
         assert_eq!(
-            plan.recipe_for(string, air::ValueUse::Read, RustRecipePosition::Value),
-            Ok(RustPhysicalRecipe::ManagedShare)
-        );
-        assert_eq!(
-            plan.recipe_for(tuple, air::ValueUse::Read, RustRecipePosition::Value),
-            Ok(RustPhysicalRecipe::ReconstructAggregate)
-        );
-        assert_eq!(
-            plan.recipe_for(tuple, air::ValueUse::Consume, RustRecipePosition::Value),
-            Ok(RustPhysicalRecipe::Move)
-        );
-        assert_eq!(
-            plan.recipe_for(function, air::ValueUse::Read, RustRecipePosition::Value),
+            graph.action_for(plan, function, RustRecipePosition::Value),
             Err(RustRecipeGap::FunctionCapabilityPending(function))
         );
         assert_eq!(
-            plan.recipe_for(dyn_ty, air::ValueUse::Read, RustRecipePosition::Value),
-            Err(RustRecipeGap::DynamicCarrierPending(dyn_ty))
+            graph.action_for(plan, callable_dynamic, RustRecipePosition::Value),
+            Err(RustRecipeGap::FunctionCapabilityPending(function))
         );
+        assert_eq!(graph.action(stable), &RustMaterializerAction::Copy);
+
+        let mut mismatched = support;
+        mismatched.modules[0].types[0]
+            .materializer
+            .as_mut()
+            .unwrap()
+            .rust_type
+            .segments
+            .push("wrong".to_string());
+        let mut graph = RustMaterializerGraph::with_native_support(&[mismatched]);
+        assert_eq!(
+            graph.action_for(plan, provider, RustRecipePosition::Value),
+            Err(RustRecipeGap::UnsupportedType(provider))
+        );
+    }
+
+    #[test]
+    fn materializer_graph_interns_recursive_aggregate_actions() {
+        let mut program = Program::default();
+        let surface = surface(&mut program, "Recursive");
+        let dynamic = program.alloc_type(TypeData::Dyn(surface));
+        let module = program.alloc_module(air::Module::default());
+        let aggregate = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Recursive"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("value"),
+                ty: dynamic,
+            }],
+            cycle_capable: true,
+            stringify_override: None,
+        });
+        let aggregate = program.alloc_type(TypeData::Aggregate(aggregate));
+        witness(&mut program, surface, aggregate);
+        let classes = TypePassClasses::analyze(&program);
+        let plan = RustRepresentationPlan::new(&program, &classes);
+        let mut graph = RustMaterializerGraph::default();
+
+        let root = graph
+            .action_for(plan, aggregate, RustRecipePosition::Value)
+            .unwrap();
+        let RustMaterializerAction::Struct { fields } = graph.action(root) else {
+            panic!("expected aggregate materializer");
+        };
+        let dynamic = fields[0];
+        let RustMaterializerAction::DynamicMaterialize { variants, .. } = graph.action(dynamic)
+        else {
+            panic!("expected dynamic materializer");
+        };
+        let nested = variants[0].payload;
+        let RustMaterializerAction::Struct { fields } = graph.action(nested) else {
+            panic!("expected nested aggregate materializer");
+        };
+        assert_eq!(fields[0], dynamic);
+    }
+
+    #[test]
+    fn materializer_graph_interns_mutually_recursive_aggregate_actions() {
+        let mut program = Program::default();
+        let first_surface = surface(&mut program, "First");
+        let second_surface = surface(&mut program, "Second");
+        let first_dynamic = program.alloc_type(TypeData::Dyn(first_surface));
+        let second_dynamic = program.alloc_type(TypeData::Dyn(second_surface));
+        let module = program.alloc_module(air::Module::default());
+        let first = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("First"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("second"),
+                ty: second_dynamic,
+            }],
+            cycle_capable: true,
+            stringify_override: None,
+        });
+        let first = program.alloc_type(TypeData::Aggregate(first));
+        let second = program.alloc_aggregate(air::AggregateDecl {
+            name: Ident::new("Second"),
+            module,
+            kind: air::AggregateKind::Struct,
+            type_args: vec![],
+            const_args: vec![],
+            fields: vec![FieldDecl {
+                name: Ident::new("first"),
+                ty: first_dynamic,
+            }],
+            cycle_capable: true,
+            stringify_override: None,
+        });
+        let second = program.alloc_type(TypeData::Aggregate(second));
+        witness(&mut program, first_surface, first);
+        witness(&mut program, second_surface, second);
+        let classes = TypePassClasses::analyze(&program);
+        let plan = RustRepresentationPlan::new(&program, &classes);
+        let mut graph = RustMaterializerGraph::default();
+
+        let root = graph
+            .action_for(plan, first, RustRecipePosition::Value)
+            .unwrap();
+        let RustMaterializerAction::Struct { fields } = graph.action(root) else {
+            panic!("expected first aggregate materializer");
+        };
+        let second_dynamic = fields[0];
+        let RustMaterializerAction::DynamicMaterialize { variants, .. } =
+            graph.action(second_dynamic)
+        else {
+            panic!("expected second dynamic materializer");
+        };
+        let RustMaterializerAction::Struct { fields } = graph.action(variants[0].payload) else {
+            panic!("expected second aggregate materializer");
+        };
+        let RustMaterializerAction::DynamicMaterialize { variants, .. } = graph.action(fields[0])
+        else {
+            panic!("expected first dynamic materializer");
+        };
+        let RustMaterializerAction::Struct { fields } = graph.action(variants[0].payload) else {
+            panic!("expected nested first aggregate materializer");
+        };
+        assert_eq!(fields[0], second_dynamic);
     }
 
     #[test]
@@ -4907,7 +4913,6 @@ mod tests {
         assert!(policy.supports_param_mode(list, ParamMode::Value));
         assert!(policy.supports_param_mode(list, ParamMode::MutBorrow));
         assert!(policy.copyable(function));
-        assert!(policy.value_from_ref_supported(function));
     }
 
     #[test]
@@ -5087,33 +5092,44 @@ mod tests {
     }
 
     #[test]
-    fn policy_shares_structs_with_shareable_fields() {
-        let mut program = RirProgram::default();
-        let string = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::String);
-        let label = RirTypeId::from_index(program.types.len());
-        program
-            .types
-            .push(RirType::Struct(RirStructId::from_index(0)));
-        program.structs.push(RirStruct {
-            id: RirStructId::from_index(0),
+    fn capture_shareability_rejects_embedded_slices() {
+        let string = RirTypeId::from_index(0);
+        let slice = RirTypeId::from_index(1);
+        let label = RirTypeId::from_index(2);
+        let view = RirTypeId::from_index(3);
+        let field = |id, ty| RirField {
+            id: RirFieldId::from_index(0),
+            symbol: RirSymbol::new(id),
+            ty,
+        };
+        let strukt = |id, symbol, field| RirStruct {
+            id: RirStructId::from_index(id),
             air_id: None,
-            symbol: RirSymbol::new("Label"),
-            display: RirSymbol::new("Label"),
+            symbol: RirSymbol::new(symbol),
+            display: RirSymbol::new(symbol),
             native_path: None,
             native_ref: false,
             native_key: None,
             copyable: false,
-            fields: vec![RirField {
-                id: RirFieldId::from_index(0),
-                symbol: RirSymbol::new("text"),
-                ty: string,
-            }],
-        });
+            fields: vec![field],
+        };
+        let program = RirProgram {
+            types: vec![
+                RirType::String,
+                RirType::Slice(string),
+                RirType::Struct(RirStructId::from_index(0)),
+                RirType::Struct(RirStructId::from_index(1)),
+            ],
+            structs: vec![
+                strukt(0, "Label", field("text", string)),
+                strukt(1, "View", field("slice", slice)),
+            ],
+            ..RirProgram::default()
+        };
         let policy = RirRustRepPolicy::new(&program);
 
-        assert!(!policy.copyable(label));
-        assert!(policy.shareable_value(label));
+        assert!(policy.capture_shareable(label));
+        assert!(!policy.capture_shareable(view));
     }
 
     #[test]
@@ -5199,16 +5215,16 @@ mod tests {
         assert!(!policy.map_key_supported(ty(7)));
         assert_eq!(
             policy.record_derives(&key_fields, false),
-            vec!["Clone", "PartialEq", "Eq", "Hash"]
+            vec!["PartialEq", "Eq", "Hash"]
         );
         assert_eq!(
             policy.record_derives(&key_fields, true),
-            vec!["Clone", "PartialEq", "Eq", "Hash", "Copy"]
+            vec!["Clone", "Copy", "PartialEq", "Eq", "Hash"]
         );
-        assert_eq!(policy.record_derives(&float_fields, false), vec!["Clone"]);
+        assert!(policy.record_derives(&float_fields, false).is_empty());
         assert_eq!(
             policy.enum_derives(&program.enums[0]),
-            vec!["Clone", "PartialEq", "Eq", "Hash"]
+            vec!["PartialEq", "Eq", "Hash"]
         );
     }
 
@@ -5240,7 +5256,6 @@ mod tests {
 
         assert_eq!(policy.value_rep(node), RustValueRep::HeapHandle);
         assert!(!policy.copyable(node));
-        assert!(policy.shareable_value(node));
         assert!(policy.supports_param(node, RirParamSemantic::Value));
         assert!(policy.supports_param(node, RirParamSemantic::SharedBorrow));
         assert!(policy.supports_param(node, RirParamSemantic::MutBorrow));
@@ -5248,270 +5263,6 @@ mod tests {
         assert_eq!(policy.rust_ty(node), "Node<'cx>");
         assert!(!policy.cow_value(node));
         assert!(!policy.copyable(maybe_node));
-        assert!(policy.shareable_value(maybe_node));
-    }
-
-    #[test]
-    fn policy_classifies_materialization() {
-        let mut program = RirProgram::default();
-        let int = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Int);
-        let string = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::String);
-        let list = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::List(int));
-        let map = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Map {
-            key: int,
-            value: string,
-        });
-        let node = RirTypeId::from_index(program.types.len());
-        program
-            .types
-            .push(RirType::DataRef(RirDataRefId::from_index(0)));
-        program.datarefs.push(RirDataRef {
-            id: RirDataRefId::from_index(0),
-            air_id: air::AggregateId::from_index(0),
-            native_key: None,
-            symbol: RirSymbol::new("Node"),
-            display: RirSymbol::new("Node"),
-            cycle_capable: true,
-            fields: vec![RirField {
-                id: RirFieldId::from_index(0),
-                symbol: RirSymbol::new("value"),
-                ty: int,
-            }],
-        });
-        let tuple = RirTypeId::from_index(program.types.len());
-        program
-            .types
-            .push(RirType::Tuple(RirTupleId::from_index(0)));
-        program.tuples.push(RirTuple {
-            id: RirTupleId::from_index(0),
-            symbol: RirSymbol::new("Tuple0"),
-            display: RirSymbol::new("Tuple0"),
-            fields: vec![
-                RirField {
-                    id: RirFieldId::from_index(0),
-                    symbol: RirSymbol::new("_0"),
-                    ty: string,
-                },
-                RirField {
-                    id: RirFieldId::from_index(1),
-                    symbol: RirSymbol::new("_1"),
-                    ty: node,
-                },
-            ],
-            copyable: false,
-        });
-        let maybe_node = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Option(node));
-        let slice = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Slice(int));
-        let lambda_sig = RirLambdaSigId::from_index(0);
-        let lambda = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Lambda(lambda_sig));
-        program.lambda_sigs.push(RirLambdaSig {
-            id: lambda_sig,
-            params: vec![],
-            ret: int,
-        });
-        program.lambdas.push(RirLambda {
-            id: RirLambdaId::from_index(0),
-            source: RirLambdaSource::Function(FunctionId::from_index(0)),
-            function: RirFunctionId::from_index(0),
-            sig: lambda_sig,
-            escape: RirLambdaEscape::NonEscaping,
-            storage: RirLambdaStorage::ZeroEnv,
-            captures: vec![],
-        });
-        let slice_tuple = RirTypeId::from_index(program.types.len());
-        program
-            .types
-            .push(RirType::Tuple(RirTupleId::from_index(1)));
-        program.tuples.push(RirTuple {
-            id: RirTupleId::from_index(1),
-            symbol: RirSymbol::new("Tuple1"),
-            display: RirSymbol::new("Tuple1"),
-            fields: vec![RirField {
-                id: RirFieldId::from_index(0),
-                symbol: RirSymbol::new("_0"),
-                ty: slice,
-            }],
-            copyable: false,
-        });
-        let lambda_tuple = RirTypeId::from_index(program.types.len());
-        program
-            .types
-            .push(RirType::Tuple(RirTupleId::from_index(2)));
-        program.tuples.push(RirTuple {
-            id: RirTupleId::from_index(2),
-            symbol: RirSymbol::new("Tuple2"),
-            display: RirSymbol::new("Tuple2"),
-            fields: vec![RirField {
-                id: RirFieldId::from_index(0),
-                symbol: RirSymbol::new("_0"),
-                ty: lambda,
-            }],
-            copyable: false,
-        });
-        let lambda_enum = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Enum(RirEnumId::from_index(0)));
-        program.enums.push(RirEnum {
-            id: RirEnumId::from_index(0),
-            air_id: None,
-            native_path: None,
-            native_key: None,
-            core: None,
-            repr: RirEnumRepr::Adt,
-            raw_type: None,
-            symbol: RirSymbol::new("LambdaEnum"),
-            display: RirSymbol::new("LambdaEnum"),
-            copyable: false,
-            variants: vec![RirVariant {
-                id: RirVariantId::from_index(0),
-                symbol: RirSymbol::new("Payload"),
-                display: RirSymbol::new("Payload"),
-                kind: RirVariantKind::Tuple,
-                raw_value: None,
-                fields: vec![RirField {
-                    id: RirFieldId::from_index(0),
-                    symbol: RirSymbol::new("_0"),
-                    ty: lambda,
-                }],
-            }],
-        });
-        let lambda_key_map = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Map {
-            key: lambda_tuple,
-            value: int,
-        });
-        let lambda_value_map = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Map {
-            key: int,
-            value: lambda_tuple,
-        });
-        let nested_lambda_key_map_value = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Map {
-            key: int,
-            value: lambda_key_map,
-        });
-        let policy = RirRustRepPolicy::new(&program);
-
-        assert_eq!(policy.materialization(int), RustMaterialization::Copy);
-        assert_eq!(policy.materialization(string), RustMaterialization::Share);
-        assert_eq!(policy.materialization(list), RustMaterialization::Share);
-        assert_eq!(policy.materialization(map), RustMaterialization::Share);
-        assert_eq!(
-            policy.materialization(node),
-            RustMaterialization::CloneHandle
-        );
-        assert_eq!(policy.materialization(tuple), RustMaterialization::Share);
-        assert_eq!(
-            policy.materialization(maybe_node),
-            RustMaterialization::Share
-        );
-        assert_eq!(
-            policy.materialization(slice),
-            RustMaterialization::BorrowGuard
-        );
-        assert_eq!(policy.materialization(lambda), RustMaterialization::Copy);
-        assert_eq!(
-            policy.materialization(slice_tuple),
-            RustMaterialization::Gap
-        );
-        assert_eq!(
-            policy.materialization(lambda_tuple),
-            RustMaterialization::Share
-        );
-        assert!(policy.stored_payload_supported(list));
-        assert!(policy.stored_payload_supported(map));
-        assert!(policy.stored_payload_supported(node));
-        assert!(!policy.stored_payload_supported(slice));
-        assert!(!policy.stored_payload_supported(lambda));
-        assert_eq!(
-            policy.storage_supported(lambda, LambdaStorageFamily::StructField),
-            Ok(())
-        );
-        assert_eq!(
-            policy.storage_supported(lambda_tuple, LambdaStorageFamily::MapKey),
-            Err(LambdaStorageGap::MapKeyEqualityHash)
-        );
-        assert_eq!(
-            policy.storage_supported(lambda_enum, LambdaStorageFamily::MapKey),
-            Err(LambdaStorageGap::MapKeyEqualityHash)
-        );
-        assert_eq!(
-            policy.storage_supported(lambda_tuple, LambdaStorageFamily::MapValue),
-            Ok(())
-        );
-        assert_eq!(
-            policy.storage_supported(nested_lambda_key_map_value, LambdaStorageFamily::MapValue),
-            Err(LambdaStorageGap::MapKeyEqualityHash)
-        );
-        assert_eq!(
-            policy
-                .materialization_plan_for(
-                    lambda_tuple,
-                    RustMaterialSource::ExactGlobalRoot,
-                    RustMaterialIntent::Read,
-                )
-                .gap,
-            None
-        );
-        assert_eq!(
-            policy
-                .materialization_plan_for(
-                    lambda_key_map,
-                    RustMaterialSource::ExactGlobalRoot,
-                    RustMaterialIntent::Read,
-                )
-                .gap,
-            Some(RustMaterialGap::UnsupportedType)
-        );
-        assert_eq!(
-            policy
-                .materialization_plan_for(
-                    lambda_value_map,
-                    RustMaterialSource::ExactGlobalRoot,
-                    RustMaterialIntent::Read,
-                )
-                .gap,
-            None
-        );
-    }
-
-    #[test]
-    fn policy_rejects_non_cloneable_lambda_materialization() {
-        let mut program = RirProgram::default();
-        let int = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Int);
-        let lambda_sig = RirLambdaSigId::from_index(0);
-        let lambda = RirTypeId::from_index(program.types.len());
-        program.types.push(RirType::Lambda(lambda_sig));
-        program.lambda_sigs.push(RirLambdaSig {
-            id: lambda_sig,
-            params: vec![],
-            ret: int,
-        });
-        program.lambdas.push(RirLambda {
-            id: RirLambdaId::from_index(0),
-            source: RirLambdaSource::Function(FunctionId::from_index(0)),
-            function: RirFunctionId::from_index(0),
-            sig: lambda_sig,
-            escape: RirLambdaEscape::NonEscaping,
-            storage: RirLambdaStorage::ScopedCaptures,
-            captures: vec![RirLambdaCapture {
-                ty: int,
-                semantic: RirParamSemantic::MutBorrow,
-                abi: RirParamAbi::MutBorrow,
-                kind: RirLambdaCaptureKind::Param,
-            }],
-        });
-        let policy = RirRustRepPolicy::new(&program);
-
-        assert_eq!(policy.materialization(lambda), RustMaterialization::Gap);
-        assert!(!policy.value_from_ref_supported(lambda));
     }
 
     #[test]
@@ -5525,6 +5276,13 @@ mod tests {
         program.types.push(RirType::Int);
         program.types.push(RirType::Lambda(sig_a));
         program.types.push(RirType::Lambda(sig_b));
+        program.materializers.push(RirMaterializer {
+            id: RirMaterializerId::from_index(0),
+            ty: lambda_a_ty,
+            position: RustRecipePosition::Value,
+            action: RirMaterializerAction::CallableShare,
+        });
+        program.value_materializers = vec![None, Some(RirMaterializerId::from_index(0)), None];
         program.lambda_sigs.push(RirLambdaSig {
             id: sig_a,
             params: vec![],
@@ -5693,32 +5451,6 @@ mod tests {
     }
 
     #[test]
-    fn air_policy_shares_aggregates_with_shareable_fields() {
-        let mut program = Program::default();
-        let string = program.alloc_type(TypeData::String);
-        let module = program.alloc_module(air::Module::default());
-        let aggregate = program.alloc_aggregate(air::AggregateDecl {
-            name: Ident::new("Label"),
-            module,
-            kind: air::AggregateKind::Struct,
-            type_args: vec![],
-            const_args: vec![],
-            fields: vec![FieldDecl {
-                name: Ident::new("text"),
-                ty: string,
-            }],
-            cycle_capable: false,
-            stringify_override: None,
-        });
-        let label = program.alloc_type(TypeData::Aggregate(aggregate));
-        let classes = TypePassClasses::analyze(&program);
-        let policy = RustRepresentationPlan::new(&program, &classes);
-
-        assert!(!policy.copyable(label));
-        assert!(policy.value_place_shareable(label));
-    }
-
-    #[test]
     fn air_policy_allows_collection_broken_payload_cycles() {
         let mut program = Program::default();
         let module = program.alloc_module(air::Module::default());
@@ -5758,7 +5490,6 @@ mod tests {
         let policy = RustRepresentationPlan::new(&program, &classes);
 
         assert!(policy.stored_payload_supported(a_ty));
-        assert_eq!(policy.materialization(a_ty), RustMaterialization::Share);
     }
 
     #[test]
@@ -5806,10 +5537,13 @@ mod tests {
         let policy = RirRustRepPolicy::new(&program);
         let a = RirTypeId::from_index(1);
 
-        assert!(policy.stored_payload_supported(a));
+        assert!(
+            policy
+                .storage_supported(a, LambdaStorageFamily::UnknownOrigin)
+                .is_ok()
+        );
         assert!(policy.type_owns_heap_edges(a));
         assert!(policy.type_cx_dependent(a));
-        assert_eq!(policy.materialization(a), RustMaterialization::Share);
         assert!(RustTracePlan::build(&program).needs_struct_trace(RirStructId::from_index(0)));
     }
 
@@ -5906,11 +5640,9 @@ mod tests {
         let policy = RustRepresentationPlan::new(&program, &classes);
 
         assert!(!policy.copyable(node));
-        assert!(policy.value_place_shareable(node));
         assert!(policy.supports_param_mode(node, ParamMode::Value));
         assert!(policy.supports_param_mode(node, ParamMode::SharedBorrow));
         assert!(policy.supports_param_mode(node, ParamMode::MutBorrow));
         assert!(!policy.copyable(maybe_node));
-        assert!(policy.value_place_shareable(maybe_node));
     }
 }

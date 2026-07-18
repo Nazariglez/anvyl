@@ -8,9 +8,9 @@ use anvyx_frontend::{
         Callee, CaptureCellDecl, CaptureCellLifetime, CaptureLocalSource, EnumDecl, EnumRepr,
         ExternDecl, ExternFieldDecl, ExternMember, ExternParamDecl, ExternReceiverDecl, ExternRep,
         ExternTypeDecl, FieldDecl, Function, FunctionId, FunctionKind, LambdaDecl, LambdaEscape,
-        Local, LocalKind, Mutability, Operand, ParamEscape, ParamMode, Place, PlaceRoot, Program,
-        Projection, RValue, ScopedBorrowDecl, ScopedBorrowSource, Signature, TypeData, TypeId,
-        VariantDecl, VariantShape,
+        Local, LocalKind, Mutability, Operand, OwnedValue, ParamEscape, ParamMode, Place,
+        PlaceRoot, Program, Projection, RValue, ScopedBorrowDecl, ScopedBorrowSource, Signature,
+        TypeData, TypeId, VariantDecl, VariantShape,
     },
     ast::{ExprId, Ident},
     pipeline::{
@@ -23,9 +23,19 @@ use anvyx_frontend::{
 use super::{
     compile::{VmCompileError, VmCompileErrorKind, VmCompileErrorSite, VmCompiler},
     runtime::{ExternDispatcher, NoExterns, unsupported_callback},
-    vir::{VirCallArg, VirCallTarget},
+    vir::{VirCallArg, VirCallTarget, VirProgram},
 };
 use crate::test_support::{global_with_init, local, param, place, root_module, structured_body};
+
+fn owned(value: Operand) -> OwnedValue<Operand> {
+    OwnedValue::reusable(value)
+}
+
+fn compile(mut program: Program) -> VirProgram {
+    air::finalize_materialization(&mut program);
+    let verified = air::verify(&program).expect("AIR verify failed");
+    VmCompiler::compile(verified).expect("VM compile failed")
+}
 
 #[test]
 fn compiler_lowers_value_and_shared_borrow_modes() {
@@ -81,7 +91,7 @@ fn compiler_lowers_value_and_shared_borrow_modes() {
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(callee),
                     args: vec![
-                        CallArg::Value(Operand::Const(one)),
+                        CallArg::Value(OwnedValue::reusable(Operand::Const(one))),
                         CallArg::SharedBorrow(place(caller_string, string)),
                     ],
                 }),
@@ -94,8 +104,7 @@ fn compiler_lowers_value_and_shared_borrow_modes() {
         .functions
         .extend([callee, caller]);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
     assert_eq!(vir.functions[0].params[0].param.mode, ParamMode::Value);
     assert_eq!(
         vir.functions[0].params[1].param.mode,
@@ -161,8 +170,7 @@ fn compiler_lowers_shared_string_const_args() {
         .functions
         .extend([callee, caller]);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
     assert_eq!(
         vir.functions[1].calls[0].target,
         VirCallTarget::Function(callee)
@@ -215,7 +223,7 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
                     local: caller_local,
                     value: RValue::Aggregate {
                         kind: air::AggregateCtor::Tuple,
-                        fields: vec![Operand::Const(zero), Operand::Const(zero)],
+                        fields: vec![owned(Operand::Const(zero)), owned(Operand::Const(zero))],
                         ty: pair,
                     },
                 },
@@ -232,8 +240,7 @@ fn compiler_lowers_mut_borrow_as_projected_place_ref() {
         .functions
         .extend([callee, caller]);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
     assert_eq!(vir.functions[0].params[0].param.mode, ParamMode::MutBorrow);
     assert_eq!(
         vir.functions[1].calls[0].target,
@@ -295,8 +302,7 @@ fn compiler_collects_calls_inside_structured_control() {
         .functions
         .extend([callee, caller]);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
     assert_eq!(vir.functions[1].calls.len(), 1);
     assert_eq!(
         vir.functions[1].calls[0].target,
@@ -343,15 +349,14 @@ fn compiler_records_extern_metadata_from_call_params() {
         body: structured_body(
             vec![Statement::Eval(RValue::Call {
                 callee: Callee::Extern(ext),
-                args: vec![CallArg::Value(Operand::Const(konst))],
+                args: vec![CallArg::Value(OwnedValue::reusable(Operand::Const(konst)))],
             })],
             air::AirTail::Return(None),
         ),
     });
     program.module_mut(module).functions.push(caller);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
 
     assert_eq!(vir.externs[0].source, ext);
     assert_eq!(vir.externs[0].params[0].ty, int);
@@ -437,7 +442,7 @@ fn compiler_rejects_native_init_field_args() {
             value: air::ConstValue::Int(1),
         });
         let arg = if provided {
-            CallArg::InitFieldProvided(Operand::Const(konst))
+            CallArg::InitFieldProvided(OwnedValue::reusable(Operand::Const(konst)))
         } else {
             CallArg::InitFieldOmitted
         };
@@ -532,8 +537,7 @@ fn compiler_records_member_extern_receiver_metadata() {
     });
     program.module_mut(module).externs.push(ext);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
 
     assert_eq!(vir.externs[0].params.len(), 2);
     assert_eq!(vir.externs[0].params[0].ty, owner_ty);
@@ -673,9 +677,8 @@ fn compiler_rejects_direct_function_payload_boundaries() {
                     body: structured_body(
                         vec![Statement::Eval(RValue::Call {
                             callee: Callee::Function(callee),
-                            args: vec![CallArg::Value(Operand::Place(place(
-                                caller_local,
-                                function,
+                            args: vec![CallArg::Value(OwnedValue::reusable(Operand::Place(
+                                place(caller_local, function),
                             )))],
                         })],
                         air::AirTail::Return(None),
@@ -786,7 +789,10 @@ fn compiler_rejects_lambda_calls() {
         body: structured_body(
             vec![Statement::Eval(RValue::Call {
                 callee: Callee::Lambda(Operand::Place(place(callee_local, function_ty))),
-                args: vec![CallArg::Value(Operand::Place(place(value_local, string)))],
+                args: vec![CallArg::Value(OwnedValue::reusable(Operand::Place(place(
+                    value_local,
+                    string,
+                ))))],
             })],
             air::AirTail::Return(None),
         ),
@@ -913,7 +919,10 @@ fn compiler_rejects_noncheap_value_call_args() {
                 },
                 Statement::Eval(RValue::Call {
                     callee: Callee::Function(callee),
-                    args: vec![CallArg::Value(Operand::Place(place(caller_local, string)))],
+                    args: vec![CallArg::Value(OwnedValue::reusable(Operand::Place(place(
+                        caller_local,
+                        string,
+                    ))))],
                 }),
             ],
             air::AirTail::Return(None),
@@ -1200,8 +1209,7 @@ fn compiler_rejects_recursive_function_payload_cycles_without_overflow() {
     });
     program.module_mut(module).functions.push(func);
 
-    let verified = air::verify(&program).expect("AIR verify failed");
-    let vir = VmCompiler::compile(verified).expect("VM compile failed");
+    let vir = compile(program);
     assert_eq!(vir.functions.len(), 1);
     assert_eq!(vir.functions[0].source, func);
 }
@@ -1481,7 +1489,7 @@ fn make_lambda_value_program(
             local: source,
             value: RValue::Aggregate {
                 kind: air::AggregateCtor::Tuple,
-                fields: vec![Operand::Const(zero), Operand::Const(zero)],
+                fields: vec![owned(Operand::Const(zero)), owned(Operand::Const(zero))],
                 ty: pair,
             },
         });
@@ -1666,7 +1674,7 @@ fn lambda_root_program(case: LambdaRootCase) -> (Program, FunctionId, VmCompileE
             let init = if matches!(case, LambdaRootCase::LambdaCaptureCellProjected) {
                 RValue::Aggregate {
                     kind: air::AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(zero), Operand::Const(zero)],
+                    fields: vec![owned(Operand::Const(zero)), owned(Operand::Const(zero))],
                     ty: pair,
                 }
             } else {
@@ -1786,7 +1794,7 @@ fn lambda_root_program(case: LambdaRootCase) -> (Program, FunctionId, VmCompileE
             let init = if matches!(case, LambdaRootCase::CaptureCellProjected) {
                 RValue::Aggregate {
                     kind: air::AggregateCtor::Tuple,
-                    fields: vec![Operand::Const(zero), Operand::Const(zero)],
+                    fields: vec![owned(Operand::Const(zero)), owned(Operand::Const(zero))],
                     ty: pair,
                 }
             } else {
@@ -2666,7 +2674,9 @@ fn compile_verified_errors(program: &air::OwnedVerifiedProgram) -> Vec<VmCompile
 }
 
 fn compile_errors(program: &Program) -> Vec<VmCompileError> {
-    let verified = air::verify(program).expect("AIR verify failed");
+    let mut program = program.clone();
+    air::finalize_materialization(&mut program);
+    let verified = air::verify(&program).expect("AIR verify failed");
     VmCompiler::compile(verified).expect_err("VM compile should fail")
 }
 

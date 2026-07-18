@@ -1,5 +1,3 @@
-use anvyx_frontend::air;
-
 use super::rir::{
     RirDynCarrierId, RirDynReceiver, RirDynVariantId, RirOperand, RirPlace, RirPlaceRoot,
     RirProgram, RirRValue, RirStmt, RirStructuredBlock, stmt_child_blocks_any,
@@ -44,6 +42,7 @@ fn collect_annotations(block: &RirStructuredBlock, annotations: &mut Vec<Option<
         | RirStmt::CellInit { value, .. }
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
+        | RirStmt::DataRefSet { value, .. }
         | RirStmt::Eval(value) = stmt
             && let RirRValue::DynCall { exact_variant, .. } = value
         {
@@ -72,6 +71,7 @@ fn clear_block(block: &mut RirStructuredBlock) {
         | RirStmt::CellInit { value, .. }
         | RirStmt::CellSet { value, .. }
         | RirStmt::ScopedPlaceCellSet { value, .. }
+        | RirStmt::DataRefSet { value, .. }
         | RirStmt::Eval(value) = stmt
             && let RirRValue::DynCall { exact_variant, .. } = value
         {
@@ -124,10 +124,10 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
         RirStmt::Init { local, value } => {
             visit_rvalue(value, state);
             let exact = rvalue_exact(value, state);
-            if let Some(source) = consumed_local(value)
-                && source != *local
-            {
-                state[source.index()] = None;
+            for source in transferred_locals(value) {
+                if source != *local {
+                    state[source.index()] = None;
+                }
             }
             state[local.index()] = exact;
             invalidate_after_call(value, state);
@@ -136,10 +136,10 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
             visit_rvalue(value, state);
             let exact = rvalue_exact(value, state);
             let destination = direct_local(dst);
-            if let Some(source) = consumed_local(value)
-                && Some(source) != destination
-            {
-                state[source.index()] = None;
+            for source in transferred_locals(value) {
+                if Some(source) != destination {
+                    state[source.index()] = None;
+                }
             }
             if let Some(local) = destination {
                 state[local.index()] = exact;
@@ -150,6 +150,9 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
         }
         RirStmt::Eval(value) => {
             visit_rvalue(value, state);
+            for source in transferred_locals(value) {
+                state[source.index()] = None;
+            }
             invalidate_after_call(value, state);
         }
         RirStmt::If(branch) => {
@@ -180,16 +183,36 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
             state.fill(None);
         }
         RirStmt::PatternMatch(match_) => {
+            let exact = direct_local(&match_.subject).and_then(|local| state[local.index()]);
             for arm in &mut match_.arms {
-                visit_nested(&mut arm.block, state);
+                let mut nested = state.to_vec();
+                if let Some(exact) = exact {
+                    for alternative in &arm.alternatives {
+                        for binding in &alternative.bindings {
+                            if binding.path.steps.is_empty() {
+                                nested[binding.local.index()] = Some(exact);
+                            }
+                        }
+                    }
+                }
+                visit_block(&mut arm.block, &mut nested);
             }
             state.fill(None);
         }
         RirStmt::DynMatch(match_) => {
+            let exact = match &match_.source {
+                super::rir::RirDynMatchSource::Owned(value) => owned_exact(value, state),
+                super::rir::RirDynMatchSource::MutPlace(_)
+                | super::rir::RirDynMatchSource::Borrowed(_) => None,
+            };
             for arm in &mut match_.arms {
                 visit_nested(&mut arm.block, state);
             }
-            visit_nested(&mut match_.fallback, state);
+            let mut fallback = state.to_vec();
+            if let (Some(exact), Some(local)) = (exact, match_.fallback_binding.local()) {
+                fallback[local.index()] = Some(exact);
+            }
+            visit_block(&mut match_.fallback, &mut fallback);
             state.fill(None);
         }
         RirStmt::OptionMatch(match_) => {
@@ -207,13 +230,13 @@ fn visit_stmt(stmt: &mut RirStmt, state: &mut [Option<ExactWitness>]) {
         | RirStmt::MutPlaceSet { value, .. }
         | RirStmt::CellInit { value, .. }
         | RirStmt::CellSet { value, .. }
-        | RirStmt::ScopedPlaceCellSet { value, .. } => {
+        | RirStmt::ScopedPlaceCellSet { value, .. }
+        | RirStmt::DataRefSet { value, .. } => {
             visit_rvalue(value, state);
             state.fill(None);
         }
         RirStmt::GlobalEnsure { .. }
         | RirStmt::ScopedPlaceCellInit { .. }
-        | RirStmt::DataRefSet { .. }
         | RirStmt::SequenceSlotSet { .. }
         | RirStmt::MapValueSet { .. } => state.fill(None),
     }
@@ -233,13 +256,13 @@ fn visit_rvalue(value: &mut RirRValue, state: &[Option<ExactWitness>]) {
     let RirRValue::DynCall {
         carrier,
         exact_variant,
-        receiver: RirDynReceiver::Owned { value, .. },
+        receiver: RirDynReceiver::Owned(value),
         ..
     } = value
     else {
         return;
     };
-    *exact_variant = operand_exact(value, state)
+    *exact_variant = owned_exact(value, state)
         .filter(|exact| exact.carrier == *carrier)
         .map(|exact| exact.variant);
 }
@@ -252,16 +275,15 @@ fn rvalue_exact(value: &RirRValue, state: &[Option<ExactWitness>]) -> Option<Exa
             carrier: *carrier,
             variant: *variant,
         }),
-        RirRValue::Use(value)
-        | RirRValue::MoveValue { value, .. }
-        | RirRValue::DynCopy { value, .. } => operand_exact(value, state),
+        RirRValue::Use(value) => operand_exact(value, state),
+        RirRValue::Materialize(owned) => owned_exact(owned, state),
         RirRValue::DynWeaken {
             target,
             value,
             arms,
             ..
         } => {
-            let source = operand_exact(value, state)?;
+            let source = owned_exact(value, state)?;
             arms.iter()
                 .find(|arm| arm.source == source.variant)
                 .map(|arm| ExactWitness {
@@ -270,6 +292,16 @@ fn rvalue_exact(value: &RirRValue, state: &[Option<ExactWitness>]) -> Option<Exa
                 })
         }
         _ => None,
+    }
+}
+
+fn owned_exact(
+    owned: &super::rir::RirOwnedValue,
+    state: &[Option<ExactWitness>],
+) -> Option<ExactWitness> {
+    match &owned.value {
+        super::rir::RirOwnedOperand::Value(value) => operand_exact(value, state),
+        super::rir::RirOwnedOperand::Access(_) | super::rir::RirOwnedOperand::DynBorrow(_) => None,
     }
 }
 
@@ -293,20 +325,17 @@ fn invalidate_place(place: &RirPlace, state: &mut [Option<ExactWitness>]) {
     }
 }
 
-fn consumed_local(value: &RirRValue) -> Option<super::rir::RirLocalId> {
-    let (RirRValue::MoveValue { value: operand, .. }
-    | RirRValue::DynWeaken {
-        value: operand,
-        air_use: air::DynOwnedUse::ConsumeTemporary,
-        ..
-    }) = value
-    else {
-        return None;
-    };
-    let RirOperand::Place(place) = operand else {
-        return None;
-    };
-    direct_local(place)
+fn transferred_locals(value: &RirRValue) -> Vec<super::rir::RirLocalId> {
+    let mut locals = vec![];
+    value.for_each_owned_value(&mut |owned| {
+        if matches!(owned.source, super::rir::RirOwnedSource::Transfer { .. })
+            && let super::rir::RirOwnedOperand::Value(RirOperand::Place(place)) = &owned.value
+            && let Some(local) = direct_local(place)
+        {
+            locals.push(local);
+        }
+    });
+    locals
 }
 
 fn invalidate_after_call(value: &RirRValue, state: &mut [Option<ExactWitness>]) {
@@ -317,13 +346,26 @@ fn invalidate_after_call(value: &RirRValue, state: &mut [Option<ExactWitness>]) 
 
 #[cfg(test)]
 mod tests {
+    use anvyx_frontend::air;
+
     use super::*;
     use crate::rust::rir::{
-        RirDynPayloadAction, RirLocalId, RirLoop, RirLoopId, RirRValue, RirTerm, RirTypeId,
+        RirDataRefId, RirDynMatch, RirDynMatchFallbackBinding, RirDynMatchSource, RirFieldId,
+        RirLocalId, RirLoop, RirLoopId, RirMaterializerId, RirOwnedOperand, RirOwnedSource,
+        RirOwnedValue, RirPatternAlternative, RirPatternArm, RirPatternBinding,
+        RirPatternBindingMode, RirPatternMatch, RirPatternPath, RirProjection, RirRValue, RirTerm,
+        RirTypeId,
     };
 
     fn local(id: usize, ty: RirTypeId) -> RirOperand {
         RirOperand::Place(RirPlace::local(RirLocalId::from_index(id), vec![], ty))
+    }
+
+    fn owned(value: RirOperand) -> RirOwnedValue {
+        RirOwnedValue {
+            value: RirOwnedOperand::Value(value),
+            source: RirOwnedSource::Reuse(RirMaterializerId::from_index(0)),
+        }
     }
 
     fn call(value: RirOperand, carrier: RirDynCarrierId, ty: RirTypeId) -> RirRValue {
@@ -331,10 +373,7 @@ mod tests {
             carrier,
             air_slot: air::ContractSlotId::from_index(0),
             exact_variant: None,
-            receiver: RirDynReceiver::Owned {
-                value,
-                consume: false,
-            },
+            receiver: RirDynReceiver::Owned(owned(value)),
             args: vec![],
             arms: vec![],
             ty,
@@ -354,10 +393,7 @@ mod tests {
                         carrier,
                         variant,
                         air_witness: air::ContractWitnessId::from_index(0),
-                        air_use: air::DynOwnedUse::ReusableRead,
-                        air_local: None,
-                        value: local(2, ty),
-                        action: RirDynPayloadAction::Copy,
+                        value: owned(local(2, ty)),
                         ty,
                     },
                 },
@@ -388,10 +424,7 @@ mod tests {
                         carrier,
                         variant: RirDynVariantId::from_index(0),
                         air_witness: air::ContractWitnessId::from_index(0),
-                        air_use: air::DynOwnedUse::ReusableRead,
-                        air_local: None,
-                        value: local(1, ty),
-                        action: RirDynPayloadAction::Copy,
+                        value: owned(local(1, ty)),
                         ty,
                     },
                 },
@@ -428,10 +461,7 @@ mod tests {
                         carrier,
                         variant,
                         air_witness: air::ContractWitnessId::from_index(0),
-                        air_use: air::DynOwnedUse::ReusableRead,
-                        air_local: None,
-                        value: local(1, ty),
-                        action: RirDynPayloadAction::Copy,
+                        value: owned(local(1, ty)),
                         ty,
                     },
                 },
@@ -445,5 +475,154 @@ mod tests {
             panic!("expected dynamic call");
         };
         assert_eq!(*exact_variant, None);
+    }
+
+    #[test]
+    fn pattern_binding_preserves_exact_witness() {
+        let ty = RirTypeId::from_index(0);
+        let carrier = RirDynCarrierId::from_index(0);
+        let variant = RirDynVariantId::from_index(0);
+        let mut block = RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: RirLocalId::from_index(0),
+                    value: RirRValue::DynPack {
+                        carrier,
+                        variant,
+                        air_witness: air::ContractWitnessId::from_index(0),
+                        value: owned(local(2, ty)),
+                        ty,
+                    },
+                },
+                RirStmt::PatternMatch(RirPatternMatch {
+                    subject: RirPlace::local(RirLocalId::from_index(0), vec![], ty),
+                    arms: vec![RirPatternArm {
+                        alternatives: vec![RirPatternAlternative {
+                            tests: vec![],
+                            bindings: vec![RirPatternBinding {
+                                local: RirLocalId::from_index(1),
+                                path: RirPatternPath::default(),
+                                ty,
+                                mode: RirPatternBindingMode::Owned {
+                                    materializer: RirMaterializerId::from_index(0),
+                                },
+                            }],
+                        }],
+                        block: RirStructuredBlock {
+                            stmts: vec![RirStmt::Eval(call(local(1, ty), carrier, ty))],
+                            term: RirTerm::Unreachable,
+                        },
+                    }],
+                }),
+            ],
+            term: RirTerm::Unreachable,
+        };
+
+        visit_block(&mut block, &mut [None; 3]);
+
+        let RirStmt::PatternMatch(match_) = &block.stmts[1] else {
+            panic!("expected pattern match");
+        };
+        let RirStmt::Eval(RirRValue::DynCall { exact_variant, .. }) =
+            &match_.arms[0].block.stmts[0]
+        else {
+            panic!("expected dynamic call");
+        };
+        assert_eq!(*exact_variant, Some(variant));
+    }
+
+    #[test]
+    fn dynamic_fallback_binding_preserves_exact_witness() {
+        let ty = RirTypeId::from_index(0);
+        let carrier = RirDynCarrierId::from_index(0);
+        let variant = RirDynVariantId::from_index(0);
+        let mut block = RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: RirLocalId::from_index(0),
+                    value: RirRValue::DynPack {
+                        carrier,
+                        variant,
+                        air_witness: air::ContractWitnessId::from_index(0),
+                        value: owned(local(2, ty)),
+                        ty,
+                    },
+                },
+                RirStmt::DynMatch(RirDynMatch {
+                    carrier,
+                    source: RirDynMatchSource::Owned(owned(local(0, ty))),
+                    arms: vec![],
+                    fallback_binding: RirDynMatchFallbackBinding::Take(RirLocalId::from_index(1)),
+                    fallback: RirStructuredBlock {
+                        stmts: vec![RirStmt::Eval(call(local(1, ty), carrier, ty))],
+                        term: RirTerm::Unreachable,
+                    },
+                }),
+            ],
+            term: RirTerm::Unreachable,
+        };
+
+        visit_block(&mut block, &mut [None; 3]);
+
+        let RirStmt::DynMatch(match_) = &block.stmts[1] else {
+            panic!("expected dynamic match");
+        };
+        let RirStmt::Eval(RirRValue::DynCall { exact_variant, .. }) = &match_.fallback.stmts[0]
+        else {
+            panic!("expected dynamic call");
+        };
+        assert_eq!(*exact_variant, Some(variant));
+    }
+
+    #[test]
+    fn dataref_set_annotations_are_canonicalized() {
+        let ty = RirTypeId::from_index(0);
+        let carrier = RirDynCarrierId::from_index(0);
+        let expected = RirDynVariantId::from_index(0);
+        let forged = RirDynVariantId::from_index(1);
+        let mut block = RirStructuredBlock {
+            stmts: vec![
+                RirStmt::Init {
+                    local: RirLocalId::from_index(0),
+                    value: RirRValue::DynPack {
+                        carrier,
+                        variant: expected,
+                        air_witness: air::ContractWitnessId::from_index(0),
+                        value: owned(local(2, ty)),
+                        ty,
+                    },
+                },
+                RirStmt::DataRefSet {
+                    object: local(2, ty),
+                    dataref: RirDataRefId::from_index(0),
+                    projections: vec![RirProjection::Field(RirFieldId::from_index(0))],
+                    value: call(local(0, ty), carrier, ty),
+                    ty,
+                },
+            ],
+            term: RirTerm::Unreachable,
+        };
+        let RirStmt::DataRefSet {
+            value: RirRValue::DynCall { exact_variant, .. },
+            ..
+        } = &mut block.stmts[1]
+        else {
+            panic!("expected dynamic dataref write");
+        };
+        *exact_variant = Some(forged);
+
+        let mut annotations = vec![];
+        collect_annotations(&block, &mut annotations);
+        assert_eq!(annotations, [Some(forged)]);
+
+        clear_block(&mut block);
+        let mut annotations = vec![];
+        collect_annotations(&block, &mut annotations);
+        assert_eq!(annotations, [None]);
+
+        visit_block(&mut block, &mut [None; 3]);
+        let mut annotations = vec![];
+        collect_annotations(&block, &mut annotations);
+        assert_eq!(annotations, [Some(expected)]);
     }
 }

@@ -3,17 +3,12 @@ use anvyx_frontend::air::{
     TypeData, TypeId, TypePassClasses, place_model as air_place,
 };
 
-use super::{
-    mut_place::direct_native_mut_borrow_supported,
-    rep_policy::{
-        RustMaterialGap, RustMaterialIntent, RustMaterialSource, RustMaterialization,
-        RustRepresentationPlan,
-    },
-};
+use super::{mut_place::direct_native_mut_borrow_supported, rep_policy::RustRepresentationPlan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceAccessIntent {
     ReadValue,
+    OwnedRead,
     SharedBorrow,
     MutBorrow,
     Assign,
@@ -75,6 +70,7 @@ pub struct DataRefProjectionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataRefSegmentPlan {
+    pub(super) object_prefix: Vec<PlaceProjection>,
     pub(super) dataref_ty: TypeId,
     pub(super) dataref: air::AggregateId,
     pub(super) storage: Vec<PlaceProjection>,
@@ -102,6 +98,20 @@ impl DataRefProjectionPlan {
         for step in path.steps() {
             let projection = convert_projection(step);
             if materialized {
+                if let TypeData::DataRef(dataref) = program.type_arena.data(step.source_ty())
+                    && matches!(step.kind(), air_place::ProjectionKind::DataRefField(_))
+                {
+                    let storage_ty = projection.ty;
+                    current = Some(DataRefSegmentPlan {
+                        object_prefix: std::mem::take(&mut remaining),
+                        dataref_ty: step.source_ty(),
+                        dataref: *dataref,
+                        storage: vec![projection],
+                        storage_ty,
+                    });
+                    materialized = false;
+                    continue;
+                }
                 if dataref_remaining_projection_supported(step.kind()) {
                     remaining.push(projection);
                     continue;
@@ -111,6 +121,7 @@ impl DataRefProjectionPlan {
             match program.type_arena.data(step.source_ty()) {
                 TypeData::DataRef(dataref) => {
                     let mut segment = DataRefSegmentPlan {
+                        object_prefix: vec![],
                         dataref_ty: step.source_ty(),
                         dataref: *dataref,
                         storage: vec![],
@@ -144,10 +155,7 @@ impl DataRefProjectionPlan {
                         return Err(Self::projection_gap(intent));
                     }
                 }
-                _ if current.is_some()
-                    && intent == PlaceAccessIntent::ReadValue
-                    && dataref_remaining_projection_supported(step.kind()) =>
-                {
+                _ if current.is_some() && dataref_remaining_projection_supported(step.kind()) => {
                     segments.push(current.take().expect("checked above"));
                     remaining.push(projection);
                     materialized = true;
@@ -292,7 +300,7 @@ impl<'a> PlaceAccessCx<'a> {
         if intent == PlaceAccessIntent::SliceView
             && (matches!(
                 place.root,
-                PlaceRoot::CaptureCell(_) | PlaceRoot::ScopedBorrow(_) | PlaceRoot::Global(_)
+                PlaceRoot::CaptureCell(_) | PlaceRoot::ScopedBorrow(_)
             ) || path.crosses_dataref())
         {
             return Err(PlaceAccessGapKind::SliceView);
@@ -312,23 +320,19 @@ impl<'a> PlaceAccessCx<'a> {
     }
 
     pub fn global_payload_gap(&self, ty: TypeId) -> Option<PlaceAccessGapKind> {
-        let plan = self.policy().materialization_plan_for(
-            ty,
-            RustMaterialSource::ExactGlobalRoot,
-            RustMaterialIntent::Read,
-        );
-        match plan.materialization {
-            RustMaterialization::Copy
-            | RustMaterialization::Share
-            | RustMaterialization::CloneHandle
-            | RustMaterialization::CloneLambda => None,
-            RustMaterialization::BorrowGuard | RustMaterialization::Gap => Some(match plan.gap {
-                Some(RustMaterialGap::UnsupportedType) => PlaceAccessGapKind::GlobalType,
-                Some(RustMaterialGap::UnsupportedRooting) | None => {
-                    PlaceAccessGapKind::GlobalRooting
-                }
-            }),
+        if self.policy().global_storage_supported(ty) {
+            return None;
         }
+        Some(
+            if matches!(
+                self.program.type_arena.data(ty),
+                TypeData::Void | TypeData::Any
+            ) {
+                PlaceAccessGapKind::GlobalType
+            } else {
+                PlaceAccessGapKind::GlobalRooting
+            },
+        )
     }
 
     pub fn global_supported(&self, global: GlobalId) -> bool {
@@ -474,14 +478,11 @@ impl<'a> PlaceAccessCx<'a> {
         if let Some(air_place::PlaceStorage::Global(global)) = root.storage {
             return self.check_global(intent, global, place, path, dataref);
         }
-        if intent == PlaceAccessIntent::StructuralMutation && path.crosses_dataref() {
-            return Err(PlaceAccessGapKind::PlaceProjection);
-        }
         if intent == PlaceAccessIntent::MutPlaceArg && root.storage.is_none() {
             return Err(PlaceAccessGapKind::MutablePlace);
         }
         if intent == PlaceAccessIntent::CollectionLoan {
-            if !collection_loan_projection_supported(self.program, path) {
+            if dataref.is_none() && !collection_loan_projection_supported(self.program, path) {
                 return Err(PlaceAccessGapKind::PlaceProjection);
             }
             match root.storage {
@@ -508,7 +509,9 @@ impl<'a> PlaceAccessCx<'a> {
         }
         if matches!(
             intent,
-            PlaceAccessIntent::ReadValue | PlaceAccessIntent::SharedBorrow
+            PlaceAccessIntent::ReadValue
+                | PlaceAccessIntent::OwnedRead
+                | PlaceAccessIntent::SharedBorrow
         ) && path.crosses_dataref()
             && dataref.is_none()
         {
@@ -532,7 +535,10 @@ impl<'a> PlaceAccessCx<'a> {
             Some(
                 air_place::PlaceStorage::CaptureCell(_) | air_place::PlaceStorage::ScopedBorrow(_),
             ) if !place.projection.is_empty() => {
-                let allow_collections = intent == PlaceAccessIntent::ReadValue;
+                let allow_collections = matches!(
+                    intent,
+                    PlaceAccessIntent::ReadValue | PlaceAccessIntent::OwnedRead
+                );
                 if ordinary_mut_place_supported(self.program, path, allow_collections) {
                     Ok(())
                 } else {
@@ -558,7 +564,7 @@ impl<'a> PlaceAccessCx<'a> {
             return Err(PlaceAccessGapKind::PlaceProjection);
         };
         if path.crosses_dataref() {
-            return Err(PlaceAccessGapKind::PlaceProjection);
+            return Ok(());
         }
         self.check_projected_mut_place(path, true)
             .map_err(|_| PlaceAccessGapKind::PlaceProjection)
@@ -610,7 +616,9 @@ impl<'a> PlaceAccessCx<'a> {
                     Err(PlaceAccessGapKind::GlobalProjection)
                 }
             }
-            PlaceAccessIntent::ReadValue if !place.projection.is_empty() => {
+            PlaceAccessIntent::ReadValue | PlaceAccessIntent::OwnedRead
+                if !place.projection.is_empty() =>
+            {
                 if !(global_read_projection_supported(path) || dataref.is_some()) {
                     return Err(PlaceAccessGapKind::GlobalProjection);
                 }
@@ -633,7 +641,9 @@ impl<'a> PlaceAccessCx<'a> {
                 Err(PlaceAccessGapKind::GlobalProjection)
             }
             PlaceAccessIntent::MutBorrow => Err(PlaceAccessGapKind::GlobalBorrow),
-            PlaceAccessIntent::ReadValue | PlaceAccessIntent::SharedBorrow
+            PlaceAccessIntent::ReadValue
+            | PlaceAccessIntent::OwnedRead
+            | PlaceAccessIntent::SharedBorrow
                 if payload_gap.is_some() =>
             {
                 Err(PlaceAccessGapKind::GlobalValueRead)
@@ -660,6 +670,11 @@ impl<'a> PlaceAccessCx<'a> {
             {
                 Err(PlaceAccessGapKind::GlobalProjection)
             }
+            PlaceAccessIntent::SliceView
+                if place.projection.is_empty() && payload_gap.is_none() =>
+            {
+                Ok(())
+            }
             PlaceAccessIntent::PayloadAlias | PlaceAccessIntent::SliceView => {
                 Err(PlaceAccessGapKind::GlobalProjection)
             }
@@ -667,6 +682,7 @@ impl<'a> PlaceAccessCx<'a> {
                 Err(PlaceAccessGapKind::MutablePlaceNativeBoundary)
             }
             PlaceAccessIntent::ReadValue
+            | PlaceAccessIntent::OwnedRead
             | PlaceAccessIntent::SharedBorrow
             | PlaceAccessIntent::Assign
             | PlaceAccessIntent::MutPlaceArg => Ok(()),
@@ -688,10 +704,8 @@ impl<'a> PlaceAccessCx<'a> {
 
     fn value_read_supported(&self, ty: TypeId) -> bool {
         !matches!(
-            self.policy()
-                .materialization_plan_for(ty, RustMaterialSource::Value, RustMaterialIntent::Read)
-                .materialization,
-            RustMaterialization::Gap
+            self.program.type_arena.data(ty),
+            TypeData::Void | TypeData::Any | TypeData::Slice(_)
         )
     }
 
@@ -737,7 +751,9 @@ fn dataref_remaining_projection_supported(kind: air_place::ProjectionKind) -> bo
         kind,
         air_place::ProjectionKind::Field(_)
             | air_place::ProjectionKind::TupleField(_)
+            | air_place::ProjectionKind::ArrayIndex(_)
             | air_place::ProjectionKind::ListIndex(_)
+            | air_place::ProjectionKind::SliceIndex(_)
     )
 }
 
@@ -815,14 +831,22 @@ fn dataref_mut_place_payload_supported(
     classes: &TypePassClasses,
     ty: TypeId,
 ) -> bool {
-    !matches!(
-        RustRepresentationPlan::new(program, classes).materialization_for(
-            ty,
-            RustMaterialSource::DataRefMutPlace,
-            RustMaterialIntent::MutPlacePayload,
-        ),
-        RustMaterialization::Gap
-    )
+    match program.type_arena.data(ty) {
+        TypeData::Int
+        | TypeData::Flag(_)
+        | TypeData::Float
+        | TypeData::Bool
+        | TypeData::Char
+        | TypeData::DataRef(_)
+        | TypeData::Dyn(_) => true,
+        TypeData::Void | TypeData::Any | TypeData::Slice(_) => false,
+        _ => RustRepresentationPlan::new(program, classes)
+            .storage_supported(
+                ty,
+                super::rep_policy::LambdaStorageFamily::DataRefProjection,
+            )
+            .is_ok(),
+    }
 }
 
 fn ordinary_mut_place_supported(
@@ -1196,20 +1220,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_collection_mut_place_projection_after_dataref_crossing() {
+    fn accepts_collection_mut_place_projection_after_dataref_crossing() {
         let (program, place) = aggregate_collection_dataref_projection_program();
 
-        let gap = cx(&program)
+        let plan = cx(&program)
             .plan(
                 FunctionId::from_index(0),
                 PlaceAccessIntent::MutPlaceArg,
                 &place,
             )
-            .expect_err(
-                "collection mut-place projections after dataref crossings remain unsupported",
-            );
+            .expect("collection mut-place projections after dataref crossings are supported");
 
-        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceDataRef);
+        assert_eq!(plan.dataref_plan().unwrap().remaining.len(), 1);
     }
 
     #[test]
@@ -1338,18 +1360,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_dataref_mut_place_payload() {
+    fn accepts_materializable_dataref_mut_place_payload() {
         let (program, place) = dataref_field_program(TypeData::String, true);
 
-        let gap = cx(&program)
+        let plan = cx(&program)
             .plan(
                 FunctionId::from_index(0),
                 PlaceAccessIntent::MutPlaceArg,
                 &place,
             )
-            .expect_err("string dataref mut-place payloads stay unsupported");
+            .expect("materializable dataref payloads are supported");
 
-        assert_eq!(gap, PlaceAccessGapKind::MutablePlaceDataRef);
+        assert!(plan.dataref_plan().is_some());
     }
 
     fn captured_field_program(root: PlaceRoot) -> (Program, CaptureCellId, Place) {

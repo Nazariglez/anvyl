@@ -60,12 +60,14 @@ pub use provider::{
     ExternFunctionKey, ExternInitDescriptor, ExternLayout, ExternMaterialization, ExternMemberKey,
     ExternMemberSelector, ExternMethodDescriptor, ExternModuleDescriptor, ExternOperator,
     ExternOperatorDescriptor, ExternParam, ExternRep, ExternSignature, ExternStaticDescriptor,
-    ExternTypeDescriptor, ExternTypeExpr, ExternTypeKey, FunctionExport, ModuleExport,
-    ModuleExportItem, ModulePath, ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode,
-    RustAbiSupport, RustExternAbi, RustExternBinding, RustLocalBinding, RustMemberBinding,
+    ExternTypeDescriptor, ExternTypeExpr, ExternTypeKey, FunctionExport,
+    INLINE_MATERIALIZER_SYMBOL, InlineMaterializationAttestation, ModuleExport, ModuleExportItem,
+    ModulePath, ParamFlow, ProviderDescriptor, ProviderId, ReceiverMode, RustAbiSupport,
+    RustExternAbi, RustExternBinding, RustLocalBinding, RustMaterializerBinding, RustMemberBinding,
     RustModuleSupport, RustParamAbi, RustPath, RustProviderCargo, RustProviderSupport,
-    RustReturnAbi, RustTypeBinding, RustWrapperCtx, TypeExport, TypeMemberExport, UnaryOp,
-    merge_type_members, validate_rust_provider_support,
+    RustReturnAbi, RustTypeBinding, RustWrapperCtx, TypeExport, TypeMemberExport,
+    TypeMemberFragment, UnaryOp, merge_type_members, native_materializer_module,
+    validate_rust_provider_support,
 };
 pub use resource::{AnvRef, AnvRefType};
 pub use runtime_owner::{RuntimeOwnerEntry, RuntimeOwnerHandle, RuntimeOwnerShutdownGuard};

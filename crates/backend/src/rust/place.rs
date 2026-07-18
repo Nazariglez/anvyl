@@ -1,12 +1,13 @@
 use super::{
     dataref_place::{self as dataref_paths},
     rir::{
-        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirOptionSubject,
-        RirParamAbi, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram, RirProjection, RirStmt,
-        RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
+        RirDataRefId, RirField, RirFunction, RirLocalId, RirMutPlaceArg, RirOptionPayloadBinding,
+        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceModel, RirPlaceRoot, RirProgram,
+        RirProjection, RirStmt, RirStructuredBlock, RirType, RirTypeId, stmt_child_blocks_any,
     },
     syntax::comma,
     target,
+    value::RustValues,
 };
 
 struct RenderedPlace {
@@ -17,6 +18,7 @@ struct RenderedPlace {
 pub(super) struct SliceIndexAccess {
     pub slice: String,
     pub index: String,
+    pub ty: RirTypeId,
     pub list_root: bool,
 }
 
@@ -32,9 +34,18 @@ pub(super) struct MutPlaceProjection {
 
 pub(super) enum MutPlaceProjectionStep {
     Field(String),
-    ArrayIndex { index: String, len: u64 },
-    ListIndex { index: String, version: String },
-    SliceIndex { index: String },
+    ArrayIndex {
+        index: String,
+        len: u64,
+    },
+    ListIndex {
+        index: String,
+        version: String,
+        ty: RirTypeId,
+    },
+    SliceIndex {
+        index: String,
+    },
 }
 
 pub(super) struct ProjectionFacts {
@@ -163,6 +174,15 @@ impl<'a> RustPlaces<'a> {
             && self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
     }
 
+    pub(super) fn physical_ref_root(&self, place: &RirPlace) -> bool {
+        let RirPlaceRoot::Local(local) = place.root else {
+            return false;
+        };
+        place.projections.is_empty()
+            && (self.param_abi_for_local(local) == Some(RirParamAbi::SharedBorrow)
+                || self.payload_ref_cell_local(local))
+    }
+
     pub(super) fn mut_place_root_param(&self, place: &RirPlace) -> bool {
         let RirPlaceRoot::Local(local) = place.root else {
             unreachable!("expected a local RIR place")
@@ -264,7 +284,7 @@ impl<'a> RustPlaces<'a> {
                         RirType::List(elem) => {
                             let version = format!("__v{}", fields.len());
                             let body = if root_is_mut_place {
-                                target::mut_place_access(
+                                target::mut_place_access_ctx(
                                     root,
                                     target::runtime_param_name(),
                                     &Self::projection_version_body(&steps)?,
@@ -277,6 +297,7 @@ impl<'a> RustPlaces<'a> {
                             steps.push(MutPlaceProjectionStep::ListIndex {
                                 index: field,
                                 version,
+                                ty,
                             });
                             ty = elem;
                         }
@@ -381,6 +402,7 @@ impl<'a> RustPlaces<'a> {
                 .symbol
                 .as_str()
                 .to_string(),
+            ty: rendered.ty,
             list_root,
         })
     }
@@ -408,6 +430,16 @@ impl<'a> RustPlaces<'a> {
             .iter()
             .find(|param| param.local == local)
             .map(|param| param.abi)
+    }
+
+    fn sequence_materializer_closure(&self, ty: RirTypeId) -> String {
+        let materializer = self
+            .program
+            .sequence_elem_materializer(ty)
+            .expect("verified sequence storage declaration");
+        let body =
+            RustValues::new(self.program, self.function).materialize_ref(materializer, "value");
+        target::materializer_closure("value", &body)
     }
 
     fn apply_projections(
@@ -447,6 +479,7 @@ impl<'a> RustPlaces<'a> {
                             rendered.ty = elem;
                         }
                         RirType::List(elem) if allow_list_index => {
+                            let materialize = self.sequence_materializer_closure(rendered.ty);
                             let list = rendered.expr.clone();
                             let checked =
                                 target::checked_index_result(index, "__anv_list.len()", "list");
@@ -457,17 +490,20 @@ impl<'a> RustPlaces<'a> {
                                     target::runtime_param_name(),
                                     "index",
                                     &target::collection_structural_version("__anv_list"),
+                                    &materialize,
                                 )
                             );
                             rendered.ty = elem;
                         }
                         RirType::Slice(elem) => {
+                            let materialize = self.sequence_materializer_closure(rendered.ty);
                             rendered.expr = format!(
                                 "{}?",
                                 target::slice_elem_at_shared(
                                     &rendered.expr,
                                     target::runtime_param_name(),
                                     index,
+                                    &materialize,
                                 )
                             );
                             rendered.ty = elem;
@@ -495,14 +531,15 @@ fn stmt_has_mut_place_payload(stmt: &RirStmt, local: RirLocalId) -> bool {
                 .iter()
                 .any(|arm| arm.binding == super::rir::RirDynMatchBinding::Alias(local))
                 || matches!(
-                    (&match_.source, match_.fallback_binding),
-                    (super::rir::RirDynMatchSource::MutPlace(_), Some(binding)) if binding == local
+                    match_.fallback_binding,
+                    super::rir::RirDynMatchFallbackBinding::Alias(binding) if binding == local
                 )
         }
         RirStmt::OptionMatch(match_) => {
-            match_.payload == Some(local)
-                && match_.payload_ref
-                && matches!(match_.subject, RirOptionSubject::MutPlace(_))
+            matches!(
+                match_.payload,
+                Some(RirOptionPayloadBinding::Ref { local: payload, .. }) if payload == local
+            ) && matches!(match_.subject, RirOptionSubject::MutPlace(_))
         }
         RirStmt::MapEntryMatch(match_) => match_.payload == Some(local),
         _ => false,

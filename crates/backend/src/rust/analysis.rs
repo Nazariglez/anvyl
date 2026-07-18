@@ -7,10 +7,11 @@ use super::{
         RirCallArg, RirCallTarget, RirCellRef, RirCellStorage, RirChild, RirCollectionAccess,
         RirCollectionLoanScope, RirCollectionRootKind, RirDynReceiver, RirExternKind, RirFunction,
         RirLambdaStorage, RirMutPlaceAccess, RirMutPlaceArg, RirMutPlaceHandle, RirOperand,
-        RirOptionSubject, RirParamAbi, RirPlace, RirPlaceRoot, RirProgram, RirRValue, RirRangeFor,
-        RirRawEnumValue, RirResolvedCallTarget, RirStmt, RirStringLiteralId, RirStringifyHelper,
-        RirStringifyHelperKind, RirStringifyReq, RirStringifyReqKind, RirStructuredBlock, RirType,
-        RirTypeId, native_arg_facts, native_return_adopts_resource, stmt_child_blocks_any,
+        RirOptionPayloadBinding, RirOptionSubject, RirOwnedOperand, RirParamAbi, RirPlace,
+        RirPlaceRoot, RirProgram, RirRValue, RirRangeFor, RirRawEnumValue, RirResolvedCallTarget,
+        RirStmt, RirStringLiteralId, RirStringifyHelper, RirStringifyHelperKind, RirStringifyReq,
+        RirStringifyReqKind, RirStructuredBlock, RirType, RirTypeId, native_arg_facts,
+        native_return_adopts_resource, stmt_child_blocks_any,
     },
 };
 
@@ -55,7 +56,7 @@ fn collect_block_string_literals(
             | RirStmt::Eval(value) => collect_rvalue_string_literals(program, value, owned),
             RirStmt::DataRefSet { object, value, .. } => {
                 collect_operand_string_literal(program, object, owned);
-                collect_operand_string_literal(program, value, owned);
+                collect_rvalue_string_literals(program, value, owned);
             }
             RirStmt::SequenceSlotSet { value, .. } | RirStmt::MapValueSet { value, .. } => {
                 collect_operand_string_literal(program, value, owned);
@@ -81,8 +82,16 @@ fn collect_block_string_literals(
             }
         });
     }
-    if let super::rir::RirTerm::Return(Some(value)) = &block.term {
-        collect_operand_string_literal(program, value, owned);
+    match &block.term {
+        super::rir::RirTerm::Return(Some(value)) => {
+            collect_operand_string_literal(program, value, owned);
+        }
+        super::rir::RirTerm::ReturnOwned(owned_value) => {
+            if let RirOwnedOperand::Value(value) = &owned_value.value {
+                collect_operand_string_literal(program, value, owned);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -123,8 +132,8 @@ fn collect_rvalue_string_literals(
             collect_operand_string_literal(program, operand, owned);
         }
         RirChild::CallArg(arg) => collect_call_arg_string_literals(program, arg, owned),
-        RirChild::CaptureArg(super::rir::RirLambdaCaptureArg::Readonly { value }) => {
-            collect_operand_string_literal(program, value, owned);
+        RirChild::CaptureArg(super::rir::RirLambdaCaptureArg::Owned { value }) => {
+            collect_owned_string_literal(program, value, owned);
         }
         RirChild::Place { .. }
         | RirChild::MutPlace { .. }
@@ -143,12 +152,11 @@ fn collect_call_arg_string_literals(
 ) {
     match arg {
         RirCallArg::Value(value)
-        | RirCallArg::MovedValue { value, .. }
         | RirCallArg::InitFieldProvided(value)
         | RirCallArg::ScopedLambda { callee: value, .. }
         | RirCallArg::EscapingLambda { callee: value, .. }
         | RirCallArg::AnvCallback { callee: value, .. } => {
-            collect_operand_string_literal(program, value, owned);
+            collect_owned_string_literal(program, value, owned);
         }
         RirCallArg::InitFieldOmitted
         | RirCallArg::SharedBorrow(_)
@@ -156,6 +164,16 @@ fn collect_call_arg_string_literals(
         | RirCallArg::MutBorrow(_)
         | RirCallArg::MutPlace(_)
         | RirCallArg::DynBorrow(_) => {}
+    }
+}
+
+fn collect_owned_string_literal(
+    program: &RirProgram,
+    value: &super::rir::RirOwnedValue,
+    owned: &mut HashSet<RirStringLiteralId>,
+) {
+    if let RirOwnedOperand::Value(operand) = &value.value {
+        collect_operand_string_literal(program, operand, owned);
     }
 }
 
@@ -258,12 +276,15 @@ fn stmt_calls_fallible(
                 .any(|operand| operand_has_fallible_place(program, function, operand))
                 || block_calls_fallible(program, fallible, function, &for_.body)
         }
-        RirStmt::DataRefSet { object, value, .. } => {
+        RirStmt::DataRefSet {
+            object, value, ty, ..
+        } => {
             operand_uses_mut_place_param(function, object)
-                || operand_uses_mut_place_param(function, value)
+                || rvalue_uses_mut_place_param(function, value)
                 || operand_has_fallible_place(program, function, object)
-                || operand_has_fallible_place(program, function, value)
-                || operand_ty(program, value).is_some_and(|ty| program.collection_replace_ty(ty))
+                || rvalue_uses_fallible_place(program, function, value)
+                || program.collection_replace_ty(*ty)
+                || rvalue_calls_fallible(program, fallible, function, value)
         }
         RirStmt::PatternMatch(match_) => {
             place_has_fallible_projection(program, function, &match_.subject)
@@ -273,8 +294,8 @@ fn stmt_calls_fallible(
         }
         RirStmt::DynMatch(match_) => {
             let source = match &match_.source {
-                super::rir::RirDynMatchSource::Owned { value, .. } => {
-                    operand_has_fallible_place(program, function, value)
+                super::rir::RirDynMatchSource::Owned(value) => {
+                    owned_value_has_fallible_place(program, function, value)
                 }
                 super::rir::RirDynMatchSource::MutPlace(_)
                 | super::rir::RirDynMatchSource::Borrowed(_) => true,
@@ -285,7 +306,7 @@ fn stmt_calls_fallible(
                 })
         }
         RirStmt::OptionMatch(match_) => {
-            match_.payload_ref
+            match_.payload.is_some_and(RirOptionPayloadBinding::is_ref)
                 || option_subject_fallible(program, function, &match_.subject)
                 || stmt_child_blocks_any(stmt, |block| {
                     block_calls_fallible(program, fallible, function, block)
@@ -306,6 +327,10 @@ fn term_calls_fallible(
         super::rir::RirTerm::Return(Some(operand)) => {
             operand_has_fallible_place(program, function, operand)
         }
+        super::rir::RirTerm::ReturnOwned(owned) => match &owned.value {
+            RirOwnedOperand::Value(value) => operand_has_fallible_place(program, function, value),
+            RirOwnedOperand::Access(_) | RirOwnedOperand::DynBorrow(_) => true,
+        },
         super::rir::RirTerm::None
         | super::rir::RirTerm::Return(None)
         | super::rir::RirTerm::Break(_)
@@ -342,7 +367,11 @@ fn rvalue_calls_fallible(
                     (RirType::Float, RirType::Int)
                 )
             }
-            RirRValue::ListPush { .. }
+            RirRValue::Materialize(super::rir::RirOwnedValue {
+                value: RirOwnedOperand::Access(_),
+                ..
+            })
+            | RirRValue::ListPush { .. }
             | RirRValue::RangeListCopy { .. }
             | RirRValue::MapGet { .. }
             | RirRValue::MapInsert { .. }
@@ -352,9 +381,6 @@ fn rvalue_calls_fallible(
             | RirRValue::MapValueAt { .. }
             | RirRValue::SequenceSlotAt { .. }
             | RirRValue::SliceView { .. }
-            | RirRValue::CellGetCopy { .. }
-            | RirRValue::ScopedPlaceCellGet { .. }
-            | RirRValue::MutPlaceGetCopy { .. }
             | RirRValue::CheckedIterCount { .. } => true,
             RirRValue::DynCall {
                 receiver,
@@ -425,14 +451,12 @@ fn dynamic_call_args(
     args: &[RirCallArg],
 ) -> Option<Vec<RirCallArg>> {
     let receiver = match (receiver, abi) {
-        (RirDynReceiver::Owned { value, .. }, RirParamAbi::Value) => {
-            RirCallArg::Value(value.clone())
-        }
+        (RirDynReceiver::Owned(value), RirParamAbi::Value) => RirCallArg::Value(value.clone()),
         (
-            RirDynReceiver::Owned {
-                value: RirOperand::Place(place),
-                ..
-            },
+            RirDynReceiver::Owned(super::rir::RirOwnedValue {
+                value: RirOwnedOperand::Value(RirOperand::Place(place)),
+                source: super::rir::RirOwnedSource::Reuse(_),
+            }),
             RirParamAbi::SharedBorrow,
         ) => RirCallArg::SharedBorrow(place.clone()),
         (
@@ -474,10 +498,11 @@ fn rvalue_uses_fallible_place(
             }
             RirChild::CallArg(arg) => call_arg_has_fallible_place(program, function, arg),
             RirChild::CaptureArg(capture) => match capture {
-                super::rir::RirLambdaCaptureArg::Readonly { value } => {
-                    operand_has_fallible_place(program, function, value)
+                super::rir::RirLambdaCaptureArg::Owned { value } => {
+                    owned_value_has_fallible_place(program, function, value)
                 }
-                super::rir::RirLambdaCaptureArg::Scoped { place } => {
+                super::rir::RirLambdaCaptureArg::Shared { place }
+                | super::rir::RirLambdaCaptureArg::Scoped { place } => {
                     place_has_fallible_projection(program, function, place)
                 }
                 super::rir::RirLambdaCaptureArg::StackCell { .. }
@@ -504,6 +529,18 @@ fn operand_has_fallible_place(
     }
 }
 
+fn owned_value_has_fallible_place(
+    program: &RirProgram,
+    function: &RirFunction,
+    value: &super::rir::RirOwnedValue,
+) -> bool {
+    match &value.value {
+        RirOwnedOperand::Value(operand) => operand_has_fallible_place(program, function, operand),
+        RirOwnedOperand::Access(place) => mut_place_preparation_fallible(program, place),
+        RirOwnedOperand::DynBorrow(_) => true,
+    }
+}
+
 fn call_arg_has_fallible_place(
     program: &RirProgram,
     function: &RirFunction,
@@ -511,7 +548,6 @@ fn call_arg_has_fallible_place(
 ) -> bool {
     match arg {
         RirCallArg::Value(operand)
-        | RirCallArg::MovedValue { value: operand, .. }
         | RirCallArg::InitFieldProvided(operand)
         | RirCallArg::ScopedLambda {
             callee: operand, ..
@@ -521,7 +557,7 @@ fn call_arg_has_fallible_place(
         }
         | RirCallArg::AnvCallback {
             callee: operand, ..
-        } => operand_has_fallible_place(program, function, operand),
+        } => owned_value_has_fallible_place(program, function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_has_fallible_projection(program, function, place)
         }
@@ -730,7 +766,7 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
         }
         RirStmt::DataRefSet { object, value, .. } => ContextUse::rt_statics()
             .union(operand_context_use(program, function, object))
-            .union(operand_context_use(program, function, value)),
+            .union(rvalue_context_use(program, function, value)),
         RirStmt::SequenceSlotSet {
             collection, value, ..
         } => ContextUse::rt()
@@ -756,8 +792,8 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
             .union(stmt_child_blocks_context_use(program, function, stmt)),
         RirStmt::DynMatch(match_) => {
             let source = match &match_.source {
-                super::rir::RirDynMatchSource::Owned { value, .. } => {
-                    operand_context_use(program, function, value)
+                super::rir::RirDynMatchSource::Owned(value) => {
+                    owned_value_context_use(program, function, value)
                 }
                 super::rir::RirDynMatchSource::MutPlace(place) => {
                     mut_place_context_use(program, function, place).union(ContextUse::rt())
@@ -768,7 +804,11 @@ fn stmt_context_use(program: &RirProgram, function: &RirFunction, stmt: &RirStmt
         }
         RirStmt::OptionMatch(match_) => {
             let subject = option_subject_context_use(program, function, &match_.subject);
-            let payload = match_.payload_ref.then(ContextUse::rt).unwrap_or_default();
+            let payload = match_
+                .payload
+                .is_some_and(RirOptionPayloadBinding::is_ref)
+                .then(ContextUse::rt)
+                .unwrap_or_default();
             subject
                 .union(payload)
                 .union(stmt_child_blocks_context_use(program, function, stmt))
@@ -828,7 +868,14 @@ fn rvalue_context_use(
     function: &RirFunction,
     value: &RirRValue,
 ) -> ContextUse {
-    let mut uses = if rvalue_uses_mut_place_param(function, value) {
+    let mut uses = if rvalue_uses_mut_place_param(function, value)
+        || matches!(
+            value,
+            RirRValue::Materialize(super::rir::RirOwnedValue {
+                value: RirOwnedOperand::Access(_),
+                ..
+            })
+        ) {
         ContextUse::rt()
     } else {
         ContextUse::default()
@@ -880,7 +927,6 @@ fn rvalue_context_use(
             })
         }
         RirRValue::DataRefAlloc { .. }
-        | RirRValue::DataRefGet { .. }
         | RirRValue::List { .. }
         | RirRValue::Map { .. }
         | RirRValue::RangeListCopy { .. } => uses.union(ContextUse::rt_statics()),
@@ -890,12 +936,7 @@ fn rvalue_context_use(
         | RirRValue::MapRemove { .. }
         | RirRValue::MapEntryAt { .. }
         | RirRValue::MapKeyAt { .. }
-        | RirRValue::MapValueAt { .. }
-        | RirRValue::ScopedPlaceCellGet { .. } => uses.union(ContextUse::rt()),
-        RirRValue::MutPlaceGetCopy { place, .. } => uses
-            .union(ContextUse::rt())
-            .union(mut_place_context_use(program, function, place)),
-        RirRValue::CellGetCopy { cell, .. } => uses.union(cell_context_use(program, *cell)),
+        | RirRValue::MapValueAt { .. } => uses.union(ContextUse::rt()),
         RirRValue::Stringify { source_ty, .. }
             if matches!(
                 program.types[source_ty.index()],
@@ -990,10 +1031,11 @@ fn rvalue_operand_context_use(
             }
             RirChild::CallArg(arg) => call_arg_context_use(program, function, arg),
             RirChild::CaptureArg(capture) => match capture {
-                super::rir::RirLambdaCaptureArg::Readonly { value } => {
-                    operand_context_use(program, function, value)
+                super::rir::RirLambdaCaptureArg::Owned { value } => {
+                    owned_value_context_use(program, function, value)
                 }
-                super::rir::RirLambdaCaptureArg::Scoped { place } => {
+                super::rir::RirLambdaCaptureArg::Shared { place }
+                | super::rir::RirLambdaCaptureArg::Scoped { place } => {
                     place_context_use(program, function, place)
                 }
                 super::rir::RirLambdaCaptureArg::StackCell { cell }
@@ -1020,6 +1062,13 @@ fn term_context_use(
         super::rir::RirTerm::Return(Some(operand)) => {
             operand_context_use(program, function, operand)
         }
+        super::rir::RirTerm::ReturnOwned(owned) => match &owned.value {
+            RirOwnedOperand::Value(value) => operand_context_use(program, function, value),
+            RirOwnedOperand::Access(access) => {
+                ContextUse::rt().union(mut_place_context_use(program, function, access))
+            }
+            RirOwnedOperand::DynBorrow(_) => ContextUse::rt(),
+        },
         super::rir::RirTerm::None
         | super::rir::RirTerm::Return(None)
         | super::rir::RirTerm::Break(_)
@@ -1092,13 +1141,13 @@ fn call_arg_context_use(
     arg: &RirCallArg,
 ) -> ContextUse {
     match arg {
-        RirCallArg::Value(operand)
-        | RirCallArg::MovedValue { value: operand, .. }
-        | RirCallArg::InitFieldProvided(operand) => operand_context_use(program, function, operand),
+        RirCallArg::Value(operand) | RirCallArg::InitFieldProvided(operand) => {
+            owned_value_context_use(program, function, operand)
+        }
         RirCallArg::ScopedLambda { callee, .. }
         | RirCallArg::EscapingLambda { callee, .. }
         | RirCallArg::AnvCallback { callee, .. } => {
-            ContextUse::generated_call().union(operand_context_use(program, function, callee))
+            ContextUse::generated_call().union(owned_value_context_use(program, function, callee))
         }
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_context_use(program, function, place)
@@ -1207,6 +1256,18 @@ fn raw_string_projection_uses_statics(
     })
 }
 
+fn owned_value_context_use(
+    program: &RirProgram,
+    function: &RirFunction,
+    value: &super::rir::RirOwnedValue,
+) -> ContextUse {
+    match &value.value {
+        RirOwnedOperand::Value(operand) => operand_context_use(program, function, operand),
+        RirOwnedOperand::Access(place) => mut_place_context_use(program, function, place),
+        RirOwnedOperand::DynBorrow(_) => ContextUse::rt(),
+    }
+}
+
 fn operand_context_use(
     program: &RirProgram,
     function: &RirFunction,
@@ -1294,7 +1355,6 @@ fn mut_place_uses_mut_place_param(function: &RirFunction, arg: &RirMutPlaceArg) 
 fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bool {
     match arg {
         RirCallArg::Value(operand)
-        | RirCallArg::MovedValue { value: operand, .. }
         | RirCallArg::InitFieldProvided(operand)
         | RirCallArg::ScopedLambda {
             callee: operand, ..
@@ -1304,7 +1364,7 @@ fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bo
         }
         | RirCallArg::AnvCallback {
             callee: operand, ..
-        } => operand_uses_mut_place_param(function, operand),
+        } => owned_value_uses_mut_place_param(function, operand),
         RirCallArg::SharedBorrow(place) | RirCallArg::MutBorrow(place) => {
             place_is_mut_place_param(function, place)
         }
@@ -1312,6 +1372,17 @@ fn call_arg_uses_mut_place_param(function: &RirFunction, arg: &RirCallArg) -> bo
         | RirCallArg::MutPlace(_)
         | RirCallArg::DynBorrow(_)
         | RirCallArg::InitFieldOmitted => false,
+    }
+}
+
+fn owned_value_uses_mut_place_param(
+    function: &RirFunction,
+    value: &super::rir::RirOwnedValue,
+) -> bool {
+    match &value.value {
+        RirOwnedOperand::Value(operand) => operand_uses_mut_place_param(function, operand),
+        RirOwnedOperand::Access(place) => mut_place_uses_mut_place_param(function, place),
+        RirOwnedOperand::DynBorrow(_) => false,
     }
 }
 
@@ -1368,10 +1439,11 @@ fn rvalue_uses_mut_place_param(function: &RirFunction, value: &RirRValue) -> boo
             }
             RirChild::CallArg(arg) => call_arg_uses_mut_place_param(function, arg),
             RirChild::CaptureArg(capture) => match capture {
-                super::rir::RirLambdaCaptureArg::Readonly { value } => {
-                    operand_uses_mut_place_param(function, value)
+                super::rir::RirLambdaCaptureArg::Owned { value } => {
+                    owned_value_uses_mut_place_param(function, value)
                 }
-                super::rir::RirLambdaCaptureArg::Scoped { place } => {
+                super::rir::RirLambdaCaptureArg::Shared { place }
+                | super::rir::RirLambdaCaptureArg::Scoped { place } => {
                     place_is_mut_place_param(function, place)
                 }
                 super::rir::RirLambdaCaptureArg::StackCell { .. }

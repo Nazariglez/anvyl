@@ -35,7 +35,7 @@ pub(super) fn direct_native_mut_borrow_supported(
 
 impl PlanCx<'_> {
     pub(super) fn plan_source_mut_place_arg(
-        &self,
+        &mut self,
         function: FunctionId,
         place: &Place,
         locals: &mut Vec<RirLocal>,
@@ -52,7 +52,7 @@ impl PlanCx<'_> {
     }
 
     pub(super) fn plan_mut_place_arg(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
@@ -67,13 +67,20 @@ impl PlanCx<'_> {
     }
 
     fn plan_dataref_mut_place_arg(
-        &self,
+        &mut self,
         function: FunctionId,
         plan: &PlaceAccessPlan,
         locals: &mut Vec<RirLocal>,
     ) -> PlannedMutPlaceArg {
         let mut stmts = vec![];
-        let segment = self.dataref_mut_place_segment(function, plan, locals, &mut stmts);
+        let mut segment = self.dataref_mut_place_segment(function, plan, locals, &mut stmts);
+        let dataref = plan.dataref_plan().expect("dataref mutable-place plan");
+        segment.projections.extend(
+            dataref
+                .remaining
+                .iter()
+                .map(|projection| self.rir_place_projection(projection)),
+        );
         let arg = RirMutPlaceArg::dataref(
             segment.object,
             segment.dataref,

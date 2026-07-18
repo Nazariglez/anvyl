@@ -635,6 +635,69 @@ pub(super) fn string_literal_share(statics: &str, id: RirStringLiteralId) -> Str
     format!("{statics}.{}.share()", string_literal_field(id))
 }
 
+pub(super) fn managed_share_from_ref(value: &str) -> String {
+    format!("(*({value})).share()")
+}
+
+pub(super) fn identity_share_from_ref(value: &str) -> String {
+    format!("(*({value})).clone()")
+}
+
+pub(super) fn callable_share_from_ref(value: &str) -> String {
+    format!("({value}).clone()")
+}
+
+pub(super) fn provider_materialize(path: &anvyx_runtime::RustPath, value: &str) -> String {
+    let path = std::iter::once(path.crate_name.as_str())
+        .chain(path.segments.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("::");
+    format!("{path}({value})")
+}
+
+pub(super) fn materializer_symbol(id: crate::rust::rir::RirMaterializerId) -> String {
+    format!("__anv_materialize_{}", id.index())
+}
+
+pub(super) fn materializer_call(id: crate::rust::rir::RirMaterializerId, value: &str) -> String {
+    format!("{}({value})", materializer_symbol(id))
+}
+
+pub(super) fn materializer_closure(item: &str, body: &str) -> String {
+    format!("|{item}| {body}")
+}
+
+pub(super) fn staged_commit_symbol(id: crate::rust::rir::RirMaterializerId) -> String {
+    format!("__anv_commit_stage_{}", id.index())
+}
+
+pub(super) fn staged_commit_call(id: crate::rust::rir::RirMaterializerId, value: &str) -> String {
+    format!("{}({value})", staged_commit_symbol(id))
+}
+
+pub(super) fn dyn_borrow_materialize_decl(
+    id: crate::rust::rir::RirMaterializerId,
+    ret: &str,
+) -> String {
+    format!(
+        "fn materialize_{}(&mut self, rt: &mut {}) -> {}",
+        id.index(),
+        runtime_ctx_ty_with("'_"),
+        result_ty(ret)
+    )
+}
+
+pub(super) fn dyn_borrow_materialize(
+    value: &str,
+    id: crate::rust::rir::RirMaterializerId,
+) -> String {
+    format!(
+        "({value}).materialize_{}({})?",
+        id.index(),
+        runtime_param_name()
+    )
+}
+
 pub(super) fn string_literal_str(statics: &str, id: RirStringLiteralId) -> String {
     format!("{statics}.{}.as_str()", string_literal_field(id))
 }
@@ -810,10 +873,29 @@ pub(super) fn anv_slice_from_list(root: &str, start: &str, len: &str) -> String 
     )
 }
 
-pub(super) fn anv_slice_from_list_mut(rt: &str, root: &str, start: &str, len: &str) -> String {
+pub(super) fn anv_slice_from_list_mut(
+    rt: &str,
+    root: &str,
+    start: &str,
+    len: &str,
+    materialize: &str,
+) -> String {
     format!(
-        "{}::from_list_mut({rt}, {root}, {start}, {len})?",
+        "unsafe {{ {}::from_list_mut_with({rt}, {root}, {start}, {len}, {materialize}) }}?",
         rt_path("AnvSlice")
+    )
+}
+
+pub(super) fn mut_place_list_slice_view(
+    place: &str,
+    rt: &str,
+    start: &str,
+    end: &str,
+    inclusive: bool,
+    materialize: &str,
+) -> String {
+    format!(
+        "unsafe {{ {place}.slice_view_mut_with({rt}, {start}, {end}, {inclusive}, {materialize}) }}?"
     )
 }
 
@@ -821,7 +903,7 @@ pub(super) fn anv_slice_slice(source: &str, start: &str, len: &str) -> String {
     format!("{source}.slice({start}, {len})")
 }
 
-pub(super) fn anv_slice_copy_range_with(
+pub(super) fn collection_copy_range_with(
     source: &str,
     rt: &str,
     storage_ty: &str,
@@ -841,16 +923,16 @@ pub(super) fn mut_place_slice_view(
     mutable: bool,
     raw: bool,
 ) -> String {
-    let view = if mutable {
-        format!("{place}.slice_view_mut({rt}, {start}, {end}, {inclusive})")
+    debug_assert!(
+        raw || !mutable,
+        "mutable list place view requires a materializer"
+    );
+    let method = if mutable {
+        "slice_view_mut"
     } else {
-        format!("{place}.slice_view({start}, {end}, {inclusive})")
+        "slice_view_with_ctx"
     };
-    if raw {
-        format!("unsafe {{ {view} }}?")
-    } else {
-        format!("{view}?")
-    }
+    format!("unsafe {{ {place}.{method}({rt}, {start}, {end}, {inclusive}) }}?")
 }
 
 pub(super) fn anv_map_from_entries(rt: &str, storage_ty: &str, entries: &str) -> String {
@@ -860,28 +942,45 @@ pub(super) fn anv_map_from_entries(rt: &str, storage_ty: &str, entries: &str) ->
     )
 }
 
-pub(super) fn list_push_ctx_region(value: &str) -> String {
-    format!("{{ value.push(rt, {value})?; Ok(()) }}")
+pub(super) fn list_push_ctx_region(value: &str, materialize: &str) -> String {
+    format!("{{ unsafe {{ value.push_with(rt, {value}, {materialize}) }}?; Ok(()) }}")
 }
 
-pub(super) fn map_insert_region(key: &str, inserted: &str) -> String {
-    format!("{{ value.insert(rt, {key}, {inserted})?; Ok(()) }}")
+pub(super) fn map_insert_region(
+    key: &str,
+    inserted: &str,
+    materialize_key: &str,
+    materialize_value: &str,
+) -> String {
+    format!(
+        "{{ unsafe {{ value.insert_with(rt, {key}, {inserted}, {materialize_key}, {materialize_value}) }}?; Ok(()) }}"
+    )
 }
 
 pub(super) fn map_contains_key_region(key: &str) -> String {
     format!("value.contains_key(rt, &{key})")
 }
 
-pub(super) fn map_remove_region(key: &str) -> String {
-    format!("value.remove(rt, &{key})")
+pub(super) fn map_remove_region(
+    key: &str,
+    materialize_key: &str,
+    materialize_value: &str,
+) -> String {
+    format!("unsafe {{ value.remove_with(rt, &{key}, {materialize_key}, {materialize_value}) }}")
 }
 
 pub(super) fn collection_structural_version(collection: &str) -> String {
     format!("{collection}.structural_version()")
 }
 
-pub(super) fn list_elem_at_shared(list: &str, rt: &str, index: &str, version: &str) -> String {
-    format!("{list}.elem_at_shared({rt}, {index}, {version})")
+pub(super) fn list_elem_at_shared(
+    list: &str,
+    rt: &str,
+    index: &str,
+    version: &str,
+    materialize: &str,
+) -> String {
+    format!("unsafe {{ {list}.elem_at_shared_with({rt}, {index}, {version}, {materialize}) }}")
 }
 
 pub(super) fn list_with_elem_shared_short(
@@ -901,19 +1000,33 @@ pub(super) fn list_with_elem_mut_leaf(
     rt: &str,
     index: &str,
     version: &str,
+    materialize: &str,
     body: &str,
 ) -> String {
     format!(
-        "unsafe {{ {list}.with_elem_mut_leaf({rt}, {index}, {version}, |value| {{ {body} }}) }}"
+        "unsafe {{ {list}.with_elem_mut_leaf({rt}, {index}, {version}, {materialize}, |value| {{ {body} }}) }}"
     )
 }
 
-pub(super) fn slice_elem_at_shared(slice: &str, rt: &str, index: &str) -> String {
-    format!("{slice}.elem_at_shared({rt}, {index})")
+pub(super) fn slice_elem_at_shared(
+    slice: &str,
+    rt: &str,
+    index: &str,
+    materialize: &str,
+) -> String {
+    format!("unsafe {{ {slice}.elem_at_shared_with({rt}, {index}, {materialize}) }}")
 }
 
 pub(super) fn collection_projection_owner(collection: &str) -> String {
     format!("({collection}).__anvyx_projection_owner()")
+}
+
+pub(super) fn collection_staged_owner(collection: &str) -> String {
+    format!("({collection}).__anvyx_staged_owner()")
+}
+
+pub(super) fn collection_commit_staged_owner(collection: &str) -> String {
+    format!("({collection}).__anvyx_commit_staged_owner()")
 }
 
 pub(super) fn slice_with_elem_shared_leaf(
@@ -929,16 +1042,43 @@ pub(super) fn slice_with_elem_mut_leaf(slice: &str, rt: &str, index: &str, body:
     format!("unsafe {{ {slice}.with_elem_mut_leaf({rt}, {index}, |value| {{ {body} }}) }}")
 }
 
-pub(super) fn map_with_value_shared_short(map: &str, rt: &str, key: &str, body: &str) -> String {
-    format!("{map}.with_value_shared_short({rt}, {key}, |value| {{ {body} }})")
+pub(super) fn map_get_with(map: &str, rt: &str, key: &str, materialize_value: &str) -> String {
+    format!("unsafe {{ {map}.get_with({rt}, &{key}, {materialize_value}) }}?")
 }
 
-pub(super) fn map_key_at_shared(map: &str, rt: &str, index: &str, version: &str) -> String {
-    format!("{map}.key_at_shared({rt}, {index}, {version})?")
+pub(super) fn map_key_at_shared(
+    map: &str,
+    rt: &str,
+    index: &str,
+    version: &str,
+    materialize_key: &str,
+) -> String {
+    format!("unsafe {{ {map}.key_at_shared_with({rt}, {index}, {version}, {materialize_key}) }}?")
 }
 
-pub(super) fn map_value_at_shared(map: &str, rt: &str, index: &str, version: &str) -> String {
-    format!("{map}.value_at_shared({rt}, {index}, {version})?")
+pub(super) fn map_value_at_shared(
+    map: &str,
+    rt: &str,
+    index: &str,
+    version: &str,
+    materialize_value: &str,
+) -> String {
+    format!(
+        "unsafe {{ {map}.value_at_shared_with({rt}, {index}, {version}, {materialize_value}) }}?"
+    )
+}
+
+pub(super) fn map_entry_at_shared(
+    map: &str,
+    rt: &str,
+    index: &str,
+    version: &str,
+    materialize_key: &str,
+    materialize_value: &str,
+) -> String {
+    format!(
+        "unsafe {{ {map}.entry_at_shared_with({rt}, {index}, {version}, {materialize_key}, {materialize_value}) }}?"
+    )
 }
 
 pub(super) fn map_with_value_mut_short(
@@ -946,10 +1086,12 @@ pub(super) fn map_with_value_mut_short(
     rt: &str,
     index: &str,
     version: &str,
+    materialize_key: &str,
+    materialize_value: &str,
     body: &str,
 ) -> String {
     format!(
-        "unsafe {{ {map}.with_value_mut_short({rt}, {index}, {version}, |value| {{ {body} }}) }}"
+        "unsafe {{ {map}.with_value_mut_short_with({rt}, {index}, {version}, {materialize_key}, {materialize_value}, |value| {{ {body} }}) }}"
     )
 }
 
@@ -969,8 +1111,20 @@ pub(super) fn mut_place_begin_shape_loan(place: &str, runtime: &str) -> String {
     )
 }
 
-pub(super) fn map_begin_value_loan_region(key: &str) -> String {
-    format!("value.begin_value_loan_by_key(rt, &{key})")
+pub(super) fn mut_place_begin_staged_shape_loan(place: &str, runtime: &str) -> String {
+    format!("unsafe {{ {place}.begin_shape_loan_with_ctx({runtime}) }}?")
+}
+
+pub(super) fn mut_place_map_value_loan(
+    place: &str,
+    rt: &str,
+    key: &str,
+    materialize_key: &str,
+    materialize_value: &str,
+) -> String {
+    format!(
+        "unsafe {{ {place}.map_value_loan_with({rt}, &{key}, {materialize_key}, {materialize_value}) }}?"
+    )
 }
 
 pub(super) fn shape_loan_version(loan: &str) -> String {
@@ -1226,25 +1380,43 @@ pub(super) fn iter_step_by(iter: &str, step: &str) -> String {
 mod tests {
     use super::{
         anv_list_ty, anv_map_from_entries, anv_map_ty, anv_string_from, box_pin_struct_start,
-        callback_check_identity, callback_record_heap_type_field, checked_index,
-        checked_iter_step_by, dataref_place_heap_type_access, dataref_place_heap_type_field,
-        dataref_place_ops_ty, erased_handle_ty, generated_call, generated_runtime_inner_symbol,
-        generated_runtime_symbol, global_begin_projected_loan, global_set_or_replace_collection,
-        heap_access_error, heap_register, heap_scope, heap_scope_owned, heap_type_access,
-        lambda_cell_ctor, map_heap_access_error, mut_place_access, mut_place_dataref,
+        callable_share_from_ref, callback_check_identity, callback_record_heap_type_field,
+        checked_index, checked_iter_step_by, dataref_place_heap_type_access,
+        dataref_place_heap_type_field, dataref_place_ops_ty, erased_handle_ty, generated_call,
+        generated_runtime_inner_symbol, generated_runtime_symbol, global_begin_projected_loan,
+        global_set_or_replace_collection, heap_access_error, heap_register, heap_scope,
+        heap_scope_owned, heap_type_access, identity_share_from_ref, lambda_cell_ctor,
+        managed_share_from_ref, map_heap_access_error, mut_place_access, mut_place_dataref,
         mut_place_get_copy, mut_place_global, mut_place_heap_cell, mut_place_local,
         mut_place_local_raw, mut_place_projected, mut_place_reborrow, mut_place_replace_collection,
         mut_place_scoped_cell, mut_place_set, mut_place_stack_cell, mut_place_ty,
         non_null_cast_mut, optional_payload_ops_ctor, optional_payload_ops_ty, owner_attach,
         owner_begin_shutdown, owner_enter, owner_enter_current, owner_entry_ptr,
         owner_suspend_for_provider, phantom_pinned_ty, phantom_pinned_value, pin_box_ty,
-        pin_get_unchecked_mut, projection_ops_ty, result_ty, rt_heap_alloc, rt_heap_erase,
-        rt_heap_try_with_erased, rt_heap_try_with_erased_mut, rt_heap_with, rt_heap_with_mut,
-        runtime_ctx_ty_with, runtime_owner_handle_new, runtime_owner_handle_ty, runtime_param_name,
-        runtime_validate_reentry, safepoint_state_ty, scoped_mut_place_cell_new,
-        scoped_mut_place_cell_ty, stack_lambda_cell_ctor, stack_lambda_cell_ty, trace_crate_attr,
-        trace_derive, trace_root_set_ty, visitor_ty,
+        pin_get_unchecked_mut, projection_ops_ty, provider_materialize, result_ty, rt_heap_alloc,
+        rt_heap_erase, rt_heap_try_with_erased, rt_heap_try_with_erased_mut, rt_heap_with,
+        rt_heap_with_mut, runtime_ctx_ty_with, runtime_owner_handle_new, runtime_owner_handle_ty,
+        runtime_param_name, runtime_validate_reentry, safepoint_state_ty,
+        scoped_mut_place_cell_new, scoped_mut_place_cell_ty, stack_lambda_cell_ctor,
+        stack_lambda_cell_ty, trace_crate_attr, trace_derive, trace_root_set_ty, visitor_ty,
     };
+
+    #[test]
+    fn renders_reusable_materializer_calls() {
+        assert_eq!(managed_share_from_ref("value"), "(*(value)).share()");
+        assert_eq!(identity_share_from_ref("value"), "(*(value)).clone()");
+        assert_eq!(callable_share_from_ref("value"), "(value).clone()");
+        assert_eq!(
+            provider_materialize(
+                &anvyx_runtime::RustPath {
+                    crate_name: "host".to_string(),
+                    segments: vec!["shim".to_string(), "materialize".to_string()],
+                },
+                "value",
+            ),
+            "host::shim::materialize(value)"
+        );
+    }
 
     #[test]
     fn renders_runtime_types() {

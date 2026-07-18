@@ -4,9 +4,9 @@ use anvyx_frontend::{
     air::{
         self, AggregateCtor, AggregateId, AggregateKind, CallArg, Callee, ConstId, ConstValue,
         EnumId, ExternDecl, ExternId, Function, FunctionId, FunctionKind, GlobalId, Local, LocalId,
-        LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
-        PlaceRoot, Program, RValue, ReturnMode, TypeData, TypeId, TypePassClasses, ValueUse,
-        VariantDecl, VariantShape, VerifiedProgram,
+        LocalKind, Module, Mutability, Operand, OwnedValue, Param, ParamEscape, ParamMode,
+        ParamRole, Place, PlaceRoot, Program, RValue, ReturnMode, TypeData, TypeId,
+        TypePassClasses, ValueSource, VariantDecl, VariantShape, VerifiedProgram,
     },
     ast::{FormatKind, FormatSign, FormatSpec},
 };
@@ -18,7 +18,8 @@ use super::{
         PlaceAccessCx, PlaceAccessGapKind, PlaceAccessIntent, PlaceAccessPlan, PlaceAccessRoot,
     },
     rep_policy::{
-        LambdaStorageFamily, LambdaStorageGap, RustRecipePosition, RustRepresentationPlan,
+        LambdaStorageFamily, LambdaStorageGap, RustCallableMaterializer, RustMaterializerGraph,
+        RustRecipePosition, RustRepresentationPlan,
     },
     rir,
 };
@@ -32,10 +33,20 @@ impl RustBackendProfile {
         native_providers: &[RustProviderSupport],
     ) -> Result<(), Vec<RustBackendProfileError>> {
         let program = program.program();
+        let classes = TypePassClasses::analyze(program);
+        let mut materializers = RustMaterializerGraph::with_native_support(native_providers);
+        materializers.set_callable_materializers((0..program.type_arena.len()).filter_map(
+            |index| {
+                let ty = TypeId::from_index(index);
+                matches!(program.type_arena.data(ty), TypeData::Function(_))
+                    .then_some((ty, RustCallableMaterializer::Share))
+            },
+        ));
         let mut cx = ProfileCx {
             program,
             native_providers,
-            classes: TypePassClasses::analyze(program),
+            classes,
+            materializers,
             retained_callbacks: native_call::air_has_retained_callbacks(program),
             errors: vec![],
         };
@@ -112,6 +123,7 @@ struct ProfileCx<'a> {
     program: &'a Program,
     native_providers: &'a [RustProviderSupport],
     classes: TypePassClasses,
+    materializers: RustMaterializerGraph,
     retained_callbacks: bool,
     errors: Vec<RustBackendProfileError>,
 }
@@ -208,7 +220,7 @@ impl ProfileCx<'_> {
         self.check_type_ref(ProfileSite::Type(id), id);
     }
 
-    fn aggregate_decl_supported(&self, aggregate: AggregateId) -> bool {
+    fn aggregate_decl_supported(&mut self, aggregate: AggregateId) -> bool {
         let decl = self.program.aggregate(aggregate);
         decl.kind == AggregateKind::Struct
             && decl.fields.iter().all(|field| {
@@ -220,7 +232,7 @@ impl ProfileCx<'_> {
             })
     }
 
-    fn dataref_decl_supported(&self, aggregate: AggregateId) -> bool {
+    fn dataref_decl_supported(&mut self, aggregate: AggregateId) -> bool {
         let decl = self.program.aggregate(aggregate);
         decl.kind == AggregateKind::DataRef
             && decl.fields.iter().all(|field| {
@@ -232,7 +244,7 @@ impl ProfileCx<'_> {
             })
     }
 
-    fn enum_decl_supported(&self, enm: EnumId) -> bool {
+    fn enum_decl_supported(&mut self, enm: EnumId) -> bool {
         self.program.enum_decl(enm).variants.iter().all(|variant| {
             variant_field_tys(variant).all(|ty| {
                 self.stored_payload_supported(ty)
@@ -244,7 +256,7 @@ impl ProfileCx<'_> {
         })
     }
 
-    fn extern_type_supported(&self, ext: air::ExternTypeId) -> bool {
+    fn extern_type_supported(&mut self, ext: air::ExternTypeId) -> bool {
         let decl = self.program.extern_type(ext);
         match decl.rep {
             air::ExternRep::Shared => true,
@@ -364,7 +376,9 @@ impl ProfileCx<'_> {
             match capture {
                 air::LambdaCaptureDecl::NoRuntime { .. } => {}
                 air::LambdaCaptureDecl::ReadonlyLocal { ty, .. } => {
-                    if !self.policy().value_place_shareable(*ty) || self.type_contains_slice(*ty) {
+                    if !self.reusable_type_supported(*ty, RustRecipePosition::Value)
+                        || self.type_contains_slice(*ty)
+                    {
                         self.push(site, ProfileErrorKind::UnsupportedLambdaCapture);
                     }
                 }
@@ -393,7 +407,7 @@ impl ProfileCx<'_> {
     }
 
     fn pattern_alias_subject_supported(plan: &PlaceAccessPlan) -> bool {
-        plan.payload_alias_direct_place()
+        plan.payload_alias_direct_place() || plan.dataref_plan().is_some()
     }
 
     fn pattern_match_has_alias_binding(match_: &air::AirPatternMatch) -> bool {
@@ -469,13 +483,23 @@ impl ProfileCx<'_> {
                         {
                             self.push(site, ProfileErrorKind::UnsupportedRValue);
                         }
+                        for binding in arm
+                            .alternatives
+                            .iter()
+                            .flat_map(|alternative| &alternative.bindings)
+                            .filter(|binding| binding.mode == air::AirPatternBindingMode::Owned)
+                        {
+                            if !self.reusable_supported(binding.ty) {
+                                self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                            }
+                        }
                         self.check_air_block(function, &arm.block);
                     }
                 }
                 air::AirStmt::DynMatch(match_) => {
                     match &match_.source {
-                        air::AirDynMatchSource::Owned { value, .. } => {
-                            self.check_operand(site, value);
+                        air::AirDynMatchSource::Owned(value) => {
+                            self.check_owned_operand(site, value, RustRecipePosition::Value);
                         }
                         air::AirDynMatchSource::Mutable(place) => {
                             if !matches!(place.root, PlaceRoot::DynBorrowParam(_)) {
@@ -509,8 +533,7 @@ impl ProfileCx<'_> {
                         && !match_.payload_ref
                         && let TypeData::Optional(inner) =
                             self.program.type_arena.data(match_.discr.ty)
-                        && !matches!(self.program.type_arena.data(*inner), TypeData::Dyn(_))
-                        && !self.policy().value_from_ref_supported(*inner)
+                        && !self.reusable_supported(*inner)
                     {
                         self.push(site, ProfileErrorKind::NonCopyValueRequired);
                     }
@@ -557,13 +580,41 @@ impl ProfileCx<'_> {
                         &scope.root,
                         CollectionAccessOp::slot(&scope.slots),
                     );
+                    if let TypeData::Array { elem, .. } =
+                        self.program.type_arena.data(scope.root.ty)
+                        && scope.slots.iter().any(|slot| {
+                            slot.kind == air::AirCollectionSlotKind::SequenceElement
+                                && !slot.mutable
+                        })
+                        && !self.reusable_type_supported(
+                            *elem,
+                            RustRecipePosition::StoredPayload(
+                                LambdaStorageFamily::FixedArrayElement,
+                            ),
+                        )
+                    {
+                        self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                    }
                     self.check_air_block(function, &scope.body);
                 }
             }
         }
-        if let air::AirTail::Return(Some(value)) = &body.tail {
-            let site = ProfileSite::Terminator(function);
-            self.check_operand(site, value);
+        let site = ProfileSite::Terminator(function);
+        match &body.tail {
+            air::AirTail::Return(Some(value)) => self.check_operand(site, value),
+            air::AirTail::ReturnOwned(owned) => {
+                self.check_operand(site, &owned.value);
+                if matches!(owned.source, ValueSource::Reusable)
+                    && !self.reusable_operand_supported(&owned.value, RustRecipePosition::Value)
+                {
+                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
+                }
+            }
+            air::AirTail::None
+            | air::AirTail::Return(None)
+            | air::AirTail::Break(_)
+            | air::AirTail::Continue(_)
+            | air::AirTail::Unreachable => {}
         }
     }
 
@@ -665,8 +716,15 @@ impl ProfileCx<'_> {
 
     fn check_rvalue(&mut self, site: ProfileSite, value: &RValue) {
         match value {
-            RValue::DynPack { value, .. } | RValue::DynWeaken { value, .. } => {
-                self.check_operand(site, value);
+            RValue::DynPack { value, .. } => self.check_owned_operand(
+                site,
+                value,
+                RustRecipePosition::StoredPayload(LambdaStorageFamily::DynamicPayload),
+            ),
+            RValue::DynWeaken { value, .. }
+            | RValue::Materialize(value)
+            | RValue::FunctionValue { value, .. } => {
+                self.check_owned_operand(site, value, RustRecipePosition::Value);
             }
             RValue::DynCall {
                 receiver,
@@ -675,7 +733,9 @@ impl ProfileCx<'_> {
                 args,
             } => {
                 match receiver {
-                    air::DynReceiver::Owned(value) => self.check_operand(site, value),
+                    air::DynReceiver::Owned(value) => {
+                        self.check_owned_operand(site, value, RustRecipePosition::Value);
+                    }
                     air::DynReceiver::Borrowed(_) => {}
                     air::DynReceiver::MutableOwned(place) => {
                         let Some(function) = Self::current_function_id(site) else {
@@ -706,14 +766,7 @@ impl ProfileCx<'_> {
             }
             RValue::FunctionRef { .. } => {}
             RValue::FlagStatic { ty, .. } => self.check_type_ref(site, *ty),
-            RValue::Use(operand) | RValue::FunctionValue { value: operand, .. } => {
-                self.check_operand(site, operand);
-                if self.non_shareable_value_operand(operand)
-                    && !self.unbound_movable_temp_operand(site, operand)
-                {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                }
-            }
+            RValue::Use(operand) => self.check_operand(site, operand),
             RValue::Unary { value, ty, .. } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *ty);
@@ -739,9 +792,11 @@ impl ProfileCx<'_> {
                     }
                 }
             }
-            RValue::DynDowncast { value, target, .. }
-            | RValue::Cast { value, target }
-            | RValue::RawProject { value, target } => {
+            RValue::DynDowncast { value, target, .. } => {
+                self.check_owned_operand(site, value, RustRecipePosition::Value);
+                self.check_type_ref(site, *target);
+            }
+            RValue::Cast { value, target } | RValue::RawProject { value, target } => {
                 self.check_operand(site, value);
                 self.check_type_ref(site, *target);
             }
@@ -751,13 +806,12 @@ impl ProfileCx<'_> {
                 self.check_type_ref(site, *ty);
             }
             RValue::OptionalSome { value, ty } => {
-                self.check_operand(site, value);
+                self.check_owned_operand(
+                    site,
+                    value,
+                    RustRecipePosition::StoredPayload(LambdaStorageFamily::OptionalPayload),
+                );
                 self.check_type_ref(site, *ty);
-                if self.non_shareable_value_operand(value)
-                    && !self.unbound_movable_temp_operand(site, value)
-                {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                }
             }
             RValue::Stringify { value, source_ty } => {
                 self.check_operand(site, value);
@@ -814,12 +868,13 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
                 };
-                self.check_operand(site, value);
-                if self.operand_ty(value) != *elem {
+                self.check_owned_operand(
+                    site,
+                    value,
+                    RustRecipePosition::StoredPayload(LambdaStorageFamily::ListElement),
+                );
+                if self.operand_ty(&value.value) != *elem {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
-                }
-                if self.non_shareable_value_operand(value) {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
                 }
             }
             RValue::SliceView {
@@ -828,7 +883,10 @@ impl ProfileCx<'_> {
                 end,
                 ty,
                 ..
-            } => self.check_range_rvalue(site, source, *start, *end, *ty, false),
+            } => {
+                self.check_collection_access(site, source, CollectionAccessOp::SliceView);
+                self.check_range_rvalue(site, source, *start, *end, *ty, false);
+            }
             RValue::RangeListCopy {
                 source,
                 start,
@@ -879,8 +937,12 @@ impl ProfileCx<'_> {
                         );
                     }
                 }
-                self.check_operand(site, key);
-                self.check_operand(site, value);
+                self.check_owned_operand(site, key, RustRecipePosition::MapKey);
+                self.check_owned_operand(
+                    site,
+                    value,
+                    RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+                );
                 let TypeData::Map {
                     key: expected_key,
                     value: expected_value,
@@ -890,8 +952,8 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
                 };
-                if self.operand_ty(key) != *expected_key
-                    || self.operand_ty(value) != *expected_value
+                if self.operand_ty(&key.value) != *expected_key
+                    || self.operand_ty(&value.value) != *expected_value
                 {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
@@ -937,7 +999,7 @@ impl ProfileCx<'_> {
                             }
                         }
                         air::LambdaCaptureArg::ReadonlyLocal { value } => {
-                            self.check_operand(site, value);
+                            self.check_owned_operand(site, value, RustRecipePosition::Value);
                         }
                         air::LambdaCaptureArg::ScopedLocal { place } => {
                             self.check_place(site, place);
@@ -969,7 +1031,7 @@ impl ProfileCx<'_> {
         &mut self,
         site: ProfileSite,
         kind: &AggregateCtor,
-        fields: &[Operand],
+        fields: &[OwnedValue<Operand>],
         ty: TypeId,
     ) {
         match kind {
@@ -993,7 +1055,11 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
                 let expected = decl.fields.iter().map(|field| field.ty).collect::<Vec<_>>();
-                self.check_value_fields(site, fields, expected);
+                let family = match expected_kind {
+                    AggregateKind::Struct => LambdaStorageFamily::StructField,
+                    AggregateKind::DataRef => LambdaStorageFamily::DataRefProjection,
+                };
+                self.check_value_fields(site, fields, expected, family);
             }
             AggregateCtor::EnumVariant { enum_id, variant } => {
                 if !matches!(self.program.type_arena.data(ty), TypeData::Enum(id) if id == enum_id)
@@ -1014,9 +1080,9 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
                 let expected = variant_field_tys(variant).collect::<Vec<_>>();
-                self.check_value_fields(site, fields, expected);
+                self.check_value_fields(site, fields, expected, LambdaStorageFamily::EnumPayload);
             }
-            AggregateCtor::Array => {
+            AggregateCtor::Array | AggregateCtor::ArrayFill => {
                 let TypeData::Array { elem, len } = self.program.type_arena.data(ty) else {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
@@ -1024,14 +1090,24 @@ impl ProfileCx<'_> {
                 if *len != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                self.check_value_fields(site, fields, std::iter::repeat_n(*elem, fields.len()));
+                self.check_value_fields(
+                    site,
+                    fields,
+                    std::iter::repeat_n(*elem, fields.len()),
+                    LambdaStorageFamily::FixedArrayElement,
+                );
             }
             AggregateCtor::List => {
                 let TypeData::List(elem) = self.program.type_arena.data(ty) else {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                     return;
                 };
-                self.check_value_fields(site, fields, std::iter::repeat_n(*elem, fields.len()));
+                self.check_value_fields(
+                    site,
+                    fields,
+                    std::iter::repeat_n(*elem, fields.len()),
+                    LambdaStorageFamily::ListElement,
+                );
             }
             AggregateCtor::Map => {
                 let TypeData::Map { key, value, .. } = self.program.type_arena.data(ty) else {
@@ -1042,9 +1118,16 @@ impl ProfileCx<'_> {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
                 for entry in fields.chunks_exact(2) {
-                    for (operand, expected) in [(&entry[0], *key), (&entry[1], *value)] {
-                        self.check_operand(site, operand);
-                        if self.operand_ty(operand) != expected {
+                    for (operand, expected, position) in [
+                        (&entry[0], *key, RustRecipePosition::MapKey),
+                        (
+                            &entry[1],
+                            *value,
+                            RustRecipePosition::StoredPayload(LambdaStorageFamily::MapValue),
+                        ),
+                    ] {
+                        self.check_owned_operand(site, operand, position);
+                        if self.operand_ty(&operand.value) != expected {
                             self.push(site, ProfileErrorKind::UnsupportedRValue);
                         }
                     }
@@ -1058,7 +1141,12 @@ impl ProfileCx<'_> {
                 if elems.len() != fields.len() {
                     self.push(site, ProfileErrorKind::UnsupportedRValue);
                 }
-                self.check_value_fields(site, fields, elems.iter().copied());
+                self.check_value_fields(
+                    site,
+                    fields,
+                    elems.iter().copied(),
+                    LambdaStorageFamily::TupleField,
+                );
             }
         }
     }
@@ -1066,18 +1154,14 @@ impl ProfileCx<'_> {
     fn check_value_fields(
         &mut self,
         site: ProfileSite,
-        fields: &[Operand],
+        fields: &[OwnedValue<Operand>],
         expected: impl IntoIterator<Item = TypeId>,
+        family: LambdaStorageFamily,
     ) {
         for (operand, expected) in fields.iter().zip(expected) {
-            self.check_operand(site, operand);
-            if self.operand_ty(operand) != expected {
+            self.check_owned_operand(site, operand, RustRecipePosition::StoredPayload(family));
+            if self.operand_ty(&operand.value) != expected {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
-            }
-            if self.non_shareable_value_operand(operand)
-                && !self.unbound_movable_temp_operand(site, operand)
-            {
-                self.push(site, ProfileErrorKind::NonCopyValueRequired);
             }
         }
     }
@@ -1091,7 +1175,10 @@ impl ProfileCx<'_> {
         ty: TypeId,
         copied: bool,
     ) {
-        self.check_range_locals(site, source, start, end);
+        if copied {
+            self.check_place(site, source);
+        }
+        self.check_range_locals(site, start, end);
         let source_elem = match self.program.type_arena.data(source.ty) {
             TypeData::Array { elem, .. } | TypeData::List(elem) | TypeData::Slice(elem) => *elem,
             _ => {
@@ -1108,7 +1195,7 @@ impl ProfileCx<'_> {
         };
         if source_elem != result_elem {
             self.push(site, ProfileErrorKind::UnsupportedRValue);
-        } else if copied && !self.policy().value_from_ref_supported(result_elem) {
+        } else if copied && !self.reusable_supported(result_elem) {
             self.push(site, ProfileErrorKind::NonCopyValueRequired);
         }
     }
@@ -1124,14 +1211,7 @@ impl ProfileCx<'_> {
             .ok()
     }
 
-    fn check_range_locals(
-        &mut self,
-        site: ProfileSite,
-        source: &Place,
-        start: LocalId,
-        end: LocalId,
-    ) {
-        self.check_place(site, source);
+    fn check_range_locals(&mut self, site: ProfileSite, start: LocalId, end: LocalId) {
         for local in [start, end] {
             let Some(data) = self.current_local(site, local) else {
                 self.push(site, ProfileErrorKind::UnsupportedRValue);
@@ -1200,8 +1280,8 @@ impl ProfileCx<'_> {
     fn call_arg_native_facts(&self, arg: &CallArg) -> native_call::NativeArgFacts {
         let ty = match arg {
             CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
-            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                Some(self.operand_ty(operand))
+            CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+                Some(self.operand_ty(&owned.value))
             }
             CallArg::DynBorrow(borrow) => Some(borrow.ty),
             CallArg::SharedStringConst(_) | CallArg::InitFieldOmitted => None,
@@ -1245,13 +1325,8 @@ impl ProfileCx<'_> {
                 }
                 air::DynBorrowSource::Borrowed(_) => {}
             },
-            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                self.check_operand(site, operand);
-                if self.non_shareable_value_operand(operand)
-                    && !self.unbound_movable_temp_operand(site, operand)
-                {
-                    self.push(site, ProfileErrorKind::NonCopyValueRequired);
-                }
+            CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+                self.check_owned_operand(site, owned, RustRecipePosition::Value);
             }
             CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
             CallArg::SharedBorrow(place) => {
@@ -1352,46 +1427,29 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn unbound_movable_temp_operand(&self, site: ProfileSite, operand: &Operand) -> bool {
-        let (Some(function), Operand::Place(place)) = (Self::current_function_id(site), operand)
-        else {
-            return false;
-        };
-        let Some(local) = place.root.local() else {
-            return false;
-        };
-        let local = &self.program.functions[function.index()].locals[local.index()];
-        place.projection.is_empty()
-            && (local.kind == LocalKind::Temp
-                || (matches!(
-                    self.program.type_arena.data(place.ty),
-                    TypeData::Function(_)
-                ) && local.binding.is_none()))
+    fn check_owned_operand(
+        &mut self,
+        site: ProfileSite,
+        owned: &OwnedValue<Operand>,
+        position: RustRecipePosition,
+    ) {
+        self.check_operand(site, &owned.value);
+        if owned.source == ValueSource::Reusable
+            && !self.reusable_operand_supported(&owned.value, position)
+        {
+            self.push(site, ProfileErrorKind::NonCopyValueRequired);
+        }
     }
 
-    fn non_shareable_value_operand(&self, operand: &Operand) -> bool {
+    fn reusable_operand_supported(
+        &mut self,
+        operand: &Operand,
+        position: RustRecipePosition,
+    ) -> bool {
         let Operand::Place(place) = operand else {
-            return false;
+            return true;
         };
-        let ty = self.program.type_arena.data(place.ty);
-        let reconstructable = matches!(
-            ty,
-            TypeData::Aggregate(_)
-                | TypeData::Tuple(_)
-                | TypeData::Enum(_)
-                | TypeData::Array { .. }
-        ) && self
-            .policy()
-            .storage_supported(place.ty, LambdaStorageFamily::UnknownOrigin)
-            .is_ok();
-        !matches!(ty, TypeData::Slice(_) | TypeData::Dyn(_))
-            && self.non_copy_type(place.ty)
-            && !self.policy().value_place_shareable(place.ty)
-            && !reconstructable
-    }
-
-    fn non_copy_type(&self, ty: TypeId) -> bool {
-        !self.policy().copyable(ty)
+        self.reusable_type_supported(place.ty, position)
     }
 
     fn operand_ty(&self, operand: &Operand) -> TypeId {
@@ -1422,8 +1480,14 @@ impl ProfileCx<'_> {
                     }
                 }
                 self.check_place(site, place);
+                if matches!(place.root, PlaceRoot::Global(_))
+                    && place.projection.is_empty()
+                    && !self.reusable_type_supported(place.ty, RustRecipePosition::Global)
+                {
+                    self.push(site, ProfileErrorKind::UnsupportedGlobalValueRead);
+                }
                 if self.place_capture_cell(site, place).is_some()
-                    && !self.policy().value_place_shareable(place.ty)
+                    && !self.reusable_type_supported(place.ty, RustRecipePosition::Value)
                 {
                     self.push(site, ProfileErrorKind::UnsupportedLambdaCell);
                 }
@@ -1712,9 +1776,7 @@ impl ProfileCx<'_> {
                 true
             }
             TypeData::Slice(elem) => {
-                if !self.reject_function_container(site, *elem) {
-                    self.check_type_ref(site, *elem);
-                }
+                self.check_type_ref(site, *elem);
                 true
             }
             TypeData::List(elem) => {
@@ -1832,11 +1894,21 @@ impl ProfileCx<'_> {
         }
     }
 
-    fn stored_payload_supported(&self, ty: TypeId) -> bool {
-        self.policy()
-            .recipe_for(
+    fn reusable_supported(&mut self, ty: TypeId) -> bool {
+        self.reusable_type_supported(ty, RustRecipePosition::Value)
+    }
+
+    fn reusable_type_supported(&mut self, ty: TypeId, position: RustRecipePosition) -> bool {
+        let plan = RustRepresentationPlan::new(self.program, &self.classes);
+        self.materializers.action_for(plan, ty, position).is_ok()
+    }
+
+    fn stored_payload_supported(&mut self, ty: TypeId) -> bool {
+        let plan = RustRepresentationPlan::new(self.program, &self.classes);
+        self.materializers
+            .action_for(
+                plan,
                 ty,
-                ValueUse::Store,
                 RustRecipePosition::StoredPayload(LambdaStorageFamily::UnknownOrigin),
             )
             .is_ok()

@@ -198,7 +198,7 @@ fn method_owner_returns_use_export_name_and_owned_abi() {
         .iter()
         .find(|binding| matches!(&binding.selector, ExternMemberSelector::Method(name) if name == "duplicate"))
         .unwrap();
-    assert_eq!(export.descriptor.methods[0].signature.ret, owner);
+    assert_eq!(export.methods[0].signature.ret, owner);
     assert!(matches!(
         &duplicate.abi.ret,
         RustReturnAbi::OwnedNamed(ExternTypeExpr::Named { name, .. }) if name == "OwnerReturns"
@@ -267,9 +267,9 @@ fn explicit_owner_ref_return_stays_value_abi() {
 fn renamed_owner_returns_use_export_name() {
     let export = __anvyx_methods_renamedownerreturn();
 
-    assert_eq!(export.descriptor.name, "ExportedOwner");
+    assert_eq!(export.name, "ExportedOwner");
     assert!(matches!(
-        &export.descriptor.methods[0].signature.ret,
+        &export.methods[0].signature.ret,
         ExternTypeExpr::Named { name, .. } if name == "ExportedOwner"
     ));
     assert!(matches!(
@@ -282,7 +282,6 @@ fn renamed_owner_returns_use_export_name() {
 fn scoped_lambda_method_uses_callback_descriptor_and_no_hidden_ctx() {
     let export = __anvyx_methods_callbackops();
     let method = export
-        .descriptor
         .statics
         .iter()
         .find(|method| method.name == "each")
@@ -320,7 +319,6 @@ fn scoped_lambda_method_uses_callback_descriptor_and_no_hidden_ctx() {
 fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
     let export = __anvyx_methods_callbackops();
     let method = export
-        .descriptor
         .statics
         .iter()
         .find(|method| method.name == "retain")
@@ -348,7 +346,6 @@ fn escaping_lambda_static_method_uses_escaping_callback_descriptor() {
 fn escaping_lambda_method_receiver_uses_escaping_callback_descriptor() {
     let export = __anvyx_methods_callbackops();
     let method = export
-        .descriptor
         .methods
         .iter()
         .find(|method| method.name == "retain_on_self")
@@ -376,13 +373,13 @@ fn escaping_lambda_method_receiver_uses_escaping_callback_descriptor() {
 #[test]
 fn init_supports_visible_result_and_runtime_result_metadata() {
     let default = __anvyx_methods_defaultinit();
-    let default_init = default.descriptor.init.as_ref().unwrap();
+    let default_init = default.init.as_ref().unwrap();
     assert!(default_init.params.is_empty());
     assert!(default_init.field_init.is_empty());
     assert!(default_init.presence_init.is_empty());
 
     let presence = __anvyx_methods_presenceinit();
-    let presence_init = presence.descriptor.init.as_ref().unwrap();
+    let presence_init = presence.init.as_ref().unwrap();
     assert_eq!(presence_init.params.len(), 1);
     assert_eq!(presence_init.params[0].ty, ExternTypeExpr::String);
     assert!(presence_init.field_init.is_empty());
@@ -398,7 +395,7 @@ fn init_supports_visible_result_and_runtime_result_metadata() {
     );
 
     let visible = __anvyx_methods_fallibleinit();
-    let visible_init = visible.descriptor.init.as_ref().unwrap();
+    let visible_init = visible.init.as_ref().unwrap();
     assert_eq!(visible_init.params.len(), 1);
     assert_eq!(visible_init.field_init, ["ok"]);
     assert!(!visible_init.effects.fallible);
@@ -415,7 +412,7 @@ fn init_supports_visible_result_and_runtime_result_metadata() {
     ));
 
     let hidden = __anvyx_methods_runtimeresultinit();
-    let hidden_init = hidden.descriptor.init.as_ref().unwrap();
+    let hidden_init = hidden.init.as_ref().unwrap();
     assert_eq!(
         hidden_init.ret,
         ExternTypeExpr::Named {
@@ -442,7 +439,7 @@ fn init_supports_visible_result_and_runtime_result_metadata() {
 fn ctx_method_hides_ctx_from_metadata_and_wrapper_uses_ctx_first() {
     let export = __anvyx_methods_ctxbox();
 
-    assert_eq!(export.descriptor.methods[0].signature.params.len(), 1);
+    assert_eq!(export.methods[0].signature.params.len(), 1);
     assert_eq!(
         export.bindings[0].abi.params,
         [
@@ -532,6 +529,7 @@ fn methods_merge_into_generic_ref_descriptor() {
 
     assert_eq!(export.descriptor.name, "GenericResource");
     assert_eq!(export.descriptor.methods[0].name, "id");
+    assert!(export.inline_materialization().is_none());
 }
 
 #[test]
@@ -542,6 +540,10 @@ fn methods_merge_into_derive_owned_type_descriptor() {
     assert_eq!(export.descriptor.fields[0].name, "x");
     assert_eq!(export.descriptor.methods[0].name, "x");
     assert_eq!(export.descriptor.rep, anvyx_runtime::ExternRep::Inline);
+    assert_eq!(
+        export.inline_materialization().unwrap().mode(),
+        anvyx_runtime::ExternMaterialization::Copy
+    );
     let descriptor_init = export.descriptor.init.as_ref().unwrap();
     assert_eq!(descriptor_init.field_init, ["x"]);
     assert!(matches!(
@@ -619,35 +621,32 @@ fn self_operator_uses_derive_owned_type_name() {
 fn methods_descriptor_covers_member_roles() {
     let export = __anvyx_methods_vec2();
 
-    assert_eq!(export.descriptor.name, "Vec2");
-    assert_eq!(export.descriptor.methods.len(), 2);
-    assert_eq!(export.descriptor.methods[0].name, "len2");
-    assert_eq!(
-        export.descriptor.methods[0].doc.as_deref(),
-        Some("Length squared.")
-    );
-    assert_eq!(export.descriptor.methods[0].receiver, ReceiverMode::Shared);
-    assert_eq!(export.descriptor.methods[1].receiver, ReceiverMode::Mutable);
-    assert_eq!(export.descriptor.statics[0].name, "unit");
-    let init = export.descriptor.init.as_ref().unwrap();
+    assert_eq!(export.name, "Vec2");
+    assert_eq!(export.methods.len(), 2);
+    assert_eq!(export.methods[0].name, "len2");
+    assert_eq!(export.methods[0].doc.as_deref(), Some("Length squared."));
+    assert_eq!(export.methods[0].receiver, ReceiverMode::Shared);
+    assert_eq!(export.methods[1].receiver, ReceiverMode::Mutable);
+    assert_eq!(export.statics[0].name, "unit");
+    let init = export.init.as_ref().unwrap();
     assert_eq!(init.params.len(), 2);
     assert_eq!(init.field_init, ["x", "y"]);
-    assert_eq!(export.descriptor.fields.len(), 1);
-    assert!(export.descriptor.fields.iter().all(|field| field.computed));
-    assert!(export.descriptor.fields[0].readable);
-    assert!(export.descriptor.fields[0].writable);
-    assert_eq!(export.descriptor.operators.len(), 3);
-    assert!(export.descriptor.operators.iter().any(|op| op.op
+    assert_eq!(export.fields.len(), 1);
+    assert!(export.fields.iter().all(|field| field.computed));
+    assert!(export.fields[0].readable);
+    assert!(export.fields[0].writable);
+    assert_eq!(export.operators.len(), 3);
+    assert!(export.operators.iter().any(|op| op.op
         == ExternOperator::Binary {
             op: BinaryOp::Add,
             self_on_right: false,
         }));
-    assert!(export.descriptor.operators.iter().any(|op| op.op
+    assert!(export.operators.iter().any(|op| op.op
         == ExternOperator::Binary {
             op: BinaryOp::LessThanEq,
             self_on_right: false,
         }));
-    assert!(export.descriptor.operators.iter().any(|op| op.op
+    assert!(export.operators.iter().any(|op| op.op
         == ExternOperator::Binary {
             op: BinaryOp::Mul,
             self_on_right: true,

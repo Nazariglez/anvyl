@@ -2,8 +2,8 @@ use std::{cell::UnsafeCell, hash::Hash, marker::PhantomData, rc::Rc};
 
 use crate::{
     AnvList, AnvMap, AnvSlice, Ctx, ErasedHandle, GlobalSlot, Handle, LambdaCell, RuntimeError,
-    SafepointGuardKind, SafepointState, StackLambdaCell, ValueLoanGuard, heap_access_error,
-    lambda_cell::CellBorrowFlag,
+    SafepointGuardKind, SafepointState, ShapeLoanGuard, StackLambdaCell, ValueLoanGuard,
+    heap_access_error, lambda_cell::CellBorrowFlag,
 };
 
 pub enum MutPlace<'place, 'cx, T> {
@@ -283,50 +283,116 @@ unsafe impl<'cx, T: 'cx> ProjectedPlaceObject<'cx, T> for DataRefPlace<'_, 'cx, 
 }
 
 impl<'cx, T: 'cx> MutPlace<'_, 'cx, AnvList<'cx, T>> {
-    pub fn slice_view(
+    /// # Safety
+    ///
+    /// The place must remain valid while the returned loan is active.
+    pub unsafe fn begin_shape_loan_with_ctx<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+    ) -> Result<ShapeLoanGuard, RuntimeError> {
+        let owner =
+            unsafe { self.access_with_ctx(ctx, |_ctx, list| Ok(list.__anvyx_staged_owner())) }?;
+        let loan = owner.begin_shape_loan()?;
+        unsafe {
+            self.mutate(ctx, |list| {
+                *list = owner.__anvyx_commit_staged_owner();
+                Ok(())
+            })?;
+        }
+        Ok(loan)
+    }
+
+    /// # Safety
+    ///
+    /// The place and its source storage must outlive the returned slice, and the callback region
+    /// must not reenter Anvyx.
+    pub unsafe fn slice_view_with_ctx<'rt>(
         &self,
+        ctx: &mut Ctx<'cx, 'rt>,
         start: i64,
         end: i64,
         inclusive: bool,
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
-        match self {
-            Self::Local(list, _) => {
-                let list = unsafe { &**list };
+        unsafe {
+            self.access_with_ctx(ctx, |_ctx, list| {
                 let range = crate::checked_range(start, end, inclusive, list.len())?;
                 AnvSlice::from_list(list, range.start, range.len())
-            }
-            Self::StackCell(..)
-            | Self::HeapCell(_)
-            | Self::Global(_)
-            | Self::Projected(_)
-            | Self::ProjectedBorrow(_)
-            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
+            })
         }
     }
 
-    pub fn slice_view_mut<'rt>(
+    /// # Safety
+    ///
+    /// The materializer must not reenter Anvyx or access the list while storage is reconstructed.
+    /// The place and its source storage must outlive the returned slice.
+    pub unsafe fn slice_view_mut_with<'rt>(
         &mut self,
         ctx: &mut Ctx<'cx, 'rt>,
         start: i64,
         end: i64,
         inclusive: bool,
-    ) -> Result<AnvSlice<'cx, T>, RuntimeError>
-    where
-        T: Clone,
-    {
-        match self {
-            Self::Local(list, _) => {
-                let list = unsafe { &mut **list };
-                let range = crate::checked_range(start, end, inclusive, list.len())?;
-                AnvSlice::from_list_mut(ctx, list, range.start, range.len())
-            }
-            Self::StackCell(..)
-            | Self::HeapCell(_)
-            | Self::Global(_)
-            | Self::Projected(_)
-            | Self::ProjectedBorrow(_)
-            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
+        materialize: impl FnMut(&T) -> T,
+    ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
+        let mut owner =
+            unsafe { self.access_with_ctx(ctx, |_ctx, list| Ok(list.__anvyx_staged_owner())) }?;
+        let range = crate::checked_range(start, end, inclusive, owner.len())?;
+        let slice = unsafe {
+            AnvSlice::from_list_mut_with(ctx, &mut owner, range.start, range.len(), materialize)?
+        };
+        unsafe {
+            self.mutate(ctx, |list| {
+                *list = owner.__anvyx_commit_staged_owner();
+                Ok(())
+            })?;
         }
+        Ok(slice)
+    }
+}
+
+impl<'cx, K: Eq + Hash + 'cx, V: 'cx> MutPlace<'_, 'cx, AnvMap<'cx, K, V>> {
+    /// # Safety
+    ///
+    /// The place must remain valid while the returned loan is active.
+    pub unsafe fn begin_shape_loan_with_ctx<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+    ) -> Result<ShapeLoanGuard, RuntimeError> {
+        let owner =
+            unsafe { self.access_with_ctx(ctx, |_ctx, map| Ok(map.__anvyx_staged_owner())) }?;
+        let loan = owner.begin_shape_loan()?;
+        unsafe {
+            self.mutate(ctx, |map| {
+                *map = owner.__anvyx_commit_staged_owner();
+                Ok(())
+            })?;
+        }
+        Ok(loan)
+    }
+
+    /// # Safety
+    ///
+    /// The materializers must not reenter Anvyx or access the map while storage is reconstructed.
+    /// Key materialization must preserve equality and hash identity. The place must outlive the
+    /// returned loan.
+    pub unsafe fn map_value_loan_with<'rt>(
+        &mut self,
+        ctx: &mut Ctx<'cx, 'rt>,
+        key: &K,
+        materialize_key: impl FnMut(&K) -> K,
+        materialize_value: impl FnMut(&V) -> V,
+    ) -> Result<ValueLoanGuard, RuntimeError> {
+        let mut owner =
+            unsafe { self.access_with_ctx(ctx, |_ctx, map| Ok(map.__anvyx_staged_owner())) }?;
+        let loan = unsafe {
+            owner.begin_value_loan_by_key_with(ctx, key, materialize_key, materialize_value)?
+        };
+        unsafe {
+            self.mutate(ctx, |map| {
+                *map = owner.__anvyx_commit_staged_owner();
+                Ok(())
+            })?;
+        }
+        Ok(loan)
     }
 }
 
@@ -335,28 +401,23 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
     ///
     /// The returned raw slice descriptor must not outlive this place, and the source array must not
     /// be moved or invalidated while the descriptor is used.
-    pub unsafe fn slice_view(
+    pub unsafe fn slice_view_with_ctx<'rt>(
         &self,
+        ctx: &mut Ctx<'cx, 'rt>,
         start: i64,
         end: i64,
         inclusive: bool,
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
-        match self {
-            Self::Local(array, _) => {
-                let array = unsafe { &**array };
+        unsafe {
+            self.access_with_ctx(ctx, |_ctx, array| {
                 let range = crate::checked_range(start, end, inclusive, N)?;
-                Ok(
-                    unsafe {
-                        AnvSlice::from_raw_parts(array.as_ptr(), N, range.start, range.len())
-                    },
-                )
-            }
-            Self::StackCell(..)
-            | Self::HeapCell(_)
-            | Self::Global(_)
-            | Self::Projected(_)
-            | Self::ProjectedBorrow(_)
-            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
+                Ok(AnvSlice::from_raw_parts(
+                    array.as_ptr(),
+                    N,
+                    range.start,
+                    range.len(),
+                ))
+            })
         }
     }
 
@@ -366,31 +427,23 @@ impl<'cx, T: 'cx, const N: usize> MutPlace<'_, 'cx, [T; N]> {
     /// or invalidate the source array while the descriptor is used.
     pub unsafe fn slice_view_mut<'rt>(
         &mut self,
-        _ctx: &mut Ctx<'cx, 'rt>,
+        ctx: &mut Ctx<'cx, 'rt>,
         start: i64,
         end: i64,
         inclusive: bool,
     ) -> Result<AnvSlice<'cx, T>, RuntimeError> {
-        match self {
-            Self::Local(array, _) => {
-                let array = unsafe { &mut **array };
+        unsafe {
+            self.mutate_with_ctx(ctx, |_ctx, array| {
                 let range = crate::checked_range(start, end, inclusive, N)?;
-                Ok(unsafe {
-                    AnvSlice::from_raw_parts_mut(array.as_mut_ptr(), N, range.start, range.len())
-                })
-            }
-            Self::StackCell(..)
-            | Self::HeapCell(_)
-            | Self::Global(_)
-            | Self::Projected(_)
-            | Self::ProjectedBorrow(_)
-            | Self::ScopedCell(_) => Err(non_local_slice_view_error()),
+                Ok(AnvSlice::from_raw_parts_mut(
+                    array.as_mut_ptr(),
+                    N,
+                    range.start,
+                    range.len(),
+                ))
+            })
         }
     }
-}
-
-fn non_local_slice_view_error() -> RuntimeError {
-    RuntimeError::new("slice view over non-local mutable collection parameter is unsupported")
 }
 
 impl<T> Copy for GlobalPlace<'_, '_, T> {}
@@ -655,10 +708,9 @@ mod tests {
     use std::mem::ManuallyDrop;
 
     use crate::{
-        AnvList, AnvMap, AnvSlice, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType,
-        LambdaCell, ListStorage, MapStorage, MapValueOps, MutPlace, OptionalPayloadOps,
-        ProjectionOps, RuntimeError, SafepointState, ScopedMutPlaceCell, StackLambdaCell,
-        heap_access_error,
+        AnvList, AnvMap, Ctx, DataRefPlaceOps, ErasedHandle, GlobalSlot, HeapType, LambdaCell,
+        ListStorage, MapStorage, MapValueOps, MutPlace, OptionalPayloadOps, ProjectionOps,
+        RuntimeError, SafepointState, ScopedMutPlaceCell, StackLambdaCell, heap_access_error,
     };
 
     macro_rules! with_ctx {
@@ -777,7 +829,7 @@ mod tests {
         ) -> Result<(), RuntimeError> {
             let index = crate::checked_index_result(self.index, root.len(), "list")?;
             // SAFETY: Projection callbacks are leaf operations and cannot reenter the list.
-            unsafe { root.with_elem_mut_leaf(ctx, index, self.version, f) }
+            unsafe { root.with_elem_mut_leaf(ctx, index, self.version, |value| *value, f) }
         }
     }
 
@@ -789,7 +841,7 @@ mod tests {
             index: 0,
             version: list.structural_version(),
         };
-        list.push(&mut ctx, 3).unwrap();
+        unsafe { list.push_with(&mut ctx, 3, |value| *value) }.unwrap();
         let mut place = MutPlace::projected(MutPlace::local(&mut list), &ops);
 
         assert!(place.get_copy(&mut ctx).is_err());
@@ -818,7 +870,13 @@ mod tests {
         assert_eq!(place.get_copy(&mut ctx).unwrap(), 4);
         place.set(&mut ctx, 5).unwrap();
         drop(place);
-        assert_eq!(list.elem_at_shared(&ctx, 1, list.structural_version()).unwrap(), 5);
+        assert_eq!(
+            unsafe {
+                list.elem_at_shared_with(&ctx, 1, list.structural_version(), |value| *value)
+            }
+            .unwrap(),
+            5
+        );
             );
     }
 
@@ -826,7 +884,10 @@ mod tests {
     fn projected_map_value_rejects_missing_and_inactive_loans() {
         with_ctx!(ctx;
         let mut map = map(&mut ctx, [("a", 1_i64)]);
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let guard = unsafe {
+            map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+        }
+        .unwrap();
         let missing_ops = MapValueOps::new("missing", &guard);
         {
             let mut place = MutPlace::projected(MutPlace::local(&mut map), &missing_ops);
@@ -848,7 +909,10 @@ mod tests {
     fn projected_map_callback_error_preserves_mutation() {
         with_ctx!(ctx;
         let mut map = map(&mut ctx, [("a", 1_i64)]);
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let guard = unsafe {
+            map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+        }
+        .unwrap();
         let ops = MapValueOps::new("a", &guard);
         {
             let mut place = MutPlace::projected(MutPlace::local(&mut map), &ops);
@@ -865,7 +929,7 @@ mod tests {
             place.set(&mut ctx, 5).unwrap();
         }
         drop(guard);
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(5));
+        assert_eq!(unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(), Some(5));
             );
     }
 
@@ -873,7 +937,10 @@ mod tests {
     fn scoped_cell_wraps_projected_map_value() {
         with_ctx!(ctx;
         let mut map = map(&mut ctx, [("a", 1_i64)]);
-        let guard = map.begin_value_loan_by_key(&mut ctx, &"a").unwrap();
+        let guard = unsafe {
+            map.begin_value_loan_by_key_with(&mut ctx, &"a", |key| *key, |value| *value)
+        }
+        .unwrap();
         let ops = MapValueOps::new("a", &guard);
         {
             let place = MutPlace::projected(MutPlace::local(&mut map), &ops);
@@ -884,7 +951,7 @@ mod tests {
         }
 
         drop(guard);
-        assert_eq!(map.get(&ctx, &"a").unwrap(), Some(5));
+        assert_eq!(unsafe { map.get_with(&ctx, &"a", |value| *value) }.unwrap(), Some(5));
             );
     }
 
@@ -994,6 +1061,227 @@ mod tests {
                 .try_with_erased_mut(object, self.ty, |storage| f(&mut storage.field))
                 .map_err(heap_access_error)?
         }
+    }
+
+    struct StagedListOps<'cx> {
+        ty: HeapType<'cx, Storage<AnvList<'cx, i64>>>,
+    }
+
+    unsafe impl<'cx> DataRefPlaceOps<'cx, AnvList<'cx, i64>> for StagedListOps<'cx> {
+        fn access(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&AnvList<'cx, i64>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let value = ctx
+                .heap_ref()
+                .try_with_erased(object, self.ty, |storage| {
+                    Ok(storage.field.__anvyx_staged_owner())
+                })
+                .map_err(heap_access_error)??;
+            f(&value)
+        }
+
+        fn mutate(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&mut AnvList<'cx, i64>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let mut value = ctx
+                .heap_ref()
+                .try_with_erased(object, self.ty, |storage| {
+                    Ok(storage.field.__anvyx_staged_owner())
+                })
+                .map_err(heap_access_error)??;
+            let result = f(&mut value);
+            let writeback = ctx
+                .heap()
+                .try_with_erased_mut(object, self.ty, |storage| {
+                    storage.field = value.__anvyx_commit_staged_owner();
+                    Ok(())
+                })
+                .map_err(heap_access_error)?;
+            match (result, writeback) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+    }
+
+    struct ListPayload<'cx> {
+        values: AnvList<'cx, i64>,
+    }
+
+    struct ListPayloadOps;
+
+    unsafe impl<'cx> ProjectionOps<'cx, ListPayload<'cx>, AnvList<'cx, i64>> for ListPayloadOps {
+        fn access(
+            &self,
+            _ctx: &mut Ctx<'cx, '_>,
+            root: &ListPayload<'cx>,
+            f: &mut dyn FnMut(&AnvList<'cx, i64>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            f(&root.values)
+        }
+
+        fn mutate(
+            &self,
+            _ctx: &mut Ctx<'cx, '_>,
+            root: &mut ListPayload<'cx>,
+            f: &mut dyn FnMut(&mut AnvList<'cx, i64>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            f(&mut root.values)
+        }
+    }
+
+    struct StagedPayloadOps<'cx> {
+        ty: HeapType<'cx, Storage<ListPayload<'cx>>>,
+    }
+
+    unsafe impl<'cx> DataRefPlaceOps<'cx, ListPayload<'cx>> for StagedPayloadOps<'cx> {
+        fn access(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&ListPayload<'cx>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let value = ctx
+                .heap_ref()
+                .try_with_erased(object, self.ty, |storage| {
+                    Ok(ListPayload {
+                        values: storage.field.values.__anvyx_staged_owner(),
+                    })
+                })
+                .map_err(heap_access_error)??;
+            f(&value)
+        }
+
+        fn mutate(
+            &self,
+            ctx: &mut Ctx<'cx, '_>,
+            object: &ErasedHandle<'cx>,
+            f: &mut dyn FnMut(&mut ListPayload<'cx>) -> Result<(), RuntimeError>,
+        ) -> Result<(), RuntimeError> {
+            let mut value = ctx
+                .heap_ref()
+                .try_with_erased(object, self.ty, |storage| {
+                    Ok(ListPayload {
+                        values: storage.field.values.__anvyx_staged_owner(),
+                    })
+                })
+                .map_err(heap_access_error)??;
+            let result = f(&mut value);
+            let writeback = ctx
+                .heap()
+                .try_with_erased_mut(object, self.ty, |storage| {
+                    storage.field = ListPayload {
+                        values: value.values.__anvyx_commit_staged_owner(),
+                    };
+                    Ok(())
+                })
+                .map_err(heap_access_error)?;
+            match (result, writeback) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn dataref_collection_stage_preserves_version_and_reentry_gate() {
+        with_ctx!(ctx;
+        let list_ty = ctx.heap().register_untracked::<ListStorage<'_, i64>>();
+        let list = AnvList::from_elems(&mut ctx, list_ty, [1]);
+        let storage_ty = ctx
+            .heap()
+            .register_untracked::<Storage<AnvList<'_, i64>>>();
+        let object = ctx.heap().alloc(storage_ty, Storage { field: list });
+        let ops = StagedListOps { ty: storage_ty };
+        let erased = ctx.heap().erase(&object).unwrap();
+        let mut place = MutPlace::dataref(erased, &ops);
+
+        unsafe {
+            place
+                .mutate_with_ctx(&mut ctx, |ctx, list| {
+                    list.push_with(ctx, 2, |value| *value)
+                })
+                .unwrap();
+        }
+        let version = unsafe {
+            place
+                .access_with_ctx(&mut ctx, |_ctx, list| Ok(list.structural_version()))
+                .unwrap()
+        };
+        assert_eq!(version, 1);
+
+        let loan = unsafe { place.begin_shape_loan_with_ctx(&mut ctx) }.unwrap();
+        let err = unsafe {
+            place.mutate_with_ctx(&mut ctx, |ctx, list| {
+                list.push_with(ctx, 3, |value| *value)
+            })
+        }
+        .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "cannot structurally mutate collection during active iteration or slice view"
+        );
+        drop(loan);
+            );
+    }
+
+    #[test]
+    fn aggregate_dataref_stage_preserves_nested_collection_gate() {
+        with_ctx!(ctx;
+        let list_ty = ctx.heap().register_untracked::<ListStorage<'_, i64>>();
+        let list = AnvList::from_elems(&mut ctx, list_ty, [1]);
+        let storage_ty = ctx
+            .heap()
+            .register_untracked::<Storage<ListPayload<'_>>>();
+        let object = ctx.heap().alloc(
+            storage_ty,
+            Storage {
+                field: ListPayload { values: list },
+            },
+        );
+        let ops = StagedPayloadOps { ty: storage_ty };
+        let fields = ListPayloadOps;
+        let first = ctx.heap().erase(&object).unwrap();
+        let second = ctx.heap().erase(&object).unwrap();
+        let mut first = MutPlace::dataref(first, &ops);
+        let mut second = MutPlace::dataref(second, &ops);
+
+        unsafe {
+            first
+                .mutate_with_ctx(&mut ctx, |ctx, payload| {
+                    payload.values.push_with(ctx, 2, |value| *value)
+                })
+                .unwrap();
+        }
+        let version = unsafe {
+            first
+                .access_with_ctx(&mut ctx, |_ctx, payload| {
+                    Ok(payload.values.structural_version())
+                })
+                .unwrap()
+        };
+        assert_eq!(version, 1);
+
+        let mut nested = MutPlace::projected(first.reborrow(), &fields);
+        let loan = unsafe { nested.begin_shape_loan_with_ctx(&mut ctx) }.unwrap();
+        let err = unsafe {
+            second.mutate_with_ctx(&mut ctx, |ctx, payload| {
+                payload.values.push_with(ctx, 3, |value| *value)
+            })
+        }
+        .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "cannot structurally mutate collection during active iteration or slice view"
+        );
+        drop(loan);
+            );
     }
 
     fn manual_copy<T>(value: &T) -> ManuallyDrop<T> {
@@ -1166,79 +1454,76 @@ mod tests {
             );
     }
 
-    macro_rules! assert_unsupported_slice_views {
+    macro_rules! assert_list_slice_views {
         ($ctx:expr, $place:expr) => {{
             let mut place = $place;
-            assert_unsupported_slice_view(place.slice_view(0, 2, false));
-            assert_unsupported_slice_view(place.slice_view_mut($ctx, 0, 2, false));
+            let view = unsafe { place.slice_view_with_ctx($ctx, 0, 2, false) }.unwrap();
+            assert_eq!(view.len(), 2);
+            drop(view);
+            let view =
+                unsafe { place.slice_view_mut_with($ctx, 0, 2, false, |value| *value) }.unwrap();
+            assert_eq!(view.len(), 2);
         }};
     }
 
-    macro_rules! assert_unsupported_raw_slice_views {
+    macro_rules! assert_array_slice_views {
         ($ctx:expr, $place:expr) => {{
             let mut place = $place;
-            assert_unsupported_slice_view(unsafe { place.slice_view(0, 2, false) });
-            assert_unsupported_slice_view(unsafe { place.slice_view_mut($ctx, 0, 2, false) });
+            let view = unsafe { place.slice_view_with_ctx($ctx, 0, 2, false) }.unwrap();
+            assert_eq!(view.len(), 2);
+            drop(view);
+            let view = unsafe { place.slice_view_mut($ctx, 0, 2, false) }.unwrap();
+            assert_eq!(view.len(), 2);
         }};
-    }
-
-    fn assert_unsupported_slice_view<T>(result: Result<AnvSlice<'_, T>, RuntimeError>) {
-        let Err(err) = result else {
-            panic!("expected unsupported slice view");
-        };
-        assert_eq!(
-            err.message(),
-            "slice view over non-local mutable collection parameter is unsupported"
-        );
     }
 
     #[test]
-    fn stack_cell_slice_views_are_unsupported() {
+    fn stack_cell_slice_views_work() {
         with_ctx!(ctx;
         let list_cell = StackLambdaCell::new(list(&mut ctx, [1_i64, 2, 3]));
-        assert_unsupported_slice_views!(&mut ctx, MutPlace::stack_cell(&list_cell));
+        assert_list_slice_views!(&mut ctx, MutPlace::stack_cell(&list_cell));
 
         let array_cell = StackLambdaCell::new([1_i64, 2, 3]);
-        assert_unsupported_raw_slice_views!(&mut ctx, MutPlace::stack_cell(&array_cell));
+        assert_array_slice_views!(&mut ctx, MutPlace::stack_cell(&array_cell));
             );
     }
 
     #[test]
-    fn heap_cell_slice_views_are_unsupported() {
+    fn heap_cell_slice_views_work() {
         with_ctx!(ctx;
         let list_ty = ctx.heap().register_untracked::<LambdaCell<AnvList<'_, i64>>>();
         let list_value = list(&mut ctx, [1_i64, 2, 3]);
         let list_cell = ctx.heap().alloc(list_ty, LambdaCell::new(list_value));
-        assert_unsupported_slice_views!(&mut ctx, MutPlace::heap_cell(list_cell));
+        assert_list_slice_views!(&mut ctx, MutPlace::heap_cell(list_cell));
 
         let array_ty = ctx.heap().register_untracked::<LambdaCell<[i64; 3]>>();
         let array_cell = ctx.heap().alloc(array_ty, LambdaCell::new([1_i64, 2, 3]));
-        assert_unsupported_raw_slice_views!(&mut ctx, MutPlace::heap_cell(array_cell));
+        assert_array_slice_views!(&mut ctx, MutPlace::heap_cell(array_cell));
             );
     }
 
     #[test]
-    fn scoped_cell_slice_views_are_unsupported() {
+    fn scoped_cell_slice_views_work() {
         with_ctx!(ctx;
         let mut list = list(&mut ctx, [1_i64, 2, 3]);
         let list_cell = ScopedMutPlaceCell::new(MutPlace::local(&mut list));
-        assert_unsupported_slice_views!(&mut ctx, MutPlace::scoped_cell(&list_cell));
+        assert_list_slice_views!(&mut ctx, MutPlace::scoped_cell(&list_cell));
 
         let mut array = [1_i64, 2, 3];
         let array_cell = ScopedMutPlaceCell::new(MutPlace::local(&mut array));
-        assert_unsupported_raw_slice_views!(&mut ctx, MutPlace::scoped_cell(&array_cell));
+        assert_array_slice_views!(&mut ctx, MutPlace::scoped_cell(&array_cell));
             );
     }
 
     #[test]
-    fn dataref_slice_views_are_unsupported() {
+    fn dataref_slice_views_work() {
         with_ctx!(ctx;
         let list_ty = ctx.heap().register_untracked::<Storage<AnvList<'_, i64>>>();
         let list_value = list(&mut ctx, [1_i64, 2, 3]);
         let list_object = ctx.heap().alloc(list_ty, Storage { field: list_value });
         let list_erased = ctx.heap().erase(&list_object).unwrap();
         let list_ops = FieldOps { ty: list_ty };
-        assert_unsupported_slice_views!(&mut ctx, MutPlace::dataref(list_erased, &list_ops));
+        assert_list_slice_views!(&mut ctx, MutPlace::dataref(list_erased, &list_ops));
 
         let array_ty = ctx.heap().register_untracked::<Storage<[i64; 3]>>();
         let array_object = ctx.heap().alloc(
@@ -1249,7 +1534,7 @@ mod tests {
         );
         let array_erased = ctx.heap().erase(&array_object).unwrap();
         let array_ops = FieldOps { ty: array_ty };
-        assert_unsupported_raw_slice_views!(&mut ctx, MutPlace::dataref(array_erased, &array_ops));
+        assert_array_slice_views!(&mut ctx, MutPlace::dataref(array_erased, &array_ops));
             );
     }
 }

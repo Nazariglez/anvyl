@@ -4,7 +4,6 @@ use indexmap::IndexMap;
 
 use crate::{Trace, TraceDriver, Visitor};
 
-#[derive(Clone)]
 pub struct ListStorage<'cx, T> {
     elems: Vec<T>,
     _brand: PhantomData<&'cx ()>,
@@ -45,7 +44,6 @@ impl<T: std::fmt::Debug> std::fmt::Debug for ListStorage<'_, T> {
     }
 }
 
-#[derive(Clone)]
 pub struct MapStorage<'cx, K, V> {
     entries: IndexMap<K, V>,
     _brand: PhantomData<&'cx ()>,
@@ -77,6 +75,10 @@ impl<K: Eq + Hash, V> MapStorage<'_, K, V> {
 
     pub(crate) fn get_index(&self, index: usize) -> Option<(&K, &V)> {
         self.entries.get_index(index)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter()
     }
 
     pub(crate) fn get_index_of(&self, key: &K) -> Option<usize> {

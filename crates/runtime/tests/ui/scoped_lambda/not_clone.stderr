@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `anvyx_runtime::ScopedLambda<'static, 'static, (), ()>: std::clone::Clone` is not satisfied
+error[E0277]: the trait bound `anvyx_runtime::ScopedLambda<'static, 'static, (), ()>: Clone` is not satisfied
  --> tests/ui/scoped_lambda/not_clone.rs:6:20
   |
 6 |     assert_clone::<ScopedLambda<'static, 'static, (), ()>>();
-  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `std::clone::Clone` is not implemented for `anvyx_runtime::ScopedLambda<'static, 'static, (), ()>`
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `anvyx_runtime::ScopedLambda<'static, 'static, (), ()>`
   |
 note: required by a bound in `assert_clone`
  --> tests/ui/scoped_lambda/not_clone.rs:3:20
