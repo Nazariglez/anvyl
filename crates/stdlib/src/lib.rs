@@ -36,6 +36,9 @@ pub fn rust_provider_supports() -> Vec<anvyx_runtime::RustProviderSupport> {
 fn provider_support(
     mut module: anvyx_runtime::RustModuleSupport,
 ) -> anvyx_runtime::RustProviderSupport {
+    for ty in &mut module.types {
+        ty.retarget_crate("anvyx_stdlib");
+    }
     let native_prefix = ["mem".to_string()];
     for binding in &mut module.bindings {
         binding.path.crate_name = "anvyx_stdlib".to_string();
