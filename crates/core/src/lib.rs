@@ -113,7 +113,7 @@ fn provider_support(
     mut module: anvyx_runtime::RustModuleSupport,
 ) -> anvyx_runtime::RustProviderSupport {
     for ty in &mut module.types {
-        ty.path.crate_name = "anvyx_core".to_string();
+        ty.retarget_crate("anvyx_core");
     }
     let native_prefix = [provider.to_string()];
     for binding in &mut module.bindings {
