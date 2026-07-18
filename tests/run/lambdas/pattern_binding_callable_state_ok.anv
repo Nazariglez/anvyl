@@ -1,0 +1,31 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 7
+// @match-end
+
+struct Callback {
+    f: fn() -> int,
+}
+
+fn fixed() -> int { 1 }
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn invoke(f: escaping fn() -> int) -> int {
+    f()
+}
+
+fn run(callback: Callback) -> int {
+    match (callback, 0) {
+        (Callback { f }, _) => invoke(f),
+    }
+}
+
+fn main() {
+    println(run(Callback { f: fixed }));
+    println(run(Callback { f: make(7) }));
+}

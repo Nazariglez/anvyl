@@ -1,0 +1,6 @@
+[project]
+name = "cleanup-map"
+entry = "src/main.anv"
+
+[dependencies]
+cleanup = { path = "../value_materialization_cleanup_provider" }

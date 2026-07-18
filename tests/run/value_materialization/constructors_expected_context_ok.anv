@@ -1,0 +1,128 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+lazy var GLOBAL_CHOICE: Option<Choice> = nil;
+
+enum Choice {
+    Text(string),
+    None,
+}
+
+struct Boxed {
+    choice: Choice,
+    optional: Option<Choice>,
+    outcome: Result<Choice, string>,
+    default_optional: Option<Choice> = Option.Some(Choice.Text("explicit default")),
+    default_outcome: Result<Choice, string> = .Ok(.Text("inferred default")),
+}
+
+fn choice_text(value: Choice) -> string {
+    match value {
+        Choice.Text(text) => text,
+        Choice.None => "none",
+    }
+}
+
+fn optional_text(value: Option<Choice>) -> string {
+    match value {
+        Option.Some(choice) => choice_text(choice),
+        Option.None => "nil",
+    }
+}
+
+fn result_text(value: Result<Choice, string>) -> string {
+    match value {
+        Result.Ok(choice) => choice_text(choice),
+        Result.Err(error) => error,
+    }
+}
+
+fn accept(value: Option<Choice>) -> Option<Choice> {
+    value
+}
+
+fn explicit_return() -> Result<Choice, string> {
+    Result.Ok(Choice.Text("explicit return"))
+}
+
+fn inferred_return() -> Result<Choice, string> {
+    .Ok(.Text("inferred return"))
+}
+
+fn main() {
+    let explicit_choice: Choice = Choice.Text("explicit binding");
+    let inferred_choice: Choice = .Text("inferred binding");
+    let explicit_optional: Option<Choice> = Option.Some(Choice.Text("explicit optional"));
+    let inferred_optional: Option<Choice> = .Some(.Text("inferred optional"));
+    let explicit_result: Result<Choice, string> = Result.Ok(Choice.Text("explicit result"));
+    let inferred_result: Result<Choice, string> = .Ok(.Text("inferred result"));
+
+    let explicit_box = Boxed {
+        choice: Choice.Text("explicit field"),
+        optional: Option.Some(Choice.Text("explicit nested")),
+        outcome: Result.Err("explicit error"),
+    };
+    var inferred_box = Boxed {
+        choice: .Text("inferred field"),
+        optional: .Some(.Text("inferred nested")),
+        outcome: .Err("inferred error"),
+    };
+
+    let explicit_array: [Option<Choice>; 1] = [Option.Some(Choice.Text("explicit array"))];
+    let inferred_array: [Option<Choice>; 1] = [.Some(.Text("inferred array"))];
+    var values: [Option<Choice>] = [Option.Some(Choice.Text("explicit list"))];
+    values.push(.Some(.Text("inferred push")));
+
+    var slots: [string: Result<Choice, string>] = [
+        "explicit": Result.Ok(Choice.Text("explicit map")),
+    ];
+    slots.insert("inferred", .Ok(.Text("inferred insert")));
+    slots["assigned"] = .Ok(.Text("inferred indexed assignment"));
+
+    var assigned: Option<Choice> = nil;
+    assigned = Option.Some(Choice.Text("explicit assignment"));
+    assigned = .Some(.Text("inferred assignment"));
+    inferred_box.optional = .Some(.Text("projected assignment"));
+    GLOBAL_CHOICE = .Some(.Text("global assignment"));
+
+    let explicit_argument = accept(Option.Some(Choice.Text("explicit argument")));
+    let inferred_argument = accept(.Some(.Text("inferred argument")));
+    let explicit_returned = explicit_return();
+    let inferred_returned = inferred_return();
+
+    assert(choice_text(explicit_choice) == "explicit binding");
+    assert(choice_text(inferred_choice) == "inferred binding");
+    assert(optional_text(explicit_optional) == "explicit optional");
+    assert(optional_text(inferred_optional) == "inferred optional");
+    assert(result_text(explicit_result) == "explicit result");
+    assert(result_text(inferred_result) == "inferred result");
+    assert(choice_text(explicit_box.choice) == "explicit field");
+    assert(optional_text(explicit_box.optional) == "explicit nested");
+    assert(result_text(explicit_box.outcome) == "explicit error");
+    assert(optional_text(explicit_box.default_optional) == "explicit default");
+    assert(result_text(explicit_box.default_outcome) == "inferred default");
+    assert(optional_text(inferred_box.optional) == "projected assignment");
+    assert(optional_text(inferred_box.default_optional) == "explicit default");
+    assert(result_text(inferred_box.default_outcome) == "inferred default");
+    assert(optional_text(explicit_array[0]) == "explicit array");
+    assert(optional_text(inferred_array[0]) == "inferred array");
+    assert(optional_text(values[0]) == "explicit list");
+    assert(optional_text(values[1]) == "inferred push");
+    if let explicit? = slots["explicit"] {
+        assert(result_text(explicit) == "explicit map");
+    }
+    if let inferred? = slots["inferred"] {
+        assert(result_text(inferred) == "inferred insert");
+    }
+    if let indexed? = slots["assigned"] {
+        assert(result_text(indexed) == "inferred indexed assignment");
+    }
+    assert(optional_text(assigned) == "inferred assignment");
+    assert(optional_text(GLOBAL_CHOICE) == "global assignment");
+    assert(optional_text(explicit_argument) == "explicit argument");
+    assert(optional_text(inferred_argument) == "inferred argument");
+    assert(result_text(explicit_returned) == "explicit return");
+    assert(result_text(inferred_returned) == "inferred return");
+    println("ok");
+}

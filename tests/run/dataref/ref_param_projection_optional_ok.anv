@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: optional payload dataref mutable-place projections are future work
 // @match: 2
 
 dataref Box {

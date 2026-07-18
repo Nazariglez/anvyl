@@ -1,6 +1,10 @@
 // @mode: run
 // @expect: success
-// @match: 2
+// @match-begin
+// 2
+// 2
+// 3
+// @match-end
 
 struct Payload {
     xs: [int],
@@ -10,7 +14,15 @@ dataref Box {
     payload: Payload,
 }
 
+fn push(ref payload: Payload) {
+    payload.xs.push(3);
+}
+
 fn main() {
-    let b = Box { payload: Payload { xs: [1, 2] } };
-    println(b.payload.xs[1]);
+    var box = Box { payload: Payload { xs: [1, 2] } };
+    println(box.payload.xs[1]);
+    let shared = box.payload.xs;
+    push(box.payload);
+    println(shared[1]);
+    println(box.payload.xs[2]);
 }

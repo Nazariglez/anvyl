@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// global
+// global
+// @match-end
+
+lazy var values: [string; 1] = ["global"];
+
+fn first(ref items: [string; 1]) -> string {
+    items[0]
+}
+
+fn main() {
+    println(values[0]);
+    println(first(values));
+}

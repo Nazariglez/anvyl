@@ -7,7 +7,7 @@ pub fn host_direct_first<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     xs: AnvList<'cx, i64>,
 ) -> RuntimeResult<i64> {
-    xs.checked_index(ctx, 0)
+    unsafe { xs.checked_index_with(ctx, 0, |value| *value) }
 }
 
 #[function(ctx)]
@@ -22,7 +22,7 @@ pub fn host_direct_lookup<'cx>(
     scores: AnvMap<'cx, AnvString, i64>,
     key: AnvString,
 ) -> RuntimeResult<Option<i64>> {
-    scores.get(ctx, &key)
+    unsafe { scores.get_with(ctx, &key, |value| *value) }
 }
 
 #[function(ctx)]
@@ -38,7 +38,7 @@ pub fn host_slice_first<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     values: AnvSlice<'cx, i64>,
 ) -> RuntimeResult<i64> {
-    values.elem_at_shared(ctx, 0)
+    unsafe { values.elem_at_shared_with(ctx, 0, |value| *value) }
 }
 
 anvyx_runtime::builtin_module! {

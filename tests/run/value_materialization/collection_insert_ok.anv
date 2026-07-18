@@ -1,0 +1,32 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+struct Item {
+    name: string,
+}
+
+fn main() {
+    let key = "player";
+    let item = Item { name: key };
+
+    let array: [Item; 2] = [item; 2];
+    var list: [Item] = [item];
+    list.push(item);
+
+    var map: [string: Item] = [key: item];
+    map.insert(key, item);
+    map[key] = item;
+
+    assert(key == "player");
+    assert(item.name == "player");
+    assert(array[0].name == "player");
+    assert(array[1].name == "player");
+    assert(list[0].name == "player");
+    assert(list[1].name == "player");
+    if let saved? = map[key] {
+        assert(saved.name == "player");
+    }
+    assert(key == "player");
+    println("ok");
+}

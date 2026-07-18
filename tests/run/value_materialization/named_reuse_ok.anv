@@ -1,0 +1,60 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+lazy let GLOBAL_NAME = "global";
+
+struct Label {
+    text: string,
+}
+
+fn reuse_param(text: string) -> string {
+    let copy = text;
+    let stored = [text];
+    assert(copy == "player");
+    assert(stored[0] == "player");
+    text
+}
+
+fn main() {
+    let name = "player";
+    let alias = name;
+    let returned = reuse_param(name);
+    let label = Label { text: name };
+    let projected = label.text;
+    let projected_values = [label.text];
+    let tuple = (name, 1);
+    let array = [name];
+    let list: [string] = [name];
+    let optional: Option<string> = Option.Some(name);
+    let capture = || name;
+    let global_copy = GLOBAL_NAME;
+    let global_values = [GLOBAL_NAME];
+
+    var assigned = "old";
+    assigned = name;
+
+    if let payload? = optional {
+        let payload_copy = payload;
+        let payload_values = [payload];
+        assert(payload_copy == "player");
+        assert(payload_values[0] == "player");
+        assert(payload == "player");
+    }
+
+    assert(name == "player");
+    assert(alias == "player");
+    assert(returned == "player");
+    assert(label.text == "player");
+    assert(projected == "player");
+    assert(projected_values[0] == "player");
+    assert(tuple.0 == "player");
+    assert(array[0] == "player");
+    assert(list[0] == "player");
+    assert(capture() == "player");
+    assert(assigned == "player");
+    assert(global_copy == "global");
+    assert(global_values[0] == "global");
+    assert(GLOBAL_NAME == "global");
+    println("ok");
+}

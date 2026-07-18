@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 7
+// @match-end
+
+contract Callable {
+    fn value(self) -> int;
+}
+
+enum Callback {
+    Fixed(fn() -> int),
+    Captured(fn() -> int),
+}
+
+extend Callback {
+    fn value(self) -> int { 0 }
+}
+
+fn fixed() -> int { 1 }
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn invoke(f: escaping fn() -> int) -> int {
+    f()
+}
+
+fn run(value: dyn Callable) -> int {
+    match value as? {
+        Callback(callback) => match callback {
+            Callback.Fixed(f) | Callback.Captured(f) => invoke(f),
+        },
+        _ => 0,
+    }
+}
+
+fn main() {
+    println(run(Callback.Fixed(fixed)));
+    println(run(Callback.Captured(make(7))));
+}

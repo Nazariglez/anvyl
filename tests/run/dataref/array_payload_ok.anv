@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: dataref array payload projection is future work
 // @match: 1
 
 dataref Item {

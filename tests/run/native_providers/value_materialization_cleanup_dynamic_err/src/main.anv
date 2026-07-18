@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: error
+// @match-begin
+//     Checking tests/run/native_providers/value_materialization_cleanup_dynamic_err/src/main.anv...
+//   Generating Rust...
+//    Compiling generated Rust...
+//      Running tests/run/native_providers/value_materialization_cleanup_dynamic_err/src/main.anv...
+//       error: generated Rust binary failed
+// make 4
+// materialize 4
+// materialize 4
+// drop 4
+// drop 4
+// drop 4
+// Error: RuntimeError { message: "list index 0 out of bounds for len 0" }
+//
+//
+// @match-end
+
+import pkg:cleanup { Probe, make_probe, probe_id };
+
+contract Tagged {
+    fn id(self) -> int;
+}
+
+struct Wrapped {
+    probe: Probe,
+
+    fn id(self) -> int {
+        probe_id(self.probe)
+    }
+}
+
+fn main() {
+    let probe = make_probe(4);
+    let tagged: dyn Tagged = Wrapped { probe: probe };
+    let missing: [dyn Tagged] = [];
+    let values: [dyn Tagged] = [tagged, missing[0]];
+}

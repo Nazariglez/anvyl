@@ -4,7 +4,9 @@
 
 lazy let title = "ready";
 
+fn read_title() -> string { title }
+
 fn main() {
-    let local = title;
+    let local = read_title();
     println(local);
 }

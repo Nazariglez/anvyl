@@ -1,6 +1,5 @@
 // @mode: run
 // @expect: success
-// @skip: indexed dataref mutable-place projections are future work
 // @match: 2
 
 dataref Bag {

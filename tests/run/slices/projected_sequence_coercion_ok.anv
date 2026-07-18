@@ -1,0 +1,56 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 11
+// 3
+// 9
+// 1
+// 1
+// 7
+// 9
+// 3
+// 15
+// 9
+// 11
+// 9
+// @match-end
+
+fn sum(xs: slice[int]) -> int {
+    xs[0] + xs[1]
+}
+
+fn set_first(ref xs: slice[int], value: int) {
+    xs[0] = value;
+}
+
+lazy var global_list: [int] = [7, 8];
+lazy var global_array: [int; 2] = [5, 6];
+
+fn main() {
+    let readonly = [[5, 6]];
+    println(sum(readonly[0]));
+
+    var inner = [1, 2];
+    let inner_alias = inner;
+    var lists = [inner];
+    let lists_alias = lists;
+    println(sum(lists[0]));
+    set_first(lists[0], 9);
+    println(lists[0][0]);
+    println(lists_alias[0][0]);
+    println(inner_alias[0]);
+
+    var arrays: [[int; 2]] = [[3, 4]];
+    let arrays_alias = arrays;
+    println(sum(arrays[0]));
+    set_first(arrays[0], 9);
+    println(arrays[0][0]);
+    println(arrays_alias[0][0]);
+
+    println(sum(global_list));
+    set_first(global_list, 9);
+    println(global_list[0]);
+    println(sum(global_array));
+    set_first(global_array, 9);
+    println(global_array[0]);
+}

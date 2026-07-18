@@ -1,0 +1,151 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+import pkg:host.host {
+    HostValue,
+    collect_now,
+    live_values,
+    make_value,
+    materializations,
+    read_value,
+    reset_materializations,
+    reset_trace_visits,
+    trace_visits,
+};
+
+struct HostHolder {
+    value: fn() -> HostValue,
+}
+
+struct HostValues {
+    marker: HostValue,
+    values: [HostValue],
+}
+
+dataref HostBox {
+    value: HostValue,
+}
+
+struct TrackedHostValue {
+    value: HostValue,
+    child: HostBox,
+}
+
+lazy var GLOBAL_VALUE = make_value(0);
+lazy var TRACKED_VALUES: [TrackedHostValue] = [];
+
+fn assign_mut(ref dst: HostValue, next: HostValue) {
+    dst = next;
+}
+
+fn transferred_value() -> HostValue {
+    if true { make_value(9) } else { make_value(0) }
+}
+
+fn release_host_values() {
+    let value = make_value(20);
+    read_value(value);
+    read_value(value);
+}
+
+fn release_tracked_host_values() {
+    let child = HostBox { value: make_value(21) };
+    TRACKED_VALUES = [TrackedHostValue {
+        value: make_value(22),
+        child: child,
+    }];
+    let shared = TRACKED_VALUES;
+    TRACKED_VALUES.push(TrackedHostValue {
+        value: make_value(23),
+        child: child,
+    });
+    collect_now();
+    read_value(shared[0].value);
+    TRACKED_VALUES = [];
+}
+
+fn main() {
+    let live_before = live_values();
+    release_host_values();
+    assert(live_values() == live_before);
+    reset_trace_visits();
+    release_tracked_host_values();
+    collect_now();
+    assert(trace_visits() > 0);
+    assert(live_values() == live_before);
+
+    let value: HostValue = make_value(7);
+    reset_materializations();
+    assert(read_value(value) == 7);
+    assert(read_value(value) == 7);
+    assert(materializations() == 2);
+
+    reset_materializations();
+    let transferred = if true { make_value(8) } else { make_value(0) };
+    assert(read_value(transferred) == 8);
+    assert(materializations() == 1);
+
+    reset_materializations();
+    let returned = transferred_value();
+    assert(read_value(returned) == 9);
+    assert(materializations() == 1);
+
+    reset_materializations();
+    assert(read_value(make_value(10)) == 10);
+    assert(materializations() == 0);
+
+    reset_materializations();
+    let captured = make_value(11);
+    let capture = HostHolder { value: || captured };
+    assert(materializations() == 1);
+
+    var cell = make_value(0);
+    let set_cell = |next: HostValue| { cell = next; };
+    let cell_source = make_value(13);
+    reset_materializations();
+    set_cell(cell_source);
+    assert(materializations() == 2);
+
+    var mut_place = make_value(0);
+    let mut_place_source = make_value(14);
+    reset_materializations();
+    assign_mut(mut_place, mut_place_source);
+    assert(materializations() == 2);
+
+    var box = HostBox { value: make_value(0) };
+    let dataref_source = make_value(15);
+    reset_materializations();
+    box.value = dataref_source;
+    assert(materializations() == 1);
+
+    let global_source = make_value(16);
+    reset_materializations();
+    GLOBAL_VALUE = global_source;
+    assert(materializations() == 1);
+
+    reset_materializations();
+    GLOBAL_VALUE = if true { make_value(17) } else { make_value(0) };
+    assert(materializations() == 0);
+
+    let nested = [HostValues {
+        marker: make_value(18),
+        values: [make_value(19)],
+    }];
+    reset_materializations();
+    let copied = nested[0].values[0..1];
+    assert(materializations() == 1);
+    assert(read_value(copied[0]) == 19);
+
+    reset_materializations();
+    let _fill_zero: [HostValue; 0] = [make_value(24); 0];
+    assert(materializations() == 0);
+    reset_materializations();
+    let _fill_one: [HostValue; 1] = [make_value(25); 1];
+    assert(materializations() == 1);
+    reset_materializations();
+    let _fill_two: [HostValue; 2] = [make_value(26); 2];
+    assert(materializations() == 2);
+
+    println("ok");
+}

@@ -142,7 +142,7 @@ pub fn host_slice_first<'cx>(
     ctx: &mut Ctx<'cx, '_>,
     values: AnvSlice<'cx, i64>,
 ) -> RuntimeResult<i64> {
-    values.elem_at_shared(ctx, 0)
+    unsafe { values.elem_at_shared_with(ctx, 0, |value| *value) }
 }
 
 #[function]

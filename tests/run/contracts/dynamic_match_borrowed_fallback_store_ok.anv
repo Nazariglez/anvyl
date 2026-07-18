@@ -1,0 +1,39 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 7
+// @match-end
+
+contract Drawable {
+    fn value(self) -> int;
+}
+
+struct Enemy {
+    points: int,
+
+    fn value(self) -> int { self.points }
+}
+
+struct Prop {
+    points: int,
+
+    fn value(self) -> int { self.points }
+}
+
+fn preserve(ref actor: dyn Drawable) -> dyn Drawable {
+    match actor as? {
+        Enemy(enemy) => enemy,
+        other => {
+            let saved: dyn Drawable = other;
+            saved
+        },
+    }
+}
+
+fn main() {
+    var actor: dyn Drawable = Prop { points: 7 };
+    let saved = preserve(actor);
+    println(saved.value());
+    println(actor.value());
+}

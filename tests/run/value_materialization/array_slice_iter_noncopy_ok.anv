@@ -1,0 +1,43 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+struct Item {
+    name: string,
+}
+
+fn read_slice(items: slice[Item]) -> string {
+    var text = "";
+    for item in items {
+        text += item.name;
+    }
+    text
+}
+
+fn main() {
+    let first = Item { name: "a" };
+    let second = Item { name: "b" };
+    let array: [Item; 2] = [first, second];
+
+    var forward = "";
+    for item in array {
+        forward += item.name;
+    }
+
+    var reverse = "";
+    for item in iter(array).rev() {
+        reverse += item.name;
+    }
+
+    let list: [Item] = [first, second];
+    let sliced = read_slice(list[0..2]);
+
+    assert(first.name == "a");
+    assert(second.name == "b");
+    assert(array[0].name == "a");
+    assert(list[1].name == "b");
+    assert(forward == "ab");
+    assert(reverse == "ba");
+    assert(sliced == "ab");
+    println("ok");
+}

@@ -1,0 +1,26 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// before
+// second
+// after
+// @match-end
+
+lazy var STATE = "before";
+
+fn mutate() -> string {
+    STATE = "after";
+    "second"
+}
+
+struct Pair {
+    first: string = STATE,
+    second: string = mutate(),
+}
+
+fn main() {
+    let pair = Pair {};
+    println(pair.first);
+    println(pair.second);
+    println(STATE);
+}

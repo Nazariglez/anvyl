@@ -1,0 +1,27 @@
+// @mode: run
+// @expect: error
+// @match-begin
+//     Checking tests/run/native_providers/value_materialization_cleanup_map_err/src/main.anv...
+//   Generating Rust...
+//    Compiling generated Rust...
+//      Running tests/run/native_providers/value_materialization_cleanup_map_err/src/main.anv...
+//       error: generated Rust binary failed
+// make 3
+// materialize 3
+// drop 3
+// drop 3
+// Error: RuntimeError { message: "list index 0 out of bounds for len 0" }
+//
+//
+// @match-end
+
+import pkg:cleanup { Probe, make_probe };
+
+fn main() {
+    let probe = make_probe(3);
+    let missing: [Probe] = [];
+    let values: [string: Probe] = [
+        "first": probe,
+        "second": missing[0],
+    ];
+}

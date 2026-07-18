@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 7
+
+fn make(seed: int) -> fn() -> int {
+    || seed
+}
+
+fn call_first(values: slice[fn() -> int]) -> int {
+    values[0]()
+}
+
+fn main() {
+    let values: [fn() -> int; 1] = [make(7)];
+    println(call_first(values));
+}

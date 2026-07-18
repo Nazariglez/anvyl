@@ -1,0 +1,50 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+struct Leaf {
+    text: string,
+}
+
+struct Branch {
+    payload: (Leaf, [Option<Result<string, string>>; 1]),
+}
+
+enum Tree {
+    Branch(Branch),
+    Empty,
+}
+
+fn main() {
+    let text = "leaf";
+    let leaf = Leaf { text };
+    let outcome: Result<string, string> = .Ok(text);
+    let branch = Branch {
+        payload: (leaf, [Option.Some(outcome)]),
+    };
+    let tree = Tree.Branch(branch);
+    let trees = [tree];
+    let maybe_tree = Option.Some(tree);
+
+    assert(text == "leaf");
+    assert(leaf.text == "leaf");
+    match tree {
+        Tree.Branch(saved) => assert(saved.payload.0.text == "leaf"),
+        Tree.Empty => assert(false),
+    };
+    match trees[0] {
+        Tree.Branch(saved) => assert(saved.payload.0.text == "leaf"),
+        Tree.Empty => assert(false),
+    };
+    if let saved? = maybe_tree {
+        match saved {
+            Tree.Branch(branch) => assert(branch.payload.0.text == "leaf"),
+            Tree.Empty => assert(false),
+        };
+    }
+    match tree {
+        Tree.Branch(saved) => assert(saved.payload.0.text == "leaf"),
+        Tree.Empty => assert(false),
+    };
+    println("ok");
+}
