@@ -48,7 +48,7 @@ pub struct ExternLayout {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ExternMaterialization {
     Copy,
-    Clone,
+    Materialize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -547,6 +547,17 @@ mod tests {
                 thread: CallbackThread::SameThread,
             },
         }
+    }
+
+    #[test]
+    fn materialization_serialization_uses_semantic_capability_name() {
+        let encoded = serde_json::to_string(&ExternMaterialization::Materialize).unwrap();
+        assert_eq!(encoded, "\"Materialize\"");
+        assert_eq!(
+            serde_json::from_str::<ExternMaterialization>(&encoded).unwrap(),
+            ExternMaterialization::Materialize
+        );
+        assert!(serde_json::from_str::<ExternMaterialization>("\"Clone\"").is_err());
     }
 
     #[test]

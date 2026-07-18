@@ -79,6 +79,10 @@ impl Summary {
         self.events.push(event);
     }
 
+    pub(crate) fn is_success(&self) -> bool {
+        self.failed() == 0 && self.timed_out() == 0
+    }
+
     fn passed(&self) -> usize {
         self.count(SummaryOutcome::is_passed)
     }
@@ -559,49 +563,51 @@ mod tests {
 
     #[test]
     fn summary_derives_counts_from_events() {
-        let mut summary = Summary::default();
-        summary.add(
-            PathBuf::from("compile_fail.anv"),
-            result(
+        let outcomes = [
+            ("pass.anv", TestResult::Pass, Mode::Run),
+            (
+                "compile_fail.anv",
                 TestResult::Fail {
                     phase: FailurePhase::Compile,
                     message: "compile fail".to_string(),
                 },
                 Mode::Check,
             ),
-            true,
-        );
-        summary.add(
-            PathBuf::from("runtime_fail.anv"),
-            result(
+            (
+                "runtime_fail.anv",
                 TestResult::Fail {
                     phase: FailurePhase::Runtime,
                     message: "runtime fail".to_string(),
                 },
                 Mode::Run,
             ),
-            true,
-        );
-        summary.add(
-            PathBuf::from("compile_timeout.anv"),
-            result(
+            (
+                "compile_timeout.anv",
                 TestResult::Timeout {
                     phase: FailurePhase::Compile,
                 },
                 Mode::Check,
             ),
-            true,
-        );
-        summary.add(
-            PathBuf::from("runtime_timeout.anv"),
-            result(
+            (
+                "runtime_timeout.anv",
                 TestResult::Timeout {
                     phase: FailurePhase::Runtime,
                 },
                 Mode::Run,
             ),
-            true,
-        );
+            (
+                "skip.anv",
+                TestResult::Skip {
+                    message: "not supported".to_string(),
+                },
+                Mode::Check,
+            ),
+            ("helper.anv", TestResult::Helper, Mode::Check),
+        ];
+        let mut summary = Summary::default();
+        for (file, outcome, mode) in outcomes {
+            summary.add(PathBuf::from(file), result(outcome, mode), true);
+        }
 
         let report = summary.json_report(&runner_args(), Instant::now());
         let kinds = report
@@ -610,8 +616,11 @@ mod tests {
             .map(|issue| issue.kind)
             .collect::<Vec<_>>();
 
+        assert_eq!(report.passed, 1);
         assert_eq!(report.failed, 2);
         assert_eq!(report.timed_out, 2);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.helpers, 1);
         assert_eq!(report.compile_failed, 1);
         assert_eq!(report.runtime_failed, 1);
         assert_eq!(report.compile_timed_out, 1);
@@ -620,6 +629,22 @@ mod tests {
         assert!(kinds.contains(&"runtime_failed"));
         assert!(kinds.contains(&"compile_timed_out"));
         assert!(kinds.contains(&"runtime_timed_out"));
+        assert!(!summary.is_success());
+
+        let mut successful = Summary::default();
+        for (file, outcome) in [
+            ("pass.anv", TestResult::Pass),
+            (
+                "skip.anv",
+                TestResult::Skip {
+                    message: "not supported".to_string(),
+                },
+            ),
+            ("helper.anv", TestResult::Helper),
+        ] {
+            successful.add(PathBuf::from(file), result(outcome, Mode::Check), true);
+        }
+        assert!(successful.is_success());
     }
 
     #[test]

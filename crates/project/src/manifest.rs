@@ -238,7 +238,7 @@ fn rust_provider_support(
 fn retarget_rust_modules(modules: &mut [RustModuleSupport], cargo_alias: &str) {
     for module in modules {
         for ty in &mut module.types {
-            ty.path.crate_name = cargo_alias.to_string();
+            ty.retarget_crate(cargo_alias);
         }
         for binding in &mut module.bindings {
             binding.path.crate_name = cargo_alias.to_string();
@@ -1084,6 +1084,50 @@ mod tests {
             probe.cargo_alias
         );
     }
+
+    #[test]
+    fn provider_retargeting_updates_materializer_crate_path() {
+        let mut modules = vec![rust_support("host", "host_provider")];
+        modules[0].types[0].materializer = Some(anvyx_runtime::RustMaterializerBinding {
+            mode: anvyx_runtime::ExternMaterialization::Copy,
+            rust_type: anvyx_runtime::RustPath {
+                crate_name: "host_provider".to_string(),
+                segments: vec!["Handle".to_string()],
+            },
+            path: anvyx_runtime::RustPath {
+                crate_name: "host_provider".to_string(),
+                segments: vec![
+                    "__anvyx_native_export_handle".to_string(),
+                    "__anvyx_materialize".to_string(),
+                ],
+            },
+        });
+
+        retarget_rust_modules(&mut modules, "provider_alias");
+
+        assert_eq!(modules[0].types[0].path.crate_name, "provider_alias");
+        let materializer = modules[0].types[0].materializer.as_ref().unwrap();
+        assert_eq!(materializer.rust_type.crate_name, "provider_alias");
+        assert_eq!(materializer.path.crate_name, "provider_alias");
+    }
+
+    #[test]
+    fn package_attachment_rejects_missing_inline_module_support() {
+        let probe = package_provider_fixture("Game Host", "host-provider");
+        let mut descriptor = provider_descriptor("host");
+        let ty = &mut descriptor.modules[0].types[0];
+        ty.rep = anvyx_runtime::ExternRep::Inline;
+        ty.layout = Some(anvyx_runtime::ExternLayout { size: 8, align: 8 });
+        ty.materialization = Some(anvyx_runtime::ExternMaterialization::Copy);
+        let output = ProviderProbeOutput {
+            descriptors: vec![descriptor],
+            supports: vec![],
+        };
+
+        let error = native_providers_from_probe(&probe, output).unwrap_err();
+
+        assert!(error.contains("missing type support"), "{error}");
+    }
     #[test]
     fn package_attachment_rejects_duplicate_provider_modules() {
         let probe = package_provider_fixture("Game Host", "host-provider");
@@ -1323,6 +1367,7 @@ mod tests {
                 segments: vec!["Handle".to_string()],
             },
             owns_heap_edges: false,
+            materializer: None,
         }
     }
 

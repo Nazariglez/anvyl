@@ -90,6 +90,10 @@ fn main() {
         summary.print_summary(start_time);
         println!();
     }
+
+    if !summary.is_success() {
+        std::process::exit(1);
+    }
 }
 
 fn run_tests(
