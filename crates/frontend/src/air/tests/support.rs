@@ -2,9 +2,9 @@ use super::super::{
     AggregateDecl, AirBlock, AirBody, AirStmt, AirTail, CaptureCellDecl, ConstData,
     ContractSurfaceDecl, ContractWeakeningDecl, ContractWitnessDecl, DynBorrowParamDecl, EnumDecl,
     EnumRepr, ExternDecl, ExternTypeDecl, FlagDecl, Function, FunctionKind, GlobalDecl, LambdaDecl,
-    Local, LocalKind, Module, Mutability, Operand, Param, ParamEscape, ParamMode, ParamRole, Place,
-    PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl, ScopedBorrowSource, Signature,
-    TypeData, VariantDecl, VariantShape,
+    Local, LocalKind, Module, Mutability, Operand, OwnedValue, Param, ParamEscape, ParamMode,
+    ParamRole, Place, PlaceRoot, Program, RValue, RawEnumValue, ScopedBorrowDecl,
+    ScopedBorrowSource, Signature, TypeData, ValueSource, VariantDecl, VariantShape,
     ids::{
         AggregateId, BindingId, BlockId, CaptureCellId, ConstId, ContractSurfaceId,
         ContractWeakeningId, ContractWitnessId, DynBorrowParamId, EnumId, ExternId, ExternTypeId,
@@ -378,11 +378,31 @@ pub fn test_module(builder: &mut ProgramBuilder) -> ModuleId {
 }
 
 pub fn stmt_init(local: LocalId, value: RValue) -> AirStmt {
-    AirStmt::Init { local, value }
+    AirStmt::Init {
+        local,
+        value: finalized_store(value),
+    }
 }
 
 pub fn stmt_assign(dst: Place, value: RValue) -> AirStmt {
-    AirStmt::Assign { dst, value }
+    AirStmt::Assign {
+        dst,
+        value: finalized_store(value),
+    }
+}
+
+fn finalized_store(value: RValue) -> RValue {
+    match value {
+        RValue::Use(value) => RValue::Materialize(OwnedValue {
+            value,
+            source: ValueSource::Reusable,
+        }),
+        value => value,
+    }
+}
+
+pub fn owned(value: Operand) -> OwnedValue<Operand> {
+    OwnedValue::reusable(value)
 }
 
 pub fn stmt_eval(value: RValue) -> AirStmt {
@@ -390,7 +410,10 @@ pub fn stmt_eval(value: RValue) -> AirStmt {
 }
 
 pub fn term_return(value: Operand) -> AirTail {
-    AirTail::Return(Some(value))
+    AirTail::ReturnOwned(OwnedValue {
+        value,
+        source: ValueSource::Reusable,
+    })
 }
 
 pub fn term_return_void() -> AirTail {

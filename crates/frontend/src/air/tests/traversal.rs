@@ -3,6 +3,10 @@ use crate::{
     ast::{BinaryOp, FormatSpec, UnaryOp},
 };
 
+fn owned(value: Operand) -> OwnedValue<Operand> {
+    OwnedValue::reusable(value)
+}
+
 fn local(index: usize) -> LocalId {
     LocalId::from_index(index)
 }
@@ -223,9 +227,18 @@ fn rvalue_children_have_roles() {
     let values = vec![
         (RValue::Use(operand(0)), vec!["o:Consume"]),
         (
-            RValue::DynPack {
+            RValue::Materialize(OwnedValue {
                 value: operand(0),
-                use_: DynOwnedUse::ConsumeTemporary,
+                source: ValueSource::Reusable,
+            }),
+            vec!["o:Store"],
+        ),
+        (
+            RValue::DynPack {
+                value: OwnedValue {
+                    value: operand(0),
+                    source: ValueSource::TransferTemp { local: local(0) },
+                },
                 witness: ContractWitnessId::from_index(0),
                 ty: ty(1),
             },
@@ -233,8 +246,10 @@ fn rvalue_children_have_roles() {
         ),
         (
             RValue::DynWeaken {
-                value: operand(0),
-                use_: DynOwnedUse::ConsumeTemporary,
+                value: OwnedValue {
+                    value: operand(0),
+                    source: ValueSource::TransferTemp { local: local(0) },
+                },
                 weakening: ContractWeakeningId::from_index(0),
                 ty: ty(1),
             },
@@ -242,13 +257,12 @@ fn rvalue_children_have_roles() {
         ),
         (
             RValue::DynDowncast {
-                value: operand(0),
-                use_: DynOwnedUse::ReusableRead,
+                value: owned(operand(0)),
                 surface: ContractSurfaceId::from_index(0),
                 target: ty(1),
                 ty: ty(2),
             },
-            vec!["o:Read"],
+            vec!["o:Store"],
         ),
         (
             RValue::DynCall {
@@ -261,7 +275,10 @@ fn rvalue_children_have_roles() {
         ),
         (
             RValue::FunctionValue {
-                value: operand(0),
+                value: OwnedValue {
+                    value: operand(0),
+                    source: ValueSource::TransferTemp { local: local(0) },
+                },
                 capability: FunctionValueCapability::Unknown,
             },
             vec!["o:Consume"],
@@ -293,10 +310,10 @@ fn rvalue_children_have_roles() {
         ),
         (
             RValue::OptionalSome {
-                value: operand(0),
+                value: owned(operand(0)),
                 ty: ty(0),
             },
-            vec!["o:Read"],
+            vec!["o:Store"],
         ),
         (
             RValue::Cast {
@@ -323,7 +340,7 @@ fn rvalue_children_have_roles() {
         (
             RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![operand(0), operand(1)],
+                fields: vec![owned(operand(0)), owned(operand(1))],
                 ty: ty(0),
             },
             vec!["o:Store", "o:Store"],
@@ -331,7 +348,10 @@ fn rvalue_children_have_roles() {
         (
             RValue::Call {
                 callee: Callee::Lambda(operand(0)),
-                args: vec![CallArg::Value(operand(1)), CallArg::MutBorrow(place(2))],
+                args: vec![
+                    CallArg::Value(owned(operand(1))),
+                    CallArg::MutBorrow(place(2)),
+                ],
             },
             vec!["o:Read", "a:Value", "a:MutBorrow"],
         ),
@@ -359,7 +379,7 @@ fn rvalue_children_have_roles() {
         (
             RValue::ListPush {
                 list: place(0),
-                value: operand(1),
+                value: owned(operand(1)),
             },
             vec!["p:Mutate", "o:Store"],
         ),
@@ -391,8 +411,8 @@ fn rvalue_children_have_roles() {
         (
             RValue::MapInsert {
                 map: place(0),
-                key: operand(1),
-                value: operand(2),
+                key: owned(operand(1)),
+                value: owned(operand(2)),
                 kind: MapWriteKind::StructuralInsert,
             },
             vec!["p:Mutate", "o:Store", "o:Store"],
@@ -456,7 +476,9 @@ fn rvalue_children_have_roles() {
         (
             RValue::MakeLambda {
                 lambda: LambdaId::from_index(0),
-                captures: vec![LambdaCaptureArg::ReadonlyLocal { value: operand(0) }],
+                captures: vec![LambdaCaptureArg::ReadonlyLocal {
+                    value: owned(operand(0)),
+                }],
                 ty: ty(0),
             },
             vec!["capture"],
@@ -493,7 +515,10 @@ fn children_preserve_identity_and_order() {
 
     let call = RValue::Call {
         callee: Callee::Function(FunctionId::from_index(0)),
-        args: vec![CallArg::Value(operand(4)), CallArg::SharedBorrow(place(8))],
+        args: vec![
+            CallArg::Value(owned(operand(4))),
+            CallArg::SharedBorrow(place(8)),
+        ],
     };
     let mut args = vec![];
     call.for_each_child(ValueUse::Read, &mut |child| {
@@ -563,4 +588,95 @@ fn recursive_walk_includes_nested_rvalues_and_tail() {
             "o:Consume",
         ]
     );
+}
+
+#[test]
+fn owned_value_visitor_covers_every_explicit_edge() {
+    let owned = |index| OwnedValue {
+        value: operand(index),
+        source: ValueSource::TransferTemp {
+            local: local(index),
+        },
+    };
+    let block = AirBlock {
+        stmts: vec![
+            AirStmt::Eval(RValue::Materialize(owned(0))),
+            AirStmt::Eval(RValue::DynPack {
+                value: owned(1),
+                witness: ContractWitnessId::from_index(0),
+                ty: ty(1),
+            }),
+            AirStmt::Eval(RValue::DynWeaken {
+                value: owned(2),
+                weakening: ContractWeakeningId::from_index(0),
+                ty: ty(1),
+            }),
+            AirStmt::Eval(RValue::DynDowncast {
+                value: owned(3),
+                surface: ContractSurfaceId::from_index(0),
+                target: ty(0),
+                ty: ty(1),
+            }),
+            AirStmt::Eval(RValue::FunctionValue {
+                value: owned(4),
+                capability: FunctionValueCapability::Unknown,
+            }),
+            AirStmt::Eval(RValue::OptionalSome {
+                value: owned(5),
+                ty: ty(1),
+            }),
+            AirStmt::Eval(RValue::ListPush {
+                list: place(0),
+                value: owned(6),
+            }),
+            AirStmt::Eval(RValue::Aggregate {
+                kind: AggregateCtor::Tuple,
+                fields: vec![owned(7)],
+                ty: ty(1),
+            }),
+            AirStmt::Eval(RValue::MapInsert {
+                map: place(0),
+                key: owned(8),
+                value: owned(9),
+                kind: MapWriteKind::StructuralInsert,
+            }),
+            AirStmt::Eval(RValue::Call {
+                callee: Callee::Function(FunctionId::from_index(0)),
+                args: vec![
+                    CallArg::Value(owned(10)),
+                    CallArg::InitFieldProvided(owned(11)),
+                ],
+            }),
+            AirStmt::Eval(RValue::DynCall {
+                receiver: DynReceiver::Owned(owned(12)),
+                surface: ContractSurfaceId::from_index(0),
+                slot: ContractSlotId::from_index(0),
+                args: vec![CallArg::Value(owned(13))],
+            }),
+            AirStmt::Eval(RValue::MakeLambda {
+                lambda: LambdaId::from_index(0),
+                captures: vec![LambdaCaptureArg::ReadonlyLocal { value: owned(14) }],
+                ty: ty(1),
+            }),
+            AirStmt::DynMatch(AirDynMatch {
+                source: AirDynMatchSource::Owned(owned(15)),
+                surface: ContractSurfaceId::from_index(0),
+                arms: vec![],
+                fallback: AirDynMatchFallback {
+                    binding: AirDynMatchFallbackBinding::Discard,
+                    block: AirBlock::default(),
+                },
+            }),
+            AirStmt::Eval(RValue::Use(operand(20))),
+        ],
+        tail: AirTail::ReturnOwned(owned(16)),
+    };
+    let mut transfers = vec![];
+    block.for_each_owned_value(&mut |owned| {
+        let ValueSource::TransferTemp { local } = owned.source else {
+            panic!("expected transfer marker")
+        };
+        transfers.push(local.index());
+    });
+    assert_eq!(transfers, (0..=16).collect::<Vec<_>>());
 }

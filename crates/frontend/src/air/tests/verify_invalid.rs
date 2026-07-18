@@ -4,7 +4,7 @@ use verify::{
     VerifyErrorKind as EK, VerifySite,
 };
 
-use super::{super::verify::verify_structured_body, *};
+use super::{super::verify::verify_structured_body, support::owned, *};
 use crate::{
     air::{
         AirPatternAlternative, AirPatternArm, AirPatternBinding, AirPatternBindingMode,
@@ -14,6 +14,7 @@ use crate::{
         ContractWitnessKey, ContractWitnessSlotDecl, ContractWitnessTarget, ExternBindingDecl,
         ExternStaticDecl, ExternTypeId, FlagDecl, FlagId, FlagMemberDecl, FlagMemberId,
         FlagStaticOp, FunctionSpecialization, FunctionValueCapability, GlobalInitEffect, Module,
+        OwnedValue, ValueSource,
     },
     ast::Ident,
 };
@@ -23,6 +24,147 @@ fn field(name: &str, ty: TypeId) -> FieldDecl {
         name: Ident::new(name),
         ty,
     }
+}
+
+fn materialize(value: Operand, source: ValueSource) -> RValue {
+    RValue::Materialize(OwnedValue { value, source })
+}
+
+#[test]
+fn rejects_forged_materialize_roles() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let void = builder.void_ty();
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_roles", module, FunctionKind::Normal, void);
+    let local = fb.push_local(None, int, Mutability::Immutable, LocalKind::Temp);
+    fb.push_block(term_return_void());
+    let function = builder.alloc_function(fb.finish());
+    let body = AirBody {
+        block: AirBlock {
+            stmts: vec![
+                AirStmt::Init {
+                    local,
+                    value: RValue::Use(op_const(one)),
+                },
+                AirStmt::Eval(materialize(op_place(local, int), ValueSource::Reusable)),
+            ],
+            tail: AirTail::Return(None),
+        },
+    };
+    let program = builder.finish();
+    let errors = verify_structured_body(&program, function, &body).unwrap_err();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| { error.kind == EK::BadRValue(BadRValue::InvalidMaterialize) })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn rejects_forged_named_multiple_and_repeated_transfers() {
+    fn errors(kind: LocalKind, repeated: bool, extra_read: bool) -> Vec<VerifyError> {
+        let mut builder = ProgramBuilder::default();
+        let int = builder.int_ty();
+        let void = builder.void_ty();
+        let module = test_module(&mut builder);
+        let one = builder.alloc_const(ConstData {
+            ty: int,
+            value: ConstValue::Int(1),
+        });
+        let mut fb = FunctionBuilder::new("bad_transfer", module, FunctionKind::Normal, void);
+        let source = fb.push_local(None, int, Mutability::Immutable, kind);
+        let dest = fb.push_local(None, int, Mutability::Immutable, LocalKind::Temp);
+        fb.push_block(term_return_void());
+        let function = builder.alloc_function(fb.finish());
+        let transfer = stmt_init(
+            dest,
+            materialize(
+                op_place(source, int),
+                ValueSource::TransferTemp { local: source },
+            ),
+        );
+        let transfer = if repeated {
+            AirStmt::Loop(AirLoop {
+                id: AirLoopId::from_index(0),
+                body: AirBlock {
+                    stmts: vec![transfer],
+                    tail: AirTail::Break(AirLoopId::from_index(0)),
+                },
+            })
+        } else {
+            transfer
+        };
+        let mut stmts = vec![stmt_init(source, RValue::Use(op_const(one))), transfer];
+        if extra_read {
+            stmts.push(stmt_eval(RValue::Use(op_place(source, int))));
+        }
+        let body = AirBody {
+            block: AirBlock {
+                stmts,
+                tail: AirTail::Return(None),
+            },
+        };
+        let program = builder.finish();
+        verify_structured_body(&program, function, &body).unwrap_err()
+    }
+
+    for errors in [
+        errors(LocalKind::User, false, false),
+        errors(LocalKind::Temp, false, true),
+        errors(LocalKind::Temp, true, false),
+    ] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.kind == EK::BadRValue(BadRValue::InvalidMaterialize) })
+        );
+    }
+}
+
+#[test]
+fn rejects_forged_array_fill_transfer() {
+    let mut builder = ProgramBuilder::default();
+    let int = builder.int_ty();
+    let void = builder.void_ty();
+    let array = builder.alloc_type(TypeData::Array { elem: int, len: 1 });
+    let module = test_module(&mut builder);
+    let one = builder.alloc_const(ConstData {
+        ty: int,
+        value: ConstValue::Int(1),
+    });
+    let mut fb = FunctionBuilder::new("bad_fill_transfer", module, FunctionKind::Normal, void);
+    let source = fb.push_local(None, int, Mutability::Immutable, LocalKind::Temp);
+    let dest = fb.push_local(None, array, Mutability::Immutable, LocalKind::Temp);
+    let block = fb.push_block(term_return_void());
+    fb.add_statement(block, stmt_init(source, RValue::Use(op_const(one))));
+    fb.add_statement(
+        block,
+        stmt_init(
+            dest,
+            RValue::Aggregate {
+                kind: AggregateCtor::ArrayFill,
+                fields: vec![OwnedValue {
+                    value: op_place(source, int),
+                    source: ValueSource::TransferTemp { local: source },
+                }],
+                ty: array,
+            },
+        ),
+    );
+    builder.alloc_function(fb.finish());
+    let errors = verify(&builder.finish()).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.kind == EK::BadRValue(BadRValue::InvalidMaterialize) })
+    );
 }
 
 fn verify_void_entry(
@@ -561,7 +703,7 @@ fn function_call_arg_type_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee_id),
-            args: vec![CallArg::Value(op_place(p_arg, bool_ty))],
+            args: vec![CallArg::Value(owned(op_place(p_arg, bool_ty)))],
         }),
     );
     let caller_id = builder.alloc_function(caller.finish());
@@ -916,7 +1058,7 @@ fn call_arity_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![CallArg::Value(op_place(p_n, int_ty))],
+            args: vec![CallArg::Value(owned(op_place(p_n, int_ty)))],
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -951,7 +1093,7 @@ fn call_value_arg_invalid_type_does_not_panic() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee_id),
-            args: vec![CallArg::Value(op_place(arg, invalid_ty))],
+            args: vec![CallArg::Value(owned(op_place(arg, invalid_ty)))],
         }),
     );
     let fid = builder.alloc_function(caller.finish());
@@ -1044,8 +1186,8 @@ fn call_arg_type_mismatch() {
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
             args: vec![
-                CallArg::Value(op_place(p_n, int_ty)),
-                CallArg::Value(op_place(p_b, bool_ty)),
+                CallArg::Value(owned(op_place(p_n, int_ty))),
+                CallArg::Value(owned(op_place(p_b, bool_ty))),
             ],
         }),
     );
@@ -1107,7 +1249,7 @@ fn call_arg_function_escape_mismatch() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![CallArg::Value(op_place(f, non_ty))],
+            args: vec![CallArg::Value(owned(op_place(f, non_ty)))],
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -2400,7 +2542,7 @@ fn make_lambda_capture_value_type_must_match_decl() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_const(bad),
+                value: owned(op_const(bad)),
             }],
             ty: lambda_ty,
         }),
@@ -2579,11 +2721,11 @@ fn escaping_readonly_capture_must_not_use_scoped_borrow_root() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: Operand::Place(Place {
+                value: owned(Operand::Place(Place {
                     root: PlaceRoot::ScopedBorrow(scoped),
                     projection: vec![],
                     ty: int_ty,
-                }),
+                })),
             }],
             ty: lambda_ty,
         }),
@@ -2645,7 +2787,7 @@ fn escaping_readonly_capture_must_not_use_borrow_param() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_place(borrowed, int_ty),
+                value: owned(op_place(borrowed, int_ty)),
             }],
             ty: lambda_ty,
         }),
@@ -2963,7 +3105,7 @@ fn readonly_capture_must_match_binding_identity() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_place(local, int_ty),
+                value: owned(op_place(local, int_ty)),
             }],
             ty: lambda_ty,
         }),
@@ -3011,7 +3153,7 @@ fn readonly_capture_must_not_use_const_operand() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_const(value),
+                value: owned(op_const(value)),
             }],
             ty: lambda_ty,
         }),
@@ -3061,7 +3203,7 @@ fn readonly_capture_must_not_use_temp_local() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_place(temp, int_ty),
+                value: owned(op_place(temp, int_ty)),
             }],
             ty: lambda_ty,
         }),
@@ -3116,7 +3258,7 @@ fn readonly_capture_must_not_snapshot_mutable_local() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_place(local, int_ty),
+                value: owned(op_place(local, int_ty)),
             }],
             ty: lambda_ty,
         }),
@@ -3230,7 +3372,7 @@ fn lambda_call_args_must_match_signature() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Lambda(op_place(callee, lambda_ty)),
-            args: vec![CallArg::Value(op_const(arg))],
+            args: vec![CallArg::Value(owned(op_const(arg)))],
         }),
     );
     let fid = builder.alloc_function(fb.finish());
@@ -3307,7 +3449,7 @@ fn escaping_function_param_rejects_nonescaping_lambda_value() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee),
-            args: vec![CallArg::Value(op_place(local, lambda_ty))],
+            args: vec![CallArg::Value(owned(op_place(local, lambda_ty)))],
         }),
     );
     let main = builder.alloc_function(main.finish());
@@ -3344,7 +3486,7 @@ fn function_value_proof_rejects_nonescaping_local_as_escaping() {
         stmt_init(
             temp,
             RValue::FunctionValue {
-                value: op_place(param, lambda_ty),
+                value: OwnedValue::reusable(op_place(param, lambda_ty)),
                 capability: FunctionValueCapability::Escaping,
             },
         ),
@@ -3391,11 +3533,11 @@ fn escaping_function_param_rejects_unknown_function_value() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee),
-            args: vec![CallArg::Value(Operand::Place(Place {
+            args: vec![CallArg::Value(owned(Operand::Place(Place {
                 root: PlaceRoot::Local(pair),
                 projection: vec![Projection::TupleField(0)],
                 ty: lambda_ty,
-            }))],
+            })))],
         }),
     );
     let main = builder.alloc_function(main.finish());
@@ -4410,8 +4552,7 @@ fn malformed_dynamic_rvalues_reject() {
     fb.add_statement(
         bb0,
         stmt_eval(RValue::DynPack {
-            value: op_place(concrete, int),
-            use_: DynOwnedUse::ReusableRead,
+            value: OwnedValue::reusable(op_place(concrete, int)),
             witness: ContractWitnessId::from_index(99),
             ty: dyn_ty,
         }),
@@ -4419,8 +4560,7 @@ fn malformed_dynamic_rvalues_reject() {
     fb.add_statement(
         bb0,
         stmt_eval(RValue::DynWeaken {
-            value: op_place(dynamic, dyn_ty),
-            use_: DynOwnedUse::ReusableRead,
+            value: OwnedValue::reusable(op_place(dynamic, dyn_ty)),
             weakening: ContractWeakeningId::from_index(99),
             ty: dyn_ty,
         }),
@@ -4428,7 +4568,9 @@ fn malformed_dynamic_rvalues_reject() {
     fb.add_statement(
         bb0,
         stmt_eval(RValue::DynCall {
-            receiver: crate::air::DynReceiver::Owned(op_place(dynamic, dyn_ty)),
+            receiver: crate::air::DynReceiver::Owned(OwnedValue::reusable(op_place(
+                dynamic, dyn_ty,
+            ))),
             surface,
             slot: ContractSlotId::from_index(99),
             args: vec![],
@@ -4541,10 +4683,12 @@ fn dynamic_call_checks_escaping_callback_args() {
     fb.add_statement(
         bb0,
         stmt_eval(RValue::DynCall {
-            receiver: crate::air::DynReceiver::Owned(op_place(receiver, dyn_ty)),
+            receiver: crate::air::DynReceiver::Owned(OwnedValue::reusable(op_place(
+                receiver, dyn_ty,
+            ))),
             surface,
             slot: ContractSlotId::from_index(0),
-            args: vec![CallArg::Value(op_place(callback, callback_ty))],
+            args: vec![CallArg::Value(owned(op_place(callback, callback_ty)))],
         }),
     );
     let function = builder.alloc_function(fb.finish());
@@ -6132,7 +6276,7 @@ fn aggregate_ctor_slot_type_mismatch() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Struct(aggregate),
-                fields: vec![op_place(p_b, bool_ty), op_place(p_i, int_ty)],
+                fields: vec![owned(op_place(p_b, bool_ty)), owned(op_place(p_i, int_ty))],
                 ty: aggregate_ty,
             }),
         );
@@ -6177,7 +6321,7 @@ fn enum_struct_ctor_slot_type_mismatch() {
                     enum_id,
                     variant: VariantId::from_index(0),
                 },
-                fields: vec![op_place(p_b, bool_ty), op_place(p_i, int_ty)],
+                fields: vec![owned(op_place(p_b, bool_ty)), owned(op_place(p_i, int_ty))],
                 ty: enum_ty,
             }),
         );
@@ -6253,7 +6397,7 @@ fn aggregate_ctor_field_count_mismatch() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Struct(aggregate),
-                fields: vec![op_place(p, int_ty)],
+                fields: vec![owned(op_place(p, int_ty))],
                 ty: aggregate_ty,
             }),
         );
@@ -6282,7 +6426,7 @@ fn array_ctor_shape_is_verified() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Array,
-                fields: vec![op_place(p, bool_ty)],
+                fields: vec![owned(op_place(p, bool_ty))],
                 ty: array_ty,
             }),
         );
@@ -6317,7 +6461,7 @@ fn tuple_ctor_field_count_is_verified() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![op_place(p, bool_ty)],
+                fields: vec![owned(op_place(p, bool_ty))],
                 ty: tuple_ty,
             }),
         );
@@ -6348,7 +6492,7 @@ fn tuple_ctor_field_types_are_verified() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![op_place(lhs, bool_ty), op_place(rhs, bool_ty)],
+                fields: vec![owned(op_place(lhs, bool_ty)), owned(op_place(rhs, bool_ty))],
                 ty: tuple_ty,
             }),
         );
@@ -6373,7 +6517,7 @@ fn tuple_ctor_result_type_is_verified() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![op_place(p, int_ty)],
+                fields: vec![owned(op_place(p, int_ty))],
                 ty: int_ty,
             }),
         );
@@ -6400,7 +6544,7 @@ fn list_ctor_shape_is_verified() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::List,
-                fields: vec![op_place(p, bool_ty)],
+                fields: vec![owned(op_place(p, bool_ty))],
                 ty: list_ty,
             }),
         );
@@ -6430,7 +6574,7 @@ fn collection_ctor_result_type_is_verified() {
                 bb0,
                 stmt_eval(RValue::Aggregate {
                     kind: AggregateCtor::Array,
-                    fields: vec![op_place(p, int_ty)],
+                    fields: vec![owned(op_place(p, int_ty))],
                     ty: int_ty,
                 }),
             );
@@ -6466,7 +6610,7 @@ fn aggregate_ctor_result_and_kind_mismatch() {
             bb0,
             stmt_eval(RValue::Aggregate {
                 kind: AggregateCtor::Struct(aggregate),
-                fields: vec![op_place(p, int_ty)],
+                fields: vec![owned(op_place(p, int_ty))],
                 ty: int_ty,
             }),
         );
@@ -6523,7 +6667,7 @@ fn enum_ctor_unit_count_tuple_type_and_result_mismatch() {
                         enum_id,
                         variant: VariantId::from_index(variant),
                     },
-                    fields: vec![op_place(p, bool_ty)],
+                    fields: vec![owned(op_place(p, bool_ty))],
                     ty,
                 }),
             );
@@ -7133,7 +7277,7 @@ fn collection_loan_rejects_same_root_structural_ops() {
                 body: AirBlock {
                     stmts: vec![stmt_eval(RValue::ListPush {
                         list: place(xs, list_ty),
-                        value: op_const(one),
+                        value: owned(op_const(one)),
                     })],
                     tail: AirTail::None,
                 },

@@ -55,6 +55,7 @@ pub enum AirTail {
     #[default]
     None,
     Return(Option<Operand>),
+    ReturnOwned(OwnedValue<Operand>),
     Break(AirLoopId),
     Continue(AirLoopId),
     Unreachable,
@@ -181,24 +182,9 @@ pub struct AirDynMatch {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AirDynMatchSource {
-    Owned { value: Operand, use_: DynOwnedUse },
+    Owned(OwnedValue<Operand>),
     Borrowed(DynBorrow),
     Mutable(Place),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DynOwnedUse {
-    ConsumeTemporary,
-    ReusableRead,
-}
-
-impl DynOwnedUse {
-    fn value_use(self) -> ValueUse {
-        match self {
-            Self::ConsumeTemporary => ValueUse::Consume,
-            Self::ReusableRead => ValueUse::Read,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -447,8 +433,8 @@ pub enum Operand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallArg {
-    Value(Operand),
-    InitFieldProvided(Operand),
+    Value(OwnedValue<Operand>),
+    InitFieldProvided(OwnedValue<Operand>),
     InitFieldOmitted,
     SharedBorrow(Place),
     SharedStringConst(ConstId),
@@ -469,13 +455,25 @@ impl CallArg {
 
     pub(crate) fn place(&self) -> Option<&Place> {
         match self {
-            Self::Value(Operand::Place(place))
-            | Self::InitFieldProvided(Operand::Place(place))
+            Self::Value(OwnedValue {
+                value: Operand::Place(place),
+                ..
+            })
+            | Self::InitFieldProvided(OwnedValue {
+                value: Operand::Place(place),
+                ..
+            })
             | Self::SharedBorrow(place)
             | Self::MutBorrow(place) => Some(place),
             Self::DynBorrow(borrow) => Some(borrow.place()),
-            Self::Value(Operand::Const(_))
-            | Self::InitFieldProvided(Operand::Const(_))
+            Self::Value(OwnedValue {
+                value: Operand::Const(_),
+                ..
+            })
+            | Self::InitFieldProvided(OwnedValue {
+                value: Operand::Const(_),
+                ..
+            })
             | Self::InitFieldOmitted
             | Self::SharedStringConst(_) => None,
         }
@@ -485,7 +483,7 @@ impl CallArg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LambdaCaptureArg {
     NoRuntime,
-    ReadonlyLocal { value: Operand },
+    ReadonlyLocal { value: OwnedValue<Operand> },
     ScopedLocal { place: Place },
     ScopedBorrow { place: Place },
     CaptureCell { cell: CaptureCellId },
@@ -511,23 +509,42 @@ pub enum FlagStaticOp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OwnedValue<T> {
+    pub value: T,
+    pub source: ValueSource,
+}
+
+impl<T> OwnedValue<T> {
+    pub fn reusable(value: T) -> Self {
+        Self {
+            value,
+            source: ValueSource::Reusable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueSource {
+    Reusable,
+    TransferTemp { local: LocalId },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum RValue {
     Use(Operand),
+    Materialize(OwnedValue<Operand>),
     DynPack {
-        value: Operand,
-        use_: DynOwnedUse,
+        value: OwnedValue<Operand>,
         witness: ContractWitnessId,
         ty: TypeId,
     },
     DynWeaken {
-        value: Operand,
-        use_: DynOwnedUse,
+        value: OwnedValue<Operand>,
         weakening: ContractWeakeningId,
         ty: TypeId,
     },
     DynDowncast {
-        value: Operand,
-        use_: DynOwnedUse,
+        value: OwnedValue<Operand>,
         surface: ContractSurfaceId,
         target: TypeId,
         ty: TypeId,
@@ -539,7 +556,7 @@ pub enum RValue {
         args: Vec<CallArg>,
     },
     FunctionValue {
-        value: Operand,
+        value: OwnedValue<Operand>,
         capability: FunctionValueCapability,
     },
     Unary {
@@ -559,7 +576,7 @@ pub enum RValue {
         negated: bool,
     },
     OptionalSome {
-        value: Operand,
+        value: OwnedValue<Operand>,
         ty: TypeId,
     },
     Cast {
@@ -581,7 +598,7 @@ pub enum RValue {
     },
     Aggregate {
         kind: AggregateCtor,
-        fields: Vec<Operand>,
+        fields: Vec<OwnedValue<Operand>>,
         ty: TypeId,
     },
     Call {
@@ -604,7 +621,7 @@ pub enum RValue {
     },
     ListPush {
         list: Place,
-        value: Operand,
+        value: OwnedValue<Operand>,
     },
     ListPop {
         list: Place,
@@ -624,8 +641,8 @@ pub enum RValue {
     },
     MapInsert {
         map: Place,
-        key: Operand,
-        value: Operand,
+        key: OwnedValue<Operand>,
+        value: OwnedValue<Operand>,
         kind: MapWriteKind,
     },
     MapRemove {
@@ -700,7 +717,7 @@ impl DynBorrow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DynReceiver {
-    Owned(Operand),
+    Owned(OwnedValue<Operand>),
     MutableOwned(Place),
     Borrowed(DynBorrow),
 }
@@ -760,6 +777,7 @@ pub enum AggregateCtor {
     EnumVariant { enum_id: EnumId, variant: VariantId },
     List,
     Array,
+    ArrayFill,
     Map,
     DataRef(AggregateId),
 }
@@ -783,16 +801,37 @@ impl AirBlock {
         for stmt in &self.stmts {
             stmt.for_each_child(f);
         }
-        if let AirTail::Return(Some(operand)) = &self.tail {
-            f(AirChild::Operand {
+        match &self.tail {
+            AirTail::Return(Some(operand)) => f(AirChild::Operand {
                 operand,
                 use_: ValueUse::Consume,
-            });
+            }),
+            AirTail::ReturnOwned(owned) => f(AirChild::Operand {
+                operand: &owned.value,
+                use_: match owned.source {
+                    ValueSource::Reusable => ValueUse::Store,
+                    ValueSource::TransferTemp { .. } => ValueUse::Consume,
+                },
+            }),
+            AirTail::None
+            | AirTail::Return(None)
+            | AirTail::Break(_)
+            | AirTail::Continue(_)
+            | AirTail::Unreachable => {}
         }
     }
 
     pub fn walk_children(&self, f: &mut impl FnMut(AirChild<'_>)) {
         self.for_each_child(&mut |child| walk_child(child, f));
+    }
+
+    pub fn for_each_owned_value(&self, f: &mut impl FnMut(&OwnedValue<Operand>)) {
+        for stmt in &self.stmts {
+            stmt.for_each_owned_value(f);
+        }
+        if let AirTail::ReturnOwned(owned) = &self.tail {
+            f(owned);
+        }
     }
 }
 
@@ -813,6 +852,27 @@ fn walk_child(child: AirChild<'_>, f: &mut impl FnMut(AirChild<'_>)) {
 }
 
 impl AirStmt {
+    pub fn for_each_owned_value(&self, f: &mut impl FnMut(&OwnedValue<Operand>)) {
+        match self {
+            Self::Init { value, .. }
+            | Self::GlobalSetRoot { value, .. }
+            | Self::GlobalUpdateRoot { value, .. }
+            | Self::Assign { value, .. }
+            | Self::Eval(value) => value.for_each_owned_value(f),
+            Self::DynMatch(match_) => {
+                if let AirDynMatchSource::Owned(owned) = &match_.source {
+                    f(owned);
+                }
+            }
+            _ => {}
+        }
+        self.for_each_child(&mut |child| {
+            if let AirChild::Block(block) = child {
+                block.for_each_owned_value(f);
+            }
+        });
+    }
+
     pub fn for_each_child(&self, f: &mut impl FnMut(AirChild<'_>)) {
         match self {
             Self::Init { value, .. }
@@ -924,9 +984,7 @@ impl AirStmt {
             }
             Self::DynMatch(match_) => {
                 match &match_.source {
-                    AirDynMatchSource::Owned { value, use_ } => {
-                        emit_operand(f, value, use_.value_use());
-                    }
+                    AirDynMatchSource::Owned(value) => emit_owned(f, value),
                     AirDynMatchSource::Borrowed(borrow) => f(AirChild::DynBorrow(borrow)),
                     AirDynMatchSource::Mutable(place) => {
                         emit_place(f, place, PlaceUse::Borrow(ParamMode::MutBorrow));
@@ -973,18 +1031,71 @@ fn emit_place<'a>(f: &mut impl FnMut(AirChild<'a>), place: &'a Place, use_: Plac
     f(AirChild::Place { place, use_ });
 }
 
+fn emit_owned<'a>(f: &mut impl FnMut(AirChild<'a>), owned: &'a OwnedValue<Operand>) {
+    emit_operand(
+        f,
+        &owned.value,
+        match owned.source {
+            ValueSource::Reusable => ValueUse::Store,
+            ValueSource::TransferTemp { .. } => ValueUse::Consume,
+        },
+    );
+}
+
 impl RValue {
-    pub fn for_each_child(&self, use_: ValueUse, f: &mut impl FnMut(AirChild<'_>)) {
+    pub fn for_each_owned_value(&self, f: &mut impl FnMut(&OwnedValue<Operand>)) {
         match self {
-            Self::Use(value) | Self::FunctionValue { value, .. } => emit_operand(f, value, use_),
-            Self::DynPack { value, use_, .. }
-            | Self::DynWeaken { value, use_, .. }
-            | Self::DynDowncast { value, use_, .. } => {
-                emit_operand(f, value, use_.value_use());
+            Self::Materialize(owned)
+            | Self::DynPack { value: owned, .. }
+            | Self::DynWeaken { value: owned, .. }
+            | Self::DynDowncast { value: owned, .. }
+            | Self::FunctionValue { value: owned, .. }
+            | Self::OptionalSome { value: owned, .. }
+            | Self::ListPush { value: owned, .. } => f(owned),
+            Self::Aggregate { fields, .. } => fields.iter().for_each(f),
+            Self::MapInsert { key, value, .. } => {
+                f(key);
+                f(value);
+            }
+            Self::Call { args, .. } => {
+                for arg in args {
+                    if let CallArg::Value(owned) | CallArg::InitFieldProvided(owned) = arg {
+                        f(owned);
+                    }
+                }
             }
             Self::DynCall { receiver, args, .. } => {
+                if let DynReceiver::Owned(owned) = receiver {
+                    f(owned);
+                }
+                for arg in args {
+                    if let CallArg::Value(owned) | CallArg::InitFieldProvided(owned) = arg {
+                        f(owned);
+                    }
+                }
+            }
+            Self::MakeLambda { captures, .. } => {
+                for capture in captures {
+                    if let LambdaCaptureArg::ReadonlyLocal { value } = capture {
+                        f(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn for_each_child(&self, use_: ValueUse, f: &mut impl FnMut(AirChild<'_>)) {
+        match self {
+            Self::Use(value) => emit_operand(f, value, use_),
+            Self::Materialize(owned)
+            | Self::DynPack { value: owned, .. }
+            | Self::DynWeaken { value: owned, .. }
+            | Self::DynDowncast { value: owned, .. }
+            | Self::FunctionValue { value: owned, .. } => emit_owned(f, owned),
+            Self::DynCall { receiver, args, .. } => {
                 match receiver {
-                    DynReceiver::Owned(value) => emit_operand(f, value, ValueUse::Read),
+                    DynReceiver::Owned(value) => emit_owned(f, value),
                     DynReceiver::MutableOwned(place) => emit_place(f, place, PlaceUse::Mutate),
                     DynReceiver::Borrowed(borrow) => f(AirChild::DynBorrow(borrow)),
                 }
@@ -997,8 +1108,8 @@ impl RValue {
                     });
                 }
             }
+            Self::OptionalSome { value, .. } => emit_owned(f, value),
             Self::Unary { value, .. }
-            | Self::OptionalSome { value, .. }
             | Self::Cast { value, .. }
             | Self::RawProject { value, .. }
             | Self::RawTryConstruct { value, .. }
@@ -1011,7 +1122,7 @@ impl RValue {
             }
             Self::Aggregate { fields, .. } => {
                 for field in fields {
-                    emit_operand(f, field, ValueUse::Store);
+                    emit_owned(f, field);
                 }
             }
             Self::Call { callee, args } => {
@@ -1035,7 +1146,7 @@ impl RValue {
             Self::Len { source } => emit_place(f, source, PlaceUse::Read),
             Self::ListPush { list, value } => {
                 emit_place(f, list, PlaceUse::Mutate);
-                emit_operand(f, value, ValueUse::Store);
+                emit_owned(f, value);
             }
             Self::ListPop { list, .. } => emit_place(f, list, PlaceUse::Mutate),
             Self::RangeListCopy {
@@ -1060,8 +1171,8 @@ impl RValue {
                 map, key, value, ..
             } => {
                 emit_place(f, map, PlaceUse::Mutate);
-                emit_operand(f, key, ValueUse::Store);
-                emit_operand(f, value, ValueUse::Store);
+                emit_owned(f, key);
+                emit_owned(f, value);
             }
             Self::MapRemove { map, key, .. } => {
                 emit_place(f, map, PlaceUse::Mutate);

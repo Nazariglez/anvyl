@@ -161,7 +161,9 @@ pub(crate) fn call_arg_ty_with(
     mut const_lookup: impl FnMut(ConstId) -> Option<TypeId>,
 ) -> Option<TypeId> {
     match arg {
-        CallArg::Value(op) | CallArg::InitFieldProvided(op) => operand_ty_with(op, const_lookup),
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+            operand_ty_with(&owned.value, const_lookup)
+        }
         CallArg::InitFieldOmitted => None,
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => Some(place.ty),
         CallArg::SharedStringConst(id) => const_lookup(*id),
@@ -331,7 +333,9 @@ pub(crate) fn rvalue_ty(
     value: &RValue,
 ) -> Option<TypeId> {
     match value {
-        RValue::Use(op) | RValue::FunctionValue { value: op, .. } => operand_ty(program, op),
+        RValue::Use(op) => operand_ty(program, op),
+        RValue::FunctionValue { value, .. } => operand_ty(program, &value.value),
+        RValue::Materialize(owned) => operand_ty(program, &owned.value),
         RValue::DynPack { ty, .. }
         | RValue::DynWeaken { ty, .. }
         | RValue::DynDowncast { ty, .. }

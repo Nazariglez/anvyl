@@ -166,26 +166,16 @@ fn expand_inner(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream
         }
 
         #[doc(hidden)]
-        pub fn #companion() -> anvyx_runtime::TypeExport {
-            anvyx_runtime::TypeExport {
-                rust_type_path: #rust_type_path,
-                owns_heap_edges: false,
-                descriptor: anvyx_runtime::ExternTypeDescriptor {
-                    name: #export_name.to_string(),
-                    doc: None,
-                    rep: anvyx_runtime::ExternRep::Inline,
-                    layout: None,
-                    materialization: None,
-                    owns_heap_edges: None,
-                    fields: vec![#(#descriptor_fields),*],
-                    variants: vec![],
-                    init: #init,
-                    methods: vec![#(#descriptor_methods),*],
-                    statics: vec![#(#descriptor_statics),*],
-                    operators: vec![#(#descriptor_operators),*],
-                },
-                bindings: vec![#(#bindings),*],
-            }
+        pub fn #companion() -> anvyx_runtime::TypeMemberFragment {
+            anvyx_runtime::TypeMemberFragment::new(
+                #export_name.to_string(),
+                vec![#(#descriptor_fields),*],
+                #init,
+                vec![#(#descriptor_methods),*],
+                vec![#(#descriptor_statics),*],
+                vec![#(#descriptor_operators),*],
+                vec![#(#bindings),*],
+            )
         }
 
         anvyx_runtime::inventory::submit! {

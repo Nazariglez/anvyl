@@ -16,18 +16,18 @@ use super::{
     ContractSurfaceId, ContractWeakeningDecl, ContractWeakeningId, ContractWitnessDecl,
     ContractWitnessId, ContractWitnessKey as AirWitnessKey, ContractWitnessSlotDecl,
     ContractWitnessTarget, CoreEnumKind, DynBorrow, DynBorrowParamDecl, DynBorrowSource,
-    DynOwnedUse, DynReceiver, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl,
-    ExternFieldDecl, ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp,
-    ExternOpDecl, ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl,
-    ExternTypeBindingDecl, ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, FlagDecl,
-    FlagMemberDecl, FlagMemberId, FlagStaticOp, Function, FunctionId, FunctionKind, FunctionOwner,
+    DynReceiver, EnumDecl, EnumRepr, ExternAbi, ExternBindingDecl, ExternDecl, ExternFieldDecl,
+    ExternId, ExternInitArgDecl, ExternMember, ExternMethodDecl, ExternOp, ExternOpDecl,
+    ExternParamDecl, ExternReceiverDecl, ExternRep, ExternStaticDecl, ExternTypeBindingDecl,
+    ExternTypeDecl, ExternVariantAbiDecl, FieldDecl, FieldId, FlagDecl, FlagMemberDecl,
+    FlagMemberId, FlagStaticOp, Function, FunctionId, FunctionKind, FunctionOwner,
     FunctionSpecialization, FunctionValueCapability, GlobalDecl, GlobalId, GlobalInitEffect,
     IterCountCheck, LambdaCaptureArg, LambdaCaptureDecl, LambdaCaptureSlotId, LambdaDecl,
     LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapWriteKind, Module, ModuleId,
-    Mutability as AirMutability, Operand, Param, ParamEscape, ParamMode, ParamRole, ParamType,
-    Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl, ScopedBorrowId,
-    ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl, VariantShape,
-    VerifyError, ownership, place_model,
+    Mutability as AirMutability, Operand, OwnedValue, Param, ParamEscape, ParamMode, ParamRole,
+    ParamType, Place, PlaceRoot, Program, RValue, RawEnumValue, ReturnMode, ScopedBorrowDecl,
+    ScopedBorrowId, ScopedBorrowSource, Signature, SignatureType, TypeData, TypeId, VariantDecl,
+    VariantShape, VerifyError, ownership, place_model,
     typing::{self, PrimitiveTypes},
     verify,
 };
@@ -63,6 +63,14 @@ use crate::{
         nominal_type_with_args, substitute_aggregate_member, type_has_unfinished_facts,
     },
 };
+
+fn owned(value: Operand) -> OwnedValue<Operand> {
+    OwnedValue::reusable(value)
+}
+
+fn owned_fields(fields: Vec<Operand>) -> Vec<OwnedValue<Operand>> {
+    fields.into_iter().map(owned).collect()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LowerError {
@@ -2565,7 +2573,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
 
     fn lower_return_operand(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
         match self.function.signature.return_mode {
-            ReturnMode::Value(expected) => self.lower_value_to(expr, expected, expr),
+            ReturnMode::Value(expected) => self.lower_expected_value(expr, expected, expr),
             ReturnMode::Place(_) => self.lower_place_arg(expr, true).map(Operand::Place),
         }
     }
@@ -4440,7 +4448,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 let ty = self.cx.lower_ty(&ty)?;
                 let init = match self.lower_binding_string_init(&binding.node.value)? {
                     Some(value) => value,
-                    None => RValue::Use(self.lower_value_to(
+                    None => RValue::Use(self.lower_expected_value(
                         &binding.node.value,
                         ty,
                         &binding.node.value,
@@ -5224,8 +5232,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 .iter()
                 .find_map(|(field, value)| (field == name).then(|| value.clone()));
             let arg = match (*presence, value) {
-                (false, Some(value)) => CallArg::Value(value),
-                (true, Some(value)) => CallArg::InitFieldProvided(value),
+                (false, Some(value)) => CallArg::Value(owned(value)),
+                (true, Some(value)) => CallArg::InitFieldProvided(owned(value)),
                 (true, None) => CallArg::InitFieldOmitted,
                 (false, None) => return Err(unsupported_expr(expr)),
             };
@@ -5512,7 +5520,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     return Ok(None);
                 };
                 RValue::FunctionValue {
-                    value,
+                    value: owned(value),
                     capability: Self::storage_function_value_capability(*origin),
                 }
             }
@@ -5592,7 +5600,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             LoweredCaptureKind::ReadonlyLocal => {
                 let place = exact_local_capture_place(expr_id, &self.capture_sources, capture, ty)?;
                 Ok(LambdaCaptureArg::ReadonlyLocal {
-                    value: Operand::Place(place),
+                    value: owned(Operand::Place(place)),
                 })
             }
             LoweredCaptureKind::CaptureCell => {
@@ -5636,16 +5644,16 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         };
         let (start, end) = match range {
             ast::Range::Bounded { start, end, .. } => (
-                Some(self.lower_value_to(start, field_ty(RANGE_START_FIELD)?, start)?),
-                Some(self.lower_value_to(end, field_ty(RANGE_END_FIELD)?, end)?),
+                Some(self.lower_expected_value(start, field_ty(RANGE_START_FIELD)?, start)?),
+                Some(self.lower_expected_value(end, field_ty(RANGE_END_FIELD)?, end)?),
             ),
             ast::Range::From { start } => (
-                Some(self.lower_value_to(start, field_ty(RANGE_START_FIELD)?, start)?),
+                Some(self.lower_expected_value(start, field_ty(RANGE_START_FIELD)?, start)?),
                 None,
             ),
             ast::Range::To { end, .. } => (
                 None,
-                Some(self.lower_value_to(end, field_ty(RANGE_END_FIELD)?, end)?),
+                Some(self.lower_expected_value(end, field_ty(RANGE_END_FIELD)?, end)?),
             ),
         };
         let fields = aggregate_fields
@@ -5660,7 +5668,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty,
             RValue::Aggregate {
                 kind: AggregateCtor::Struct(aggregate),
-                fields,
+                fields: owned_fields(fields),
                 ty,
             },
         )
@@ -5788,19 +5796,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let downcast = match value {
                 Operand::Place(place) if matches!(place.root, PlaceRoot::DynBorrowParam(_)) => self
                     .lower_borrowed_dyn_downcast(&cast.node.expr, place, surface, target, raw_ty)?,
-                value => {
-                    let use_ = self.dyn_owned_use(&value);
-                    self.emit_typed_temp(
-                        raw_ty,
-                        RValue::DynDowncast {
-                            value,
-                            use_,
-                            surface,
-                            target,
-                            ty: raw_ty,
-                        },
-                    )?
-                }
+                value => self.emit_typed_temp(
+                    raw_ty,
+                    RValue::DynDowncast {
+                        value: owned(value),
+                        surface,
+                        target,
+                        ty: raw_ty,
+                    },
+                )?,
             };
             let expected = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
             if expected == raw_ty {
@@ -5832,12 +5836,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 .position(|ty| ty == &TypeData::Dyn(surface))
                 .map(TypeId::from_index)
                 .ok_or_else(|| unsupported_expr(expr))?;
-            let use_ = self.dyn_owned_use(&value);
             return self.emit_typed_temp(
                 ty,
                 RValue::DynPack {
-                    value,
-                    use_,
+                    value: owned(value),
                     witness,
                     ty,
                 },
@@ -5845,7 +5847,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         }
         if let Some(_fact) = self.facts.dyn_weakenings.get(&expr.node.id) {
             let value = self.lower_dynamic_source(expr)?;
-            let use_ = self.dyn_owned_use(&value);
             let weakening = self
                 .cx
                 .maps
@@ -5865,8 +5866,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.emit_typed_temp(
                 ty,
                 RValue::DynWeaken {
-                    value,
-                    use_,
+                    value: owned(value),
                     weakening,
                     ty,
                 },
@@ -5956,8 +5956,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             let packed = this.emit_typed_temp(
                 dyn_ty,
                 RValue::DynPack {
-                    value: Operand::Place(this.local_place(payload)),
-                    use_: DynOwnedUse::ConsumeTemporary,
+                    value: owned(Operand::Place(this.local_place(payload))),
                     witness,
                     ty: dyn_ty,
                 },
@@ -5988,21 +5987,6 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.lower_place(expr, &fact).map(Operand::Place);
         }
         self.lower_plain_value(expr)
-    }
-
-    fn dyn_owned_use(&self, value: &Operand) -> DynOwnedUse {
-        match value {
-            Operand::Place(Place {
-                root: PlaceRoot::Local(local),
-                projection,
-                ..
-            }) if projection.is_empty()
-                && self.function.locals[local.index()].kind == LocalKind::Temp =>
-            {
-                DynOwnedUse::ConsumeTemporary
-            }
-            Operand::Const(_) | Operand::Place(_) => DynOwnedUse::ReusableRead,
-        }
     }
 
     fn lower_plain_value(&mut self, expr: &ExprNode) -> Result<Operand, LowerError> {
@@ -6572,7 +6556,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
             },
             |this| {
-                this.lower_value_to(&binary.node.right, result_ty, expr)
+                this.lower_expected_value(&binary.node.right, result_ty, expr)
                     .map(Some)
             },
         )
@@ -6639,7 +6623,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let source = self.lower_expected_value_raw(source_expr, param.ty, expr)?;
         self.emit_temp(RValue::Call {
             callee: Callee::Function(callee),
-            args: vec![CallArg::Value(source)],
+            args: vec![CallArg::Value(owned(source))],
         })
     }
 
@@ -6744,6 +6728,15 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.optional_some(value, expected, site);
         }
 
+        if let ExprKind::InferredEnum(inferred) = &expr.node.kind
+            && matches!(
+                self.cx.program.type_data(expected),
+                TypeData::Optional(_) | TypeData::Enum(_)
+            )
+        {
+            return self.lower_inferred_enum_to(expr, inferred, expected);
+        }
+
         match (&expr.node.kind, self.cx.program.type_data(expected).clone()) {
             (ExprKind::ArrayLiteral(literal), TypeData::List(elem)) => {
                 self.lower_array_literal_to(expr, literal, AggregateCtor::List, elem, expected)
@@ -6785,7 +6778,14 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .iter()
             .map(|element| self.lower_expected_value(element, elem, expr))
             .collect::<Result<Vec<_>, _>>()?;
-        self.emit_typed_temp(ty, RValue::Aggregate { kind, fields, ty })
+        self.emit_typed_temp(
+            ty,
+            RValue::Aggregate {
+                kind,
+                fields: owned_fields(fields),
+                ty,
+            },
+        )
     }
 
     fn lower_array_fill_to(
@@ -6800,8 +6800,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         self.emit_typed_temp(
             ty,
             RValue::Aggregate {
-                kind: AggregateCtor::Array,
-                fields: vec![value; len],
+                kind: AggregateCtor::ArrayFill,
+                fields: vec![owned(value); len],
                 ty,
             },
         )
@@ -6824,7 +6824,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty,
             RValue::Aggregate {
                 kind: AggregateCtor::Map,
-                fields,
+                fields: owned_fields(fields),
                 ty,
             },
         )
@@ -6849,7 +6849,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty,
             RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields,
+                fields: owned_fields(fields),
                 ty,
             },
         )
@@ -6904,7 +6904,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if self.operand_ty(&value) != inner {
             return Err(unsupported_expr(site));
         }
-        self.emit_typed_temp(ty, RValue::OptionalSome { value, ty })
+        self.emit_typed_temp(
+            ty,
+            RValue::OptionalSome {
+                value: owned(value),
+                ty,
+            },
+        )
     }
 
     fn optional_subject_from_operand(
@@ -7267,7 +7273,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty_id,
             RValue::Aggregate {
                 kind,
-                fields,
+                fields: owned_fields(fields),
                 ty: ty_id,
             },
         )
@@ -7287,13 +7293,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             .enumerate()
             .map(|(slot, field)| (slot, field.name, field.ty))
             .collect::<Vec<_>>();
-        let mut values = HashMap::new();
-        for (name, field_expr) in &literal.node.fields {
-            let known = expected.iter().any(|(_, field, _)| field == name);
-            if !known || values.insert(*name, field_expr).is_some() {
-                return Err(unsupported_expr(expr));
-            }
-        }
+        let field_types = expected
+            .iter()
+            .map(|(_, name, ty)| (*name, *ty))
+            .collect::<Vec<_>>();
+        let mut values = self.lower_named_fields(expr, &literal.node.fields, &field_types)?;
 
         let defaults = self
             .facts
@@ -7322,8 +7326,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let fields = expected
             .into_iter()
             .map(|(slot, name, ty)| {
-                if let Some(field_expr) = values.remove(&name) {
-                    return self.lower_expected_value(field_expr, ty, expr);
+                if let Some(value) = values.remove(&name) {
+                    return Ok(value);
                 }
                 let Some(default) = defaults
                     .iter()
@@ -7348,9 +7352,46 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Err(unsupported_expr(expr));
         };
         let default_expr = (*default_expr).clone();
-        self.with_default_facts(default.default, &default.facts_body, |this| {
+        let value = self.with_default_facts(default.default, &default.facts_body, |this| {
             this.lower_expected_value(&default_expr, ty, expr)
-        })
+        })?;
+        self.snapshot_field_value(value, ty)
+    }
+
+    fn lower_named_fields(
+        &mut self,
+        expr: &ExprNode,
+        fields: &[(Ident, ExprNode)],
+        expected: &[(Ident, TypeId)],
+    ) -> Result<HashMap<Ident, Operand>, LowerError> {
+        let mut values = HashMap::new();
+        for (name, field_expr) in fields {
+            let Some((_, ty)) = expected.iter().find(|(expected, _)| expected == name) else {
+                return Err(unsupported_expr(expr));
+            };
+            if values.contains_key(name) {
+                return Err(unsupported_expr(expr));
+            }
+            let value = self.lower_expected_value(field_expr, *ty, expr)?;
+            let value = self.snapshot_field_value(value, *ty)?;
+            values.insert(*name, value);
+        }
+        Ok(values)
+    }
+
+    fn snapshot_field_value(&mut self, value: Operand, ty: TypeId) -> Result<Operand, LowerError> {
+        let whole_temp = matches!(
+            &value,
+            Operand::Place(place)
+                if place.projection.is_empty()
+                    && place.root.local().is_some_and(|local| {
+                        self.function.locals[local.index()].kind == LocalKind::Temp
+                    })
+        );
+        if matches!(value, Operand::Const(_)) || whole_temp {
+            return Ok(value);
+        }
+        self.emit_typed_temp(ty, RValue::Use(value))
     }
 
     fn lower_ordered_fields(
@@ -7362,21 +7403,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         if expected.len() != fields.len() {
             return Err(unsupported_expr(expr));
         }
-        let mut values = HashMap::new();
-        for (name, field_expr) in fields {
-            if values.contains_key(name) {
-                return Err(unsupported_expr(expr));
-            }
-            values.insert(*name, field_expr);
-        }
+        let mut values = self.lower_named_fields(expr, fields, &expected)?;
         expected
             .into_iter()
-            .map(|(name, ty)| {
-                let Some(field_expr) = values.remove(&name) else {
-                    return Err(unsupported_expr(expr));
-                };
-                self.lower_expected_value(field_expr, ty, expr)
-            })
+            .map(|(name, _)| values.remove(&name).ok_or_else(|| unsupported_expr(expr)))
             .collect()
     }
 
@@ -7420,7 +7450,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
 
         let mut lowered = vec![];
         for (name, field_ty, field_expr) in field_types {
-            let value = self.lower_value_to(field_expr, field_ty, field_expr)?;
+            let value = self.lower_expected_value(field_expr, field_ty, field_expr)?;
             let value = self.emit_typed_temp(field_ty, RValue::Use(value))?;
             lowered.push((name, value));
         }
@@ -7471,17 +7501,36 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         expr: &ExprNode,
         inferred: &ast::InferredEnumNode,
     ) -> Result<Operand, LowerError> {
-        let ty = self.lower_expr_ty(expr.node.id)?;
-        let ty_id = self.cx.lower_ty(&ty)?;
-        let enum_id = match self.cx.program.type_data(ty_id) {
-            TypeData::Enum(enum_id) => *enum_id,
-            _ => return Err(unsupported_expr(expr)),
+        let ty = self.cx.lower_ty(&self.lower_expr_ty(expr.node.id)?)?;
+        self.lower_inferred_enum_to(expr, inferred, ty)
+    }
+
+    fn lower_inferred_enum_to(
+        &mut self,
+        expr: &ExprNode,
+        inferred: &ast::InferredEnumNode,
+        ty: TypeId,
+    ) -> Result<Operand, LowerError> {
+        if let TypeData::Optional(inner) = self.cx.program.type_data(ty).clone() {
+            return match (inferred.node.variant.as_str(), &inferred.node.args) {
+                ("Some", ast::InferredEnumArgs::Tuple(args)) if args.len() == 1 => {
+                    let value = self.lower_expected_value(&args[0], inner, expr)?;
+                    self.optional_some(value, ty, expr)
+                }
+                ("None", ast::InferredEnumArgs::Unit) => self.optional_none(ty, expr),
+                _ => Err(unsupported_expr(expr)),
+            };
+        }
+
+        let TypeData::Enum(enum_id) = self.cx.program.type_data(ty) else {
+            return Err(unsupported_expr(expr));
         };
+        let enum_id = *enum_id;
         let Some(variant) = self.enum_variant_id(enum_id, inferred.node.variant) else {
             return Err(unsupported_expr(expr));
         };
         match &inferred.node.args {
-            ast::InferredEnumArgs::Unit => self.emit_enum_variant(ty_id, enum_id, variant, vec![]),
+            ast::InferredEnumArgs::Unit => self.emit_enum_variant(ty, enum_id, variant, vec![]),
             ast::InferredEnumArgs::Tuple(args) => {
                 let VariantShape::Tuple(expected) =
                     &self.cx.program.enum_decl(enum_id).variants[variant.index()].shape
@@ -7495,9 +7544,9 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 let fields = args
                     .iter()
                     .zip(expected)
-                    .map(|(arg, ty)| self.lower_value_to(arg, ty, expr))
+                    .map(|(arg, ty)| self.lower_expected_value(arg, ty, expr))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.emit_enum_variant(ty_id, enum_id, variant, fields)
+                self.emit_enum_variant(ty, enum_id, variant, fields)
             }
             ast::InferredEnumArgs::Struct(args) => {
                 let Some((_, expected)) = self.enum_struct_variant(enum_id, inferred.node.variant)
@@ -7505,7 +7554,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     return Err(unsupported_expr(expr));
                 };
                 let fields = self.lower_ordered_fields(expr, args, expected)?;
-                self.emit_enum_variant(ty_id, enum_id, variant, fields)
+                self.emit_enum_variant(ty, enum_id, variant, fields)
             }
         }
     }
@@ -7545,7 +7594,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ty,
             RValue::Aggregate {
                 kind: AggregateCtor::EnumVariant { enum_id, variant },
-                fields,
+                fields: owned_fields(fields),
                 ty,
             },
         )
@@ -7816,7 +7865,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         result: LocalId,
         result_ty: TypeId,
     ) -> Result<(), LowerError> {
-        let value = self.lower_value_to(body, result_ty, body)?;
+        let value = self.lower_expected_value(body, result_ty, body)?;
         if !self.terminated {
             self.emit_init(result, RValue::Use(value))?;
         }
@@ -8006,21 +8055,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                             surface,
                         )?)
                     }
-                    value => AirDynMatchSource::Owned {
-                        use_: self.dyn_owned_use(&value),
-                        value,
-                    },
+                    value => AirDynMatchSource::Owned(owned(value)),
                 }
             }
         };
         let aliases = matches!(source, AirDynMatchSource::Mutable(_));
-        let takes = matches!(
-            source,
-            AirDynMatchSource::Owned {
-                use_: DynOwnedUse::ConsumeTemporary,
-                ..
-            }
-        );
         let mut arms = Vec::with_capacity(plan.arms.len());
         for (ast_arm, checked) in match_expr.node.arms.iter().zip(&plan.arms) {
             let ast::MatchArmHead::DynDowncast(ast_downcast) = &ast_arm.node.head else {
@@ -8060,11 +8099,10 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     self.lower_nested_expr_branch_value(&ast_arm.node.body, result)?
                 }
             };
-            let binding = match (binding, aliases, takes) {
-                (Some(local), true, _) => AirDynMatchTargetBinding::Alias(local),
-                (Some(local), false, true) => AirDynMatchTargetBinding::Take(local),
-                (Some(local), false, false) => AirDynMatchTargetBinding::Materialize(local),
-                (None, _, _) => AirDynMatchTargetBinding::Discard,
+            let binding = match (binding, aliases) {
+                (Some(local), true) => AirDynMatchTargetBinding::Alias(local),
+                (Some(local), false) => AirDynMatchTargetBinding::Materialize(local),
+                (None, _) => AirDynMatchTargetBinding::Discard,
             };
             arms.push(AirDynMatchArm {
                 target,
@@ -8713,7 +8751,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         let Some(tail) = &block.node.tail else {
             return Err(unsupported_expr(owner));
         };
-        self.lower_value_to(tail, expected, owner).map(Some)
+        self.lower_expected_value(tail, expected, owner).map(Some)
     }
 
     fn lower_nested_effect(&mut self, block: &BlockNode) -> Result<AirBlock, LowerError> {
@@ -8748,7 +8786,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         result: LocalId,
     ) -> Result<AirBlock, LowerError> {
         self.with_nested_block(|this| {
-            let value = this.lower_value_to(expr, this.function.locals[result.index()].ty, expr)?;
+            let value =
+                this.lower_expected_value(expr, this.function.locals[result.index()].ty, expr)?;
             if !this.terminated {
                 this.emit_init(result, RValue::Use(value))?;
             }
@@ -9192,13 +9231,13 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             ParamMode::Value
                 if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) =>
             {
-                Ok(CallArg::Value(Operand::Place(
+                Ok(CallArg::Value(owned(Operand::Place(
                     self.lower_shared_slice_call_arg(expr, param.ty)?,
-                )))
+                ))))
             }
-            ParamMode::Value => Ok(CallArg::Value(
+            ParamMode::Value => Ok(CallArg::Value(owned(
                 self.lower_expected_value(expr, param.ty, expr)?,
-            )),
+            ))),
             ParamMode::SharedBorrow => self.lower_shared_call_arg(expr, param.ty),
             ParamMode::MutBorrow => {
                 let place = if matches!(self.cx.program.type_data(param.ty), TypeData::Slice(_)) {
@@ -9229,7 +9268,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return self.lower_operand_call_arg(Operand::Place(receiver), param, site);
         }
         Ok(match param.mode {
-            ParamMode::Value => CallArg::Value(Operand::Place(receiver)),
+            ParamMode::Value => CallArg::Value(owned(Operand::Place(receiver))),
             ParamMode::SharedBorrow => CallArg::SharedBorrow(receiver),
             ParamMode::MutBorrow => CallArg::MutBorrow(receiver),
         })
@@ -9250,7 +9289,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 site,
             )?;
             return Ok(match param.mode {
-                ParamMode::Value => CallArg::Value(Operand::Place(place)),
+                ParamMode::Value => CallArg::Value(owned(Operand::Place(place))),
                 ParamMode::SharedBorrow => CallArg::SharedBorrow(place),
                 ParamMode::MutBorrow => CallArg::MutBorrow(place),
             });
@@ -9263,7 +9302,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 } else {
                     self.optional_some(value, param.ty, site)?
                 };
-                Ok(CallArg::Value(value))
+                Ok(CallArg::Value(owned(value)))
             }
             ParamMode::SharedBorrow => {
                 if self.operand_ty(&value) != param.ty {
@@ -9339,7 +9378,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                         surface,
                     )?)
                 }
-                _ => DynReceiver::Owned(value),
+                _ => DynReceiver::Owned(owned(value)),
             }
         };
         let args = call
@@ -9470,7 +9509,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             if let Some(inner) = typing::optional_inner(&self.cx.program, ty_id) {
                 return match (target.id.name.as_str(), call.node.args.as_slice()) {
                     ("Some", [value]) => {
-                        let value = self.lower_value_to(value, inner, expr)?;
+                        let value = self.lower_expected_value(value, inner, expr)?;
                         Ok(RValue::Use(self.optional_some(value, ty_id, expr)?))
                     }
                     ("None", []) => Ok(RValue::Use(self.optional_none(ty_id, expr)?)),
@@ -9504,11 +9543,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 .args
                 .iter()
                 .zip(expected)
-                .map(|(arg, ty)| self.lower_value_to(arg, ty, expr))
+                .map(|(arg, ty)| self.lower_expected_value(arg, ty, expr))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(RValue::Aggregate {
                 kind: AggregateCtor::EnumVariant { enum_id, variant },
-                fields,
+                fields: owned_fields(fields),
                 ty: ty_id,
             });
         }
@@ -9713,7 +9752,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 let keep = this.lower_filter_keep(predicate, &callback, args, remove_matches)?;
                 this.emit_eval(RValue::ListPush {
                     list: this.local_place(flags),
-                    value: keep,
+                    value: owned(keep),
                 })?;
                 this.terminate(AirTail::Continue(id))
             })
@@ -9918,7 +9957,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 )?;
                 self.emit_eval(RValue::ListPush {
                     list: self.local_place(kept),
-                    value: elem_value,
+                    value: owned(elem_value),
                 })
             }
             FilterCollection::Map { key, value } => {
@@ -9926,8 +9965,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                     self.map_filter_entry(root, index, entry_ty.expect("map entry type"))?;
                 self.emit_eval(RValue::MapInsert {
                     map: self.local_place(kept),
-                    key: Self::tuple_field_operand(entry.clone(), 0, key),
-                    value: Self::tuple_field_operand(entry, 1, value),
+                    key: owned(Self::tuple_field_operand(entry.clone(), 0, key)),
+                    value: owned(Self::tuple_field_operand(entry, 1, value)),
                     kind: MapWriteKind::StructuralInsert,
                 })
             }
@@ -9969,7 +10008,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
         args.into_iter()
             .zip(&sig.params)
             .map(|(arg, param)| match param.mode {
-                ParamMode::Value => Ok(CallArg::Value(arg)),
+                ParamMode::Value => Ok(CallArg::Value(owned(arg))),
                 ParamMode::SharedBorrow => match arg {
                     Operand::Place(place) => Ok(CallArg::SharedBorrow(place)),
                     Operand::Const(_) => Err(unsupported_expr(site)),
@@ -10157,8 +10196,11 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Ok(None);
         };
         self.require_mutable_place(expr, &list)?;
-        let value = self.lower_value_to(&call.node.args[0], elem, expr)?;
-        Ok(Some(RValue::ListPush { list, value }))
+        let value = self.lower_expected_value(&call.node.args[0], elem, expr)?;
+        Ok(Some(RValue::ListPush {
+            list,
+            value: owned(value),
+        }))
     }
 
     fn lower_map_insert_call(
@@ -10181,12 +10223,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Ok(None);
         };
         self.require_mutable_place(expr, &map)?;
-        let key = self.lower_value_to(&call.node.args[0], key_ty, expr)?;
-        let value = self.lower_value_to(&call.node.args[1], value_ty, expr)?;
+        let key = self.lower_expected_value(&call.node.args[0], key_ty, expr)?;
+        let value = self.lower_expected_value(&call.node.args[1], value_ty, expr)?;
         Ok(Some(RValue::MapInsert {
             map,
-            key,
-            value,
+            key: owned(key),
+            value: owned(value),
             kind: MapWriteKind::StructuralInsert,
         }))
     }
@@ -10488,7 +10530,7 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 if let Some(fact) = self.global_access(assign.node.target.node.id).cloned() {
                     let dst = self.lower_global_projected_place(&assign.node.target, &fact)?;
                     let value =
-                        self.lower_value_to(&assign.node.value, dst.ty, &assign.node.value)?;
+                        self.lower_expected_value(&assign.node.value, dst.ty, &assign.node.value)?;
                     return match fact.mode {
                         GlobalAccessMode::RootAssign
                             if fact.init_effect == TcGlobalInitEffect::StoreWithoutInit =>
@@ -10504,7 +10546,8 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
                 }
                 let fact = self.local_use(&assign.node.target, LocalUseMode::Assign)?;
                 let dst = self.lower_place(&assign.node.target, &fact)?;
-                let value = self.lower_value_to(&assign.node.value, dst.ty, &assign.node.value)?;
+                let value =
+                    self.lower_expected_value(&assign.node.value, dst.ty, &assign.node.value)?;
                 self.emit_assign(dst, RValue::Use(value))
             }
             op => {
@@ -10609,12 +10652,12 @@ impl<'cx, 'facts, 'tc> FunctionLowerer<'cx, 'facts, 'tc> {
             return Err(unsupported_expr(target));
         };
         self.require_mutable_place(target, &map)?;
-        let key = self.lower_value_to(&index.node.index, key_ty, target)?;
-        let value = self.lower_value_to(value_expr, value_ty, value_expr)?;
+        let key = self.lower_expected_value(&index.node.index, key_ty, target)?;
+        let value = self.lower_expected_value(value_expr, value_ty, value_expr)?;
         self.emit_eval(RValue::MapInsert {
             map,
-            key,
-            value,
+            key: owned(key),
+            value: owned(value),
             kind: MapWriteKind::IndexedAssignment,
         })?;
         Ok(true)
@@ -11408,6 +11451,7 @@ pub(crate) fn lower_with_source_index(
     cx.lower_function_bodies(&functions)?;
     ownership::finalize(&mut cx.program)
         .map_err(|errors| LowerError::Ownership(errors.into_boxed_slice()))?;
+    super::materialization::finalize(&mut cx.program);
     verify(&cx.program).map_err(|errors| LowerError::Verify(errors.into_boxed_slice()))?;
     reject_any_types(&cx.program)?;
     Ok(cx.program)
@@ -13236,7 +13280,7 @@ mod tests {
     use super::*;
     use crate::{
         air::{
-            BadContract, BadPlace, BadStatement, VerifyErrorKind,
+            BadContract, BadPlace, BadStatement, OwnedValue, VerifyErrorKind,
             verify::{verify as verify_air, verify_contract_declarations as verify_contracts},
         },
         ast, externs,
@@ -13248,6 +13292,14 @@ mod tests {
         },
         typecheck::{self, TypecheckConfig, nominal_type, nominal_type_with_args},
     };
+
+    fn returned_operand(tail: &AirTail) -> Option<&Operand> {
+        match tail {
+            AirTail::Return(Some(value)) => Some(value),
+            AirTail::ReturnOwned(owned) => Some(&owned.value),
+            _ => None,
+        }
+    }
 
     #[test]
     fn empty_program_lowers_to_verified_air() {
@@ -13604,7 +13656,7 @@ mod tests {
         let Some(AirStmt::DynMatch(match_)) = main.body.block.stmts.last() else {
             panic!("expected structured dynamic match");
         };
-        assert!(matches!(match_.source, AirDynMatchSource::Owned { .. }));
+        assert!(matches!(match_.source, AirDynMatchSource::Owned(_)));
         assert_eq!(match_.arms.len(), 1);
         assert!(match_.arms[0].binding.local().is_some());
         assert!(match_.fallback.binding.local().is_some());
@@ -13795,10 +13847,10 @@ mod tests {
         assert!(function_statements(main).any(|stmt| matches!(
             stmt,
             AirStmt::DynMatch(AirDynMatch {
-                source: AirDynMatchSource::Owned {
+                source: AirDynMatchSource::Owned(OwnedValue {
                     value: Operand::Place(Place { projection, .. }),
                     ..
-                },
+                }),
                 ..
             }) if !projection.is_empty()
         )));
@@ -14173,12 +14225,15 @@ mod tests {
                     value:
                         RValue::DynPack {
                             value:
-                                Operand::Place(Place {
-                                    root: PlaceRoot::Local(local),
-                                    projection,
-                                    ty,
-                                }),
-                            use_: DynOwnedUse::ConsumeTemporary,
+                                OwnedValue {
+                                    value:
+                                        Operand::Place(Place {
+                                            root: PlaceRoot::Local(local),
+                                            projection,
+                                            ty,
+                                        }),
+                                    source: super::super::ValueSource::TransferTemp { .. },
+                                },
                             ..
                         },
                     ..
@@ -15201,7 +15256,7 @@ mod tests {
             .expect("missing main");
 
         assert!(function_statements(main).any(|statement| {
-            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Function(_), args }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_))]))
+            matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Function(_), args }) if matches!(args.as_slice(), [CallArg::Value(OwnedValue { value: Operand::Place(_), .. })]))
         }));
     }
 
@@ -15278,7 +15333,7 @@ mod tests {
         }));
         assert!(program_statements(&air).any(|statement| {
             matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Extern(_), args })
-                if matches!(args.as_slice(), [CallArg::Value(Operand::Place(place))]
+                if matches!(args.as_slice(), [CallArg::Value(OwnedValue { value: Operand::Place(place), .. })]
                     if matches!(air.type_data(place.ty), TypeData::Function(_))))
         }));
     }
@@ -15302,7 +15357,7 @@ mod tests {
         }));
         assert!(program_statements(&air).any(|statement| {
             matches!(statement, AirStmt::Eval(RValue::Call { callee: Callee::Extern(_), args })
-                if matches!(args.as_slice(), [CallArg::Value(Operand::Place(place))]
+                if matches!(args.as_slice(), [CallArg::Value(OwnedValue { value: Operand::Place(place), .. })]
                     if matches!(air.type_data(place.ty), TypeData::Function(_))))
         }));
     }
@@ -15460,7 +15515,7 @@ mod tests {
             let TypeData::Optional(inner) = air.type_data(ty) else {
                 panic!("OptionalSome result must be optional");
             };
-            assert_eq!(test_operand_ty(&air, &value), *inner);
+            assert_eq!(test_operand_ty(&air, &value.value), *inner);
             found = true;
         }
         assert!(found);
@@ -15510,12 +15565,12 @@ mod tests {
             [AirStmt::GlobalEnsure { global: id }] if *id == global
         ));
         assert!(matches!(
-            main.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&main.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Global(id),
-                projection: ref fields,
+                projection: fields,
                 ..
-            }))) if id == global && fields.is_empty()
+            })) if *id == global && fields.is_empty()
         ));
     }
 
@@ -15938,11 +15993,11 @@ mod tests {
             } if *global == base
         )));
         assert!(matches!(
-            init.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&init.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Local(_),
                 ..
-            })))
+            }))
         ));
     }
 
@@ -15976,11 +16031,11 @@ mod tests {
                     [AirStmt::GlobalEnsure { global }] if *global == base
                 )
                 && matches!(
-                    function.body.block.tail,
-                    AirTail::Return(Some(Operand::Place(Place {
+                    returned_operand(&function.body.block.tail),
+                    Some(Operand::Place(Place {
                         root: PlaceRoot::Global(global),
                         ..
-                    }))) if global == base
+                    })) if *global == base
                 )
         }));
     }
@@ -16015,11 +16070,11 @@ mod tests {
                     }]
                 )
                 && matches!(
-                    function.body.block.tail,
-                    AirTail::Return(Some(Operand::Place(Place {
+                    returned_operand(&function.body.block.tail),
+                    Some(Operand::Place(Place {
                         root: PlaceRoot::Global(GlobalId(0)),
                         ..
-                    })))
+                    }))
                 )
         }));
     }
@@ -16039,12 +16094,12 @@ mod tests {
             .expect("missing main");
 
         assert!(matches!(
-            main.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&main.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Global(GlobalId(0)),
-                projection: ref fields,
+                projection: fields,
                 ..
-            }))) if fields.is_empty()
+            })) if fields.is_empty()
         ));
     }
 
@@ -16092,12 +16147,12 @@ mod tests {
             .expect("missing main");
 
         assert!(matches!(
-            main.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&main.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Global(GlobalId(0)),
-                projection: ref fields,
+                projection: fields,
                 ..
-            }))) if matches!(fields.as_slice(), [crate::air::Projection::TupleField(0)])
+            })) if matches!(fields.as_slice(), [crate::air::Projection::TupleField(0)])
         ));
     }
 
@@ -16115,12 +16170,12 @@ mod tests {
             .expect("missing main");
 
         assert!(matches!(
-            main.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&main.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Global(GlobalId(0)),
-                projection: ref fields,
+                projection: fields,
                 ..
-            }))) if matches!(fields.as_slice(), [crate::air::Projection::Index(_)])
+            })) if matches!(fields.as_slice(), [crate::air::Projection::Index(_)])
         ));
     }
 
@@ -16166,12 +16221,12 @@ mod tests {
             .expect("missing main");
 
         assert!(matches!(
-            main.body.block.tail,
-            AirTail::Return(Some(Operand::Place(Place {
+            returned_operand(&main.body.block.tail),
+            Some(Operand::Place(Place {
                 root: PlaceRoot::Global(GlobalId(0)),
-                projection: ref fields,
+                projection: fields,
                 ..
-            }))) if fields.len() == 1
+            })) if fields.len() == 1
         ));
     }
 
@@ -16762,9 +16817,9 @@ mod tests {
             Some(AirStmt::Eval(RValue::Call { .. }))
         ));
         assert!(matches!(
-            body.tail,
-            AirTail::Return(Some(Operand::Const(id)))
-                if matches!(air.const_data(id).value, ConstValue::String(ref s) if s.as_ref() == "<void>")
+            returned_operand(&body.tail),
+            Some(Operand::Const(id))
+                if matches!(air.const_data(*id).value, ConstValue::String(ref s) if s.as_ref() == "<void>")
         ));
     }
 
@@ -16807,67 +16862,79 @@ mod tests {
     }
 
     #[test]
-    fn enum_variant_constructors_lower_to_air_aggregates() {
-        let source = r"
-            enum Message { Quit, Ping(int), Move { x: int, y: int } }
-            fn f() {
-                let a = Message.Quit;
-                let b = Message.Ping(42);
-                let c = Message.Move { x: 1, y: 2 };
+    fn contextual_constructors_use_expected_payload_types() {
+        let source = r#"
+            enum Choice { Text(string), None }
+            enum Access: flag { Read, Write }
+            struct Holder {
+                optional: Option<Choice>,
+                outcome: Result<Choice, string>,
             }
-        ";
-        let air = lower_full_core_root(source, "f").expect("lower failed");
-        let enum_ty = air
-            .type_arena
-            .iter()
-            .position(|ty| matches!(ty, TypeData::Enum(_)))
-            .map(TypeId::from_index)
-            .expect("enum type missing");
-        let variants = program_statements(&air)
-            .filter_map(|statement| match statement {
-                AirStmt::Init {
-                    value:
-                        RValue::Aggregate {
-                            kind: AggregateCtor::EnumVariant { variant, .. },
-                            ty,
-                            fields,
-                        },
-                    ..
-                } if ty == enum_ty => Some((variant.index(), fields.len())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(variants, vec![(0, 0), (1, 1), (2, 2)]);
-    }
-
-    #[test]
-    fn inferred_enum_variants_lower_to_air_aggregates() {
-        let source = r"
-            enum Message { Quit, Ping(int), Move { x: int, y: int } }
-            fn f() {
-                let a: Message = .Quit;
-                let b: Message = .Ping(42);
-                let c: Message = .Move { x: 1, y: 2 };
+            fn take(value: Option<Choice>) -> Option<Choice> { value }
+            fn explicit_result() -> Result<Choice, string> {
+                Result.Ok(Choice.Text("explicit return"))
             }
-        ";
-        let air = lower_full_core_root(source, "f").expect("lower failed");
-        let variants = program_statements(&air)
-            .filter_map(|statement| match statement {
-                AirStmt::Init {
-                    value:
-                        RValue::Aggregate {
-                            kind: AggregateCtor::EnumVariant { variant, .. },
-                            fields,
-                            ..
-                        },
-                    ..
-                } => Some((variant.index(), fields.len())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+            fn inferred_result() -> Result<Choice, string> {
+                .Ok(.Text("inferred return"))
+            }
+            fn main(flag: bool) -> Holder {
+                let access: Access = .Read;
+                let explicit: Option<Choice> = Option.Some(Choice.Text("explicit binding"));
+                let inferred: Option<Choice> = .Some(.Text("inferred binding"));
+                let argument = take(.Some(.Text("argument")));
+                let branch: Result<Choice, string> = if flag {
+                    .Ok(.Text("branch"))
+                } else {
+                    Result.Err("error")
+                };
+                let tuple: (Option<Choice>, Option<Choice>) = (
+                    Option.Some(Choice.Text("tuple explicit")),
+                    .Some(.Text("tuple inferred")),
+                );
+                let explicit_returned = explicit_result();
+                let inferred_returned = inferred_result();
+                Holder { optional: argument, outcome: branch }
+            }
+        "#;
+        let air = lower_full_core_root(source, "main").expect("lower failed");
+        let mut optionals = 0;
+        let mut enum_variants = 0;
 
-        assert_eq!(variants, vec![(0, 0), (1, 1), (2, 2)]);
+        for statement in program_statements(&air) {
+            let AirStmt::Init { value, .. } = statement else {
+                continue;
+            };
+            match value {
+                RValue::OptionalSome { value, ty } => {
+                    let TypeData::Optional(inner) = air.type_data(ty) else {
+                        panic!("OptionalSome result must be optional");
+                    };
+                    assert_eq!(test_operand_ty(&air, &value.value), *inner);
+                    optionals += 1;
+                }
+                RValue::Aggregate {
+                    kind: AggregateCtor::EnumVariant { enum_id, variant },
+                    fields,
+                    ..
+                } => {
+                    let VariantShape::Tuple(expected) =
+                        &air.enum_decl(enum_id).variants[variant.index()].shape
+                    else {
+                        assert!(fields.is_empty());
+                        continue;
+                    };
+                    assert_eq!(fields.len(), expected.len());
+                    for (field, expected) in fields.iter().zip(expected) {
+                        assert_eq!(test_operand_ty(&air, &field.value), *expected);
+                    }
+                    enum_variants += 1;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(optionals, 5);
+        assert_eq!(enum_variants, 12);
     }
 
     #[test]
@@ -16886,11 +16953,11 @@ mod tests {
 
         let body = &function.body.block;
         assert!(matches!(
-            body.tail,
-            AirTail::Return(Some(Operand::Place(Place {
-                projection: ref projections,
+            returned_operand(&body.tail),
+            Some(Operand::Place(Place {
+                projection: projections,
                 ..
-            }))) if matches!(projections.as_slice(), [crate::air::Projection::Field(_)])
+            })) if matches!(projections.as_slice(), [crate::air::Projection::Field(_)])
         ));
     }
 
@@ -17109,62 +17176,128 @@ mod tests {
     }
 
     #[test]
-    fn reachable_struct_literal_return_value_lowers_to_aggregate() {
-        let source =
-            "struct S { x: int } fn make() -> S { S { x: 1 } } fn main() { let s = make(); }";
+    fn struct_fields_evaluate_in_source_order_and_store_in_declaration_order() {
+        let source = r#"
+            fn second() -> string { "second" }
+            struct Pair { first: string, second: string }
+            fn main(first: string) -> Pair { Pair { second: second(), first } }
+        "#;
         let air = lower_root(source, "main").expect("lower failed");
-
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Init {
-                    value: RValue::Aggregate {
-                        kind: AggregateCtor::Struct(_),
-                        fields,
-                        ..
-                    },
-                    ..
-                } if fields.len() == 1
-            )
-        }));
-    }
-
-    #[test]
-    fn aggregate_default_fields_lower_in_declaration_order() {
-        let source = "fn one() -> int { 1 } struct Pair { a: int = one(), b: int } fn f() -> Pair { Pair { b: 2 } }";
-        let air = lower_root(source, "f").expect("lower failed");
         let function = air
             .functions
             .iter()
-            .find(|function| function.name == Ident::new("f"))
-            .expect("function missing");
-        let mut calls_before_aggregate = 0;
-        let mut found = false;
-        for stmt in &function.body.block.stmts {
-            match stmt {
-                AirStmt::Init {
-                    value: RValue::Call { .. },
-                    ..
-                } => calls_before_aggregate += 1,
-                AirStmt::Init {
-                    value:
-                        RValue::Aggregate {
-                            kind: AggregateCtor::Struct(_),
-                            fields,
-                            ..
-                        },
+            .find(|function| function.name == Ident::new("main"))
+            .expect("main missing");
+        let mut eval_names = vec![];
+        let mut value_names = HashMap::new();
+        let mut field_names = vec![];
+
+        for statement in &function.body.block.stmts {
+            let AirStmt::Init { local, value } = statement else {
+                continue;
+            };
+            match value {
+                RValue::Call {
+                    callee: Callee::Function(callee),
                     ..
                 } => {
-                    assert_eq!(calls_before_aggregate, 1);
-                    assert_eq!(fields.len(), 2);
-                    assert!(matches!(fields[0], Operand::Place(_)));
-                    assert!(matches!(fields[1], Operand::Const(_)));
-                    found = true;
+                    let name = air.function(*callee).name;
+                    eval_names.push(name);
+                    value_names.insert(*local, name);
+                }
+                RValue::Materialize(OwnedValue {
+                    value: Operand::Place(place),
+                    ..
+                }) => {
+                    let source = place.root.local().expect("field source must be local");
+                    assert_eq!(function.locals[source.index()].kind, LocalKind::Arg);
+                    let name = Ident::new("first");
+                    eval_names.push(name);
+                    value_names.insert(*local, name);
+                }
+                RValue::Aggregate {
+                    kind: AggregateCtor::Struct(_),
+                    fields,
+                    ..
+                } => {
+                    field_names = fields
+                        .iter()
+                        .map(|field| {
+                            let Operand::Place(place) = &field.value else {
+                                panic!("field value must be a place");
+                            };
+                            let local = place.root.local().expect("field value must be local");
+                            value_names[&local]
+                        })
+                        .collect();
                 }
                 _ => {}
             }
         }
-        assert!(found);
+
+        assert_eq!(eval_names, [Ident::new("second"), Ident::new("first")]);
+        assert_eq!(field_names, [Ident::new("first"), Ident::new("second")]);
+    }
+
+    #[test]
+    fn aggregate_defaults_follow_source_fields_and_store_in_declaration_order() {
+        let source = r#"
+            fn default_a() -> string { "default" }
+            fn explicit_b() -> string { "explicit" }
+            struct Pair { a: string = default_a(), b: string }
+            fn main() -> Pair { Pair { b: explicit_b() } }
+        "#;
+        let air = lower_root(source, "main").expect("lower failed");
+        let function = air
+            .functions
+            .iter()
+            .find(|function| function.name == Ident::new("main"))
+            .expect("main missing");
+        let mut call_names = vec![];
+        let mut call_locals = HashMap::new();
+        let mut field_names = vec![];
+
+        for statement in &function.body.block.stmts {
+            let AirStmt::Init { local, value } = statement else {
+                continue;
+            };
+            match value {
+                RValue::Call {
+                    callee: Callee::Function(callee),
+                    ..
+                } => {
+                    let name = air.function(*callee).name;
+                    call_names.push(name);
+                    call_locals.insert(*local, name);
+                }
+                RValue::Aggregate {
+                    kind: AggregateCtor::Struct(_),
+                    fields,
+                    ..
+                } => {
+                    field_names = fields
+                        .iter()
+                        .map(|field| {
+                            let Operand::Place(place) = &field.value else {
+                                panic!("field value must be a place");
+                            };
+                            let local = place.root.local().expect("field value must be local");
+                            call_locals[&local]
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            call_names,
+            [Ident::new("explicit_b"), Ident::new("default_a")]
+        );
+        assert_eq!(
+            field_names,
+            [Ident::new("default_a"), Ident::new("explicit_b")]
+        );
     }
 
     #[test]
@@ -17443,7 +17576,7 @@ mod tests {
         };
         assert!(matches!(
             args.as_slice(),
-            [CallArg::Value(Operand::Place(Place { projection, .. }))]
+            [CallArg::Value(OwnedValue { value: Operand::Place(Place { projection, .. }), .. })]
                 if projection == &[crate::air::Projection::Field(FieldId::from_index(0))]
         ));
     }
@@ -17758,7 +17891,7 @@ fn f() {
                 AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(_),
                     args,
-                }) if matches!(args.as_slice(), [CallArg::Value(Operand::Place(_)), CallArg::MutBorrow(_)])
+                }) if matches!(args.as_slice(), [CallArg::Value(OwnedValue { value: Operand::Place(_), .. }), CallArg::MutBorrow(_)])
             )
         }));
     }
@@ -17939,28 +18072,6 @@ fn f() {
     }
 
     #[test]
-    fn map_index_assignment_lowers_to_indexed_insert() {
-        let air = lower_root(
-            "fn f(ref counts: [string: int]) { counts[\"a\"] = 1; }",
-            "f",
-        )
-        .expect("lower failed");
-        assert!(program_statements(&air).any(|statement| {
-            matches!(
-                statement,
-                AirStmt::Eval(RValue::MapInsert {
-                    kind: MapWriteKind::IndexedAssignment,
-                    ..
-                })
-            )
-        }));
-        assert!(
-            !program_statements(&air)
-                .any(|statement| { matches!(statement, AirStmt::Assign { .. }) })
-        );
-    }
-
-    #[test]
     fn concrete_function_lowers_to_verified_body() {
         let air = lower_root("fn f(ref a: int) -> int { a }", "f").expect("lower failed");
         assert_eq!(air.functions.len(), 1);
@@ -17979,7 +18090,7 @@ fn f() {
         assert_eq!(local.kind, LocalKind::Arg);
         assert_eq!(local.mutability, AirMutability::Mutable);
         let body = &function.body.block;
-        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&body.tail).is_some());
     }
 
     #[test]
@@ -18006,7 +18117,7 @@ fn f(a: int) -> int {
         let function = &air.functions[0];
         assert!(function_statements(function).any(|stmt| matches!(stmt, AirStmt::Assign { .. })));
         let body = &function.body.block;
-        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&body.tail).is_some());
     }
 
     #[test]
@@ -18020,7 +18131,7 @@ fn f() -> int {
         let air = lower_root(source, "f").expect("lower failed");
         let function = &air.functions[0];
         let body = &function.body.block;
-        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&body.tail).is_some());
     }
 
     #[test]
@@ -18062,7 +18173,7 @@ fn f() -> int {
             unreachable!()
         };
         assert!(branch.else_block.is_some());
-        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&body.tail).is_some());
     }
 
     #[test]
@@ -18109,7 +18220,11 @@ fn or_value(lhs: bool) -> bool { lhs || rhs(rhs(true)) }
             let [
                 AirStmt::Init {
                     local: result,
-                    value: RValue::Use(Operand::Const(_)),
+                    value:
+                        RValue::Materialize(OwnedValue {
+                            value: Operand::Const(_),
+                            ..
+                        }),
                 },
             ] = constant.stmts.as_slice()
             else {
@@ -18155,9 +18270,9 @@ fn or_value(lhs: bool) -> bool { lhs || rhs(rhs(true)) }
         let AirStmt::If(branch) = &body.stmts[0] else {
             panic!("missing branch")
         };
-        assert!(matches!(branch.then_block.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&branch.then_block.tail).is_some());
         assert!(branch.else_block.is_none());
-        assert!(matches!(body.tail, AirTail::Return(Some(_))));
+        assert!(returned_operand(&body.tail).is_some());
     }
 
     #[test]
@@ -18170,11 +18285,8 @@ fn or_value(lhs: bool) -> bool { lhs || rhs(rhs(true)) }
         let AirStmt::If(branch) = &body.stmts[0] else {
             panic!("missing branch")
         };
-        assert!(matches!(branch.then_block.tail, AirTail::Return(Some(_))));
-        assert!(matches!(
-            branch.else_block.as_ref().unwrap().tail,
-            AirTail::Return(Some(_))
-        ));
+        assert!(returned_operand(&branch.then_block.tail).is_some());
+        assert!(returned_operand(&branch.else_block.as_ref().unwrap().tail).is_some());
         assert!(matches!(body.tail, AirTail::Unreachable));
     }
 
@@ -18478,7 +18590,7 @@ fn main() {}
             function_statements(air.function(outer.body)).any(|statement| {
                 matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
                 if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal {
-                    value: Operand::Place(place)
+                    value: OwnedValue { value: Operand::Place(place), .. }
                 }] if matches!(place.root, PlaceRoot::LambdaCapture(_))))
             })
         );
@@ -18776,8 +18888,8 @@ fn main() {}
 
         assert_eq!(lambda.escape, LambdaEscape::Escaping);
         assert!(matches!(
-            &owner.body.block.tail,
-            AirTail::Return(Some(Operand::Place(place))) if place.root == PlaceRoot::CaptureCell(cell)
+            returned_operand(&owner.body.block.tail),
+            Some(Operand::Place(place)) if place.root == PlaceRoot::CaptureCell(cell)
         ));
     }
 
@@ -18895,7 +19007,7 @@ fn main() {}
             function_statements(air.function(outer.body)).any(|statement| {
                 matches!(statement, AirStmt::Init { value: RValue::MakeLambda { captures, .. }, .. }
                 if matches!(&captures[..], [LambdaCaptureArg::ReadonlyLocal {
-                    value: Operand::Place(place)
+                    value: OwnedValue { value: Operand::Place(place), .. }
                 }] if matches!(place.root, PlaceRoot::LambdaCapture(_))))
             })
         );

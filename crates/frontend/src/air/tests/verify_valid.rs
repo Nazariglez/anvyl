@@ -1,6 +1,6 @@
-use super::{super::verify::verify_structured_body, *};
+use super::{super::verify::verify_structured_body, support::owned, *};
 use crate::{
-    air::{FunctionValueCapability, MapWriteKind},
+    air::{FunctionValueCapability, MapWriteKind, OwnedValue},
     ast::Ident,
 };
 #[test]
@@ -68,7 +68,7 @@ fn explicit_function_value_capability_verifies_escaping_arg() {
             pair,
             RValue::Aggregate {
                 kind: AggregateCtor::Tuple,
-                fields: vec![op_place(function, lambda_ty)],
+                fields: vec![owned(op_place(function, lambda_ty))],
                 ty: tuple_ty,
             },
         ),
@@ -78,11 +78,11 @@ fn explicit_function_value_capability_verifies_escaping_arg() {
         stmt_init(
             temp,
             RValue::FunctionValue {
-                value: Operand::Place(Place {
+                value: OwnedValue::reusable(Operand::Place(Place {
                     root: PlaceRoot::Local(pair),
                     projection: vec![Projection::TupleField(0)],
                     ty: lambda_ty,
-                }),
+                })),
                 capability: FunctionValueCapability::Escaping,
             },
         ),
@@ -91,7 +91,7 @@ fn explicit_function_value_capability_verifies_escaping_arg() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(callee),
-            args: vec![CallArg::Value(op_place(temp, lambda_ty))],
+            args: vec![CallArg::Value(owned(op_place(temp, lambda_ty)))],
         }),
     );
     let main = builder.alloc_function(main.finish());
@@ -121,11 +121,11 @@ fn explicit_function_value_capability_verifies_projected_storage() {
         stmt_init(
             temp,
             RValue::FunctionValue {
-                value: Operand::Place(Place {
+                value: OwnedValue::reusable(Operand::Place(Place {
                     root: PlaceRoot::Local(pair),
                     projection: vec![Projection::TupleField(0)],
                     ty: lambda_ty,
-                }),
+                })),
                 capability: FunctionValueCapability::Escaping,
             },
         ),
@@ -918,7 +918,7 @@ fn readonly_local_capture_uses_capture_slot_root() {
         stmt_eval(RValue::MakeLambda {
             lambda,
             captures: vec![LambdaCaptureArg::ReadonlyLocal {
-                value: op_place(captured, int_ty),
+                value: owned(op_place(captured, int_ty)),
             }],
             ty: lambda_ty,
         }),
@@ -1086,7 +1086,9 @@ fn escaping_function_param_accepts_known_escaping_values() {
             bb0,
             stmt_eval(RValue::Call {
                 callee: Callee::Function(accept_id),
-                args: vec![CallArg::Value(op_place(local, lambda_ty))],
+                args: vec![CallArg::Value(OwnedValue::reusable(op_place(
+                    local, lambda_ty,
+                )))],
             }),
         );
     }
@@ -1146,11 +1148,11 @@ fn escaping_function_param_accepts_escaping_capture_slot() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Function(accept),
-            args: vec![CallArg::Value(Operand::Place(Place {
+            args: vec![CallArg::Value(owned(Operand::Place(Place {
                 root: PlaceRoot::LambdaCapture(LambdaCaptureSlotId::from_index(0)),
                 projection: vec![],
                 ty: callback_ty,
-            }))],
+            })))],
         }),
     );
     assert_eq!(builder.alloc_function(body_fb.finish()), body);
@@ -1215,7 +1217,7 @@ fn tuple_ctor_shape_is_valid() {
         bb0,
         stmt_eval(RValue::Aggregate {
             kind: AggregateCtor::Tuple,
-            fields: vec![op_place(lhs, int_ty), op_place(rhs, bool_ty)],
+            fields: vec![owned(op_place(lhs, int_ty)), owned(op_place(rhs, bool_ty))],
             ty: tuple_ty,
         }),
     );
@@ -1320,11 +1322,8 @@ fn structured_straight_line_scalar_return() {
     let func_id = builder.alloc_function(fb.finish());
     let body = AirBody {
         block: AirBlock {
-            stmts: vec![AirStmt::Init {
-                local,
-                value: RValue::Use(op_const(value)),
-            }],
-            tail: AirTail::Return(Some(op_place(local, int_ty))),
+            stmts: vec![stmt_init(local, RValue::Use(op_const(value)))],
+            tail: term_return(op_place(local, int_ty)),
         },
     };
     let program = builder.finish();
@@ -1355,11 +1354,11 @@ fn structured_if_return_then_fallthrough() {
                 cond: op_place(cond, bool_ty),
                 then_block: AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(yes))),
+                    tail: term_return(op_const(yes)),
                 },
                 else_block: None,
             })],
-            tail: AirTail::Return(Some(op_const(no))),
+            tail: term_return(op_const(no)),
         },
     };
     let program = builder.finish();
@@ -1390,11 +1389,11 @@ fn structured_both_if_branches_return() {
                 cond: op_place(cond, bool_ty),
                 then_block: AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(yes))),
+                    tail: term_return(op_const(yes)),
                 },
                 else_block: Some(AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(no))),
+                    tail: term_return(op_const(no)),
                 }),
             })],
             tail: AirTail::Unreachable,
@@ -1424,14 +1423,11 @@ fn structured_loop_break_state_reaches_after_loop() {
             stmts: vec![AirStmt::Loop(AirLoop {
                 id: loop_id,
                 body: AirBlock {
-                    stmts: vec![AirStmt::Init {
-                        local: out,
-                        value: RValue::Use(op_const(one)),
-                    }],
+                    stmts: vec![stmt_init(out, RValue::Use(op_const(one)))],
                     tail: AirTail::Break(loop_id),
                 },
             })],
-            tail: AirTail::Return(Some(op_place(out, int_ty))),
+            tail: term_return(op_place(out, int_ty)),
         },
     };
     let program = builder.finish();
@@ -1459,10 +1455,7 @@ fn structured_branch_result_initialized_in_both_arms() {
     fb.push_block(term_return(op_const(one)));
     let func_id = builder.alloc_function(fb.finish());
     let init_arm = |value| AirBlock {
-        stmts: vec![AirStmt::Init {
-            local: out,
-            value: RValue::Use(op_const(value)),
-        }],
+        stmts: vec![stmt_init(out, RValue::Use(op_const(value)))],
         tail: AirTail::None,
     };
     let body = AirBody {
@@ -1472,7 +1465,7 @@ fn structured_branch_result_initialized_in_both_arms() {
                 then_block: init_arm(one),
                 else_block: Some(init_arm(two)),
             })],
-            tail: AirTail::Return(Some(op_place(out, int_ty))),
+            tail: term_return(op_place(out, int_ty)),
         },
     };
     let program = builder.finish();
@@ -1633,7 +1626,7 @@ fn fn_aggregate() {
             local_agg,
             RValue::Aggregate {
                 kind: AggregateCtor::Struct(agg_id),
-                fields: vec![op_place(p_x, int_ty), op_place(p_y, int_ty)],
+                fields: vec![owned(op_place(p_x, int_ty)), owned(op_place(p_y, int_ty))],
                 ty: agg_ty,
             },
         ),
@@ -1673,7 +1666,7 @@ fn function_call() {
             result,
             RValue::Call {
                 callee: Callee::Function(callee_id),
-                args: vec![CallArg::Value(op_place(p_arg, int_ty))],
+                args: vec![CallArg::Value(owned(op_place(p_arg, int_ty)))],
             },
         ),
     );
@@ -1735,7 +1728,7 @@ fn extern_call() {
         bb0,
         stmt_eval(RValue::Call {
             callee: Callee::Extern(ext_id),
-            args: vec![CallArg::Value(op_place(p_n, int_ty))],
+            args: vec![CallArg::Value(owned(op_place(p_n, int_ty)))],
         }),
     );
 
@@ -1796,7 +1789,7 @@ fn structured_optional_match_with_payload() {
         ty: int_ty,
         value: ConstValue::Int(0),
     });
-    fb.push_block(AirTail::Return(Some(op_place(payload, int_ty))));
+    fb.push_block(term_return(op_place(payload, int_ty)));
     let func_id = builder.alloc_function(fb.finish());
     let body = AirBody {
         block: AirBlock {
@@ -1811,10 +1804,10 @@ fn structured_optional_match_with_payload() {
                 },
                 none_block: AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(none))),
+                    tail: term_return(op_const(none)),
                 },
             })],
-            tail: AirTail::Return(Some(op_place(payload, int_ty))),
+            tail: term_return(op_place(payload, int_ty)),
         },
     };
     let program = builder.finish();
@@ -1849,11 +1842,11 @@ fn structured_optional_match_without_payload() {
                 payload_escapes: false,
                 some_block: AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(one))),
+                    tail: term_return(op_const(one)),
                 },
                 none_block: AirBlock {
                     stmts: vec![],
-                    tail: AirTail::Return(Some(op_const(zero))),
+                    tail: term_return(op_const(zero)),
                 },
             })],
             tail: AirTail::Unreachable,
@@ -2027,8 +2020,8 @@ fn structured_map_value_update_inside_loan_verifies() {
                 body: AirBlock {
                     stmts: vec![stmt_eval(RValue::MapInsert {
                         map: place(map, map_ty),
-                        key: op_const(one),
-                        value: op_const(one),
+                        key: owned(op_const(one)),
+                        value: owned(op_const(one)),
                         kind: MapWriteKind::IndexedAssignment,
                     })],
                     tail: AirTail::None,

@@ -389,7 +389,7 @@ fn provider_package_support_tokens(modules: &[Path]) -> Vec<TokenStream> {
                 let mut child_supports = #module::rust_module_supports();
                 for support in &mut child_supports {
                     for ty in &mut support.types {
-                        ty.path.retarget_prefix(&module_root, &native_root);
+                        ty.retarget_prefix(&module_root, &native_root);
                     }
                     for binding in &mut support.bindings {
                         binding.path.retarget_native_root(&native_root);

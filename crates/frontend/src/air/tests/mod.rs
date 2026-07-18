@@ -12,7 +12,7 @@ pub(super) use super::{
     AirCollectionSlotScope, AirIf, AirLoop, AirLoopId, AirOptionalMatch, AirStmt, AirTail,
     BindingId, BlockId, CallArg, Callee, CaptureCellDecl, CaptureCellId, CaptureCellLifetime,
     CaptureLocalSource, ConstData, ConstId, ConstValue, ContractWeakeningId, ContractWitnessId,
-    DynBorrowParamDecl, DynOwnedUse, EnumDecl, EnumId, ExternDecl, ExternFieldDecl, ExternMember,
+    DynBorrowParamDecl, EnumDecl, EnumId, ExternDecl, ExternFieldDecl, ExternMember,
     ExternParamDecl, ExternReceiverDecl, ExternRep, ExternTypeDecl, FieldDecl, FieldId, Function,
     FunctionId, FunctionKind, GlobalDecl, GlobalId, LambdaCaptureArg, LambdaCaptureDecl,
     LambdaCaptureSlotId, LambdaDecl, LambdaEscape, LambdaId, Local, LocalId, LocalKind, MapOrder,

@@ -1,6 +1,7 @@
 pub mod body;
 pub mod decl;
 pub mod ids;
+mod materialization;
 pub mod ownership;
 pub mod place_model;
 pub mod types;
@@ -22,6 +23,7 @@ pub use ids::{
     ExternTypeId, FieldId, FlagId, FlagMemberId, FunctionId, GlobalId, LambdaCaptureSlotId,
     LambdaId, LocalId, ModuleId, ScopedBorrowId, TypeId, VariantId,
 };
+pub use materialization::finalize as finalize_materialization;
 pub use ownership::*;
 pub use types::*;
 pub use verify::*;

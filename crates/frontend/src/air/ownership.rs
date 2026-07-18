@@ -397,8 +397,8 @@ impl ParamUseAnalyzer<'_> {
             .and_then(|callee| self.callee_param_mode(callee, index))
             .unwrap_or(mode);
         match (mode, arg) {
-            (ParamMode::Value, CallArg::Value(operand) | CallArg::InitFieldProvided(operand)) => {
-                self.observe_operand(operand, ValueContext::CallValue);
+            (ParamMode::Value, CallArg::Value(owned) | CallArg::InitFieldProvided(owned)) => {
+                self.observe_operand(&owned.value, ValueContext::CallValue);
             }
             (ParamMode::Value, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
                 self.observe_place(place, ParamUse::ValueRequired);
@@ -408,8 +408,8 @@ impl ParamUseAnalyzer<'_> {
             }
             (
                 ParamMode::SharedBorrow,
-                CallArg::Value(operand) | CallArg::InitFieldProvided(operand),
-            ) => self.observe_operand(operand, ValueContext::Read),
+                CallArg::Value(owned) | CallArg::InitFieldProvided(owned),
+            ) => self.observe_operand(&owned.value, ValueContext::Read),
             (ParamMode::SharedBorrow, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
                 self.observe_place(place, ParamUse::ReadOnly);
             }
@@ -418,8 +418,14 @@ impl ParamUseAnalyzer<'_> {
             }
             (
                 ParamMode::MutBorrow,
-                CallArg::Value(Operand::Place(place))
-                | CallArg::InitFieldProvided(Operand::Place(place))
+                CallArg::Value(super::OwnedValue {
+                    value: Operand::Place(place),
+                    ..
+                })
+                | CallArg::InitFieldProvided(super::OwnedValue {
+                    value: Operand::Place(place),
+                    ..
+                })
                 | CallArg::SharedBorrow(place)
                 | CallArg::MutBorrow(place),
             ) => self.observe_place(place, ParamUse::ReborrowMut),
@@ -428,8 +434,14 @@ impl ParamUseAnalyzer<'_> {
             }
             (
                 _,
-                CallArg::Value(Operand::Const(_))
-                | CallArg::InitFieldProvided(Operand::Const(_))
+                CallArg::Value(super::OwnedValue {
+                    value: Operand::Const(_),
+                    ..
+                })
+                | CallArg::InitFieldProvided(super::OwnedValue {
+                    value: Operand::Const(_),
+                    ..
+                })
                 | CallArg::InitFieldOmitted
                 | CallArg::SharedStringConst(_),
             ) => {}
@@ -467,7 +479,7 @@ impl ParamUseAnalyzer<'_> {
         match capture {
             LambdaCaptureArg::NoRuntime | LambdaCaptureArg::CaptureCell { .. } => {}
             LambdaCaptureArg::ReadonlyLocal { value } => {
-                self.observe_operand(value, ValueContext::Store);
+                self.observe_operand(&value.value, ValueContext::Store);
             }
             LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
                 self.observe_place(place, ParamUse::ReborrowMut);
@@ -491,6 +503,19 @@ impl ParamUseAnalyzer<'_> {
     fn observe_local(&mut self, local: LocalId, use_: ParamUse) {
         let Some(index) = self.param_index(local) else {
             return;
+        };
+        let use_ = if use_ == ParamUse::ValueRequired
+            && self
+                .function
+                .signature
+                .params
+                .get(index)
+                .is_some_and(|param| {
+                    matches!(self.program.type_arena.data(param.ty), TypeData::Slice(_))
+                }) {
+            ParamUse::ReadOnly
+        } else {
+            use_
         };
         self.uses[index] = Some(merge_param_use(self.uses[index], use_));
     }
@@ -1106,16 +1131,26 @@ fn rewrite_call_args(
     let mut prepended = vec![];
     for (arg, mode) in args.iter_mut().zip(expected) {
         let replacement = match (mode, &*arg) {
-            (ParamMode::Value, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => {
-                Some(CallArg::Value(Operand::Place(place.clone())))
-            }
-            (ParamMode::Value, CallArg::SharedStringConst(id)) => {
-                Some(CallArg::Value(Operand::Const(*id)))
-            }
-            (ParamMode::SharedBorrow, CallArg::Value(Operand::Place(place))) => {
-                Some(CallArg::SharedBorrow(place.clone()))
-            }
-            (ParamMode::SharedBorrow, CallArg::Value(Operand::Const(value))) => {
+            (ParamMode::Value, CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)) => Some(
+                CallArg::Value(super::OwnedValue::reusable(Operand::Place(place.clone()))),
+            ),
+            (ParamMode::Value, CallArg::SharedStringConst(id)) => Some(CallArg::Value(
+                super::OwnedValue::reusable(Operand::Const(*id)),
+            )),
+            (
+                ParamMode::SharedBorrow,
+                CallArg::Value(super::OwnedValue {
+                    value: Operand::Place(place),
+                    ..
+                }),
+            ) => Some(CallArg::SharedBorrow(place.clone())),
+            (
+                ParamMode::SharedBorrow,
+                CallArg::Value(super::OwnedValue {
+                    value: Operand::Const(value),
+                    ..
+                }),
+            ) => {
                 let ty = const_type(const_types, *value)
                     .expect("ownership const type snapshot should contain every AIR const");
                 let local = LocalId::from_index(locals.len());
@@ -1138,7 +1173,11 @@ fn rewrite_call_args(
             }
             (
                 ParamMode::MutBorrow,
-                CallArg::Value(Operand::Place(place)) | CallArg::SharedBorrow(place),
+                CallArg::Value(super::OwnedValue {
+                    value: Operand::Place(place),
+                    ..
+                })
+                | CallArg::SharedBorrow(place),
             ) => Some(CallArg::MutBorrow(place.clone())),
             _ => None,
         };
@@ -1210,8 +1249,8 @@ mod tests {
             ConstValue, ContractReceiver, ContractReturnDecl, ContractSlotDecl, ContractSlotId,
             ContractSurfaceDecl, EnumDecl, ExternRep, ExternTypeDecl, FieldDecl, Function,
             FunctionKind, LambdaDecl, LambdaEscape, Local, LocalKind, MapOrder, Module, ModuleId,
-            Mutability, Operand, Param, ParamEscape, ParamRole, Place, RValue, ReturnMode,
-            Signature, VariantDecl,
+            Mutability, Operand, OwnedValue, Param, ParamEscape, ParamRole, Place, RValue,
+            ReturnMode, Signature, VariantDecl,
         },
         ast::Ident,
     };
@@ -1394,7 +1433,7 @@ mod tests {
             string,
             vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(999)),
-                args: vec![CallArg::Value(param_operand(string))],
+                args: vec![CallArg::Value(OwnedValue::reusable(param_operand(string)))],
             })],
             AirTail::Return(None),
         );
@@ -1418,7 +1457,7 @@ mod tests {
             list,
             vec![AirStmt::Eval(RValue::ListPush {
                 list: param_place(list),
-                value: Operand::Const(value),
+                value: OwnedValue::reusable(Operand::Const(value)),
             })],
             AirTail::Return(None),
         );
@@ -1538,7 +1577,7 @@ mod tests {
             func_ty,
             vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Lambda(param_operand(func_ty)),
-                args: vec![CallArg::Value(Operand::Const(arg))],
+                args: vec![CallArg::Value(OwnedValue::reusable(Operand::Const(arg)))],
             })],
             AirTail::Return(None),
         );
@@ -1633,6 +1672,22 @@ mod tests {
     }
 
     #[test]
+    fn infer_param_modes_keeps_slice_value_required_param_borrowed() {
+        let mut program = Program::default();
+        let int = program.alloc_type(TypeData::Int);
+        let slice = program.alloc_type(TypeData::Slice(int));
+        let function = param_function(
+            &mut program,
+            slice,
+            vec![],
+            AirTail::Return(Some(param_operand(slice))),
+        );
+
+        let modes = infer_param_modes(&program).expect("mode inference failed");
+        assert_eq!(modes[function.index()], vec![ParamMode::SharedBorrow]);
+    }
+
+    #[test]
     fn infer_param_modes_preserves_noncheap_value_required_ref_param() {
         let mut program = Program::default();
         let string = program.alloc_type(TypeData::String);
@@ -1694,7 +1749,7 @@ mod tests {
             string,
             vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(1)),
-                args: vec![CallArg::Value(param_operand(string))],
+                args: vec![CallArg::Value(OwnedValue::reusable(param_operand(string)))],
             })],
             AirTail::Return(None),
         );
@@ -1731,7 +1786,7 @@ mod tests {
             string,
             vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(read),
-                args: vec![CallArg::Value(param_operand(string))],
+                args: vec![CallArg::Value(OwnedValue::reusable(param_operand(string)))],
             })],
             AirTail::Return(None),
         );
@@ -1775,7 +1830,7 @@ mod tests {
             body: test_body(
                 vec![AirStmt::Eval(RValue::Call {
                     callee: Callee::Function(read),
-                    args: vec![CallArg::Value(Operand::Const(arg))],
+                    args: vec![CallArg::Value(OwnedValue::reusable(Operand::Const(arg)))],
                 })],
                 AirTail::Return(None),
             ),
@@ -1830,7 +1885,13 @@ mod tests {
         else {
             panic!("expected call");
         };
-        assert!(matches!(args[0], CallArg::Value(Operand::Const(found)) if found == arg));
+        assert!(matches!(
+            args[0],
+            CallArg::Value(OwnedValue {
+                value: Operand::Const(found),
+                ..
+            }) if found == arg
+        ));
     }
 
     #[test]
@@ -1883,7 +1944,7 @@ mod tests {
                         projection: vec![],
                         ty: lambda_ty,
                     })),
-                    args: vec![CallArg::Value(Operand::Const(arg))],
+                    args: vec![CallArg::Value(OwnedValue::reusable(Operand::Const(arg)))],
                 })],
                 AirTail::Return(None),
             ),
@@ -2024,7 +2085,7 @@ mod tests {
             string,
             vec![AirStmt::Eval(RValue::Call {
                 callee: Callee::Function(FunctionId::from_index(0)),
-                args: vec![CallArg::Value(param_operand(string))],
+                args: vec![CallArg::Value(OwnedValue::reusable(param_operand(string)))],
             })],
             AirTail::Return(None),
         );

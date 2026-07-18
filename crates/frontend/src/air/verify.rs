@@ -19,8 +19,8 @@ use super::{
         AirIf, AirMapEntryMatch, AirOptionalMatch, AirPatternAlternative, AirPatternArm,
         AirPatternBinding, AirPatternBindingMode, AirPatternMatch, AirPatternPath,
         AirPatternPathStep, AirPatternTest, AirStmt, AirTail, CallArg, Callee, DynBorrow,
-        DynBorrowSource, DynOwnedUse, DynReceiver, GlobalInitEffect, LambdaCaptureArg,
-        MapWriteKind, Operand, Place, PlaceReadLocal, PlaceRoot, Projection, RValue, ValueUse,
+        DynBorrowSource, DynReceiver, GlobalInitEffect, LambdaCaptureArg, MapWriteKind, Operand,
+        OwnedValue, Place, PlaceReadLocal, PlaceRoot, Projection, RValue, ValueSource, ValueUse,
     },
     ids::*,
     place_model,
@@ -365,6 +365,7 @@ pub enum BadRValue {
     InvalidDynDowncast,
     InvalidDynCall,
     InvalidDynBorrow,
+    InvalidMaterialize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -875,6 +876,7 @@ struct VerifyCx<'a> {
     program: &'a Program,
     primitives: PrimitiveTypes,
     type_states: Vec<TypeState>,
+    transferable: Vec<std::collections::HashSet<LocalId>>,
     errors: Vec<VerifyError>,
 }
 
@@ -887,10 +889,14 @@ enum TypeState {
 
 impl<'a> VerifyCx<'a> {
     fn new(program: &'a Program) -> Self {
+        let transferable = (0..program.functions.len())
+            .map(|index| super::materialization::transferable_locals(program, index))
+            .collect();
         Self {
             program,
             primitives: PrimitiveTypes::scan(program),
             type_states: vec![TypeState::Unseen; program.type_arena.len()],
+            transferable,
             errors: Vec::new(),
         }
     }
@@ -1012,6 +1018,7 @@ impl<'a> VerifyCx<'a> {
 enum FunctionValueState {
     Scalar(FunctionValueCapability),
     Fields(Vec<FunctionValueState>),
+    Variants(Vec<Vec<FunctionValueState>>),
 }
 
 impl FunctionValueState {
@@ -1036,6 +1043,27 @@ impl FunctionValueState {
                     .map(|(left, right)| Self::join(left, right))
                     .collect(),
             ),
+            (Self::Variants(left), Self::Variants(right)) if left.len() == right.len() => {
+                if left
+                    .iter()
+                    .zip(&right)
+                    .any(|(left, right)| left.len() != right.len())
+                {
+                    Self::unknown()
+                } else {
+                    Self::Variants(
+                        left.into_iter()
+                            .zip(right)
+                            .map(|(left, right)| {
+                                left.into_iter()
+                                    .zip(right)
+                                    .map(|(left, right)| Self::join(left, right))
+                                    .collect()
+                            })
+                            .collect(),
+                    )
+                }
+            }
             _ => Self::unknown(),
         }
     }
@@ -1043,7 +1071,7 @@ impl FunctionValueState {
     fn capability(&self) -> FunctionValueCapability {
         match self {
             Self::Scalar(capability) => *capability,
-            Self::Fields(_) => FunctionValueCapability::Unknown,
+            Self::Fields(_) | Self::Variants(_) => FunctionValueCapability::Unknown,
         }
     }
 
@@ -1066,6 +1094,17 @@ impl FunctionValueState {
                 .reduce(Self::join)
                 .unwrap_or_else(Self::unknown),
         }
+    }
+
+    fn variant_field(&self, variant: VariantId, field: u16) -> Self {
+        let Self::Variants(variants) = self else {
+            return Self::unknown();
+        };
+        variants
+            .get(variant.index())
+            .and_then(|fields| fields.get(field as usize))
+            .cloned()
+            .unwrap_or_else(Self::unknown)
     }
 
     fn projection_mut(&mut self, projections: &[Projection]) -> Option<&mut Self> {
@@ -2917,8 +2956,16 @@ fn stmt_uses_capture_cell(stmt: &AirStmt, cell: CaptureCellId) -> bool {
     found
 }
 
+fn tail_return_operand(tail: &AirTail) -> Option<&Operand> {
+    match tail {
+        AirTail::Return(Some(operand)) => Some(operand),
+        AirTail::ReturnOwned(owned) => Some(&owned.value),
+        _ => None,
+    }
+}
+
 fn tail_uses_capture_cell(tail: &AirTail, cell: CaptureCellId) -> bool {
-    matches!(tail, AirTail::Return(Some(operand)) if operand_uses_capture_cell(operand, cell))
+    tail_return_operand(tail).is_some_and(|operand| operand_uses_capture_cell(operand, cell))
 }
 
 fn rvalue_uses_capture_cell(value: &RValue, cell: CaptureCellId) -> bool {
@@ -2943,8 +2990,8 @@ fn child_uses_capture_cell(child: AirChild<'_>, cell: CaptureCellId) -> bool {
 
 fn call_arg_uses_capture_cell(arg: &CallArg, cell: CaptureCellId) -> bool {
     match arg {
-        CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-            operand_uses_capture_cell(operand, cell)
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+            operand_uses_capture_cell(&owned.value, cell)
         }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
             place_uses_capture_cell(place, cell)
@@ -2957,7 +3004,7 @@ fn call_arg_uses_capture_cell(arg: &CallArg, cell: CaptureCellId) -> bool {
 fn lambda_capture_arg_uses_capture_cell(arg: &LambdaCaptureArg, cell: CaptureCellId) -> bool {
     match arg {
         LambdaCaptureArg::CaptureCell { cell: found } => *found == cell,
-        LambdaCaptureArg::ReadonlyLocal { value } => operand_uses_capture_cell(value, cell),
+        LambdaCaptureArg::ReadonlyLocal { value } => operand_uses_capture_cell(&value.value, cell),
         LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
             place_uses_capture_cell(place, cell)
         }
@@ -4124,7 +4171,7 @@ fn clear_rvalue_write_state(
         RValue::ListPush { list, value } => {
             state.push_place_value(
                 list,
-                operand_function_state(program, function_id, value, state),
+                operand_function_state(program, function_id, &value.value, state),
             );
         }
         RValue::ListPop { list, .. }
@@ -4134,34 +4181,12 @@ fn clear_rvalue_write_state(
     }
 }
 
-fn clear_dyn_consumed_temporary(value: &RValue, state: &mut LocalInit) {
-    let operand = match value {
-        RValue::DynPack {
-            value,
-            use_: DynOwnedUse::ConsumeTemporary,
-            ..
+fn clear_transferred_temporaries(value: &RValue, state: &mut LocalInit) {
+    value.for_each_owned_value(&mut |owned| {
+        if let ValueSource::TransferTemp { local } = owned.source {
+            state.clear(local);
         }
-        | RValue::DynWeaken {
-            value,
-            use_: DynOwnedUse::ConsumeTemporary,
-            ..
-        }
-        | RValue::DynDowncast {
-            value,
-            use_: DynOwnedUse::ConsumeTemporary,
-            ..
-        } => Some(value),
-        _ => None,
-    };
-    if let Some(Operand::Place(Place {
-        root: PlaceRoot::Local(local),
-        projection,
-        ..
-    })) = operand
-        && projection.is_empty()
-    {
-        state.clear(*local);
-    }
+    });
 }
 
 fn verify_air_stmt(
@@ -4175,6 +4200,7 @@ fn verify_air_stmt(
     let block_id = BlockId::from_index(0);
     match stmt {
         AirStmt::Init { local, value } => {
+            verify_materialize_role(cx, function_id, block_id, index, value, true);
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_promoted_local_not_initialized(cx, function_id, block_id, index, *local);
             verify_init_stmt(cx, function_id, block_id, index, *local, value);
@@ -4190,7 +4216,7 @@ fn verify_air_stmt(
                     );
                 }
                 let mut next = state.clone();
-                clear_dyn_consumed_temporary(value, &mut next);
+                clear_transferred_temporaries(value, &mut next);
                 next.init(*local);
                 next.set_local_value(
                     *local,
@@ -4201,12 +4227,13 @@ fn verify_air_stmt(
             Some(state.clone())
         }
         AirStmt::Assign { dst, value } => {
+            verify_materialize_role(cx, function_id, block_id, index, value, true);
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_air_place_write(cx, function_id, index, dst, state);
             verify_assign_stmt(cx, function_id, block_id, index, dst, value);
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             let mut next = state.clone();
-            clear_dyn_consumed_temporary(value, &mut next);
+            clear_transferred_temporaries(value, &mut next);
             if let PlaceRoot::CaptureCell(cell) = dst.root
                 && dst.projection.is_empty()
             {
@@ -4219,12 +4246,13 @@ fn verify_air_stmt(
             Some(next)
         }
         AirStmt::Eval(value) => {
+            verify_materialize_role(cx, function_id, block_id, index, value, false);
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_rvalue(cx, function_id, block_id, Some(index), value);
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             let mut next = state.clone();
             clear_rvalue_write_state(cx.program, function_id, value, &mut next);
-            clear_dyn_consumed_temporary(value, &mut next);
+            clear_transferred_temporaries(value, &mut next);
             Some(next)
         }
         AirStmt::GlobalEnsure { global } => {
@@ -4246,11 +4274,12 @@ fn verify_air_stmt(
             value,
             init,
         } => {
+            verify_materialize_role(cx, function_id, block_id, index, value, true);
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_set_root_stmt(cx, function_id, block_id, index, *global, value, *init);
             let mut next = state.clone();
-            clear_dyn_consumed_temporary(value, &mut next);
+            clear_transferred_temporaries(value, &mut next);
             next.set_global_value(
                 *global,
                 rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
@@ -4258,11 +4287,12 @@ fn verify_air_stmt(
             Some(next)
         }
         AirStmt::GlobalUpdateRoot { global, value } => {
+            verify_materialize_role(cx, function_id, block_id, index, value, true);
             verify_air_rvalue_reads(cx, function_id, index, value, state);
             verify_function_value_escape_proof(cx, function_id, index, value, state);
             verify_global_update_root_stmt(cx, function_id, block_id, index, *global, value, state);
             let mut next = state.clone();
-            clear_dyn_consumed_temporary(value, &mut next);
+            clear_transferred_temporaries(value, &mut next);
             next.set_global_value(
                 *global,
                 rvalue_function_state(cx.program, function_id, &cx.primitives, value, state),
@@ -4720,8 +4750,8 @@ fn verify_dyn_borrow_root_contract(
                         reject_dyn_borrow_place(cx, function_id, place);
                     }
                 }
-                AirDynMatchSource::Owned { value, .. } => {
-                    reject_dyn_borrow_operand(cx, function_id, value);
+                AirDynMatchSource::Owned(value) => {
+                    reject_dyn_borrow_operand(cx, function_id, &value.value);
                 }
             }
             for arm in &match_.arms {
@@ -4732,7 +4762,7 @@ fn verify_dyn_borrow_root_contract(
         }
         stmt.for_each_child(&mut |child| verify_dyn_borrow_child(cx, function_id, child));
     }
-    if let AirTail::Return(Some(value)) = &block.tail {
+    if let Some(value) = tail_return_operand(&block.tail) {
         reject_dyn_borrow_operand(cx, function_id, value);
     }
 }
@@ -4745,8 +4775,8 @@ fn verify_dyn_borrow_child(cx: &mut VerifyCx<'_>, function_id: FunctionId, child
         AirChild::Place { place, .. } => reject_dyn_borrow_place(cx, function_id, place),
         AirChild::CallArg { arg, .. } => match arg {
             CallArg::DynBorrow(_) | CallArg::InitFieldOmitted | CallArg::SharedStringConst(_) => {}
-            CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-                reject_dyn_borrow_operand(cx, function_id, operand);
+            CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+                reject_dyn_borrow_operand(cx, function_id, &owned.value);
             }
             CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                 reject_dyn_borrow_place(cx, function_id, place);
@@ -4754,7 +4784,7 @@ fn verify_dyn_borrow_child(cx: &mut VerifyCx<'_>, function_id: FunctionId, child
         },
         AirChild::LambdaCapture(capture) => match capture {
             LambdaCaptureArg::ReadonlyLocal { value } => {
-                reject_dyn_borrow_operand(cx, function_id, value);
+                reject_dyn_borrow_operand(cx, function_id, &value.value);
             }
             LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
                 reject_dyn_borrow_place(cx, function_id, place);
@@ -5167,10 +5197,10 @@ fn verify_collection_loan_contract_stmt(
         }
         AirStmt::DynMatch(match_) => {
             match &match_.source {
-                AirDynMatchSource::Owned { value, .. } => verify_collection_loan_contract_operand(
+                AirDynMatchSource::Owned(value) => verify_collection_loan_contract_operand(
                     cx,
                     function_id,
-                    value,
+                    &value.value,
                     slot_locals,
                     active_slots,
                     false,
@@ -5281,7 +5311,7 @@ fn verify_collection_loan_contract_tail(
     slot_locals: &std::collections::HashSet<LocalId>,
     active_slots: &std::collections::HashSet<LocalId>,
 ) {
-    if let AirTail::Return(Some(value)) = tail {
+    if let Some(value) = tail_return_operand(tail) {
         verify_collection_loan_contract_operand(
             cx,
             function_id,
@@ -5302,16 +5332,23 @@ fn verify_collection_loan_contract_rvalue(
     active_loans: &[CollectionLoanFrame],
 ) {
     match value {
+        RValue::Materialize(owned)
+        | RValue::DynPack { value: owned, .. }
+        | RValue::DynWeaken { value: owned, .. }
+        | RValue::DynDowncast { value: owned, .. }
+        | RValue::FunctionValue { value: owned, .. } => verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            &owned.value,
+            slot_locals,
+            active_slots,
+            false,
+        ),
         RValue::Use(op)
-        | RValue::DynPack { value: op, .. }
-        | RValue::DynWeaken { value: op, .. }
-        | RValue::DynDowncast { value: op, .. }
-        | RValue::FunctionValue { value: op, .. }
         | RValue::Unary { value: op, .. }
         | RValue::Cast { value: op, .. }
         | RValue::RawProject { value: op, .. }
         | RValue::RawTryConstruct { value: op, .. }
-        | RValue::OptionalSome { value: op, .. }
         | RValue::Stringify { value: op, .. }
         | RValue::Format { value: op, .. } => verify_collection_loan_contract_operand(
             cx,
@@ -5326,7 +5363,7 @@ fn verify_collection_loan_contract_rvalue(
                 DynReceiver::Owned(op) => verify_collection_loan_contract_operand(
                     cx,
                     function_id,
-                    op,
+                    &op.value,
                     slot_locals,
                     active_slots,
                     false,
@@ -5359,6 +5396,14 @@ fn verify_collection_loan_contract_rvalue(
                 );
             }
         }
+        RValue::OptionalSome { value, .. } => verify_collection_loan_contract_operand(
+            cx,
+            function_id,
+            &value.value,
+            slot_locals,
+            active_slots,
+            false,
+        ),
         RValue::Binary { lhs, rhs, .. } | RValue::SharedRefEq { lhs, rhs, .. } => {
             verify_collection_loan_contract_operand(
                 cx,
@@ -5382,7 +5427,7 @@ fn verify_collection_loan_contract_rvalue(
                 verify_collection_loan_contract_operand(
                     cx,
                     function_id,
-                    field,
+                    &field.value,
                     slot_locals,
                     active_slots,
                     false,
@@ -5483,7 +5528,7 @@ fn verify_collection_loan_contract_rvalue(
             verify_collection_loan_contract_operand(
                 cx,
                 function_id,
-                value,
+                &value.value,
                 slot_locals,
                 active_slots,
                 false,
@@ -5531,7 +5576,7 @@ fn verify_collection_loan_contract_rvalue(
             verify_collection_loan_contract_operand(
                 cx,
                 function_id,
-                key,
+                &key.value,
                 slot_locals,
                 active_slots,
                 false,
@@ -5539,7 +5584,7 @@ fn verify_collection_loan_contract_rvalue(
             verify_collection_loan_contract_operand(
                 cx,
                 function_id,
-                value,
+                &value.value,
                 slot_locals,
                 active_slots,
                 false,
@@ -5623,7 +5668,7 @@ fn verify_collection_loan_contract_rvalue(
                         verify_collection_loan_contract_operand(
                             cx,
                             function_id,
-                            value,
+                            &value.value,
                             slot_locals,
                             active_slots,
                             escapes,
@@ -5772,11 +5817,11 @@ fn verify_collection_loan_contract_call_arg(
     escapes: bool,
 ) {
     match arg {
-        CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
             verify_collection_loan_contract_operand(
                 cx,
                 function_id,
-                op,
+                &owned.value,
                 slot_locals,
                 active_slots,
                 escapes,
@@ -5984,6 +6029,7 @@ fn verify_air_pattern_match(
     let Some(subject_ty) = subject_ty else {
         return Some(state.clone());
     };
+    let subject_value = place_function_state(cx.program, function_id, &match_.subject, state, true);
 
     let mut fallthrough = vec![];
     for arm in &match_.arms {
@@ -5998,6 +6044,7 @@ fn verify_air_pattern_match(
             verify_air_pattern_alternative(cx, &site, function_id, subject_ty, alternative);
         }
         verify_pattern_alternative_binding_sets(cx, &site, arm);
+        let mut alternatives = vec![];
         for alternative in &arm.alternatives {
             let guards = enum_variant_guards(alternative);
             let optional_guards = optional_some_guards(alternative);
@@ -6008,30 +6055,16 @@ fn verify_air_pattern_match(
                     &site,
                     function_id,
                     subject_ty,
+                    &subject_value,
                     &guards,
                     &optional_guards,
                     binding,
                     &mut alternative_state,
                 );
             }
+            alternatives.push(alternative_state);
         }
-        let mut arm_state = state.clone();
-        if let Some(alternative) = arm.alternatives.first() {
-            let guards = enum_variant_guards(alternative);
-            let optional_guards = optional_some_guards(alternative);
-            for binding in &alternative.bindings {
-                verify_pattern_binding(
-                    cx,
-                    &site,
-                    function_id,
-                    subject_ty,
-                    &guards,
-                    &optional_guards,
-                    binding,
-                    &mut arm_state,
-                );
-            }
-        }
+        let mut arm_state = LocalInit::join(alternatives).unwrap_or_else(|| state.clone());
         if let Some(mut state) =
             verify_air_block(cx, function_id, &arm.block, &mut arm_state, loops)
         {
@@ -6062,16 +6095,22 @@ fn verify_air_dyn_match(
 ) -> Option<LocalInit> {
     let site = VerifyCx::stmt_site(function_id, BlockId::from_index(0), index);
     let (source_ty, source_place, takes, binding_mutability) = match &match_.source {
-        AirDynMatchSource::Owned { value, use_ } => {
-            verify_air_operand_read(cx, function_id, index, value, state);
-            verify_operand(cx, function_id, BlockId::from_index(0), Some(index), value);
+        AirDynMatchSource::Owned(owned) => {
+            verify_air_operand_read(cx, function_id, index, &owned.value, state);
+            verify_operand(
+                cx,
+                function_id,
+                BlockId::from_index(0),
+                Some(index),
+                &owned.value,
+            );
             (
-                typing::operand_ty(cx.program, value),
-                match value {
+                typing::operand_ty(cx.program, &owned.value),
+                match &owned.value {
                     Operand::Place(place) => Some(place),
                     Operand::Const(_) => None,
                 },
-                *use_ == DynOwnedUse::ConsumeTemporary,
+                matches!(owned.source, ValueSource::TransferTemp { .. }),
                 Mutability::Immutable,
             )
         }
@@ -6096,9 +6135,7 @@ fn verify_air_dyn_match(
         }
     };
     let ownership_valid = match &match_.source {
-        AirDynMatchSource::Owned { value, use_ } => {
-            dyn_owned_use_valid(cx.program, function_id, value, *use_)
-        }
+        AirDynMatchSource::Owned(owned) => owned_source_valid(cx, function_id, owned, false),
         AirDynMatchSource::Borrowed(_) | AirDynMatchSource::Mutable(_) => true,
     };
     let source_matches = ownership_valid && source_ty.is_some_and(|ty| {
@@ -6117,17 +6154,17 @@ fn verify_air_dyn_match(
                 AirDynMatchTargetBinding::Alias(_)
             ) | (_, AirDynMatchTargetBinding::Discard)
                 | (
-                    AirDynMatchSource::Owned {
-                        use_: DynOwnedUse::ConsumeTemporary,
+                    AirDynMatchSource::Owned(OwnedValue {
+                        source: ValueSource::TransferTemp { .. },
                         ..
-                    },
+                    }),
                     AirDynMatchTargetBinding::Take(_)
                 )
                 | (
-                    AirDynMatchSource::Owned {
-                        use_: DynOwnedUse::ReusableRead,
+                    AirDynMatchSource::Owned(OwnedValue {
+                        source: ValueSource::Reusable,
                         ..
-                    } | AirDynMatchSource::Borrowed(_),
+                    }) | AirDynMatchSource::Borrowed(_),
                     AirDynMatchTargetBinding::Materialize(_)
                 )
         );
@@ -6155,6 +6192,7 @@ fn verify_air_dyn_match(
             function_id,
             binding,
             arm.target,
+            source_call_return_state(cx.program, arm.target),
             binding_mutability,
             state,
             &mut arm_state,
@@ -6205,7 +6243,7 @@ fn verify_air_dyn_match(
             AirDynMatchFallbackBinding::Alias(_)
         ) | (_, AirDynMatchFallbackBinding::Discard)
             | (
-                AirDynMatchSource::Owned { .. } | AirDynMatchSource::Borrowed(_),
+                AirDynMatchSource::Owned(_) | AirDynMatchSource::Borrowed(_),
                 AirDynMatchFallbackBinding::Preserve(_)
             )
     );
@@ -6219,6 +6257,7 @@ fn verify_air_dyn_match(
             function_id,
             fallback_binding,
             source_ty,
+            source_call_return_state(cx.program, source_ty),
             binding_mutability,
             state,
             &mut fallback_state,
@@ -6287,6 +6326,7 @@ fn verify_dyn_match_binding(
     function_id: FunctionId,
     binding: Option<LocalId>,
     ty: TypeId,
+    value: FunctionValueState,
     mutability: Mutability,
     prior: &LocalInit,
     state: &mut LocalInit,
@@ -6303,6 +6343,7 @@ fn verify_dyn_match_binding(
         && !prior.is_possible(binding);
     if valid {
         state.init(binding);
+        state.set_local_value(binding, value);
     }
     valid
 }
@@ -6332,8 +6373,8 @@ fn dyn_match_binding_returned(
     binding: LocalId,
 ) -> bool {
     if matches!(
-        &block.tail,
-        AirTail::Return(Some(Operand::Place(place)))
+        tail_return_operand(&block.tail),
+        Some(Operand::Place(place))
             if dyn_match_place_has_binding_origin(program, function_id, place, binding)
     ) {
         return true;
@@ -6421,7 +6462,7 @@ fn dyn_match_child_uses_root(
         AirChild::DynBorrow(borrow) => conflicts(borrow.place()),
         AirChild::LambdaCapture(capture) => match capture {
             LambdaCaptureArg::ReadonlyLocal { value } => {
-                matches!(value, Operand::Place(place) if conflicts(place))
+                matches!(&value.value, Operand::Place(place) if conflicts(place))
             }
             LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
                 conflicts(place)
@@ -6735,6 +6776,7 @@ fn verify_pattern_binding(
     site: &VerifySite,
     function_id: FunctionId,
     subject_ty: TypeId,
+    subject_value: &FunctionValueState,
     guards: &[AirPatternVariantGuard],
     optional_guards: &[AirPatternPath],
     binding: &AirPatternBinding,
@@ -6767,7 +6809,29 @@ fn verify_pattern_binding(
         );
     }
     state.init(binding.local);
-    state.set_local_value(binding.local, FunctionValueState::non_function());
+    state.set_local_value(
+        binding.local,
+        pattern_binding_function_state(subject_value, &binding.path),
+    );
+}
+
+fn pattern_binding_function_state(
+    subject: &FunctionValueState,
+    path: &AirPatternPath,
+) -> FunctionValueState {
+    let mut value = subject.clone();
+    for step in &path.steps {
+        value = match step {
+            AirPatternPathStep::Field(field) => value.project(&Projection::Field(*field)),
+            AirPatternPathStep::TupleField(field) => value.project(&Projection::TupleField(*field)),
+            AirPatternPathStep::OptionalSome => value.project(&Projection::TupleField(0)),
+            AirPatternPathStep::EnumTupleField { variant, field, .. }
+            | AirPatternPathStep::EnumStructField { variant, field, .. } => {
+                value.variant_field(*variant, *field)
+            }
+        };
+    }
+    value
 }
 
 fn verify_pattern_path(
@@ -7161,10 +7225,16 @@ fn verify_air_tail(
     match tail {
         AirTail::None => Some(state.clone()),
         AirTail::Return(value) => {
+            let function = cx.program.function(function_id);
             if let Some(value) = value {
                 verify_air_operand_read(cx, function_id, 0, value, state);
+                if matches!(function.signature.return_mode, ReturnMode::Value(_)) {
+                    cx.push(
+                        site.clone(),
+                        VerifyErrorKind::BadRValue(BadRValue::InvalidMaterialize),
+                    );
+                }
             }
-            let function = cx.program.function(function_id);
             verify_return(
                 cx,
                 function_id,
@@ -7172,6 +7242,27 @@ fn verify_air_tail(
                 site,
                 function.signature.return_mode,
                 value.as_ref(),
+            );
+            None
+        }
+        AirTail::ReturnOwned(owned) => {
+            verify_air_operand_read(cx, function_id, 0, &owned.value, state);
+            let function = cx.program.function(function_id);
+            if matches!(function.signature.return_mode, ReturnMode::Place(_))
+                || !owned_source_valid(cx, function_id, owned, false)
+            {
+                cx.push(
+                    site.clone(),
+                    VerifyErrorKind::BadRValue(BadRValue::InvalidMaterialize),
+                );
+            }
+            verify_return(
+                cx,
+                function_id,
+                BlockId::from_index(0),
+                site,
+                function.signature.return_mode,
+                Some(&owned.value),
             );
             None
         }
@@ -7228,8 +7319,8 @@ fn verify_air_rvalue_reads(
             verify_air_place_read(cx, function_id, index, place, state);
         }
         AirChild::CallArg { arg, .. } => match arg {
-            CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
-                verify_air_operand_read(cx, function_id, index, op, state);
+            CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+                verify_air_operand_read(cx, function_id, index, &owned.value, state);
             }
             CallArg::SharedBorrow(place) | CallArg::MutBorrow(place) => {
                 verify_air_place_read(cx, function_id, index, place, state);
@@ -7247,7 +7338,7 @@ fn verify_air_rvalue_reads(
         }
         AirChild::LambdaCapture(capture) => match capture {
             LambdaCaptureArg::ReadonlyLocal { value } => {
-                verify_air_operand_read(cx, function_id, index, value, state);
+                verify_air_operand_read(cx, function_id, index, &value.value, state);
             }
             LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
                 verify_air_place_read(cx, function_id, index, place, state);
@@ -7710,27 +7801,90 @@ fn verify_stringify(
     }
 }
 
-fn dyn_owned_use_valid(
-    program: &Program,
-    function_id: FunctionId,
-    value: &Operand,
-    use_: DynOwnedUse,
-) -> bool {
-    let temporary = matches!(
-        value,
-        Operand::Place(Place {
-            root: PlaceRoot::Local(local),
-            projection,
-            ..
-        }) if projection.is_empty()
-            && program.function(function_id).locals.get(local.index()).is_some_and(|local| {
-                local.kind == LocalKind::Temp
-            })
-    );
-    match use_ {
-        DynOwnedUse::ConsumeTemporary => temporary,
-        DynOwnedUse::ReusableRead => !temporary,
+fn verify_materialize_role(
+    cx: &mut VerifyCx<'_>,
+    function: FunctionId,
+    block: BlockId,
+    index: usize,
+    value: &RValue,
+    owning: bool,
+) {
+    let invalid = if owning {
+        matches!(value, RValue::Use(_))
+    } else {
+        matches!(value, RValue::Materialize(_))
+    };
+    if invalid {
+        cx.push(
+            VerifyCx::stmt_site(function, block, index),
+            VerifyErrorKind::BadRValue(BadRValue::InvalidMaterialize),
+        );
     }
+}
+
+fn owned_source_valid(
+    cx: &VerifyCx<'_>,
+    function: FunctionId,
+    owned: &OwnedValue<Operand>,
+    allow_slice_transfer: bool,
+) -> bool {
+    let slice = matches!(
+        &owned.value,
+        Operand::Place(place)
+            if matches!(cx.program.type_arena.get(place.ty), Some(TypeData::Slice(_)))
+    );
+    match owned.source {
+        ValueSource::Reusable => !slice,
+        ValueSource::TransferTemp { local } => {
+            (!slice || allow_slice_transfer)
+                && matches!(
+                    &owned.value,
+                    Operand::Place(place)
+                        if place.root == PlaceRoot::Local(local) && place.projection.is_empty()
+                )
+                && cx.transferable[function.index()].contains(&local)
+        }
+    }
+}
+
+fn rvalue_owned_sources_valid(cx: &VerifyCx<'_>, function: FunctionId, value: &RValue) -> bool {
+    let valid = |owned: &OwnedValue<Operand>, allow_slice| {
+        owned_source_valid(cx, function, owned, allow_slice)
+    };
+    match value {
+        RValue::Materialize(owned)
+        | RValue::DynPack { value: owned, .. }
+        | RValue::DynWeaken { value: owned, .. }
+        | RValue::DynDowncast { value: owned, .. }
+        | RValue::FunctionValue { value: owned, .. }
+        | RValue::OptionalSome { value: owned, .. }
+        | RValue::ListPush { value: owned, .. } => valid(owned, false),
+        RValue::Aggregate { kind, fields, .. } => fields.iter().all(|owned| {
+            valid(owned, false)
+                && (!matches!(kind, AggregateCtor::ArrayFill)
+                    || matches!(owned.source, ValueSource::Reusable))
+        }),
+        RValue::MapInsert { key, value, .. } => valid(key, false) && valid(value, false),
+        RValue::Call { args, .. } => call_owned_sources_valid(args, &valid),
+        RValue::DynCall { receiver, args, .. } => {
+            (!matches!(receiver, DynReceiver::Owned(owned) if !valid(owned, false)))
+                && call_owned_sources_valid(args, &valid)
+        }
+        RValue::MakeLambda { captures, .. } => captures.iter().all(|capture| {
+            !matches!(capture, LambdaCaptureArg::ReadonlyLocal { value } if !valid(value, false))
+        }),
+        _ => true,
+    }
+}
+
+fn call_owned_sources_valid(
+    args: &[CallArg],
+    valid: &impl Fn(&OwnedValue<Operand>, bool) -> bool,
+) -> bool {
+    args.iter().all(|arg| match arg {
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => valid(owned, true),
+        _ => true,
+    })
 }
 
 fn verify_rvalue(
@@ -7742,21 +7896,24 @@ fn verify_rvalue(
 ) {
     let stmt_idx = stmt_index.unwrap_or(0);
     let site = VerifyCx::stmt_site(function_id, block_id, stmt_idx);
+    if !rvalue_owned_sources_valid(cx, function_id, value) {
+        cx.push(
+            site.clone(),
+            VerifyErrorKind::BadRValue(BadRValue::InvalidMaterialize),
+        );
+    }
 
     match value {
         RValue::Use(op) => {
             verify_operand(cx, function_id, block_id, stmt_index, op);
         }
-        RValue::DynPack {
-            value,
-            use_,
-            witness,
-            ty,
-        } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
-            let valid = dyn_owned_use_valid(cx.program, function_id, value, *use_)
-                && cx.program.contract_witnesses.get(witness.index()).is_some_and(|decl| {
-                typing::operand_ty(cx.program, value) == Some(decl.key.concrete_ty)
+        RValue::Materialize(owned) => {
+            verify_operand(cx, function_id, block_id, stmt_index, &owned.value);
+        }
+        RValue::DynPack { value, witness, ty } => {
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
+            let valid = cx.program.contract_witnesses.get(witness.index()).is_some_and(|decl| {
+                typing::operand_ty(cx.program, &value.value) == Some(decl.key.concrete_ty)
                     && matches!(cx.program.type_arena.get(*ty), Some(TypeData::Dyn(surface)) if *surface == decl.key.surface)
             });
             if !valid {
@@ -7769,14 +7926,12 @@ fn verify_rvalue(
         }
         RValue::DynWeaken {
             value,
-            use_,
             weakening,
             ty,
         } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
-            let source_ty = typing::operand_ty(cx.program, value);
-            let valid = dyn_owned_use_valid(cx.program, function_id, value, *use_)
-                && cx.program.contract_weakenings.get(weakening.index()).is_some_and(|decl| {
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
+            let source_ty = typing::operand_ty(cx.program, &value.value);
+            let valid = cx.program.contract_weakenings.get(weakening.index()).is_some_and(|decl| {
                 matches!(source_ty.and_then(|ty| cx.program.type_arena.get(ty)), Some(TypeData::Dyn(surface)) if *surface == decl.source)
                     && matches!(cx.program.type_arena.get(*ty), Some(TypeData::Dyn(surface)) if *surface == decl.target)
             });
@@ -7790,14 +7945,13 @@ fn verify_rvalue(
         }
         RValue::DynDowncast {
             value,
-            use_,
             surface,
             target,
             ty,
         } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
             let source_matches = matches!(
-                typing::operand_ty(cx.program, value)
+                typing::operand_ty(cx.program, &value.value)
                     .and_then(|ty| cx.program.type_arena.get(ty)),
                 Some(TypeData::Dyn(found)) if found == surface
             );
@@ -7815,11 +7969,7 @@ fn verify_rvalue(
                 cx.program.type_arena.get(*ty),
                 Some(TypeData::Optional(found)) if found == target
             );
-            if !(dyn_owned_use_valid(cx.program, function_id, value, *use_)
-                && source_matches
-                && target_is_nominal
-                && option_matches)
-            {
+            if !(source_matches && target_is_nominal && option_matches) {
                 cx.push(
                     site.clone(),
                     VerifyErrorKind::BadRValue(BadRValue::InvalidDynDowncast),
@@ -7844,8 +7994,8 @@ fn verify_rvalue(
             args,
         ),
         RValue::FunctionValue { value, .. } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
-            verify_function_value_operand_type(cx, site, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
+            verify_function_value_operand_type(cx, site, &value.value);
         }
         RValue::Stringify { value, source_ty } => {
             verify_stringify(
@@ -7940,11 +8090,11 @@ fn verify_rvalue(
             required_rvalue_primitive(cx, site, PrimitiveKind::Bool);
         }
         RValue::OptionalSome { value, ty } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
             cx.verify_type_ref(site.clone(), *ty);
             match (
                 typing::optional_inner(cx.program, *ty),
-                typing::operand_ty(cx.program, value),
+                typing::operand_ty(cx.program, &value.value),
             ) {
                 (Some(inner), Some(value_ty)) if inner == value_ty => {}
                 (Some(inner), Some(value_ty)) => cx.push(
@@ -7958,7 +8108,7 @@ fn verify_rvalue(
                     site,
                     VerifyErrorKind::BadRValue(BadRValue::OptionalSomeTypeMismatch {
                         expected: *ty,
-                        found: typing::operand_ty(cx.program, value).unwrap_or(*ty),
+                        found: typing::operand_ty(cx.program, &value.value).unwrap_or(*ty),
                     }),
                 ),
             }
@@ -8047,13 +8197,15 @@ fn verify_rvalue(
                 AggregateCtor::EnumVariant { enum_id, variant } => {
                     verify_enum_ctor(cx, site.clone(), *enum_id, *variant, *ty, fields);
                 }
-                AggregateCtor::Array => verify_array_ctor(cx, site.clone(), *ty, fields),
+                AggregateCtor::Array | AggregateCtor::ArrayFill => {
+                    verify_array_ctor(cx, site.clone(), *ty, fields);
+                }
                 AggregateCtor::List => verify_list_ctor(cx, site.clone(), *ty, fields),
                 AggregateCtor::Map => verify_map_ctor(cx, site.clone(), *ty, fields),
                 AggregateCtor::Tuple => verify_tuple_ctor(cx, site.clone(), *ty, fields),
             }
             for field in fields {
-                verify_operand(cx, function_id, block_id, stmt_index, field);
+                verify_operand(cx, function_id, block_id, stmt_index, &field.value);
             }
         }
         RValue::Call { callee, args } => {
@@ -8092,9 +8244,9 @@ fn verify_rvalue(
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, list);
             verify_mutable_place(cx, function_id, &site, list);
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
             if let Some(expected_elem) = typing::list_elem(cx.program, list.ty)
-                && let Some(value_ty) = typing::operand_ty(cx.program, value)
+                && let Some(value_ty) = typing::operand_ty(cx.program, &value.value)
                 && value_ty != expected_elem
             {
                 cx.push(
@@ -8181,11 +8333,11 @@ fn verify_rvalue(
             required_rvalue_primitive(cx, site.clone(), PrimitiveKind::Void);
             verify_place(cx, function_id, block_id, stmt_index, map);
             verify_mutable_place(cx, function_id, &site, map);
-            verify_operand(cx, function_id, block_id, stmt_index, key);
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &key.value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
             if let Some((expected_key, expected_value)) = typing::map_kv(cx.program, map.ty) {
-                verify_map_key(cx, &site, key, expected_key);
-                verify_map_value(cx, &site, value, expected_value);
+                verify_map_key(cx, &site, &key.value, expected_key);
+                verify_map_value(cx, &site, &value.value, expected_value);
             }
         }
         RValue::MapEntryAt { map, index, ty } => {
@@ -8370,7 +8522,7 @@ fn verify_lambda_captures(
             );
         }
         if let LambdaCaptureArg::ReadonlyLocal { value } = capture
-            && !readonly_capture_arg_is_valid(cx.program, function_id, decl_capture, value)
+            && !readonly_capture_arg_is_valid(cx.program, function_id, decl_capture, &value.value)
         {
             cx.push(
                 site.clone(),
@@ -8477,18 +8629,18 @@ fn lambda_capture_matches(
             },
             LambdaCaptureArg::ReadonlyLocal { value },
         ) => {
-            typing::operand_ty(program, value) == Some(*ty)
+            typing::operand_ty(program, &value.value) == Some(*ty)
                 && (source.owner == function_id
                     && readonly_capture_is_immutable_owned(
                         program,
                         function_id,
-                        value,
+                        &value.value,
                         Some(*source),
                     )
                     || operand_is_matching_lambda_capture(
                         program,
                         function_id,
-                        value,
+                        &value.value,
                         *binding,
                         *source,
                         *ty,
@@ -8727,7 +8879,7 @@ fn verify_lambda_capture(
     match capture {
         LambdaCaptureArg::NoRuntime => {}
         LambdaCaptureArg::ReadonlyLocal { value } => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
         }
         LambdaCaptureArg::ScopedLocal { place } | LambdaCaptureArg::ScopedBorrow { place } => {
             verify_place(cx, function_id, block_id, stmt_index, place);
@@ -9214,7 +9366,12 @@ fn verify_place(
     Some(current_ty)
 }
 
-fn verify_array_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+fn verify_array_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    ty: TypeId,
+    fields: &[OwnedValue<Operand>],
+) {
     let Some((elem, len)) = typing::array_elem_len(cx.program, ty) else {
         push_collection_result_mismatch(cx, site, AggregateCtor::Array, ty);
         return;
@@ -9232,7 +9389,12 @@ fn verify_array_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields
     verify_collection_fields(cx, &site, &AggregateCtor::Array, elem, fields);
 }
 
-fn verify_list_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+fn verify_list_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    ty: TypeId,
+    fields: &[OwnedValue<Operand>],
+) {
     let Some(elem) = typing::list_elem(cx.program, ty) else {
         push_collection_result_mismatch(cx, site, AggregateCtor::List, ty);
         return;
@@ -9240,7 +9402,12 @@ fn verify_list_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields:
     verify_collection_fields(cx, &site, &AggregateCtor::List, elem, fields);
 }
 
-fn verify_map_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+fn verify_map_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    ty: TypeId,
+    fields: &[OwnedValue<Operand>],
+) {
     let Some((key, value)) = typing::map_kv(cx.program, ty) else {
         push_collection_result_mismatch(cx, site, AggregateCtor::Map, ty);
         return;
@@ -9263,14 +9430,19 @@ fn verify_map_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: 
                 &site,
                 &AggregateCtor::Map,
                 base + offset,
-                &entry[offset],
+                &entry[offset].value,
                 expected,
             );
         }
     }
 }
 
-fn verify_tuple_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields: &[Operand]) {
+fn verify_tuple_ctor(
+    cx: &mut VerifyCx<'_>,
+    site: VerifySite,
+    ty: TypeId,
+    fields: &[OwnedValue<Operand>],
+) {
     let Some(TypeData::Tuple(elems)) = cx.type_data(ty).cloned() else {
         push_collection_result_mismatch(cx, site, AggregateCtor::Tuple, ty);
         return;
@@ -9286,7 +9458,14 @@ fn verify_tuple_ctor(cx: &mut VerifyCx<'_>, site: VerifySite, ty: TypeId, fields
         );
     }
     for (field, (operand, expected)) in fields.iter().zip(elems).enumerate() {
-        verify_collection_field(cx, &site, &AggregateCtor::Tuple, field, operand, expected);
+        verify_collection_field(
+            cx,
+            &site,
+            &AggregateCtor::Tuple,
+            field,
+            &operand.value,
+            expected,
+        );
     }
 }
 
@@ -9295,10 +9474,10 @@ fn verify_collection_fields(
     site: &VerifySite,
     ctor: &AggregateCtor,
     expected: TypeId,
-    fields: &[Operand],
+    fields: &[OwnedValue<Operand>],
 ) {
     for (field, operand) in fields.iter().enumerate() {
-        verify_collection_field(cx, site, ctor, field, operand, expected);
+        verify_collection_field(cx, site, ctor, field, &operand.value, expected);
     }
 }
 
@@ -9340,7 +9519,7 @@ fn verify_collection_field(
 fn verify_ordered_fields(
     cx: &mut VerifyCx<'_>,
     site: &VerifySite,
-    fields: &[Operand],
+    fields: &[OwnedValue<Operand>],
     expected: &[TypeId],
     count_mismatch: impl FnOnce(usize, usize) -> VerifyErrorKind,
     mut type_mismatch: impl FnMut(usize, TypeId, TypeId) -> VerifyErrorKind,
@@ -9349,7 +9528,7 @@ fn verify_ordered_fields(
         cx.push(site.clone(), count_mismatch(expected.len(), fields.len()));
     }
     for (index, (operand, expected)) in fields.iter().zip(expected).enumerate() {
-        if let Some(found) = typing::operand_ty(cx.program, operand)
+        if let Some(found) = typing::operand_ty(cx.program, &operand.value)
             && found != *expected
         {
             cx.push(site.clone(), type_mismatch(index, *expected, found));
@@ -9363,7 +9542,7 @@ fn verify_aggregate_ctor(
     aggregate_id: AggregateId,
     expected_kind: AggregateKind,
     ty: TypeId,
-    fields: &[Operand],
+    fields: &[OwnedValue<Operand>],
 ) {
     let Some(aggregate) = cx.program.aggregates.get(aggregate_id.index()) else {
         cx.push(
@@ -9431,7 +9610,7 @@ fn verify_enum_ctor(
     enum_id: EnumId,
     variant: VariantId,
     ty: TypeId,
-    fields: &[Operand],
+    fields: &[OwnedValue<Operand>],
 ) {
     let Some(enm) = cx.program.enums.get(enum_id.index()) else {
         cx.push(
@@ -9511,9 +9690,9 @@ fn verify_dyn_call(
     };
     let receiver_valid = match receiver {
         DynReceiver::Owned(value) => {
-            verify_operand(cx, function_id, block_id, stmt_index, value);
+            verify_operand(cx, function_id, block_id, stmt_index, &value.value);
             slot_decl.receiver != ContractReceiver::Ref
-                && operand_dyn_surface(cx.program, value) == Some(surface)
+                && operand_dyn_surface(cx.program, &value.value) == Some(surface)
         }
         DynReceiver::MutableOwned(place) => {
             verify_place(cx, function_id, block_id, stmt_index, place);
@@ -9543,10 +9722,16 @@ fn verify_dyn_call(
         }
     }
     let receiver_place = match receiver {
-        DynReceiver::Owned(Operand::Place(place)) => Some((ParamMode::SharedBorrow, place)),
+        DynReceiver::Owned(OwnedValue {
+            value: Operand::Place(place),
+            ..
+        }) => Some((ParamMode::SharedBorrow, place)),
         DynReceiver::MutableOwned(place) => Some((ParamMode::MutBorrow, place)),
         DynReceiver::Borrowed(borrow) => Some((ParamMode::MutBorrow, borrow.place())),
-        DynReceiver::Owned(Operand::Const(_)) => None,
+        DynReceiver::Owned(OwnedValue {
+            value: Operand::Const(_),
+            ..
+        }) => None,
     };
     if let Some((receiver_mode, receiver_place)) = receiver_place {
         for (index, arg) in args.iter().enumerate() {
@@ -9739,8 +9924,8 @@ fn verify_call_arg(
     arg: &CallArg,
 ) {
     match arg {
-        CallArg::Value(op) | CallArg::InitFieldProvided(op) => {
-            verify_operand(cx, function_id, block_id, stmt_index, op);
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+            verify_operand(cx, function_id, block_id, stmt_index, &owned.value);
         }
         CallArg::InitFieldOmitted => {}
         CallArg::SharedBorrow(place) => {
@@ -9870,8 +10055,8 @@ fn arg_function_escape(
     state: &LocalInit,
 ) -> FunctionValueCapability {
     match arg {
-        CallArg::Value(operand) | CallArg::InitFieldProvided(operand) => {
-            operand_function_escape(program, function_id, operand, state)
+        CallArg::Value(owned) | CallArg::InitFieldProvided(owned) => {
+            operand_function_escape(program, function_id, &owned.value, state)
         }
         CallArg::SharedBorrow(place) | CallArg::MutBorrow(place)
             if matches!(program.type_arena.data(place.ty), TypeData::Function(_)) =>
@@ -10039,6 +10224,9 @@ fn global_initializer_function_state_inner(
         AirTail::Return(Some(value)) => {
             initializer_operand_function_state(program, global_decl.init, value, &state)
         }
+        AirTail::ReturnOwned(owned) => {
+            initializer_operand_function_state(program, global_decl.init, &owned.value, &state)
+        }
         AirTail::None
         | AirTail::Return(None)
         | AirTail::Break(_)
@@ -10090,6 +10278,9 @@ fn rvalue_function_state_inner(
         RValue::Use(operand) => {
             operand_function_state_inner(program, function_id, operand, state, global_init)
         }
+        RValue::Materialize(owned) => {
+            operand_function_state_inner(program, function_id, &owned.value, state, global_init)
+        }
         RValue::FunctionValue { capability, .. } => FunctionValueState::function(*capability),
         RValue::FunctionRef { .. } => {
             FunctionValueState::function(FunctionValueCapability::Escaping)
@@ -10110,7 +10301,7 @@ fn rvalue_function_state_inner(
             FunctionValueState::Fields(vec![operand_function_state_inner(
                 program,
                 function_id,
-                value,
+                &value.value,
                 state,
                 global_init,
             )])
@@ -10121,11 +10312,18 @@ fn rvalue_function_state_inner(
             })
         }
         RValue::Aggregate { kind, fields, .. } => aggregate_function_state(
+            program,
             kind,
             fields
                 .iter()
                 .map(|field| {
-                    operand_function_state_inner(program, function_id, field, state, global_init)
+                    operand_function_state_inner(
+                        program,
+                        function_id,
+                        &field.value,
+                        state,
+                        global_init,
+                    )
                 })
                 .collect(),
         ),
@@ -10155,16 +10353,37 @@ fn rvalue_function_state_inner(
 }
 
 fn aggregate_function_state(
+    program: &Program,
     kind: &AggregateCtor,
     fields: Vec<FunctionValueState>,
 ) -> FunctionValueState {
     match kind {
         AggregateCtor::Struct(_)
         | AggregateCtor::Tuple
-        | AggregateCtor::EnumVariant { .. }
         | AggregateCtor::Array
+        | AggregateCtor::ArrayFill
         | AggregateCtor::List
         | AggregateCtor::DataRef(_) => FunctionValueState::Fields(fields),
+        AggregateCtor::EnumVariant { enum_id, variant } => {
+            let mut variants = program
+                .enum_decl(*enum_id)
+                .variants
+                .iter()
+                .map(|variant| match &variant.shape {
+                    VariantShape::Unit => vec![],
+                    VariantShape::Tuple(fields) => fields
+                        .iter()
+                        .map(|field| source_call_return_state(program, *field))
+                        .collect(),
+                    VariantShape::Struct(fields) => fields
+                        .iter()
+                        .map(|field| source_call_return_state(program, field.ty))
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            variants[variant.index()] = fields;
+            FunctionValueState::Variants(variants)
+        }
         AggregateCtor::Map => FunctionValueState::Fields(
             fields
                 .into_iter()
@@ -10263,7 +10482,7 @@ fn verify_function_value_escape_proof(
     else {
         return;
     };
-    let actual = operand_function_state(cx.program, function_id, value, state).capability();
+    let actual = operand_function_state(cx.program, function_id, &value.value, state).capability();
     if function_value_escape_proof_conflicts(*capability, actual) {
         cx.push(
             VerifyCx::stmt_site(function_id, BlockId::from_index(0), index),
@@ -10336,6 +10555,29 @@ fn source_call_return_state(program: &Program, ty: TypeId) -> FunctionValueState
                         .collect(),
                 )
             }),
+        Some(TypeData::Enum(enm)) => {
+            program
+                .enums
+                .get(enm.index())
+                .map_or_else(FunctionValueState::unknown, |enm| {
+                    FunctionValueState::Variants(
+                        enm.variants
+                            .iter()
+                            .map(|variant| match &variant.shape {
+                                VariantShape::Unit => vec![],
+                                VariantShape::Tuple(fields) => fields
+                                    .iter()
+                                    .map(|field| source_call_return_state(program, *field))
+                                    .collect(),
+                                VariantShape::Struct(fields) => fields
+                                    .iter()
+                                    .map(|field| source_call_return_state(program, field.ty))
+                                    .collect(),
+                            })
+                            .collect(),
+                    )
+                })
+        }
         Some(TypeData::Array { elem, .. } | TypeData::List(elem)) => {
             FunctionValueState::Fields(vec![source_call_return_state(program, *elem)])
         }

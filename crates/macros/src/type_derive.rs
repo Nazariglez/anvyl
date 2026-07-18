@@ -116,6 +116,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
     }
     let companion = crate::naming::fn_companion_ident(ident);
     let native_mod = crate::naming::native_export_module_ident(ident);
+    let materializer_fn = crate::naming::materializer_fn_ident();
     let doc = crate::util::extract_doc(&item.attrs)
         .map_or_else(|| quote! { None }, |doc| quote! { Some(#doc.to_string()) });
     let rust_type_path = if item.generics.params.is_empty() {
@@ -139,7 +140,7 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
         ),
         TypeDeriveKind::Enum => (
             quote! { Some(anvyx_runtime::ExternLayout { size: ::core::mem::size_of::<#ident #ty_generics>() as u64, align: ::core::mem::align_of::<#ident #ty_generics>() as u64 }) },
-            quote! { Some(anvyx_runtime::ExternMaterialization::Clone) },
+            quote! { Some(anvyx_runtime::ExternMaterialization::Materialize) },
             quote! { Some(#owns_heap_edges) },
         ),
         TypeDeriveKind::Ref => (
@@ -148,14 +149,42 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
             quote! { Some(#owns_heap_edges) },
         ),
     };
-    let marker_impl = if matches!(kind, TypeDeriveKind::Ref) {
-        quote! {
+    let native_materializer = match kind {
+        TypeDeriveKind::Inline => quote! {
+            pub fn #materializer_fn(value: &super::#ident #ty_generics) -> super::#ident #ty_generics {
+                *value
+            }
+        },
+        TypeDeriveKind::Enum => quote! {
+            pub fn #materializer_fn(value: &super::#ident #ty_generics) -> super::#ident #ty_generics {
+                value.clone()
+            }
+        },
+        TypeDeriveKind::Ref => quote! {},
+    };
+    let export_ctor = match kind {
+        TypeDeriveKind::Inline => {
+            quote! { anvyx_runtime::TypeExport::copy::<#ident #ty_generics> }
+        }
+        TypeDeriveKind::Enum => {
+            quote! { anvyx_runtime::TypeExport::enumeration::<#ident #ty_generics> }
+        }
+        TypeDeriveKind::Ref => {
+            quote! { anvyx_runtime::TypeExport::shared::<#ident #ty_generics> }
+        }
+    };
+    let marker_impl = match kind {
+        TypeDeriveKind::Ref => quote! {
             unsafe impl #impl_generics #marker_trait for #ident #ty_generics #where_clause {
                 const OWNS_ANVYX_HEAP_EDGES: bool = #owns_heap_edges;
             }
-        }
-    } else {
-        quote! { impl #impl_generics #marker_trait for #ident #ty_generics #where_clause {} }
+        },
+        TypeDeriveKind::Inline | TypeDeriveKind::Enum => quote! {
+            unsafe impl #impl_generics #marker_trait for #ident #ty_generics #where_clause {
+                const OWNS_ANVYX_HEAP_EDGES: bool = #owns_heap_edges;
+                const __ANVYX_MATERIALIZER: fn(&Self) -> Self = #native_mod::#materializer_fn;
+            }
+        },
     };
 
     Ok(quote! {
@@ -166,10 +195,9 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
             fn __anvyx_assert_type<T: #marker_trait>() {}
             __anvyx_assert_type::<#ident #ty_generics>();
             #trace_assert
-            anvyx_runtime::merge_type_members(anvyx_runtime::TypeExport {
-                rust_type_path: #rust_type_path,
-                owns_heap_edges: #owns_heap_edges,
-                descriptor: anvyx_runtime::ExternTypeDescriptor {
+            anvyx_runtime::merge_type_members(#export_ctor(
+                #rust_type_path,
+                anvyx_runtime::ExternTypeDescriptor {
                     name: #export_name.to_string(),
                     doc: #doc,
                     rep: #rep,
@@ -183,12 +211,14 @@ fn expand_inner(input: TokenStream, kind: TypeDeriveKind) -> syn::Result<TokenSt
                     statics: vec![],
                     operators: vec![],
                 },
-                bindings: vec![],
-            })
+                vec![],
+            ))
         }
 
         #[doc(hidden)]
-        pub mod #native_mod {}
+        pub mod #native_mod {
+            #native_materializer
+        }
     })
 }
 

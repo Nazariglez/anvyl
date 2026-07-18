@@ -8,7 +8,14 @@ pub fn fn_companion_ident(fn_name: &Ident) -> Ident {
 
 /// `__anvyx_native_export_{name}`
 pub fn native_export_module_ident(fn_name: &Ident) -> Ident {
-    format_ident!("__anvyx_native_export_{}", generated_suffix(fn_name))
+    format_ident!(
+        "{}",
+        anvyx_externs::native_materializer_module(&fn_name.to_string())
+    )
+}
+
+pub fn materializer_fn_ident() -> Ident {
+    format_ident!("{}", anvyx_externs::INLINE_MATERIALIZER_SYMBOL)
 }
 
 fn generated_suffix(ident: &Ident) -> String {
