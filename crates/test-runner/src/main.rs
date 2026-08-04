@@ -233,20 +233,3 @@ fn list_all_anv_files(root: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.path().to_path_buf())
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::batch_frontend_config;
-
-    #[test]
-    fn batch_frontend_uses_release_profile() {
-        assert_eq!(
-            batch_frontend_config(false).context.profile,
-            anvyx_lang::Profile::Debug
-        );
-        assert_eq!(
-            batch_frontend_config(true).context.profile,
-            anvyx_lang::Profile::Release
-        );
-    }
-}

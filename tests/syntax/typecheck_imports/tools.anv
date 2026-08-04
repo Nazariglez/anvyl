@@ -1,0 +1,3 @@
+// @helper
+
+pub fn id<T>(value: T) -> T { value }

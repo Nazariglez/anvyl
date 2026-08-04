@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 2
+// @match-end
+
+fn value(cond: bool) -> int {
+    if cond {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+fn main() {
+    println(value(true));
+    println(value(false));
+}

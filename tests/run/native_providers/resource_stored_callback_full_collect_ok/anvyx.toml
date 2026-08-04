@@ -1,0 +1,6 @@
+[project]
+name = "resource_stored_callback_full_collect"
+entry = "src/main.anv"
+
+[dependencies]
+host = { path = "provider" }

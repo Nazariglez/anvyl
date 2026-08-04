@@ -1,0 +1,20 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 5
+// 4
+// @match-end
+
+fn named(text: string) -> int {
+    text.len()
+}
+
+fn invoke(callback: fn(string) -> int, text: string) -> int {
+    callback(text)
+}
+
+fn main() {
+    let function = named;
+    println(invoke(function, "hello"));
+    println(invoke(|text: string| text.len(), "rust"));
+}

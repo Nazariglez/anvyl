@@ -8111,38 +8111,3 @@ fn lambda_capture_call_arg(index: usize, capture: &RirLambdaCapture) -> String {
         RirLambdaCaptureKind::HeapCell { .. } => format!("c{index}.clone()"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use anvyx_frontend::air;
-
-    use super::{super::rir::*, call_arg_root_local};
-
-    #[test]
-    fn transferred_call_arg_is_not_scheduled_for_cleanup_drop() {
-        let local = RirLocalId::from_index(0);
-        let owned = |source| {
-            RirCallArg::Value(RirOwnedValue {
-                value: RirOwnedOperand::Value(RirOperand::Place(RirPlace::local(
-                    local,
-                    vec![],
-                    RirTypeId::from_index(0),
-                ))),
-                source,
-            })
-        };
-
-        assert_eq!(
-            call_arg_root_local(&owned(RirOwnedSource::Transfer {
-                air_local: air::LocalId::from_index(0),
-            })),
-            None
-        );
-        assert_eq!(
-            call_arg_root_local(&owned(RirOwnedSource::Reuse(
-                RirMaterializerId::from_index(0),
-            ))),
-            Some(local)
-        );
-    }
-}

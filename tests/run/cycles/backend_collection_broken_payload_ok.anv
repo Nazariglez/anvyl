@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: ok
+
+struct Tree { children: [Tree] = [] }
+struct Registry { entries: [string: Registry] = [:] }
+
+fn main() {
+    let tree = Tree {};
+    let registry = Registry {};
+    println("ok");
+}

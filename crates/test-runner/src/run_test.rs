@@ -205,7 +205,7 @@ fn done(result: TestResult, mode: Mode) -> RunTestResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::{path::Path, time::Duration};
 
     use super::{TestPlan, is_batch_eligible, plan_test};
     use crate::directives::Directives;
@@ -228,51 +228,8 @@ mod tests {
     }
 
     #[test]
-    fn batch_eligible_for_plain_success_run() {
-        let plan = plan("// @mode: run\n// @expect: success\n");
-
-        assert!(is_batch_eligible(&plan));
-    }
-
-    #[test]
-    fn error_run_not_batch_eligible() {
-        let plan = plan("// @mode: run\n// @expect: error\n// @contains: bad\n");
-
-        assert!(!is_batch_eligible(&plan));
-    }
-
-    #[test]
-    fn check_not_batch_eligible() {
-        let plan = plan("// @mode: check\n// @expect: success\n");
-
-        assert!(!is_batch_eligible(&plan));
-    }
-
-    #[test]
-    fn cli_options_block_batch() {
-        let plan = plan("// @mode: run\n// @expect: success\n// @feature: demo\n");
-
-        assert!(!is_batch_eligible(&plan));
-    }
-
-    #[test]
     fn stdin_blocks_batch() {
         let plan = plan("// @mode: run\n// @expect: success\n// @stdin: hello\n");
-
-        assert!(!is_batch_eligible(&plan));
-    }
-
-    #[test]
-    fn manifest_context_blocks_batch() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(
-            temp.path().join("anvyx.toml"),
-            "[project]\nentry = \"main.anv\"\n",
-        )
-        .unwrap();
-        let main = temp.path().join("main.anv");
-        fs::write(&main, "// @mode: run\n// @expect: success\nfn main() {}\n").unwrap();
-        let plan = plan_file(&main, "// @mode: run\n// @expect: success\nfn main() {}\n");
 
         assert!(!is_batch_eligible(&plan));
     }

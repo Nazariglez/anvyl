@@ -1,0 +1,8 @@
+// @mode: check
+// @expect: success
+
+import std:mem;
+
+fn main() {
+    mem.collect_cycles();
+}

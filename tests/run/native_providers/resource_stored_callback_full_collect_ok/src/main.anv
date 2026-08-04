@@ -1,0 +1,16 @@
+// @mode: run
+// @expect: success
+// @match: 42
+
+import pkg:host.host { collect_all, counter_value, fire_slot, make_counter, make_slot };
+
+fn main() {
+    let slot = {
+        let counter = make_counter(42);
+        make_slot(|| {
+            println(counter_value(counter));
+        }, counter)
+    };
+    collect_all();
+    fire_slot(slot);
+}

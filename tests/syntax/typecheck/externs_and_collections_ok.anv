@@ -1,0 +1,36 @@
+// @mode: check
+// @expect: success
+
+extern type Point {
+    x: float;
+    y: float;
+}
+
+extern fn make_point(x: float, y: float) -> Point;
+extern fn touch(point: Point);
+extern fn tick() -> void;
+
+struct Holder {
+    @as embed point: Point,
+}
+
+fn wrap<T>(value: T) {
+    tick();
+    let _ = value;
+}
+
+fn main() {
+    var point = make_point(1.0, 2.0);
+    point.x += 1.0;
+    touch(point);
+    let holder = Holder { point };
+    touch(holder);
+    wrap(1);
+    wrap("text");
+
+    var values: [[int]] = [[1], [2]];
+    let index = 0;
+    values[index].for_each(|ref value| {
+        value += 1;
+    });
+}

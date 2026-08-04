@@ -1,0 +1,31 @@
+// @mode: check
+// @expect: success
+
+struct Entity { x: int }
+struct Enemy { @as embed entity: Entity }
+
+fn id<T>(x: T) -> T { x }
+fn wrap<T>(x: T) -> T { id(x) }
+fn make<T, U>(x: T) -> U? { nil }
+fn len<T, N: int>(xs: [T; N]) -> int { N }
+
+struct Arrays {
+    fn len<T, N: int>(xs: [T; N]) -> int { N }
+}
+
+const CAP = 3;
+
+fn main() {
+    let a = wrap(1);
+    let b = wrap("x");
+    let c = wrap(2);
+    let _: string? = make<int>(a);
+    let fixed: [int; 3] = [1, 2, 3];
+    assert(len(fixed) == 3);
+    assert(len<int, CAP>(fixed) == 3);
+    assert(Arrays.len<int, 3>(fixed) == 3);
+
+    let enemy = Enemy { entity: Entity { x: 1 } };
+    let entity: Entity = enemy as Entity;
+    assert(entity.x == 1);
+}

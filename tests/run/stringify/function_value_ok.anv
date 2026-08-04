@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @skip: function-value stringify requires backend structural-stringify support
+
+fn callback() {}
+
+fn render<T>(value: T) -> string {
+    #stringify(value)
+}
+
+fn main() {
+    let value = callback;
+    println(#stringify(value));
+    println(render(callback));
+}

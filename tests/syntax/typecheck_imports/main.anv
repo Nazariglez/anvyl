@@ -1,0 +1,10 @@
+// @mode: check
+// @expect: success
+
+import facade;
+
+fn main() {
+    let direct = facade.renamed(1);
+    let extended = facade.pick(direct);
+    assert(extended == 2);
+}

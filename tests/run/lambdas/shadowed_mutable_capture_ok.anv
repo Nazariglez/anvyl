@@ -1,0 +1,23 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 12
+// 2
+// @match-end
+
+fn main() {
+    var count = 1;
+    let outer = || {
+        count += 1;
+        count
+    };
+    {
+        var count = 10;
+        let inner = || {
+            count += 2;
+            count
+        };
+        println(inner());
+    };
+    println(outer());
+}

@@ -1,0 +1,5 @@
+error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
+ --> tests/ui/fail/mut_place_string.rs:4:62
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, String>) {
+  |                                                              ^^^^^^

@@ -833,29 +833,6 @@ pub fn verify(program: &Program) -> Result<VerifiedProgram<'_>, Vec<VerifyError>
     }
 }
 
-#[cfg(test)]
-pub(crate) fn verify_structured_body(
-    program: &Program,
-    function_id: FunctionId,
-    body: &super::AirBody,
-) -> Result<(), Vec<VerifyError>> {
-    let mut cx = VerifyCx::new(program);
-    let mut state = LocalInit::new(program, program.function(function_id));
-    verify_air_block(
-        &mut cx,
-        function_id,
-        &body.block,
-        &mut state,
-        &mut Vec::new(),
-    );
-    verify_collection_loan_contract(&mut cx, function_id, &body.block);
-    if cx.errors.is_empty() {
-        Ok(())
-    } else {
-        Err(cx.errors)
-    }
-}
-
 pub struct VerifiedProgram<'a> {
     program: &'a Program,
 }
@@ -1594,17 +1571,6 @@ fn collect_contract_errors(cx: &mut VerifyCx<'_>) {
         verify_contract_weakening(cx, id);
     }
     verify_projected_contract_witnesses(cx);
-}
-
-#[cfg(test)]
-pub(crate) fn verify_contract_declarations(program: &Program) -> Result<(), Vec<VerifyError>> {
-    let mut cx = VerifyCx::new(program);
-    collect_contract_errors(&mut cx);
-    if cx.errors.is_empty() {
-        Ok(())
-    } else {
-        Err(cx.errors)
-    }
 }
 
 fn verify_contract_surface(cx: &mut VerifyCx<'_>, id: ContractSurfaceId) {

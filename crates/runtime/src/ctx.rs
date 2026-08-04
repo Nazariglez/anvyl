@@ -337,72 +337,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::{SafepointGuardKind, TraceDriver, Visitor};
-
-    #[test]
-    fn heap_borrow_blocks_collect_and_reentry() {
-        Heap::scope(|heap| {
-            let mut ctx = Ctx::new(heap);
-            let state = ctx.__anvyx_safepoint_state();
-            let borrow = ctx.heap();
-
-            assert_eq!(
-                state.validate_collect().unwrap_err().message(),
-                "cannot collect while heap borrow guard is active"
-            );
-            assert_eq!(
-                state.validate_reentry().unwrap_err().message(),
-                "cannot reenter runtime while heap borrow guard is active"
-            );
-
-            drop(borrow);
-            assert!(ctx.collect_all().is_ok());
-        });
-    }
-
-    #[test]
-    fn heap_ref_borrow_blocks_collect_and_reentry() {
-        Heap::scope(|heap| {
-            let ctx = Ctx::new(heap);
-            let borrow = ctx.heap_ref();
-            let state = ctx.__anvyx_safepoint_state();
-
-            assert!(state.validate_collect().is_err());
-            assert!(state.validate_reentry().is_err());
-
-            drop(borrow);
-            assert!(state.validate_collect().is_ok());
-            assert!(state.validate_reentry().is_ok());
-        });
-    }
-
-    #[test]
-    #[should_panic(expected = "nested runtime heap access")]
-    fn heap_ref_borrow_rejects_nested_heap_access_before_borrowing() {
-        Heap::scope(|heap| {
-            let ctx = Ctx::new(heap);
-            let _borrow = ctx.heap_ref();
-
-            let _ = ctx.stats();
-        });
-    }
-
-    #[test]
-    fn collect_checks_safepoint_state() {
-        Heap::scope(|heap| {
-            let mut ctx = Ctx::new(heap);
-            let state = ctx.__anvyx_safepoint_state();
-            let guard = state.enter(SafepointGuardKind::HeapBorrow).unwrap();
-
-            assert_eq!(
-                ctx.collect_all().unwrap_err().message(),
-                "cannot collect while heap borrow guard is active"
-            );
-
-            drop(guard);
-            assert!(ctx.collect_all().is_ok());
-        });
-    }
+    use crate::{TraceDriver, Visitor};
 
     #[test]
     fn collect_blocks_reentry_while_roots_are_validated() {

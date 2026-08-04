@@ -12,5 +12,10 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
 
+[dev-dependencies]
+anvyx-externs = { path = "../externs" }
+anvyx-runtime = { path = "../runtime" }
+trybuild = "1"
+
 [lints]
 workspace = true

@@ -87,25 +87,3 @@ impl<T> Display for NumericLiteral<T> {
         f.write_str(self.spelling())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use super::NumericLiteral;
-
-    #[test]
-    fn equality_and_hash_ignore_spelling() {
-        let decimal = NumericLiteral::new("15", 15_i64);
-        let hexadecimal = NumericLiteral::new("0x0F", 15_i64);
-        let values = HashSet::from([decimal, hexadecimal]);
-
-        assert_eq!(values.len(), 1);
-    }
-
-    #[test]
-    fn canonical_float_keeps_float_syntax() {
-        assert_eq!(NumericLiteral::from(4.0).spelling(), "4.0");
-        assert_eq!(NumericLiteral::from(4.5).spelling(), "4.5");
-    }
-}

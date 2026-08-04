@@ -1,0 +1,5 @@
+error: Vec<T> is not a provider boundary carrier; use AnvList<'cx, T> or explicit runtime copy helpers
+ --> tests/ui/fail/mut_place_vec.rs:4:62
+  |
+4 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: MutPlace<'_, 'cx, Vec<i64>>) {
+  |                                                              ^^^^^^^^

@@ -1,0 +1,3 @@
+// @helper
+pub struct Vec2 {}
+pub fn make() -> Vec2 { Vec2 {} }

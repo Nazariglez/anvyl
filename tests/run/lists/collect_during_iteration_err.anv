@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: error
+// @contains: cannot collect while collection loan guard is active
+
+import std:mem;
+
+fn main() {
+    var values: [int] = [1, 2];
+    values.for_each(|ref _| {
+        mem.collect_cycles();
+    });
+}

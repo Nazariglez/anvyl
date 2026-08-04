@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: error
+// @skip: Rust backend cannot lower dataref collection reentry through an alias
+
+dataref Store {
+    values: [int],
+}
+
+fn main() {
+    var store = Store { values: [1, 2] };
+    let alias = store;
+    store.values.for_each(|ref _| {
+        alias.values.push(3);
+    });
+}

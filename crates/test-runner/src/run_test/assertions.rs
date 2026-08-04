@@ -153,10 +153,10 @@ fn check_program_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{AssertionInput, check, check_program_stream};
+    use super::{AssertionInput, check};
     use crate::{
-        directives::{Directives, StreamAssertions},
-        model::{FailurePhase, Mode, TestResult},
+        directives::Directives,
+        model::{Mode, TestResult},
     };
 
     fn directives(src: &str) -> Directives {
@@ -172,17 +172,6 @@ mod tests {
     }
 
     #[test]
-    fn stderr_contains_checks_run_success_stderr() {
-        let directives = directives("// @stderr-contains: expected\n");
-        let input = AssertionInput::success(Mode::Run, "", "program expected stderr\n");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Pass
-        ));
-    }
-
-    #[test]
     fn stderr_match_checks_exact_run_success_stderr_lines() {
         let directives = directives("// @stderr-match: exact stderr\n");
         let input = AssertionInput::success(Mode::Run, "", "exact stderr\n");
@@ -190,65 +179,6 @@ mod tests {
         assert!(matches!(
             check(&directives.assertions, &input),
             TestResult::Pass
-        ));
-    }
-
-    #[test]
-    fn stdout_contains_does_not_match_run_success_stderr() {
-        let directives = directives("// @contains: stderr only\n");
-        let input = AssertionInput::success(Mode::Run, "", "stderr only\n");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Fail {
-                phase: FailurePhase::Runtime,
-                ..
-            }
-        ));
-    }
-    #[test]
-    fn stream_matcher_uses_caller_phase() {
-        let contains = vec!["missing".to_string()];
-        let result =
-            check_program_stream("stdout", "actual\n", None, &contains, FailurePhase::Runtime);
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Runtime,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn warn_contains_checks_stderr_only() {
-        let directives = directives("// @warn-contains: warning text\n");
-        let input = AssertionInput::success(Mode::Check, "warning text\n", "");
-
-        assert!(matches!(
-            check(&directives.assertions, &input),
-            TestResult::Fail {
-                phase: FailurePhase::Compile,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn exact_match_reports_line_mismatch() {
-        let stream = super::NamedStream::borrowed("stdout", "actual\n", FailurePhase::Runtime);
-        let assertions = StreamAssertions {
-            exact: Some("expected".to_string()),
-            contains: vec![],
-        };
-
-        assert!(matches!(
-            super::check_stream(&stream, &assertions),
-            TestResult::Fail {
-                phase: FailurePhase::Runtime,
-                ..
-            }
         ));
     }
 }

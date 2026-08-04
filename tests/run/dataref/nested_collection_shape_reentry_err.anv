@@ -1,0 +1,19 @@
+// @mode: run
+// @expect: error
+// @skip: Rust backend cannot lower nested dataref collection reentry through an alias
+
+struct Payload {
+    values: [int],
+}
+
+dataref Store {
+    payload: Payload,
+}
+
+fn main() {
+    var store = Store { payload: Payload { values: [1, 2] } };
+    let alias = store;
+    store.payload.values.for_each(|ref _| {
+        alias.payload.values.push(3);
+    });
+}

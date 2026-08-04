@@ -1,0 +1,29 @@
+error: callbacks are only supported in top-level parameter position
+ --> tests/ui/fail/provider_descriptor_callback_forms.rs:7:22
+  |
+7 |         fn make() -> fn(int);
+  |                      ^^
+
+error: callbacks are only supported in top-level parameter position
+  --> tests/ui/fail/provider_descriptor_callback_forms.rs:12:28
+   |
+12 |         fn each(callback: [fn(int)]) -> void;
+   |                            ^^
+
+error: callback supports at most 8 parameters
+  --> tests/ui/fail/provider_descriptor_callback_forms.rs:17:74
+   |
+17 |         fn many(callback: fn(int, int, int, int, int, int, int, int, int)) -> void;
+   |                                                                          ^
+
+error: unsupported callback parameter type
+  --> tests/ui/fail/provider_descriptor_callback_forms.rs:22:38
+   |
+22 |         fn leaves(callback: fn(string) -> [int]) -> void;
+   |                                      ^
+
+error: unsupported callback return type
+  --> tests/ui/fail/provider_descriptor_callback_forms.rs:27:47
+   |
+27 |         fn returns(callback: fn(int) -> string) -> void;
+   |                                               ^

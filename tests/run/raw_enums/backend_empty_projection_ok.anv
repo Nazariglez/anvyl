@@ -1,0 +1,10 @@
+// @mode: run
+// @expect: success
+
+enum EmptyInt: int {}
+enum EmptyString: string {}
+
+fn int_value(value: EmptyInt) -> int { value as int }
+fn string_value(value: EmptyString) -> string { value as string }
+
+fn main() {}

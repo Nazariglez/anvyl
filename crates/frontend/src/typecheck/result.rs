@@ -86,68 +86,6 @@ impl TypecheckFailure {
     }
 }
 
-#[cfg(test)]
-pub struct TypecheckOutput {
-    errors: Vec<TypeError>,
-    warnings: Vec<CompileWarning>,
-    lint_events: Vec<LintEvent>,
-    diagnostic_context: TypeDiagnosticContext,
-    facts: Option<TypecheckFacts>,
-}
-
-#[cfg(test)]
-impl TypecheckOutput {
-    pub(crate) fn success(
-        warnings: Vec<CompileWarning>,
-        lint_events: Vec<LintEvent>,
-        diagnostic_context: TypeDiagnosticContext,
-        facts: TypecheckFacts,
-    ) -> Self {
-        facts.validate();
-        Self {
-            errors: vec![],
-            warnings,
-            lint_events,
-            diagnostic_context,
-            facts: Some(facts),
-        }
-    }
-
-    pub(crate) fn failed(
-        errors: Vec<TypeError>,
-        warnings: Vec<CompileWarning>,
-        lint_events: Vec<LintEvent>,
-        diagnostic_context: TypeDiagnosticContext,
-    ) -> Self {
-        debug_assert!(!errors.is_empty());
-        Self {
-            errors,
-            warnings,
-            lint_events,
-            diagnostic_context,
-            facts: None,
-        }
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<TypeError>,
-        Vec<CompileWarning>,
-        Vec<LintEvent>,
-        TypeDiagnosticContext,
-        Option<TypecheckFacts>,
-    ) {
-        (
-            self.errors,
-            self.warnings,
-            self.lint_events,
-            self.diagnostic_context,
-            self.facts,
-        )
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct TypecheckFacts {
     pub(super) lambda_escapes: LambdaEscapeMap,
@@ -212,23 +150,6 @@ impl TypecheckFacts {
             iter_runtime_checks: map_delta(&old.iter_runtime_checks, &self.iter_runtime_checks),
             import_records: self.import_records.clone(),
             used_imports: self.used_imports.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn validate(&self) {
-        for (expr_id, fact) in &self.lambda_escapes {
-            debug_assert_eq!(*expr_id, fact.expr_id);
-        }
-        for ((lambda_id, binding_id), fact) in &self.lambda_captures {
-            debug_assert_eq!(*lambda_id, fact.lambda_id);
-            debug_assert_eq!(*binding_id, fact.binding_id);
-        }
-        for (expr_id, fact) in &self.iter_runtime_checks {
-            debug_assert_eq!(*expr_id, fact.expr);
-        }
-        for (binding_id, fact) in &self.capture_cell_requirements {
-            debug_assert_eq!(*binding_id, fact.binding_id);
         }
     }
 }

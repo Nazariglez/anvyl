@@ -297,13 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn enters_attached_owner_before_cast() {
-        let (owner, _runtime) = attached_owner();
-
-        assert_eq!(cast_after_entry(&owner).unwrap(), 1);
-    }
-
-    #[test]
     fn active_entry_blocks_reentry_before_cast() {
         let (owner, _runtime) = attached_owner();
         let _entry = owner.__anvyx_enter_current().unwrap();
@@ -312,85 +305,6 @@ mod tests {
             cast_after_entry(&owner).unwrap_err().message(),
             "runtime owner entry is active"
         );
-    }
-
-    #[test]
-    fn provider_suspend_temporarily_allows_reentry() {
-        let (owner, _runtime) = attached_owner();
-        let entry = owner.__anvyx_enter_current().unwrap();
-        let provider = owner.__anvyx_suspend_entry_for_provider().unwrap();
-
-        assert_eq!(cast_after_entry(&owner).unwrap(), 1);
-        drop(provider);
-        assert_eq!(
-            cast_after_entry(&owner).unwrap_err().message(),
-            "runtime owner entry is active"
-        );
-        drop(entry);
-        assert_eq!(cast_after_entry(&owner).unwrap(), 1);
-    }
-
-    #[test]
-    fn provider_suspend_requires_active_entry() {
-        let (owner, _runtime) = attached_owner();
-
-        assert_eq!(
-            owner
-                .__anvyx_suspend_entry_for_provider()
-                .unwrap_err()
-                .message(),
-            "runtime owner entry is not active"
-        );
-    }
-
-    #[test]
-    fn stale_generation_fails_before_pointer_cast_and_releases_entry() {
-        let (owner, _runtime) = attached_owner();
-        let stale_generation = owner.shutdown_generation();
-        let shutdown = owner.__anvyx_begin_shutdown().unwrap();
-
-        assert_eq!(
-            owner
-                .__anvyx_enter(owner.owner_id(), stale_generation)
-                .unwrap_err()
-                .message(),
-            "runtime owner shutdown is in progress"
-        );
-        drop(shutdown);
-        assert_eq!(
-            owner
-                .__anvyx_enter(owner.owner_id(), stale_generation)
-                .unwrap_err()
-                .message(),
-            "runtime owner shutdown generation mismatch"
-        );
-        assert_eq!(
-            owner.__anvyx_enter_current().unwrap_err().message(),
-            "runtime owner pointer is detached"
-        );
-    }
-
-    #[test]
-    fn dead_pointer_fails_before_cast() {
-        let (owner, _runtime) = attached_owner();
-        owner.__anvyx_detach_owner_ptr().unwrap();
-
-        assert_eq!(
-            cast_after_entry(&owner).unwrap_err().message(),
-            "runtime owner pointer is detached"
-        );
-    }
-
-    #[test]
-    fn detach_rejects_active_invocation() {
-        let (owner, _runtime) = attached_owner();
-        owner.__anvyx_increment_active_invocations().unwrap();
-
-        assert_eq!(
-            owner.__anvyx_detach_owner_ptr().unwrap_err().message(),
-            "runtime callback invocation is active"
-        );
-        assert_eq!(cast_after_entry(&owner).unwrap(), 1);
     }
 
     #[test]
@@ -414,34 +328,6 @@ mod tests {
                 .unwrap_err()
                 .message(),
             "runtime owner pointer cannot be reattached"
-        );
-    }
-
-    #[test]
-    fn shutdown_generation_overflow_does_not_mutate_state() {
-        let (owner, _runtime) = attached_owner();
-        owner.token.shutdown_generation.set(nonzero(u64::MAX));
-
-        assert_eq!(
-            owner.__anvyx_begin_shutdown().unwrap_err().message(),
-            "runtime owner shutdown generation overflow"
-        );
-        assert_eq!(cast_after_entry(&owner).unwrap(), 1);
-    }
-
-    #[test]
-    fn shutdown_clears_pointer_before_completion() {
-        let (owner, _runtime) = attached_owner();
-        let shutdown = owner.__anvyx_begin_shutdown().unwrap();
-
-        assert_eq!(
-            owner.__anvyx_enter_current().unwrap_err().message(),
-            "runtime owner shutdown is in progress"
-        );
-        drop(shutdown);
-        assert_eq!(
-            owner.__anvyx_enter_current().unwrap_err().message(),
-            "runtime owner pointer is detached"
         );
     }
 

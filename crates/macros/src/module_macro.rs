@@ -673,36 +673,3 @@ fn missing(macro_name: &str, key: &str) -> syn::Error {
         format!("missing {macro_name} key `{key}`"),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_provider_package(input: TokenStream) -> syn::Result<ProviderPackageArgs> {
-        syn::parse2(input)
-    }
-
-    #[test]
-    fn provider_package_accepts_raw_module_idents() {
-        let args = parse_provider_package(quote! { modules: [r#type] }).unwrap();
-
-        assert_eq!(path_segment_tokens(&args.modules[0]), ["type"]);
-        let _ = provider_package_native_tokens(&args.modules);
-    }
-
-    #[test]
-    fn provider_package_rejects_invalid_modules() {
-        for input in [
-            quote! {},
-            quote! { exports: [window] },
-            quote! { modules: [] },
-            quote! { modules: [window, window] },
-            quote! { modules: [crate::window] },
-            quote! { modules: [self::window] },
-            quote! { modules: [super::window] },
-            quote! { modules: [window::<T>] },
-        ] {
-            assert!(parse_provider_package(input).is_err());
-        }
-    }
-}

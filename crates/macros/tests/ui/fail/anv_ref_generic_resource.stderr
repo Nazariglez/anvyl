@@ -1,0 +1,5 @@
+error: AnvRef resource type must be a concrete non-generic type name
+ --> tests/ui/fail/anv_ref_generic_resource.rs:8:56
+  |
+8 | fn bad<'cx>(ctx: &mut Ctx<'cx, '_>, value: AnvRef<'cx, Box<Counter>>) {
+  |                                                        ^^^^^^^^^^^^

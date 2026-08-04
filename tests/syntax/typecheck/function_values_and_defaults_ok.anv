@@ -1,0 +1,28 @@
+// @mode: check
+// @expect: success
+
+fn tick() {}
+fn default_value<T>() -> T? { nil }
+
+struct Box<T> {
+    value: T? = default_value<T>(),
+}
+
+fn make() -> fn() { tick }
+
+fn stringify_value<T>(value: T) -> string {
+    let render: fn() -> string = || #stringify(value);
+    render()
+}
+
+fn main(condition: bool) {
+    let boxed: Box<int> = Box<int> {};
+    let optional: fn()? = if condition { tick } else { nil };
+    optional?();
+    make()();
+    let number = stringify_value(1);
+    let text = stringify_value("text");
+    assert(number == "1");
+    assert(text == "text");
+    boxed;
+}

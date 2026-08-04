@@ -1,0 +1,15 @@
+// @mode: run
+// @expect: success
+// @match: 5
+
+fn count(text: string, remaining: int) -> int {
+    if remaining == 0 {
+        text.len()
+    } else {
+        count(text, remaining - 1)
+    }
+}
+
+fn main() {
+    println(count("hello", 2));
+}

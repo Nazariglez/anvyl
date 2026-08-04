@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: array length must not be negative
+
+const NEG = -1;
+
+fn take<N: int>(values: [int; N]) {}
+
+fn main() {
+    take<NEG>([]);
+}

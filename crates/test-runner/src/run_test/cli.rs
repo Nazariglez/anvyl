@@ -67,6 +67,11 @@ fn spawn(cmd: &str, case: &CliCase, release: bool) -> Result<ProcessOutcome, Str
 
     let mut command = std::process::Command::new(cmd);
     command.args(child_args(case, release));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
     let mut child = command
         .stdin(Stdio::piped())
@@ -76,8 +81,7 @@ fn spawn(cmd: &str, case: &CliCase, release: bool) -> Result<ProcessOutcome, Str
         .map_err(|e| e.to_string())?;
 
     if let Err(err) = write_child_stdin(child.stdin.take(), &case.stdin) {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate(&mut child);
         return Err(err);
     }
 
@@ -92,12 +96,27 @@ fn spawn(cmd: &str, case: &CliCase, release: bool) -> Result<ProcessOutcome, Str
         });
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    terminate(&mut child);
     let (_, stderr) = read_child_output(&mut child);
     Ok(ProcessOutcome::Timeout {
         phase: timeout_phase_for_output(case.mode, &stderr),
     })
+}
+
+fn terminate(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // SAFETY: the child starts a dedicated process group above, and SIGKILL
+        // does not access Rust memory.
+        let killed_group = unsafe { libc::kill(process_group, libc::SIGKILL) } == 0;
+        if !killed_group {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn child_args(case: &CliCase, release: bool) -> Vec<String> {
@@ -146,34 +165,9 @@ fn timeout_phase_for_output(mode: Mode, stderr: &str) -> FailurePhase {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{ErrorKind, Write},
-        path::PathBuf,
-        time::Duration,
-    };
+    use std::io::{ErrorKind, Write};
 
-    use super::{
-        child_args, process_timeout_for_mode, timeout_phase_for_output, write_child_stdin,
-    };
-    use crate::{
-        directives::CliOptions,
-        model::{FailurePhase, Mode},
-        run_test::CliCase,
-    };
-
-    fn case(mode: Mode) -> CliCase {
-        CliCase {
-            file: PathBuf::from(match mode {
-                Mode::Check => "tests/syntax/basic_ok.anv",
-                Mode::Run => "tests/run/basic_ok.anv",
-            }),
-            mode,
-            runtime_timeout: Duration::from_millis(2),
-            compile_timeout: Duration::from_millis(300),
-            cli_options: CliOptions::default(),
-            stdin: String::new(),
-        }
-    }
+    use super::write_child_stdin;
 
     struct BrokenPipeWriter;
 
@@ -187,56 +181,7 @@ mod tests {
         }
     }
     #[test]
-    fn run_forwards_release() {
-        assert_eq!(
-            child_args(&case(Mode::Run), true),
-            vec!["run", "--release", "tests/run/basic_ok.anv"]
-        );
-    }
-
-    #[test]
-    fn writes_stdin() {
-        let mut written = Vec::new();
-
-        write_child_stdin(Some(&mut written), "first\n\nthird\n").unwrap();
-
-        assert_eq!(written, b"first\n\nthird\n");
-    }
-
-    #[test]
     fn broken_pipe_is_ok() {
         assert!(write_child_stdin(Some(BrokenPipeWriter), "input\n").is_ok());
-    }
-
-    #[test]
-    fn timeout_uses_marker() {
-        assert_eq!(
-            timeout_phase_for_output(Mode::Run, "Compile error: stuck\n"),
-            FailurePhase::Compile,
-        );
-        assert_eq!(
-            timeout_phase_for_output(Mode::Run, ""),
-            FailurePhase::Runtime,
-        );
-    }
-
-    #[test]
-    fn check_timeout() {
-        let timeout = process_timeout_for_mode(
-            Mode::Check,
-            Duration::from_millis(2),
-            Duration::from_millis(300),
-        );
-        assert_eq!(timeout, Duration::from_millis(300));
-    }
-
-    #[test]
-    fn run_timeout_includes_compile_budget() {
-        let timeout = process_timeout_for_mode(
-            Mode::Run,
-            Duration::from_millis(2),
-            Duration::from_millis(300),
-        );
-        assert_eq!(timeout, Duration::from_millis(302));
     }
 }

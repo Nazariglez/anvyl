@@ -6,9 +6,6 @@ mod pattern;
 mod stmt;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chumsky::{

@@ -1,0 +1,5 @@
+error: String is not a provider boundary carrier; use AnvString for owned strings or &str for borrowed parameters
+ --> tests/ui/fail/scoped_lambda_string.rs:4:40
+  |
+4 | fn bad(callback: ScopedLambda<'_, '_, (String,), ()>) {
+  |                                        ^^^^^^

@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match: updated
+
+dataref Node {
+    name: string,
+}
+
+fn update(ref text: string) {
+    text = "updated";
+}
+
+fn main() {
+    var node = Node { name: "initial" };
+    update(node.name);
+    println(node.name);
+}

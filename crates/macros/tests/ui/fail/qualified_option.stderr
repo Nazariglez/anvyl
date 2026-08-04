@@ -1,0 +1,5 @@
+error: unsupported #[function] boundary type
+ --> tests/ui/fail/qualified_option.rs:8:15
+  |
+8 | fn bad(value: foreign::Option<i64>) {
+  |               ^^^^^^^^^^^^^^^^^^^^

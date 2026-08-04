@@ -1,0 +1,7 @@
+// @mode: check
+// @expect: error
+// @contains: Unknown member 'nonexistent' in module '<std>:<root>'
+
+import std:nonexistent;
+
+fn main() {}

@@ -2,5 +2,3 @@
 pub mod rust;
 #[cfg(test)]
 mod test_support;
-#[cfg(test)]
-mod vm;

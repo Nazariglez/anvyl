@@ -1,0 +1,12 @@
+// @mode: run
+// @expect: success
+// @match: 1
+
+fn next() -> int { 1 }
+
+fn main() {
+    var value = 0;
+    let read = || value;
+    value = next();
+    println(read());
+}

@@ -1,0 +1,29 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 1
+// 1
+// 0
+// @match-end
+
+import std:mem;
+
+dataref Node {
+    next: Node?,
+}
+
+fn make_cycle() {
+    var node = Node { next: nil };
+    node.next = node;
+}
+
+fn main() {
+    mem.auto_collect(false);
+    make_cycle();
+    println(mem.managed_count());
+    mem.collect_cycles();
+    println(mem.managed_count());
+    mem.auto_collect(true);
+    mem.collect_cycles();
+    println(mem.managed_count());
+}

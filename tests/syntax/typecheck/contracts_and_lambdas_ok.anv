@@ -1,0 +1,36 @@
+// @mode: check
+// @expect: success
+
+contract A { fn a(self) -> int; }
+contract B { fn b(self) -> int; }
+contract Updatable { fn update(ref self); }
+
+struct Both { value: int,
+    fn a(self) -> int { self.value }
+    fn b(self) -> int { self.value + 1 }
+}
+
+struct Enemy { hp: int,
+    fn update(ref self) { self.hp = 0; }
+}
+
+fn use_both(value: dyn A + B) -> int { value.a() + value.b() }
+
+fn make<T>(x: T) -> fn() -> string {
+    || #stringify(x)
+}
+
+fn main() {
+    let both: dyn B + A = Both { value: 2 };
+    assert(use_both(both) == 5);
+
+    var items: [dyn Updatable] = [Enemy { hp: 1 }];
+    for ref item in items {
+        item.update();
+    }
+
+    let int_string = make(1);
+    let string_string = make("x");
+    assert(int_string() == "1");
+    assert(string_string() == "x");
+}

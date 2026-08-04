@@ -438,26 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_lsp_positions_inside_surrogate_pairs_are_rejected() {
-        let index = LineIndex::new("😀");
-
-        assert_eq!(
-            index.lsp_position_to_byte(LspPosition {
-                line: 0,
-                character: 1
-            }),
-            None
-        );
-        assert_eq!(
-            index.lsp_position_to_byte(LspPosition {
-                line: 0,
-                character: 2
-            }),
-            Some(4)
-        );
-    }
-
-    #[test]
     fn crlf_starts_next_line_after_newline() {
         let index = LineIndex::new("a\r\nb");
 

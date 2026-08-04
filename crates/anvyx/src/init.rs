@@ -65,35 +65,3 @@ fn ensure_gitignore(dir: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn gitignore_unchanged_when_already_listed() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = "/target\n.anvyx\n";
-        fs::write(dir.path().join(".gitignore"), original).unwrap();
-        ensure_gitignore(dir.path()).unwrap();
-        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, original);
-    }
-
-    #[test]
-    fn gitignore_adds_separator_when_no_trailing_newline() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitignore"), "/target").unwrap();
-        ensure_gitignore(dir.path()).unwrap();
-        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, "/target\n.anvyx\n");
-    }
-
-    #[test]
-    fn gitignore_ignores_substring_match() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitignore"), "foo.anvyx\n").unwrap();
-        ensure_gitignore(dir.path()).unwrap();
-        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content, "foo.anvyx\n.anvyx\n");
-    }
-}

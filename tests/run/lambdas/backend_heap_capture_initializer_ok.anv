@@ -1,0 +1,18 @@
+// @mode: run
+// @expect: success
+// @match: 2
+
+fn initial() -> int { 1 }
+
+fn make() -> fn() -> int {
+    var value = initial();
+    || {
+        value += 1;
+        value
+    }
+}
+
+fn main() {
+    let next = make();
+    println(next());
+}

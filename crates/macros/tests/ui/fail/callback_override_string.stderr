@@ -1,0 +1,7 @@
+error: unsupported callback parameter type
+ --> tests/ui/fail/callback_override_string.rs:3:1
+  |
+3 | #[function(params(callback = "fn(string) -> void"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `function` (in Nightly builds, run with -Z macro-backtrace for more info)

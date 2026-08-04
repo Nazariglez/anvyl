@@ -1,0 +1,34 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 7
+// 0
+// @match-end
+
+import std:mem;
+
+dataref Node {
+    value: int,
+    callback: fn() -> int,
+}
+
+fn one() -> int { 1 }
+
+fn make_cycle() -> fn() -> int {
+    var node = Node { value: 7, callback: one };
+    let callback = || node.value;
+    node.callback = callback;
+    callback
+}
+
+fn retain_across_collection() {
+    let callback = make_cycle();
+    mem.collect_cycles();
+    println(callback());
+}
+
+fn main() {
+    retain_across_collection();
+    mem.collect_cycles();
+    println(mem.managed_count());
+}

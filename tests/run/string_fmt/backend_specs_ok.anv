@@ -1,0 +1,17 @@
+// @mode: run
+// @expect: success
+// @match-begin
+// 0005
+// 3.14
+//   hi
+// @match-end
+
+fn render(text: string) -> string { f"{text:>4}" }
+
+fn main() {
+    let number = 5;
+    let decimal = 3.14159;
+    println(f"{number:04}");
+    println(f"{decimal:.2}");
+    println(render("hi"));
+}

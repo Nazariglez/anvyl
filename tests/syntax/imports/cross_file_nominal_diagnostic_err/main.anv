@@ -1,0 +1,11 @@
+// @mode: check
+// @expect: error
+// @contains: a.anv
+// @contains: b.anv
+
+import a { make };
+import b { take };
+
+fn main() {
+    take(make());
+}

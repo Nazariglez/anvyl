@@ -1,0 +1,5 @@
+error: AnvRef lifetime must be `'cx`
+ --> tests/ui/fail/anv_ref_missing_lifetime.rs:8:45
+  |
+8 | fn bad(ctx: &mut Ctx<'_, '_>, value: AnvRef<'_, Counter>) {
+  |                                             ^^

@@ -1,0 +1,7 @@
+error: callback supports at most 8 parameters
+ --> tests/ui/fail/callback_override_too_many.rs:3:1
+  |
+3 | #[function(params(value = "fn(int, int, int, int, int, int, int, int, int)"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `function` (in Nightly builds, run with -Z macro-backtrace for more info)

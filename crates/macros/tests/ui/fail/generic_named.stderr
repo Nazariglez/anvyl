@@ -1,0 +1,5 @@
+error: generic named boundary types are not supported
+ --> tests/ui/fail/generic_named.rs:6:15
+  |
+6 | fn bad(value: WindowConfig<i64>) {
+  |               ^^^^^^^^^^^^^^^^^

@@ -175,9 +175,11 @@ name = "anvyx-macros"
 version = "0.1.0"
 dependencies = [
  "anvyx-externs",
+ "anvyx-runtime",
  "proc-macro2",
  "quote",
  "syn",
+ "trybuild",
 ]
 
 [[package]]
@@ -1104,6 +1106,7 @@ version = "0.1.0"
 dependencies = [
  "anvyx-lang",
  "anvyx-project",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

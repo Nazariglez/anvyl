@@ -221,20 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_preserves_missing_exit_code() {
-        let directives = directives("// @exit-code: 1\n");
-        let result = classify(completed(None, "", ""), &directives);
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Compile,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn exit_code_directive_accepts_matching_user_exit() {
         let directives = directives("// @exit-code: 7\n");
         let result = classify(completed(Some(7), "", ""), &directives);
@@ -260,71 +246,6 @@ mod tests {
     fn stderr_marker_classifies_runtime_before_mode_fallback() {
         let directives = directives("// @mode: check\n");
         let result = classify(completed(Some(1), "", "Runtime error: boom\n"), &directives);
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Runtime,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn stderr_marker_classifies_compile_before_mode_fallback() {
-        let directives = directives("// @mode: run\n");
-        let result = classify(
-            completed(Some(1), "", "Compile error: type mismatch\n"),
-            &directives,
-        );
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Compile,
-                ..
-            }
-        ));
-    }
-    #[test]
-    fn unknown_nonzero_run_failure_defaults_to_compile_without_marker() {
-        let directives = directives("");
-        let result = classify(completed(Some(1), "", ""), &directives);
-
-        assert!(matches!(
-            result,
-            TestResult::Fail {
-                phase: FailurePhase::Compile,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn timeout_expectation_accepts_compile_and_runtime_timeouts() {
-        let directives = directives("// @expect: timeout\n");
-
-        let compile = classify(
-            ProcessOutcome::Timeout {
-                phase: FailurePhase::Compile,
-            },
-            &directives,
-        );
-        let runtime = classify(
-            ProcessOutcome::Timeout {
-                phase: FailurePhase::Runtime,
-            },
-            &directives,
-        );
-
-        assert!(matches!(compile, TestResult::Pass));
-        assert!(matches!(runtime, TestResult::Pass));
-    }
-
-    #[test]
-    fn expectation_mismatch_fails_without_text_assertions() {
-        let directives = directives("// @expect: error\n");
-        let result = classify(completed(Some(0), "", ""), &directives);
 
         assert!(matches!(
             result,

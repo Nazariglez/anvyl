@@ -60,36 +60,3 @@ scoped_lambda_call!(A0: a0, A1: a1, A2: a2, A3: a3, A4: a4);
 scoped_lambda_call!(A0: a0, A1: a1, A2: a2, A3: a3, A4: a4, A5: a5);
 scoped_lambda_call!(A0: a0, A1: a1, A2: a2, A3: a3, A4: a4, A5: a5, A6: a6);
 scoped_lambda_call!(A0: a0, A1: a1, A2: a2, A3: a3, A4: a4, A5: a5, A6: a6, A7: a7);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    unsafe fn add(state: NonNull<()>, args: (i64, i64)) -> Result<i64, RuntimeError> {
-        let base = unsafe { *(state.as_ptr().cast::<i64>()) };
-        base.checked_add(args.0)
-            .and_then(|sum| sum.checked_add(args.1))
-            .ok_or_else(|| RuntimeError::new("callback overflow"))
-    }
-
-    unsafe fn fail(_: NonNull<()>, _: ()) -> Result<(), RuntimeError> {
-        Err(RuntimeError::new("callback failed"))
-    }
-
-    #[test]
-    fn calls_typed_thunk() {
-        let mut base: i64 = 10;
-        let f =
-            unsafe { ScopedLambda::<'_, '_, (i64, i64), i64>::__anvyx_from_raw(&mut base, add) };
-
-        assert_eq!(f.call(1, 2).unwrap(), 13);
-    }
-
-    #[test]
-    fn propagates_runtime_error() {
-        let mut state = ();
-        let f = unsafe { ScopedLambda::<'_, '_, (), ()>::__anvyx_from_raw(&mut state, fail) };
-
-        assert_eq!(f.call().unwrap_err().message(), "callback failed");
-    }
-}

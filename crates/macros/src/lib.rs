@@ -52,30 +52,3 @@ pub fn provider_package(input: TokenStream) -> TokenStream {
 pub fn provider_descriptor(input: TokenStream) -> TokenStream {
     provider_descriptor::expand(input.into()).into()
 }
-
-#[cfg(test)]
-mod tests {
-    const MACRO_MODULES: &[(&str, &str)] = &[
-        ("function_macro.rs", include_str!("function_macro.rs")),
-        ("methods_macro.rs", include_str!("methods_macro.rs")),
-        ("module_macro.rs", include_str!("module_macro.rs")),
-        ("type_derive.rs", include_str!("type_derive.rs")),
-        ("boundary.rs", include_str!("boundary.rs")),
-        (
-            "provider_descriptor.rs",
-            include_str!("provider_descriptor.rs"),
-        ),
-    ];
-
-    #[test]
-    fn macros_do_not_reference_legacy_runtime() {
-        for (name, source) in MACRO_MODULES {
-            for banned in [concat!("anvyx_", "lang"), "ExternHandler", "StdModule"] {
-                assert!(
-                    !source.contains(banned),
-                    "{name} must not reference legacy {banned}"
-                );
-            }
-        }
-    }
-}

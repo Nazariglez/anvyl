@@ -1,0 +1,51 @@
+error: missing provider_package! key `modules`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:1:1
+  |
+1 | anvyx_runtime::provider_package! {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `anvyx_runtime::provider_package` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: expected provider_package! key `modules`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:2:36
+  |
+2 | anvyx_runtime::provider_package! { exports: [window] }
+  |                                    ^^^^^^^
+
+error: provider_package! key `modules` must not be empty
+ --> tests/ui/fail/provider_package_invalid_modules.rs:3:1
+  |
+3 | anvyx_runtime::provider_package! { modules: [] }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `anvyx_runtime::provider_package` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: duplicate provider_package! module `window`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:4:54
+  |
+4 | anvyx_runtime::provider_package! { modules: [window, window] }
+  |                                                      ^^^^^^
+
+error: provider_package! module paths must not start with `crate`, `self`, or `super`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:5:46
+  |
+5 | anvyx_runtime::provider_package! { modules: [crate::window] }
+  |                                              ^^^^^^^^^^^^^
+
+error: provider_package! module paths must not start with `crate`, `self`, or `super`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:6:46
+  |
+6 | anvyx_runtime::provider_package! { modules: [self::window] }
+  |                                              ^^^^^^^^^^^^
+
+error: provider_package! module paths must not start with `crate`, `self`, or `super`
+ --> tests/ui/fail/provider_package_invalid_modules.rs:7:46
+  |
+7 | anvyx_runtime::provider_package! { modules: [super::window] }
+  |                                              ^^^^^^^^^^^^^
+
+error: generic paths are not supported here
+ --> tests/ui/fail/provider_package_invalid_modules.rs:8:46
+  |
+8 | anvyx_runtime::provider_package! { modules: [window::<i64>] }
+  |                                              ^^^^^^^^^^^^^

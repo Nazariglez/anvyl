@@ -1,0 +1,5 @@
+error: MutPlace second lifetime must be `'cx`
+ --> tests/ui/fail/mut_place_missing_ctx.rs:4:28
+  |
+4 | fn bad(value: MutPlace<'_, '_, i64>) {
+  |                            ^^

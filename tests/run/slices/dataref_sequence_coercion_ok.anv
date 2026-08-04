@@ -1,0 +1,24 @@
+// @mode: run
+// @expect: success
+// @skip: Rust backend cannot lower dataref fields as slice arguments
+
+dataref Store {
+    values: [int],
+    array: [int; 2],
+}
+
+fn sum(xs: slice[int]) -> int {
+    xs[0] + xs[1]
+}
+
+fn set_first(ref xs: slice[int]) {
+    xs[0] = 9;
+}
+
+fn main() {
+    var store = Store { values: [1, 2], array: [1, 2] };
+    set_first(store.values);
+    println(sum(store.values));
+    set_first(store.array);
+    println(sum(store.array));
+}

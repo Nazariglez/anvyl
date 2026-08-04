@@ -106,9 +106,6 @@ mod surface;
 mod type_ops;
 mod type_refs;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConstDiagnostic {
     Value(ConstValue),
@@ -4153,34 +4150,6 @@ impl TypeChecker {
 }
 
 #[cfg(test)]
-pub(crate) fn check_with_modules(
-    program: &Program,
-    resolved: &ResolveResult,
-    externs: RawExterns,
-    config: TypecheckConfig,
-) -> TypecheckOutput {
-    match check_semantic_with_modules(program, resolved, externs, config) {
-        Ok(mut semantic) => {
-            let warnings = std::mem::take(&mut semantic.warnings);
-            let lint_events = std::mem::take(&mut semantic.lint_events);
-            let diagnostic_context =
-                TypeDiagnosticContext::from_decls(&semantic.program.declarations);
-            TypecheckOutput::success(
-                warnings,
-                lint_events,
-                diagnostic_context,
-                TypecheckFacts::from_semantic(semantic),
-            )
-        }
-        Err(failure) => TypecheckOutput::failed(
-            failure.errors,
-            failure.warnings,
-            failure.lint_events,
-            *failure.diagnostic_context,
-        ),
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn check_semantic_with_modules(
     program: &Program,

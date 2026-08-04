@@ -1,0 +1,14 @@
+// @mode: run
+// @expect: error
+// @contains: while it is initializing
+
+lazy var score = initialize();
+
+fn initialize() -> int {
+    score = 1;
+    0
+}
+
+fn main() {
+    println(score);
+}
